@@ -1,0 +1,168 @@
+# Continuous integration (D10).
+#
+# This workflow has no release trigger and must never acquire one: releases are
+# manual only and live in release.yml
+# (`.taskflow/2026-08-21-local-runner-manager/09-release-distribution.md`).
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should say why, not print a backtrace-less panic.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One red leg must not hide the state of the other two.
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          # macos-latest is Apple Silicon, so the platform the persona actually
+          # uses is the platform that is tested. The `uname` assertion below
+          # keeps that true if GitHub ever repoints the label.
+          - name: macos-arm64
+            os: macos-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+    defaults:
+      run:
+        # bash exists on all three runner images, so every step below is one
+        # script rather than one script per OS.
+        shell: bash
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Assert the macOS leg is ARM64
+        if: runner.os == 'macOS'
+        run: |
+          echo "runner.arch=${{ runner.arch }}  uname -m=$(uname -m)"
+          test "$(uname -m)" = "arm64"
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Cache the cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Verify that the committed Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  e2e:
+    # The workspace-root acceptance suite (task h1). h1 fills the suite in
+    # without editing this workflow: the command below is fixed, and the suite
+    # selects its own scenarios through `#[ignore]`.
+    #
+    # The job SKIPS, rather than fails, when its secret is absent, so a fork
+    # pull request and an offline contributor are not blocked. A job-level `if`
+    # cannot read the `secrets` context, so the guard is a first step that
+    # publishes an output every later step keys on.
+    name: e2e (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Decide whether the acceptance suite can run
+        id: guard
+        env:
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+        run: |
+          if [ -n "${RUNNER_MANAGER_E2E_TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=e2e skipped::RUNNER_MANAGER_E2E_TOKEN is not set for this run, so the acceptance suite is skipped rather than failed."
+          fi
+
+      - name: Check out the repository
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/checkout@v5
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        if: steps.guard.outputs.enabled == 'true'
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      - name: Cache the cargo registry and build artifacts
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      # The suite drives the real binary, and `cargo test -p <pkg>` builds only
+      # that package, so the binary has to exist first.
+      - name: Build the workspace
+        if: steps.guard.outputs.enabled == 'true'
+        run: cargo build --workspace
+
+      - name: Run the acceptance suite
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+          RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
+          RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+        run: cargo test -p runner-manager-e2e -- --ignored

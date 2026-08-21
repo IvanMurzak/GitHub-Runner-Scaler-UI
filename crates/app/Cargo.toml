@@ -1,0 +1,52 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# The package, the binary, and the published crate are all named
+# `runner-manager` (`02-target-architecture.md`, RESOLVED 2026-08-21). The
+# directory is `crates/app`; the name is what ships.
+
+[package]
+name = "runner-manager"
+description = "Local-first autoscaling manager for ephemeral GitHub Actions self-hosted runners, with a CLI and a Ratatui TUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# No `readme` key: the repository README belongs to a3, and a path pointing
+# outside `crates/app/` is not packageable anyway.
+keywords =["github-actions", "self-hosted-runner", "autoscaling", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "runner-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+runner-manager-agent = { workspace = true }
+runner-manager-domain = { workspace = true }
+runner-manager-github = { workspace = true }
+runner-manager-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+insta = { workspace = true }
+predicates = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }

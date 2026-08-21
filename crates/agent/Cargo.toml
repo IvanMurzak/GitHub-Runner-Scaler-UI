@@ -1,0 +1,46 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# `zip`, `tar`, `flate2`, `sha2`, and `hex` are here for `e2`: the GitHub runner
+# package is a `.zip` on Windows and a `.tar.gz` elsewhere, and its published
+# SHA-256 is verified before extraction (`05-infrastructure.md`).
+
+[package]
+name = "runner-manager-agent"
+description = "Demand reconciliation, runner package cache, and JIT runner lifecycle for runner-manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+runner-manager-domain = { workspace = true }
+runner-manager-github = { workspace = true }
+runner-manager-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serial_test = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = { workspace = true }

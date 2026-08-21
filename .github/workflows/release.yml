@@ -1,0 +1,42 @@
+# Manual release (D10).
+#
+# SKELETON ONLY. Task a1 creates this file with its trigger and permission
+# block already correct so that the acceptance check "release.yml contains
+# exactly one trigger, workflow_dispatch"
+# (`.taskflow/2026-08-21-local-runner-manager/09-release-distribution.md`) is
+# true from the first commit. Task a2 fills in the ordered steps: validate the
+# version format, validate monotonicity against both Cargo.toml and the latest
+# published release, run the full CI matrix on the release commit, write the
+# version and tag it, build and sign per-target artifacts, package them with
+# SHA256SUMS and an SBOM, and publish. Task a3 adds the downstream channel
+# update.
+#
+# EXACTLY ONE TRIGGER. There is no `push`, `tag`, `schedule`, or `release`
+# trigger and there must never be one: the release workflow holds the only
+# credential able to publish and never runs automatically
+# (`07-security.md`, operational requirement 7).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "X.Y.Z"
+        required: true
+        type: string
+
+# The minimum needed to publish, and no more.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: The release steps are not implemented yet
+        run: |
+          echo "Requested version: ${{ inputs.version }}"
+          echo "runner-manager has no release pipeline yet; task a2 implements it."
+          echo "Failing deliberately: a dispatch that publishes nothing must not report success."
+          exit 1
