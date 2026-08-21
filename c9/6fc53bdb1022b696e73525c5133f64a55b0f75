@@ -1,0 +1,39 @@
+Cargo.toml
+  s_5332f62e0ed5a7::t_f85456eeafba7f 171-197,200-201,203-204
+  s_5332f62e0ed5a7::t_c729ecd7ba50dd 212-230
+  s_5332f62e0ed5a7::t_044cc17718c266 81-91,97,99
+.github/workflows/ci.yml
+  s_5332f62e0ed5a7::t_1574930dece5f6 216-239,241
+  s_5332f62e0ed5a7::t_bc4a70d9e47c5a 100-103,107-124,127,130-142,144,146,148,157-159,161-177,181
+crates/platform/Cargo.toml
+  s_5332f62e0ed5a7::t_6cb2e877a7cffe 46-52,57-58
+crates/domain/Cargo.toml
+  s_5332f62e0ed5a7::t_e91c1968b65e4a 33-37
+tests/Cargo.toml
+  s_5332f62e0ed5a7::t_36ab1947b81361 41-43
+crates/agent/Cargo.toml
+  s_5332f62e0ed5a7::t_4f6c51badfe1e0 30-33
+crates/app/Cargo.toml
+  s_5332f62e0ed5a7::t_2d817e988eddd1 38-40,56-57
+  s_5332f62e0ed5a7::t_1c553542d81fba 20
+crates/app/tests/workflow_triggers.rs
+  s_5332f62e0ed5a7::t_6357f7bc4bf4b9 19-40,60-81,83-86,88-94,96,98-100,103-106,108-109,111-117,120-130,132-135,138-178,192,194-216,221,224-225,227-243,245-249,251-259,261-263,266-268,270-272
+Cargo.lock
+  s_5332f62e0ed5a7::t_4bb6bd257617fe 2436,2455,2459,2466,2512,2540,2568,2629,2912-2923,3892-3904
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "c96fc53bdb1022b696e73525c5133f64a55b0f75",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
