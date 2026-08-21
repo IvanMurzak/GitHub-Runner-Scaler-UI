@@ -16,6 +16,7 @@ param(
   [Parameter(Mandatory)] [string] $ClientId,
   [Parameter(Mandatory)] [string] $Repo,      # owner/repo, disposable
   [string] $Org,                              # optional, disposable
+  [string] $ScaleSetName,                     # fix the name to pre-wire a workflow's runs-on
   [int]    $MaxCapacity = 1,
   [int]    $PollSeconds = 30                  # long-poll wait for a queued job
 )
@@ -115,7 +116,7 @@ $svc = @{ Authorization = "Bearer $($script:admin)"; Accept = 'application/json'
 try {
   # -------------------------------------------------------------- link 4
   Write-Host "`n=== LINK 4: scale set administration + message session ===" -ForegroundColor Cyan
-  $setName = "rm-d17-spike-$([Environment]::MachineName.ToLower())"
+  $setName = if ($ScaleSetName) { $ScaleSetName } else { "rm-d17-spike-$([Environment]::MachineName.ToLower())" }
   $body = @{
     name = $setName; runnerGroupId = 1
     labels = @(@{ name = $setName; type = 'System' })
@@ -163,7 +164,10 @@ try {
       Note 'link5-acquirejobs' 'AMBER' 'no JobAvailable message to acquire'
     }
 
-    Invoke-RestMethod -Method Delete -Uri "$uri/$($msg.messageId)" -Headers $mq | Out-Null
+    # The queue URL carries a query string, so the message id goes on the PATH.
+    # "$uri/$id" would produce "...?api-version=6.0-preview/42" and 404.
+    $del = [UriBuilder]$uri; $del.Path = "$($del.Path)/$($msg.messageId)"
+    Invoke-RestMethod -Method Delete -Uri $del.Uri.AbsoluteUri -Headers $mq | Out-Null
     Note 'link5-deletemessage' 'GREEN' "acknowledged messageId $($msg.messageId)"
   }
 
@@ -176,13 +180,29 @@ try {
 }
 finally {
   Write-Host "`n=== cleanup ===" -ForegroundColor Cyan
+  # The admin JWT lives 20 minutes. A run that waited on the long poll can
+  # outlive it, and an expired token here would strand a scale set on the
+  # repository — so re-mint the chain before deleting anything.
+  try {
+    $rt2 = (Invoke-RestMethod -Method Post -Headers $gh `
+      -Uri "$API/repos/$Repo/actions/runners/registration-token").token
+    $c2 = Invoke-RestMethod -Method Post -Uri "$API/actions/runner-registration" `
+      -Headers @{ Authorization = "RemoteAuth $rt2"; Accept = 'application/json' } `
+      -ContentType 'application/json' `
+      -Body (@{ url = "https://github.com/$Repo"; runner_event = 'register' } | ConvertTo-Json -Compress)
+    $svc = @{ Authorization = "Bearer $($c2.token)"; Accept = 'application/json' }
+    $script:tenant = $c2.url
+  } catch { Write-Host "  admin re-mint failed, using original token: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+
   if ($script:sessionId -and $script:scaleSetId) {
     try { Invoke-RestMethod -Method Delete -Headers $svc -Uri "$($script:tenant)_apis/runtime/runnerscalesets/$($script:scaleSetId)/sessions/$($script:sessionId)?api-version=$AV" | Out-Null
           Write-Host "  session deleted" } catch { Write-Host "  session delete failed: $($_.Exception.Message)" -ForegroundColor Red }
   }
   if ($script:scaleSetId) {
     try { Invoke-RestMethod -Method Delete -Headers $svc -Uri "$($script:tenant)_apis/runtime/runnerscalesets/$($script:scaleSetId)?api-version=$AV" | Out-Null
-          Write-Host "  scale set deleted" } catch { Write-Host "  scale set delete failed: $($_.Exception.Message)" -ForegroundColor Red }
+          Write-Host "  scale set deleted" }
+    catch { Write-Host "  scale set delete FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  delete it by hand: scale set id $($script:scaleSetId) on $Repo" -ForegroundColor Red }
   }
 }
 
