@@ -42,8 +42,8 @@
 mod common;
 
 use common::{
-    FixtureRelease, TARGETS, bash_program, build_release, corrupt, install_script, posix,
-    repository_root, run_bash,
+    FixtureRelease, TARGETS, bash_program, build_release, install_script, posix, repository_root,
+    run_bash, substitute_payload,
 };
 
 use std::path::{Path, PathBuf};
@@ -358,6 +358,10 @@ fn install_sh_verifies_the_published_digest_and_installs_a_working_binary() {
 #[test]
 fn install_sh_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alone() {
     // ------------------------------------------------------------------------
+    // THE ARCHIVE IS SUBSTITUTED, NOT DAMAGED. See `common::substitute_payload`:
+    // a damaged one is refused by `tar` before the digest is ever consulted, so
+    // a script with no checksum check would pass this test too.
+    //
     // THE SECOND HALF IS THE ONE THAT IS EASY TO GET WRONG.
     // ------------------------------------------------------------------------
     // "Aborts on a corrupted asset" is satisfied by a script that deletes the
@@ -370,7 +374,7 @@ fn install_sh_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alon
     assert!(ok, "the first install must succeed:\n{output}");
     let before = run_installed(&fixture.binary());
 
-    corrupt(&fixture.release.archive("x86_64-unknown-linux-gnu"));
+    substitute_payload(&fixture.release, "x86_64-unknown-linux-gnu");
 
     let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
     assert!(
@@ -854,14 +858,7 @@ fn install_ps1_verifies_the_published_digest_and_installs() {
         std::fs::read(
             fixture
                 .release
-                .assets
-                .parent()
-                .expect("the fixture root")
-                .join("stage")
-                .join(format!(
-                    "runner-manager-{}-x86_64-pc-windows-msvc",
-                    fixture.release.version
-                ))
+                .staged("x86_64-pc-windows-msvc")
                 .join("runner-manager.exe")
         )
         .expect("the staged binary"),
@@ -885,7 +882,7 @@ fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alo
     let binary = fixture.directory.join("runner-manager.exe");
     let before = std::fs::read(&binary).expect("the installed binary");
 
-    corrupt(&fixture.release.archive("x86_64-pc-windows-msvc"));
+    substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
 
     let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
     assert!(

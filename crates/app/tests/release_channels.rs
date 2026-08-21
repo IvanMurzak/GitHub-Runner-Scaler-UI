@@ -44,8 +44,8 @@
 mod common;
 
 use common::{
-    FixtureRelease, TARGETS, build_release, channels_script, corrupt, posix, repository_root,
-    run_bash,
+    FixtureRelease, TARGETS, build_release, channels_script, posix, repository_root, run_bash,
+    substitute_payload,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -560,7 +560,7 @@ fn npm_stage_refuses_an_archive_whose_digest_does_not_match() {
     // publish the tampered binary with a correct-looking checksum beside it.
     let temporary = TempDir::new().expect("a temporary directory");
     let release = build_release(temporary.path(), "1.2.3");
-    corrupt(&release.archive("aarch64-unknown-linux-gnu"));
+    substitute_payload(&release, "aarch64-unknown-linux-gnu");
 
     let out = temporary.path().join("dist-npm");
     let (ok, output) = stage(&release, &out);

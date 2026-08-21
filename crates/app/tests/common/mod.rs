@@ -192,6 +192,7 @@ pub const TARGETS: [(&str, &str, &str); 5] = [
 ];
 
 pub struct FixtureRelease {
+    pub root: PathBuf,
     pub assets: PathBuf,
     pub version: String,
 }
@@ -199,6 +200,13 @@ pub struct FixtureRelease {
 impl FixtureRelease {
     pub fn sums(&self) -> PathBuf {
         self.assets.join("SHA256SUMS")
+    }
+
+    /// The staged payload directory an archive was packed from.
+    pub fn staged(&self, target: &str) -> PathBuf {
+        self.root
+            .join("stage")
+            .join(format!("runner-manager-{}-{target}", self.version))
     }
 
     pub fn archive(&self, target: &str) -> PathBuf {
@@ -243,18 +251,7 @@ pub fn build_release(root: &Path, version: &str) -> FixtureRelease {
         std::fs::write(payload.join("LICENSE"), b"MIT\n").expect("fixture licence");
 
         let archive = assets.join(format!("{stem}.{extension}"));
-        match extension {
-            "tar.gz" => {
-                // Shelled out rather than written by hand: `tar` is on all three
-                // runner images -- release.yml's own packaging step calls it --
-                // and a hand-rolled tar writer would be fixture code with its
-                // own bugs. The zip below has no such luxury; see write_zip.
-                let (ok, output) = run_tar(&stage, &stem, &archive);
-                assert!(ok, "packing {stem}.tar.gz failed:\n{output}");
-            }
-            "zip" => write_stored_zip(&archive, &[(format!("{stem}/{binary}"), body.as_bytes())]),
-            other => panic!("unknown archive extension {other}"),
-        }
+        pack(&stage, &stem, binary, extension, &archive, body.as_bytes());
 
         sums.push_str(&checksum_line(&archive));
         sums.push('\n');
@@ -267,6 +264,7 @@ pub fn build_release(root: &Path, version: &str) -> FixtureRelease {
         .expect("fixture SHA256SUMS");
 
     FixtureRelease {
+        root: root.to_path_buf(),
         assets,
         version: version.to_string(),
     }
@@ -415,14 +413,64 @@ pub fn write_stored_zip(path: &Path, entries: &[(String, &[u8])]) {
         .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
 }
 
-/// Appends bytes to a file, so that its digest stops matching `SHA256SUMS`.
+/// Packs one staged payload directory into the archive shape its target uses.
+fn pack(stage: &Path, stem: &str, binary: &str, extension: &str, archive: &Path, body: &[u8]) {
+    match extension {
+        "tar.gz" => {
+            // Shelled out rather than written by hand: `tar` is on all three
+            // runner images -- release.yml's own packaging step calls it -- and
+            // a hand-rolled tar writer would be fixture code with its own bugs.
+            // The zip has no such luxury; see write_stored_zip.
+            let (ok, output) = run_tar(stage, stem, archive);
+            assert!(ok, "packing {stem}.{extension} failed:\n{output}");
+        }
+        "zip" => write_stored_zip(archive, &[(format!("{stem}/{binary}"), body)]),
+        other => panic!("unknown archive extension {other}"),
+    }
+}
+
+/// Replaces one target's archive with a **valid** archive carrying different
+/// bytes, leaving `SHA256SUMS` describing the archive that used to be there.
 ///
-/// Appending rather than rewriting on purpose: the archive stays a well-formed
-/// archive that would unpack cleanly, so a script that failed to check the
-/// digest would sail past it and install something. That is the mistake being
-/// tested for.
-pub fn corrupt(path: &Path) {
-    let mut bytes = std::fs::read(path).unwrap_or_else(|err| panic!("cannot read {path:?}: {err}"));
-    bytes.extend_from_slice(b"tampered");
-    std::fs::write(path, &bytes).unwrap_or_else(|err| panic!("cannot write {path:?}: {err}"));
+/// ----------------------------------------------------------------------------
+/// SUBSTITUTED, NOT DAMAGED, AND THE DIFFERENCE IS THE WHOLE TEST.
+/// ----------------------------------------------------------------------------
+/// The obvious way to write this is to append a few bytes to the file. It
+/// looks equivalent and it is not: GNU tar rejects trailing garbage on its own,
+/// so a script that never checked a digest would ALSO fail -- and the test
+/// would pass while proving nothing about the checksum. Measured, not assumed:
+/// with the digest comparison deliberately disabled, the appended-bytes version
+/// of this failed with `tar: could not unpack` rather than with a mismatch.
+///
+/// What `07-security.md` actually names as the threat is "a published release
+/// artifact is tampered with in transit" -- a substitution, which unpacks
+/// perfectly and runs whatever the attacker put in it. So the archive rebuilt
+/// here is well-formed in every way except that it is not the one whose digest
+/// was published. Nothing but the SHA-256 comparison can tell.
+pub fn substitute_payload(release: &FixtureRelease, target: &str) {
+    let (_, extension, binary) = TARGETS
+        .iter()
+        .find(|(name, _, _)| *name == target)
+        .unwrap_or_else(|| panic!("unknown target {target}"));
+
+    let stem = format!("runner-manager-{}-{target}", release.version);
+    let body = format!("#!/bin/sh\necho \"substituted payload for {target}\"\n");
+    let staged = release.staged(target);
+    std::fs::write(staged.join(binary), body.as_bytes()).expect("the substituted binary");
+
+    let archive = release.archive(target);
+    std::fs::remove_file(&archive).expect("removing the original archive");
+    pack(
+        &release.root.join("stage"),
+        &stem,
+        binary,
+        extension,
+        &archive,
+        body.as_bytes(),
+    );
+
+    assert!(
+        archive.is_file(),
+        "the substituted archive was not written for {target}"
+    );
 }
