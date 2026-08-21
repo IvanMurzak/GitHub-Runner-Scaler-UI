@@ -507,6 +507,12 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
             "{name} ships without a README; npmjs.com renders the package page \
              from it, and it is where the npm-prefix warning lives"
         );
+        assert!(
+            out.join(&name).join("LICENSE").is_file(),
+            "{name} declares `\"license\": \"MIT\"` and ships no licence text. \
+             A package that claims a licence nobody can read is a package \
+             nobody can comply with."
+        );
     }
 
     // The root package carries the shim and nothing platform-specific.
@@ -514,6 +520,10 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
     assert!(
         root.join("bin").join("runner-manager.cjs").is_file(),
         "the root package is missing the shim npm's `bin` entry points at"
+    );
+    assert!(
+        root.join("LICENSE").is_file(),
+        "the root package declares MIT and ships no licence text"
     );
 
     // ------------------------------------------------------------------------
@@ -766,6 +776,79 @@ fn the_shim_resolves_the_same_packages_the_generator_publishes() {
             "the shim expects the wrong binary file name for `{key}`"
         );
     }
+}
+
+#[test]
+fn the_npm_readme_warns_that_a_global_npm_prefix_moves() {
+    // ------------------------------------------------------------------------
+    // THIS README IS SHIPPED, AND IT IS THE ONLY WARNING THE npm USER GETS.
+    // ------------------------------------------------------------------------
+    // `05-infrastructure.md` (service behaviour 6) and
+    // `09-release-distribution.md` both single out one failure mode of this
+    // channel: `npm i -g` installs into the ACTIVE Node version's global
+    // prefix, `service install` records the binary's absolute path, and
+    // switching Node versions leaves the installed service pointing at a path
+    // that no longer exists. Nothing fails at the time; it fails at the next
+    // unattended boot.
+    //
+    // The task spec makes documenting it part of the deliverable. It is
+    // asserted here, and not just in the repository README, because `npm-stage`
+    // copies this file into all six published packages -- so it is what a user
+    // who arrived through npmjs.com reads, and they may never see the
+    // repository at all.
+    let readme = read(&repository_root().join("npm").join("README.md"));
+    assert!(
+        readme.len() > 500,
+        "npm/README.md is too short to be the package page it is published as"
+    );
+
+    for (needle, why) in [
+        (
+            "global prefix",
+            "the mechanism: an `npm i -g` binary lives under the active Node \
+             installation's global prefix",
+        ),
+        (
+            "service install",
+            "the command that records the absolute path, and the one to re-run \
+             after a Node upgrade",
+        ),
+        (
+            "service status",
+            "what reports the resulting stale path as an error rather than \
+             appearing healthy",
+        ),
+        (
+            "stale",
+            "the word `service status` actually uses, so a user can match what \
+             they read here to what they see there",
+        ),
+        (
+            "install.sh",
+            "the channel with no such failure mode, which is why the README \
+             recommends it for a boot-start service",
+        ),
+        (
+            "Administration",
+            "the permission disclosure follows the product into the channel: \
+             an npm user may never open the repository README \
+             (`07-security.md`)",
+        ),
+    ] {
+        assert!(
+            readme.contains(needle),
+            "npm/README.md never mentions `{needle}`: {why}"
+        );
+    }
+
+    // The disclosure has to be more than the permission's name here too.
+    assert!(
+        readme.contains("deleting")
+            && readme.contains("renaming")
+            && readme.contains("transferring"),
+        "npm/README.md names `Administration: Read and write` without saying \
+         what it permits. The string is not the disclosure."
+    );
 }
 
 /// The `node` that runs the shim, or `None` with a reason printed.

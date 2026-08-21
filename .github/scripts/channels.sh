@@ -401,8 +401,14 @@ cmd_npm_stage() {
     repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
     local shim="${repository_root}/npm/bin/${PRODUCT}.cjs"
     local wrapper_readme="${repository_root}/npm/README.md"
+    local licence="${repository_root}/LICENSE"
     [[ -f "$shim" ]] || die "npm-stage: the wrapper entry point is missing: $shim"
     [[ -f "$wrapper_readme" ]] || die "npm-stage: the wrapper README is missing: $wrapper_readme"
+    # Every manifest below says `"license": "MIT"`, and a package that claims a
+    # licence and ships no text of it is a package nobody can comply with. npm
+    # includes a LICENSE file regardless of `files`, so copying it is all that
+    # is needed.
+    [[ -f "$licence" ]] || die "npm-stage: LICENSE is missing: $licence"
 
     rm -rf "$outdir"
     cmd_npm_manifests "$version" "$sums" "$outdir" >/dev/null
@@ -454,6 +460,7 @@ cmd_npm_stage() {
         cp "$produced" "${outdir}/${package}/bin/${binary}"
         chmod 755 "${outdir}/${package}/bin/${binary}"
         cp "$wrapper_readme" "${outdir}/${package}/README.md"
+        cp "$licence" "${outdir}/${package}/LICENSE"
         rm -rf "$unpack"
 
         order+=("$package")
@@ -466,6 +473,7 @@ cmd_npm_stage() {
     cp "$shim" "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
     chmod 755 "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
     cp "$wrapper_readme" "${outdir}/${PRODUCT}/README.md"
+    cp "$licence" "${outdir}/${PRODUCT}/LICENSE"
 
     # THE ROOT PACKAGE IS PUBLISHED LAST, AND THE ORDER IS WRITTEN DOWN RATHER
     # THAN LEFT TO WHOEVER LOOPS OVER THE DIRECTORY. It declares every platform
