@@ -158,11 +158,14 @@ pub enum OwnershipError {
 ///   for the restart case, where a pre-registration attempt is found after the
 ///   agent restarts.
 ///
-/// Those edges are also what make five of the seven [`FailureReason`] variants
+/// Those edges are also what make six of the eight [`FailureReason`] variants
 /// reachable at all — `JitRequestFailed`, `JitExpired`,
-/// `RunnerPackageUnverified`, `RunnerVersionRejected` and `ProcessStartFailed`
-/// each occur at a pre-registration state, and `03-control-flows.md` flow 2
-/// names every one as a condition the agent must record.
+/// `RunnerPackageUnverified`, `RunnerVersionRejected`, `ProcessStartFailed` and
+/// `RegistrationTimedOut` each occur at a pre-registration state.
+/// `03-control-flows.md` flow 2 names the first five as conditions the agent
+/// must record; `RegistrationTimedOut` is named by no document and is this
+/// crate's own, added because [`recovery_decision`] needs to say "alive, past
+/// its deadline, still unregistered" without calling it a crash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -322,9 +325,51 @@ pub enum FailureReason {
     /// The child process could not be spawned.
     ProcessStartFailed,
     /// The child process exited before it could do its one job.
+    ///
+    /// **Only for a process that is actually gone.** A runner still running past
+    /// its startup deadline is [`Self::RegistrationTimedOut`], not this: `g2`
+    /// renders these strings to an operator, and telling one that a process
+    /// "exited unexpectedly" while it is visible in Task Manager spends the
+    /// credibility of every other message this product prints.
     ProcessExitedUnexpectedly,
+    /// The runner process is up but never registered with GitHub inside its
+    /// startup window.
+    ///
+    /// Split from [`Self::ProcessExitedUnexpectedly`] because it is accurate and
+    /// because it points an operator somewhere else entirely. A process that
+    /// exited is a crash to investigate — logs, exit code, a corrupt runner
+    /// package. A process that is alive and unregistered has almost always
+    /// failed to *reach* GitHub: a proxy, a firewall, a DNS answer, an expired
+    /// or wrong-scoped configuration. Those are configuration and networking
+    /// fixes, and an operator sent to the wrong one of the two loses the time
+    /// this distinction exists to save.
+    RegistrationTimedOut,
     /// Anything else. Must carry no credential.
     Other(String),
+}
+
+impl FailureReason {
+    /// One value of every variant, the counterpart of [`AttemptState::ALL`].
+    ///
+    /// `Other`'s detail is empty because what a caller enumerates is the
+    /// *variant*; no consumer should read the string out of this constant.
+    ///
+    /// **This list is hand-written and can go stale on its own.** What stops it
+    /// is not the array length — a length written as `8` next to eight elements
+    /// asserts nothing — but the exhaustive, wildcard-free `match` in
+    /// `tests::all_failure_reasons_are_reachable_from_the_state_that_produces_them`,
+    /// which stops compiling the moment a variant is added and so puts the
+    /// author who adds one in front of this constant.
+    pub const ALL: [FailureReason; 8] = [
+        FailureReason::JitRequestFailed,
+        FailureReason::JitExpired,
+        FailureReason::RunnerPackageUnverified,
+        FailureReason::RunnerVersionRejected,
+        FailureReason::ProcessStartFailed,
+        FailureReason::ProcessExitedUnexpectedly,
+        FailureReason::RegistrationTimedOut,
+        FailureReason::Other(String::new()),
+    ];
 }
 
 impl fmt::Display for FailureReason {
@@ -342,6 +387,10 @@ impl fmt::Display for FailureReason {
             FailureReason::ProcessExitedUnexpectedly => {
                 f.write_str("the runner process exited unexpectedly")
             }
+            FailureReason::RegistrationTimedOut => f.write_str(
+                "the runner process is running but did not register with GitHub \
+                 before its startup deadline",
+            ),
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
     }
@@ -953,6 +1002,9 @@ pub enum RecoveryDecision {
     /// returns `Observe(Idle)` and never [`Self::Adopt`], because GitHub is
     /// authoritative for the remote status while the local process is
     /// authoritative for supervision, and both facts are true at once.
+    /// `Idle` with `process_alive` and `Registered { busy: true }` returns
+    /// `Observe(Busy)` for exactly the same reason; it did not always, and the
+    /// arm's own comment records what that cost.
     ///
     /// **An `Observe` decision must be applied *and persisted*, or it repeats
     /// forever.** The decision is a pure function of the journalled state and
@@ -961,7 +1013,47 @@ pub enum RecoveryDecision {
     /// pass and be handed the same decision, indefinitely.
     Observe(AttemptState),
     /// Conclude the attempt with this outcome.
+    ///
+    /// **Terminal, and therefore a capacity release.** An attempt is only
+    /// concluded where the thing it was supervising is already gone; see
+    /// [`Self::Terminate`] for the case where it is not.
     Conclude(AttemptOutcome),
+    /// The process is still alive but the attempt cannot go on: **stop the
+    /// process, and only once it is gone record this outcome.**
+    ///
+    /// **Why this is not a [`Self::Conclude`].** `Conclude` moves the attempt to
+    /// a terminal state, and a terminal attempt no longer
+    /// [counts against capacity](AttemptState::counts_against_capacity) — so
+    /// concluding one whose process is still running hands the host back a slot
+    /// it is still using. The agent then starts a replacement runner beside a
+    /// live, unregistered one that may yet register and take a job, for an
+    /// attempt the journal already calls `failed`. There is no
+    /// `RecoveryDecision` that would have expressed the fix: [`Self::Adopt`]
+    /// means take over supervision and [`Self::Clean`] means delete a runtime
+    /// directory, and neither stops anything.
+    ///
+    /// **What happens to the capacity slot.** Nothing, until the process is
+    /// actually gone. The attempt stays in its current, non-terminal state and
+    /// keeps holding its slot for as long as the runner it started is running,
+    /// which is the honest answer — the resources are genuinely occupied. The
+    /// slot comes back at the moment the caller applies the payload through
+    /// [`RunnerAttempt::conclude`], which it does only after the process has
+    /// exited.
+    ///
+    /// **It is safe to re-derive.** The decision is a pure function of the
+    /// journalled state and the observation, so an agent that dies between
+    /// deciding and terminating is handed the same decision on the next pass. A
+    /// caller that terminates but crashes before writing the outcome observes
+    /// `process_alive: false` next time and reaches the ordinary
+    /// [`Self::Conclude`] arm instead; that arm names the process as gone, which
+    /// by then it is.
+    ///
+    /// **The one thing this does not bound** is a process that refuses to die.
+    /// The slot is held until it does. That is a worse outcome than concluding
+    /// early only if the runner was never going to register, and a better one in
+    /// every case where it was — and unlike the early conclusion it cannot
+    /// oversubscribe the host.
+    Terminate(AttemptOutcome),
 }
 
 /// Decide what to do about one journalled attempt after a restart, or on any
@@ -1063,16 +1155,87 @@ pub fn recovery_decision(
             // are legal edges out of `starting`.
             G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
             G::Registered { busy: false } => RecoveryDecision::Observe(S::Idle),
+            // Three cases, not two, and the third is the one that matters.
+            //
             // A live process inside its startup window is adopted, the same as
             // in every other pre-terminal state: `e3` must take over supervision
             // rather than start a second runner for the same work.
             //
-            // Anything else here is a runner that did not come up: flow 2's
-            // "runner exit before job acceptance". Since the amendment that is
-            // recordable, so the attempt concludes and gives its slot back.
+            // A process that is *gone* is flow 2's "runner exit before job
+            // acceptance". Since the amendment that is recordable, so the
+            // attempt concludes and gives its slot back.
+            //
+            // A process that is alive and past its deadline is neither, and
+            // collapsing it into the second was a real defect: `Conclude` makes
+            // the attempt terminal, a terminal attempt stops counting against
+            // capacity, and the host therefore got its slot back while the
+            // runner was still running -- free to register late and take a job
+            // for an attempt the journal already called `failed`, beside the
+            // replacement the freed slot let the agent start. It also read
+            // `ProcessExitedUnexpectedly` to an operator looking at the process
+            // in a task manager. `Terminate` says the true thing and keeps the
+            // slot until the process is actually gone.
             G::NotRegistered => {
-                if observation.process_alive && elapsed < timeouts.startup {
+                if !observation.process_alive {
+                    RecoveryDecision::Conclude(AttemptOutcome::failed(
+                        FailureReason::ProcessExitedUnexpectedly,
+                    ))
+                } else if elapsed < timeouts.startup {
                     RecoveryDecision::Adopt
+                } else {
+                    RecoveryDecision::Terminate(AttemptOutcome::failed(
+                        FailureReason::RegistrationTimedOut,
+                    ))
+                }
+            }
+            G::Unreachable => unreachable!("handled above"),
+        },
+
+        // GitHub is consulted **first**, exactly as at `starting` above, and the
+        // symmetry is load-bearing rather than tidy. This arm used to
+        // short-circuit on `process_alive` before looking at GitHub, so the same
+        // conflict -- a live process that GitHub reports as `busy` -- resolved
+        // one way here and the opposite way one state earlier. What that cost
+        // was not an inconsistency but a wrong outcome: `Adopt` left the journal
+        // saying `idle`, so `last_state_change_at` went on pointing at the idle
+        // entry, and a runner that later crashed *during its job* had its idle
+        // timeout elapse and was concluded `ExitedIdleWithoutWork` -- the benign
+        // surplus exit, recorded for a mid-job crash, inverting the one
+        // distinction this module exists to keep. Nothing downstream could
+        // catch it either: `required_from` for that outcome is `&[Idle]`, and
+        // the attempt really was `idle`.
+        //
+        // `Observe(Busy)` is returned whether or not the process is alive: the
+        // caller adopts supervision independently of this decision, which is
+        // what [`RecoveryDecision::Observe`] already instructs and what
+        // `starting` has always relied on.
+        S::Idle => match observation.github {
+            // GitHub says this runner took a job, and GitHub is authoritative
+            // for remote job status (precedence rule 3). `idle -> busy` was
+            // added by the amendment *for this observation*; before this change
+            // the only arm that could reach it was the one where the process is
+            // already dead.
+            G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
+            // GitHub agrees with the journal, so there is no state to move to.
+            // A live process is adopted; a dead one means supervision is lost
+            // while the remote registration outlived it and needs removing.
+            G::Registered { busy: false } => {
+                if observation.process_alive {
+                    RecoveryDecision::Adopt
+                } else {
+                    RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
+                }
+            }
+            // Nothing at GitHub. A live process is still ours to supervise.
+            // Otherwise the surplus case and the crash case, separated by the
+            // clock: a runner that sat out its whole idle timeout and then
+            // exited with no registration left behind did what flow 2.7
+            // describes. One that vanished early did not.
+            G::NotRegistered => {
+                if observation.process_alive {
+                    RecoveryDecision::Adopt
+                } else if elapsed >= timeouts.idle {
+                    RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork)
                 } else {
                     RecoveryDecision::Conclude(AttemptOutcome::failed(
                         FailureReason::ProcessExitedUnexpectedly,
@@ -1081,39 +1244,6 @@ pub fn recovery_decision(
             }
             G::Unreachable => unreachable!("handled above"),
         },
-
-        S::Idle => {
-            if observation.process_alive {
-                return RecoveryDecision::Adopt;
-            }
-            match observation.github {
-                // The surplus case, and the crash case, separated by the clock:
-                // a runner that sat out its whole idle timeout and then exited
-                // with no registration left behind did what flow 2.7 describes.
-                // One that vanished early did not.
-                G::NotRegistered => {
-                    if elapsed >= timeouts.idle {
-                        RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork)
-                    } else {
-                        RecoveryDecision::Conclude(AttemptOutcome::failed(
-                            FailureReason::ProcessExitedUnexpectedly,
-                        ))
-                    }
-                }
-                // The runner is still registered at GitHub but this agent no
-                // longer owns a process for it: supervision is lost and the
-                // remote registration needs removing.
-                G::Registered { busy: false } => {
-                    RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
-                }
-                // GitHub says this runner took a job, and GitHub is
-                // authoritative for remote job status. `idle -> busy` is an edge
-                // since the amendment, so this is now recorded rather than
-                // reported as unrepresentable.
-                G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
-                G::Unreachable => unreachable!("handled above"),
-            }
-        }
 
         S::Busy => {
             if observation.process_alive {
@@ -1345,9 +1475,20 @@ mod tests {
             if state.is_terminal() {
                 continue;
             }
-            assert!(
-                state.counts_against_capacity(),
-                "{state} is non-terminal, so it holds a slot"
+            // Read through `active_count`, which is the function the
+            // reconciliation formula actually calls, rather than through
+            // `state.counts_against_capacity()`. The latter is defined as
+            // `!self.is_terminal()`, so asserting it one line under
+            // `if state.is_terminal() { continue; }` is `assert!(true)` and
+            // catches nothing; this asserts the same property against a second
+            // reader that can regress on its own -- an inverted or mistyped
+            // filter predicate in `active_count` fails here and nowhere else in
+            // this test.
+            assert_eq!(
+                active_count([&attempt_in(state, 0)]),
+                1,
+                "{state} is non-terminal, so the reconciliation formula must \
+                 still be subtracting it"
             );
             assert!(
                 state.can_transition_to(AttemptState::Failed)
@@ -1543,19 +1684,55 @@ mod tests {
         }
     }
 
+    /// The earliest state at which the agent learns each fact, from flow 2's own
+    /// step order.
+    ///
+    /// **This match is exhaustive and carries no wildcard, and that is the whole
+    /// mechanism.** The assertion it replaced read
+    /// `assert_eq!(cases.len(), 7, "FailureReason has seven variants; ...")`,
+    /// and `cases.len()` on a `[_; 7]` is the compile-time constant `7`: the
+    /// assertion was `7 == 7` and could not fail. Measured on the code as it
+    /// stood, adding an eighth variant produced exactly one error — `E0004` from
+    /// `Display`'s match — and once that arm was written the suite was green
+    /// with the new variant unreachable and untested. Here, a ninth variant
+    /// stops this file compiling until somebody says which state produces it,
+    /// and `all_failure_reasons_are_reachable_from_the_state_that_produces_them`
+    /// then proves the answer.
+    fn earliest_state_producing(reason: &FailureReason) -> AttemptState {
+        match reason {
+            // Step 5: the package is verified before the JIT request is made.
+            FailureReason::RunnerPackageUnverified => AttemptState::Allocated,
+            // Step 5: `generate-jitconfig` did not return a configuration.
+            FailureReason::JitRequestFailed => AttemptState::Allocated,
+            // Flow 4.4: a configuration arrived and was never claimed.
+            FailureReason::JitExpired => AttemptState::JitReceived,
+            // Step 6: the child process could not be spawned.
+            FailureReason::ProcessStartFailed => AttemptState::JitReceived,
+            // Edge case 7: GitHub refuses the registration on version grounds.
+            FailureReason::RunnerVersionRejected => AttemptState::Starting,
+            // Flow 2's "runner exit before job acceptance".
+            FailureReason::ProcessExitedUnexpectedly => AttemptState::Starting,
+            // The live-but-unregistered process past its startup deadline; see
+            // the `S::Starting` / `G::NotRegistered` arm of `recovery_decision`.
+            FailureReason::RegistrationTimedOut => AttemptState::Starting,
+            FailureReason::Other(_) => AttemptState::Busy,
+        }
+    }
+
     #[test]
-    fn all_seven_failure_reasons_are_reachable_from_the_state_that_produces_them() {
-        // `03-control-flows.md` flow 2 names every one of these by name as a
-        // condition the agent must record. Before the diagram amendment five of
-        // the seven were unreachable: each occurs at a pre-registration state,
-        // and `allocated`, `jit_received` and `starting` had no terminal edge, so
-        // `conclude` answered `OutcomeUnreachable` from every state that could
-        // actually have produced them. A `FailureReason` variant that nothing can
-        // reach is a variant `g2` renders a match arm for and no test can cover.
+    fn all_failure_reasons_are_reachable_from_the_state_that_produces_them() {
+        // `03-control-flows.md` flow 2 names most of these by name as conditions
+        // the agent must record. Before the diagram amendment five were
+        // unreachable: each occurs at a pre-registration state, and `allocated`,
+        // `jit_received` and `starting` had no terminal edge, so `conclude`
+        // answered `OutcomeUnreachable` from every state that could actually
+        // have produced them. A `FailureReason` variant that nothing can reach
+        // is a variant `g2` renders a match arm for and no test can cover.
         //
-        // The state paired with each reason is the earliest one at which the
-        // agent learns that fact, taken from flow 2's own step order.
-        let cases: [(FailureReason, AttemptState); 7] = [
+        // The table is written out rather than derived so each pairing carries
+        // its reason; `earliest_state_producing` above is what makes a new
+        // variant a compile error, and the two are cross-checked below.
+        let cases: [(FailureReason, AttemptState); 8] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -1574,20 +1751,44 @@ mod tests {
                 FailureReason::ProcessExitedUnexpectedly,
                 AttemptState::Starting,
             ),
+            // A live runner that never reached GitHub inside its startup window.
+            (FailureReason::RegistrationTimedOut, AttemptState::Starting),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
                 AttemptState::Busy,
             ),
         ];
 
-        // Every variant is covered exactly once, so adding an eighth without
-        // giving it a reachable state fails here rather than silently.
+        // Every variant is covered exactly once. Three separate things have to
+        // hold, and none of them is a length compared against itself:
+        //
+        //  * `FailureReason::ALL` and this table are the same size, so a variant
+        //    added to one and not the other is caught;
+        //  * every variant in `ALL` appears here -- by discriminant, because
+        //    `Other`'s payload differs between the two lists;
+        //  * each pairing agrees with `earliest_state_producing`, whose
+        //    wildcard-free match is what stops this file compiling when a
+        //    variant is added at all.
         assert_eq!(
             cases.len(),
-            7,
-            "FailureReason has seven variants; each needs a state it is reachable \
-             from"
+            FailureReason::ALL.len(),
+            "every FailureReason variant needs a state it is reachable from"
         );
+        for listed in FailureReason::ALL {
+            assert!(
+                cases.iter().any(|(reason, _)| {
+                    std::mem::discriminant(reason) == std::mem::discriminant(&listed)
+                }),
+                "{listed:?} is in FailureReason::ALL but has no case here"
+            );
+        }
+        for (reason, from) in &cases {
+            assert_eq!(
+                earliest_state_producing(reason),
+                *from,
+                "{reason:?}: the table and the exhaustive match disagree"
+            );
+        }
 
         for (reason, from) in cases {
             let mut attempt = attempt_in(from, 0);
@@ -2357,8 +2558,10 @@ mod tests {
         assert_eq!(attempt.state(), AttemptState::Busy);
         assert_eq!(attempt.github_runner_id(), Some(73));
 
-        // A live process still wins: local process state is authoritative for
-        // supervision, so the agent adopts before it reconciles.
+        // And a live process does not change the answer. GitHub is authoritative
+        // for remote job status; the caller adopts supervision independently of
+        // the decision, which is what `Observe`'s own documentation says and
+        // what `starting` has always relied on.
         assert_eq!(
             recovery_decision(
                 &attempt_in(AttemptState::Idle, 1_000),
@@ -2369,7 +2572,223 @@ mod tests {
                 timeouts,
                 &clock,
             ),
+            RecoveryDecision::Observe(AttemptState::Busy),
+            "a live process must not hide a job GitHub is reporting"
+        );
+    }
+
+    #[test]
+    fn a_restart_during_a_job_is_recorded_as_busy_and_not_left_reading_idle() {
+        // A1. The same conflict -- a live process that GitHub reports as `busy`
+        // -- must resolve the same way at `idle` as at `starting`, and this test
+        // is written as the damage rather than as the symmetry, because the
+        // symmetry is not what it costs to get wrong.
+        //
+        // Before the fix, `idle` short-circuited on `process_alive` and answered
+        // `Adopt`. `Adopt` writes nothing, so the journal stayed `idle` and
+        // `last_state_change_at` stayed pointed at the idle entry. Ten minutes
+        // later the runner crashed mid-job, GitHub reaped its registration, and
+        // the idle timeout had long since elapsed -- so the crash was concluded
+        // `ExitedIdleWithoutWork`: the benign surplus exit, which `g2` renders
+        // as a normal end and never alarms an operator about. Nothing
+        // downstream could refuse it, because `required_from` for that outcome
+        // is `&[Idle]` and the attempt genuinely was `idle`.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let clock = StubClock::at(1_000);
+
+        // The two arms answer alike, which is the property. `starting` was
+        // already right; `idle` was not.
+        let mid_job = RecoveryObservation {
+            process_alive: true,
+            github: GithubRunnerObservation::Registered { busy: true },
+        };
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                mid_job,
+                timeouts,
+                &clock
+            ),
+            recovery_decision(
+                &attempt_in(AttemptState::Starting, 1_000),
+                mid_job,
+                timeouts,
+                &clock
+            ),
+            "the same observation must not resolve one way at idle and the \
+             opposite way one state earlier"
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                mid_job,
+                timeouts,
+                &clock
+            ),
+            RecoveryDecision::Observe(AttemptState::Busy)
+        );
+
+        // And now the consequence, walked end to end. The caller applies the
+        // decision -- which `Observe` requires, on pain of repeating for ever --
+        // and the attempt is `busy` with `last_state_change_at` moved to the
+        // moment the job was observed.
+        let mut attempt = attempt_in(AttemptState::Idle, 1_000);
+        attempt.assigned_job(73, ts(1_000)).expect("idle -> busy");
+        assert_eq!(attempt.last_state_change_at(), ts(1_000));
+
+        // Ten minutes on, the process is gone and GitHub has reaped the runner.
+        // Well past the idle timeout, and irrelevant: a crash from `busy` is
+        // `Orphaned`, and `ExitedIdleWithoutWork` is not reachable from `busy`
+        // at all.
+        clock.set(1_600);
+        let crashed = RecoveryObservation {
+            process_alive: false,
+            github: GithubRunnerObservation::NotRegistered,
+        };
+        let decision = recovery_decision(&attempt, crashed, timeouts, &clock);
+        assert_eq!(
+            decision,
+            RecoveryDecision::Conclude(AttemptOutcome::Orphaned),
+            "a crash during a job is a lost supervision, never the surplus exit"
+        );
+        let RecoveryDecision::Conclude(outcome) = decision else {
+            unreachable!("asserted just above")
+        };
+        assert!(
+            outcome.is_failure() && !outcome.is_idle_exit(),
+            "`g2` reads these two flags to decide whether to alarm an operator, \
+             and a mid-job crash must alarm one"
+        );
+
+        // The old behaviour, spelled out so the regression is unmistakable: had
+        // the attempt been left at `idle`, this is what the same crash would
+        // have produced.
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                crashed,
+                timeouts,
+                &clock
+            ),
+            RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork),
+            "which is exactly why the journal must not be left saying `idle`"
+        );
+    }
+
+    #[test]
+    fn a_live_unregistered_runner_past_its_deadline_is_stopped_before_its_slot_returns() {
+        // A2. Three cases at `starting` with nothing at GitHub, and the middle
+        // one used to be folded into the last.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let clock = StubClock::at(1_000);
+        let attempt = attempt_in(AttemptState::Starting, 1_000);
+        let unregistered = |alive| RecoveryObservation {
+            process_alive: alive,
+            github: GithubRunnerObservation::NotRegistered,
+        };
+
+        // Inside the window, alive: adopted.
+        clock.set(1_119);
+        assert_eq!(
+            recovery_decision(&attempt, unregistered(true), timeouts, &clock),
             RecoveryDecision::Adopt
+        );
+
+        // Gone: an accurate `ProcessExitedUnexpectedly`, and terminal, because
+        // there is nothing left running to hold the slot.
+        assert_eq!(
+            recovery_decision(&attempt, unregistered(false), timeouts, &clock),
+            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            )),
+            "the one case that really is flow 2's runner exit"
+        );
+
+        // Alive and past the deadline: neither of the above.
+        clock.set(1_120);
+        let decision = recovery_decision(&attempt, unregistered(true), timeouts, &clock);
+        assert_eq!(
+            decision,
+            RecoveryDecision::Terminate(AttemptOutcome::failed(
+                FailureReason::RegistrationTimedOut
+            ))
+        );
+        assert_ne!(
+            decision,
+            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            )),
+            "a process visible in a task manager did not exit unexpectedly, and \
+             an operator told that it did stops believing the next message too"
+        );
+
+        // The substance: the slot is not returned while the process runs. The
+        // decision itself moves nothing, so the attempt is still `starting` and
+        // still counted -- which is what stops the agent starting a replacement
+        // beside a runner that could still register and take a job.
+        let mut attempt = attempt;
+        assert!(attempt.counts_against_capacity());
+        assert_eq!(active_count([&attempt]), 1);
+
+        // The slot comes back at the moment the caller applies the payload,
+        // which it does only after the process is gone.
+        let RecoveryDecision::Terminate(outcome) = decision else {
+            unreachable!("asserted above")
+        };
+        attempt
+            .conclude(outcome, ts(1_130))
+            .expect("the payload must be applicable to the attempt it was made about");
+        assert_eq!(attempt.state(), AttemptState::Failed);
+        assert!(!attempt.counts_against_capacity());
+        assert_eq!(active_count([&attempt]), 0);
+
+        // And the decision is re-derivable: an agent that died between deciding
+        // and terminating is handed the same answer next pass, while one that
+        // terminated but crashed before writing sees a dead process and reaches
+        // the ordinary conclusion, whose wording is by then true.
+        let pending = attempt_in(AttemptState::Starting, 1_000);
+        assert_eq!(
+            recovery_decision(&pending, unregistered(true), timeouts, &clock),
+            RecoveryDecision::Terminate(AttemptOutcome::failed(
+                FailureReason::RegistrationTimedOut
+            ))
+        );
+        assert_eq!(
+            recovery_decision(&pending, unregistered(false), timeouts, &clock),
+            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            ))
+        );
+    }
+
+    #[test]
+    fn the_two_starting_failures_read_differently_to_an_operator() {
+        // `g2` renders `FailureReason` directly, and these two send an operator
+        // in different directions: one to a crash investigation, the other to a
+        // networking or configuration fix. Reaching for `Other` here instead of
+        // a named variant would have put a free-form string on the same path.
+        let exited = FailureReason::ProcessExitedUnexpectedly.to_string();
+        let timed_out = FailureReason::RegistrationTimedOut.to_string();
+        assert_ne!(exited, timed_out);
+        assert!(
+            timed_out.contains("running") && timed_out.contains("register"),
+            "the message must say the process is up and unregistered: {timed_out}"
+        );
+        assert!(
+            !timed_out.contains("exited"),
+            "the whole point is that nothing exited: {timed_out}"
+        );
+        assert!(
+            !matches!(FailureReason::RegistrationTimedOut, FailureReason::Other(_)),
+            "a known, named condition must not travel through the escape hatch"
         );
     }
 

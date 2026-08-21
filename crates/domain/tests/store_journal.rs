@@ -323,21 +323,47 @@ fn the_journal_survives_process_death_and_yields_the_same_attempts() {
     let mut policy = fixtures::policy().build();
     policy.repair_required().expect("pending policies may");
 
-    {
+    let (mode, wal) = {
         let store = SqliteStore::open(&path).expect("a fresh database opens");
         store.put_host(&host).expect("stored");
         store.insert_policy(&policy).expect("stored");
         for attempt in &written {
             store.record_attempt(attempt).expect("journalled");
         }
+        let observed = (
+            store.journal_mode().to_string(),
+            store.readers_do_not_block_writers(),
+        );
         abandon(store);
-    }
+        observed
+    };
 
-    assert!(
+    // The store *asks* for WAL and now reports what it got, so this asks too.
+    // Asserting the `-wal` file unconditionally failed on a healthy build
+    // wherever WAL is unavailable -- no shared-memory support, as on a
+    // network-mounted application data directory -- with nothing to say that
+    // the mode, rather than the durability, was what had changed. Everything
+    // below holds in either mode and is the actual point of the test; this pair
+    // of assertions is the part that is about WAL specifically.
+    //
+    // Nothing reopens the database here. A second `SqliteStore` would close
+    // cleanly at the end of its statement, and a clean close checkpoints the
+    // write-ahead log away -- which is precisely the file being asserted on.
+    assert_eq!(
+        wal,
+        mode == "wal",
+        "`readers_do_not_block_writers` must agree with the reported mode"
+    );
+    assert_eq!(
         path.with_extension("sqlite3-wal").exists(),
-        "the write-ahead log must still be there: if it were checkpointed away, \
-         the reopen below would prove nothing about recovering from an unclean \
-         stop"
+        wal,
+        "in {mode} mode a write-ahead log beside the database is {}",
+        if wal {
+            "required: without it the reopen below proves nothing about \
+             recovering from an unclean stop"
+        } else {
+            "impossible, so one on disk means the mode was misreported"
+        }
     );
 
     let reopened = SqliteStore::open(&path).expect("a killed process leaves a readable database");
@@ -376,20 +402,46 @@ fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
     let clock = FakeClock::default();
     let timeouts = RecoveryTimeouts::provisional();
 
+    // `entered_state_at` is deliberately **not** `created_at`. The two used to
+    // be the same instant -- `fixtures::created_at()` is exactly what
+    // `FakeClock::default().now()` returns -- and with them equal, a storage
+    // layer that wrote `created_at` into `last_state_change_at` was
+    // unobservable here: every elapsed-time assertion below landed on the same
+    // branch either way. Confirmed by mutating the store: that transposition
+    // passed this test while two others failed it.
+    //
+    // So the attempt is allocated at T0 and enters `idle` a full idle timeout
+    // later, and the clock is advanced to match. The transposition now moves
+    // `last_state_change_at` *earlier* by exactly one timeout, which is enough
+    // to push the first assertion below onto the wrong branch.
+    let allocated_at = clock.now();
+    let entered_idle_at = allocated_at + timeouts.idle;
     let idle = fixtures::attempt()
         .id(AttemptId::from_u128(0x401))
         .state(AttemptState::Idle)
         .github_runner_id(73)
         .process_id(4_242)
-        .entered_state_at(clock.now())
+        .created_at(allocated_at)
+        .entered_state_at(entered_idle_at)
         .build();
     let busy = fixtures::attempt()
         .id(AttemptId::from_u128(0x402))
         .state(AttemptState::Busy)
         .github_runner_id(74)
         .process_id(4_243)
-        .entered_state_at(clock.now())
+        .created_at(allocated_at)
+        .entered_state_at(entered_idle_at)
         .build();
+    assert_ne!(
+        idle.created_at,
+        idle.last_state_change_at(),
+        "if these are equal, nothing below can tell the two columns apart"
+    );
+
+    // Now is the moment the runner entered `idle`, so no time has yet elapsed
+    // *in that state* -- while a whole idle timeout has elapsed since
+    // allocation. That gap is the discriminator.
+    clock.advance(timeouts.idle);
 
     {
         let store = SqliteStore::open(&path).expect("opens");
@@ -419,10 +471,16 @@ fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
         recovery_decision(&loaded[0], vanished, timeouts, &clock),
         recovery_decision(&idle, vanished, timeouts, &clock)
     );
-    assert!(matches!(
-        recovery_decision(&loaded[0], vanished, timeouts, &clock),
-        RecoveryDecision::Conclude(outcome) if outcome.is_failure()
-    ));
+    assert!(
+        matches!(
+            recovery_decision(&loaded[0], vanished, timeouts, &clock),
+            RecoveryDecision::Conclude(outcome) if outcome.is_failure()
+        ),
+        "no time has passed in `idle`, so this is a crash -- and this is the \
+         discriminating assertion: had storage written `created_at` into \
+         `last_state_change_at`, a whole idle timeout would appear to have \
+         elapsed and this would report the benign surplus exit instead"
+    );
 
     clock.advance(timeouts.idle);
     assert!(
@@ -430,9 +488,8 @@ fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
             recovery_decision(&loaded[0], vanished, timeouts, &clock),
             RecoveryDecision::Conclude(outcome) if outcome.is_idle_exit()
         ),
-        "if storage had written `created_at` into `last_state_change_at`, this \
-         attempt's timeout would run from allocation and this assertion would \
-         land on the wrong branch"
+        "and once the timeout really has elapsed in `idle`, it is flow 2.7's \
+         surplus runner"
     );
 
     // And an outage decides nothing destructive, reloaded or not.
