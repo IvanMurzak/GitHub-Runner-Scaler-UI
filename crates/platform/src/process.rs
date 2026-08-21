@@ -1944,6 +1944,87 @@ mod tests {
         assert!(!probe_failure_means_gone(None, ESRCH));
     }
 
+    /// Every `dead_code` allowance in this file must name a *complement*.
+    ///
+    /// A lint on the lint, and it exists because the alternative did not work.
+    /// `probe_failure_means_gone` carried `#[cfg_attr(windows, allow(dead_code,
+    /// …))]` while its only non-test caller was macOS-only. On Linux the
+    /// allowance was inactive *and* the caller absent, so `dead_code` fired on
+    /// the lib target and `cargo clippy --all-targets -- -D warnings` failed --
+    /// on the one CI leg no Windows developer runs, and invisibly to every
+    /// local gate.
+    ///
+    /// A `dead_code` allowance is a claim about everywhere the caller is *not*,
+    /// so its condition is naturally a complement: `not(target_os = "…")`. A
+    /// bare positive names a single platform and says nothing whatsoever about
+    /// the rest, which is precisely how the wrong one went unnoticed. Requiring
+    /// the complement form does not prove the condition names the *right*
+    /// platform, but it does refuse the shape that hid the bug.
+    ///
+    /// Scoped to this file because it is the only one in the crate with
+    /// target-conditional compilation; the assertion at the end fails if that
+    /// stops being true by way of these allowances disappearing.
+    #[test]
+    fn every_dead_code_allowance_names_a_complement() {
+        // Comment lines go first. This test's own documentation quotes the
+        // attribute that motivated it, and on the first run the scan duly
+        // found that quotation and failed -- which is a fair demonstration
+        // that it detects the shape, and a reminder that a text scan reads
+        // prose as readily as code.
+        let source: String = include_str!("process.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut checked = 0;
+
+        for block in source.split("#[cfg_attr(").skip(1) {
+            // Walk to the `)` closing `cfg_attr(`, and remember the first
+            // comma at depth zero: that is what separates the condition from
+            // the attributes it applies.
+            let mut depth = 0usize;
+            let mut body_end = None;
+            let mut split_at = None;
+            for (index, character) in block.char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        if depth == 0 {
+                            body_end = Some(index);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    ',' if depth == 0 && split_at.is_none() => split_at = Some(index),
+                    _ => {}
+                }
+            }
+
+            let (Some(body_end), Some(split_at)) = (body_end, split_at) else {
+                continue;
+            };
+            if !block[split_at..body_end].contains("dead_code") {
+                continue;
+            }
+
+            let condition = block[..split_at].trim();
+            checked += 1;
+            assert!(
+                condition.starts_with("not("),
+                "a dead_code allowance must name the complement of its \
+                 caller's cfg rather than one platform, or it says nothing \
+                 about the legs it does not name: `{condition}`"
+            );
+        }
+
+        assert!(
+            checked >= 3,
+            "this scan found {checked} dead_code allowances; it used to find \
+             three, so either they were removed or the parser has stopped \
+             matching and the check is now vacuous"
+        );
+    }
+
     /// The three-way answer, on synthesised tokens, on every platform.
     ///
     /// The spawn-based tests above cannot cover the case where two identities

@@ -340,10 +340,10 @@ fn redact_core(core: &str) -> String {
     // Both halves are judged unwrapped: compact JSON welds a quote to each,
     // so the key arrives as `encoded_jit_config"`, which is on no list.
     for separator in ['=', ':'] {
-        if let Some((key, _)) = core.split_once(separator) {
-            if is_credential_key(key.trim_matches(WRAPPERS)) {
-                return format!("{key}{separator}{REDACTION}");
-            }
+        if let Some((key, _)) = core.split_once(separator)
+            && is_credential_key(key.trim_matches(WRAPPERS))
+        {
+            return format!("{key}{separator}{REDACTION}");
         }
     }
 
@@ -366,10 +366,10 @@ fn redact_core(core: &str) -> String {
             // truncated -- which the unrecursed `:` path never did, and which
             // is worth having, because an HMAC-SHA256 signature has exactly a
             // digest's shape and was previously printed in full.
-            if key.trim_matches(WRAPPERS).eq_ignore_ascii_case("sha256") {
-                if let Some(bare) = redacted.strip_prefix("sha256:") {
-                    return format!("{key}{separator}{lead}{bare}{trail}");
-                }
+            if key.trim_matches(WRAPPERS).eq_ignore_ascii_case("sha256")
+                && let Some(bare) = redacted.strip_prefix("sha256:")
+            {
+                return format!("{key}{separator}{lead}{bare}{trail}");
             }
             return format!("{key}{separator}{lead}{redacted}{trail}");
         }

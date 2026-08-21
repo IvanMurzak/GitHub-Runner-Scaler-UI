@@ -429,9 +429,24 @@ pub fn validate(os: Os, arch: Arch) -> Result<HostSupport, UnsupportedHost> {
     }
 
     let status = SupportStatus::of(arch);
-    let warnings = match status {
-        SupportStatus::GenerallyAvailable => Vec::new(),
-        SupportStatus::PublicPreview => vec![SupportWarning::Arm64PublicPreview],
+
+    // Matched on `arch`, not on `status`. The *verdict* is single-sourced from
+    // `Arch::is_public_preview` and stays that way -- `status` still gates the
+    // arms -- but the warning *text* names an architecture, and choosing it by
+    // status re-encoded which architecture that is. A second preview
+    // architecture would have been handed ARM64's message with no compile
+    // error: the one place this module's "adding a variant is a compile error"
+    // claim did not hold.
+    //
+    // Matching the pair means a new `Arch` variant fails to compile here until
+    // someone decides what it is owed, which for a preview architecture is a
+    // `SupportWarning` variant of its own.
+    let warnings = match (status, arch) {
+        (SupportStatus::GenerallyAvailable, _) => Vec::new(),
+        (SupportStatus::PublicPreview, Arch::Arm64) => vec![SupportWarning::Arm64PublicPreview],
+        // Unreachable while ARM64 is the only preview architecture, and it is
+        // `Arch::is_public_preview` that decides that, not this match.
+        (SupportStatus::PublicPreview, Arch::X64 | Arch::Arm32) => Vec::new(),
     };
 
     Ok(HostSupport {

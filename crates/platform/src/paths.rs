@@ -234,7 +234,22 @@ impl AppPaths {
             }
 
             match create_restricted_leaf(path) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // `DirBuilder::mode` passes the mode through `mkdir(2)`,
+                    // which applies `& ~umask`. The result is therefore always
+                    // a *subset* of `0700` -- never more permissive, so this is
+                    // not a security hole -- but it is no longer exactly `0700`
+                    // the way an explicit `set_permissions` made it. An unusual
+                    // umask that strips owner bits would leave a tree this
+                    // program cannot write, and would fail the `0700` assertion
+                    // the logging installer makes about these directories.
+                    //
+                    // Chmodding the freshly-created path does not reopen the
+                    // window that creating-then-tightening used to have:
+                    // created at `0700` or tighter and then set to `0700`, the
+                    // directory is not permissive at any instant.
+                    restrict_directory(purpose, path)?;
+                }
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Already there. It may predate this rule, or predate this
                     // program, so tighten it rather than assume. A non-
@@ -282,10 +297,14 @@ impl fmt::Display for AppPaths {
     }
 }
 
-/// Tightens a directory that already existed.
+/// Sets a directory to exactly `0700`.
 ///
-/// Only reached on that path now: a directory this program creates gets `0700`
-/// from `mkdir(2)` itself and never exists with anything else.
+/// Called on both paths, and for two different reasons. A directory that
+/// already existed may predate this rule and can be anything at all. A
+/// directory this program just created is already a subset of `0700`, because
+/// `mkdir(2)` applied the mode through the umask -- but a subset is not the
+/// same as exactly `0700`, and the callers of these directories assume the
+/// owner bits are present.
 #[cfg(unix)]
 fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsError> {
     use std::os::unix::fs::PermissionsExt;
