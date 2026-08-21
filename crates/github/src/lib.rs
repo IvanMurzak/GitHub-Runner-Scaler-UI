@@ -948,8 +948,25 @@ pub struct AuthenticatedClient {
     last_revalidation: std::sync::Mutex<Revalidation>,
     revalidations_performed: AtomicU64,
 
-    /// `401`s seen since the last success. A `403` while this is non-zero is a
-    /// lockout; a `403` while it is zero is a permissions answer.
+    /// `401`s seen since the last successful caller response.
+    ///
+    /// **Nothing in production reads this.** It is incremented on every `401`
+    /// and cleared by a successful caller response, and that is the whole of
+    /// what it does. It used to be documented as the lockout's test — "a `403`
+    /// while this is non-zero is a lockout" — and
+    /// [`AuthenticatedClient::is_lockout_403`] stopped consulting it when that
+    /// rule was replaced by position plus GitHub's own evidence:
+    /// [`Attempt::Retry`] already implies this request's own `401` incremented
+    /// it moments ago, so reading it added no signal, and it did add a race that
+    /// failed open — a concurrent success clearing the count downgraded a real
+    /// lockout to a permissions answer.
+    ///
+    /// The field is kept on purpose, and only the tests read it: they drive it
+    /// to values that *would* change the answer if it were still consulted, and
+    /// assert that the answer does not change. Deleting it would delete the
+    /// ability to make that assertion, which is the only thing standing between
+    /// the conjunct and its reintroduction. See
+    /// `a_concurrent_success_cannot_downgrade_a_lockout_to_a_permissions_answer`.
     consecutive_unauthorized: AtomicU64,
     lockout: std::sync::Mutex<LockoutState>,
 }
@@ -1149,21 +1166,52 @@ impl AuthenticatedClient {
     /// `auth login`; [`Revalidation::Valid`] and [`Revalidation::Unavailable`]
     /// both spend the one retry.
     ///
-    /// # Position, and why this entry point may not latch a lockout
+    /// # Position, and what it no longer decides on its own
     ///
-    /// A `403` is the authentication lockout only when it lands on the *retry*
-    /// this client itself issued after a request's own `401`
-    /// ([`AuthenticatedClient::is_lockout_403`]). This method is the caller's
-    /// own probe: it is a **first** attempt by construction, whatever happened
-    /// on some other request minutes ago. So it passes [`Attempt::First`] down,
-    /// and the probe it drives cannot latch.
+    /// This method is the caller's own probe: it is a **first** attempt by
+    /// construction, whatever happened on some other request minutes ago, so it
+    /// passes [`Attempt::First`] down.
+    ///
+    /// That used to settle the matter. This heading read "why this entry point
+    /// may not latch a lockout", and the text said the probe it drives *cannot*
+    /// latch — an accurate description of the position rule as it then stood,
+    /// and a false statement about the product. A lockout that outlives one
+    /// back-off continues on a **first** attempt by construction, because this
+    /// client's retry never happened: the request never reached the wire.
+    /// Refusing to latch there stopped the back-off entirely and hammered a
+    /// credential GitHub had asked to be left alone.
+    ///
+    /// So position alone no longer decides.
+    /// [`AuthenticatedClient::is_lockout_403`] reads GitHub's own evidence in
+    /// the first position instead: a first attempt latches when, and only when,
+    /// the response carries `retry-after` and no parseable GitHub message body.
+    /// A permissions refusal names what is not accessible, so it still does not
+    /// latch, which is what keeps [`GithubError::Forbidden`] reachable from
+    /// here.
     ///
     /// `revalidate_and_retry_once` uses the private
     /// [`AuthenticatedClient::revalidate_after_unauthorized`] instead, which is
-    /// in the retry position and may.
+    /// in the retry position, where any `403` that is not a rate limit is the
+    /// lockout regardless of what the body says.
+    ///
+    /// # This call can latch a lockout, and then it says so
+    ///
+    /// Because a first attempt can latch, this call can leave the whole client
+    /// backed off for up to [`MAX_LOCKOUT_BACKOFF`]. It reports that as
+    /// [`GithubError::AuthenticationLockout`] rather than answering
+    /// `Ok(`[`Revalidation::Unavailable`]`)` and leaving the caller to discover
+    /// it through a separate [`AuthenticatedClient::is_locked_out`] call. An
+    /// `auth status` that printed "could not determine" while the client it had
+    /// just silenced sat mute for fifteen minutes would be reporting the wrong
+    /// event, and reporting it as the milder one.
     ///
     /// # Errors
-    /// [`GithubError::AuthenticationLockout`] if the probe itself is locked out.
+    /// [`GithubError::AuthenticationLockout`] if this client is already backing
+    /// off when the call arrives, **or** if this call's own probe latches one.
+    ///
+    /// A credential GitHub has rejected outright is *not* an error here: that
+    /// comes back as `Ok(`[`Revalidation::Rejected`]`)`, and what to do about it
+    /// — prompt for `auth login` — is the caller's decision, not this method's.
     ///
     /// # Panics
     /// If a previous holder panicked while the re-validation result lock was
@@ -1196,7 +1244,7 @@ impl AuthenticatedClient {
         // someone else's re-validation covers us and we must not repeat it.
         let sampled = self.revalidation_generation.load(Ordering::SeqCst);
         let _guard = self.revalidation_gate.lock().await;
-        if self.revalidation_generation.load(Ordering::SeqCst) != sampled {
+        let outcome = if self.revalidation_generation.load(Ordering::SeqCst) != sampled {
             let shared = *self
                 .last_revalidation
                 .lock()
@@ -1205,20 +1253,48 @@ impl AuthenticatedClient {
                 outcome = ?shared,
                 "reused an in-flight credential re-validation instead of starting another"
             );
-            return Ok(shared);
-        }
+            shared
+        } else {
+            self.revalidations_performed.fetch_add(1, Ordering::SeqCst);
+            let fresh = self.probe_credential(attempt).await;
+            *self
+                .last_revalidation
+                .lock()
+                .expect("re-validation lock poisoned") = fresh;
+            self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
+            tracing::info!(
+                outcome = ?fresh,
+                "re-validated the stored credential (no token renewal exists in this design)"
+            );
+            fresh
+        };
 
-        self.revalidations_performed.fetch_add(1, Ordering::SeqCst);
-        let outcome = self.probe_credential(attempt).await;
-        *self
-            .last_revalidation
-            .lock()
-            .expect("re-validation lock poisoned") = outcome;
-        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
-        tracing::info!(
-            outcome = ?outcome,
-            "re-validated the stored credential (no token renewal exists in this design)"
-        );
+        // The probe is HTTP, and since the continuation rule re-widened
+        // `Attempt::First`, HTTP from *this* entry point can latch a lockout.
+        // `probe_credential` reports a `403` as `Unavailable` whether or not it
+        // latched one, and `Unavailable` on its own reads as "this taught us
+        // nothing about the credential" — so without this check `revalidate`
+        // answers `Ok(Unavailable)` having just silenced the entire client for
+        // up to `MAX_LOCKOUT_BACKOFF`, and the only way for `f1` to find that
+        // out is a separate `is_locked_out()` call it has no reason to make.
+        //
+        // `revalidate_and_retry_once` has always re-checked after its own probe.
+        // Doing it here instead makes the two entry points agree: before, being
+        // told about the lockout depended on *who latched it* — the guard above
+        // reports one latched by someone else's traffic, this reports one
+        // latched by the caller's own probe — and that distinction is invisible
+        // from outside and actionable by nobody.
+        //
+        // This changes what is reported, not when a lockout latches:
+        // `latch_lockout` is reached on exactly the paths it was before.
+        //
+        // It also covers the shared branch above, which the retry path's own
+        // check never could. A second caller arriving while the first one's
+        // probe is in flight takes the cached `Unavailable` without probing at
+        // all, and is just as silenced by the lockout that probe latched.
+        if let Some(retry_after) = self.lockout_remaining() {
+            return Err(GithubError::AuthenticationLockout { retry_after });
+        }
         Ok(outcome)
     }
 
@@ -1228,9 +1304,15 @@ impl AuthenticatedClient {
     /// `attempt` is the *caller's* position, not the probe's own. A probe driven
     /// by `send`'s `401` handling is part of that request's retry; a probe a
     /// caller asked for through [`AuthenticatedClient::revalidate`] is a first
-    /// attempt. Only the former may latch a lockout — see
-    /// [`AuthenticatedClient::is_lockout_403`], which both this and `classify`
-    /// now go through, so the rule is stated once instead of twice.
+    /// attempt.
+    ///
+    /// Either may latch a lockout, on different evidence. This used to say "only
+    /// the former may", which was the position rule before the continuation rule
+    /// re-widened `Attempt::First`: a retry `403` that is not a rate limit is
+    /// the lockout outright, and a first-attempt `403` is the lockout when
+    /// GitHub's own evidence says so — `retry-after` present, no parseable
+    /// message. See [`AuthenticatedClient::is_lockout_403`], which both this and
+    /// `classify` go through, so the rule is stated once instead of twice.
     async fn probe_credential(&self, attempt: Attempt) -> Revalidation {
         let probe = ApiRequest::get(REVALIDATION_PATH).query("per_page", 1);
         match self.send_raw(&probe).await {
@@ -1238,10 +1320,17 @@ impl AuthenticatedClient {
             // probe is this client's own diagnostic, not the caller's traffic,
             // and a successful probe is exactly the state a lockout arrives in:
             // GitHub still accepts the credential, and answers the *next* real
-            // request with `403`. Resetting here would erase the evidence the
-            // `403` is classified against and report a lockout as a permissions
-            // failure. Only a successful caller request clears the count, in
-            // `classify`.
+            // request with `403`. Only a successful caller request clears the
+            // count, in `classify`.
+            //
+            // The reason used to be given as "resetting here would erase the
+            // evidence the `403` is classified against", and that stopped being
+            // true when `is_lockout_403` stopped consulting the count. There is
+            // no such evidence to erase now — nothing in production reads the
+            // field. The line stays because the field's one remaining job is to
+            // let the tests prove it is *not* consulted, and a probe that
+            // quietly rewrote it would make those tests assert against a counter
+            // value no caller path actually produces.
             Ok(response) if response.status.is_success() => Revalidation::Valid,
             Ok(response) if response.status == StatusCode::UNAUTHORIZED => {
                 self.consecutive_unauthorized.fetch_add(1, Ordering::SeqCst);
@@ -1249,12 +1338,20 @@ impl AuthenticatedClient {
             }
             Ok(response) if response.status == StatusCode::FORBIDDEN => {
                 // A `403` on a probe that *is* this request's retry is the
-                // lockout. Latch it; the caller's own classification will report
-                // it. A `403` on a probe a caller asked for directly is not —
-                // the comment that used to sit here claimed "the probe only ever
+                // lockout outright. A `403` on a probe a caller asked for
+                // directly is the lockout only when the response itself says so
+                // — `retry-after` present, no parseable message — because that
+                // is what a lockout continuing past one back-off looks like, and
+                // it necessarily arrives in the first position.
+                //
+                // The comment that used to sit here claimed "the probe only ever
                 // runs after a `401`, so it is always in the retry position",
-                // and publishing `revalidate` is what made that untrue. The
-                // position now arrives as an argument instead of being asserted.
+                // and publishing `revalidate` is what made that untrue. Its
+                // replacement then said a direct probe "is not" the lockout,
+                // which the continuation rule in turn made untrue. Both were
+                // position asserted as a conclusion; the position now arrives as
+                // an argument and the conclusion is drawn in one place, by
+                // `is_lockout_403`.
                 if self.is_lockout_403(&response, attempt) {
                     self.latch_lockout(&response.headers);
                 }
@@ -1278,6 +1375,12 @@ impl AuthenticatedClient {
                 Err(GithubError::AuthenticationFailed)
             }
             Revalidation::Valid | Revalidation::Unavailable => {
+                // `revalidate_from` now converts a lockout that its own probe
+                // latched, so this no longer catches that case. It stays for the
+                // one it still catches: a *concurrent* request latching between
+                // that check and this one. Sending the retry into a live lockout
+                // is the thing the back-off exists to prevent, and this is the
+                // last point at which it can be declined.
                 if let Some(remaining) = self.lockout_remaining() {
                     return Err(GithubError::AuthenticationLockout {
                         retry_after: remaining,
@@ -1388,13 +1491,18 @@ impl AuthenticatedClient {
     /// every lockout outliving one back-off.
     ///
     /// No counter is needed for that case either, because the response says so
-    /// itself. GitHub's lockout carries `retry-after` and an empty body; a
-    /// permissions refusal carries a message naming what is not accessible and
+    /// itself. GitHub's lockout carries `retry-after` and no parseable message;
+    /// a permissions refusal carries a message naming what is not accessible and
     /// no `retry-after`. Requiring **both** halves of that signature is what
     /// keeps this from degenerating into "every `403` is a lockout": a
     /// permissions answer has a message, so it never matches, and a secondary
     /// rate limit has both a message and `retry-after`, so `is_rate_limited`
     /// takes it first.
+    ///
+    /// "No parseable message" is deliberately wider than "an empty body", which
+    /// is how this used to be stated. See [`is_lockout_continuation`] for what
+    /// else falls into it — a proxy's HTML error page most notably — and for why
+    /// the resulting false positives are accepted rather than tightened away.
     ///
     /// This also settles a standing worry about [`MAX_LOCKOUT_BACKOFF`]. With
     /// the continuation recognised, the ceiling no longer decides whether the
@@ -1548,17 +1656,48 @@ fn is_rate_limited(response: &ApiResponse) -> bool {
 ///
 /// * **`retry-after` is present.** GitHub sends it when it wants to be left
 ///   alone. A permissions refusal never does — there is nothing to wait for.
-/// * **The body carries no message.** A permissions refusal always names what
-///   is not accessible ("Resource not accessible by integration"); the lockout's
-///   body is empty. This is the half that stops the rule from swallowing
-///   [`GithubError::Forbidden`] entirely.
+///
+///   The header's *presence* is what is tested, not whether it parses, and that
+///   is a fix rather than laziness. [`retry_after`] reads **integer seconds
+///   only**, while RFC 9110 §10.2.3 also permits an HTTP-date. Gating detection
+///   on `retry_after(..).is_some()` meant a date-form header was not recognised
+///   as a continuation at all, and the bug this function exists to fix came
+///   straight back for that shape — silently, since the response still looks
+///   like an ordinary [`GithubError::Forbidden`] on the way out.
+///
+///   How long to wait stays a separate question, still answered by the integer
+///   parse: [`AuthenticatedClient::latch_lockout`] already falls back to
+///   [`DEFAULT_LOCKOUT_BACKOFF`] for a header it cannot read, so a date-form
+///   header now latches sixty seconds instead of latching nothing. GitHub sends
+///   integer seconds in practice; the point is not to depend on that.
+/// * **The body carries no parseable GitHub message.** A permissions refusal
+///   always names what is not accessible ("Resource not accessible by
+///   integration"); the lockout's does not. This is the half that stops the rule
+///   from swallowing [`GithubError::Forbidden`] entirely.
+///
+///   "No parseable GitHub message" is wider than "the body is empty", which is
+///   how this used to be written, and the difference is worth stating because it
+///   is what the code actually tests. [`error_message`] returns `None` for *any*
+///   body that is not JSON carrying a non-empty `message`: an HTML error page
+///   from a proxy or a CDN, a JSON body carrying only `documentation_url`, plain
+///   text, a truncated response. Proxies routinely send `Retry-After` too, so a
+///   `403` that never came from GitHub at all can read as an authentication
+///   lockout here.
+///
+///   That is accepted rather than missed. The cost is bounded — the client
+///   waits, clamped by [`MAX_LOCKOUT_BACKOFF`], then re-asks — and the direction
+///   is the safe one: treating a strange `403` as "wait" costs latency, while
+///   treating a real lockout as a permissions answer costs the back-off
+///   entirely and tells the operator to fix a grant that is not missing.
+///   Tightening it would mean asserting the body *is* GitHub's, which is
+///   precisely the assertion an intercepting proxy makes false.
 ///
 /// Callers reach this through [`AuthenticatedClient::is_lockout_403`], which
 /// rules out a rate limit first — a secondary rate limit carries `retry-after`
 /// *and* a message, so it fails this test on the second half anyway, but the
 /// ordering makes the precedence explicit rather than incidental.
 fn is_lockout_continuation(response: &ApiResponse) -> bool {
-    retry_after(&response.headers).is_some() && error_message(&response.body).is_none()
+    response.headers.contains_key("retry-after") && error_message(&response.body).is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -2628,8 +2767,11 @@ mod tests {
     /// as the *expected* one for `generate-jitconfig`.
     ///
     /// The lockout's real signature is narrower: a `403` on the one retry this
-    /// client issues after this request's own `401`. A fresh first attempt
-    /// answering `403` is a permissions answer, whatever happened minutes ago.
+    /// client issues after this request's own `401`, or a `403` whose own
+    /// headers and body say GitHub is continuing a lockout. Neither is "the
+    /// count is non-zero", which is what a stale `401` leaves behind — so the
+    /// permissions `403` below is a permissions answer whatever happened minutes
+    /// ago, and it is the *response*, not the history, that decides.
     #[tokio::test]
     async fn a_stale_401_does_not_turn_a_later_permissions_403_into_a_lockout() {
         let server = MockServer::start().await;
@@ -2948,6 +3090,107 @@ mod tests {
              reports a missing permission as `the credential is fine, please wait`"
         );
         assert_eq!(client.lockout_remaining(), None);
+    }
+
+    /// The square the other three leave empty, and the one where a defect in the
+    /// composition would hide.
+    ///
+    /// Covered elsewhere: a first-attempt continuation through `send`, a
+    /// first-attempt permissions `403` through `send`, and a direct probe
+    /// meeting a permissions `403` (immediately above). A direct probe meeting a
+    /// *continuation-shaped* `403` is the fourth square, and it is the
+    /// composition point of the two rules that pull in opposite directions —
+    /// the narrowing to `Attempt::First` that fixed the stale-`401` lockout, and
+    /// the continuation rule that re-widens `First` on GitHub's own evidence.
+    ///
+    /// If the narrowing swallowed the continuation here, every other test in
+    /// this file would still pass, and `f1`'s `auth status` would poll a
+    /// credential GitHub had asked it to leave alone — reporting each refusal as
+    /// a missing grant.
+    #[tokio::test]
+    async fn a_directly_requested_probe_latches_a_continuation_shaped_lockout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            // The continuation's signature: `retry-after`, and a body with no
+            // message for `error_message` to find.
+            .respond_with(ResponseTemplate::new(403).insert_header("retry-after", "60"))
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+
+        // No preceding traffic whatsoever: a first attempt in the strongest
+        // sense, which is exactly the position the narrowed rule refused to
+        // latch in.
+        let err = client
+            .revalidate()
+            .await
+            .expect_err("a probe that latches a lockout reports it rather than `Unavailable`");
+        assert!(
+            err.is_lockout(),
+            "`revalidate` latched a client-wide lockout and must say so; answering \
+             `Ok(Unavailable)` leaves `f1` to discover a 15-minute outage through a separate \
+             `is_locked_out()` call it has no reason to make: {err:?}"
+        );
+        assert!(
+            client.is_locked_out(),
+            "a 403 carrying `retry-after` with no message is GitHub continuing a lockout, \
+             whoever asked for the request that met it"
+        );
+        assert_eq!(client.lockout_remaining(), Some(Duration::from_secs(60)));
+
+        // And the back-off is real, not just a renamed error.
+        let before = server.received_requests().await.unwrap().len();
+        let err = client.revalidate().await.expect_err("still locked out");
+        assert!(err.is_lockout(), "{err:?}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before,
+            "latching must actually stop traffic"
+        );
+    }
+
+    /// [`retry_after`] parses integer seconds only; RFC 9110 §10.2.3 also
+    /// permits an HTTP-date. Detection used to gate on that parse succeeding, so
+    /// a date-form `Retry-After` was not recognised as a continuation at all and
+    /// the hole the continuation rule exists to close reopened for that shape —
+    /// silently, because the response leaves as an ordinary `Forbidden`.
+    ///
+    /// GitHub sends integer seconds in practice. This pins the crate to not
+    /// depending on that, and records where the two halves part company:
+    /// presence decides *whether* it is a lockout, the integer parse decides
+    /// only *how long*, and `latch_lockout` already had a default for the header
+    /// it could not read.
+    #[tokio::test]
+    async fn a_date_form_retry_after_is_still_recognised_as_a_continuation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let err = client
+            .revalidate()
+            .await
+            .expect_err("a date-form `retry-after` is still GitHub asking to be left alone");
+        assert!(
+            err.is_lockout(),
+            "gating detection on an integer parse hands the continuation bug back for every \
+             lockout GitHub chose to date-stamp: {err:?}"
+        );
+        assert_eq!(
+            client.lockout_remaining(),
+            Some(DEFAULT_LOCKOUT_BACKOFF),
+            "the date form is recognised for detection; the duration falls back to the \
+             default, which is what `latch_lockout` already did with a header it could not \
+             parse as seconds"
+        );
     }
 
     /// The narrowing that fixed the stale-`401` lockout opened a hole at the
