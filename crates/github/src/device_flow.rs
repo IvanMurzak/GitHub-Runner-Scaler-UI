@@ -57,9 +57,15 @@
 //! client cannot hold. `lib.rs`'s
 //! `tests::no_renewal_path_and_no_confidential_credential_in_this_crate` scans
 //! this file and `lib.rs` for the identifiers such a path would need — after
-//! normalising case and word separators, so that a camel-cased or kebab-cased
-//! spelling is the same needle. That normalisation is why the prose here writes
+//! lower-casing and removing `_`, so that every casing a Rust identifier can
+//! take is the same needle. That normalisation is why the prose here writes
 //! "renewal token" and "client secret" as separate words.
+//!
+//! `-` is deliberately *not* removed from a `.rs` file, because a Rust
+//! identifier cannot contain one and removing it made ordinary hyphenated
+//! English trip the gate. The manifest is normalised the other way, where `-` is
+//! a kebab-case word separator rather than a hyphen. `lib.rs`'s
+//! `tests::normalise_source` carries the reasoning and the residual gap.
 
 use std::{fmt, time::Duration};
 
