@@ -1,0 +1,29 @@
+crates/github/src/lib.rs
+  s_5332f62e0ed5a7::t_76d5733b407291 1307-1315
+  s_5332f62e0ed5a7::t_b612f3dfd8594c 1323-1333
+  s_5332f62e0ed5a7::t_badbebe7201eda 1378-1383
+  s_5332f62e0ed5a7::t_e832df91ff2ea7 1169,1171-1173,1175-1190,1194-1195,1197-1206,1209-1214
+  s_5332f62e0ed5a7::t_1026f4cea1decb 2770-2774
+  s_5332f62e0ed5a7::t_833ba8c924e971 3095-3195
+  s_5332f62e0ed5a7::t_bc449bb1328adb 1494-1495,1502-1505
+  s_5332f62e0ed5a7::t_aba0ac4f2a42d9 951-969
+  s_5332f62e0ed5a7::t_1bf8bda6a64524 1660-1693,1700
+  s_5332f62e0ed5a7::t_e0e4363fca9aff 1170,1196,1247,1256-1270,1272-1297,1506,1659
+  s_5332f62e0ed5a7::t_011019872da49f 1341-1347,1349-1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "0646ba849ab1902fb3b4e2bda735a91c207861bc",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
