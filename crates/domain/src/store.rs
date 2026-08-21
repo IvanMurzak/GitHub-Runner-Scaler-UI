@@ -1403,3 +1403,1345 @@ integer_column!(u64_column, u64, "a non-negative integer");
 integer_option_column!(u16_option_column, u16, "a value in 0..=65535");
 integer_option_column!(u32_option_column, u32, "a value in 0..=4294967295");
 integer_option_column!(u64_option_column, u64, "a non-negative integer");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use crate::attempt::FailureReason;
+    use crate::model::Label;
+    use crate::policy::PolicyMode;
+
+    // `b1`'s fixture ids, spelled as the UUID text a row holds, so a row written
+    // by hand here and a `testkit` fixture in `tests/` describe the same objects.
+    const HOST_UUID: &str = "00000000-0000-0000-0000-000000000001";
+    const POLICY_UUID: &str = "00000000-0000-0000-0000-000000000010";
+    const ATTEMPT_UUID: &str = "00000000-0000-0000-0000-000000000100";
+    const LABELS_JSON: &str = r#"{"host_label":"rm-home-win-x64","additional":[]}"#;
+    const COMPLETED_JOB: &str = r#"{"outcome":"completed_job"}"#;
+
+    fn host_id() -> HostId {
+        HostId::from_u128(0x0000_0001)
+    }
+
+    fn policy_id() -> PolicyId {
+        PolicyId::from_u128(0x0000_0010)
+    }
+
+    fn attempt_id() -> AttemptId {
+        AttemptId::from_u128(0x0000_0100)
+    }
+
+    fn ts(secs: i64) -> Timestamp {
+        chrono::DateTime::from_timestamp(secs, 0).expect("a representable instant")
+    }
+
+    fn store() -> SqliteStore {
+        SqliteStore::open_in_memory().expect("an in-memory database always opens")
+    }
+
+    // -- raw rows -----------------------------------------------------------
+    //
+    // Every corruption test below starts from a row the store itself would have
+    // written and changes exactly one thing. A test that built its whole row by
+    // hand would drift from the schema and start passing for the wrong reason.
+
+    #[derive(Debug, Clone)]
+    struct RawHost {
+        id: String,
+        display_name: String,
+        os: String,
+        architecture: String,
+        host_capacity: i64,
+        service_start_mode: String,
+        refresh_interval_secs: i64,
+        created_at: String,
+    }
+
+    impl Default for RawHost {
+        fn default() -> Self {
+            Self {
+                id: HOST_UUID.to_string(),
+                display_name: "home-pc".to_string(),
+                os: "windows".to_string(),
+                architecture: "x64".to_string(),
+                host_capacity: 2,
+                service_start_mode: "boot".to_string(),
+                refresh_interval_secs: 60,
+                created_at: timestamp_to_text(ts(1_000)),
+            }
+        }
+    }
+
+    impl RawHost {
+        fn insert(&self, store: &SqliteStore) {
+            store
+                .lock()
+                .execute(
+                    "INSERT OR REPLACE INTO hosts (
+                         id, display_name, os, architecture, host_capacity,
+                         service_start_mode, refresh_interval_secs, created_at
+                     ) VALUES (
+                         :id, :display_name, :os, :architecture, :host_capacity,
+                         :service_start_mode, :refresh_interval_secs, :created_at
+                     )",
+                    named_params! {
+                        ":id": self.id,
+                        ":display_name": self.display_name,
+                        ":os": self.os,
+                        ":architecture": self.architecture,
+                        ":host_capacity": self.host_capacity,
+                        ":service_start_mode": self.service_start_mode,
+                        ":refresh_interval_secs": self.refresh_interval_secs,
+                        ":created_at": self.created_at,
+                    },
+                )
+                .expect("the raw host row is writable");
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RawPolicy {
+        id: String,
+        target_scope: String,
+        target_slug: String,
+        installation_id: i64,
+        host_id: String,
+        routing_labels: Option<String>,
+        min_capacity: i64,
+        max_capacity: Option<i64>,
+        enabled: i64,
+        state: String,
+        cache_policy: String,
+        revision: i64,
+    }
+
+    impl Default for RawPolicy {
+        fn default() -> Self {
+            Self {
+                id: POLICY_UUID.to_string(),
+                target_scope: "repository".to_string(),
+                target_slug: "o/r".to_string(),
+                installation_id: 1,
+                host_id: HOST_UUID.to_string(),
+                routing_labels: Some(LABELS_JSON.to_string()),
+                min_capacity: 0,
+                max_capacity: Some(2),
+                enabled: 1,
+                state: "active".to_string(),
+                cache_policy: "retain_runner_package".to_string(),
+                revision: 1,
+            }
+        }
+    }
+
+    impl RawPolicy {
+        fn insert(&self, store: &SqliteStore) {
+            store
+                .lock()
+                .execute(
+                    "INSERT OR REPLACE INTO policies (
+                         id, target_scope, target_slug, installation_id, host_id,
+                         routing_labels, min_capacity, max_capacity, enabled,
+                         state, cache_policy, revision
+                     ) VALUES (
+                         :id, :target_scope, :target_slug, :installation_id, :host_id,
+                         :routing_labels, :min_capacity, :max_capacity, :enabled,
+                         :state, :cache_policy, :revision
+                     )",
+                    named_params! {
+                        ":id": self.id,
+                        ":target_scope": self.target_scope,
+                        ":target_slug": self.target_slug,
+                        ":installation_id": self.installation_id,
+                        ":host_id": self.host_id,
+                        ":routing_labels": self.routing_labels,
+                        ":min_capacity": self.min_capacity,
+                        ":max_capacity": self.max_capacity,
+                        ":enabled": self.enabled,
+                        ":state": self.state,
+                        ":cache_policy": self.cache_policy,
+                        ":revision": self.revision,
+                    },
+                )
+                .expect("the raw policy row is writable");
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RawAttempt {
+        id: String,
+        policy_id: String,
+        github_runner_id: Option<i64>,
+        state: String,
+        outcome: Option<String>,
+        process_id: Option<i64>,
+        runtime_path: String,
+        created_at: String,
+        terminal_at: Option<String>,
+        last_state_change_at: String,
+    }
+
+    impl Default for RawAttempt {
+        fn default() -> Self {
+            Self {
+                id: ATTEMPT_UUID.to_string(),
+                policy_id: POLICY_UUID.to_string(),
+                github_runner_id: None,
+                state: "allocated".to_string(),
+                outcome: None,
+                process_id: None,
+                runtime_path: "runtime/policy/attempt".to_string(),
+                created_at: timestamp_to_text(ts(1_000)),
+                terminal_at: None,
+                last_state_change_at: timestamp_to_text(ts(1_000)),
+            }
+        }
+    }
+
+    impl RawAttempt {
+        fn insert(&self, store: &SqliteStore) {
+            store
+                .lock()
+                .execute(
+                    "INSERT OR REPLACE INTO attempts (
+                         id, policy_id, github_runner_id, state, outcome, process_id,
+                         runtime_path, created_at, terminal_at, last_state_change_at
+                     ) VALUES (
+                         :id, :policy_id, :github_runner_id, :state, :outcome, :process_id,
+                         :runtime_path, :created_at, :terminal_at, :last_state_change_at
+                     )",
+                    named_params! {
+                        ":id": self.id,
+                        ":policy_id": self.policy_id,
+                        ":github_runner_id": self.github_runner_id,
+                        ":state": self.state,
+                        ":outcome": self.outcome,
+                        ":process_id": self.process_id,
+                        ":runtime_path": self.runtime_path,
+                        ":created_at": self.created_at,
+                        ":terminal_at": self.terminal_at,
+                        ":last_state_change_at": self.last_state_change_at,
+                    },
+                )
+                .expect("the raw attempt row is writable");
+        }
+    }
+
+    // -- the on-disk format -------------------------------------------------
+
+    #[test]
+    fn the_on_disk_tokens_are_pinned() {
+        // A column token comes from the domain's own serde naming, which means a
+        // rename in `b1` would silently change the on-disk format of every
+        // existing database. These assertions turn that into a failing test here
+        // instead. The three enums without an `ALL` constant are covered by an
+        // exhaustive `match`, so a new variant is a compile error rather than an
+        // unpinned token.
+        for (state, expected) in [
+            (AttemptState::Allocated, "allocated"),
+            (AttemptState::JitReceived, "jit_received"),
+            (AttemptState::Starting, "starting"),
+            (AttemptState::Idle, "idle"),
+            (AttemptState::Busy, "busy"),
+            (AttemptState::Finished, "finished"),
+            (AttemptState::Failed, "failed"),
+            (AttemptState::Orphaned, "orphaned"),
+            (AttemptState::Cleaned, "cleaned"),
+        ] {
+            assert_eq!(token(&state), expected);
+        }
+        assert_eq!(
+            AttemptState::ALL.len(),
+            9,
+            "a new AttemptState needs a pinned token above"
+        );
+
+        for (state, expected) in [
+            (PolicyState::Pending, "pending"),
+            (PolicyState::Active, "active"),
+            (PolicyState::Draining, "draining"),
+            (PolicyState::Disabled, "disabled"),
+            (PolicyState::RepairRequired, "repair_required"),
+            (PolicyState::AuthenticationFailed, "authentication_failed"),
+        ] {
+            assert_eq!(token(&state), expected);
+        }
+        assert_eq!(
+            PolicyState::ALL.len(),
+            6,
+            "a new PolicyState needs a pinned token above"
+        );
+
+        for os in Os::ALL {
+            assert_eq!(
+                token(&os),
+                match os {
+                    Os::Windows => "windows",
+                    Os::MacOs => "mac_os",
+                    Os::Linux => "linux",
+                }
+            );
+        }
+        for arch in Arch::ALL {
+            assert_eq!(
+                token(&arch),
+                match arch {
+                    Arch::X64 => "x64",
+                    Arch::Arm64 => "arm64",
+                    Arch::Arm32 => "arm32",
+                }
+            );
+        }
+        for mode in [StartMode::Boot, StartMode::Login] {
+            assert_eq!(
+                token(&mode),
+                match mode {
+                    StartMode::Boot => "boot",
+                    StartMode::Login => "login",
+                }
+            );
+        }
+        for cache in [
+            CachePolicy::RetainRunnerPackage,
+            CachePolicy::DiscardRunnerPackage,
+        ] {
+            assert_eq!(
+                token(&cache),
+                match cache {
+                    CachePolicy::RetainRunnerPackage => "retain_runner_package",
+                    CachePolicy::DiscardRunnerPackage => "discard_runner_package",
+                }
+            );
+        }
+        for scope in [TargetScope::Repository, TargetScope::Organization] {
+            assert_eq!(
+                token(&scope),
+                match scope {
+                    TargetScope::Repository => "repository",
+                    TargetScope::Organization => "organization",
+                }
+            );
+        }
+
+        // The stored token is not the runtime `Display` string, and for `Os` the
+        // two genuinely differ: `Windows` displays as its GitHub label token
+        // `win` and is stored as `windows`. Pinned so that "just use Display"
+        // becomes a visibly breaking change rather than a silent format
+        // migration.
+        assert_eq!(Os::Windows.to_string(), "win");
+        assert_eq!(token(&Os::Windows), "windows");
+    }
+
+    #[test]
+    fn a_timestamp_round_trips_to_the_nanosecond() {
+        // The system clock produces sub-second precision, so a text format that
+        // truncated it would make every round-trip assertion on a `Host` or an
+        // attempt fail for values production actually writes.
+        let precise = chrono::DateTime::from_timestamp(1_787_270_400, 123_456_789)
+            .expect("a representable instant");
+        let text = timestamp_to_text(precise);
+        assert_eq!(text, "2026-08-21T00:00:00.123456789Z");
+        assert_eq!(
+            parse_timestamp(&text, "t", "c", "id").expect("round trips"),
+            precise
+        );
+
+        // Fixed width, so lexical order is instant order and `ORDER BY
+        // created_at` means what it says.
+        assert_eq!(timestamp_to_text(ts(0)).len(), text.len());
+        assert!(timestamp_to_text(ts(0)) < timestamp_to_text(ts(1)));
+    }
+
+    // -- migrations ---------------------------------------------------------
+
+    #[test]
+    fn the_migration_chain_is_ordered_and_starts_at_one() {
+        assert!(!MIGRATIONS.is_empty());
+        assert_eq!(MIGRATIONS[0].version, 1);
+        for pair in MIGRATIONS.windows(2) {
+            assert!(
+                pair[1].version > pair[0].version,
+                "the chain must be strictly ascending; {} does not follow {}",
+                pair[1].version,
+                pair[0].version
+            );
+        }
+        assert_eq!(
+            MIGRATIONS.last().expect("non-empty").version,
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must be the last step in the chain, or a fresh \
+             database reports a version it was never migrated to"
+        );
+    }
+
+    #[test]
+    fn a_fresh_database_gets_the_whole_chain() {
+        let store = store();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+
+        let conn = store.lock();
+        for table in TABLES {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("sqlite_master is readable");
+            assert_eq!(count, 1, "{table} was not created");
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .expect("prepared");
+        let applied: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("queried")
+            .collect::<Result<_, _>>()
+            .expect("collected");
+        assert_eq!(
+            applied,
+            MIGRATIONS
+                .iter()
+                .map(|m| i64::from(m.version))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_database_one_version_behind_gets_only_the_missing_step() {
+        // The production chain has one step (see `MIGRATIONS`), so "one version
+        // behind" cannot yet be expressed against it. The runner is general, and
+        // this exercises the two properties that matter about it: an applied step
+        // is not re-run, and a missing one is.
+        const CHAIN: &[Migration] = &[
+            Migration {
+                version: 1,
+                name: "first",
+                sql: "CREATE TABLE step_one (id INTEGER NOT NULL PRIMARY KEY, \
+                      note TEXT NOT NULL) STRICT;",
+            },
+            Migration {
+                version: 2,
+                name: "second",
+                sql: "CREATE TABLE step_two (id INTEGER NOT NULL PRIMARY KEY) STRICT;",
+            },
+        ];
+
+        let mut conn = Connection::open_in_memory().expect("in-memory");
+        assert_eq!(
+            apply_migrations(&mut conn, &CHAIN[..1], &SystemClock).expect("step one applies"),
+            1
+        );
+        conn.execute(
+            "INSERT INTO step_one (id, note) VALUES (1, 'written between the two steps')",
+            [],
+        )
+        .expect("insertable");
+
+        // Forward-only: `CREATE TABLE step_one` would fail outright if step one
+        // were re-run, so a successful return already proves it was skipped, and
+        // the surviving row proves nothing was rebuilt underneath it.
+        assert_eq!(
+            apply_migrations(&mut conn, CHAIN, &SystemClock).expect("only step two applies"),
+            2
+        );
+        let note: String = conn
+            .query_row("SELECT note FROM step_one WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("the row written before the second step survives it");
+        assert_eq!(note, "written between the two steps");
+        let two: i64 = conn
+            .query_row("SELECT count(*) FROM step_two", [], |row| row.get(0))
+            .expect("step two created its table");
+        assert_eq!(two, 0);
+        assert_eq!(current_version(&conn).expect("readable"), 2);
+
+        // Running the whole chain over an up-to-date database changes nothing,
+        // which is what every ordinary open does.
+        assert_eq!(
+            apply_migrations(&mut conn, CHAIN, &SystemClock).expect("idempotent"),
+            2
+        );
+        let applied: i64 = conn
+            .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("readable");
+        assert_eq!(applied, 2, "a step must be recorded exactly once");
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused_rather_than_guessed_at() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+
+        let store = SqliteStore::open(&path).expect("a fresh database opens");
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        drop(store);
+
+        // A future build migrated it further than this build understands.
+        let future = SCHEMA_VERSION + 1;
+        {
+            let conn = Connection::open(&path).expect("reopenable");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) \
+                 VALUES (?1, 'from_the_future', ?2)",
+                rusqlite::params![i64::from(future), timestamp_to_text(ts(2_000))],
+            )
+            .expect("insertable");
+        }
+
+        let error = SqliteStore::open(&path).expect_err("a newer database must be refused");
+        assert!(
+            matches!(
+                error,
+                StoreError::SchemaTooNew { found, supported }
+                    if found == future && supported == SCHEMA_VERSION
+            ),
+            "expected SchemaTooNew, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&future.to_string()) && message.contains(&SCHEMA_VERSION.to_string()),
+            "the error must name both versions so an operator knows which way to \
+             move: {message}"
+        );
+        assert!(
+            !error.is_conflict(),
+            "a schema refusal is not an optimistic-concurrency conflict"
+        );
+    }
+
+    // -- the column/field mapping ------------------------------------------
+
+    #[test]
+    fn every_column_lands_in_the_field_of_the_same_name() {
+        // `PersistedAttempt` and `PersistedPolicy` make the *field* names
+        // compile-checked and say plainly that the *column* names are not. This
+        // is the test they ask for: every column holds a value that appears
+        // nowhere else in its row, so a transposition cannot survive it.
+        //
+        // The pairs this is really about are `created_at`/`last_state_change_at`
+        // (both `Timestamp`) and `installation_id`/`revision` (both `u64`): each
+        // transposes without a compile error, and each was a real defect in an
+        // earlier positional signature.
+        let store = store();
+
+        RawHost {
+            host_capacity: 7,
+            refresh_interval_secs: 45,
+            created_at: timestamp_to_text(ts(1_234)),
+            display_name: "distinguishable-name".to_string(),
+            ..RawHost::default()
+        }
+        .insert(&store);
+
+        let host = store.host(host_id()).expect("loads").expect("present");
+        assert_eq!(host.id, host_id(), "hosts.id");
+        assert_eq!(host.display_name, "distinguishable-name");
+        assert_eq!(host.host_capacity.get(), 7, "hosts.host_capacity");
+        assert_eq!(
+            host.refresh_interval.as_secs(),
+            45,
+            "hosts.refresh_interval_secs"
+        );
+        assert_eq!(host.created_at, ts(1_234), "hosts.created_at");
+        assert_eq!(host.os, Os::Windows, "hosts.os");
+        assert_eq!(host.architecture, Arch::X64, "hosts.architecture");
+        assert_eq!(
+            host.service_start_mode,
+            StartMode::Boot,
+            "hosts.service_start_mode"
+        );
+
+        RawPolicy {
+            installation_id: 111,
+            revision: 222,
+            min_capacity: 3,
+            max_capacity: Some(9),
+            enabled: 0,
+            state: "pending".to_string(),
+            cache_policy: "discard_runner_package".to_string(),
+            target_slug: "owner/repo".to_string(),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+
+        let policy = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(policy.id, policy_id(), "policies.id");
+        assert_eq!(policy.host_id, host_id(), "policies.host_id");
+        assert_eq!(
+            policy.installation_id, 111,
+            "policies.installation_id must not come from policies.revision"
+        );
+        assert_eq!(
+            policy.revision(),
+            222,
+            "policies.revision must not come from policies.installation_id"
+        );
+        assert_eq!(policy.min_capacity(), 3, "policies.min_capacity");
+        assert_eq!(
+            policy.max_capacity().expect("autoscale").get(),
+            9,
+            "policies.max_capacity"
+        );
+        assert!(!policy.enabled(), "policies.enabled");
+        assert_eq!(policy.state(), PolicyState::Pending, "policies.state");
+        assert_eq!(
+            policy.cache_policy,
+            CachePolicy::DiscardRunnerPackage,
+            "policies.cache_policy"
+        );
+        assert_eq!(policy.target.slug(), "owner/repo", "policies.target_slug");
+        assert_eq!(
+            policy.target.scope(),
+            TargetScope::Repository,
+            "policies.target_scope"
+        );
+        assert_eq!(
+            policy
+                .routing_labels()
+                .expect("autoscale")
+                .host_label()
+                .as_str(),
+            "rm-home-win-x64",
+            "policies.routing_labels"
+        );
+
+        RawAttempt {
+            github_runner_id: Some(73),
+            process_id: Some(4_242),
+            state: "finished".to_string(),
+            outcome: Some(COMPLETED_JOB.to_string()),
+            runtime_path: "runtime/distinguishable".to_string(),
+            created_at: timestamp_to_text(ts(1_000)),
+            last_state_change_at: timestamp_to_text(ts(2_000)),
+            terminal_at: Some(timestamp_to_text(ts(3_000))),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+
+        let attempt = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(attempt.id, attempt_id(), "attempts.id");
+        assert_eq!(attempt.policy_id, policy_id(), "attempts.policy_id");
+        assert_eq!(
+            attempt.github_runner_id(),
+            Some(73),
+            "attempts.github_runner_id"
+        );
+        assert_eq!(attempt.process_id(), Some(4_242), "attempts.process_id");
+        assert_eq!(attempt.state(), AttemptState::Finished, "attempts.state");
+        assert_eq!(
+            attempt.outcome(),
+            Some(&AttemptOutcome::CompletedJob),
+            "attempts.outcome"
+        );
+        assert_eq!(
+            attempt.runtime_path(),
+            Path::new("runtime/distinguishable"),
+            "attempts.runtime_path"
+        );
+        assert_eq!(
+            attempt.created_at,
+            ts(1_000),
+            "attempts.created_at must not come from attempts.last_state_change_at"
+        );
+        assert_eq!(
+            attempt.last_state_change_at(),
+            ts(2_000),
+            "attempts.last_state_change_at must not come from attempts.created_at; \
+             every recovery timeout is measured from it"
+        );
+        assert_eq!(
+            attempt.terminal_at(),
+            Some(ts(3_000)),
+            "attempts.terminal_at"
+        );
+    }
+
+    // -- hand-corrupted rows ------------------------------------------------
+
+    #[test]
+    fn a_hand_corrupted_policy_shape_is_rejected_on_load() {
+        // D19 says `MonitorOnly` requires both `routing_labels` and
+        // `max_capacity` to be NULL and `Autoscale` requires both to be present.
+        // The columns admit four combinations; two are illegal, and each gets its
+        // own error rather than being coerced into something plausible.
+        let store = store();
+
+        RawPolicy {
+            routing_labels: Some(LABELS_JSON.to_string()),
+            max_capacity: None,
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(
+            matches!(
+                store.policy(policy_id()),
+                Err(StoreError::CorruptPolicy {
+                    source: PolicyError::AutoscaleWithoutMaxCapacity,
+                    ..
+                })
+            ),
+            "labels without a ceiling could oversubscribe the host"
+        );
+
+        RawPolicy {
+            routing_labels: None,
+            max_capacity: Some(2),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(matches!(
+            store.policy(policy_id()),
+            Err(StoreError::CorruptPolicy {
+                source: PolicyError::AutoscaleWithoutRoutingLabels,
+                ..
+            })
+        ));
+
+        RawPolicy {
+            routing_labels: None,
+            max_capacity: None,
+            min_capacity: 1,
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(matches!(
+            store.policy(policy_id()),
+            Err(StoreError::CorruptPolicy {
+                source: PolicyError::MonitorOnlyWithMinCapacity { min: 1 },
+                ..
+            })
+        ));
+
+        RawPolicy {
+            min_capacity: 3,
+            max_capacity: Some(2),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(
+            matches!(
+                store.policy(policy_id()),
+                Err(StoreError::CorruptPolicy {
+                    source: PolicyError::InvertedCapacityRange { min: 3, max: 2 },
+                    ..
+                })
+            ),
+            "an inverted range makes clamp(demand, min, max) panic, so it must \
+             not survive a load"
+        );
+
+        // A scope/slug pair that cannot exist: `Org::new` rejects a slash.
+        RawPolicy {
+            target_scope: "organization".to_string(),
+            target_slug: "o/r".to_string(),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(
+            matches!(
+                store.policy(policy_id()),
+                Err(StoreError::CorruptPolicy {
+                    source: PolicyError::Invalid(ValidationError::IllegalCharacter {
+                        found: '/',
+                        ..
+                    }),
+                    ..
+                })
+            ),
+            "the target is rebuilt through the real constructor, so GitHub's \
+             naming rules run again on load"
+        );
+
+        // And the columns that carry no domain type of their own.
+        for (label, raw) in [
+            (
+                "a zero ceiling",
+                RawPolicy {
+                    max_capacity: Some(0),
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "a third spelling of enabled",
+                RawPolicy {
+                    enabled: 7,
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "an unrecognised state",
+                RawPolicy {
+                    state: "retired".to_string(),
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "a negative revision",
+                RawPolicy {
+                    revision: -1,
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "a routing label carrying the separator the runner splits on",
+                RawPolicy {
+                    routing_labels: Some(r#"{"host_label":"bad,label"}"#.to_string()),
+                    ..RawPolicy::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(
+                    store.policy(policy_id()),
+                    Err(StoreError::CorruptColumn { .. })
+                ),
+                "{label} must be reported as a corrupt column"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hand_corrupted_host_row_is_rejected_on_load() {
+        let store = store();
+
+        RawHost {
+            refresh_interval_secs: 1,
+            ..RawHost::default()
+        }
+        .insert(&store);
+        assert!(
+            matches!(
+                store.host(host_id()),
+                Err(StoreError::CorruptHost {
+                    source: ValidationError::BelowFloor {
+                        min: 30,
+                        actual: 1,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "a hand-edited row must not make this host poll every second; the \
+             floor is a rate-budget constraint"
+        );
+
+        RawHost {
+            display_name: "   ".to_string(),
+            ..RawHost::default()
+        }
+        .insert(&store);
+        assert!(matches!(
+            store.host(host_id()),
+            Err(StoreError::CorruptHost {
+                source: ValidationError::Empty { .. },
+                ..
+            })
+        ));
+
+        for (label, raw) in [
+            (
+                "zero capacity",
+                RawHost {
+                    host_capacity: 0,
+                    ..RawHost::default()
+                },
+            ),
+            (
+                "an unsupported operating system",
+                RawHost {
+                    os: "plan9".to_string(),
+                    ..RawHost::default()
+                },
+            ),
+            (
+                "a malformed created_at",
+                RawHost {
+                    created_at: "yesterday".to_string(),
+                    ..RawHost::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(store.host(host_id()), Err(StoreError::CorruptColumn { .. })),
+                "{label} must be reported as a corrupt column"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hand_corrupted_attempt_row_is_rejected_on_load() {
+        let store = store();
+
+        for (label, raw) in [
+            (
+                "terminal with no outcome",
+                RawAttempt {
+                    state: "finished".to_string(),
+                    outcome: None,
+                    terminal_at: Some(timestamp_to_text(ts(2_000))),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "non-terminal carrying an outcome",
+                RawAttempt {
+                    state: "busy".to_string(),
+                    outcome: Some(COMPLETED_JOB.to_string()),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "a failed attempt claiming it ran a job",
+                RawAttempt {
+                    state: "failed".to_string(),
+                    outcome: Some(COMPLETED_JOB.to_string()),
+                    terminal_at: Some(timestamp_to_text(ts(2_000))),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "terminal with no terminal_at",
+                RawAttempt {
+                    state: "finished".to_string(),
+                    outcome: Some(COMPLETED_JOB.to_string()),
+                    terminal_at: None,
+                    ..RawAttempt::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(
+                    store.attempt(attempt_id()),
+                    Err(StoreError::CorruptAttempt { .. })
+                ),
+                "{label} must not load"
+            );
+        }
+
+        for (label, raw) in [
+            (
+                "a negative process id",
+                RawAttempt {
+                    process_id: Some(-1),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "an unrecognised state",
+                RawAttempt {
+                    state: "wedged".to_string(),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "an outcome that is not one",
+                RawAttempt {
+                    state: "finished".to_string(),
+                    outcome: Some(r#"{"outcome":"went_home"}"#.to_string()),
+                    terminal_at: Some(timestamp_to_text(ts(2_000))),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "a malformed created_at",
+                RawAttempt {
+                    created_at: "yesterday".to_string(),
+                    ..RawAttempt::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(
+                    store.attempt(attempt_id()),
+                    Err(StoreError::CorruptColumn { .. })
+                ),
+                "{label} must be reported as a corrupt column"
+            );
+        }
+    }
+
+    // -- optimistic concurrency ---------------------------------------------
+
+    #[test]
+    fn a_stale_revision_write_is_rejected_and_is_not_an_io_error() {
+        let store = store();
+        let mut policy = ScalePolicy::new(
+            policy_id(),
+            ScaleTarget::repository("o/r").expect("valid"),
+            1,
+            host_id(),
+            PolicyMode::autoscale(
+                RoutingLabels::from_host_label(Label::new("rm-home-win-x64").expect("valid")),
+                0,
+                NonZeroU16::new(2).expect("non-zero"),
+            )
+            .expect("valid"),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&policy).expect("inserted");
+        assert_eq!(policy.revision(), 0);
+
+        // The TUI reads revision 0 and enables the policy.
+        let mut tui_copy = store.policy(policy_id()).expect("loads").expect("present");
+        tui_copy.activate().expect("a pending policy activates");
+        store
+            .update_policy(&tui_copy, 0)
+            .expect("the first write wins");
+        assert_eq!(
+            store
+                .policy(policy_id())
+                .expect("loads")
+                .expect("present")
+                .revision(),
+            1
+        );
+
+        // A CLI invocation that read revision 0 before that write now tries its
+        // own change.
+        policy
+            .set_max_capacity(NonZeroU16::new(5).expect("non-zero"))
+            .expect("autoscale");
+        let error = store
+            .update_policy(&policy, 0)
+            .expect_err("the second write must be rejected");
+        assert!(
+            matches!(
+                error,
+                StoreError::StaleRevision {
+                    expected: 0,
+                    found: 1,
+                    ..
+                }
+            ),
+            "expected a stale-revision rejection, got {error:?}"
+        );
+        assert!(
+            error.is_conflict(),
+            "the caller must be able to tell a lost race from an I/O failure"
+        );
+
+        // And nothing was written: the loser's ceiling is not in the database and
+        // the winner's change is intact.
+        let stored = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(stored.max_capacity().expect("autoscale").get(), 2);
+        assert!(stored.enabled());
+
+        // Re-reading and re-applying succeeds, which is the documented recovery.
+        let mut fresh = stored;
+        fresh
+            .set_max_capacity(NonZeroU16::new(5).expect("non-zero"))
+            .expect("autoscale");
+        store.update_policy(&fresh, 1).expect("the retry wins");
+        assert_eq!(
+            store
+                .policy(policy_id())
+                .expect("loads")
+                .expect("present")
+                .max_capacity()
+                .expect("autoscale")
+                .get(),
+            5
+        );
+    }
+
+    #[test]
+    fn removing_a_policy_takes_the_same_revision_check() {
+        let store = store();
+        RawPolicy {
+            revision: 4,
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+
+        let error = store
+            .remove_policy(policy_id(), 3)
+            .expect_err("a stale delete must be rejected");
+        assert!(error.is_conflict(), "got {error:?}");
+        assert!(
+            store.policy(policy_id()).expect("loads").is_some(),
+            "a rejected delete must not delete"
+        );
+
+        store
+            .remove_policy(policy_id(), 4)
+            .expect("the current revision deletes");
+        assert!(store.policy(policy_id()).expect("loads").is_none());
+    }
+
+    #[test]
+    fn a_revision_guarded_write_to_a_missing_row_is_not_found_not_a_conflict() {
+        let store = store();
+        let error = store
+            .remove_policy(policy_id(), 0)
+            .expect_err("there is nothing to delete");
+        assert!(
+            matches!(error, StoreError::NotFound { what: "policy", .. }),
+            "a missing row is a different problem from a lost race: {error:?}"
+        );
+        assert!(!error.is_conflict());
+    }
+
+    #[test]
+    fn inserting_a_policy_twice_is_reported_as_already_existing() {
+        let store = store();
+        RawPolicy::default().insert(&store);
+        let policy = store.policy(policy_id()).expect("loads").expect("present");
+        let error = store.insert_policy(&policy).expect_err("the id is taken");
+        assert!(
+            matches!(error, StoreError::AlreadyExists { what: "policy", .. }),
+            "got {error:?}"
+        );
+    }
+
+    // -- the journal --------------------------------------------------------
+
+    #[test]
+    fn created_at_is_never_rewritten_by_a_later_journal_write() {
+        let store = store();
+        let allocated = RunnerAttempt::allocate(attempt_id(), policy_id(), "runtime/x", ts(1_000));
+        store.record_attempt(&allocated).expect("journalled");
+
+        // A later write claiming a different allocation instant. `created_at` is
+        // absent from the upsert's DO UPDATE list precisely so this cannot move
+        // it; every elapsed-time calculation downstream depends on it.
+        let rewritten = RunnerAttempt::from_persisted(PersistedAttempt {
+            created_at: ts(5_000),
+            last_state_change_at: ts(5_000),
+            ..allocated.to_persisted()
+        })
+        .expect("a legal attempt");
+        store.record_attempt(&rewritten).expect("journalled");
+
+        let stored = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(stored.created_at, ts(1_000), "created_at never moves");
+        assert_eq!(
+            stored.last_state_change_at(),
+            ts(5_000),
+            "every other column is updated in place"
+        );
+    }
+
+    #[test]
+    fn a_backwards_clock_is_clamped_on_write_and_on_load() {
+        // The hazard `SqliteStore::normalise` exists for. `move_to` accepts any
+        // `now`, so a wall clock stepping backwards between two transitions
+        // builds an in-memory attempt that `from_persisted` refuses -- which
+        // would leave a journal row nothing can ever load, holding a capacity
+        // slot and an uncleaned runtime directory for ever.
+        let store = store();
+        let mut attempt =
+            RunnerAttempt::allocate(attempt_id(), policy_id(), "runtime/x", ts(1_000));
+        attempt
+            .jit_received(ts(900))
+            .expect("the domain accepts a backwards `now` with no ordering check");
+
+        // The load path really would refuse this, so the repair below is
+        // load-bearing rather than decorative.
+        assert!(
+            matches!(
+                RunnerAttempt::from_persisted(attempt.to_persisted()),
+                Err(AttemptError::TimestampsOutOfOrder {
+                    field: "last_state_change_at",
+                    ..
+                })
+            ),
+            "if the domain ever accepts this, `normalise` is dead code and should go"
+        );
+
+        store.record_attempt(&attempt).expect("journalled");
+        assert_eq!(store.clock_skew_repairs(), 1);
+        {
+            let conn = store.lock();
+            let raw: String = conn
+                .query_row(
+                    "SELECT last_state_change_at FROM attempts WHERE id = ?1",
+                    [ATTEMPT_UUID],
+                    |row| row.get(0),
+                )
+                .expect("readable");
+            assert_eq!(
+                raw,
+                timestamp_to_text(ts(1_000)),
+                "the write path stores a row that can be read back, not one that \
+                 poisons the journal"
+            );
+        }
+        let back = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(back.last_state_change_at(), ts(1_000));
+        assert_eq!(
+            store.clock_skew_repairs(),
+            1,
+            "the stored row is already sound, so loading it repairs nothing"
+        );
+
+        // A row this build did not write -- an older version, or a hand edit --
+        // is repaired on the way out instead.
+        RawAttempt {
+            created_at: timestamp_to_text(ts(1_000)),
+            last_state_change_at: timestamp_to_text(ts(400)),
+            state: "finished".to_string(),
+            outcome: Some(COMPLETED_JOB.to_string()),
+            terminal_at: Some(timestamp_to_text(ts(500))),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+        let repaired = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(repaired.last_state_change_at(), ts(1_000));
+        assert_eq!(repaired.terminal_at(), Some(ts(1_000)));
+        assert_eq!(
+            store.clock_skew_repairs(),
+            3,
+            "both out-of-order timestamps are counted, and each is logged at warn"
+        );
+    }
+
+    #[test]
+    fn a_runtime_path_that_is_not_utf8_is_refused_rather_than_mangled() {
+        // `e3` deletes the directory this path names. A lossy conversion would
+        // either fail to delete or name a different directory, so the write is
+        // refused instead.
+        #[cfg(windows)]
+        let bad: PathBuf = {
+            use std::os::windows::ffi::OsStringExt as _;
+            // An unpaired surrogate: a legal Windows path, not legal UTF-8.
+            std::ffi::OsString::from_wide(&[0x0072, 0xD800]).into()
+        };
+        #[cfg(not(windows))]
+        let bad: PathBuf = {
+            use std::os::unix::ffi::OsStringExt as _;
+            std::ffi::OsString::from_vec(vec![b'r', 0xFF]).into()
+        };
+        assert!(bad.to_str().is_none(), "the fixture path must be non-UTF-8");
+
+        let store = store();
+        let attempt = RunnerAttempt::allocate(attempt_id(), policy_id(), bad, ts(1_000));
+        let error = store
+            .record_attempt(&attempt)
+            .expect_err("a path that cannot round-trip must not be stored");
+        assert!(
+            matches!(error, StoreError::UnrepresentablePath { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn attempts_are_listed_oldest_first_and_can_be_filtered_by_policy() {
+        let store = store();
+        let other_policy = PolicyId::from_u128(0x0000_0011);
+
+        let first = RunnerAttempt::allocate(
+            AttemptId::from_u128(0xA1),
+            policy_id(),
+            "runtime/a1",
+            ts(1_000),
+        );
+        let second = RunnerAttempt::allocate(
+            AttemptId::from_u128(0xA2),
+            other_policy,
+            "runtime/a2",
+            ts(2_000),
+        );
+        let third = RunnerAttempt::allocate(
+            AttemptId::from_u128(0xA3),
+            policy_id(),
+            "runtime/a3",
+            ts(3_000),
+        );
+        for attempt in [&third, &first, &second] {
+            store.record_attempt(attempt).expect("journalled");
+        }
+
+        assert_eq!(
+            store
+                .attempts()
+                .expect("loads")
+                .iter()
+                .map(|a| a.created_at)
+                .collect::<Vec<_>>(),
+            vec![ts(1_000), ts(2_000), ts(3_000)],
+            "insertion order must not decide read order"
+        );
+
+        assert_eq!(
+            store.attempts_for_policy(policy_id()).expect("loads"),
+            vec![first.clone(), third]
+        );
+
+        assert!(store.remove_attempt(first.id).expect("removable"));
+        assert!(
+            !store.remove_attempt(first.id).expect("idempotent"),
+            "removing an absent attempt is not an error, it is a `false`"
+        );
+        assert_eq!(store.attempts().expect("loads").len(), 2);
+    }
+
+    #[test]
+    fn the_store_is_usable_as_a_shared_trait_object() {
+        // The agent holds one handle across tasks while the TUI reads through
+        // it. If this stops compiling, every caller has to change shape.
+        let concrete = store();
+        RawHost::default().insert(&concrete);
+        let store: Arc<dyn Store> = Arc::new(concrete);
+
+        let handle = Arc::clone(&store);
+        let seen = std::thread::spawn(move || handle.host(host_id()).expect("loads").is_some())
+            .join()
+            .expect("the reader thread did not panic");
+        assert!(seen);
+        assert!(store.policies().expect("loads").is_empty());
+    }
+
+    #[test]
+    fn the_dump_names_every_table_and_reaches_every_column() {
+        let store = store();
+        RawHost::default().insert(&store);
+        RawPolicy::default().insert(&store);
+        RawAttempt::default().insert(&store);
+
+        let dump = store.dump_text().expect("dumpable");
+        for table in TABLES {
+            assert!(
+                dump.contains(&format!("-- table {table}")),
+                "{table} is missing from the dump"
+            );
+        }
+        assert!(dump.contains(&format!("-- schema version {SCHEMA_VERSION}")));
+        assert!(dump.contains("hosts.display_name=home-pc"));
+        assert!(dump.contains("policies.target_slug=o/r"));
+        assert!(dump.contains("attempts.outcome=NULL"));
+        assert!(
+            dump.contains("attempts.runtime_path=runtime/policy/attempt"),
+            "a dump that omitted a column would make the security scan vacuous"
+        );
+
+        // A free-form string reaches the dump, which is why `07-security.md`'s
+        // scan runs over the dump rather than over the schema: the schema alone
+        // cannot say what a caller put in `FailureReason::Other`.
+        let reason = FailureReason::Other("no credential here".to_string());
+        assert!(json(&AttemptOutcome::failed(reason)).contains("no credential here"));
+    }
+}
