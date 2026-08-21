@@ -47,12 +47,13 @@
 //!
 //! That scan is a **separate test binary**, and deliberately so. As a unit test
 //! it silently stopped working: `tracing` caches each callsite's `Interest`
-//! once per *process*, while `with_default` installs a subscriber on one
-//! *thread*, so the other unit tests running concurrently registered the
-//! library's callsites as disabled before the scan ever installed its
-//! subscriber. It captured only its own three events, and passed with a real
-//! device-code leak on the live path. A binary holding one test cannot be
-//! poisoned that way; the file's own documentation records the measurement.
+//! process-wide while `with_default` installs a subscriber on one *thread*, and
+//! run **concurrently** with the crate's other unit tests the scan captured
+//! only its own handful of events — passing with a real device-code leak on the
+//! live path. A binary holding one test has no concurrency to be poisoned by.
+//! The word "concurrently" is load-bearing and was measured;
+//! `tests/no_secret_reaches_the_logs.rs` records the numbers and what they rule
+//! out.
 
 pub mod demand;
 pub mod device_flow;
@@ -2097,9 +2098,10 @@ impl AuthenticatedClient {
 /// Test support shared by this file and [`device_flow`].
 ///
 /// It lives inline rather than in `src/testing.rs` on purpose. `a1` laid out
-/// this crate's four source files and owns every manifest; `c3` and `c4` are
-/// working in the same directory in parallel, and a new file there is a merge
-/// conflict waiting to happen for no benefit. An inline `#[cfg(test)]` module is
+/// this crate's five source files — `lib.rs`, `device_flow.rs`, `rest.rs`,
+/// `demand.rs`, `jit.rs` — and owns every manifest; `c3` and `c4` are working in
+/// the same directory in parallel, and a new file there is a merge conflict
+/// waiting to happen for no benefit. An inline `#[cfg(test)]` module is
 /// reachable as `crate::testing` from every module in the crate and adds nothing
 /// to a release build.
 ///
@@ -2281,14 +2283,19 @@ pub(crate) mod testing {
 
     // The `tracing` capture subscriber that used to live here now lives in
     // `tests/no_secret_reaches_the_logs.rs`, and the move is the point rather
-    // than tidying. `tracing` caches a callsite's `Interest` once, process-wide,
-    // while `with_default` installs a subscriber only on the calling *thread* —
-    // so a scan run alongside 34 other unit tests saw its library callsites
-    // already registered `Interest::never()` by threads that had no subscriber,
-    // and captured nothing but its own three events. It passed with a real
-    // device-code leak in the flow. A scan that is the only test in its process
-    // cannot be poisoned that way, and no `#[cfg(test)]` module here can offer
+    // than tidying. `tracing` caches a callsite's `Interest` process-wide while
+    // `with_default` installs a subscriber only on the calling *thread*, so a
+    // scan running alongside the crate's other unit tests captured nothing but
+    // its own handful of events and passed with a real device-code leak in the
+    // flow. A scan that is the only test in its process has no concurrent
+    // thread to be poisoned by, and no `#[cfg(test)]` module here can offer
     // that guarantee.
+    //
+    // The blinding is a *concurrency* effect and not a permanent
+    // first-registration one — see that file's header for the measurement that
+    // separates the two. The distinction matters here because only the
+    // concurrency reading implies what this comment concludes: that one test
+    // per process is the fix.
 }
 
 #[cfg(test)]

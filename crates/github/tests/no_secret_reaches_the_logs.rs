@@ -14,27 +14,67 @@
 //! or `--exact`. `.github/workflows/ci.yml` runs `cargo test --workspace`, which
 //! is the mode where it passed.
 //!
-//! The mechanism is not subtle once seen. `tracing::subscriber::with_default`
-//! installs a subscriber on the **calling thread**, but `tracing` caches each
-//! callsite's `Interest` **once, process-wide**. The other thirty-four unit
-//! tests run concurrently on threads with no subscriber installed; whichever of
-//! them reached `device_flow.rs`'s or `lib.rs`'s logging callsites first
-//! registered those callsites `Interest::never()`, permanently, for the whole
-//! process. The scan then captured nothing but the three `tracing::info!`
-//! events it emitted itself — so `assert!(!logs.is_empty())` passed, and
-//! `logs.contains(FIXTURE_USER_CODE)` passed too, because the test's own
-//! `?auth` event renders `DeviceAuthorization`. What looked like a scan over a
-//! whole login was three `Debug` impls being re-checked, which
+//! # The mechanism, corrected
+//!
+//! `tracing::subscriber::with_default` installs a subscriber on the **calling
+//! thread**, while `tracing` caches each callsite's `Interest` **process-wide**.
+//! That much is right, and it is the whole of the hazard. What this file used to
+//! say next was not: that whichever unit test reached a logging callsite first
+//! registered it `Interest::never()` *permanently*, for the rest of the process.
+//!
+//! It does not survive contact with `tracing-core`. `Dispatch::new` — which
+//! `with_default` calls to wrap a subscriber — calls `callsite::register_dispatch`,
+//! whose last act is `CALLSITES.rebuild_interest(..)`: it walks **every**
+//! registered callsite and recomputes its interest against the dispatchers now
+//! present (`tracing-core-0.1.36`, `callsite.rs`). Installing a subscriber
+//! un-disables the callsites that were disabled before it existed. A first
+//! registration is not permanent, and cannot be.
+//!
+//! The measurement says the same thing, and says it louder. Driving this flow
+//! from inside the unit-test binary, under `--test-threads=1`, with the probe
+//! ordered **last** so that all fifty-nine other tests have already executed
+//! every logging callsite in `lib.rs` and `device_flow.rs` with no subscriber
+//! installed:
+//!
+//! | how the suite was run | events the scan captured |
+//! |---|---|
+//! | `--lib --test-threads=1` | **67** |
+//! | `--lib`, default parallelism | **0** |
+//! | `--workspace`, default parallelism | **1** |
+//!
+//! If first registration were permanent, the first row would read `0` — every
+//! callsite had already been touched, subscriber-less, before the probe ran. It
+//! reads 67. What collapses the capture is not *order*, it is **concurrency**:
+//! the interest cache is one global value shared by threads that do not share a
+//! subscriber, and other threads running through these callsites at the same
+//! time are what destroys it.
+//!
+//! The consequence for the original failure is unchanged. The scan captured
+//! nothing but the three `tracing::info!` events it emitted itself — so
+//! `assert!(!logs.is_empty())` passed, and `logs.contains(FIXTURE_USER_CODE)`
+//! passed too, because the test's own `?auth` event renders
+//! `DeviceAuthorization`. What looked like a scan over a whole login was three
+//! `Debug` impls being re-checked, which
 //! `no_type_in_this_crate_renders_a_secret_through_debug` already covers
 //! directly.
 //!
-//! A test binary is one process. This file holds exactly **one** `#[test]`, so
-//! no other thread exists to register a callsite before the subscriber is
-//! installed, and the isolation is structural rather than a convention someone
-//! has to remember. `serial_test` would have serialised the *unit* tests but not
-//! fixed this: the poisoning happens on first touch, whoever touches first, and
-//! serialisation only reorders that. Two defences are kept regardless, because
-//! a scan that silently proves nothing is worse than no scan at all:
+//! # Why a separate binary is still the fix
+//!
+//! A test binary is one process, and this file holds exactly **one** `#[test]`,
+//! so there is no second thread to run a callsite concurrently with the capture.
+//! The conclusion is the same one the old paragraph reached; it now rests on the
+//! reason that is actually true, which matters because the two readings disagree
+//! about the remedy. Under the permanent-first-registration story, nothing short
+//! of process isolation could ever help and `--test-threads=1` would be useless;
+//! under the concurrency story, serialisation *does* restore the capture — the
+//! 67 above is exactly that — and process isolation is chosen because it does
+//! not depend on how anyone invokes `cargo test`. `.github/workflows/ci.yml`
+//! runs `cargo test --workspace`, the 1-event row.
+//!
+//! `serial_test` was considered and is not enough. It serialises the tests that
+//! opt in, so it would work only for as long as every future unit test in this
+//! crate remembered to, and a scan that silently proves nothing is worse than no
+//! scan at all. Two defences are kept for the same reason:
 //!
 //! 1. [`the four callsite markers`](LIBRARY_CALLSITES) must appear in the
 //!    capture. If the capture is ever blind again, this fails loudly instead of
