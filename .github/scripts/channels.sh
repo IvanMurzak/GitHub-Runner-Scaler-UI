@@ -65,6 +65,13 @@ Usage: bash .github/scripts/channels.sh <subcommand> [args]
 
   npm-package-name <target>
       Print the npm platform package name for <target>.
+
+  npm-stage <version> <SHA256SUMS> <archive-directory> <output-directory>
+      Assemble the publishable npm tree: render the manifests, RE-VERIFY each
+      release archive against <SHA256SUMS>, and unpack its binary into the
+      matching platform package. Writes <output-directory>/PUBLISH_ORDER.
+      Aborts, having published nothing, if any archive is missing or its
+      digest does not match.
 USAGE
 }
 
@@ -355,6 +362,119 @@ cmd_npm_manifests() {
 }
 
 # ----------------------------------------------------------------------------
+# Assembling the publishable npm tree.
+# ----------------------------------------------------------------------------
+# THE DIGEST IS CHECKED AGAIN HERE, AND THAT IS NOT BELT-AND-BRACES.
+#
+# `npm-manifests` above copies a digest OUT of SHA256SUMS into a manifest. That
+# proves the two documents agree with each other; it proves nothing about the
+# archive the binary is actually taken from. The Definition of Done says the
+# npm package must resolve to the same checksum the release published, and the
+# only way to establish that is to hash the bytes being unpacked and compare.
+#
+# So this recomputes every archive's SHA-256 before it opens it. A mismatch
+# aborts with nothing staged -- which is also what makes "a corrupted archive
+# never reaches a published package" a property `release_channels.rs` can drive
+# on every pull request, by corrupting a fixture archive and watching this
+# refuse.
+digest_of() {
+    local file="$1" raw
+    if command -v sha256sum >/dev/null 2>&1; then
+        raw="$(sha256sum -b "$file")"
+    elif command -v shasum >/dev/null 2>&1; then
+        raw="$(shasum -a 256 "$file")"
+    else
+        die "no SHA-256 tool found (looked for sha256sum, shasum)"
+    fi
+    printf '%s\n' "${raw%% *}"
+}
+
+cmd_npm_stage() {
+    local version="${1-}" sums="${2-}" archives="${3-}" outdir="${4-}"
+    require_semver "$version"
+    [[ -f "$sums" ]] || die "npm-stage: no such file: $sums"
+    [[ -d "$archives" ]] || die "npm-stage: no such directory: $archives"
+    [[ -n "$outdir" ]] || die "npm-stage: no output directory given"
+
+    # `<repo>/.github/scripts/channels.sh` -> `<repo>`.
+    local repository_root
+    repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    local shim="${repository_root}/npm/bin/${PRODUCT}.cjs"
+    local wrapper_readme="${repository_root}/npm/README.md"
+    [[ -f "$shim" ]] || die "npm-stage: the wrapper entry point is missing: $shim"
+    [[ -f "$wrapper_readme" ]] || die "npm-stage: the wrapper README is missing: $wrapper_readme"
+
+    rm -rf "$outdir"
+    cmd_npm_manifests "$version" "$sums" "$outdir" >/dev/null
+
+    local target os cpu extension binary asset expected actual package unpack produced
+    local -a order=()
+    while IFS='|' read -r target os cpu extension binary; do
+        [[ -n "$target" ]] || continue
+        package="${PRODUCT}-${os}-${cpu}"
+        asset="$(cmd_asset_name "$version" "$target")"
+        expected="$(cmd_checksum "$sums" "$asset")"
+
+        [[ -f "${archives}/${asset}" ]] ||
+            die "npm-stage: ${archives}/${asset} is missing; the release did not publish ${target} or it was not downloaded"
+
+        actual="$(digest_of "${archives}/${asset}")"
+        if [[ "$actual" != "$expected" ]]; then
+            printf '%s: DIGEST MISMATCH for %s\n' "$PROGRAM" "$asset" >&2
+            printf '  SHA256SUMS says: %s\n' "$expected" >&2
+            printf '  the file is:     %s\n' "$actual" >&2
+            die "npm-stage: refusing to publish a package built from an archive that does not match its published digest"
+        fi
+
+        unpack="${outdir}/.unpack-${target}"
+        rm -rf "$unpack"
+        mkdir -p "$unpack"
+        case "$extension" in
+        tar.gz) tar -xzf "${archives}/${asset}" -C "$unpack" ;;
+        zip)
+            command -v unzip >/dev/null 2>&1 ||
+                die "npm-stage: unzip is required to unpack ${asset}"
+            unzip -q "${archives}/${asset}" -d "$unpack"
+            ;;
+        *) die "npm-stage: unknown archive extension '${extension}' for ${target}" ;;
+        esac
+
+        produced="${unpack}/${PRODUCT}-${version}-${target}/${binary}"
+        [[ -f "$produced" ]] ||
+            die "npm-stage: ${asset} does not contain ${PRODUCT}-${version}-${target}/${binary}"
+
+        mkdir -p "${outdir}/${package}/bin"
+        cp "$produced" "${outdir}/${package}/bin/${binary}"
+        chmod 755 "${outdir}/${package}/bin/${binary}"
+        cp "$wrapper_readme" "${outdir}/${package}/README.md"
+        rm -rf "$unpack"
+
+        order+=("$package")
+        printf 'staged %s from %s (%s)\n' "$package" "$asset" "$expected"
+    done <<<"$PUBLISHED_TARGETS"
+
+    ((${#order[@]} == 5)) || die "npm-stage: staged ${#order[@]} platform packages, expected 5"
+
+    mkdir -p "${outdir}/${PRODUCT}/bin"
+    cp "$shim" "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
+    chmod 755 "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
+    cp "$wrapper_readme" "${outdir}/${PRODUCT}/README.md"
+
+    # THE ROOT PACKAGE IS PUBLISHED LAST, AND THE ORDER IS WRITTEN DOWN RATHER
+    # THAN LEFT TO WHOEVER LOOPS OVER THE DIRECTORY. It declares every platform
+    # package at an exact version; published first, it is installable for the
+    # minutes before its dependencies exist, and every install in that window
+    # fails at the point where npm resolves them.
+    {
+        printf '%s\n' "${order[@]}"
+        printf '%s\n' "$PRODUCT"
+    } >"${outdir}/PUBLISH_ORDER"
+
+    printf 'staged %d packages under %s; publish in the order in %s/PUBLISH_ORDER\n' \
+        "$((${#order[@]} + 1))" "$outdir" "$outdir"
+}
+
+# ----------------------------------------------------------------------------
 
 main() {
     local subcommand="${1-}"
@@ -370,6 +490,7 @@ main() {
     npm-package-name) cmd_npm_package_name "$@" ;;
     brew-formula) cmd_brew_formula "$@" ;;
     npm-manifests) cmd_npm_manifests "$@" ;;
+    npm-stage) cmd_npm_stage "$@" ;;
     -h | --help | help) usage ;;
     *)
         printf '%s: unknown subcommand: %s\n\n' "$PROGRAM" "$subcommand" >&2

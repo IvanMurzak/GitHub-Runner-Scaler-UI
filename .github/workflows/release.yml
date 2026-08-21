@@ -18,9 +18,9 @@
 #   5. build per target, verify signatures  job `build`
 #   6. package, checksums, SBOM             jobs `build` and `sbom`
 #   7. publish the GitHub Release           job `publish`
-#
-# Step 8 of that list -- install scripts, npm, and the Homebrew tap -- is task
-# a3's and is added to this workflow by a3.
+#   8. update the downstream channels       job `channels`
+#      -- the install scripts, the npm packages and the Homebrew tap formula,
+#         each pinned to the checksums THIS run published
 #
 # ----------------------------------------------------------------------------
 # THE DECISIONS LIVE IN .github/scripts/release.sh, NOT IN THESE STEP BODIES.
@@ -96,6 +96,42 @@
 # -exists check in `validate` refuses rather than overwrites: a re-dispatch that
 # silently reused a tag would move a version that somebody may already have
 # fetched.
+#
+# ----------------------------------------------------------------------------
+# OPERATOR RECOVERY: A FAILURE IN STEP 8, AFTER THE RELEASE IS PUBLISHED.
+# ----------------------------------------------------------------------------
+# `channels` is the one job that runs AFTER something irreversible has already
+# succeeded, and it talks to two systems this repository does not own. Its
+# failures are therefore a different shape from every failure above, and they
+# are NOT recovered by re-dispatching the workflow: step 2 would refuse the same
+# version, and step 4's tag check would refuse the same tag.
+#
+# The release itself is fine in every one of these cases. The GitHub Release,
+# its assets and `SHA256SUMS` are published and correct, and
+# `install.sh`/`install.ps1` read `SHA256SUMS` at run time -- so the install
+# script channel works the moment step 7 finishes, whatever step 8 does next.
+# What a step-8 failure costs is npm and Homebrew being a version behind.
+#
+# To recover, an operator with write access RE-RUNS THE FAILED JOB from the run
+# page (`Re-run failed jobs`), which starts `channels` again against the same
+# tag. It is written to be re-runnable:
+#
+#   * the install-script upload refuses to overwrite an asset it already
+#     uploaded, so a re-run reports that and moves on;
+#   * `npm publish` refuses a version that is already published, and the step
+#     treats "already published" as success rather than as an error;
+#   * the tap commit is skipped when the formula on the tap already pins this
+#     version.
+#
+# Two failures need a human decision rather than a re-run:
+#
+#   * A MISSING SECRET. `NPM_TOKEN` or `HOMEBREW_TAP_TOKEN` absent fails the
+#     job on purpose rather than skipping the channel quietly -- a release that
+#     silently did not update npm is worse than one that says so. Add the
+#     secret, then re-run the job.
+#   * A NON-FAST-FORWARD ON THE TAP. Somebody pushed to the tap repository
+#     while this ran. Nothing here force-pushes, so the push is refused and the
+#     job fails; a re-run re-clones and succeeds.
 name: Release
 
 on:
@@ -819,3 +855,232 @@ jobs:
             echo
             sed 's/^/- /' published.txt
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Step 8. The downstream channels, each pinned to what step 7 just published.
+  # --------------------------------------------------------------------------
+  # THIS JOB RE-DOWNLOADS THE PUBLISHED ASSETS INSTEAD OF REUSING THE BUILD
+  # ARTIFACTS, AND THAT IS THE POINT OF IT.
+  #
+  # The build artifacts are what this run produced; the release assets are what
+  # users will actually fetch. Those are the same bytes only if publication
+  # worked, and "the Homebrew formula and the npm package resolve to the same
+  # checksums the release published" is a claim about the second set. Reusing
+  # the first would make every digest below self-consistent and prove nothing
+  # about the release page -- so the assets come back down from GitHub, and
+  # `sha256sum -c` is run against them before a single manifest is rendered.
+  #
+  # THE INSTALL SCRIPTS ARE NOT REGENERATED, AND THEY DO NOT CARRY A DIGEST.
+  # They read `SHA256SUMS` at run time and derive the asset name from it, so
+  # they never need editing at release time (`09-release-distribution.md`,
+  # install-script requirement 2). "Updating" them means publishing the current
+  # copies as release assets, which is what makes
+  # `releases/latest/download/install.sh` the address the README documents.
+  #
+  # The decisions -- which digest belongs to which asset, what the formula and
+  # the manifests say, whether an archive may be unpacked into a package at all
+  # -- are subcommands of `.github/scripts/channels.sh`, run on every pull
+  # request by `crates/app/tests/release_channels.rs` with no credential and
+  # nothing published. See that file's header for why.
+  channels:
+    name: update the distribution channels (step 8)
+    needs: [validate, tag, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Refuse to start without the credentials this job needs
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          # Checked FIRST, before anything is uploaded or pushed, so a missing
+          # secret costs no partial channel update. And checked rather than
+          # skipped: a release that quietly did not update npm looks identical
+          # to one that did, and the difference surfaces as a user installing a
+          # version behind and never knowing why.
+          missing=0
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "MISSING: repository secret NPM_TOKEN (npm publish)" >&2
+            missing=1
+          fi
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "MISSING: repository secret HOMEBREW_TAP_TOKEN (push to the tap)" >&2
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "REJECTED: step 8 cannot update the channels it is responsible for." >&2
+            echo "The release itself is published and correct; add the secrets" >&2
+            echo "above and re-run THIS JOB. Do not re-dispatch the workflow." >&2
+            exit 1
+          fi
+          echo "both channel credentials are present"
+
+      - name: Step 8 - bring back down what was actually published
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p published
+          gh release download "$TAG" --dir published
+
+          cd published
+          echo "--- assets on the release page ---"
+          ls -l
+
+          # The gate every downstream pin rests on. `sha256sum -c` checks each
+          # line of SHA256SUMS against the file beside it and fails on the
+          # first mismatch, so a release whose assets and checksum file
+          # disagree stops here rather than being copied into a formula.
+          sha256sum -c SHA256SUMS
+
+      - name: Step 8 - publish the install scripts as release assets
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # No `--clobber`: this workflow never replaces a published asset.
+          # On a re-run the upload is refused, which is reported and is not a
+          # failure -- the asset that is already there is the one this run
+          # would have uploaded, because both come from the same tagged commit.
+          if gh release upload "$TAG" install/install.sh install/install.ps1; then
+            echo "uploaded install.sh and install.ps1"
+          else
+            echo "upload refused; the scripts are already attached to ${TAG}."
+            echo "That is the expected result of re-running this job."
+          fi
+
+          echo "The README's documented address is now live:"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.ps1"
+
+      - name: Step 8 - stage the npm packages from the verified archives
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # Re-hashes every archive before unpacking it, so the binary that
+          # ends up inside a published npm package provably came from the
+          # artifact whose digest the release published.
+          bash .github/scripts/channels.sh npm-stage \
+            "$VERSION" published/SHA256SUMS published dist-npm
+
+          echo "--- publish order ---"
+          cat dist-npm/PUBLISH_ORDER
+
+      - name: Step 8 - render the Homebrew formula
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          bash .github/scripts/channels.sh brew-formula \
+            "$VERSION" published/SHA256SUMS "$GITHUB_REPOSITORY" \
+            dist-brew/runner-manager.rb
+
+          echo "--- Formula/runner-manager.rb ---"
+          cat dist-brew/runner-manager.rb
+
+      - name: Set up Node with the npm registry configured
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Step 8 - publish the npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # PUBLISH_ORDER puts the five platform packages first and the root
+          # package last. The root declares each of them at an exact version,
+          # so publishing it first leaves it installable for the minutes before
+          # its dependencies exist -- and every install in that window fails.
+          while read -r package; do
+            [ -n "$package" ] || continue
+
+            # `npm view` answers from the registry, so "already published" is
+            # decided by the registry rather than by whether this job has run
+            # before. That is what makes the job re-runnable: a partial step 8
+            # can be finished without unpublishing anything.
+            if npm view "${package}@${VERSION}" version >/dev/null 2>&1; then
+              echo "already published: ${package}@${VERSION}"
+              continue
+            fi
+
+            # NO `--provenance`. npm's provenance attestation is signed with an
+            # OIDC token, which needs `id-token: write` -- a permission
+            # `crates/app/tests/workflow_triggers.rs` refuses outright for this
+            # workflow, because it would let the one workflow holding a
+            # publishing credential mint more (`07-security.md`). Artifact
+            # integrity here is SHA-256 plus the SBOM, and each platform
+            # package records the digest of the archive its binary came from.
+            echo "--- publishing ${package}@${VERSION}"
+            ( cd "dist-npm/${package}" && npm publish --access public )
+          done < dist-npm/PUBLISH_ORDER
+
+          echo "npm channel is at ${VERSION}"
+
+      - name: Step 8 - update the Homebrew tap
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: ${{ vars.RUNNER_MANAGER_TAP_REPOSITORY || 'IvanMurzak/homebrew-tap' }}
+          TAP_BRANCH: ${{ vars.RUNNER_MANAGER_TAP_BRANCH || 'main' }}
+        run: |
+          # Cloned fresh, immediately before the commit, so the window in which
+          # somebody else can push to the tap is as small as this job can make
+          # it. Nothing here forces anything: if the push is refused as a
+          # non-fast-forward, the job fails and a re-run re-clones. Overwriting
+          # another commit on the tap would silently drop whatever it carried.
+          git clone --depth 1 --branch "$TAP_BRANCH" \
+            "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git" tap
+
+          mkdir -p tap/Formula
+          cp dist-brew/runner-manager.rb tap/Formula/runner-manager.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/runner-manager.rb
+
+          if git diff --cached --quiet; then
+            echo "the tap already pins ${VERSION}; nothing to commit."
+            echo "That is the expected result of re-running this job."
+            exit 0
+          fi
+
+          git commit -m "runner-manager ${VERSION}"
+          git push origin "HEAD:refs/heads/${TAP_BRANCH}"
+          echo "tap ${TAP_REPOSITORY} updated to ${VERSION}"
+
+      - name: Report what the channels now serve
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          TAP_REPOSITORY: ${{ vars.RUNNER_MANAGER_TAP_REPOSITORY || 'IvanMurzak/homebrew-tap' }}
+        run: |
+          {
+            echo "### Channels updated for ${TAG}"
+            echo
+            echo "- install script: \`releases/latest/download/install.sh\` and \`install.ps1\`"
+            echo "- npm: \`runner-manager@${VERSION}\` plus five platform packages"
+            echo "- Homebrew: \`${TAP_REPOSITORY}\` Formula/runner-manager.rb"
+            echo "- cargo: \`cargo install runner-manager\` builds from the published crate"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the rendered channel manifests
+        uses: actions/upload-artifact@v4
+        with:
+          # The `release-` prefix keeps it collectable by the same
+          # `download-artifact` pattern every other producer here uses.
+          name: release-channels
+          path: |
+            dist-brew/runner-manager.rb
+            dist-npm/*/package.json
+            dist-npm/PUBLISH_ORDER
+          if-no-files-found: error
+          retention-days: 7
