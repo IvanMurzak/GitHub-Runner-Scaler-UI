@@ -39,7 +39,8 @@
 The single binary has these commands. This list is exhaustive.
 
 ```text
-runner-manager auth configure
+runner-manager auth login
+runner-manager auth status
 runner-manager auth logout
 runner-manager host set-capacity N
 runner-manager host show
@@ -69,10 +70,10 @@ policy creation non-arming, at the cost of one extra command in Journey 1.
   Cargo.lock         # committed
   rust-toolchain.toml
   .github/workflows/ # ci.yml and release.yml (see 09-release-distribution.md)
-  assets/            # animated SVG download buttons
+  install/           # install.sh and install.ps1, published per release
   crates/app/        # clap commands, Ratatui shell, presentation state; [[bin]] runner-manager
   crates/domain/     # policy and lifecycle state machine
-  crates/github/     # GitHub App JWT, installation token, REST + Actions-service adapters
+  crates/github/     # device flow, user token, REST + Actions-service adapters
   crates/agent/      # scale-set reconciliation and JIT lifecycle
   crates/platform/   # process, filesystem, machine-scoped secret store, service, OS adapters
   crates/testkit/    # fake clock, fake GitHub gateway, fixture builders
@@ -91,10 +92,10 @@ Crossterm as its default backend and re-exports it).
 
 | Role | Runs where | May do | Must not do |
 |---|---|---|---|
-| TUI/CLI client | Operator terminal on the host | Read and change local policy and host capacity, inspect GitHub state. | Own a second agent lock or store private key in display state. |
+| TUI/CLI client | Operator terminal on the host | Read and change local policy and host capacity, inspect GitHub state. | Own a second agent lock or hold the user access token in display state. |
 | Host agent | One local machine | Poll assigned scale sets, acquire assigned jobs, provision host-local JIT runners up to policy and host capacity. | Manage a different host or expose a network API. |
 | JIT runner child | Temporary host directory | Execute exactly one assigned job. | Reuse workspace or credentials after cleanup. |
-| GitHub App | GitHub | Mint scoped installation tokens; exchange them for Actions-service admin tokens. | Receive a broader installation than the operator selected. |
+| Published GitHub App | GitHub | Declare the permission set and be installed by the user on repositories they choose. | Hold a private key, mint installation tokens, or receive a broader installation than the user selected. |
 
 ## Architecture decisions
 
@@ -104,7 +105,7 @@ Rationale only. `README.md` carries decision status and is authoritative.
 |---|---|---|
 | D1 | Separate public repository; no `ai-pipeline` dependency. | Maintains a clean product, release, and trust boundary. |
 | D2 | One host-local agent manages only local runners. | Avoids remote administration and gives clear resource ownership; global inventory remains read-only. |
-| D3 | GitHub App only in v1. | Renewable installation tokens and operator-selected installation scope; onboarding is more involved than PAT, and repository-scoped scale sets force `Administration: Read and write`. |
+| D3 | Device flow against one published App. | Three-action onboarding with no server, no client secret, and no key file; the cost is a non-expiring user token at rest and a trust dependency on the published App. Repository-scoped scale sets still force `Administration: Read and write`. |
 | D4 | Scale sets with JIT ephemeral runners only. | Correct GitHub autoscaling model and clean per-job state; requires a local listener, an Actions-service protocol adapter, and cold-start time. |
 | D5 | `daemon run` plus optional OS service installation. | Works for interactive debugging and unattended home hosts; adds platform installer test work. |
 | D6 | Rust single binary with Ratatui/Crossterm and direct HTTPS clients. | Small deployable surface and native cross-platform TUI; public-preview scale-set protocol needs adapter contract tests. |
@@ -153,9 +154,10 @@ job workspaces.
 | Host settings | Current `host_capacity` and current total across policies, service start mode, refresh interval. | Edit and confirm. |
 | Activity and errors | Lifecycle events, retries, rate limits, cleanup outcome, and actionable remediation. | Copy-safe diagnostics, acknowledge errors. |
 
-No screen displays private keys, installation tokens, Actions-service admin
-tokens, message-queue tokens, encoded JIT configuration, or command lines
-containing them.
+No screen displays the user access token, Actions-service admin tokens,
+message-queue tokens, encoded JIT configuration, or command lines containing
+them. The device-flow *user code* is displayed by design during `auth login`
+and only then.
 
 ## Requirement traceability
 
@@ -175,27 +177,26 @@ containing them.
 | Human-friendly modern view | Dashboard, focused tables, health/error states, text-plus-color status. | Journey gates in `08-user-workflows.md`. |
 | Tested on every PR and merge (D10) | `.github/workflows/ci.yml` matrix. | CI required-check status on the pull request. |
 | Manual, validated, tested releases (D10) | `.github/workflows/release.yml`, `workflow_dispatch` only. | Release-workflow rehearsal in `09-release-distribution.md`. |
-| One-command install per OS (D11) | npm wrapper, Homebrew tap, Scoop bucket, `cargo install`. | Per-channel install smoke test on each OS. |
+| One-command install per OS (D11) | Install script, npm wrapper, Homebrew tap, Scoop bucket, `cargo install`. | Per-channel install smoke test on each OS, asserting no security prompt. |
+| Three-action onboarding (D3) | Device flow against the published App, then an installation URL. | Device-flow round-trip test and Journey 1 gate in `08-user-workflows.md`. |
 
 ## Owner-facing open questions
 
-1. **Package, crate, and binary name.** The repository is
-   `IvanMurzak/GitHub-Runner-Scaler-UI`; these documents use the working binary
-   name `runner-manager`. Wave 0 must resolve whether the shipped binary,
-   workspace root package, published crate, and npm package keep
-   `runner-manager` or adopt a name derived from the repository. This is a
-   rename of a string constant and the `[[bin]]` target, not an architecture
-   dependency, but it blocks the first release because it appears in every
-   artifact filename and install command.
-2. **Scale-set scope: repository or organization.** Repository-scoped scale
-   sets require GitHub App `Administration: Read and write`, which is the same
-   grant that permits repository deletion, transfer, and collaborator changes.
-   Organization-scoped scale sets use the narrower
-   `Organization → Self-hosted runners: Read and write`. See `07-security.md`.
-3. **Monitor-only mode.** The repository description presents autoscaling as
+1. **Scale-set scope: repository or organization.** Repository-scoped scale
+   sets require `Administration: Read and write` on the published App, which is
+   the same grant that permits repository deletion, transfer, and collaborator
+   changes. Organization-scoped scale sets use the narrower
+   `Organization → Self-hosted runners: Read and write`. Because every user
+   installs the *same* published App, this permission set is a one-time,
+   product-wide decision, not a per-user one. See `07-security.md`.
+2. **Monitor-only mode.** The repository description presents autoscaling as
    optional, but every documented path requires a GitHub App, a scale set, and a
    non-zero `max_capacity`. Wave 1 must decide whether `repo add` without
    `--max-capacity` creates a monitor-only policy.
+
+The product name is settled: the binary, workspace root package, published
+crate, and npm package are all named `runner-manager` (RESOLVED 2026-08-21).
+The repository keeps its own name, `IvanMurzak/GitHub-Runner-Scaler-UI`.
 
 D1-D14 in `README.md` resolve every other product-policy decision needed to
 begin implementation.

@@ -2,8 +2,8 @@
 
 ## Persistent local data
 
-SQLite contains configuration and recovery metadata only. The private key is
-stored in the platform machine-scoped secret store, never SQLite.
+SQLite contains configuration and recovery metadata only. The user access
+token is stored in the platform machine-scoped secret store, never SQLite.
 
 ```text
 Host {
@@ -68,7 +68,8 @@ rate-limit semantics.
 
 | Operation | Protocol | Result |
 |---|---|---|
-| Discover repositories and App installation | `api.github.com`, GitHub App REST | Authorized repository set. |
+| Obtain a user access token | `github.com/login/device` device flow, public `client_id` only | Non-expiring user-to-server token. No redirect, no client secret, no server. |
+| Discover repositories the App is installed on | `api.github.com`, user-to-server REST | Authorized repository set. |
 | List runners | `api.github.com` REST, paginated | Runner id, labels, OS, status, busy, ephemeral. |
 | Count activity | `api.github.com` REST workflow runs filtered to `in_progress` | Per-repository and aggregate workflow count. |
 | Download runner application | `api.github.com` REST runner-downloads metadata | OS/architecture URL plus optional `sha256_checksum`. |
@@ -112,8 +113,8 @@ protocol drifts.
 The TUI reads an in-memory snapshot. The agent independently refreshes runner
 inventory and workflow counts on a bounded interval, default 60 seconds with a
 hard floor of 30 seconds per repository. That worst case is roughly 240
-requests per hour per repository against the 5,000 requests/hour minimum for a
-GitHub App installation. `repo add` computes the projected hourly budget and
+requests per hour per repository against the 5,000 requests/hour minimum that
+applies to the token in use. `repo add` computes the projected hourly budget and
 refuses a configuration that would exceed half of that floor. Manual refresh
 coalesces with an in-flight request. Rate limiting increases refresh delay and
 is displayed, never hidden. Long-poll demand is separate from UI refresh and is
@@ -124,7 +125,7 @@ not stopped while the TUI is closed.
 | Layer | Required tests |
 |---|---|
 | Domain | State transitions for `AttemptState` and `PolicyState`, capacity math including the host ceiling and the `min <= max` invariant, workflow-count aggregation, disable/drain precedence, ownership rejection, and recovery decisions with fake time. |
-| GitHub gateway | HTTP fixtures for pagination, rate limits, 401 refresh, 403 auth lockout, and the two-stage Actions-service token exchange. |
+| GitHub gateway | Device-flow round trip including `authorization_pending`, `slow_down`, `expired_token`, and `access_denied`; HTTP fixtures for pagination, rate limits, 401 on a revoked token, 403 auth lockout, and the two-stage Actions-service token exchange. |
 | Scale-set adapter | Contract tests against the pinned protocol revision: demand decoding, `JobAvailable` to `AcquireJobs`, `DeleteMessage` acknowledgement, session-token refresh, JIT generation, and fail-closed decoding of unknown critical fields. |
 | Agent | Fake process and filesystem tests for spawn failure, restart/orphan cleanup, busy protection, idle-host zero-runner assertion, host-ceiling enforcement across multiple policies, and no duplicate runners under lock contention. |
 | Platform | Windows/macOS/Linux path, lock, machine-scoped secret store, and service adapter contract tests; privileged installer smoke tests on native CI runners; stale-binary-path detection after an npm-managed upgrade. |

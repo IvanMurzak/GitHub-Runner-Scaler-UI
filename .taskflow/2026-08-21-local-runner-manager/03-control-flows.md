@@ -2,9 +2,11 @@
 
 ## 1. Add a repository from CLI
 
-1. Operator runs `runner-manager auth configure`; the app validates the GitHub
-   App identity and selected installation, and stores the private key in the
-   machine-scoped secret store (D13).
+1. Operator runs `runner-manager auth login`. The tool starts the device flow
+   with its built-in public `client_id`, prints the verification URL and user
+   code, polls for completion, and stores the returned user access token in the
+   machine-scoped secret store (D13). If the published App is not yet installed
+   on any repository, it prints the installation URL.
 2. Operator runs `runner-manager host set-capacity 2` if the host default is
    not acceptable.
 3. Operator runs `runner-manager repo add OWNER/REPO --host-label home-win
@@ -68,21 +70,24 @@ workflow outcome.
    runner processes, reports `offline` in TUI/CLI, and backs off with jitter.
    The offline state states that queued jobs are cancelled by GitHub after 24
    hours, so a prolonged outage loses queued work.
-4. When connectivity returns, it refreshes the App installation token and
-   resumes long polling. It does not replay an already acknowledged message as
+4. When connectivity returns, it re-establishes the Actions-service credential
+   chain and resumes long polling. It does not replay an already acknowledged message as
    a new capacity count; `DeleteMessage` acknowledges, and the last processed
    message id is passed to the next `GetMessage`.
 
 ## 4. Token and JIT expiry
 
-1. GitHub App credentials mint a short-lived installation token on demand. The
-   App JWT is valid for at most 10 minutes; the installation token expires
-   after 1 hour.
-2. The Actions-service credential chain is separate and two-stage: the
-   installation token mints a runner registration token, which is exchanged for
-   an Actions-service admin token and tenant URL. That admin token is refreshed
-   60 seconds before its expiry. Each message session additionally carries its
-   own message-queue token with an independent refresh path.
+1. The stored user access token does not expire, because the published App
+   opts out of user-token expiration (D3). There is no refresh token and no
+   client secret, so there is nothing for the agent to renew and nothing for a
+   server to hold. The token is revoked by the user uninstalling the App or
+   revoking the authorization on GitHub.
+2. The Actions-service credential chain is derived from the user token and is
+   two-stage: the user token mints a runner registration token, which is
+   exchanged for an Actions-service admin token and tenant URL. That admin
+   token is refreshed 60 seconds before its expiry. Each message session
+   additionally carries its own message-queue token with an independent refresh
+   path.
 3. Expired or unauthorized REST responses trigger one refresh under a
    single-flight mutex, then one retry. A 403 following repeated 401s indicates
    GitHub's temporary authentication lockout, not a permissions change; the
@@ -90,8 +95,10 @@ workflow outcome.
    from `authentication_failed`.
 4. An expired JIT config is discarded, its runtime directory is removed, and a
    new JIT config is requested only if current demand still requires capacity.
-5. Invalid App credentials move every policy to `authentication_failed`; the
-   TUI gives a precise remediation command and the agent creates no runners.
+5. A revoked or invalidated user token, or an App uninstalled from a
+   repository, moves the affected policies to `authentication_failed`; the TUI
+   gives a precise remediation command — `auth login` or the installation URL —
+   and the agent creates no runners.
 
 ## 5. Disable scaling
 

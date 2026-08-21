@@ -28,17 +28,17 @@ runner material is stored in the current working directory by default.
 
 | Item | Location | Rotation/removal |
 |---|---|---|
-| GitHub App private key | Machine-scoped secret store: DPAPI machine scope (Windows), System Keychain (macOS), `0600` file plus systemd credentials (Linux) | Re-import via `auth configure`; delete on `auth logout`. |
-| App id, installation id, host and policy settings | Local config/SQLite | Mutable by CLI/TUI; not secret. |
-| GitHub installation access token | Memory only | Expires after 1 hour; refreshed before expiry; never persisted. |
+| GitHub user access token | Machine-scoped secret store: DPAPI machine scope (Windows), System Keychain (macOS), `0600` file plus systemd credentials (Linux) | Re-issue via `auth login`; delete on `auth logout`; revoke on GitHub by uninstalling the App. |
+| App `client_id`, installation id, host and policy settings | Local config/SQLite | `client_id` is public by design and is compiled into the binary; the rest is mutable by CLI/TUI and not secret. |
+
 | Runner registration token | Memory only | Consumed immediately in the Actions-service registration exchange. |
 | Actions-service admin token and tenant URL | Memory only | Refreshed 60 seconds before expiry; never persisted. |
 | Message-queue access token | Memory only | Refreshed on session token expiry; never persisted. |
 | Encoded JIT configuration | Restrictive temporary file or process-safe handoff | Delete immediately after runner start or failed start. |
 | Runner package checksum/version | Local cache metadata | Revalidated on download and refresh. |
 
-The private key is machine-scoped rather than user-scoped because D13 requires
-the service to start at machine boot. A boot-time service runs outside any
+The user access token is machine-scoped rather than user-scoped because D13
+requires the service to start at machine boot. A boot-time service runs outside any
 user's login session and cannot read a per-user keychain on any supported OS:
 macOS LaunchAgents start only at login, and Windows Credential Manager vaults
 are per-user. The accepted consequence is that a local administrator or root
@@ -69,8 +69,8 @@ require explicit operator commands after installation.
 7. expose the current start mode in `host show` and in TUI host settings, and
    allow switching between `boot` and `login` without reinstalling the product.
 
-`--start-at login` remains available for operators who prefer the private key
-in a user-scoped store; in that mode the agent does not run until the operator
+`--start-at login` remains available for operators who prefer the token in a
+user-scoped store; in that mode the agent does not run until the operator
 logs in, and `service status` says so.
 
 ## Runner package lifecycle
@@ -106,19 +106,20 @@ active attempt references it.
    after confirming no active runner and no desired recovery data.
 
 The installer rollback is binary replacement plus service removal. It never
-deletes the App private key automatically.
+deletes the stored user access token automatically.
 
 ## Credential-disclosure response
 
 This is the procedure for the "any suspected key or JIT disclosure" rollback
 trigger in `06-migration-rollout.md`:
 
-1. Revoke the leaked private key in GitHub App settings.
+1. Revoke the authorization for the published App in GitHub account settings,
+   which invalidates the leaked user access token immediately.
 2. Run `auth logout` on every host to purge the machine-scoped secret store.
-3. Generate a replacement key and run `auth configure`.
+3. Run `auth login` on each host to obtain a fresh token.
 4. Allow in-flight attempts to finish or terminate them, then verify through
    GitHub inventory that no runner remains registered.
 5. Review the App's installation scope and permissions.
 
-Installation, registration, admin, and message-queue tokens are memory-only and
-expire without action.
+Registration, admin, and message-queue tokens are memory-only and expire
+without action.

@@ -6,15 +6,24 @@ Phase numbers map to ROADMAP waves as recorded in `ROADMAP.md`.
 
 - Establish the Rust workspace, `rust-toolchain.toml`, committed `Cargo.lock`,
   `.gitignore`, and matrix CI in this repository.
-- Register a GitHub App under an owner-approved account with exactly the
-  permissions listed in `07-security.md`, and explicitly accept the
+- **Run the D17 spike before any other authentication work:** prove that a
+  user-to-server token obtained by the device flow can mint a runner
+  registration token, complete the Actions-service admin exchange, open a
+  message session, call `AcquireJobs`, and generate a scale-set JIT config. A
+  negative result reverses D3; do not build the auth path until this is green.
+- Register the project's single published GitHub App once, under an
+  owner-approved account, with exactly the permissions listed in
+  `07-security.md`. Enable device flow. Opt **out** of user-token expiration.
+  Do **not** generate a private key. Explicitly accept the
   `Administration: Read and write` consequence.
 - Create a disposable test repository and document its scale-set name.
 - Measure one representative workload on each host to choose `max_capacity`
   and `host_capacity`.
 
-**Gate:** The App installation is limited to the disposable repository and the
-private key is stored in the selected machine-scoped secret store.
+**Gate:** The D17 spike passes. The published App is installable, device flow
+works end to end from a clean machine, the App installation is limited to the
+disposable repository, and the user token is stored in the selected
+machine-scoped secret store.
 
 ## Phase 1: one-host, one-repository pilot
 
@@ -58,10 +67,13 @@ threat-table tests from `07-security.md` passing on both.
 ## Phase 4: public beta
 
 - Publish the first release through the manual release workflow.
-- Publish the npm wrapper, Homebrew tap, and Scoop bucket, and verify a clean
-  one-command install on each OS from a machine that has never built the
-  product.
-- Verify the README download buttons resolve to the correct assets.
+- Publish the install scripts, npm wrapper, Homebrew tap, and Scoop bucket, and
+  verify a clean one-command install on each OS from a machine that has never
+  built the product.
+- Verify that no install path triggers a Gatekeeper block or SmartScreen
+  warning on a clean macOS and a clean Windows host.
+- Verify device-flow onboarding end to end as a user who has never seen the
+  product: install, `auth login`, install the App, first job.
 
 **Gate:** Security, offline, and cross-platform gates pass; a rollback drill
 has been executed once per supported OS.
@@ -82,7 +94,9 @@ workflow labels no longer route work to them.
 | Slow cold start | Versioned local package/cache and measured optional warm minimum later. | Job startup violates agreed operational target. |
 | Cleanup failure | Journal, startup recovery, redacted diagnostics, no workspace reuse. | Orphaned runner/workspace persists after recovery. |
 | Misrouted workflow | Unique scale-set names and pilot isolation. | Job reaches an unintended host/OS. |
-| Credential exposure | Machine-scoped secret store, memory-only tokens, redaction, strict file permissions. | Any suspected key/JIT disclosure. |
+| Credential exposure | Machine-scoped secret store, memory-only derived tokens, redaction, strict file permissions. | Any suspected token/JIT disclosure. |
+| The D17 assumption fails: user-to-server tokens cannot drive the scale-set chain | Spike runs first in Phase 0, before any auth implementation. Contingency is the per-user GitHub App with installation tokens, documented in `07-security.md`. | Spike returns a negative result; D3 is reopened. |
+| The published App becomes a single point of trust and failure | The project never generates a private key for it, so it cannot mint installation tokens for anyone. Permission set is fixed and published. Users revoke by uninstalling. | Any compromise of the App registration itself. |
 | Runner package goes stale and jobs start failing | 30-day freshness check before each cold start; version rejection treated as terminal, not retryable. | Repeated version-rejection responses. |
 | Prolonged host outage silently loses queued work | Offline state names the 24-hour queue-cancellation bound. | Outage approaching 24 hours with queued demand. |
 | Service start mode breaks after a Node upgrade | `service install` records an absolute binary path; `service status` reports a stale path. | Service fails to start after a toolchain change. |

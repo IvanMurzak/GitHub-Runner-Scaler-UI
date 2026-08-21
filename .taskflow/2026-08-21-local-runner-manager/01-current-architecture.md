@@ -37,6 +37,9 @@ local one and cannot be verified.
 | Ratatui is a Rust crate for interactive terminal dashboards; its example uses Crossterm events. Crossterm does not emit mouse or paste events unless explicitly enabled. | `github.com/ratatui/ratatui@main:README.md:26-28,42-61`; `docs.rs/crossterm` `event` module: "Mouse and focus events are not enabled by default." | Ratatui renders; Crossterm provides keyboard and mouse input only after explicit `EnableMouseCapture` and the `bracketed-paste` feature. |
 | GitHub REST provides runner **inventory** and runner-application download metadata. | GitHub REST self-hosted runners reference, "List self-hosted runners" and "List runner applications for a repository"; both require `Administration: read`. | Read models use typed HTTPS REST clients. JIT provisioning does not. |
 | A queued job is automatically cancelled after 24 hours. | GitHub Actions limits reference, "Queued job cancellation". | An agent offline for more than 24 hours loses queued work; the offline state must say so. |
+| GitHub documents the device flow as the way a headless or CLI application obtains a user access token, and states that a public client cannot secure a client secret. Only `client_id` is required to start it. | GitHub Apps docs, "Building a CLI with a GitHub App" and "Generating a user access token for a GitHub App". | D3: the tool ships a public `client_id`, holds no secret, needs no redirect listener, and needs no server. |
+| User-to-server token expiration is an opt-in/opt-out setting on the App. Opted in, the token lasts 8 hours and refreshing it **requires the client secret**. Opted out, tokens do not expire and no refresh exists. | GitHub Apps docs, "Refreshing user access tokens": "The client secret is required when refreshing user access tokens." | The published App must opt **out**, otherwise refresh would force a server to hold the secret. The cost is a non-expiring token at rest, recorded in `07-security.md`. |
+| Device flow must be explicitly enabled on the App registration. | GitHub Apps docs, "Building a CLI with a GitHub App": "you must enable device flow for your app." | A one-time configuration step on the published App, recorded in `06-migration-rollout.md` Phase 0. |
 
 Source URLs are retained so a transferred taskflow is self-contained:
 
@@ -77,6 +80,13 @@ Source URLs are retained so a transferred taskflow is self-contained:
 7. GitHub rejects runners older than 30 days from the latest release. A pinned
    immutable package cache with no freshness policy will silently start failing
    every job on a long-lived host.
+8. **Unverified and load-bearing.** D3 assumes a *user-to-server* token can
+   drive the whole Actions-service chain — runner registration token, admin
+   token exchange, message session, `AcquireJobs`, and JIT generation. GitHub
+   documents that chain for installation tokens and for PATs, not for
+   user-to-server tokens. Nothing in the reviewed sources confirms or denies
+   it. D17 makes proving this the first task of Wave 1, because a negative
+   result reverses D3.
 
 ## Planned seam index
 

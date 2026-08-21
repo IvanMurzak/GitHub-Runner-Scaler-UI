@@ -8,34 +8,41 @@ and expect both machines to resume work by themselves after a reboot.
 
 ### Journey 0: install
 
-1. Run one install command for the platform: `npm i -g <package>`,
-   `brew install <tap>/<name>`, `scoop install <bucket>/<name>`, or
-   `cargo install <crate>`.
+1. Run one install command for the platform: the install script
+   (`curl -fsSL ... | sh`, or `irm ... | iex` on Windows), `npm i -g
+   runner-manager`, `brew install <tap>/runner-manager`, `scoop install
+   <bucket>/runner-manager`, or `cargo install runner-manager`.
 2. Run `runner-manager --version` to confirm.
 
 **Release gate:** One command installs a working binary on each supported OS
-from a machine that has never built the product, with no security prompt and no
-manual quarantine or SmartScreen step. Operators who instead use the README
-download buttons get a documented one-line quarantine-removal note beside them.
+from a machine that has never built the product, with **no security prompt**.
+Every documented path runs through a terminal, so neither Gatekeeper nor
+SmartScreen is triggered on any of them.
 
 ### Journey 1: first repository by CLI
 
-Precondition: the binary is installed and the GitHub App private key is
-available locally.
+Precondition: the binary is installed. Nothing else. The user has no GitHub
+App, no private key, and no token.
 
-1. Run `runner-manager auth configure`.
-2. Select the already-installed GitHub App installation.
-3. Run `runner-manager repo add OWNER/REPO --host-label home-win
+1. Run `runner-manager auth login`. It prints a verification URL and a short
+   user code, and waits.
+2. In the browser: open `github.com/login/device`, enter the code, approve.
+3. The tool prints the installation URL; in the browser, choose the
+   repositories to install the published App on.
+4. Run `runner-manager repo add OWNER/REPO --host-label home-win
    --max-capacity 1`.
-4. Copy the printed scale-set name into the repository workflow's `runs-on`.
-5. Run `runner-manager repo set-scale OWNER/REPO --enabled true`.
-6. Run `runner-manager service install` (or `runner-manager daemon run`).
+5. Copy the printed scale-set name into the repository workflow's `runs-on`.
+6. Run `runner-manager repo set-scale OWNER/REPO --enabled true`.
+7. Run `runner-manager service install` (or `runner-manager daemon run`).
 
-**Release gate:** At most 4 `runner-manager` invocations after the GitHub App
-exists and its key is available locally — steps 1, 3, 5, 6. Step 2 is a
-selection inside step 1's command and step 4 is an edit in the repository;
-neither is counted. The add command must explain a missing installation or
-invalid capacity in one screenful without exposing credentials.
+**Release gate:** Onboarding from a clean machine to an authenticated tool is
+at most **3 user actions** (D3): one command, one code entry, one repository
+selection. The user never creates a GitHub App, never chooses permissions, and
+never handles a key file. Reaching a running autoscaled repository takes at
+most 4 further `runner-manager` invocations — steps 4, 6, 7 plus the initial
+`auth login`. Step 5 is an edit in the repository and is not counted. The add
+command must explain a missing installation or invalid capacity in one
+screenful without exposing credentials.
 
 ### Journey 2: inspect active work in TUI
 
@@ -87,8 +94,8 @@ action and never presented as zero workload or successful scale-down. The
 ### Journey 5: host reboots unattended
 
 1. The machine reboots with nobody logged in.
-2. The boot-start service starts the agent, which reads the private key from
-   the machine-scoped secret store.
+2. The boot-start service starts the agent, which reads the user access token
+   from the machine-scoped secret store.
 3. The agent reconciles the journal against GitHub and resumes long polling.
 4. `runner-manager service status` reports the start mode, the resolved binary
    path, and the last successful GitHub contact.
