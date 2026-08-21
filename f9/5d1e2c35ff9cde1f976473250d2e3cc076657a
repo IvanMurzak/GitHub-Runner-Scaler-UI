@@ -1,0 +1,19 @@
+.gitignore
+  s_971c6e82603d38::t_c23d645df189e7 19-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "f95d1e2c35ff9cde1f976473250d2e3cc076657a",
+  "prompts": {},
+  "sessions": {
+    "s_971c6e82603d38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "badd0288-c4b3-4650-9d85-951a1cc2ae61",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
