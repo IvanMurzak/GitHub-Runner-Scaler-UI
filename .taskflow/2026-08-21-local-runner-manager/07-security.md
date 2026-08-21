@@ -43,13 +43,18 @@ to users.
 
 ## GitHub App permissions
 
-The published App declares, at repository scope:
+The published App declares one permission set, used for both scopes (D18):
 
 | Permission | Level | Why |
 |---|---|---|
-| Repository → Administration | Read and write | Required by the runner registration token and scale-set JIT generation at repository scope. |
+| Repository → Administration | Read and write | Runner registration token and scale-set JIT generation at repository scope. |
 | Repository → Actions | Read | In-progress workflow-run counts. |
 | Repository → Metadata | Read | Mandatory for repository access. |
+| Organization → Self-hosted runners | Read and write | Scale-set administration at organization scope. Narrower than the repository grant: it confers no ability to delete, rename, or transfer anything. |
+
+An organization-scoped policy therefore operates under a materially smaller
+grant than a repository-scoped one. Where both are possible, organization scope
+is the safer choice and the UI says so at policy creation.
 
 `Administration: Read and write` is **not** a narrow self-hosted-runner
 permission. The same grant permits deleting, renaming, and transferring the
@@ -57,10 +62,19 @@ repository and adding or removing collaborators. It is unavoidable for
 repository-scoped scale sets. Because every user installs the same published
 App, this is a one-time product-wide decision that every future user inherits,
 and it must be stated prominently wherever the App is offered — not left for
-GitHub's installation screen to disclose. Organization-scoped scale sets would
-use the narrower `Organization → Self-hosted runners: Read and write`; that
-alternative is an open question in `02-target-architecture.md`. GitHub Apps
-cannot authenticate runners at the enterprise level at all.
+GitHub's installation screen to disclose.
+
+**This binds monitor-only users too.** D19 lets a user run the product purely as
+a dashboard, but a GitHub App grants its whole declared permission set on
+installation; there is no per-installation subset. A user who wants only
+in-progress workflow counts still grants the ability to delete their
+repositories. Splitting the product across two published Apps is the only way
+to fix that, and it is an open question in `02-target-architecture.md` that must
+be settled before the App is registered — an App's permissions cannot be
+narrowed later without forcing every installation to re-consent.
+
+GitHub Apps cannot authenticate runners at the enterprise level at all, so
+D18's two scopes are the complete set.
 
 ## Credential inventory
 
@@ -80,8 +94,8 @@ cannot authenticate runners at the enterprise level at all.
 Opting out of user-token expiration is what removes the server from the design,
 and it means a long-lived bearer token sits on an always-on machine. Compared
 with a classic PAT it is materially narrower — limited to the published App's
-three permissions and only the repositories where the user installed the App —
-but it does not expire on its own. Compensating controls:
+declared permission set and only the repositories or organizations where the
+user installed the App — but it does not expire on its own. Compensating controls:
 
 - Stored only in the machine-scoped secret store, ACL'd to the service account.
 - `auth logout` purges it locally; uninstalling the App invalidates it at
@@ -133,7 +147,7 @@ unattended restart.
    `auth status` must make the current installation scope visible.
 5. Fork and untrusted pull-request workflows must not be enabled on a personal
    host until the operator explicitly accepts the trust boundary; UI warns on
-   repository policy enablement.
+   policy enablement.
 6. Dependency updates, SHA-256 checksum publication, and SBOM generation are
    release requirements.
 7. The release workflow holds the only credential able to publish; it runs on

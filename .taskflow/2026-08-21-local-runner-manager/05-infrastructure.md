@@ -45,7 +45,7 @@ are per-user. The accepted consequence is that a local administrator or root
 account on this machine can read the key; `07-security.md` records this
 trade-off and its compensating controls.
 
-The installer creates no GitHub App and no repository policy. Those operations
+The installer creates no GitHub App and no scale policy. Those operations
 require explicit operator commands after installation.
 
 ## Service behavior

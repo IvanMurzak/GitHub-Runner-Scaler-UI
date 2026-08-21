@@ -11,13 +11,16 @@ Host {
   host_capacity: NonZeroU16, service_start_mode: StartMode,
   refresh_interval_secs: u16, created_at: Timestamp
 }
-RepositoryPolicy {
-  id: UUID, repository: OwnerRepo, installation_id: u64,
-  host_id: UUID, scale_set_id: String, scale_set_name: String,
+ScalePolicy {
+  id: UUID, target: ScaleTarget, installation_id: u64,
+  host_id: UUID, mode: PolicyMode,
+  scale_set_id: Option<String>, scale_set_name: Option<String>,
   enabled: bool, state: PolicyState,
-  min_capacity: u16, max_capacity: NonZeroU16,
+  min_capacity: u16, max_capacity: Option<NonZeroU16>,
   protocol_flag: ProtocolCompat, cache_policy: CachePolicy, revision: u64
 }
+ScaleTarget = Repository(OwnerRepo) | Organization(Org)
+PolicyMode  = MonitorOnly | Autoscale
 RunnerAttempt {
   id: UUID, policy_id: UUID, github_runner_id: Option<u64>,
   state: AttemptState, process_id: Option<u32>, runtime_path: Path,
@@ -25,13 +28,28 @@ RunnerAttempt {
 }
 ```
 
+`ScaleTarget` carries D18: a policy targets either one repository or one whole
+organization. The two differ only in which GitHub endpoints and which App
+permission the gateway uses; ownership, capacity, and lifecycle rules are
+identical.
+
+`PolicyMode` carries D19 and is an enforced invariant, not a convention:
+
+- `MonitorOnly` requires `scale_set_id`, `scale_set_name`, and `max_capacity`
+  to be `None`. The policy is read-only: it contributes runners and workflow
+  counts to the dashboard and is skipped entirely by reconciliation.
+- `Autoscale` requires all three to be `Some`.
+
+A write that violates either shape is rejected in the domain layer, so an
+autoscale policy without a capacity ceiling cannot be persisted.
+
 `Host.host_capacity` is the ceiling on concurrent runner attempts across every
-policy on this machine (D9). `RepositoryPolicy.max_capacity` is the per-policy
+policy on this machine (D9). `ScalePolicy.max_capacity` is the per-policy
 ceiling. Both are settable from the CLI and editable in TUI settings, which
 display their current values alongside the current in-use count.
 
-`min_capacity <= max_capacity` is validated on every write, so
-`clamp(total_assigned_jobs, min_capacity, max_capacity)` is always
+`min_capacity <= max_capacity` is validated on every write of an `Autoscale`
+policy, so `clamp(total_assigned_jobs, min_capacity, max_capacity)` is always
 well-defined. `min_capacity` is fixed at 0 in v1.
 
 `AttemptState` is:
@@ -70,8 +88,8 @@ rate-limit semantics.
 |---|---|---|
 | Obtain a user access token | `github.com/login/device` device flow, public `client_id` only | Non-expiring user-to-server token. No redirect, no client secret, no server. |
 | Discover repositories the App is installed on | `api.github.com`, user-to-server REST | Authorized repository set. |
-| List runners | `api.github.com` REST, paginated | Runner id, labels, OS, status, busy, ephemeral. |
-| Count activity | `api.github.com` REST workflow runs filtered to `in_progress` | Per-repository and aggregate workflow count. |
+| List runners | `api.github.com` REST, paginated; `/repos/{o}/{r}/actions/runners` or `/orgs/{org}/actions/runners` by policy target | Runner id, labels, OS, status, busy, ephemeral. |
+| Count activity | `api.github.com` REST workflow runs filtered to `in_progress`, per repository; an organization policy aggregates across the repositories the App is installed on | Per-target and aggregate workflow count. |
 | Download runner application | `api.github.com` REST runner-downloads metadata | OS/architecture URL plus optional `sha256_checksum`. |
 | Manage scale sets and message sessions | Actions-service `ScaleSetGateway` | Scale-set create/update/delete, session create/refresh, ownership metadata. |
 | Receive demand and acquire jobs | Actions-service long poll | `statistics.TotalAssignedJobs`, `JobAvailable` messages, `AcquireJobs`, `DeleteMessage` acknowledgement. |
@@ -91,13 +109,15 @@ The `api.github.com` gateway honors `retry-after`, `x-ratelimit-remaining` and
 
 The scale-set protocol is Public Preview. It is isolated behind
 `ScaleSetGateway`; no TUI, CLI, domain, or platform module can deserialize its
-wire messages directly. `RepositoryPolicy.protocol_flag` allows a single policy
+wire messages directly. `ScalePolicy.protocol_flag` allows a single policy
 to be pinned to a known-compatible protocol revision or disabled if the preview
 protocol drifts.
 
 ## Ownership and precedence
 
-1. A policy's `host_id` and unique scale-set name determine ownership.
+1. A policy's `host_id` and unique scale-set name determine ownership. A
+   `MonitorOnly` policy owns nothing and can never be the reason a runner
+   starts.
 2. A host agent may act only on attempts persisted under its `host_id`.
 3. GitHub runner status is authoritative for remote job status; local process
    state is authoritative only for a child process owned by this agent.
@@ -124,12 +144,12 @@ not stopped while the TUI is closed.
 
 | Layer | Required tests |
 |---|---|
-| Domain | State transitions for `AttemptState` and `PolicyState`, capacity math including the host ceiling and the `min <= max` invariant, workflow-count aggregation, disable/drain precedence, ownership rejection, and recovery decisions with fake time. |
+| Domain | State transitions for `AttemptState` and `PolicyState`, `PolicyMode` shape invariants in both directions, repository/organization target equivalence, capacity math including the host ceiling and the `min <= max` invariant, workflow-count aggregation, disable/drain precedence, ownership rejection, and recovery decisions with fake time. |
 | GitHub gateway | Device-flow round trip including `authorization_pending`, `slow_down`, `expired_token`, and `access_denied`; HTTP fixtures for pagination, rate limits, 401 on a revoked token, 403 auth lockout, and the two-stage Actions-service token exchange. |
 | Scale-set adapter | Contract tests against the pinned protocol revision: demand decoding, `JobAvailable` to `AcquireJobs`, `DeleteMessage` acknowledgement, session-token refresh, JIT generation, and fail-closed decoding of unknown critical fields. |
 | Agent | Fake process and filesystem tests for spawn failure, restart/orphan cleanup, busy protection, idle-host zero-runner assertion, host-ceiling enforcement across multiple policies, and no duplicate runners under lock contention. |
 | Platform | Windows/macOS/Linux path, lock, machine-scoped secret store, and service adapter contract tests; privileged installer smoke tests on native CI runners; stale-binary-path detection after an npm-managed upgrade. |
-| CLI/TUI parity | Same-command dispatch equality, policy and host-capacity persistence round-trip, scripted noninteractive `repo add`, `host set-capacity`, and `status --json`. |
+| CLI/TUI parity | Same-command dispatch equality, policy and host-capacity persistence round-trip, monitor-only to autoscale promotion, scripted noninteractive `repo add`, `org add`, `host set-capacity`, and `status --json`. |
 | UI | Ratatui snapshot tests for all screens, keyboard/mouse reducer tests, frame-budget test, resize behavior, focus order, and redaction. |
 | Security | Process-inspection, two-job contamination, corrupted-runner-package rejection, and secret-injection log-scan gates from `07-security.md`. |
 | End-to-end | A disposable GitHub test repository runs a real JIT job for each supported host OS. |

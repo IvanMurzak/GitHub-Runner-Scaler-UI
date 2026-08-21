@@ -44,11 +44,16 @@ runner-manager auth status
 runner-manager auth logout
 runner-manager host set-capacity N
 runner-manager host show
-runner-manager repo add OWNER/REPO --host-label HOST --max-capacity N
+runner-manager repo add OWNER/REPO --host-label HOST [--max-capacity N]
 runner-manager repo list
 runner-manager repo set-capacity OWNER/REPO --max-capacity N
 runner-manager repo set-scale OWNER/REPO --enabled true
 runner-manager repo remove OWNER/REPO [--purge]
+runner-manager org add ORG --host-label HOST [--max-capacity N]
+runner-manager org list
+runner-manager org set-capacity ORG --max-capacity N
+runner-manager org set-scale ORG --enabled true
+runner-manager org remove ORG [--purge]
 runner-manager daemon run
 runner-manager service install [--start-at boot|login] | uninstall | status
 runner-manager tui
@@ -58,9 +63,14 @@ runner-manager status --json
 `repo add` is the primary, automation-safe configuration workflow. `tui` is
 an optional view and editing surface, not a required background process.
 
-`repo add` creates the policy in the `pending` state and does **not** enable
-scaling; the operator enables it explicitly with `repo set-scale`. This keeps
-policy creation non-arming, at the cost of one extra command in Journey 1.
+`repo add` and `org add` create the policy in the `pending` state and never
+enable scaling; the operator enables it explicitly with `set-scale` (D20). This
+keeps policy creation non-arming, at the cost of one extra command in Journey 1.
+
+Omitting `--max-capacity` creates a **monitor-only** policy (D19): the target
+appears in the dashboard with its runners and in-progress workflow counts, no
+scale set is created, and the agent never starts a runner for it. Supplying
+`--max-capacity` later with `set-capacity` promotes it to `autoscale`.
 
 ## Workspace shape
 
@@ -116,9 +126,11 @@ Rationale only. `README.md` carries decision status and is authoritative.
 
 ## Policy and reconciliation
 
-Each enabled repository policy creates one scale set for one host. The scale set
-**name** is the routing token and encodes the product, host identity, and host
-OS — for example `rm-home-win-x64`. It must be unique within its runner group.
+Each enabled `autoscale` policy creates one scale set for one host, at either
+repository or organization scope (D18). The scale set **name** is the routing
+token and encodes the product, host identity, and host OS — for example
+`rm-home-win-x64`. It must be unique within its runner group. `monitor_only`
+policies create no scale set and take no part in reconciliation.
 Workflows target it with `runs-on: <scale-set-name>`, never the legacy generic
 `self-hosted` label. Additional labels are optional metadata only, because
 GitHub documents scale sets as having a single label and multi-label support is
@@ -169,8 +181,8 @@ and only then.
 | List all visible runners | Paginated GitHub runner inventory, marked local or external. | Multi-page REST fixture and runner-table snapshot. |
 | Repository list with active Action counts | Per-repository `in_progress` workflow-run count, rendered in parentheses. | REST fixture and repository-list snapshot. |
 | Aggregate running Actions | Summed in-progress workflow count, separate from busy-runner count. | Workflow-count aggregation tests. |
-| Settings for repository autoscaling | Versioned `RepositoryPolicy`, shared by CLI and TUI. | CLI/TUI parity tests and policy persistence test. |
-| Per-repository and host-wide runner limits, visible and editable (D9) | `RepositoryPolicy.max_capacity`, `Host.host_capacity`, `repo set-capacity`, `host set-capacity`, host settings screen. | Host-ceiling enforcement test and settings round-trip test. |
+| Settings for repository autoscaling | Versioned `ScalePolicy`, shared by CLI and TUI. | CLI/TUI parity tests and policy persistence test. |
+| Per-repository and host-wide runner limits, visible and editable (D9) | `ScalePolicy.max_capacity`, `Host.host_capacity`, `repo set-capacity`, `host set-capacity`, host settings screen. | Host-ceiling enforcement test and settings round-trip test. |
 | Headless operations, especially repository add | `repo add` command with noninteractive validation and JSON status. | Scripted end-to-end CLI test. |
 | No idle runners when unused | `min_capacity=0`, scale-set listener, JIT ephemeral lifecycle. | Idle-host zero-runner assertion. |
 | Honest offline behavior | Long-poll backoff, `offline` state, per-screen status bar, 24h queue-cancellation warning. | Journey 4 gate in `08-user-workflows.md`. |
@@ -179,20 +191,21 @@ and only then.
 | Manual, validated, tested releases (D10) | `.github/workflows/release.yml`, `workflow_dispatch` only. | Release-workflow rehearsal in `09-release-distribution.md`. |
 | One-command install per OS (D11) | Install script, npm wrapper, Homebrew tap, Scoop bucket, `cargo install`. | Per-channel install smoke test on each OS, asserting no security prompt. |
 | Three-action onboarding (D3) | Device flow against the published App, then an installation URL. | Device-flow round-trip test and Journey 1 gate in `08-user-workflows.md`. |
+| Repository and organization scale sets (D18) | `ScaleTarget` sum type; `repo` and `org` command families sharing one domain path. | Target-equivalence domain tests and one live organization-scoped job. |
+| Optional autoscaling / monitor-only (D19) | `PolicyMode`, enforced shape invariants, reconciliation skips `MonitorOnly`. | Monitor-only policy starts no runner; promotion to `autoscale` round-trip test. |
 
 ## Owner-facing open questions
 
-1. **Scale-set scope: repository or organization.** Repository-scoped scale
-   sets require `Administration: Read and write` on the published App, which is
-   the same grant that permits repository deletion, transfer, and collaborator
-   changes. Organization-scoped scale sets use the narrower
-   `Organization → Self-hosted runners: Read and write`. Because every user
-   installs the *same* published App, this permission set is a one-time,
-   product-wide decision, not a per-user one. See `07-security.md`.
-2. **Monitor-only mode.** The repository description presents autoscaling as
-   optional, but every documented path requires a GitHub App, a scale set, and a
-   non-zero `max_capacity`. Wave 1 must decide whether `repo add` without
-   `--max-capacity` creates a monitor-only policy.
+1. **One published App or two.** D19 gives users a monitor-only mode, but a
+   GitHub App declares a single permission set for every installation, so a
+   monitor-only user still grants `Administration: Read and write` — the grant
+   that also permits repository deletion, transfer, and collaborator changes.
+   Genuine least privilege for monitor-only would need a second published App
+   declaring only `Administration: read`, `Actions: read`, and `Metadata: read`,
+   with the tool choosing which App to authenticate against. That doubles the
+   registration, audit, and onboarding surface. Wave 1 must decide before the
+   published App is registered, because changing an App's permissions later
+   forces every existing installation to re-consent.
 
 The product name is settled: the binary, workspace root package, published
 crate, and npm package are all named `runner-manager` (RESOLVED 2026-08-21).

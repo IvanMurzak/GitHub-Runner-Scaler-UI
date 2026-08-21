@@ -10,12 +10,16 @@
 2. Operator runs `runner-manager host set-capacity 2` if the host default is
    not acceptable.
 3. Operator runs `runner-manager repo add OWNER/REPO --host-label home-win
-   --max-capacity 1`.
-4. The command confirms the repository is installed for the App, validates the
+   --max-capacity 1`, or `runner-manager org add ORG --host-label home-win
+   --max-capacity 1` for an organization-scoped policy (D18). Omitting
+   `--max-capacity` creates a monitor-only policy instead (D19): the command
+   creates no scale set, stops after recording the target, and the flow ends
+   here.
+4. The command confirms the target is installed for the App, validates the
    host OS/architecture against GitHub's supported matrix, validates
    `min_capacity <= max_capacity`, creates or resolves its host-owned scale
-   set, and writes a transaction to local SQLite. The policy is created in
-   `pending`; scaling is not enabled.
+   set at the policy's scope, and writes a transaction to local SQLite. The
+   policy is created in `pending`; scaling is never enabled by `add` (D20).
 5. It prints the scale-set name to use in `runs-on` and the next command;
    secrets are never echoed.
 6. `runner-manager repo set-scale OWNER/REPO --enabled true` moves the policy

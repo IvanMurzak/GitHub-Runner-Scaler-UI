@@ -44,6 +44,22 @@ most 4 further `runner-manager` invocations — steps 4, 6, 7 plus the initial
 command must explain a missing installation or invalid capacity in one
 screenful without exposing credentials.
 
+### Journey 1a: monitor a repository without autoscaling
+
+1. Run `runner-manager repo add OWNER/REPO --host-label home-win` with no
+   `--max-capacity`.
+2. The command reports that the policy is monitor-only, that no scale set was
+   created, and that no runner will ever be started for it.
+3. The target appears in the TUI with its runners and in-progress workflow
+   count.
+4. Later, `runner-manager repo set-capacity OWNER/REPO --max-capacity 1`
+   promotes it to autoscale; `repo set-scale --enabled true` arms it.
+
+**Release gate:** A monitor-only policy starts no runner under any demand,
+creates no scale set, and is visually distinct from an autoscaling policy in
+every screen that lists policies. The onboarding copy states plainly that
+installing the App grants `Administration: Read and write` even in this mode.
+
 ### Journey 2: inspect active work in TUI
 
 1. Run `runner-manager tui`.
