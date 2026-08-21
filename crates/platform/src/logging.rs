@@ -268,23 +268,38 @@ fn split_trailing_whitespace(chunk: &str) -> (&str, &str) {
     }
 }
 
+/// Splits a fragment into its leading wrapping punctuation, its core, and its
+/// trailing wrapping punctuation.
+///
+/// Shared by [`redact_word`] and [`redact_core`], because both have to judge a
+/// fragment on its core while emitting it with its punctuation intact.
+fn split_wrappers(fragment: &str) -> (&str, &str, &str) {
+    let leading = fragment.len() - fragment.trim_start_matches(WRAPPERS).len();
+    let (prefix, rest) = fragment.split_at(leading);
+    let core_len = rest.trim_end_matches(WRAPPERS).len();
+    let (core, suffix) = rest.split_at(core_len);
+    (prefix, core, suffix)
+}
+
 /// Redacts one whitespace-delimited word, and says how many following words the
 /// word implicates.
 fn redact_word(word: &str) -> (String, u32) {
     // Wrapping punctuation is kept so that JSON-ish and prose context survives
     // — `("ghu_…")` should become `("[redacted]")`, not `[redacted]`.
-    let leading = word.len() - word.trim_start_matches(WRAPPERS).len();
-    let (prefix, rest) = word.split_at(leading);
-    let core_len = rest.trim_end_matches(WRAPPERS).len();
-    let (core, suffix) = rest.split_at(core_len);
+    let (prefix, core, suffix) = split_wrappers(word);
 
     if core.is_empty() {
         return (word.to_string(), 0);
     }
 
     // A bare credential key or scheme word: the value is the next word.
+    //
+    // The stem is unwrapped before it is judged: spaced JSON writes the key as
+    // `"password":`, which leaves `password"` welded to a quote, and that is on
+    // no list. A long value survived this anyway by way of the opaque-run rule,
+    // so the gap only ever showed on a short one.
     let stem = core.trim_end_matches([':', '=']);
-    if stem.len() < core.len() && is_credential_key(stem) {
+    if stem.len() < core.len() && is_credential_key(stem.trim_matches(WRAPPERS)) {
         // Two, so that `Authorization: Bearer <token>` loses the scheme and the
         // token rather than only the scheme.
         return (word.to_string(), 2);
@@ -304,17 +319,59 @@ fn redact_core(core: &str) -> String {
         return redact_url(scheme, rest);
     }
 
+    // A Windows drive path is `key:value`-shaped by accident, and
+    // `looks_like_path` only recognises the drive letter at position zero.
+    // Splitting such a path on its colon would hand the tail to a rule that
+    // matches nothing, so it has to be judged whole, before the separators
+    // get at it.
+    if looks_like_path(core) {
+        return PATH_REDACTION.to_string();
+    }
+
     // `key=value` and `key:value` in a single word.
+    //
+    // Pass one asks only whether either separator names a credential, and it
+    // runs to completion before any value is inspected, because the *first*
+    // separator in a word is not necessarily the structural one. A base64
+    // payload carries `=` padding, so `{"encoded_jit_config":"eyJ…In0="}`
+    // splits on an `=` inside the blob into two halves that mean nothing, and
+    // the `:` that actually names the key is never reached.
+    //
+    // Both halves are judged unwrapped: compact JSON welds a quote to each,
+    // so the key arrives as `encoded_jit_config"`, which is on no list.
     for separator in ['=', ':'] {
-        if let Some((key, value)) = core.split_once(separator) {
-            if is_credential_key(key) {
+        if let Some((key, _)) = core.split_once(separator) {
+            if is_credential_key(key.trim_matches(WRAPPERS)) {
                 return format!("{key}{separator}{REDACTION}");
             }
-            // Not a credential key, but the value may still be a path or a
-            // token: `runtime=/var/lib/runner-manager/…`.
-            if separator == '=' && !value.is_empty() {
-                return format!("{key}={}", redact_value(value));
+        }
+    }
+
+    // Pass two: not a credential key, but the value may still be a path or a
+    // token: `runtime=/var/lib/runner-manager/…`. Applied to `:` as well as
+    // to `=`, because `:` is what compact JSON and a bare `key:value` use,
+    // and recursing for `=` alone is what let an encoded JIT configuration
+    // and a `runner_token:ghu_…` pair through verbatim.
+    for separator in ['=', ':'] {
+        if let Some((key, raw_value)) = core.split_once(separator) {
+            let (lead, value, trail) = split_wrappers(raw_value);
+            if value.is_empty() {
+                continue;
             }
+            let redacted = redact_value(value);
+            // `as_sha256_digest` re-attaches its own `sha256:` label, so an
+            // already-labelled digest would come back doubled as
+            // `sha256:sha256:9f86d081884c…`. Dropping the redundant label
+            // keeps the caller's own key and separator, and leaves the digest
+            // truncated -- which the unrecursed `:` path never did, and which
+            // is worth having, because an HMAC-SHA256 signature has exactly a
+            // digest's shape and was previously printed in full.
+            if key.trim_matches(WRAPPERS).eq_ignore_ascii_case("sha256") {
+                if let Some(bare) = redacted.strip_prefix("sha256:") {
+                    return format!("{key}{separator}{lead}{bare}{trail}");
+                }
+            }
+            return format!("{key}{separator}{lead}{redacted}{trail}");
         }
     }
 
@@ -879,7 +936,29 @@ mod tests {
                 // 5. Through `Debug` rather than `Display`.
                 tracing::info!(?secret, "debug shaped");
 
-                // 6. Carried on a span rather than on the event.
+                // 6. Embedded in a structured value rather than standing
+                //    alone. Every shape above presents the secret as its
+                //    own whitespace-delimited word, which is the one shape
+                //    the opaque-run rule catches for free -- so the scan
+                //    could pass while the sink leaked anything embedded.
+                //    Compact JSON is what `serde_json::to_string` emits and
+                //    what an HTTP error body arrives as, and it was emitted
+                //    verbatim: `redact_core` recursed into the value for
+                //    `=` only, and the JSON quote left the key spelled
+                //    `encoded_jit_config"`, which is not on CREDENTIAL_KEYS.
+                for key in ["encoded_jit_config", "runner_token", "pat"] {
+                    tracing::error!("registration failed: {{\"{key}\":\"{secret}\"}}");
+                    tracing::error!("registration failed: {{ \"{key}\": \"{secret}\" }}");
+                    tracing::error!("registration failed: {key}:{secret}");
+                }
+
+                // 7. An `Authorization` header value, in the same three
+                //    embedded shapes.
+                tracing::error!("response: {{\"authorization\":\"Bearer {secret}\"}}");
+                tracing::error!("response: {{ \"authorization\": \"Bearer {secret}\" }}");
+                tracing::error!("response: authorization:Bearer {secret}");
+
+                // 8. Carried on a span rather than on the event.
                 let span = tracing::info_span!("attempt", jit_config = %secret);
                 let _entered = span.enter();
                 tracing::info!(event = "inside_span", "in a span");
@@ -1299,6 +1378,52 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_embedded_in_a_structured_value_is_redacted() {
+        // Compact JSON is what `serde_json::to_string` emits and what an
+        // HTTP error body arrives as; spaced JSON is the only shape that
+        // used to be safe, and it was safe by accident -- the value is its
+        // own word there, so the opaque-run rule caught it without the key
+        // ever being recognised.
+        for shape in [
+            format!("{{\"encoded_jit_config\":\"{JIT_BLOB}\"}}"),
+            format!("{{ \"encoded_jit_config\": \"{JIT_BLOB}\" }}"),
+            format!("encoded_jit_config:{JIT_BLOB}"),
+            format!("{{\"runner_token\":\"{USER_TOKEN}\"}}"),
+            format!("runner_token:{USER_TOKEN}"),
+            format!("pat:{USER_TOKEN}"),
+            format!("{{\"authorization\":\"Bearer {USER_TOKEN}\"}}"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(JIT_BLOB) && !redacted.contains(USER_TOKEN),
+                "leaked from {shape}:\n{redacted}"
+            );
+        }
+
+        // A credential short enough to clear the opaque-run threshold and
+        // without a GitHub prefix has nothing but the key to give it away,
+        // so it leaked from the spaced shape too: `\"password\":` left the
+        // key spelled `password\"`, which is on no list.
+        for shape in [
+            "{\"password\":\"hunter2\"}",
+            "{ \"password\": \"hunter2\" }",
+        ] {
+            let redacted = redact(shape);
+            assert!(
+                !redacted.contains("hunter2"),
+                "leaked from {shape}: {redacted}"
+            );
+        }
+
+        // The neighbouring context still survives: this is a scrubber, not
+        // a deleter.
+        let body = format!("registration failed: {{\"encoded_jit_config\":\"{JIT_BLOB}\"}}");
+        let redacted = redact(&body);
+        assert!(redacted.starts_with("registration failed: "), "{redacted}");
+        assert!(redacted.contains("encoded_jit_config"), "{redacted}");
+    }
+
+    #[test]
     fn paths_are_redacted_on_both_families() {
         assert_eq!(redact(WORKSPACE), PATH_REDACTION);
         assert_eq!(redact(WINDOWS_WORKSPACE), PATH_REDACTION);
@@ -1400,12 +1525,22 @@ mod tests {
         // A prefix a caller logged itself is below the threshold and untouched.
         assert_eq!(redact(&digest[..12]), digest[..12].to_string());
 
-        // Already-labelled digests were never caught by the opaque-run rule —
-        // the `:` is not an opaque character — and still are not.
-        assert_eq!(
-            redact(&format!("sha256:{digest}")),
-            format!("sha256:{digest}")
-        );
+        // An already-labelled digest is labelled once, not twice, and is
+        // truncated like a bare one.
+        //
+        // Before `redact_core` recursed into a `:` value this arrived at
+        // `redact_value` whole, matched nothing there -- a `:` is not an
+        // opaque character -- and was printed in full. Recursing hands
+        // `as_sha256_digest` the digest on its own, which re-attaches its own
+        // label, so the redundant one is dropped rather than doubled.
+        //
+        // The truncation is the part worth having: a 64-character lowercase
+        // hex run is only *usually* a digest, an HMAC-SHA256 signature has
+        // the same shape, and `sha256:<hmac>` used to be emitted whole.
+        assert_eq!(redact(&format!("sha256:{digest}")), "sha256:9f86d081884c…");
+        // The `=` spelling had the same doubling and is fixed with it; the
+        // caller's own separator survives either way.
+        assert_eq!(redact(&format!("sha256={digest}")), "sha256=9f86d081884c…");
     }
 
     #[test]
