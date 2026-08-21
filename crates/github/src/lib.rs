@@ -41,9 +41,18 @@
 //! errors, and from tracing output. Every type here that holds one wraps it in
 //! [`secrecy::SecretString`] *and* implements [`fmt::Debug`] by hand, because a
 //! `#[derive(Debug)]` added later to a struct with a plain `String` field is
-//! precisely how this control is lost. `tests::no_secret_reaches_the_logs`
+//! precisely how this control is lost. `tests/no_secret_reaches_the_logs.rs`
 //! drives a whole login and an authenticated round trip through a capturing
 //! `tracing` subscriber and fails if any of the three appears.
+//!
+//! That scan is a **separate test binary**, and deliberately so. As a unit test
+//! it silently stopped working: `tracing` caches each callsite's `Interest`
+//! once per *process*, while `with_default` installs a subscriber on one
+//! *thread*, so the other unit tests running concurrently registered the
+//! library's callsites as disabled before the scan ever installed its
+//! subscriber. It captured only its own three events, and passed with a real
+//! device-code leak on the live path. A binary holding one test cannot be
+//! poisoned that way; the file's own documentation records the measurement.
 
 pub mod demand;
 pub mod device_flow;
@@ -110,6 +119,28 @@ pub const REVALIDATION_PATH: &str = "/user/installations";
 /// `03-control-flows.md` flow 4.3 requires a back-off but names no duration.
 /// Sixty seconds is GitHub's own documented floor for its secondary rate limits.
 pub const DEFAULT_LOCKOUT_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The longest a lockout may silence this client, whatever `Retry-After` said.
+///
+/// A back-off is a *safety* mechanism, and an unclamped one is a denial of
+/// service with extra steps: `Retry-After: 86400` would latch a silent
+/// twenty-four-hour outage of the agent's reconciliation loop, clearable only by
+/// [`AuthenticatedClient::clear_lockout`]. Fifteen minutes is far longer than any
+/// back-off GitHub documents for the authentication lockout this latches on, and
+/// short enough that a hostile or simply wrong header cannot take the product
+/// down for a shift. Honouring a header without a ceiling is trusting a remote
+/// party with the product's availability.
+pub const MAX_LOCKOUT_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// The most pages either pagination loop follows before giving up.
+///
+/// A `Link: rel="next"` that points back at the page it arrived on — a proxy
+/// rewriting the header, or a bug at the other end — is an infinite loop inside
+/// the agent's reconciliation loop, which is the one place in this product that
+/// must not be able to wedge. At `per_page=100` this ceiling is ten thousand
+/// installations or repositories, past any real account by orders of magnitude,
+/// so it bounds the pathological case without truncating a legitimate one.
+pub const MAX_PAGES: usize = 100;
 
 /// Per-request ceiling, so one wedged connection cannot stall the agent's
 /// reconciliation loop forever.
@@ -436,6 +467,17 @@ impl Eq for UserAccessToken {}
 /// [`GithubError::AuthenticationLockout`] must *wait* and tell the operator
 /// nothing is wrong with their credential, and [`GithubError::Forbidden`] is a
 /// permissions answer that re-authenticating will not change.
+///
+/// # Why the failing variants carry response headers
+///
+/// Rate-limit *policy* is `c3`'s and is deliberately not implemented here. But a
+/// policy needs evidence, and the evidence — `retry-after`,
+/// `x-ratelimit-remaining`, `x-ratelimit-reset` — only exists on the response
+/// that failed. An error taxonomy that dropped those headers would leave `c3`
+/// with no way to honour a `429` except by editing this file, which is exactly
+/// the conflict the `c2`/`c3` ownership split exists to prevent. So
+/// [`GithubError::Status`] and [`GithubError::Forbidden`] carry the headers
+/// verbatim and interpret none of them; see [`GithubError::headers`].
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
     /// GitHub rejected the credential and a single re-validation confirmed it.
@@ -455,7 +497,9 @@ pub enum GithubError {
     )]
     AuthenticationLockout { retry_after: Duration },
 
-    /// A permissions answer, with no `401` before it.
+    /// A `403` that is not the lockout: a permissions answer, or GitHub's own
+    /// rate limit. `c3` tells the two apart from `headers`; this crate does not,
+    /// because which of them is worth retrying is rate-limit policy.
     #[error(
         "GitHub denied {method} {path}: the App installation does not grant it{}",
         message.as_deref().map(|m| format!(" ({m})")).unwrap_or_default()
@@ -464,6 +508,8 @@ pub enum GithubError {
         method: String,
         path: String,
         message: Option<String>,
+        /// The response headers, verbatim and uninterpreted.
+        headers: Box<HeaderMap>,
     },
 
     #[error(
@@ -475,6 +521,9 @@ pub enum GithubError {
         method: String,
         path: String,
         message: Option<String>,
+        /// The response headers, verbatim and uninterpreted. A `429` reaches
+        /// `c3` through this variant, and its `retry-after` survives with it.
+        headers: Box<HeaderMap>,
     },
 
     /// The request never got an answer. The URL is stripped from the source
@@ -515,6 +564,69 @@ impl GithubError {
     pub fn is_lockout(&self) -> bool {
         matches!(self, Self::AuthenticationLockout { .. })
     }
+
+    /// The failing response's headers, for the variants that have them.
+    ///
+    /// This is the whole of `c2`'s contribution to rate limiting: it hands `c3`
+    /// the evidence and stops there. Nothing in this crate reads
+    /// `x-ratelimit-remaining` to decide anything.
+    #[must_use]
+    pub fn headers(&self) -> Option<&HeaderMap> {
+        match self {
+            Self::Status { headers, .. } | Self::Forbidden { headers, .. } => Some(headers),
+            _ => None,
+        }
+    }
+
+    /// The failing response's `retry-after`, in seconds, if it sent one.
+    ///
+    /// Reading a documented header is evidence, not policy: what to *do* with a
+    /// `retry-after` — wait, shed load, surface it to an operator — is `c3`'s.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.headers().and_then(retry_after)
+    }
+
+    /// The `x-ratelimit-remaining` / `x-ratelimit-reset` pair, when present.
+    ///
+    /// Returned as the raw numbers GitHub sent. `reset` is a Unix timestamp in
+    /// seconds, which is what the header carries; it is deliberately not turned
+    /// into a [`Timestamp`] here, because comparing it against a clock is the
+    /// first step of a policy decision and that decision is `c3`'s.
+    #[must_use]
+    pub fn rate_limit(&self) -> Option<RateLimitEvidence> {
+        let headers = self.headers()?;
+        let read = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let remaining = read("x-ratelimit-remaining");
+        let reset = read("x-ratelimit-reset");
+        if remaining.is_none() && reset.is_none() {
+            return None;
+        }
+        Some(RateLimitEvidence {
+            remaining,
+            reset_unix_secs: reset,
+            retry_after: self.retry_after(),
+        })
+    }
+}
+
+/// What GitHub said about its own rate limit on a response that failed.
+///
+/// Evidence, carried across the `c2`/`c3` seam. Every field is what the wire
+/// said, and none of them has been interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitEvidence {
+    /// `x-ratelimit-remaining`. Zero is GitHub's primary rate limit.
+    pub remaining: Option<u64>,
+    /// `x-ratelimit-reset`, a Unix timestamp in seconds.
+    pub reset_unix_secs: Option<u64>,
+    /// `retry-after`, which secondary rate limits send instead.
+    pub retry_after: Option<Duration>,
 }
 
 fn transport(err: reqwest::Error) -> GithubError {
@@ -673,26 +785,48 @@ impl fmt::Debug for ApiResponse {
     }
 }
 
+/// The `rel="next"` target of an RFC 8288 `Link` header, or `None`.
+///
+/// # Why this scans rather than splits
+///
+/// A comma separates one link-value from the next, but a comma is also a legal
+/// character *inside* a URL, and GitHub sends such URLs routinely — a runner
+/// query carries `labels=self-hosted,windows`. Splitting the whole header on `,`
+/// first tears that URL in half, neither half parses as `<...>`, and the
+/// relation is silently lost. The caller then treats page 1 as the whole
+/// inventory, which is the specific outcome `04-subsystem-contracts.md` forbids:
+/// "the dashboard must not treat a first page as a complete inventory".
+///
+/// So the target is located by its `<`…`>` delimiters, and only a comma that
+/// actually begins the next link-value — one followed by optional whitespace and
+/// `<` — ends the parameter section.
 fn parse_link_next(link: &str) -> Option<Url> {
-    for part in link.split(',') {
-        let mut segments = part.split(';');
-        let Some(target) = segments.next() else {
-            continue;
+    let mut rest = link;
+    while let Some(open) = rest.find('<') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('>') else {
+            // An unterminated `<` cannot be a link-value; nothing after it is
+            // interpretable either.
+            return None;
         };
-        let target = target.trim();
-        let Some(raw) = target
-            .strip_prefix('<')
-            .and_then(|rest| rest.strip_suffix('>'))
-        else {
-            continue;
-        };
-        let is_next = segments.any(|param| {
+        let target = after_open[..close].trim();
+        let tail = &after_open[close + 1..];
+
+        // The parameters run to the start of the next link-value.
+        let cut = tail
+            .match_indices(',')
+            .find(|(i, _)| tail[i + 1..].trim_start().starts_with('<'))
+            .map_or(tail.len(), |(i, _)| i);
+        let (params, next) = tail.split_at(cut);
+
+        let is_next = params.split(';').any(|param| {
             let param = param.trim().replace(['"', '\''], "");
             param.eq_ignore_ascii_case("rel=next")
         });
         if is_next {
-            return Url::parse(raw).ok();
+            return Url::parse(target).ok();
         }
+        rest = next.strip_prefix(',').unwrap_or(next);
     }
     None
 }
@@ -807,6 +941,22 @@ pub struct AuthenticatedClient {
 
 impl fmt::Debug for AuthenticatedClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `try_lock`, not `is_locked_out()`. `std::sync::Mutex` is not
+        // reentrant, and `latch_lockout` holds this one; the moment anybody adds
+        // a `tracing` call inside that function — which is a natural thing to
+        // want there — rendering the client would deadlock the whole agent. A
+        // `Debug` impl must never be able to block, so it reports what it can
+        // see and says so when it cannot.
+        let locked_out = match self.lockout.try_lock() {
+            Ok(state) => {
+                if state.until.is_some_and(|until| self.clock.now() < until) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            }
+            Err(_) => "unknown (the lockout state is being updated)",
+        };
         f.debug_struct("AuthenticatedClient")
             .field("api_base", &self.endpoints.api_base.as_str())
             .field("credential", &self.credential)
@@ -814,7 +964,7 @@ impl fmt::Debug for AuthenticatedClient {
                 "revalidations_performed",
                 &self.revalidations_performed.load(Ordering::Relaxed),
             )
-            .field("locked_out", &self.is_locked_out())
+            .field("locked_out", &locked_out)
             .finish_non_exhaustive()
     }
 }
@@ -933,7 +1083,7 @@ impl AuthenticatedClient {
         }
 
         let first = self.send_raw(request).await?;
-        match self.classify(request, &first) {
+        match self.classify(request, &first, Attempt::First) {
             Classified::Ok => Ok(first),
             Classified::Unauthorized => self.revalidate_and_retry_once(request).await,
             Classified::Error(err) => Err(err),
@@ -991,6 +1141,16 @@ impl AuthenticatedClient {
     /// If a previous holder panicked while the re-validation result lock was
     /// held.
     pub async fn revalidate(&self) -> Result<Revalidation, GithubError> {
+        // "A lockout stops traffic. This client issues no further HTTP at all
+        // until the back-off elapses" is a property of the client, not of
+        // `send`, and the probe is HTTP like any other. `send` has already
+        // returned by the time it calls in here, so this guard only bites a
+        // caller that probes on its own — and one that did would otherwise be
+        // the single exception to the rule, which is how a rule stops holding.
+        if let Some(retry_after) = self.lockout_remaining() {
+            return Err(GithubError::AuthenticationLockout { retry_after });
+        }
+
         // Sample before queuing. If this changes while we wait for the gate,
         // someone else's re-validation covers us and we must not repeat it.
         let sampled = self.revalidation_generation.load(Ordering::SeqCst);
@@ -1040,8 +1200,12 @@ impl AuthenticatedClient {
             Ok(response) if response.status == StatusCode::FORBIDDEN => {
                 // A `403` on the probe, with `401`s already counted, is the
                 // lockout. Latch it; the caller's own classification will report
-                // it.
-                if self.consecutive_unauthorized.load(Ordering::SeqCst) > 0 {
+                // it. The probe only ever runs after a `401`, so it is always in
+                // the retry position — but a rate-limited `403` is still not an
+                // authentication answer, for the same reason as in `classify`.
+                if self.consecutive_unauthorized.load(Ordering::SeqCst) > 0
+                    && !is_rate_limited(&response)
+                {
                     self.latch_lockout(&response.headers);
                 }
                 Revalidation::Unavailable
@@ -1070,7 +1234,7 @@ impl AuthenticatedClient {
                     });
                 }
                 let second = self.send_raw(request).await?;
-                match self.classify(request, &second) {
+                match self.classify(request, &second, Attempt::Retry) {
                     Classified::Ok => Ok(second),
                     // The one retry is spent. A second `401` is terminal.
                     Classified::Unauthorized => Err(GithubError::AuthenticationFailed),
@@ -1080,7 +1244,12 @@ impl AuthenticatedClient {
         }
     }
 
-    fn classify(&self, request: &ApiRequest, response: &ApiResponse) -> Classified {
+    fn classify(
+        &self,
+        request: &ApiRequest,
+        response: &ApiResponse,
+        attempt: Attempt,
+    ) -> Classified {
         let status = response.status;
         if status.is_success() {
             self.consecutive_unauthorized.store(0, Ordering::SeqCst);
@@ -1090,40 +1259,94 @@ impl AuthenticatedClient {
             self.consecutive_unauthorized.fetch_add(1, Ordering::SeqCst);
             return Classified::Unauthorized;
         }
+        if status == StatusCode::FORBIDDEN && self.is_lockout_403(response, attempt) {
+            let backoff = self.latch_lockout(&response.headers);
+            tracing::warn!(
+                method = request.method.as_str(),
+                path = %request.path,
+                backoff_secs = backoff.as_secs(),
+                "GitHub answered 403 after 401s: temporary authentication lockout, backing off"
+            );
+            return Classified::Error(GithubError::AuthenticationLockout {
+                retry_after: backoff,
+            });
+        }
+        let headers = Box::new(response.headers.clone());
+        let message = error_message(&response.body);
         if status == StatusCode::FORBIDDEN {
-            if self.consecutive_unauthorized.load(Ordering::SeqCst) > 0 {
-                let backoff = self.latch_lockout(&response.headers);
-                tracing::warn!(
-                    method = request.method.as_str(),
-                    path = %request.path,
-                    backoff_secs = backoff.as_secs(),
-                    "GitHub answered 403 after 401s: temporary authentication lockout, backing off"
-                );
-                return Classified::Error(GithubError::AuthenticationLockout {
-                    retry_after: backoff,
-                });
-            }
             return Classified::Error(GithubError::Forbidden {
                 method: request.method.as_str().to_string(),
                 path: request.path.clone(),
-                message: error_message(&response.body),
+                message,
+                headers,
             });
         }
         Classified::Error(GithubError::Status {
             status: status.as_u16(),
             method: request.method.as_str().to_string(),
             path: request.path.clone(),
-            message: error_message(&response.body),
+            message,
+            headers,
         })
     }
 
+    /// Whether a `403` is GitHub's temporary *authentication* lockout, as
+    /// opposed to a permissions answer or a rate limit.
+    ///
+    /// Two conditions, and the first one is the fix for a real defect.
+    ///
+    /// **It must have landed on the retry.** `consecutive_unauthorized` counts
+    /// `401`s since the last successful caller response and — correctly — does
+    /// not decay: a request that ends in `404`, `422` or `500` leaves it set. In
+    /// the agent's long-lived reconciliation loop that means a single `401` from
+    /// minutes ago used to convert the *next* genuine permissions `403` into a
+    /// fake lockout: sixty seconds of silence plus an operator message
+    /// insisting the credential is fine, when in truth `generate-jitconfig` was
+    /// missing `Administration: write`. The lockout's actual signature is
+    /// narrower than "a `403` while the count is set" — it is a `403` on the one
+    /// retry that this client itself issued after this request's own `401`. A
+    /// fresh first attempt answering `403` is a permissions answer, whatever
+    /// happened minutes ago.
+    ///
+    /// **It must not be a rate limit.** `classify` used to reach the `403`
+    /// branch before anything looked at the rate-limit headers, so a primary
+    /// rate limit arriving during a `401` storm was reported as
+    /// `AuthenticationLockout` — telling the operator "the credential itself is
+    /// not the problem" about a response that never mentioned the credential.
+    /// Recognising GitHub's own rate-limit evidence is not rate-limit *policy*;
+    /// it is declining to make an assertion the evidence contradicts. What to do
+    /// about the rate limit stays `c3`'s, which is why this only changes which
+    /// variant carries the headers onward.
+    fn is_lockout_403(&self, response: &ApiResponse, attempt: Attempt) -> bool {
+        attempt == Attempt::Retry
+            && self.consecutive_unauthorized.load(Ordering::SeqCst) > 0
+            && !is_rate_limited(response)
+    }
+
     fn latch_lockout(&self, headers: &HeaderMap) -> Duration {
-        let backoff = retry_after(headers).unwrap_or(DEFAULT_LOCKOUT_BACKOFF);
+        // Clamp before latching. An unclamped `Retry-After` is a remote party
+        // deciding how long this product stays down.
+        let requested = retry_after(headers).unwrap_or(DEFAULT_LOCKOUT_BACKOFF);
+        let clamped = requested.min(MAX_LOCKOUT_BACKOFF);
+
+        // A span too large for `chrono` must fall back to the default, never to
+        // `None`: the old code's `.ok()` turned an absurd `Retry-After` into "no
+        // lockout at all", which fails *open* — the exact inverse of what a
+        // back-off is for, and reachable by a header alone. The clamp above
+        // already makes this branch unreachable; it stays because the invariant
+        // it protects ("latching always latches") is worth more than the line.
+        let delta = chrono::TimeDelta::from_std(clamped).unwrap_or_else(|_| {
+            chrono::TimeDelta::from_std(DEFAULT_LOCKOUT_BACKOFF)
+                .expect("sixty seconds is a representable span")
+        });
+        let backoff = delta
+            .to_std()
+            .unwrap_or(DEFAULT_LOCKOUT_BACKOFF)
+            .min(MAX_LOCKOUT_BACKOFF);
+
         let mut state = self.lockout.lock().expect("lockout lock poisoned");
         state.backoff = backoff;
-        state.until = chrono::TimeDelta::from_std(backoff)
-            .ok()
-            .map(|delta| self.clock.now() + delta);
+        state.until = Some(self.clock.now() + delta);
         backoff
     }
 
@@ -1191,6 +1414,39 @@ enum Classified {
     Ok,
     Unauthorized,
     Error(GithubError),
+}
+
+/// Which of a request's at-most-two attempts produced a response.
+///
+/// The authentication lockout is defined by *position*, not just by status: it
+/// is what GitHub answers the retry that follows a `401`. Passing this in makes
+/// that explicit at both call sites instead of inferring it from a counter that
+/// outlives the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    First,
+    Retry,
+}
+
+/// Whether GitHub attributed a failing response to its own rate limit.
+///
+/// Reading the evidence, and nothing else — see [`GithubError`]'s note on why
+/// the headers travel with the error. `c3` decides what to do about it.
+fn is_rate_limited(response: &ApiResponse) -> bool {
+    if response.status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    // The primary rate limit's documented signature.
+    if response
+        .header("x-ratelimit-remaining")
+        .is_some_and(|v| v.trim() == "0")
+    {
+        return true;
+    }
+    // A secondary rate limit sends `retry-after` — but so does the
+    // authentication lockout, so that header alone cannot tell them apart.
+    // GitHub's own message ("You have exceeded a secondary rate limit") can.
+    error_message(&response.body).is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,6 +1612,11 @@ impl InstallationDiscovery {
 
 #[derive(Debug, Deserialize)]
 struct InstallationsPage {
+    /// GitHub reports the size of the whole collection on every page. Decoding
+    /// it costs nothing and turns silent under-collection into a visible
+    /// warning — see [`under_collected`].
+    #[serde(default)]
+    total_count: Option<u64>,
     #[serde(default)]
     installations: Vec<RawInstallation>,
 }
@@ -1363,22 +1624,56 @@ struct InstallationsPage {
 #[derive(Debug, Deserialize)]
 struct RawInstallation {
     id: u64,
-    account: RawAccount,
+    /// **Nullable.** GitHub's published `installation` schema types `account` as
+    /// nullable, so a required field here would fail the *whole* decode — and
+    /// with it all of `discover_installations`, which is all of `auth status` —
+    /// over one installation whose account this client did not need to name.
+    #[serde(default)]
+    account: Option<RawAccount>,
     #[serde(default)]
     repository_selection: Option<String>,
     #[serde(default)]
     permissions: std::collections::BTreeMap<String, String>,
 }
 
+/// An installation's account, which is *not* always a simple user.
+///
+/// GitHub's schema makes `account` either a simple-user or an enterprise, and an
+/// enterprise carries `slug` and `name` where a user carries `login`. Requiring
+/// `login` therefore made an enterprise installation a hard decode failure of
+/// the entire response. All three are optional here and
+/// [`RawAccount::display_login`] takes the first usable one.
 #[derive(Debug, Deserialize)]
 struct RawAccount {
-    login: String,
+    #[serde(default)]
+    login: Option<String>,
+    /// An enterprise account's stable identifier.
+    #[serde(default)]
+    slug: Option<String>,
+    /// An enterprise account's display name, the last resort.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(rename = "type", default)]
     account_type: Option<String>,
 }
 
+impl RawAccount {
+    fn display_login(&self) -> Option<&str> {
+        [
+            self.login.as_deref(),
+            self.slug.as_deref(),
+            self.name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RepositoriesPage {
+    #[serde(default)]
+    total_count: Option<u64>,
     #[serde(default)]
     repositories: Vec<RawRepository>,
 }
@@ -1386,6 +1681,21 @@ struct RepositoriesPage {
 #[derive(Debug, Deserialize)]
 struct RawRepository {
     full_name: String,
+}
+
+/// How many items a paginated collection said it had, when that is more than
+/// arrived.
+///
+/// This is the cheapest possible check and it is worth more than it looks. The
+/// `Link`-header parser used to lose the relation whenever a page URL contained
+/// a comma, which stopped pagination at page 1 — and *nothing* noticed, because
+/// a short answer and a complete answer are the same shape. Cross-checking the
+/// count GitHub itself reported turns that class of bug from a wrong answer into
+/// a logged warning. A collection larger than `total_count` is not reported:
+/// GitHub can legitimately grow a collection between pages.
+fn under_collected(collected: usize, total_count: Option<u64>) -> Option<u64> {
+    let total = total_count?;
+    (total > collected as u64).then_some(total)
 }
 
 impl AuthenticatedClient {
@@ -1412,14 +1722,30 @@ impl AuthenticatedClient {
     ) -> Result<InstallationDiscovery, GithubError> {
         let mut installations = Vec::new();
         for raw in self.all_installations().await? {
-            let account = match raw.account.account_type.as_deref() {
-                Some("Organization") => InstallationAccount::Organization(
-                    Org::new(&raw.account.login).map_err(|_| GithubError::Malformed {
-                        what: "an installation account login",
-                        value: raw.account.login.clone(),
-                    })?,
-                ),
-                _ => InstallationAccount::User(raw.account.login.clone()),
+            // A null or nameless account is skipped rather than fatal. GitHub
+            // types this field as nullable, and one unnameable installation must
+            // not take down `auth status` for every other one — but it is also
+            // not something to swallow quietly, because the repositories behind
+            // it are then absent from the reported reach.
+            let Some(login) = raw.account.as_ref().and_then(RawAccount::display_login) else {
+                tracing::warn!(
+                    installation_id = raw.id,
+                    "skipping an installation GitHub reported with no nameable account; \
+                     anything it reaches is missing from this report"
+                );
+                continue;
+            };
+            let account_type = raw.account.as_ref().and_then(|a| a.account_type.as_deref());
+            let account = match account_type {
+                Some("Organization") => {
+                    InstallationAccount::Organization(Org::new(login).map_err(|_| {
+                        GithubError::Malformed {
+                            what: "an installation account login",
+                            value: login.to_string(),
+                        }
+                    })?)
+                }
+                _ => InstallationAccount::User(login.to_string()),
             };
             let repository_selection = match raw.repository_selection.as_deref() {
                 Some("all") => RepositorySelection::All,
@@ -1454,27 +1780,52 @@ impl AuthenticatedClient {
 
     async fn all_installations(&self) -> Result<Vec<RawInstallation>, GithubError> {
         let mut out = Vec::new();
+        let mut total_count = None;
         let mut next = Some(ApiRequest::get("/user/installations").query("per_page", 100));
+        let mut pages = 0_usize;
         while let Some(request) = next.take() {
             let response = self.send(&request).await?;
             let page: InstallationsPage = response.json()?;
+            total_count = page.total_count.or(total_count);
             out.extend(page.installations);
+
+            pages += 1;
+            if pages >= MAX_PAGES {
+                tracing::warn!(
+                    pages,
+                    collected = out.len(),
+                    "stopped following installation pages at the ceiling; a `Link: rel=next` \
+                     that never ends would otherwise loop forever"
+                );
+                break;
+            }
             next = response
                 .next_page()
                 .map(|url| ApiRequest::get(url.as_str()));
+        }
+        if let Some(expected) = under_collected(out.len(), total_count) {
+            tracing::warn!(
+                expected,
+                collected = out.len(),
+                "GitHub reported more installations than pagination collected; the reported \
+                 reach is incomplete"
+            );
         }
         Ok(out)
     }
 
     async fn installation_repositories(&self, id: u64) -> Result<Vec<OwnerRepo>, GithubError> {
         let mut out = Vec::new();
+        let mut total_count = None;
         let mut next = Some(
             ApiRequest::get(format!("/user/installations/{id}/repositories"))
                 .query("per_page", 100),
         );
+        let mut pages = 0_usize;
         while let Some(request) = next.take() {
             let response = self.send(&request).await?;
             let page: RepositoriesPage = response.json()?;
+            total_count = page.total_count.or(total_count);
             for repo in page.repositories {
                 out.push(OwnerRepo::parse(&repo.full_name).map_err(|_| {
                     GithubError::Malformed {
@@ -1483,9 +1834,30 @@ impl AuthenticatedClient {
                     }
                 })?);
             }
+
+            pages += 1;
+            if pages >= MAX_PAGES {
+                tracing::warn!(
+                    installation_id = id,
+                    pages,
+                    collected = out.len(),
+                    "stopped following repository pages at the ceiling; a `Link: rel=next` \
+                     that never ends would otherwise loop forever"
+                );
+                break;
+            }
             next = response
                 .next_page()
                 .map(|url| ApiRequest::get(url.as_str()));
+        }
+        if let Some(expected) = under_collected(out.len(), total_count) {
+            tracing::warn!(
+                installation_id = id,
+                expected,
+                collected = out.len(),
+                "GitHub reported more repositories than pagination collected; this \
+                 installation's reach is under-reported"
+            );
         }
         Ok(out)
     }
@@ -1676,109 +2048,22 @@ pub(crate) mod testing {
         json!({ "total_count": repositories.len(), "repositories": repositories })
     }
 
-    // -- log capture --------------------------------------------------------
-
-    /// Everything a `tracing` subscriber saw, as one flat string to scan.
-    ///
-    /// Hand-written because `tracing-subscriber` is not a dependency of this
-    /// crate and `a1` owns every manifest — needing one would have been a reason
-    /// to stop and report, not to edit a `Cargo.toml`. It records every event's
-    /// target, message and fields, and every span's name and fields, which is
-    /// the whole surface a secret could reach a log through.
-    #[derive(Clone, Default)]
-    pub struct CaptureLog(Arc<Mutex<String>>);
-
-    impl CaptureLog {
-        /// # Panics
-        /// If a previous holder panicked while the lock was held.
-        pub fn contents(&self) -> String {
-            self.0.lock().expect("log lock poisoned").clone()
-        }
-
-        #[must_use]
-        pub fn subscriber(&self) -> CaptureSubscriber {
-            CaptureSubscriber {
-                sink: self.clone(),
-                next_span: AtomicU64::new(1),
-            }
-        }
-    }
-
-    pub struct CaptureSubscriber {
-        sink: CaptureLog,
-        next_span: AtomicU64,
-    }
-
-    impl CaptureSubscriber {
-        fn write(
-            &self,
-            prefix: &str,
-            metadata: &tracing::Metadata<'_>,
-            record: impl Fn(&mut Sink),
-        ) {
-            let mut buffer = self.sink.0.lock().expect("log lock poisoned");
-            buffer.push_str(prefix);
-            buffer.push(' ');
-            buffer.push_str(metadata.target());
-            buffer.push(' ');
-            buffer.push_str(metadata.name());
-            let mut sink = Sink(&mut buffer);
-            record(&mut sink);
-            buffer.push('\n');
-        }
-    }
-
-    impl tracing::Subscriber for CaptureSubscriber {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            self.write("SPAN", span.metadata(), |sink| span.record(sink));
-            tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::SeqCst))
-        }
-
-        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-            let mut buffer = self.sink.0.lock().expect("log lock poisoned");
-            buffer.push_str("RECORD");
-            let mut sink = Sink(&mut buffer);
-            values.record(&mut sink);
-            buffer.push('\n');
-        }
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            self.write("EVENT", event.metadata(), |sink| event.record(sink));
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    struct Sink<'a>(&'a mut String);
-
-    impl tracing::field::Visit for Sink<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-            use fmt::Write;
-            let _ = write!(self.0, " {}={value:?}", field.name());
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            use fmt::Write;
-            let _ = write!(self.0, " {}={value}", field.name());
-        }
-    }
+    // The `tracing` capture subscriber that used to live here now lives in
+    // `tests/no_secret_reaches_the_logs.rs`, and the move is the point rather
+    // than tidying. `tracing` caches a callsite's `Interest` once, process-wide,
+    // while `with_default` installs a subscriber only on the calling *thread* —
+    // so a scan run alongside 34 other unit tests saw its library callsites
+    // already registered `Interest::never()` by threads that had no subscriber,
+    // and captured nothing but its own three events. It passed with a real
+    // device-code leak in the flow. A scan that is the only test in its process
+    // cannot be poisoned that way, and no `#[cfg(test)]` module here can offer
+    // that guarantee.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{
-        CaptureLog, FIXTURE_DEVICE_CODE, FIXTURE_TOKEN, FIXTURE_USER_CODE, Script, TestClock,
-        installations_body, repositories_body, token_body,
-    };
+    use crate::testing::{FIXTURE_TOKEN, Script, TestClock, installations_body, repositories_body};
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -2094,6 +2379,270 @@ mod tests {
         );
     }
 
+    /// `consecutive_unauthorized` is reset only by a successful *caller*
+    /// response, so a request ending in `404`, `422` or `5xx` leaves it set —
+    /// and in the agent's long-lived reconciliation loop it stays set for as
+    /// long as nothing succeeds. Before the fix, the next genuine permissions
+    /// `403` was therefore reported as `AuthenticationLockout`: sixty seconds of
+    /// client silence, plus an operator message asserting "the credential itself
+    /// is not the problem" about a credential that was missing
+    /// `Administration: write` — the failure `04-subsystem-contracts.md` names
+    /// as the *expected* one for `generate-jitconfig`.
+    ///
+    /// The lockout's real signature is narrower: a `403` on the one retry this
+    /// client issues after this request's own `401`. A fresh first attempt
+    /// answering `403` is a permissions answer, whatever happened minutes ago.
+    #[tokio::test]
+    async fn a_stale_401_does_not_turn_a_later_permissions_403_into_a_lockout() {
+        let server = MockServer::start().await;
+        // The first request ends in a 404, which leaves the 401 count set
+        // because only a 2xx clears it.
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/actions/runners"))
+            .respond_with(Script::new(vec![
+                ResponseTemplate::new(401),
+                ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})),
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(installations_body(&[])))
+            .mount(&server)
+            .await;
+        // Minutes later, a different call is denied for a missing permission.
+        Mock::given(method("POST"))
+            .and(path("/orgs/acme/actions/runners/generate-jitconfig"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Resource not accessible by integration"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let err = client
+            .send(&ApiRequest::get("/orgs/acme/actions/runners"))
+            .await
+            .expect_err("404");
+        assert!(
+            matches!(err, GithubError::Status { status: 404, .. }),
+            "{err:?}"
+        );
+
+        let err = client
+            .send(&ApiRequest::new(
+                Method::POST,
+                "/orgs/acme/actions/runners/generate-jitconfig",
+            ))
+            .await
+            .expect_err("403");
+
+        assert!(
+            matches!(err, GithubError::Forbidden { .. }),
+            "a fresh first-attempt 403 is a permissions answer, not a lockout: {err:?}"
+        );
+        assert!(!err.is_lockout());
+        assert!(
+            !client.is_locked_out(),
+            "a stale 401 must not be able to silence the client for a minute"
+        );
+    }
+
+    /// GitHub's own rate limit is not an answer about the credential, and must
+    /// not be reported as one. `classify` reached the `403` branch before
+    /// anything looked at the rate-limit headers, so a primary rate limit
+    /// arriving during a `401` storm was announced as an authentication lockout
+    /// with the message "the credential itself is not the problem" — about a
+    /// response that never mentioned the credential.
+    #[tokio::test]
+    async fn a_rate_limited_403_is_not_reported_as_an_authentication_lockout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/actions/runners"))
+            .respond_with(Script::new(vec![
+                ResponseTemplate::new(401),
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", "1787270460")
+                    .insert_header("retry-after", "30")
+                    .set_body_json(json!({"message": "API rate limit exceeded"})),
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(installations_body(&[])))
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let err = client
+            .send(&ApiRequest::get("/orgs/acme/actions/runners"))
+            .await
+            .expect_err("rate limited");
+
+        assert!(
+            matches!(err, GithubError::Forbidden { .. }),
+            "a rate limit is not an authentication outcome: {err:?}"
+        );
+        assert!(!err.is_lockout());
+        assert!(!err.is_authentication());
+        assert!(
+            !client.is_locked_out(),
+            "a rate limit must not latch this crate's authentication back-off"
+        );
+
+        // And `c3` gets the evidence it needs to apply the policy that is its
+        // own, without editing this file.
+        let evidence = err
+            .rate_limit()
+            .expect("the headers survived classification");
+        assert_eq!(evidence.remaining, Some(0));
+        assert_eq!(evidence.reset_unix_secs, Some(1_787_270_460));
+        assert_eq!(evidence.retry_after, Some(Duration::from_secs(30)));
+    }
+
+    /// The same claim for the variant `429` lands in.
+    #[tokio::test]
+    async fn a_429_carries_its_retry_after_across_the_c2_c3_seam() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/actions/runners"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "17")
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({"message": "You have exceeded a secondary rate limit"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let err = client
+            .send(&ApiRequest::get("/orgs/acme/actions/runners"))
+            .await
+            .expect_err("429");
+
+        assert!(
+            matches!(err, GithubError::Status { status: 429, .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.retry_after(),
+            Some(Duration::from_secs(17)),
+            "destroying this header is what made `c3`'s Definition of Done unmeetable"
+        );
+        assert_eq!(
+            err.headers().and_then(|h| h.get("x-ratelimit-remaining")),
+            Some(&reqwest::header::HeaderValue::from_static("0"))
+        );
+    }
+
+    /// A back-off is a safety mechanism, and this one had both failure modes at
+    /// once: no ceiling, so `Retry-After: 86400` latched a silent twenty-four
+    /// hour outage; and `TimeDelta::from_std(...).ok()` on a value too large to
+    /// convert, which yielded `until = None` — *not locked out at all*, the
+    /// exact inverse of the requirement, reachable by a header alone.
+    #[tokio::test]
+    async fn an_extreme_retry_after_is_clamped_and_never_fails_open() {
+        async fn lockout_for(header: &str) -> (GithubError, bool, Option<Duration>) {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/orgs/acme/actions/runners"))
+                .respond_with(Script::new(vec![
+                    ResponseTemplate::new(401),
+                    ResponseTemplate::new(403).insert_header("retry-after", header),
+                ]))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/user/installations"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(installations_body(&[])))
+                .mount(&server)
+                .await;
+
+            let client = AuthenticatedClient::new(
+                Endpoints::for_test_server(&server.uri()).unwrap(),
+                UserAccessToken::new(SecretString::from(FIXTURE_TOKEN)),
+                Arc::new(TestClock::default()),
+            )
+            .unwrap();
+            let err = client
+                .send(&ApiRequest::get("/orgs/acme/actions/runners"))
+                .await
+                .expect_err("403 after a 401");
+            let locked = client.is_locked_out();
+            let remaining = client.lockout_remaining();
+            (err, locked, remaining)
+        }
+
+        // A day-long back-off is clamped to the ceiling.
+        let (err, locked, remaining) = lockout_for("86400").await;
+        let GithubError::AuthenticationLockout { retry_after } = &err else {
+            panic!("expected a lockout, got {err:?}");
+        };
+        assert_eq!(
+            *retry_after, MAX_LOCKOUT_BACKOFF,
+            "an unclamped Retry-After lets a remote party decide how long this product \
+             stays down"
+        );
+        assert!(locked);
+        assert!(remaining.is_some_and(|r| r <= MAX_LOCKOUT_BACKOFF));
+
+        // A value too large for `chrono` must still lock out. Before the fix
+        // this produced `until = None`: the more extreme the header, the less
+        // protection it bought.
+        let (err, locked, remaining) = lockout_for(&u64::MAX.to_string()).await;
+        assert!(err.is_lockout(), "{err:?}");
+        assert!(
+            locked,
+            "an absurd Retry-After must not mean `not locked out at all` — that fails open"
+        );
+        assert!(remaining.is_some_and(|r| r <= MAX_LOCKOUT_BACKOFF));
+    }
+
+    /// The lockout's own contract is "this client issues no HTTP at all", and
+    /// `revalidate` is HTTP. It documented an `AuthenticationLockout` it could
+    /// never return, which made the one direct entry point into the probe the
+    /// single exception to the rule.
+    #[tokio::test]
+    async fn a_direct_revalidation_is_refused_while_the_lockout_is_backing_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/actions/runners"))
+            .respond_with(Script::new(vec![
+                ResponseTemplate::new(401),
+                ResponseTemplate::new(403).insert_header("retry-after", "60"),
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(installations_body(&[])))
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        client
+            .send(&ApiRequest::get("/orgs/acme/actions/runners"))
+            .await
+            .expect_err("locks out");
+        assert!(client.is_locked_out());
+
+        let before = server.received_requests().await.unwrap().len();
+        let err = client
+            .revalidate()
+            .await
+            .expect_err("the documented lockout error is now reachable");
+        assert!(err.is_lockout(), "{err:?}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before,
+            "a locked-out client opens no socket, and the probe is not an exception"
+        );
+    }
+
     // -- installation discovery ---------------------------------------------
 
     #[tokio::test]
@@ -2307,6 +2856,114 @@ mod tests {
         );
     }
 
+    /// GitHub's published `installation` schema types `account` as **nullable**,
+    /// and as either a simple-user *or* an enterprise — which carries
+    /// `slug`/`name` where a user carries `login`. A required `RawAccount` with
+    /// a required `login` made either shape a hard `response.json()` failure,
+    /// which takes down all of `discover_installations`, which is all of
+    /// `auth status`. One unusual installation must not blind the command that
+    /// exists to show the user what their credential can reach.
+    #[tokio::test]
+    async fn an_installation_with_a_null_or_enterprise_account_does_not_fail_the_whole_decode() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total_count": 3,
+                "installations": [
+                    // Nullable, per the published schema.
+                    { "id": 10, "account": null, "repository_selection": "selected" },
+                    // An enterprise: no `login` at all.
+                    {
+                        "id": 20,
+                        "account": { "slug": "acme-enterprise", "name": "Acme Inc" },
+                        "repository_selection": "selected"
+                    },
+                    // And an ordinary user alongside them.
+                    {
+                        "id": 30,
+                        "account": { "login": "IvanMurzak", "type": "User" },
+                        "repository_selection": "selected"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (id, repo) in [(20_u64, "acme-enterprise/tools"), (30, "IvanMurzak/app")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/user/installations/{id}/repositories")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(repositories_body(&[repo])))
+                .mount(&server)
+                .await;
+        }
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let targets = client
+            .discover_installations(&app())
+            .await
+            .expect("one odd account must not fail the whole discovery")
+            .targets()
+            .cloned()
+            .expect("installed");
+
+        // Membership rather than order: what matters here is that neither
+        // installation was lost, not how `OwnerRepo` collates.
+        let reached = targets
+            .repositories()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            reached.contains(&"acme-enterprise/tools".to_string()),
+            "the enterprise installation is named from `slug` rather than dropped: {reached:?}"
+        );
+        assert!(
+            reached.contains(&"IvanMurzak/app".to_string()),
+            "the ordinary installation alongside it survives too: {reached:?}"
+        );
+        assert_eq!(reached.len(), 2);
+        assert_eq!(
+            targets.installations().len(),
+            2,
+            "the null account is skipped, and only it"
+        );
+    }
+
+    /// A `Link: rel="next"` that points back at the page it arrived on is an
+    /// infinite loop inside the agent's reconciliation loop — the one place in
+    /// this product that must not be able to wedge. The ceiling is what makes
+    /// this test terminate at all.
+    #[tokio::test]
+    async fn a_self_referential_link_header_stops_at_the_page_ceiling() {
+        let server = MockServer::start().await;
+        let self_link = format!("<{}/user/installations?page=2>; rel=\"next\"", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(installations_body(&[]))
+                    .insert_header("link", self_link.as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server, Arc::new(TestClock::default()));
+        let discovery = client
+            .discover_installations(&app())
+            .await
+            .expect("the ceiling is what makes this return at all");
+
+        assert!(
+            discovery.install_url().is_some(),
+            "no installation was found"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            MAX_PAGES,
+            "pagination must stop at the ceiling rather than follow the loop forever"
+        );
+    }
+
     #[test]
     fn a_link_header_yields_only_the_next_relation() {
         let header = "<https://api.github.com/user/installations?page=3>; rel=\"next\", \
@@ -2317,6 +2974,75 @@ mod tests {
         );
         assert!(parse_link_next("<https://x/>; rel=\"last\"").is_none());
         assert!(parse_link_next("nonsense").is_none());
+    }
+
+    /// A comma is legal inside a URL and GitHub sends such URLs routinely — a
+    /// runner query carries `labels=self-hosted,windows`. Splitting the header
+    /// on `,` before recognising `<...>` tore that URL in half, found no
+    /// relation, and stopped paginating at page 1 while reporting success. That
+    /// is precisely what `04-subsystem-contracts.md` forbids ("the dashboard
+    /// must not treat a first page as a complete inventory"), in the one shared
+    /// reader `c3`'s inventory also goes through.
+    #[test]
+    fn a_next_url_containing_a_comma_still_paginates() {
+        let header = "<https://api.github.com/repos/o/r/actions/runners\
+                      ?labels=self-hosted,windows&page=2>; rel=\"next\"";
+        assert_eq!(
+            parse_link_next(header).map(|u| u.to_string()),
+            Some(
+                "https://api.github.com/repos/o/r/actions/runners\
+                 ?labels=self-hosted,windows&page=2"
+                    .to_string()
+            ),
+            "a comma inside the URL must not end the link-value"
+        );
+
+        // The same URL as the second link-value, so the scan has to walk past a
+        // comma-bearing target to reach the relation it wants.
+        let header = "<https://api.github.com/x?a=1,2&page=1>; rel=\"prev\", \
+                      <https://api.github.com/x?a=1,2&page=3>; rel=\"next\"";
+        assert_eq!(
+            parse_link_next(header).map(|u| u.to_string()),
+            Some("https://api.github.com/x?a=1,2&page=3".to_string())
+        );
+    }
+
+    /// `rel="next"` is not always the first link-value, and both quoted and
+    /// unquoted forms are legal.
+    #[test]
+    fn the_next_relation_is_found_wherever_it_sits_in_the_header() {
+        let not_first = "<https://api.github.com/u?page=1>; rel=\"first\", \
+                         <https://api.github.com/u?page=9>; rel=\"last\", \
+                         <https://api.github.com/u?page=4>; rel=\"next\"";
+        assert_eq!(
+            parse_link_next(not_first).map(|u| u.to_string()),
+            Some("https://api.github.com/u?page=4".to_string())
+        );
+
+        let unquoted = "<https://api.github.com/u?page=1>; rel=prev, \
+                        <https://api.github.com/u?page=3>; rel=next";
+        assert_eq!(
+            parse_link_next(unquoted).map(|u| u.to_string()),
+            Some("https://api.github.com/u?page=3".to_string())
+        );
+
+        assert!(
+            parse_link_next("<https://api.github.com/u?page=2; rel=\"next\"").is_none(),
+            "an unterminated target is not a link-value"
+        );
+    }
+
+    /// The free cross-check that would have caught the comma bug on its own.
+    #[test]
+    fn a_short_collection_is_measured_against_the_count_github_reported() {
+        assert_eq!(under_collected(1, Some(2)), Some(2), "page 2 was dropped");
+        assert_eq!(under_collected(2, Some(2)), None, "complete");
+        assert_eq!(
+            under_collected(3, Some(2)),
+            None,
+            "a collection that grew between pages is not an under-collection"
+        );
+        assert_eq!(under_collected(0, None), None, "no count, no claim");
     }
 
     // -- redaction ----------------------------------------------------------
@@ -2346,161 +3072,146 @@ mod tests {
         assert!(!rendered.contains("SECRETBLOB"), "{rendered}");
     }
 
-    /// The Definition of Done's log scan, over a whole login and an
-    /// authenticated round trip that takes a `401`, re-validates, and retries.
-    ///
-    /// A hand-written `tracing` subscriber rather than `tracing-subscriber`,
-    /// which is not a dependency of this crate — and `a1` owns every manifest,
-    /// so needing one would have been a reason to stop rather than to edit.
-    ///
-    /// The flow deliberately logs `?auth`, `?token` and `?client` before
-    /// scanning. That is what makes this test bite: it forces every `Debug` impl
-    /// that holds a secret through the subscriber, so a `#[derive(Debug)]` added
-    /// to any of them later fails here rather than in production.
-    #[test]
-    fn no_secret_reaches_the_logs() {
-        use crate::device_flow::DeviceFlow;
-
-        let sink = CaptureLog::default();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a current-thread runtime, so the thread-local subscriber applies throughout");
-
-        tracing::subscriber::with_default(sink.subscriber(), || {
-            runtime.block_on(async {
-                let server = MockServer::start().await;
-                Mock::given(method("POST"))
-                    .and(path("/login/device/code"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                        "device_code": FIXTURE_DEVICE_CODE,
-                        "user_code": FIXTURE_USER_CODE,
-                        "verification_uri": format!("{}/login/device", server.uri()),
-                        "expires_in": 900,
-                        "interval": 5
-                    })))
-                    .mount(&server)
-                    .await;
-                Mock::given(method("POST"))
-                    .and(path("/login/oauth/access_token"))
-                    .respond_with(Script::new(vec![
-                        ResponseTemplate::new(200)
-                            .set_body_json(json!({"error": "authorization_pending"})),
-                        ResponseTemplate::new(200).set_body_json(token_body()),
-                    ]))
-                    .mount(&server)
-                    .await;
-                Mock::given(method("GET"))
-                    .and(path("/orgs/acme/actions/runners"))
-                    .respond_with(Script::new(vec![
-                        ResponseTemplate::new(401)
-                            .set_body_json(json!({"message": "Bad credentials"})),
-                        ResponseTemplate::new(200).set_body_json(json!({"total_count": 0})),
-                    ]))
-                    .mount(&server)
-                    .await;
-                Mock::given(method("GET"))
-                    .and(path("/user/installations"))
-                    .respond_with(
-                        ResponseTemplate::new(200).set_body_json(installations_body(&[(
-                            11,
-                            "IvanMurzak",
-                            "User",
-                            "selected",
-                        )])),
-                    )
-                    .mount(&server)
-                    .await;
-                Mock::given(method("GET"))
-                    .and(path("/user/installations/11/repositories"))
-                    .respond_with(
-                        ResponseTemplate::new(200).set_body_json(repositories_body(&["a/b"])),
-                    )
-                    .mount(&server)
-                    .await;
-
-                let endpoints = Endpoints::for_test_server(&server.uri()).unwrap();
-                let flow = DeviceFlow::new(app(), endpoints.clone()).unwrap();
-                let auth = flow.start().await.expect("device authorization");
-                tracing::info!(?auth, "device authorization, rendered through Debug");
-
-                let sleeper = crate::testing::RecordingSleeper::default();
-                let token = flow.complete(&auth, &sleeper).await.expect("approved");
-                tracing::info!(?token, "user access token, rendered through Debug");
-
-                let client = AuthenticatedClient::new(
-                    endpoints,
-                    token.clone(),
-                    Arc::new(TestClock::default()),
-                )
-                .unwrap();
-                tracing::info!(?client, "authenticated client, rendered through Debug");
-
-                client
-                    .send(&ApiRequest::get("/orgs/acme/actions/runners"))
-                    .await
-                    .expect("401 then retry");
-                client
-                    .discover_installations(&app())
-                    .await
-                    .expect("discovery");
-            });
-        });
-
-        let logs = sink.contents();
-        assert!(!logs.is_empty(), "the subscriber captured nothing to scan");
-        assert!(
-            !logs.contains(FIXTURE_TOKEN),
-            "the user access token reached the logs:\n{logs}"
-        );
-        assert!(
-            !logs.contains(FIXTURE_DEVICE_CODE),
-            "the device code reached the logs:\n{logs}"
-        );
-        assert!(
-            !logs.to_ascii_lowercase().contains("bearer "),
-            "an Authorization header value reached the logs:\n{logs}"
-        );
-        assert!(
-            logs.contains(FIXTURE_USER_CODE),
-            "the user code is displayed by design and only during login, so the flow \
-             must still surface it: {logs}"
-        );
-    }
+    // The Definition of Done's log scan is `tests/no_secret_reaches_the_logs.rs`
+    // and not a unit test here. See the note at the end of `mod testing` for the
+    // `tracing` callsite-cache reason it cannot be one.
 
     /// The Definition of Done's second item, made checkable rather than
-    /// reviewed: "no refresh-token code path exists, and no client secret
+    /// reviewed: "no renewal token code path exists, and no client secret
     /// appears anywhere in the crate **or its configuration**".
     ///
-    /// The two files `c2` owns are scanned, and so is the crate's manifest —
-    /// that is what "or its configuration" means for a crate with no config file
-    /// of its own. `rest.rs`, `demand.rs` and `jit.rs` are deliberately **not**
-    /// scanned: they belong to `c3` and `c4`, and a test here that failed on
-    /// their work would be this task reaching across an ownership boundary.
+    /// # Normalised, because a literal scan is evaded by naming
+    ///
+    /// This used to be a case-sensitive `contains` over two snake-case
+    /// spellings, which is a gate that any ordinary Rust or JSON identifier
+    /// walks straight through: the camel-cased, Pascal-cased and kebab-cased
+    /// spellings of the very same two identifiers were all invisible to it, and
+    /// so was a screaming-snake constant. None of those is exotic — several are
+    /// what the surrounding ecosystem actually calls these fields — so evading
+    /// this gate never had to be deliberate. Lower-casing the source and
+    /// stripping `_` and `-` collapses every one of them onto a single needle.
+    ///
+    /// The consequence is that this crate's *prose* may no longer write those
+    /// identifiers either, in any casing: it says "renewal token" and "client
+    /// secret" as separate words, which normalisation preserves and the scan
+    /// therefore ignores. That is a real constraint on the documentation, and it
+    /// is the right way round — a gate loosened until the comments compile is
+    /// not a gate.
+    ///
+    /// # Two different scopes, for two different reasons
+    ///
+    /// The **renewal** half stays scoped to the two files `c2` owns plus the
+    /// manifest. A renewal path in `c3`'s or `c4`'s file would be their finding;
+    /// failing here on their work would be this task reaching across an
+    /// ownership boundary.
+    ///
+    /// The **client secret** half covers every source file in the crate. That is
+    /// not a boundary crossing but the opposite: a public client cannot hold a
+    /// client secret at all (D3, `07-security.md`), so one appearing *anywhere*
+    /// in this crate is a product defect rather than a matter of whose file it
+    /// is, and `c2` is the designated owner of that clause.
     ///
     /// Prose in this crate deliberately writes "renewal token" and "client
-    /// secret" with a space so that this scan stays meaningful.
+    /// secret" with a space — which normalisation preserves — so that this scan
+    /// stays meaningful.
     #[test]
     fn no_renewal_path_and_no_confidential_credential_in_this_crate() {
-        for (name, source) in [
+        /// Lower-case, and `_`/`-` removed, so that one needle catches every
+        /// casing and word-separator convention. A space is *not* stripped: that
+        /// is what lets this crate's prose discuss a "client secret" without
+        /// tripping its own gate.
+        fn normalise(source: &str) -> String {
+            source.to_ascii_lowercase().replace(['_', '-'], "")
+        }
+
+        // Spelled in halves so that this test's own source does not trip the
+        // scan it runs: normalising `concat!("refresh", "token")` leaves the
+        // quote-comma-quote between the halves, so no needle appears whole.
+        const RENEWAL: &[&str] = &[concat!("refresh", "token")];
+        const CONFIDENTIAL: &[&str] = &[concat!("client", "secret"), concat!("app", "secret")];
+
+        let owned_by_c2 = [
             ("lib.rs", include_str!("lib.rs")),
             ("device_flow.rs", include_str!("device_flow.rs")),
             ("Cargo.toml", include_str!("../Cargo.toml")),
-        ] {
-            // Spelled in halves so that this test's own source does not trip it.
-            for forbidden in [
-                concat!("refresh", "_token"),
-                concat!("client", "_secret"),
-                concat!("REFRESH", "_TOKEN"),
-                concat!("CLIENT", "_SECRET"),
-                concat!("grant_type=refresh", "_token"),
-            ] {
+        ];
+        let whole_crate = [
+            ("lib.rs", include_str!("lib.rs")),
+            ("device_flow.rs", include_str!("device_flow.rs")),
+            ("rest.rs", include_str!("rest.rs")),
+            ("demand.rs", include_str!("demand.rs")),
+            ("jit.rs", include_str!("jit.rs")),
+            ("Cargo.toml", include_str!("../Cargo.toml")),
+        ];
+
+        for (name, source) in owned_by_c2 {
+            let haystack = normalise(source);
+            for forbidden in RENEWAL {
                 assert!(
-                    !source.contains(forbidden),
-                    "{name} contains {forbidden:?}: a public client cannot hold a client \
-                     secret, and the published App issues nothing to renew (D3)"
+                    !haystack.contains(forbidden),
+                    "{name} names {forbidden:?} in some spelling: the published App opts out \
+                     of user-token expiration, so GitHub issues nothing to renew (D3)"
                 );
             }
+        }
+
+        for (name, source) in whole_crate {
+            let haystack = normalise(source);
+            for forbidden in CONFIDENTIAL {
+                assert!(
+                    !haystack.contains(forbidden),
+                    "{name} names {forbidden:?} in some spelling: a public client cannot \
+                     secure a confidential credential, and this design never tries to (D3)"
+                );
+            }
+        }
+    }
+
+    /// The scan above, shown to actually catch the spellings it claims to.
+    ///
+    /// Without this, "the gate is case-insensitive now" is a comment rather than
+    /// a fact — and the finding that produced it was precisely a gate whose
+    /// description outran what it did.
+    #[test]
+    fn the_confidential_credential_scan_is_not_evaded_by_naming() {
+        fn normalise(source: &str) -> String {
+            source.to_ascii_lowercase().replace(['_', '-'], "")
+        }
+
+        // Assembled at run time rather than written out, for the same reason the
+        // needles are spelled in halves: a test that contained these spellings
+        // literally would fail the scan it is checking.
+        let evasions = [
+            format!("let {}Token = fetch()", "refresh"),
+            format!("struct {}Token;", "Refresh"),
+            format!("{}_TOKEN", "REFRESH"),
+            format!("{}Secret", "client"),
+            format!("{}-secret", "client"),
+            format!("{}_SECRET", "CLIENT"),
+            format!("{}_secret", "app"),
+        ];
+        for evasion in &evasions {
+            let normalised = normalise(evasion);
+            assert!(
+                normalised.contains(concat!("refresh", "token"))
+                    || normalised.contains(concat!("client", "secret"))
+                    || normalised.contains(concat!("app", "secret")),
+                "{evasion:?} would walk straight through the scan"
+            );
+        }
+
+        // And the prose the crate legitimately writes must still pass, or the
+        // gate would be unusable and would be weakened again to make it usable.
+        for allowed in [
+            "a public client cannot hold a client secret",
+            "the published App issues no renewal token",
+        ] {
+            let normalised = normalise(allowed);
+            assert!(
+                !normalised.contains(concat!("client", "secret"))
+                    && !normalised.contains(concat!("refresh", "token")),
+                "{allowed:?} is prose, not an identifier, and must not trip the scan"
+            );
         }
     }
 
@@ -2526,7 +3237,20 @@ mod tests {
                 .split("#[cfg(test)]")
                 .next()
                 .expect("split always yields a first element");
-            for forbidden in ["std::fs", "fs::write", "File::create", "tokio::fs"] {
+            // `OpenOptions`, `File::options` and `std::io::Write` are on this
+            // list because the original four named only the *obvious* ways to
+            // write a file. A store built with `OpenOptions::new().create(true)`
+            // would have moved the persistence boundary silently, which is the
+            // one thing this scan exists to prevent.
+            for forbidden in [
+                "std::fs",
+                "fs::write",
+                "File::create",
+                "File::options",
+                "OpenOptions",
+                "std::io::Write",
+                "tokio::fs",
+            ] {
                 assert!(
                     !non_test.contains(forbidden),
                     "{name} performs a filesystem operation ({forbidden:?}) outside its tests"

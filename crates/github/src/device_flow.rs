@@ -55,8 +55,11 @@
 //! user-token expiration, so GitHub issues no renewal token with the access
 //! token; renewing a user token requires the client secret, which a public
 //! client cannot hold. `lib.rs`'s
-//! `tests::no_renewal_path_and_no_confidential_credential_in_this_crate` scans both
-//! files for the identifiers such a path would need.
+//! `tests::no_renewal_path_and_no_confidential_credential_in_this_crate` scans
+//! this file and `lib.rs` for the identifiers such a path would need — after
+//! normalising case and word separators, so that a camel-cased or kebab-cased
+//! spelling is the same needle. That normalisation is why the prose here writes
+//! "renewal token" and "client secret" as separate words.
 
 use std::{fmt, time::Duration};
 
@@ -83,6 +86,19 @@ pub const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 /// The interval used when a response omits one. RFC 8628's default.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many consecutive retryable failures one [`DeviceFlow::complete`] loop
+/// absorbs before giving up.
+///
+/// A device login polls for up to fifteen minutes, on the product's *only*
+/// authentication path, while a human reads a code and walks to a browser.
+/// Propagating the first dropped packet aborts all of that and makes the user
+/// start again and re-approve — a login destroyed by a blip that the very next
+/// poll, five seconds later, would not have noticed. Five is enough to ride out
+/// a transient network or gateway fault and few enough that a genuinely
+/// unreachable GitHub is still reported promptly rather than polled at for the
+/// whole expiry window.
+pub const MAX_TRANSPORT_RETRIES: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -149,16 +165,39 @@ pub enum DeviceFlowError {
 }
 
 impl DeviceFlowError {
-    /// Whether presenting the same login again could succeed.
+    /// Whether presenting the *same* login again could succeed.
     ///
-    /// `false` for every variant here: the two recoverable states,
-    /// `authorization_pending` and `slow_down`, are [`PollOutcome`]s and never
-    /// become errors at all. It is a method rather than a comment because a
-    /// caller that retries [`DeviceFlowError::AccessDenied`] re-prompts a user
-    /// who has already refused.
+    /// The two recoverable protocol states, `authorization_pending` and
+    /// `slow_down`, are [`PollOutcome`]s and never become errors at all, so this
+    /// is not about them. It is about the two failures that say nothing about
+    /// the login: a dropped connection and a `5xx` from a gateway. The device
+    /// code is still live in both cases, and the next poll can still succeed —
+    /// which is why [`DeviceFlow::complete`] absorbs up to
+    /// [`MAX_TRANSPORT_RETRIES`] of them rather than destroying a login over a
+    /// blip.
+    ///
+    /// Everything else is `false`, and deliberately so. A caller that retried
+    /// [`DeviceFlowError::AccessDenied`] would re-prompt a user who has already
+    /// refused; one that retried [`DeviceFlowError::Expired`] would present a
+    /// code GitHub has already discarded. Those are the cases this method exists
+    /// to keep `false`, and no `5xx` handling may be allowed to blur them.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        false
+        match self {
+            Self::Transport(_) => true,
+            // A `5xx` is the far end failing, not an answer about this login. A
+            // `4xx` is an answer.
+            Self::Status { status, .. } => (500..600).contains(status),
+            Self::AccessDenied
+            | Self::Expired
+            | Self::IncorrectDeviceCode
+            | Self::AppMisconfigured { .. }
+            | Self::Unexpected { .. }
+            | Self::UntrustedVerificationUri { .. }
+            | Self::Decode { .. }
+            | Self::Malformed { .. }
+            | Self::Config(_) => false,
+        }
     }
 
     /// Whether the remedy is a fresh `auth login` rather than a maintainer fix.
@@ -422,11 +461,27 @@ impl DeviceFlow {
 
         let status = response.status();
         let bytes = response.bytes().await.map_err(transport)?;
-        let mut raw: RawTokenResponse =
-            serde_json::from_slice(&bytes).map_err(|source| DeviceFlowError::Decode {
-                stage: "access token",
-                source,
-            })?;
+        let mut raw: RawTokenResponse = match serde_json::from_slice(&bytes) {
+            Ok(raw) => raw,
+            // A body that is not the protocol's JSON at all — a proxy's HTML
+            // error page, say — is the *status*'s story, not a decode failure.
+            // Reporting a `502` as `Decode` hides the one fact that mattered
+            // behind a parser message, and makes a retryable gateway hiccup look
+            // like a terminal protocol violation. The status is only consulted
+            // here, once the body has already failed to be the protocol.
+            Err(source) => {
+                if status.is_success() {
+                    return Err(DeviceFlowError::Decode {
+                        stage: "access token",
+                        source,
+                    });
+                }
+                return Err(DeviceFlowError::Status {
+                    status: status.as_u16(),
+                    stage: "access token request",
+                });
+            }
+        };
 
         // GitHub answers the pending and slow-down states with HTTP 200 and an
         // `error` field, so the body is authoritative and the status is only a
@@ -512,6 +567,22 @@ impl DeviceFlow {
     /// `expired_token` remains authoritative and is checked first every round;
     /// this only catches a server that never sends it.
     ///
+    /// # One dropped packet does not kill a login
+    ///
+    /// A failure that says nothing about the login —
+    /// [`DeviceFlowError::is_retryable`], meaning a transport error or a `5xx` —
+    /// is absorbed here rather than propagated, up to
+    /// [`MAX_TRANSPORT_RETRIES`] consecutive times. This loop is the right place
+    /// for it and the caller is not: the poll interval, the expiry budget and
+    /// the device code all live here, so a retry costs one more scheduled poll
+    /// and nothing else, while a caller retrying `complete` would restart the
+    /// budget and re-derive the back-off. The counter resets on every successful
+    /// poll, so it bounds a *burst*, not the whole login.
+    ///
+    /// The four terminal states of the error matrix are unaffected: they are not
+    /// retryable, and a login the user declined is still refused on the first
+    /// answer.
+    ///
     /// # Errors
     /// Every terminal member of the error matrix.
     pub async fn complete(
@@ -521,6 +592,7 @@ impl DeviceFlow {
     ) -> Result<UserAccessToken, DeviceFlowError> {
         let mut interval = authorization.interval;
         let mut elapsed = Duration::ZERO;
+        let mut consecutive_retryable = 0_u32;
 
         loop {
             // Wait first: the user has to read the code, open the page, and type
@@ -528,7 +600,28 @@ impl DeviceFlow {
             sleeper.sleep(interval).await;
             elapsed = elapsed.saturating_add(interval);
 
-            match self.poll_once_from(authorization, interval).await? {
+            let outcome = match self.poll_once_from(authorization, interval).await {
+                Ok(outcome) => {
+                    consecutive_retryable = 0;
+                    outcome
+                }
+                Err(err) if err.is_retryable() && consecutive_retryable < MAX_TRANSPORT_RETRIES => {
+                    consecutive_retryable += 1;
+                    tracing::warn!(
+                        attempt = consecutive_retryable,
+                        max_attempts = MAX_TRANSPORT_RETRIES,
+                        error = %err,
+                        "a device-flow poll failed in a way that says nothing about the login; \
+                         the device code is still live, so polling continues"
+                    );
+                    // Indistinguishable from "not approved yet" as far as this
+                    // loop is concerned: wait the interval and ask again.
+                    PollOutcome::Pending
+                }
+                Err(err) => return Err(err),
+            };
+
+            match outcome {
                 PollOutcome::Approved(token) => return Ok(token),
                 PollOutcome::SlowDown { interval: next } => interval = next,
                 PollOutcome::Pending => {}
@@ -931,6 +1024,202 @@ mod tests {
             "a refusal is not an expiry: `auth login` again is the operator's choice, \
              not this error's instruction"
         );
+    }
+
+    // -- one dropped packet must not kill a login ---------------------------
+
+    /// `is_retryable()` was unconditionally `false`, and `complete()` propagates
+    /// with `?`, so a single transient failure anywhere in a fifteen-minute poll
+    /// aborted the whole login and made the user approve again — on the
+    /// product's only authentication path.
+    #[tokio::test]
+    async fn a_gateway_blip_mid_poll_does_not_abort_the_login() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        mount_token(
+            &server,
+            vec![
+                ResponseTemplate::new(502).set_body_string("<html>Bad Gateway</html>"),
+                ResponseTemplate::new(200).set_body_json(error_body("authorization_pending", None)),
+                ResponseTemplate::new(503).set_body_string("<html>Service Unavailable</html>"),
+                ResponseTemplate::new(200).set_body_json(token_body()),
+            ],
+        )
+        .await;
+
+        let flow = flow(&server);
+        let authorization = flow.start().await.unwrap();
+        let sleeper = RecordingSleeper::default();
+        let token = flow
+            .complete(&authorization, &sleeper)
+            .await
+            .expect("two blips must not destroy a login the user is about to approve");
+
+        assert_eq!(token.secret().expose_secret(), FIXTURE_TOKEN);
+        assert_eq!(
+            sleeper.recorded().len(),
+            4,
+            "each absorbed failure costs one more scheduled poll and nothing else"
+        );
+    }
+
+    /// The retry is bounded: a GitHub that is genuinely down is reported, not
+    /// polled at for the whole expiry window.
+    #[tokio::test]
+    async fn the_transport_retry_is_bounded_rather_than_endless() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        mount_token(
+            &server,
+            vec![ResponseTemplate::new(503).set_body_string("down")],
+        )
+        .await;
+
+        let flow = flow(&server);
+        let authorization = flow.start().await.unwrap();
+        let sleeper = RecordingSleeper::default();
+        let err = flow
+            .complete(&authorization, &sleeper)
+            .await
+            .expect_err("a persistently unreachable GitHub is still a failure");
+
+        assert!(
+            matches!(err, DeviceFlowError::Status { status: 503, .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            sleeper.recorded().len(),
+            MAX_TRANSPORT_RETRIES as usize + 1,
+            "one initial poll plus exactly {MAX_TRANSPORT_RETRIES} absorbed retries"
+        );
+    }
+
+    /// A real transport failure — nothing listening at all — takes the same
+    /// path. The bound is what stops this from polling until the device code
+    /// expires.
+    #[tokio::test]
+    async fn a_transport_failure_is_absorbed_and_bounded_like_a_gateway_error() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        let flow = flow(&server);
+        let authorization = flow.start().await.unwrap();
+
+        // A port the OS handed out and then took back: nothing is listening, so
+        // every poll is a connection failure rather than an HTTP answer. Bound
+        // to port 0 so this can never collide with a parallel worker's server.
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+            listener.local_addr().expect("a bound address").port()
+        };
+        let unreachable = DeviceFlow::new(
+            app(),
+            Endpoints::for_test_server(&format!("http://127.0.0.1:{dead_port}")).unwrap(),
+        )
+        .unwrap();
+
+        let sleeper = RecordingSleeper::default();
+        let err = unreachable
+            .complete(&authorization, &sleeper)
+            .await
+            .expect_err("nothing is listening");
+
+        assert!(matches!(err, DeviceFlowError::Transport(_)), "{err:?}");
+        assert!(
+            err.is_retryable(),
+            "the device code is still live, so `f1` may present this same login again"
+        );
+        assert_eq!(
+            sleeper.recorded().len(),
+            MAX_TRANSPORT_RETRIES as usize + 1,
+            "a dropped connection is absorbed like any other blip, and bounded the same way"
+        );
+    }
+
+    /// The body was decoded before the status was consulted, so a proxy's HTML
+    /// error page surfaced as a `Decode` failure — terminal-looking, and
+    /// silent about the one fact that mattered.
+    #[tokio::test]
+    async fn a_proxy_error_page_is_reported_as_its_status_not_as_a_decode_failure() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        mount_token(
+            &server,
+            vec![
+                ResponseTemplate::new(502)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html><body>502 Bad Gateway</body></html>"),
+            ],
+        )
+        .await;
+
+        let flow = flow(&server);
+        let authorization = flow.start().await.unwrap();
+        let err = flow
+            .poll_once(&authorization)
+            .await
+            .expect_err("a gateway page is not a token response");
+
+        match err {
+            DeviceFlowError::Status { status, stage } => {
+                assert_eq!(status, 502);
+                assert_eq!(stage, "access token request");
+            }
+            other => panic!("expected the status, got {other:?}"),
+        }
+    }
+
+    /// The other half of that reorder: the status is consulted only *after* the
+    /// body has failed to be the protocol, so a successful response carrying
+    /// nonsense is still a decode failure and is still terminal.
+    #[tokio::test]
+    async fn a_200_that_is_not_the_protocol_is_still_a_decode_failure() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        mount_token(
+            &server,
+            vec![ResponseTemplate::new(200).set_body_string("not json at all")],
+        )
+        .await;
+
+        let flow = flow(&server);
+        let authorization = flow.start().await.unwrap();
+        let err = flow.poll_once(&authorization).await.expect_err("garbage");
+
+        assert!(matches!(err, DeviceFlowError::Decode { .. }), "{err:?}");
+        assert!(
+            !err.is_retryable(),
+            "a 200 that is not the protocol is a protocol violation, not a blip"
+        );
+    }
+
+    /// The retry must never reach the four terminal states. A user who declined
+    /// is not asked again, and an expired code is not re-presented.
+    #[tokio::test]
+    async fn the_terminal_states_are_never_retried() {
+        for code in ["access_denied", "expired_token", "incorrect_device_code"] {
+            let server = MockServer::start().await;
+            mount_start(&server).await;
+            mount_token(
+                &server,
+                vec![ResponseTemplate::new(200).set_body_json(error_body(code, None))],
+            )
+            .await;
+
+            let flow = flow(&server);
+            let authorization = flow.start().await.unwrap();
+            let sleeper = RecordingSleeper::default();
+            let err = flow
+                .complete(&authorization, &sleeper)
+                .await
+                .expect_err("terminal");
+
+            assert!(!err.is_retryable(), "{code} must stay terminal: {err:?}");
+            assert_eq!(
+                sleeper.recorded().len(),
+                1,
+                "{code} must be answered on the first poll and never polled again"
+            );
+        }
     }
 
     /// One table, four codes, four distinct outcomes — which is the property the
