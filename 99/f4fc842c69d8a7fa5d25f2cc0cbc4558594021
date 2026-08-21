@@ -1,0 +1,24 @@
+.github/scripts/channels.sh
+  s_5332f62e0ed5a7::t_2781285f8168f6 463,476
+  s_5332f62e0ed5a7::t_87560862601e77 404,407-411
+crates/app/tests/release_channels.rs
+  s_5332f62e0ed5a7::t_6d85ebfb651636 524-527
+  s_5332f62e0ed5a7::t_55279257c27f72 781-853
+  s_5332f62e0ed5a7::t_f621a514991fec 510-515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "99f4fc842c69d8a7fa5d25f2cc0cbc4558594021",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
