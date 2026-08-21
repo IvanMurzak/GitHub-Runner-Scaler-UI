@@ -31,7 +31,7 @@ App, no private key, and no token.
    repositories to install the published App on.
 4. Run `runner-manager repo add OWNER/REPO --host-label home-win
    --max-capacity 1`.
-5. Copy the printed scale-set name into the repository workflow's `runs-on`.
+5. Copy the printed routing label into the repository workflow's `runs-on`.
 6. Run `runner-manager repo set-scale OWNER/REPO --enabled true`.
 7. Run `runner-manager service install` (or `runner-manager daemon run`).
 
@@ -48,16 +48,16 @@ screenful without exposing credentials.
 
 1. Run `runner-manager repo add OWNER/REPO --host-label home-win` with no
    `--max-capacity`.
-2. The command reports that the policy is monitor-only, that no scale set was
-   created, and that no runner will ever be started for it.
+2. The command reports that the policy is monitor-only and that no runner will
+   ever be started for it.
 3. The target appears in the TUI with its runners and in-progress workflow
    count.
 4. Later, `runner-manager repo set-capacity OWNER/REPO --max-capacity 1`
    promotes it to autoscale; `repo set-scale --enabled true` arms it.
 
-**Release gate:** A monitor-only policy starts no runner under any demand,
-creates no scale set, and is visually distinct from an autoscaling policy in
-every screen that lists policies. The onboarding copy states plainly that
+**Release gate:** A monitor-only policy starts no runner under any demand and
+is visually distinct from an autoscaling policy in every screen that lists
+policies. The onboarding copy states plainly that
 installing the App grants `Administration: Read and write` even in this mode.
 
 ### Journey 2: inspect active work in TUI
@@ -85,7 +85,7 @@ reach any repository in one additional action regardless of list length.
 3. Press `r`, select a repository, press `s` for its **Settings**.
 4. Toggle scale enabled and set `max_capacity`; the current value is shown
    before editing.
-5. Review the generated scale-set name and local host identity.
+5. Review the generated routing label and local host identity.
 6. Confirm the policy.
 
 **Release gate:** At most 5 focused form actions per settings screen, plus at
@@ -112,7 +112,7 @@ action and never presented as zero workload or successful scale-down. The
 1. The machine reboots with nobody logged in.
 2. The boot-start service starts the agent, which reads the user access token
    from the machine-scoped secret store.
-3. The agent reconciles the journal against GitHub and resumes long polling.
+3. The agent reconciles the journal against GitHub and resumes demand polling.
 4. `runner-manager service status` reports the start mode, the resolved binary
    path, and the last successful GitHub contact.
 

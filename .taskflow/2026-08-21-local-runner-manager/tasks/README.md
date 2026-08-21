@@ -1,5 +1,17 @@
 # Task specifications
 
+> **SUPERSEDED 2026-08-21 — do not execute this set.**
+>
+> `/taskflow-review` established that D4 (runner scale sets) is unusable and the
+> owner replaced it with public REST JIT ephemeral runners. That invalidates 13
+> of the 23 specifications below, deletes `c5` outright, and collapses most of
+> `c4`. Task files are immutable, so they are **not** patched in place; the set
+> must be re-derived by `/taskflow-tasks` against the corrected design.
+>
+> `c1-d17-scale-set-spike` is **complete** — it is what produced the evidence.
+> Its result lives in `docs/spikes/d17-user-to-server-scale-set-chain.md` and it
+> must not be re-run. Everything else was `pending` and nothing is lost.
+
 These files are **immutable specifications**. They carry no status field and are
 never edited to record progress. All live task state — status, run, PR, dates —
 exists only in [`../ROADMAP.md`](../ROADMAP.md), which `/taskflow-execute` owns.

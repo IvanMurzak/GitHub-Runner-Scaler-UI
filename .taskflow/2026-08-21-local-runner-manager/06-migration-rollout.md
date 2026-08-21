@@ -6,30 +6,35 @@ Phase numbers map to ROADMAP waves as recorded in `ROADMAP.md`.
 
 - Establish the Rust workspace, `rust-toolchain.toml`, committed `Cargo.lock`,
   `.gitignore`, and matrix CI in this repository.
-- **Run the D17 spike before any other authentication work:** prove that a
-  user-to-server token obtained by the device flow can mint a runner
-  registration token, complete the Actions-service admin exchange, open a
-  message session, call `AcquireJobs`, and generate a scale-set JIT config. A
-  negative result reverses D3; do not build the auth path until this is green.
+- **The D17 spike is complete (2026-08-21) and GREEN.** A user-to-server token
+  minted a runner registration token and completed the Actions-service admin
+  exchange at both scopes, confirming D3. The same run disproved D4: scale-set
+  creation is denied on every free-plan target, while public REST
+  `generate-jitconfig` succeeds. Evidence and method:
+  `docs/spikes/d17-user-to-server-scale-set-chain.md`.
 - Register the project's single published GitHub App once, under an
   owner-approved account, with exactly the permissions listed in
   `07-security.md`. Enable device flow. Opt **out** of user-token expiration.
   Do **not** generate a private key. Explicitly accept the
   `Administration: Read and write` consequence.
-- Create a disposable test repository and document its scale-set name.
+- Create a disposable test repository and document its routing label.
+- **Verify organization-scope `generate-jitconfig`**, which the spike could not
+  reach because the available credential lacked `admin:org`. D18's org path is
+  unproven until this passes.
 - Measure one representative workload on each host to choose `max_capacity`
   and `host_capacity`.
 
-**Gate:** The D17 spike passes. The published App is installable, device flow
-works end to end from a clean machine, the App installation is limited to the
-disposable repository, and the user token is stored in the selected
-machine-scoped secret store.
+**Gate:** The published App is installable, device flow works end to end from a
+clean machine, the App installation is limited to the disposable repository, the
+user token is stored in the selected machine-scoped secret store, and
+organization-scope `generate-jitconfig` is proven. The D17 spike itself is
+already satisfied.
 
 ## Phase 1: one-host, one-repository pilot
 
 - Install the binary on Windows with `host_capacity=1` and `max_capacity=1`.
-- Add one repository through the CLI, then enable one scale-set policy.
-- Change one test workflow to `runs-on: <scale-set-name>`.
+- Add one repository through the CLI, then enable one autoscale policy.
+- Change one test workflow to `runs-on: <routing-label>`.
 - Run a successful job, then test JIT expiry, network loss, restart recovery,
   boot-start recovery after a real reboot, and drain.
 
@@ -42,7 +47,7 @@ after a reboot without an interactive login.
 - Add repositories one at a time through CLI.
 - Keep legacy persistent runners available only with distinct labels during the
   observation period.
-- Move workflows to the scale-set name in small batches.
+- Move workflows to the routing label in small batches.
 - Observe capacity against both ceilings, startup latency, rate-limit behavior,
   cache health, runner-version freshness, and cleanup outcomes.
 
@@ -89,13 +94,16 @@ workflow labels no longer route work to them.
 
 | Risk | Mitigation | Rollback trigger |
 |---|---|---|
-| Scale-set public-preview protocol changes | Isolated adapter, pinned revision, contract tests, `protocol_flag` per policy. | Repeated protocol failure or incompatible API response. |
+| ~~Scale-set public-preview protocol changes~~ | **Removed by D4.** The product no longer speaks the preview protocol, which retires this risk together with its adapter, pinned revision, contract tests, and `protocol_flag`. | — |
+| Two hosts start a runner for the same queued job | No `AcquireJobs` equivalent exists on the REST path. Bounded by host-scoped routing labels, `max_capacity`, and `host_capacity`; a surplus ephemeral runner exits on idle timeout. | Sustained surplus runners, or an operator giving two hosts the same label. |
+| Demand polling exhausts the REST rate budget | Demand, inventory, and workflow counts share one 5,000 requests/hour ceiling. `add` refuses a configuration projected above half the floor. | Rate-limit backoff observed during normal operation. |
 | Host overload | Explicit per-policy `max_capacity` and host-wide `host_capacity`, start at one. | Sustained resource pressure or failed jobs. |
 | Slow cold start | Versioned local package/cache and measured optional warm minimum later. | Job startup violates agreed operational target. |
 | Cleanup failure | Journal, startup recovery, redacted diagnostics, no workspace reuse. | Orphaned runner/workspace persists after recovery. |
-| Misrouted workflow | Unique scale-set names and pilot isolation. | Job reaches an unintended host/OS. |
-| Credential exposure | Machine-scoped secret store, memory-only derived tokens, redaction, strict file permissions. | Any suspected token/JIT disclosure. |
-| The D17 assumption fails: user-to-server tokens cannot drive the scale-set chain | Spike runs first in Phase 0, before any auth implementation. Contingency is the per-user GitHub App with installation tokens, documented in `07-security.md`. | Spike returns a negative result; D3 is reopened. |
+| Misrouted workflow | Host-scoped routing labels and pilot isolation. | Job reaches an unintended host/OS. |
+| Credential exposure | Machine-scoped secret store, redaction, strict file permissions. D4 removed every derived GitHub credential, leaving one user token and the short-lived JIT blob. | Any suspected token/JIT disclosure. |
+| ~~The D17 assumption fails~~ | **Resolved GREEN 2026-08-21.** User-to-server tokens do drive the credential chain at both scopes; the per-user-App contingency is not needed. | — |
+| Organization-scope JIT registration turns out to be denied too | Unverified as of 2026-08-21. Phase 0 now gates on proving it. | `POST /orgs/{org}/actions/runners/generate-jitconfig` fails; D18 loses its org path. |
 | The published App becomes a single point of trust and failure | The project never generates a private key for it, so it cannot mint installation tokens for anyone. Permission set is fixed and published. Users revoke by uninstalling. | Any compromise of the App registration itself. |
 | Runner package goes stale and jobs start failing | 30-day freshness check before each cold start; version rejection treated as terminal, not retryable. | Repeated version-rejection responses. |
 | Prolonged host outage silently loses queued work | Offline state names the 24-hour queue-cancellation bound. | Outage approaching 24 hours with queued demand. |

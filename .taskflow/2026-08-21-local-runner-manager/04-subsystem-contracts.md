@@ -14,10 +14,10 @@ Host {
 ScalePolicy {
   id: UUID, target: ScaleTarget, installation_id: u64,
   host_id: UUID, mode: PolicyMode,
-  scale_set_id: Option<String>, scale_set_name: Option<String>,
+  routing_labels: Option<NonEmpty<Label>>,
   enabled: bool, state: PolicyState,
   min_capacity: u16, max_capacity: Option<NonZeroU16>,
-  protocol_flag: ProtocolCompat, cache_policy: CachePolicy, revision: u64
+  cache_policy: CachePolicy, revision: u64
 }
 ScaleTarget = Repository(OwnerRepo) | Organization(Org)
 PolicyMode  = MonitorOnly | Autoscale
@@ -35,13 +35,19 @@ identical.
 
 `PolicyMode` carries D19 and is an enforced invariant, not a convention:
 
-- `MonitorOnly` requires `scale_set_id`, `scale_set_name`, and `max_capacity`
-  to be `None`. The policy is read-only: it contributes runners and workflow
-  counts to the dashboard and is skipped entirely by reconciliation.
-- `Autoscale` requires all three to be `Some`.
+- `MonitorOnly` requires `routing_labels` and `max_capacity` to be `None`. The
+  policy is read-only: it contributes runners and workflow counts to the
+  dashboard and is skipped entirely by reconciliation.
+- `Autoscale` requires both to be `Some`.
 
 A write that violates either shape is rejected in the domain layer, so an
-autoscale policy without a capacity ceiling cannot be persisted.
+autoscale policy without a capacity ceiling or without a routing label cannot
+be persisted.
+
+D4 removed `scale_set_id`, `scale_set_name`, and `protocol_flag` from this
+model. `routing_labels` replaces the scale-set name as the routing token, and
+it is a non-empty set rather than a single value because a JIT runner may carry
+several labels where a scale set carried one.
 
 `Host.host_capacity` is the ceiling on concurrent runner attempts across every
 policy on this machine (D9). `ScalePolicy.max_capacity` is the per-policy
@@ -49,7 +55,7 @@ ceiling. Both are settable from the CLI and editable in TUI settings, which
 display their current values alongside the current in-use count.
 
 `min_capacity <= max_capacity` is validated on every write of an `Autoscale`
-policy, so `clamp(total_assigned_jobs, min_capacity, max_capacity)` is always
+policy, so `clamp(demand, min_capacity, max_capacity)` is always
 well-defined. `min_capacity` is fixed at 0 in v1.
 
 `AttemptState` is:
@@ -79,45 +85,39 @@ explicit repair instruction instead of a silent destructive retry.
 
 ## GitHub gateway contract
 
-Two distinct hosts are involved. `api.github.com` serves inventory; the Actions
-service tenant (`_apis/runtime/runnerscalesets`) serves scale-set operations.
-They have different authentication, different versioning, and different
-rate-limit semantics.
+After D4 there is exactly one host and one protocol: typed REST against
+`api.github.com`. The Actions-service tenant, with its separate authentication,
+versioning, and rate-limit semantics, is gone.
 
-| Operation | Protocol | Result |
+| Operation | Endpoint | Result |
 |---|---|---|
 | Obtain a user access token | `github.com/login/device` device flow, public `client_id` only | Non-expiring user-to-server token. No redirect, no client secret, no server. |
-| Discover repositories the App is installed on | `api.github.com`, user-to-server REST | Authorized repository set. |
-| List runners | `api.github.com` REST, paginated; `/repos/{o}/{r}/actions/runners` or `/orgs/{org}/actions/runners` by policy target | Runner id, labels, OS, status, busy, ephemeral. |
-| Count activity | `api.github.com` REST workflow runs filtered to `in_progress`, per repository; an organization policy aggregates across the repositories the App is installed on | Per-target and aggregate workflow count. |
-| Download runner application | `api.github.com` REST runner-downloads metadata | OS/architecture URL plus optional `sha256_checksum`. |
-| Manage scale sets and message sessions | Actions-service `ScaleSetGateway` | Scale-set create/update/delete, session create/refresh, ownership metadata. |
-| Receive demand and acquire jobs | Actions-service long poll | `statistics.TotalAssignedJobs`, `JobAvailable` messages, `AcquireJobs`, `DeleteMessage` acknowledgement. |
-| Generate JIT config | Actions-service `_apis/runtime/runnerscalesets/{id}/generatejitconfig` | Encoded JIT config for a scale-set runner; request body is `{name, workFolder}`. |
+| Discover installed targets | user-to-server REST | Authorized repository and organization set. |
+| List runners | `/repos/{o}/{r}/actions/runners` or `/orgs/{org}/actions/runners`, paginated | Runner id, labels, OS, status, busy, ephemeral. |
+| Count activity | workflow runs filtered to `in_progress`; an organization policy aggregates across installed repositories | Per-target and aggregate workflow count. |
+| **Read demand** | workflow runs filtered to `queued`, then their jobs, matched against the policy's `routing_labels` | Count of queued jobs this policy should serve. |
+| Download runner application | runner-downloads REST | OS/architecture URL plus optional `sha256_checksum`. |
+| **Generate JIT configuration** | `POST /repos/{o}/{r}/actions/runners/generate-jitconfig`, or the `/orgs/{org}/` form; body `{name, runner_group_id, labels, work_folder}` | `encoded_jit_config` plus the runner reference. Needs `Administration: write` at repository scope. |
 
-The public REST endpoint `POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig`
-is **not** used. It requires a `runner_group_id` and a `labels` array, registers
-a runner into a runner *group* rather than a scale set, and produces a runner
-that the scale-set session can never assign work to.
+Verified 2026-08-21: the repository endpoint returns `201` on a personal
+free-plan account with runner group 1. The organization endpoint is
+**unverified**.
 
-All `api.github.com` requests set `X-GitHub-Api-Version` and an explicit
-`Accept` header. The scale-set adapter uses the Actions service's own
-`api-version` and is not covered by REST rate-limit headers. Pagination is
-mandatory; the dashboard must not treat a first page as a complete inventory.
-The `api.github.com` gateway honors `retry-after`, `x-ratelimit-remaining` and
-`x-ratelimit-reset`, idempotency semantics, and cancellation.
+All requests set `X-GitHub-Api-Version` and an explicit `Accept` header.
+Pagination is mandatory; the dashboard must not treat a first page as a
+complete inventory. The gateway honors `retry-after`, `x-ratelimit-remaining`,
+and `x-ratelimit-reset`, idempotency semantics, and cancellation.
 
-The scale-set protocol is Public Preview. It is isolated behind
-`ScaleSetGateway`; no TUI, CLI, domain, or platform module can deserialize its
-wire messages directly. `ScalePolicy.protocol_flag` allows a single policy
-to be pinned to a known-compatible protocol revision or disabled if the preview
-protocol drifts.
+**There is no job reservation.** The scale-set model's `AcquireJobs` has no REST
+equivalent, so demand is advisory: another host may take a job this host has
+already started a runner for. `02-target-architecture.md` records the bounding
+controls.
 
 ## Ownership and precedence
 
-1. A policy's `host_id` and unique scale-set name determine ownership. A
-   `MonitorOnly` policy owns nothing and can never be the reason a runner
-   starts.
+1. A policy's `host_id` and its host-scoped `routing_labels` determine
+   ownership. A `MonitorOnly` policy owns nothing and can never be the reason a
+   runner starts.
 2. A host agent may act only on attempts persisted under its `host_id`.
 3. GitHub runner status is authoritative for remote job status; local process
    state is authoritative only for a child process owned by this agent.
@@ -131,29 +131,48 @@ protocol drifts.
 ## Refresh and backpressure
 
 The TUI reads an in-memory snapshot. The agent independently refreshes runner
-inventory and workflow counts on a bounded interval, default 60 seconds with a
-hard floor of 30 seconds per repository. That worst case is roughly 240
-requests per hour per repository against the 5,000 requests/hour minimum that
-applies to the token in use. `repo add` computes the projected hourly budget and
-refuses a configuration that would exceed half of that floor. Manual refresh
-coalesces with an in-flight request. Rate limiting increases refresh delay and
-is displayed, never hidden. Long-poll demand is separate from UI refresh and is
-not stopped while the TUI is closed.
+inventory, workflow counts, **and demand** on a bounded interval, default 60
+seconds with a hard floor of 30 seconds per target.
+
+D4 changed this analysis materially. Under scale sets, long-poll demand was
+carried by the Actions service and did **not** consume the `api.github.com`
+budget. Demand now shares one ceiling with everything else:
+
+| Per target, per hour | at the 60 s default | at the 30 s floor |
+|---|---|---|
+| queued runs plus their jobs (demand) | ~120 | ~240 |
+| runner inventory | ~60 | ~120 |
+| in-progress workflow count | ~60 | ~120 |
+| **total** | **~240** | **~480** |
+
+The ceiling for a user-to-server token is **5,000 requests/hour**, measured
+2026-08-21. `add` computes the projected hourly budget and refuses a
+configuration that would exceed **half** of it, which allows roughly **10
+targets per host** at the 60-second default and **5** at the 30-second floor.
+
+That limit is a product constraint, not an implementation detail: it must be
+stated in `repo add` output and visible in host settings, because an operator
+who adds an eleventh repository needs to know why it was refused.
+
+Manual refresh coalesces with an in-flight request. Rate limiting increases the
+refresh delay and is displayed, never hidden. Demand polling continues while the
+TUI is closed.
 
 ## Test approach
 
 | Layer | Required tests |
 |---|---|
-| Domain | State transitions for `AttemptState` and `PolicyState`, `PolicyMode` shape invariants in both directions, repository/organization target equivalence, capacity math including the host ceiling and the `min <= max` invariant, workflow-count aggregation, disable/drain precedence, ownership rejection, and recovery decisions with fake time. |
-| GitHub gateway | Device-flow round trip including `authorization_pending`, `slow_down`, `expired_token`, and `access_denied`; HTTP fixtures for pagination, rate limits, 401 on a revoked token, 403 auth lockout, and the two-stage Actions-service token exchange. |
-| Scale-set adapter | Contract tests against the pinned protocol revision: demand decoding, `JobAvailable` to `AcquireJobs`, `DeleteMessage` acknowledgement, session-token refresh, JIT generation, and fail-closed decoding of unknown critical fields. |
-| Agent | Fake process and filesystem tests for spawn failure, restart/orphan cleanup, busy protection, idle-host zero-runner assertion, host-ceiling enforcement across multiple policies, and no duplicate runners under lock contention. |
+| Domain | State transitions for `AttemptState` and `PolicyState`, `PolicyMode` shape invariants in both directions, repository/organization target equivalence, capacity math including the host ceiling and the `min <= max` invariant, label-matching of queued jobs, workflow-count aggregation, disable/drain precedence, ownership rejection, and recovery decisions with fake time. |
+| GitHub gateway | Device-flow round trip including `authorization_pending`, `slow_down`, `expired_token`, and `access_denied`; HTTP fixtures for pagination, rate limits, 401 on a revoked token, and 403 auth lockout. |
+| Demand and JIT | Queued-run and job fixtures including `runs-on` forms that must and must not match the policy's labels; `generate-jitconfig` request shape, `201` decoding, and failure modes; budget projection against the documented ceiling. |
+| Agent | Fake process and filesystem tests for spawn failure, restart/orphan cleanup, busy protection, idle-host zero-runner assertion, host-ceiling enforcement across multiple policies, no duplicate runners under lock contention, and the surplus-runner path where a JIT runner receives no job and exits on idle timeout. |
 | Platform | Windows/macOS/Linux path, lock, machine-scoped secret store, and service adapter contract tests; privileged installer smoke tests on native CI runners; stale-binary-path detection after an npm-managed upgrade. |
-| CLI/TUI parity | Same-command dispatch equality, policy and host-capacity persistence round-trip, monitor-only to autoscale promotion, scripted noninteractive `repo add`, `org add`, `host set-capacity`, and `status --json`. |
+| CLI/TUI parity | Same-command dispatch equality, policy and host-capacity persistence round-trip, monitor-only to autoscale promotion, budget refusal, scripted noninteractive `repo add`, `org add`, `host set-capacity`, and `status --json`. |
 | UI | Ratatui snapshot tests for all screens, keyboard/mouse reducer tests, frame-budget test, resize behavior, focus order, and redaction. |
 | Security | Process-inspection, two-job contamination, corrupted-runner-package rejection, and secret-injection log-scan gates from `07-security.md`. |
 | End-to-end | A disposable GitHub test repository runs a real JIT job for each supported host OS. |
 
 Release acceptance requires at least one successful JIT job, a forced
 network-outage recovery, a JIT-expiry recovery, and a policy-disable drain on
-Windows, macOS, and Linux.
+Windows, macOS, and Linux, plus one live organization-scoped job proving D18's
+currently unverified org path.

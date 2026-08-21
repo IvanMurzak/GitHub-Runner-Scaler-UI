@@ -13,47 +13,52 @@
    --max-capacity 1`, or `runner-manager org add ORG --host-label home-win
    --max-capacity 1` for an organization-scoped policy (D18). Omitting
    `--max-capacity` creates a monitor-only policy instead (D19): the command
-   creates no scale set, stops after recording the target, and the flow ends
-   here.
+   stops after recording the target and the flow ends here.
 4. The command confirms the target is installed for the App, validates the
    host OS/architecture against GitHub's supported matrix, validates
-   `min_capacity <= max_capacity`, creates or resolves its host-owned scale
-   set at the policy's scope, and writes a transaction to local SQLite. The
-   policy is created in `pending`; scaling is never enabled by `add` (D20).
-5. It prints the scale-set name to use in `runs-on` and the next command;
+   `min_capacity <= max_capacity`, derives the host-scoped routing label, checks
+   the projected REST budget, and writes a transaction to local SQLite. **No
+   remote object is created** — after D4 there is nothing to create at add
+   time, which removes the partial-creation failure mode entirely. The policy is
+   created in `pending`; scaling is never enabled by `add` (D20).
+5. It prints the routing label to use in `runs-on` and the next command;
    secrets are never echoed.
 6. `runner-manager repo set-scale OWNER/REPO --enabled true` moves the policy
    to `active`.
-7. `daemon run` loads the active policy and starts its long-poll session.
+7. `daemon run` loads the active policy and starts its demand-polling loop.
 
 Failure: a missing installation, duplicate policy, invalid capacity, an
 inverted `min_capacity`/`max_capacity` pair, or an unavailable GitHub API
-leaves no active policy. A partially created remote scale set is recorded as
-`repair_required` and the command prints an explicit repair operation rather
-than silently retrying destructive deletion.
+leaves no active policy. Because `add` creates nothing remotely, there is no
+partial remote state to repair; `repair_required` survives only for a policy
+whose local transaction is inconsistent.
 
 ## 2. Demand to job completion
 
-1. The host agent sends its `max_capacity` in the scale-set long poll as the
-   `X-ScaleSetMaxCapacity` header.
-2. GitHub returns a message containing `statistics.TotalAssignedJobs` and any
-   `JobAvailable` messages.
-3. For every `JobAvailable` message the agent calls `AcquireJobs` with the
-   message's runner-request identifiers **before** reconciling capacity. An
-   unacquired assignment is cancelled and requeued by GitHub up to three times
-   with incremental delays, then stalls.
+1. The host agent polls queued workflow runs for each active policy's target
+   and resolves their jobs, on a bounded interval that shares the REST budget
+   with inventory refresh.
+2. It counts the queued jobs whose `runs-on` matches this policy's routing
+   labels. That count is the demand signal.
+3. **No acquisition step exists.** Nothing reserves a job for this host, so a
+   second host serving the same labels may start a runner for the same job.
+   `01-current-architecture.md` edge case 6 records the consequence and the
+   bounding controls.
 4. The agent calculates desired capacity, clamps it against both
    `max_capacity` and remaining `host_capacity` headroom, and takes the
    host-wide allocation lock before creating each local runtime.
 5. It downloads/verifies the cached runner package if required, creates
-   `runtime/<policy-id>/<attempt-id>/`, and asks the Actions service for a
-   scale-set JIT config through the `ScaleSetGateway`.
+   `runtime/<policy-id>/<attempt-id>/`, and requests a JIT configuration from
+   `POST /repos|orgs/…/actions/runners/generate-jitconfig` with the policy's
+   routing labels.
 6. The agent writes the JIT config only to a restrictive temporary file,
    launches the runner process, then removes the file immediately after
    successful handoff. The JIT config is never passed as a command-line
    argument.
-7. The runner accepts one job. The dashboard changes its lifecycle state from
-   `starting` to `busy` using process state plus GitHub telemetry.
+7. The runner accepts one job, or finds none and exits on its idle timeout —
+   the surplus case from step 3. The dashboard changes its lifecycle state from
+   `starting` to `busy` using process state plus GitHub telemetry, and shows an
+   idle-exit distinctly from a failure.
 8. On exit, the agent preserves redacted diagnostics, removes the workspace
    and JIT artifacts, and marks the attempt terminal.
 
@@ -74,10 +79,10 @@ workflow outcome.
    runner processes, reports `offline` in TUI/CLI, and backs off with jitter.
    The offline state states that queued jobs are cancelled by GitHub after 24
    hours, so a prolonged outage loses queued work.
-4. When connectivity returns, it re-establishes the Actions-service credential
-   chain and resumes long polling. It does not replay an already acknowledged message as
-   a new capacity count; `DeleteMessage` acknowledges, and the last processed
-   message id is passed to the next `GetMessage`.
+4. When connectivity returns, it resumes demand polling. Because demand is
+   recomputed from the current queued-job set on every poll rather than
+   accumulated from a message stream, a reconnect cannot double-count work — the
+   acknowledgement bookkeeping the scale-set model required does not exist.
 
 ## 4. Token and JIT expiry
 
@@ -86,12 +91,10 @@ workflow outcome.
    client secret, so there is nothing for the agent to renew and nothing for a
    server to hold. The token is revoked by the user uninstalling the App or
    revoking the authorization on GitHub.
-2. The Actions-service credential chain is derived from the user token and is
-   two-stage: the user token mints a runner registration token, which is
-   exchanged for an Actions-service admin token and tenant URL. That admin
-   token is refreshed 60 seconds before its expiry. Each message session
-   additionally carries its own message-queue token with an independent refresh
-   path.
+2. No derived GitHub credential exists. D4 removed the two-stage
+   Actions-service chain — registration token, admin token and tenant URL, and
+   per-session message-queue token — so the user access token is the only
+   credential the agent holds, and nothing needs periodic renewal.
 3. Expired or unauthorized REST responses trigger one refresh under a
    single-flight mutex, then one retry. A 403 following repeated 401s indicates
    GitHub's temporary authentication lockout, not a permissions change; the
@@ -109,8 +112,8 @@ workflow outcome.
 1. CLI or TUI asks for explicit confirmation when active runners exist.
 2. The policy becomes `draining`: no new JIT runners are created, busy runners
    finish normally, and queued demand is left visible.
-3. When active local runners reach zero, the scale-set session stops and the
-   policy becomes `disabled`.
+3. When active local runners reach zero, demand polling for the policy stops
+   and the policy becomes `disabled`.
 4. Deleting a policy requires an explicit `repo remove --purge`; disabling
    never deletes cache or historical diagnostics.
 

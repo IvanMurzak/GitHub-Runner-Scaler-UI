@@ -13,21 +13,20 @@
    and one cleanup path.
 5. **CLI is the source of configuration truth:** TUI settings dispatch the
    same commands and validations as noninteractive commands.
-6. **HTTPS only, two protocols:** typed GitHub REST over `api.github.com` for
-   inventory, and the Actions service scale-set protocol for demand, job
-   acquisition, and JIT configuration. Neither GraphQL, Kubernetes, nor a
-   separate server is required.
+6. **HTTPS only, one protocol, one host:** typed GitHub REST over
+   `api.github.com` for inventory, demand, and JIT configuration. No
+   Actions-service protocol (D4), no GraphQL, no Kubernetes, no server.
 
 ## Components
 
 ```text
-+---------------------+   HTTPS REST (api.github.com): inventory, counts
-| runner-manager      |------------------------------------------------+
-|                     |                                                |
-| CLI + Ratatui TUI   |   HTTPS (Actions service): scale sets, long     |
-| Domain + SQLite     |   poll, AcquireJobs, JIT config                 v
-| Host Agent          |------------------------------------------> GitHub Actions
-| GitHub App gateway  |<-----------------------------------------------+
++---------------------+
+| runner-manager      |   HTTPS REST (api.github.com) only:
+|                     |   inventory, in-progress counts, queued-job
+| CLI + Ratatui TUI   |   demand, generate-jitconfig
+| Domain + SQLite     |------------------------------------------> GitHub Actions
+| Host Agent          |<------------------------------------------
+| GitHub App gateway  |
 | Platform adapter    |
 +----------+----------+
            |
@@ -69,7 +68,7 @@ keeps policy creation non-arming, at the cost of one extra command in Journey 1.
 
 Omitting `--max-capacity` creates a **monitor-only** policy (D19): the target
 appears in the dashboard with its runners and in-progress workflow counts, no
-scale set is created, and the agent never starts a runner for it. Supplying
+routing label is reserved, and the agent never starts a runner for it. Supplying
 `--max-capacity` later with `set-capacity` promotes it to `autoscale`.
 
 ## Workspace shape
@@ -83,8 +82,8 @@ scale set is created, and the agent never starts a runner for it. Supplying
   install/           # install.sh and install.ps1, published per release
   crates/app/        # clap commands, Ratatui shell, presentation state; [[bin]] runner-manager
   crates/domain/     # policy and lifecycle state machine
-  crates/github/     # device flow, user token, REST + Actions-service adapters
-  crates/agent/      # scale-set reconciliation and JIT lifecycle
+  crates/github/     # device flow, user token, REST adapters (inventory, demand, JIT)
+  crates/agent/      # demand reconciliation and JIT lifecycle
   crates/platform/   # process, filesystem, machine-scoped secret store, service, OS adapters
   crates/testkit/    # fake clock, fake GitHub gateway, fixture builders
 ```
@@ -103,7 +102,7 @@ Crossterm as its default backend and re-exports it).
 | Role | Runs where | May do | Must not do |
 |---|---|---|---|
 | TUI/CLI client | Operator terminal on the host | Read and change local policy and host capacity, inspect GitHub state. | Own a second agent lock or hold the user access token in display state. |
-| Host agent | One local machine | Poll assigned scale sets, acquire assigned jobs, provision host-local JIT runners up to policy and host capacity. | Manage a different host or expose a network API. |
+| Host agent | One local machine | Poll queued demand for its policies and provision host-local JIT runners up to policy and host capacity. | Manage a different host or expose a network API. |
 | JIT runner child | Temporary host directory | Execute exactly one assigned job. | Reuse workspace or credentials after cleanup. |
 | Published GitHub App | GitHub | Declare the permission set and be installed by the user on repositories they choose. | Hold a private key, mint installation tokens, or receive a broader installation than the user selected. |
 
@@ -115,10 +114,10 @@ Rationale only. `README.md` carries decision status and is authoritative.
 |---|---|---|
 | D1 | Separate public repository; no `ai-pipeline` dependency. | Maintains a clean product, release, and trust boundary. |
 | D2 | One host-local agent manages only local runners. | Avoids remote administration and gives clear resource ownership; global inventory remains read-only. |
-| D3 | Device flow against one published App. | Three-action onboarding with no server, no client secret, and no key file; the cost is a non-expiring user token at rest and a trust dependency on the published App. Repository-scoped scale sets still force `Administration: Read and write`. |
-| D4 | Scale sets with JIT ephemeral runners only. | Correct GitHub autoscaling model and clean per-job state; requires a local listener, an Actions-service protocol adapter, and cold-start time. |
+| D3 | Device flow against one published App. | Three-action onboarding with no server, no client secret, and no key file; the cost is a non-expiring user token at rest and a trust dependency on the published App. Repository-scoped JIT registration still forces `Administration: Read and write`. |
+| D4 | Public REST JIT ephemeral runners; scale sets rejected. | The only mechanism proven to work for the target audience: scale-set administration is denied on every free-plan target, while `generate-jitconfig` succeeds with the same permission. Clean per-job state and one documented protocol, at the cost of no job reservation and demand polling that shares the REST rate budget. |
 | D5 | `daemon run` plus optional OS service installation. | Works for interactive debugging and unattended home hosts; adds platform installer test work. |
-| D6 | Rust single binary with Ratatui/Crossterm and direct HTTPS clients. | Small deployable surface and native cross-platform TUI; public-preview scale-set protocol needs adapter contract tests. |
+| D6 | Rust single binary with Ratatui/Crossterm and direct HTTPS clients. | Small deployable surface and native cross-platform TUI. After D4 every GitHub call is documented, stable REST, so no preview-protocol adapter, revision pinning, or contract-test suite is needed. |
 | D7 | Default `min_capacity=0`; every policy requires explicit `max_capacity`. | Eliminates idle runners and prevents accidental host oversubscription; cold starts are accepted by default. |
 | D8 | The TUI is local and never a remote controller. | Fits D2 and avoids a second authentication/network surface. |
 | D9 | Two capacity levels: policy `max_capacity` and host `host_capacity`. | A single per-policy limit cannot stop N policies from jointly oversubscribing one machine; the host ceiling is the physical-safety guarantee. |
@@ -126,34 +125,46 @@ Rationale only. `README.md` carries decision status and is authoritative.
 
 ## Policy and reconciliation
 
-Each enabled `autoscale` policy creates one scale set for one host, at either
-repository or organization scope (D18). The scale set **name** is the routing
+Each enabled `autoscale` policy owns a **routing label set** for one host, at
+either repository or organization scope (D18). The label set is the routing
 token and encodes the product, host identity, and host OS — for example
-`rm-home-win-x64`. It must be unique within its runner group. `monitor_only`
-policies create no scale set and take no part in reconciliation.
-Workflows target it with `runs-on: <scale-set-name>`, never the legacy generic
-`self-hosted` label. Additional labels are optional metadata only, because
-GitHub documents scale sets as having a single label and multi-label support is
-feature-flagged on GHES.
+`rm-home-win-x64`. Workflows target it with `runs-on: <label>`, never the
+legacy generic `self-hosted` label alone. Unlike a scale set, a JIT runner may
+carry more than one label, so a policy may add optional descriptive labels
+without a feature flag. `monitor_only` policies own no label set and take no
+part in reconciliation.
 
-On every scale-set response:
+On every demand refresh:
 
 ```text
-acquire(job_available_messages)                       # mandatory, before scaling
-desired      = clamp(total_assigned_jobs, min_capacity, max_capacity)
+demand        = queued jobs whose `runs-on` matches this policy's routing labels
+desired       = clamp(demand, min_capacity, max_capacity)
 host_headroom = host_capacity - active_owned_runners_all_policies
-to_start     = max(0, min(desired - active_owned_runners, host_headroom))
+to_start      = max(0, min(desired - active_owned_runners, host_headroom))
 ```
 
 `min_capacity <= max_capacity` is validated on write, so the clamp is always
 well-defined. `min_capacity` is fixed at 0 in v1; a warm minimum is deferred.
 
-The agent requests one JIT configuration per `to_start` from the Actions
-service, allocates a unique runtime directory, launches the runner, and records
-its process identity. It never stops a busy runner to scale down. After
-completion or a confirmed unclaimed JIT expiry, it removes the runtime
-directory. Runner binaries and approved tool caches are retained separately from
-job workspaces.
+**There is no job reservation.** The scale-set model let a listener call
+`AcquireJobs` to claim an assignment before scaling. The REST path has no
+equivalent, so two hosts serving the same target can both start a runner for one
+queued job. The surplus runner finds no work and exits ephemerally, having cost
+one capacity slot and one cold start. Three controls bound the damage, and none
+of them eliminates it:
+
+1. Host-scoped routing labels — the default label encodes host identity, so two
+   hosts only collide when the operator deliberately gives them the same label.
+2. `max_capacity` and `host_capacity` cap the surplus.
+3. An ephemeral runner that receives no job exits on its idle timeout and is
+   cleaned like any terminal attempt.
+
+The agent requests one JIT configuration per `to_start` from
+`POST /repos|orgs/…/actions/runners/generate-jitconfig`, allocates a unique
+runtime directory, launches the runner, and records its process identity. It
+never stops a busy runner to scale down. After completion or a confirmed
+unclaimed JIT expiry, it removes the runtime directory. Runner binaries and
+approved tool caches are retained separately from job workspaces.
 
 ## UI information architecture
 
@@ -162,13 +173,12 @@ job workspaces.
 | Dashboard | Total in-progress workflows, assigned jobs, online/busy runners, host capacity used/total, health. | `Tab`, arrows, mouse click, `F5` refresh. |
 | Repositories | Authorized repositories; each row shows `(in-progress workflow count)`, scale state, `max_capacity`, and agent health. | Select, type-to-filter, enter detail. |
 | Runners | All authorized GitHub runners with owner, OS, labels, online/busy/ephemeral state; local ownership is visually distinct. | Sort, filter, inspect. |
-| Repository settings | Enable/disable scaling, scale-set name, `max_capacity`, cache policy, and safe preview. | Form navigation with keyboard or mouse. |
+| Repository settings | Enable/disable scaling, routing labels, `max_capacity`, cache policy, and safe preview. | Form navigation with keyboard or mouse. |
 | Host settings | Current `host_capacity` and current total across policies, service start mode, refresh interval. | Edit and confirm. |
 | Activity and errors | Lifecycle events, retries, rate limits, cleanup outcome, and actionable remediation. | Copy-safe diagnostics, acknowledge errors. |
 
-No screen displays the user access token, Actions-service admin tokens,
-message-queue tokens, encoded JIT configuration, or command lines containing
-them. The device-flow *user code* is displayed by design during `auth login`
+No screen displays the user access token, the encoded JIT configuration, or a
+command line containing either. The device-flow *user code* is displayed by design during `auth login`
 and only then.
 
 ## Requirement traceability
@@ -184,28 +194,36 @@ and only then.
 | Settings for repository autoscaling | Versioned `ScalePolicy`, shared by CLI and TUI. | CLI/TUI parity tests and policy persistence test. |
 | Per-repository and host-wide runner limits, visible and editable (D9) | `ScalePolicy.max_capacity`, `Host.host_capacity`, `repo set-capacity`, `host set-capacity`, host settings screen. | Host-ceiling enforcement test and settings round-trip test. |
 | Headless operations, especially repository add | `repo add` command with noninteractive validation and JSON status. | Scripted end-to-end CLI test. |
-| No idle runners when unused | `min_capacity=0`, scale-set listener, JIT ephemeral lifecycle. | Idle-host zero-runner assertion. |
-| Honest offline behavior | Long-poll backoff, `offline` state, per-screen status bar, 24h queue-cancellation warning. | Journey 4 gate in `08-user-workflows.md`. |
+| No idle runners when unused | `min_capacity=0`, demand polling, JIT ephemeral lifecycle. | Idle-host zero-runner assertion. |
+| Honest offline behavior | Demand-poll backoff with jitter, `offline` state, per-screen status bar, 24h queue-cancellation warning. | Journey 4 gate in `08-user-workflows.md`. |
 | Human-friendly modern view | Dashboard, focused tables, health/error states, text-plus-color status. | Journey gates in `08-user-workflows.md`. |
 | Tested on every PR and merge (D10) | `.github/workflows/ci.yml` matrix. | CI required-check status on the pull request. |
 | Manual, validated, tested releases (D10) | `.github/workflows/release.yml`, `workflow_dispatch` only. | Release-workflow rehearsal in `09-release-distribution.md`. |
 | One-command install per OS (D11) | Install script, npm wrapper, Homebrew tap, `cargo install`. | Per-channel install smoke test on each OS, asserting no security prompt, including a Windows host with no Node. |
 | Three-action onboarding (D3) | Device flow against the published App, then an installation URL. | Device-flow round-trip test and Journey 1 gate in `08-user-workflows.md`. |
-| Repository and organization scale sets (D18) | `ScaleTarget` sum type; `repo` and `org` command families sharing one domain path. | Target-equivalence domain tests and one live organization-scoped job. |
+| Repository and organization autoscaling (D18) | `ScaleTarget` sum type; `repo` and `org` command families sharing one domain path; `/repos/…` and `/orgs/…` JIT endpoints. | Target-equivalence domain tests and one live organization-scoped job. Organization `generate-jitconfig` is **unverified** as of 2026-08-21. |
 | Optional autoscaling / monitor-only (D19) | `PolicyMode`, enforced shape invariants, reconciliation skips `MonitorOnly`. | Monitor-only policy starts no runner; promotion to `autoscale` round-trip test. |
+| Bounded REST consumption (D4 consequence) | One shared budget for demand, inventory, and counts; `add` refuses a configuration that would exceed half the floor. | Budget-projection test and a documented maximum target count per host. |
 
 ## Owner-facing open questions
 
-None. D21 settled the last one on 2026-08-21: the project publishes exactly
-one GitHub App, and monitor-only users therefore grant the full permission
-set. The disclosure obligation that follows is a requirement in
-`07-security.md`, not an open question.
+None. D21 settled the App question on 2026-08-21, and D4 was settled on the
+same date after the D17 spike disproved scale sets; the owner chose the public
+REST JIT replacement. The disclosure obligation that follows D21 is a
+requirement in `07-security.md`, not an open question.
 
 The product name is settled: the binary, workspace root package, published
 crate, and npm package are all named `runner-manager` (RESOLVED 2026-08-21).
 The repository keeps its own name, `IvanMurzak/GitHub-Runner-Scaler-UI`.
 
-D1-D21 in `README.md` resolve every product-policy decision needed to begin
-implementation. The only unresolved item is technical, not product: the D17
-spike must confirm that a user-to-server token drives the Actions-service
-scale-set chain.
+D17 is **RESOLVED GREEN**: a user-to-server token drives the GitHub credential
+chain at both scopes. Evidence:
+`docs/spikes/d17-user-to-server-scale-set-chain.md`.
+
+Two technical items remain open, both narrower than a decision:
+
+1. Organization-scope `generate-jitconfig` is unverified — the spike credential
+   lacked `admin:org`. It must be proven before D18's org path is built.
+2. Whether a GitHub Team organization would permit scale-set creation is
+   unknown. It matters only if the owner later wants scale sets back for
+   paid-plan users.

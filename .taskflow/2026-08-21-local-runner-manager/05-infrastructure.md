@@ -30,12 +30,14 @@ runner material is stored in the current working directory by default.
 |---|---|---|
 | GitHub user access token | Machine-scoped secret store: DPAPI machine scope (Windows), System Keychain (macOS), `0600` file plus systemd credentials (Linux) | Re-issue via `auth login`; delete on `auth logout`; revoke on GitHub by uninstalling the App. |
 | App `client_id`, installation id, host and policy settings | Local config/SQLite | `client_id` is public by design and is compiled into the binary; the rest is mutable by CLI/TUI and not secret. |
-
-| Runner registration token | Memory only | Consumed immediately in the Actions-service registration exchange. |
-| Actions-service admin token and tenant URL | Memory only | Refreshed 60 seconds before expiry; never persisted. |
-| Message-queue access token | Memory only | Refreshed on session token expiry; never persisted. |
 | Encoded JIT configuration | Restrictive temporary file or process-safe handoff | Delete immediately after runner start or failed start. |
 | Runner package checksum/version | Local cache metadata | Revalidated on download and refresh. |
+
+D4 removed three credentials from this table entirely: the runner registration
+token, the Actions-service admin token and tenant URL, and the message-queue
+access token. None of them exists in the REST JIT design. The persisted
+credential surface is now one user access token, and the only short-lived
+sensitive value is the encoded JIT configuration.
 
 The user access token is machine-scoped rather than user-scoped because D13
 requires the service to start at machine boot. A boot-time service runs outside any
@@ -95,9 +97,9 @@ active attempt references it.
 ## Rollback
 
 1. Restore workflow labels to the previously documented runner target, so no
-   new job routes to the scale set. Doing this first prevents jobs from queuing
-   against a scale set that is about to have no runners; a queued job is
-   cancelled by GitHub after 24 hours.
+   new job routes to this host's routing labels. Doing this first prevents jobs
+   from queuing against labels that are about to have no runners; a queued job
+   is cancelled by GitHub after 24 hours.
 2. `repo set-scale OWNER/REPO --enabled false` drains the policy.
 3. Wait for active attempts to become terminal, then stop the daemon/service.
 4. If needed, re-enable a legacy persistent runner with a non-overlapping
@@ -121,5 +123,6 @@ trigger in `06-migration-rollout.md`:
    GitHub inventory that no runner remains registered.
 5. Review the App's installation scope and permissions.
 
-Registration, admin, and message-queue tokens are memory-only and expire
-without action.
+No derived GitHub credential outlives the process: after D4 the only
+short-lived sensitive value is the encoded JIT configuration, which is deleted
+immediately after runner start or failed start.
