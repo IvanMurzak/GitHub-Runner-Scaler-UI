@@ -1,101 +1,113 @@
 # D17 spike — can a user-to-server token drive the Actions-service scale-set chain?
 
-**Status: PARTIAL — 3 of 6 links proven, D3 not yet cleared.**
+**Status: D17 answered GREEN — and a separate, larger blocker found at link 4.**
 **Date:** 2026-08-21 · **Task:** [`c1-d17-scale-set-spike`](../../.taskflow/2026-08-21-local-runner-manager/tasks/c1-d17-scale-set-spike.md)
 
-D3 (device flow against one published GitHub App, no server, no client secret,
-no private key) rests on an assumption GitHub does not document: that a
-**user-to-server** token can drive the whole Actions-service chain. GitHub
-documents that chain for installation tokens and for PATs
-(`01-current-architecture.md`, edge case 8).
+Two independent results. They must not be conflated.
 
-## The finding that changes the shape of the risk
+1. **The D17 question is settled: yes.** A GitHub App user-to-server token
+   (`ghu_`) mints a runner registration token and completes the
+   Actions-service admin exchange. D3 is not reversed by anything found here.
+2. **Scale-set *creation* is denied on this target, for every credential type
+   tried.** This is not D17 and not a permissions mistake. It blocks D4 and the
+   product's primary persona, and it needs an owner decision.
 
-**The Actions service never sees the original credential.** Reading
-`actions/scaleset@main:client.go`, the chain is:
+## 1. D17: GREEN
 
-```text
-user credential ──▶ POST /repos|orgs/…/actions/runners/registration-token
-                          │
-                          ▼  Authorization: RemoteAuth <registration-token>
-                    POST https://api.github.com/actions/runner-registration
-                          │
-                          ▼  returns { url: <tenant>, token: <admin JWT> }
-                    everything downstream authenticates with that JWT
-```
-
-After the registration token is minted, the original credential is gone from
-the picture. `/actions/runner-registration` sees only the registration token,
-and issues a fresh Actions-service JWT of its own. Scale-set administration,
-sessions, `AcquireJobs`, and `generatejitconfig` all authenticate with that JWT
-or with the session's message-queue token — never with the user's credential.
-
-So D17 does not really have six independent unknowns. It has **one**: can a
-user-to-server token mint a runner registration token? Everything after that is
-credential-agnostic by construction, and that property is now verified rather
-than assumed.
-
-## What was proven empirically
-
-Run 2026-08-21 against `IvanMurzak/GitHub-Runner-Scaler-UI` using the GitHub
-CLI's OAuth **user** token (`gho_`, scopes `gist, read:org, repo, workflow`).
-This is not the target token family, but it is a user-type token rather than a
-PAT or an installation token, which is the distinction that matters here.
+Run 2026-08-21, published-flow App `runner-manager-d17-spike`
+(`client_id Iv23li39jMQVdEuupmI2`), device flow, against
+`IvanMurzak/GitHub-Runner-Scaler-UI`.
 
 | Link | Result | Evidence |
 |---|---|---|
-| 2 — mint registration token, repo scope | **GREEN** | `POST /repos/…/actions/runners/registration-token` → `200`, token `ACFW…`, len 29 |
-| 3 — `RemoteAuth` exchange | **GREEN** | `POST /actions/runner-registration` → `200`, returned `url`, `token`, `token_schema` |
-| 4 — admin token reaches the tenant | **GREEN (read-only)** | `GET {tenant}_apis/runtime/runnerscalesets?api-version=6.0-preview` → `200 {"count":0,"value":[]}`; also `_apis/connectionData` → `200`, `deploymentType: hosted` |
+| 1 — device flow → user token | **GREEN** | token family `ghu_` — a genuine App user-to-server token, not an OAuth or PAT credential. `authorization_pending` observed and handled. |
+| 2 — mint registration token, repo scope | **GREEN** | `200`, token length 29 |
+| 3 — `RemoteAuth` exchange | **GREEN** | `200`; tenant `pipelinesghubeus25…`; `token_schema OAuthAccessToken`; `scp ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect`; TTL **20 min** |
 
-Facts recovered from the admin JWT, all load-bearing for `c4`:
+This confirms the structural finding from `actions/scaleset@main:client.go`:
+the Actions service never sees the original credential. Once the registration
+token exists, `/actions/runner-registration` issues its own JWT and everything
+downstream authenticates with that. The `ghu_` and `gho_` runs produced
+**byte-identical** scope sets and the same service identity, which is the
+strongest possible form of this evidence.
 
-| Property | Observed value | Consequence |
-|---|---|---|
-| `token_schema` | `OAuthAccessToken` | The service labels the schema it derived the JWT from; a user-type credential is an accepted input. |
-| `scp` | `ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect` | Exactly the scale-set administration capability set. |
-| `nbf` → `exp` | **20 minutes** | `04-subsystem-contracts.md` says refresh 60 s before expiry. The real budget is 20 min, so refresh cadence is ~19 min, not hourly. |
-| `owner_id` | `R_kgDO…` (Repository node id) | The JWT is scoped to the target, not to the user. |
-| tenant URL | `https://pipelinesghubeus25.actions.githubusercontent.com/<guid>/` | Per-tenant host; not `api.github.com`. Confirms the two-host split. |
-| `api-version` | `6.0-preview` and `6.0-preview.1` both accepted | Pin `6.0-preview`; `c5` records this as the pinned revision. |
+**Consequence:** D3 stands. `c2` is unblocked *with respect to D17*.
 
-## What is still open
+## 2. The blocker: scale-set creation is denied
 
-| Link | State | Why it is not yet answered |
-|---|---|---|
-| 1 — device flow → `ghu_` token | **UNTESTED** | Needs a registered App with device flow enabled. Well documented and low risk, but untested. |
-| 2 — **`ghu_` at link 2** | **UNTESTED — this is the real D17 question** | `gho_` (OAuth App) and `ghu_` (GitHub App user-to-server) are different token families. GitHub's REST reference lists *GitHub App user access tokens* as supported for this endpoint with `Administration: write`, but the docs are not proof. |
-| 2 — organization scope | **UNTESTED** | The `gh` token lacks `admin:org`, so all three visible orgs returned `403 "You must be an org admin or have the runners and runner groups fine-grained permission"`. That is a **scope** limitation of the OAuth token, not a token-family result — a GitHub App uses permissions (`Organization → Self-hosted runners: Read and write`), not OAuth scopes, so this says nothing either way about D18. |
-| 4 — create/delete a scale set | **UNTESTED** | State-changing; deliberately not run against a real repository. |
-| 5 — session, demand, `AcquireJobs`, `DeleteMessage` | **UNTESTED** | Needs a scale set and a queued job. |
-| 6 — `generatejitconfig` | **UNTESTED** | Needs a scale set. |
-
-## How to finish it
-
-[`d17-spike.ps1`](d17-spike.ps1) runs all six links end to end, prints no
-credential, and deletes the scale set and session it creates:
-
-```powershell
-pwsh ./docs/spikes/d17-spike.ps1 -ClientId Iv23xxxxxxxx -Repo owner/disposable-repo -Org disposable-org
+```text
+POST {tenant}_apis/runtime/runnerscalesets?api-version=6.0-preview
+  → 403 AccessDeniedException
+    "Access denied. System:ServiceIdentity;DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD
+     needs Administer Permissions permissions to perform the action."
 ```
 
-It asserts the token family is `ghu_` and marks the run AMBER if it is not, so
-a run that accidentally uses the wrong credential cannot be mistaken for a
-green D17. Omitting `-Org` marks organization scope AMBER rather than passing
-silently.
+### What has been ruled out
 
-## Verdict
+| Suspected cause | Ruled out by |
+|---|---|
+| The user-to-server token is weaker than an installation token or PAT | The `gho_` (OAuth user) token, minted independently via the `gh` CLI, produces the **identical** error, the identical `scp`, and the identical service identity. The failure is credential-type-independent. |
+| Wrong or missing App permission | GitHub documents repository scope as requiring exactly `Administration: Read and write` + `Metadata: Read-only`. The App declares both. |
+| Repository scope is unsupported | GitHub documents repository scope as a supported ARC configuration: `Administration: Read and write` is "only required when configuring Actions Runner Controller to register at the repository scope". |
+| Invalid `runnerGroupId` | `GET _apis/runtime/runnergroups` returns `200` with `id 1 "Default" isDefaultGroup:true` and `id 2 "GitHub Actions"`. Group 1 exists and was the one requested. |
+| Malformed request body | Body matches `actions/scaleset` `RunnerScaleSet` exactly, including the capitalised `RunnerSetting` json tag. A malformed body would return a validation error, not `AccessDeniedException`. |
+| Expired admin token | The token was minted seconds earlier and has a 20-minute TTL. Read calls with the same token return `200`. |
 
-**Not yet GREEN.** Do not treat D3 as cleared and do not start `c2`.
+### The surviving hypothesis
 
-The residual risk is materially smaller than when D17 was written: the
-undocumented, protocol-shaped part of the chain — the `RemoteAuth` exchange and
-the tenant handshake — is proven to work from a user-type credential, and is
-proven to be blind to which credential minted the registration token. What
-remains is one REST call's permission behaviour on one token family, plus the
-mechanical confirmation of the scale-set operations.
+**The target is a repository owned by a personal account.**
+`IvanMurzak/GitHub-Runner-Scaler-UI` has `owner.type: User`, and the account
+has `plan: null`. Runner *groups* are an organization feature — GitHub's own
+wording is "Organization owners using the GitHub Team plan can create
+additional organization-level runner groups" — and a scale set is created
+inside a runner group. The service identity coming back as the placeholder
+`DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD` rather than a real GUID is consistent
+with an identity that was never bound to an administrable group.
 
-If the `ghu_` run fails at link 2, the contingency in `07-security.md` — a
-per-user GitHub App with installation tokens from a locally held private key —
-is the only known alternative, and reopening D3 is an owner decision, not this
-task's.
+This is a hypothesis, not a conclusion. It has not been tested.
+
+### The one experiment that settles it
+
+Install the App on an organization the owner administers and re-run with
+`-Org`. Available: `Tap-Top-Fun` and `WetFish-Co`, both `role=admin`, both
+`plan=free`.
+
+| Outcome | Meaning | Cost to the taskflow |
+|---|---|---|
+| Org **free** succeeds | Repository scope on a *personal account* is the blocker. | D18 inverts: organization scope becomes the only viable path, not the safer optional one. Journey 1 (`repo add`) stops being the primary journey. |
+| Org **free** also fails | Scale sets require GitHub Team or Enterprise. | D4 fails for the entire target audience. The home-host persona in `08-user-workflows.md` has neither. Autoscaling would need a different primitive, and that reopens the architecture, not a decision. |
+
+## 3. What this does and does not change
+
+- **D3 / D17: no change.** The device flow, the published-App model, and the
+  serverless design are all confirmed working end to end.
+- **D4 (scale sets + JIT ephemeral): at risk**, pending the org test.
+- **D18 (both scopes supported): at risk of inverting.** The design currently
+  presents repository scope as primary and organization scope as the safer
+  option; the evidence points the other way.
+- **`08-user-workflows.md` persona: at risk.** A home-host operator with
+  personal repositories is precisely the case that just failed.
+
+## 4. Corrections already earned for `c4` / `c5`
+
+Independent of the blocker, the run produced facts the design should absorb:
+
+| Fact | Where it lands |
+|---|---|
+| Actions-service admin JWT lives **20 minutes** | `04-subsystem-contracts.md` says refresh 60 s before expiry — correct, but the cadence is ~19 min, worth stating. |
+| `api-version=6.0-preview` accepted (also `6.0-preview.1`) | `c5`'s pinned protocol revision. |
+| `scp` is `ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect` | `c4` contract test can assert this. |
+| Tenant is a per-owner `pipelinesghubeus*` host, not `api.github.com` | Confirms the two-host split in `04-subsystem-contracts.md`. |
+| `GET _apis/runtime/runnergroups` works read-only | `c4` should resolve the group by name rather than assume id 1, as ARC does. |
+
+## 5. Verdict
+
+**D17: GREEN. Do not reopen D3.**
+
+**Do not start `c4`/`c5`/`e1`** until the organization test resolves whether
+scale sets can be created at all for this audience. That is a product
+question, not an implementation one, and it belongs to the owner.
+
+Nothing was left behind on the repository: creation failed, so no scale set
+exists to clean up, and the cleanup path re-mints its own admin token before
+deleting.

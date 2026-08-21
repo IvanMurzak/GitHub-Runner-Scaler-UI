@@ -47,16 +47,30 @@ Write-Host "`n=== LINK 1: device flow ===" -ForegroundColor Cyan
 $dc = Invoke-RestMethod -Method Post -Uri 'https://github.com/login/device/code' `
   -Headers @{ Accept = 'application/json' } -Body @{ client_id = $ClientId }
 
+$interval = [int]$dc.interval; $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
+
+# The browser step is the one thing that cannot be automated -- it is the whole
+# point of the device grant. Everything around it can be, so: copy the code,
+# open the page, and show a live countdown instead of an inert prompt.
+try { Set-Clipboard -Value $dc.user_code; $clip = ' (copied to clipboard)' } catch { $clip = '' }
+try { Start-Process $dc.verification_uri | Out-Null; $opened = 'opened in your browser' } catch { $opened = $dc.verification_uri }
+
 Write-Host ""
-Write-Host "  Open:      $($dc.verification_uri)" -ForegroundColor White
-Write-Host "  Enter code: $($dc.user_code)" -ForegroundColor Yellow
+Write-Host "  ┌─────────────────────────────┐" -ForegroundColor DarkGray
+Write-Host "  │   CODE:  $($dc.user_code)        │" -ForegroundColor Yellow
+Write-Host "  └─────────────────────────────┘$clip" -ForegroundColor DarkGray
+Write-Host "  $opened  ·  expires $($deadline.ToString('HH:mm:ss'))" -ForegroundColor White
 Write-Host ""
 
-$interval = [int]$dc.interval; $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
-$seen = @{}
+$seen = @{}; $tick = 0
 while ($true) {
   if ((Get-Date) -gt $deadline) { Note 'link1-device-flow' 'RED' 'device code expired before approval'; break }
   Start-Sleep -Seconds $interval
+  $tick++
+  if ($tick % 6 -eq 0) {
+    $left = [int]($deadline - (Get-Date)).TotalSeconds
+    Write-Host ("  waiting for approval… {0}:{1:d2} left" -f [int]($left/60), ($left%60)) -ForegroundColor DarkGray
+  }
   $r = Invoke-RestMethod -Method Post -Uri 'https://github.com/login/oauth/access_token' `
     -Headers @{ Accept = 'application/json' } -Body @{
       client_id = $ClientId; device_code = $dc.device_code
