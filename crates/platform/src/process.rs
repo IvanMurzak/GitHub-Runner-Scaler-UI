@@ -43,9 +43,20 @@
 //! `07-security.md`'s threat table: *"A process listing reveals a JIT config"*,
 //! controlled by *"Do not pass JIT data as a command-line argument; use
 //! restrictive file/pipe handoff"*. [`RestrictiveHandoff`] is that file, and
-//! [`SpawnSpec::spawn_with_handoff`] is the control with teeth: it refuses to
-//! spawn when the payload appears in any argument or environment value, so the
-//! rule fails the launch instead of failing a review.
+//! [`SpawnSpec::spawn_with_handoff`] refuses to spawn when the payload appears
+//! in any argument or environment value, so an obvious mistake fails the launch
+//! instead of failing a review.
+//!
+//! **It is a tripwire, not a proof.** A caller that passes it has not been
+//! shown to be safe. The check looks for the payload as a verbatim substring of
+//! each argument's and each environment *value's* `to_string_lossy()`, and that
+//! is all it looks for. It does not inspect the program path, the working
+//! directory, or environment variable *names*; and anything that re-encodes the
+//! payload — base64 of the base64, URL-escaping, a different Unicode
+//! normalisation — or splits it across two arguments walks straight past it.
+//! The control that actually holds is *"pass the handoff file's path"*; `e3`
+//! must not read a passing `spawn_with_handoff` call as evidence that a
+//! configuration cannot reach a process listing.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -136,6 +147,18 @@ pub struct ProcessIdentity {
 }
 
 /// What a recorded [`ProcessIdentity`] turns out to refer to now.
+///
+/// # One journal entry can answer differently on different platforms
+///
+/// For a PID now held by **another account's** process, Linux answers
+/// [`Adoption::PidRecycled`] while macOS and Windows answer
+/// [`ProcessError::Identity`]: `/proc/<pid>/stat` is world-readable, whereas
+/// `proc_pidinfo` and `OpenProcess` refuse an inspection this account is not
+/// entitled to. So the same journal entry, read back after the agent's service
+/// account has been changed, is a recycled PID on one platform and an error on
+/// the other two. `e3` branches on this, and should treat the error as the same
+/// *decision* as `PidRecycled` — do not adopt, do not terminate — rather than
+/// as a platform bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Adoption {
     /// The same process is still running. Adopt it; do not start a replacement.
@@ -248,18 +271,35 @@ impl ProcessIdentity {
     /// A PID that resolves to nothing is [`Adoption::Gone`], not an error.
     pub fn recheck(&self) -> Result<Adoption, ProcessError> {
         match sys::start_token(self.pid, LivenessFilter::LiveOnly) {
-            Ok(None) => Ok(Adoption::Gone),
-            Ok(Some(token)) if token == self.start_token => Ok(Adoption::Live),
-            Ok(Some(token)) => Ok(Adoption::PidRecycled {
-                current: Self {
-                    pid: self.pid,
-                    start_token: token,
-                },
-            }),
+            Ok(observed) => Ok(self.classify(observed)),
             Err(source) => Err(ProcessError::Identity {
                 pid: self.pid,
                 source,
             }),
+        }
+    }
+
+    /// The adoption decision itself, with the operating system already
+    /// consulted.
+    ///
+    /// Split out of [`ProcessIdentity::recheck`] so that all three answers can
+    /// be exercised without spawning anything. One of them cannot be reached
+    /// through a spawn on demand: two processes carrying an *identical* start
+    /// token. On Windows (100 ns) and macOS (1 µs) that is unreachable, and on
+    /// Linux it happens only by landing inside the same 10 ms clock tick, which
+    /// is a race a test cannot ask for. Comparing tokens here rather than
+    /// inline means the discriminator can be shown to behave correctly on that
+    /// input from every leg of the CI matrix.
+    fn classify(&self, observed: Option<String>) -> Adoption {
+        match observed {
+            None => Adoption::Gone,
+            Some(token) if token == self.start_token => Adoption::Live,
+            Some(token) => Adoption::PidRecycled {
+                current: Self {
+                    pid: self.pid,
+                    start_token: token,
+                },
+            },
         }
     }
 
@@ -1149,17 +1189,23 @@ mod sys {
 
     pub(super) fn create_restrictive_file(path: &Path) -> io::Result<File> {
         // A protected DACL — the `P` — so that nothing is inherited from the
-        // parent directory, granting full access to exactly three trustees:
-        // this account, LocalSystem, and the local Administrators group. The
-        // last two are not a weakening: `07-security.md` records that a local
-        // administrator is outside this threat model because such an account
-        // can already read the runner's workspace and credentials. Excluding
-        // them would break a service running as LocalSystem while protecting
-        // nothing.
-        let sddl = format!(
-            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{})",
-            current_user_sid()?
-        );
+        // parent directory, granting full access to exactly two trustees: this
+        // account, and the local Administrators group.
+        //
+        // `BA` is not a weakening: `07-security.md` places a local
+        // administrator outside this threat model, because such an account can
+        // already read the runner's workspace and its credentials. It is kept
+        // so that an operator can clean up a handoff file left behind by an
+        // agent running under a service account they are not logged in as.
+        //
+        // There is deliberately no `(A;;FA;;;SY)` ACE. An earlier version
+        // carried one "so that a service running as LocalSystem still works",
+        // and that justification was simply wrong: if this agent *is*
+        // LocalSystem then `current_user_sid()` returns S-1-5-18 and the third
+        // ACE already covers it. So the ACE added nothing in the one case it
+        // was written for, and in every other case it widened access to a file
+        // whose entire purpose is to be narrow.
+        let sddl = format!("D:P(A;;FA;;;BA)(A;;FA;;;{})", current_user_sid()?);
         let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
@@ -1320,6 +1366,20 @@ mod sys {
 
         #[test]
         fn a_protected_owner_only_dacl_is_not_broadly_readable() {
+            // The shape `create_restrictive_file` actually writes: protected,
+            // Administrators, and this account. No LocalSystem ACE — see the
+            // comment there for why one would add nothing.
+            assert!(!dacl_grants_broad_access(
+                "D:P(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1-2-3-1001)"
+            ));
+            // A LocalSystem agent's own SID is S-1-5-18, which is what makes
+            // the separate `SY` ACE redundant rather than load-bearing.
+            assert!(!dacl_grants_broad_access(
+                "D:P(A;;FA;;;BA)(A;;FA;;;S-1-5-18)"
+            ));
+            // Still tolerated when it arrives from somewhere else: this
+            // heuristic inspects files, and not every file it sees was written
+            // by this module.
             assert!(!dacl_grants_broad_access(
                 "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1-2-3-1001)"
             ));
@@ -1500,10 +1560,17 @@ mod sys {
 
         if written <= 0 {
             let error = io::Error::last_os_error();
-            // ESRCH is "no such process"; EPERM is a process this account may
-            // not inspect, and that is not the same answer.
+            // ESRCH is "no such process". Everything else — EPERM for a process
+            // this account may not inspect, and a zero `errno` for a
+            // `proc_pidinfo` that failed without setting one — stays an error.
+            //
+            // Zero used to be folded in here, and that was wrong for the same
+            // reason `ERROR_ACCESS_DENIED` is kept an error on the Windows leg:
+            // an unexplained failure is not evidence that the process is gone,
+            // and reporting `Gone` for one is how an agent decides to start a
+            // duplicate runner.
             return match error.raw_os_error() {
-                Some(libc::ESRCH | 0) => Ok(None),
+                Some(libc::ESRCH) => Ok(None),
                 _ => Err(error),
             };
         }
@@ -1560,6 +1627,50 @@ mod tests {
         } else {
             SpawnSpec::new("sleep").args(["600"])
         }
+    }
+
+    /// The coarsest start-token resolution any supported platform has.
+    ///
+    /// Linux's token carries `/proc/<pid>/stat` field 22, which counts
+    /// `USER_HZ` ticks. `USER_HZ` is 100 on every supported distribution, so
+    /// one tick is **10 ms** and two processes started inside the same tick get
+    /// byte-identical start tokens. Windows resolves creation time to 100 ns
+    /// and macOS to 1 µs, so neither can collide this way.
+    const COARSEST_START_TOKEN_TICK: Duration = Duration::from_millis(10);
+
+    /// Puts a start-token boundary between two spawns.
+    ///
+    /// Every "recycled PID" fixture below works by pairing one process's PID
+    /// with another process's start token. That only *is* a recycled record if
+    /// the two tokens differ. Spawning back to back is well inside one Linux
+    /// tick — a `posix_spawn` and two small `/proc` reads — so without this the
+    /// synthesised record would be the survivor's genuine identity, `recheck`
+    /// would correctly answer `Live`, and the fixture would fail while the
+    /// primitive it is testing was working exactly as designed.
+    ///
+    /// This is a defect in the fixture and not in the discriminator: recycling
+    /// a PID for real takes far longer than 10 ms, and `boot_id` changes across
+    /// a reboot, so no production record can collide this way.
+    fn separate_start_tokens() {
+        // Comfortably more than one tick, so a slow or virtualised Linux CI
+        // runner does not land on the boundary itself.
+        std::thread::sleep(COARSEST_START_TOKEN_TICK * 5 / 2);
+    }
+
+    /// Fails with a message naming its own cause if two spawns still collided.
+    ///
+    /// Without this the collision surfaces as `assert!(!…is_live())` or as a
+    /// dead survivor, both of which read as "the start token has stopped
+    /// discriminating" — the opposite of what actually happened.
+    fn assert_distinguishable(first: &ProcessIdentity, second: &ProcessIdentity) {
+        assert_ne!(
+            first.start_token(),
+            second.start_token(),
+            "the two children share a start token, so the record synthesised below would be \
+             the second child's real identity rather than a recycled one. This is the fixture \
+             colliding inside one start-token tick, not the discriminator failing; lengthen \
+             `separate_start_tokens` for this platform."
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1744,9 +1855,11 @@ mod tests {
 
         // A second, unrelated process. Its PID is the one the record will be
         // made to point at.
+        separate_start_tokens();
         let mut survivor = long_running().spawn().expect("the second child starts");
         let survivor_identity = survivor.identity().clone();
         assert_ne!(survivor_identity.pid(), recorded.pid());
+        assert_distinguishable(&recorded, &survivor_identity);
 
         victim
             .stop(Duration::from_secs(10))
@@ -1777,6 +1890,94 @@ mod tests {
             .expect("the second child stops");
     }
 
+    /// The three-way answer, on synthesised tokens, on every platform.
+    ///
+    /// The spawn-based tests above cannot cover the case where two identities
+    /// carry the *same* start token: on Windows and macOS the resolution makes
+    /// it unreachable, and on Linux it is a 10 ms race rather than something a
+    /// test can request. That case is exactly what the tick boundary in
+    /// `separate_start_tokens` is there to avoid, so it is worth pinning down
+    /// what the discriminator does with it — and pinning it down on the Windows
+    /// leg, which cannot exhibit the collision any other way.
+    #[test]
+    fn identical_start_tokens_are_the_same_process_and_differing_ones_are_not() {
+        let recorded = ProcessIdentity {
+            pid: 4312,
+            start_token: "platform:token-a".to_string(),
+        };
+
+        // The collision. This is the answer that makes a colliding fixture fail
+        // for the wrong reason: `Live` is *correct* here, because on the
+        // evidence available the two are the same process.
+        assert_eq!(
+            recorded.classify(Some("platform:token-a".to_string())),
+            Adoption::Live,
+            "an identical token is the same process; a fixture that spawns twice inside one \
+             tick is therefore asserting against a correct answer"
+        );
+
+        // A different token at the same PID is the recycled case, and it must
+        // carry whoever holds the PID now.
+        assert_eq!(
+            recorded.classify(Some("platform:token-b".to_string())),
+            Adoption::PidRecycled {
+                current: ProcessIdentity {
+                    pid: 4312,
+                    start_token: "platform:token-b".to_string(),
+                },
+            }
+        );
+
+        assert_eq!(recorded.classify(None), Adoption::Gone);
+        assert!(
+            recorded
+                .classify(Some("platform:token-a".to_string()))
+                .is_live()
+        );
+        assert!(
+            !recorded
+                .classify(Some("platform:token-b".to_string()))
+                .is_live()
+        );
+        assert!(!recorded.classify(None).is_live());
+    }
+
+    /// The Linux token shape is the one that can collide, so assert the
+    /// collision is a tick-granularity property rather than a boot-id one.
+    ///
+    /// Runs everywhere: these are strings, not `/proc` reads.
+    #[test]
+    fn two_linux_tokens_collide_only_within_one_tick_of_one_boot() {
+        let boot = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+        let at = |ticks: u64| ProcessIdentity {
+            pid: 4312,
+            start_token: format!("linux:{boot}:{ticks}"),
+        };
+
+        // Same boot, same tick: indistinguishable. This is the H1 collision,
+        // reproduced without a Linux kernel.
+        assert_eq!(
+            at(884_213).classify(Some(at(884_213).start_token)),
+            Adoption::Live
+        );
+
+        // One tick apart — 10 ms — is enough to tell them apart, which is why
+        // `separate_start_tokens` sleeps for longer than one tick.
+        assert!(
+            !at(884_213)
+                .classify(Some(at(884_214).start_token))
+                .is_live()
+        );
+
+        // The same tick count across a reboot is a different token, which is
+        // the whole reason the boot id is in there.
+        let other_boot = ProcessIdentity {
+            pid: 4312,
+            start_token: "linux:6ba7b810-9dad-11d1-80b4-00c04fd430c8:884213".to_string(),
+        };
+        assert!(!at(884_213).classify(Some(other_boot.start_token)).is_live());
+    }
+
     /// Shows the previous test is not vacuous.
     ///
     /// A bare-PID identity — the implementation the task specification calls
@@ -1789,8 +1990,10 @@ mod tests {
     fn a_bare_pid_would_have_accepted_the_recycled_record() {
         let mut victim = long_running().spawn().expect("the first child starts");
         let recorded = victim.identity().clone();
+        separate_start_tokens();
         let mut survivor = long_running().spawn().expect("the second child starts");
         let survivor_identity = survivor.identity().clone();
+        assert_distinguishable(&recorded, &survivor_identity);
 
         victim
             .stop(Duration::from_secs(10))
@@ -1824,8 +2027,14 @@ mod tests {
     fn terminating_a_recycled_record_refuses_rather_than_killing_a_stranger() {
         let mut victim = long_running().spawn().expect("the first child starts");
         let recorded = victim.identity().clone();
+        separate_start_tokens();
         let mut survivor = long_running().spawn().expect("the second child starts");
         let survivor_identity = survivor.identity().clone();
+        // Without this guard a token collision would make the test SIGTERM and
+        // then SIGKILL the very process it exists to prove is protected, and
+        // then fail on `survivor.is_running()` — a failure that names the wrong
+        // cause and has already destroyed its own evidence.
+        assert_distinguishable(&recorded, &survivor_identity);
 
         victim
             .stop(Duration::from_secs(10))

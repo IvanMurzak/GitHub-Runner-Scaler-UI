@@ -1,7 +1,7 @@
 // owner: d1-platform-core
 
-//! Host operating system and architecture, and their standing in GitHub's
-//! documented self-hosted runner support matrix.
+//! Where this host stands in GitHub's documented self-hosted runner support
+//! matrix.
 //!
 //! The matrix is quoted in `01-current-architecture.md` from GitHub's
 //! self-hosted runner reference:
@@ -25,159 +25,129 @@
 //!    2), so [`HostSupport::container_support`] reports the limitation and
 //!    `f2` surfaces it on macOS and Windows policy validation.
 //!
-//! ## Why the classifier is a `match` and not a table lookup
+//! # The types are the domain's; the verdict is this module's
 //!
-//! [`validate`] classifies with an exhaustive `match` over `(HostOs, HostArch)`
-//! rather than by searching a list of accepted pairs. That costs a few lines
-//! and buys two things. Adding a variant to either enum becomes a compile
-//! error here — the pair cannot be silently accepted or silently rejected by
-//! falling off the end of a table. And the tests can then carry their own,
-//! independently written copy of the documented matrix; asserting a table
-//! against itself would prove nothing.
+//! [`Os`] and [`Arch`] come from `runner-manager-domain` and are not restated
+//! here. An earlier version of this module defined its own `HostOs`/`HostArch`
+//! on the reasoning that platform detection sits below the persistence model —
+//! but this crate already depends on `runner-manager-domain`, so nothing was
+//! being avoided, and two enums naming the same three values had begun to
+//! disagree: `arm32` against the domain's `arm`, `windows`/`macos` against
+//! `win`/`osx`. One of those spellings feeds runner-package selection, so a
+//! disagreement there is a download of the wrong archive rather than a
+//! cosmetic difference. The domain's own documentation says as much —
+//! *"Enforcing that pairing is `d1`'s job; this enum only has to be able to
+//! name the values"* — which asks `d1` to **validate** those types, not to mint
+//! parallel ones.
+//!
+//! For the same reason the two predicates the domain already answers are not
+//! answered again here. [`SupportStatus`] and the ARM64 warning are derived
+//! from [`Arch::is_public_preview`], and [`ContainerSupport`] from
+//! [`Os::supports_container_actions`], so `f2` reading either this module or
+//! the domain gets the same verdict by construction rather than by two tables
+//! being kept in step.
+//!
+//! What is left is genuinely this module's: which *pairs* are documented,
+//! detection of the running host, the operator-facing text, and
+//! [`documented_releases`].
+//!
+//! ## Why the pair check is a `match` and not a table lookup
+//!
+//! [`validate`] classifies with an exhaustive `match` over `(Os, Arch)` rather
+//! than by searching a list of accepted pairs. That costs a few lines and buys
+//! two things. Adding a variant to either enum becomes a compile error here —
+//! the pair cannot be silently accepted or silently rejected by falling off the
+//! end of a table. And the tests can then carry their own, independently
+//! written copy of the documented matrix; asserting a table against itself
+//! would prove nothing.
 
 use std::fmt;
 
+use runner_manager_domain::model::{Arch, Os};
 use serde::{Deserialize, Serialize};
 
-/// The operating systems this product targets.
+// ---------------------------------------------------------------------------
+// Prose names
+//
+// `Os::label_token` and `Arch::label_token` are GitHub's runner-package tokens
+// — `win`, `osx`, `arm` — and `e2` selects a download with them. They are not
+// prose, and an operator reading "GitHub documents ARM32 runners on win only"
+// is being shown an internal token. These two functions exist for messages and
+// for nothing else; nothing that builds a label, a package name, or a path may
+// use them.
+// ---------------------------------------------------------------------------
+
+/// The operating system's name as GitHub's documentation writes it in prose.
+#[must_use]
+pub const fn os_name(os: Os) -> &'static str {
+    match os {
+        Os::Windows => "Windows",
+        Os::MacOs => "macOS",
+        Os::Linux => "Linux",
+    }
+}
+
+/// The architecture's name as GitHub's documentation writes it in prose.
+#[must_use]
+pub const fn arch_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X64 => "x64",
+        Arch::Arm64 => "ARM64",
+        Arch::Arm32 => "ARM32",
+    }
+}
+
+/// The operating system this binary was compiled for, or `None` when that is
+/// not one of the three documented systems.
 ///
-/// Deliberately not the same type as the domain's persisted `Os`: this crate
-/// sits below the domain in the dependency graph for everything except its own
-/// `runner-manager-domain` edge, and host detection must not wait on the
-/// persistence model. Bridging the two is a caller's job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostOs {
-    /// Windows 10/11 and Windows Server 2016/2019/2022, 64-bit.
-    Windows,
-    /// macOS 11.0 (Big Sur) or later.
-    MacOs,
-    /// One of the nine documented Linux distributions.
-    Linux,
-}
-
-/// The architectures GitHub documents for self-hosted runners.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostArch {
-    /// 64-bit x86. Generally available on all three operating systems.
-    X64,
-    /// 64-bit ARM. **Public preview** on all three operating systems.
-    Arm64,
-    /// 32-bit ARM. Documented on Linux only.
-    Arm32,
-}
-
-impl HostOs {
-    /// The canonical lowercase name, as GitHub's documentation writes it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Windows => "windows",
-            Self::MacOs => "macos",
-            Self::Linux => "linux",
-        }
-    }
-
-    /// The operating system this binary was compiled for, or `None` when that
-    /// is not one of the three documented systems.
-    ///
-    /// Resolved from `cfg!`, not from a runtime probe: a binary compiled for
-    /// one operating system cannot be running on another, and a compile-time
-    /// answer cannot be wrong about the thing it is most likely to be asked
-    /// during an incident.
-    #[must_use]
-    pub const fn detect() -> Option<Self> {
-        if cfg!(target_os = "windows") {
-            Some(Self::Windows)
-        } else if cfg!(target_os = "macos") {
-            Some(Self::MacOs)
-        } else if cfg!(target_os = "linux") {
-            Some(Self::Linux)
-        } else {
-            None
-        }
+/// Resolved from `cfg!`, not from a runtime probe: a binary compiled for one
+/// operating system cannot be running on another, and a compile-time answer
+/// cannot be wrong about the thing it is most likely to be asked during an
+/// incident.
+#[must_use]
+pub const fn detect_os() -> Option<Os> {
+    if cfg!(target_os = "windows") {
+        Some(Os::Windows)
+    } else if cfg!(target_os = "macos") {
+        Some(Os::MacOs)
+    } else if cfg!(target_os = "linux") {
+        Some(Os::Linux)
+    } else {
+        None
     }
 }
 
-impl fmt::Display for HostOs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+/// The architecture this binary was compiled for, or `None` when that is not
+/// one of the three documented architectures.
+#[must_use]
+pub const fn detect_arch() -> Option<Arch> {
+    if cfg!(target_arch = "x86_64") {
+        Some(Arch::X64)
+    } else if cfg!(target_arch = "aarch64") {
+        Some(Arch::Arm64)
+    } else if cfg!(target_arch = "arm") {
+        Some(Arch::Arm32)
+    } else {
+        None
     }
 }
 
-impl HostArch {
-    /// The canonical lowercase name, as GitHub's documentation writes it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::X64 => "x64",
-            Self::Arm64 => "arm64",
-            Self::Arm32 => "arm32",
-        }
-    }
-
-    /// The architecture this binary was compiled for, or `None` when that is
-    /// not one of the three documented architectures.
-    #[must_use]
-    pub const fn detect() -> Option<Self> {
-        if cfg!(target_arch = "x86_64") {
-            Some(Self::X64)
-        } else if cfg!(target_arch = "aarch64") {
-            Some(Self::Arm64)
-        } else if cfg!(target_arch = "arm") {
-            Some(Self::Arm32)
-        } else {
-            None
-        }
-    }
-}
-
-impl fmt::Display for HostArch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// An operating system and architecture pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Host {
-    /// The host operating system.
-    pub os: HostOs,
-    /// The host architecture.
-    pub arch: HostArch,
-}
-
-impl Host {
-    /// Builds a pair without consulting the running machine.
-    #[must_use]
-    pub const fn new(os: HostOs, arch: HostArch) -> Self {
-        Self { os, arch }
-    }
-
-    /// The pair this binary was compiled for.
-    ///
-    /// # Errors
-    ///
-    /// [`UnsupportedHost::UndocumentedPlatform`] when the operating system or
-    /// the architecture is outside GitHub's documented matrix entirely — a
-    /// FreeBSD or RISC-V build, for instance. That is a *build* that should
-    /// not exist rather than a host that should be warned about, so it is an
-    /// error and not a warning.
-    pub const fn detect() -> Result<Self, UnsupportedHost> {
-        match (HostOs::detect(), HostArch::detect()) {
-            (Some(os), Some(arch)) => Ok(Self { os, arch }),
-            _ => Err(UnsupportedHost::UndocumentedPlatform {
-                os: std::env::consts::OS,
-                arch: std::env::consts::ARCH,
-            }),
-        }
-    }
-}
-
-impl fmt::Display for Host {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.os, self.arch)
+/// The operating system and architecture this binary was compiled for.
+///
+/// # Errors
+///
+/// [`UnsupportedHost::UndocumentedPlatform`] when the operating system or the
+/// architecture is outside GitHub's documented matrix entirely — a FreeBSD or
+/// RISC-V build, for instance. That is a *build* that should not exist rather
+/// than a host that should be warned about, so it is an error and not a
+/// warning.
+pub const fn detect_host() -> Result<(Os, Arch), UnsupportedHost> {
+    match (detect_os(), detect_arch()) {
+        (Some(os), Some(arch)) => Ok((os, arch)),
+        _ => Err(UnsupportedHost::UndocumentedPlatform {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        }),
     }
 }
 
@@ -200,14 +170,17 @@ pub enum UnsupportedHost {
 
     /// Both halves are documented, but not together: ARM32 is Linux-only.
     #[error(
-        "GitHub documents ARM32 self-hosted runners on Linux only, so {os}/{arch} is not a \
-         supported combination; use an x64 or ARM64 build of {os} instead"
+        "GitHub documents ARM32 self-hosted runners on Linux only, so {} on {} is not a \
+         supported combination; use an x64 or ARM64 build of {} instead",
+        arch_name(*arch),
+        os_name(*os),
+        os_name(*os)
     )]
     UndocumentedPair {
         /// The host operating system.
-        os: HostOs,
+        os: Os,
         /// The host architecture.
-        arch: HostArch,
+        arch: Arch,
     },
 }
 
@@ -219,6 +192,20 @@ pub enum SupportStatus {
     GenerallyAvailable,
     /// Documented as public preview. Accepted, with a warning.
     PublicPreview,
+}
+
+impl SupportStatus {
+    /// Derived from [`Arch::is_public_preview`] rather than decided again here,
+    /// so `f2` cannot get one answer from the domain and another from this
+    /// module.
+    #[must_use]
+    pub const fn of(arch: Arch) -> Self {
+        if arch.is_public_preview() {
+            Self::PublicPreview
+        } else {
+            Self::GenerallyAvailable
+        }
+    }
 }
 
 /// Something an operator should be told about an accepted host.
@@ -265,6 +252,17 @@ pub enum ContainerSupport {
 }
 
 impl ContainerSupport {
+    /// Derived from [`Os::supports_container_actions`]. This type adds the
+    /// operator-facing explanation; it does not re-decide the question.
+    #[must_use]
+    pub const fn of(os: Os) -> Self {
+        if os.supports_container_actions() {
+            Self::Available
+        } else {
+            Self::RequiresLinux
+        }
+    }
+
     /// Whether container workflow features work on this host.
     #[must_use]
     pub const fn is_available(self) -> bool {
@@ -343,28 +341,35 @@ const LINUX_RELEASES: &[DocumentedRelease] = &[
 /// without restating it, and so a future correction to the matrix lands in one
 /// place.
 #[must_use]
-pub const fn documented_releases(os: HostOs) -> &'static [DocumentedRelease] {
+pub const fn documented_releases(os: Os) -> &'static [DocumentedRelease] {
     match os {
-        HostOs::Windows => WINDOWS_RELEASES,
-        HostOs::MacOs => MACOS_RELEASES,
-        HostOs::Linux => LINUX_RELEASES,
+        Os::Windows => WINDOWS_RELEASES,
+        Os::MacOs => MACOS_RELEASES,
+        Os::Linux => LINUX_RELEASES,
     }
 }
 
 /// The verdict on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSupport {
-    host: Host,
+    os: Os,
+    arch: Arch,
     status: SupportStatus,
     warnings: Vec<SupportWarning>,
     container_support: ContainerSupport,
 }
 
 impl HostSupport {
-    /// The pair this verdict is about.
+    /// The operating system this verdict is about.
     #[must_use]
-    pub const fn host(&self) -> Host {
-        self.host
+    pub const fn os(&self) -> Os {
+        self.os
+    }
+
+    /// The architecture this verdict is about.
+    #[must_use]
+    pub const fn arch(&self) -> Arch {
+        self.arch
     }
 
     /// Whether GitHub documents the pair without qualification.
@@ -389,7 +394,13 @@ impl HostSupport {
     /// The releases GitHub documents for this host's operating system.
     #[must_use]
     pub const fn documented_releases(&self) -> &'static [DocumentedRelease] {
-        documented_releases(self.host.os)
+        documented_releases(self.os)
+    }
+}
+
+impl fmt::Display for HostSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} on {}", arch_name(self.arch), os_name(self.os))
     }
 }
 
@@ -399,41 +410,36 @@ impl HostSupport {
 ///
 /// [`UnsupportedHost::UndocumentedPair`] when both halves are documented but
 /// not together, which today means ARM32 anywhere other than Linux.
-pub fn validate(host: Host) -> Result<HostSupport, UnsupportedHost> {
-    // Exhaustive on purpose: see the module documentation. A new `HostOs` or
-    // `HostArch` variant must fail to compile here rather than fall through to
-    // an accept or a reject nobody chose.
-    let status = match (host.os, host.arch) {
-        (HostOs::Windows | HostOs::MacOs | HostOs::Linux, HostArch::X64)
-        | (HostOs::Linux, HostArch::Arm32) => SupportStatus::GenerallyAvailable,
+pub fn validate(os: Os, arch: Arch) -> Result<HostSupport, UnsupportedHost> {
+    // Exhaustive on purpose: see the module documentation. A new `Os` or `Arch`
+    // variant must fail to compile here rather than fall through to an accept
+    // or a reject nobody chose.
+    //
+    // This match decides *only* which pairs are documented, which is the part
+    // the domain explicitly delegates. How firmly a documented pair is
+    // supported, and whether it runs containers, are the domain's own
+    // predicates and are read from there below.
+    match (os, arch) {
+        (Os::Windows | Os::MacOs | Os::Linux, Arch::X64 | Arch::Arm64)
+        | (Os::Linux, Arch::Arm32) => {}
 
-        (HostOs::Windows | HostOs::MacOs | HostOs::Linux, HostArch::Arm64) => {
-            SupportStatus::PublicPreview
+        (Os::Windows | Os::MacOs, Arch::Arm32) => {
+            return Err(UnsupportedHost::UndocumentedPair { os, arch });
         }
+    }
 
-        (HostOs::Windows | HostOs::MacOs, HostArch::Arm32) => {
-            return Err(UnsupportedHost::UndocumentedPair {
-                os: host.os,
-                arch: host.arch,
-            });
-        }
-    };
-
+    let status = SupportStatus::of(arch);
     let warnings = match status {
         SupportStatus::GenerallyAvailable => Vec::new(),
         SupportStatus::PublicPreview => vec![SupportWarning::Arm64PublicPreview],
     };
 
-    let container_support = match host.os {
-        HostOs::Linux => ContainerSupport::Available,
-        HostOs::Windows | HostOs::MacOs => ContainerSupport::RequiresLinux,
-    };
-
     Ok(HostSupport {
-        host,
+        os,
+        arch,
         status,
         warnings,
-        container_support,
+        container_support: ContainerSupport::of(os),
     })
 }
 
@@ -441,9 +447,10 @@ pub fn validate(host: Host) -> Result<HostSupport, UnsupportedHost> {
 ///
 /// # Errors
 ///
-/// Both variants of [`UnsupportedHost`]; see [`Host::detect`] and [`validate`].
+/// Both variants of [`UnsupportedHost`]; see [`detect_host`] and [`validate`].
 pub fn detect() -> Result<HostSupport, UnsupportedHost> {
-    validate(Host::detect()?)
+    let (os, arch) = detect_host()?;
+    validate(os, arch)
 }
 
 #[cfg(test)]
@@ -455,23 +462,17 @@ mod tests {
     /// test. Asserting the classifier against its own table would prove
     /// nothing; this list is the independent copy that makes the assertions
     /// mean something.
-    const DOCUMENTED: &[(HostOs, HostArch)] = &[
-        (HostOs::Windows, HostArch::X64),
-        (HostOs::MacOs, HostArch::X64),
-        (HostOs::Linux, HostArch::X64),
-        (HostOs::Windows, HostArch::Arm64),
-        (HostOs::MacOs, HostArch::Arm64),
-        (HostOs::Linux, HostArch::Arm64),
-        (HostOs::Linux, HostArch::Arm32),
+    const DOCUMENTED: &[(Os, Arch)] = &[
+        (Os::Windows, Arch::X64),
+        (Os::MacOs, Arch::X64),
+        (Os::Linux, Arch::X64),
+        (Os::Windows, Arch::Arm64),
+        (Os::MacOs, Arch::Arm64),
+        (Os::Linux, Arch::Arm64),
+        (Os::Linux, Arch::Arm32),
     ];
 
-    const UNDOCUMENTED: &[(HostOs, HostArch)] = &[
-        (HostOs::Windows, HostArch::Arm32),
-        (HostOs::MacOs, HostArch::Arm32),
-    ];
-
-    const ALL_OS: &[HostOs] = &[HostOs::Windows, HostOs::MacOs, HostOs::Linux];
-    const ALL_ARCH: &[HostArch] = &[HostArch::X64, HostArch::Arm64, HostArch::Arm32];
+    const UNDOCUMENTED: &[(Os, Arch)] = &[(Os::Windows, Arch::Arm32), (Os::MacOs, Arch::Arm32)];
 
     /// The DoD clause "accepts every documented pair, rejects an undocumented
     /// pair", expressed once so that it can be pointed at a deliberately broken
@@ -481,16 +482,24 @@ mod tests {
     /// is what lets `the_matrix_assertions_catch_a_classifier_that_accepts_everything`
     /// below prove these assertions are not vacuous.
     fn check_matrix(
-        classify: impl Fn(Host) -> Result<HostSupport, UnsupportedHost>,
+        classify: impl Fn(Os, Arch) -> Result<HostSupport, UnsupportedHost>,
     ) -> Result<(), String> {
         for &(os, arch) in DOCUMENTED {
-            if classify(Host::new(os, arch)).is_err() {
-                return Err(format!("{os}/{arch} is documented but was rejected"));
+            if classify(os, arch).is_err() {
+                return Err(format!(
+                    "{}/{} is documented but was rejected",
+                    os.label_token(),
+                    arch.label_token()
+                ));
             }
         }
         for &(os, arch) in UNDOCUMENTED {
-            if classify(Host::new(os, arch)).is_ok() {
-                return Err(format!("{os}/{arch} is undocumented but was accepted"));
+            if classify(os, arch).is_ok() {
+                return Err(format!(
+                    "{}/{} is undocumented but was accepted",
+                    os.label_token(),
+                    arch.label_token()
+                ));
             }
         }
         Ok(())
@@ -507,9 +516,10 @@ mod tests {
         // permissive. If `check_matrix` cannot see that, the test above is
         // decoration, so point it at a classifier that is wrong in exactly that
         // way and require it to complain.
-        let permissive = |host: Host| {
+        let permissive = |os, arch| {
             Ok(HostSupport {
-                host,
+                os,
+                arch,
                 status: SupportStatus::GenerallyAvailable,
                 warnings: Vec::new(),
                 container_support: ContainerSupport::Available,
@@ -526,12 +536,7 @@ mod tests {
 
     #[test]
     fn the_matrix_assertions_catch_a_classifier_that_rejects_everything() {
-        let hostile = |host: Host| {
-            Err(UnsupportedHost::UndocumentedPair {
-                os: host.os,
-                arch: host.arch,
-            })
-        };
+        let hostile = |os, arch| Err(UnsupportedHost::UndocumentedPair { os, arch });
 
         let complaint = check_matrix(hostile).expect_err("a hostile classifier must be caught");
         assert!(
@@ -544,15 +549,21 @@ mod tests {
     fn every_pair_is_classified_and_the_two_sets_do_not_overlap() {
         // Guards against a pair being forgotten by both lists above as the
         // matrix changes: the cross product must be partitioned exactly.
+        //
+        // `Os::ALL` and `Arch::ALL` come from the domain, so a variant added
+        // there is covered here without an edit — which was one of the reasons
+        // for stopping keeping a second pair of enums in this file.
         let mut seen = Vec::new();
-        for &os in ALL_OS {
-            for &arch in ALL_ARCH {
+        for &os in &Os::ALL {
+            for &arch in &Arch::ALL {
                 let pair = (os, arch);
                 let documented = DOCUMENTED.contains(&pair);
                 let undocumented = UNDOCUMENTED.contains(&pair);
                 assert!(
                     documented ^ undocumented,
-                    "{os}/{arch} must appear in exactly one of the two test tables"
+                    "{}/{} must appear in exactly one of the two test tables",
+                    os.label_token(),
+                    arch.label_token()
                 );
                 seen.push(pair);
             }
@@ -562,15 +573,21 @@ mod tests {
 
     #[test]
     fn arm64_is_accepted_with_a_public_preview_warning_on_all_three_systems() {
-        for &os in ALL_OS {
-            let support = validate(Host::new(os, HostArch::Arm64))
+        for &os in &Os::ALL {
+            let support = validate(os, Arch::Arm64)
                 .expect("ARM64 must be accepted, not rejected: the persona's host is ARM64");
 
-            assert_eq!(support.status(), SupportStatus::PublicPreview, "on {os}");
+            assert_eq!(
+                support.status(),
+                SupportStatus::PublicPreview,
+                "on {}",
+                os_name(os)
+            );
             assert_eq!(
                 support.warnings(),
                 [SupportWarning::Arm64PublicPreview],
-                "on {os}"
+                "on {}",
+                os_name(os)
             );
             assert!(
                 support.warnings()[0].message().contains("public preview"),
@@ -582,31 +599,34 @@ mod tests {
     #[test]
     fn generally_available_pairs_carry_no_warning() {
         for &(os, arch) in DOCUMENTED {
-            if arch == HostArch::Arm64 {
+            if arch == Arch::Arm64 {
                 continue;
             }
-            let support = validate(Host::new(os, arch)).expect("documented");
+            let support = validate(os, arch).expect("documented");
             assert_eq!(support.status(), SupportStatus::GenerallyAvailable);
             assert!(
                 support.warnings().is_empty(),
-                "{os}/{arch} is generally available and must not warn"
+                "{}/{} is generally available and must not warn",
+                os.label_token(),
+                arch.label_token()
             );
         }
     }
 
     #[test]
     fn container_actions_are_reported_as_linux_only() {
-        let linux = validate(Host::new(HostOs::Linux, HostArch::X64)).expect("documented");
+        let linux = validate(Os::Linux, Arch::X64).expect("documented");
         assert_eq!(linux.container_support(), ContainerSupport::Available);
         assert!(linux.container_support().is_available());
         assert!(linux.container_support().message().is_none());
 
-        for &os in &[HostOs::Windows, HostOs::MacOs] {
-            let support = validate(Host::new(os, HostArch::X64)).expect("documented");
+        for os in [Os::Windows, Os::MacOs] {
+            let support = validate(os, Arch::X64).expect("documented");
             assert_eq!(
                 support.container_support(),
                 ContainerSupport::RequiresLinux,
-                "{os} must report the container limitation so f2 can surface it"
+                "{} must report the container limitation so f2 can surface it",
+                os_name(os)
             );
             assert!(!support.container_support().is_available());
 
@@ -616,27 +636,82 @@ mod tests {
                 .expect("the limitation must carry operator-facing text");
             // Edge case 2's whole point is that Docker does not lift it, so the
             // message must say so or an operator will install Docker and retry.
-            assert!(message.contains("Docker"), "on {os}: {message}");
-            assert!(message.contains("Linux"), "on {os}: {message}");
+            assert!(message.contains("Docker"), "on {}: {message}", os_name(os));
+            assert!(message.contains("Linux"), "on {}: {message}", os_name(os));
         }
+    }
+
+    /// The single-source property the `HostOs`/`HostArch` deletion bought.
+    ///
+    /// `f2` may read the verdict from this module or from the domain predicate,
+    /// and the two must agree for every host — not because both tables were
+    /// updated together, but because there is only one table.
+    #[test]
+    fn the_verdicts_agree_with_the_domain_predicates_they_are_derived_from() {
+        for &(os, arch) in DOCUMENTED {
+            let support = validate(os, arch).expect("documented");
+
+            assert_eq!(
+                support.container_support().is_available(),
+                os.supports_container_actions(),
+                "container support disagrees with the domain for {}",
+                os_name(os)
+            );
+            assert_eq!(
+                support.status() == SupportStatus::PublicPreview,
+                arch.is_public_preview(),
+                "preview status disagrees with the domain for {}",
+                arch_name(arch)
+            );
+            assert_eq!(
+                support.warnings().is_empty(),
+                !arch.is_public_preview(),
+                "the warning list disagrees with the domain for {}",
+                arch_name(arch)
+            );
+        }
+    }
+
+    /// Prose names and routing tokens are different things, deliberately.
+    ///
+    /// The trap this guards is an edit that reaches for `label_token()` in an
+    /// operator-facing message, which would render "GitHub documents ARM32
+    /// runners on win only". The tokens belong to runner-package selection and
+    /// nowhere else.
+    #[test]
+    fn prose_names_are_not_routing_tokens() {
+        assert_eq!(os_name(Os::Windows), "Windows");
+        assert_eq!(Os::Windows.label_token(), "win");
+        assert_eq!(os_name(Os::MacOs), "macOS");
+        assert_eq!(Os::MacOs.label_token(), "osx");
+        assert_eq!(arch_name(Arch::Arm32), "ARM32");
+        assert_eq!(Arch::Arm32.label_token(), "arm");
+
+        // Linux and x64 are spelled the same either way, which is exactly why
+        // the other four are worth pinning: a partial overlap is what let two
+        // spellings drift without anything failing.
+        assert_eq!(os_name(Os::Linux), "Linux");
+        assert_eq!(arch_name(Arch::X64), "x64");
     }
 
     #[test]
     fn an_undocumented_pair_says_which_pair_and_why() {
-        let error = validate(Host::new(HostOs::Windows, HostArch::Arm32))
-            .expect_err("ARM32 is documented on Linux only");
+        let error =
+            validate(Os::Windows, Arch::Arm32).expect_err("ARM32 is documented on Linux only");
 
         assert_eq!(
             error,
             UnsupportedHost::UndocumentedPair {
-                os: HostOs::Windows,
-                arch: HostArch::Arm32,
+                os: Os::Windows,
+                arch: Arch::Arm32,
             }
         );
 
+        // Prose, not tokens: an operator should not have to know that `win`
+        // means Windows.
         let rendered = error.to_string();
-        assert!(rendered.contains("windows"), "{rendered}");
-        assert!(rendered.contains("arm32"), "{rendered}");
+        assert!(rendered.contains("Windows"), "{rendered}");
+        assert!(rendered.contains("ARM32"), "{rendered}");
         assert!(rendered.contains("Linux only"), "{rendered}");
     }
 
@@ -645,32 +720,29 @@ mod tests {
         // Five Windows releases, macOS with an 11.0 floor, and nine Linux
         // distributions. The counts are asserted because a distribution
         // dropped by an edit is otherwise invisible.
-        assert_eq!(documented_releases(HostOs::Windows).len(), 5);
-        assert_eq!(documented_releases(HostOs::MacOs).len(), 1);
+        assert_eq!(documented_releases(Os::Windows).len(), 5);
+        assert_eq!(documented_releases(Os::MacOs).len(), 1);
         assert_eq!(
-            documented_releases(HostOs::Linux).len(),
+            documented_releases(Os::Linux).len(),
             9,
             "`01-current-architecture.md` names nine Linux distributions"
         );
 
         assert_eq!(
-            documented_releases(HostOs::MacOs)[0].minimum_version,
+            documented_releases(Os::MacOs)[0].minimum_version,
             Some("11.0"),
             "macOS 11.0 (Big Sur) is the documented floor"
         );
-        assert_eq!(
-            documented_releases(HostOs::MacOs)[0].to_string(),
-            "macOS 11.0+"
-        );
+        assert_eq!(documented_releases(Os::MacOs)[0].to_string(), "macOS 11.0+");
 
-        for release in documented_releases(HostOs::Windows) {
+        for release in documented_releases(Os::Windows) {
             assert!(
                 release.name.starts_with("Windows"),
                 "unexpected Windows release: {release}"
             );
         }
 
-        let linux: Vec<String> = documented_releases(HostOs::Linux)
+        let linux: Vec<String> = documented_releases(Os::Linux)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -699,46 +771,47 @@ mod tests {
         let support = detect().expect("every CI leg and every supported host must classify");
 
         assert_eq!(
-            support.host(),
-            Host::detect().expect("detection agrees with itself")
+            (support.os(), support.arch()),
+            detect_host().expect("detection agrees with itself")
         );
         assert!(
-            DOCUMENTED.contains(&(support.host().os, support.host().arch)),
-            "detected {} is not in the documented matrix",
-            support.host()
+            DOCUMENTED.contains(&(support.os(), support.arch())),
+            "detected {support} is not in the documented matrix"
         );
 
         // The macOS CI leg is Apple Silicon by design (`ci.yml` asserts
         // `uname -m` is arm64), so on that leg this is the public-preview path
         // running for real rather than as a constructed pair.
-        if support.host().arch == HostArch::Arm64 {
+        if support.arch() == Arch::Arm64 {
             assert_eq!(support.status(), SupportStatus::PublicPreview);
             assert!(!support.warnings().is_empty());
         }
     }
 
+    /// A host built from this module's answer is a host the domain accepts.
+    ///
+    /// The `HostOs`/`HostArch` version could not state this at all: the caller
+    /// had to bridge between two enums, and `platform::os::Host` even
+    /// serialised its architecture under a different field name (`arch`) than
+    /// the domain's `Host` (`architecture`). There is now nothing to bridge.
     #[test]
-    fn display_and_serde_round_trip_the_canonical_names() {
-        assert_eq!(
-            Host::new(HostOs::Windows, HostArch::X64).to_string(),
-            "windows/x64"
-        );
-        assert_eq!(
-            Host::new(HostOs::MacOs, HostArch::Arm64).to_string(),
-            "macos/arm64"
-        );
-        assert_eq!(
-            Host::new(HostOs::Linux, HostArch::Arm32).to_string(),
-            "linux/arm32"
-        );
+    fn a_detected_host_feeds_the_domain_directly() {
+        use std::num::NonZeroU16;
 
-        for &os in ALL_OS {
-            for &arch in ALL_ARCH {
-                let host = Host::new(os, arch);
-                let json = serde_json::to_string(&host).expect("serialisable");
-                let back: Host = serde_json::from_str(&json).expect("deserialisable");
-                assert_eq!(host, back, "{json}");
-            }
-        }
+        use runner_manager_domain::model::{Host, HostId};
+
+        let support = detect().expect("this host classifies");
+        let host = Host::new(
+            HostId::from_u128(1),
+            "the machine this test is running on",
+            support.os(),
+            support.arch(),
+            NonZeroU16::new(4).expect("non-zero"),
+            chrono::Utc::now(),
+        )
+        .expect("a named host is valid");
+
+        assert_eq!(host.os, support.os());
+        assert_eq!(host.architecture, support.arch());
     }
 }

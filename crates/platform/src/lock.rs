@@ -243,6 +243,19 @@ impl HostLock {
     /// configuration problem, and waiting for it makes the problem quieter
     /// rather than fixing it.
     ///
+    /// # This blocks the calling thread
+    ///
+    /// The retry loop is `std::thread::sleep`, not a timer an executor can
+    /// park. `e1` takes the allocation lock from inside async reconciliation,
+    /// and calling this directly from a `tokio` task blocks a worker thread for
+    /// up to `wait` — starving every other task scheduled on it, and with a
+    /// current-thread runtime deadlocking against the very task that would
+    /// release the lock. **Async callers must wrap it in
+    /// [`tokio::task::spawn_blocking`]**, which is also where the returned
+    /// [`HostLock`] should then live, since dropping it is the release.
+    ///
+    /// [`HostLock::try_acquire`] does not block and is safe to call inline.
+    ///
     /// # Errors
     ///
     /// As [`HostLock::try_acquire`], reporting the last holder seen.
@@ -909,9 +922,12 @@ mod tests {
             "the helper holds it"
         );
 
-        // `Duration::ZERO` goes straight to the forceful kill, so no destructor
-        // and no cleanup code runs in the helper. That is the point: this is a
-        // crash, not a shutdown.
+        // `Duration::ZERO` leaves the helper no grace period. On Windows that
+        // is literally straight to `TerminateProcess`, because there is no
+        // signal to send; on Unix a SIGTERM is still sent first, but the grace
+        // period it is given is zero, so SIGKILL follows before the helper can
+        // act on it. Either way no destructor and no cleanup code runs, which
+        // is the point: this is a crash, not a shutdown.
         helper.stop(Duration::ZERO).expect("the helper is killed");
         assert!(!helper.is_running().expect("observable"));
 

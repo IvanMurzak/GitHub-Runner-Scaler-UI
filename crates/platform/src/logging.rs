@@ -40,9 +40,17 @@
 //!   — and it survives intact; log a bare `/repos/owner/repo` and it becomes
 //!   `[path]`.
 //! - Any unbroken run of 40 or more base64, base64url, or hex characters is
-//!   treated as an opaque secret. A full SHA-256 digest is 64 hex characters
-//!   and is therefore redacted even though it is not secret. Log a short
-//!   prefix when a digest needs to be visible.
+//!   treated as an opaque secret. There is exactly one carve-out: a value that
+//!   is precisely 64 lowercase hex characters is a SHA-256 digest, and renders
+//!   as a labelled 12-character prefix rather than disappearing. A digest is
+//!   not a secret, and `07-security.md` makes checksum verification a security
+//!   gate whose most useful diagnostic is expected-versus-actual.
+//! - A URL keeps its scheme, host and path and loses everything that
+//!   authenticates it: the `user:password@` userinfo, the query string, and the
+//!   fragment. The userinfo matters more than it looks — a
+//!   token-authenticated git remote is
+//!   `https://x-access-token:ghu_…@github.com/owner/repo.git`, so it is the
+//!   shape a clone or fetch failure arrives in.
 //! - A word ending in `:` or `=` whose stem is a credential header name causes
 //!   the next two words to be redacted, so `Authorization: Bearer ghu_…` loses
 //!   both the scheme and the token.
@@ -290,13 +298,10 @@ fn redact_word(word: &str) -> (String, u32) {
 
 /// Redacts one word with its wrapping punctuation already removed.
 fn redact_core(core: &str) -> String {
-    // A URL survives, minus its query string. Query strings carry tokens; the
+    // A URL survives, minus everything on it that carries a credential. The
     // scheme, host and path are what makes a log line diagnosable.
-    if core.contains("://") {
-        return match core.split_once('?') {
-            Some((base, _)) => format!("{base}?{REDACTION}"),
-            None => core.to_string(),
-        };
+    if let Some((scheme, rest)) = core.split_once("://") {
+        return redact_url(scheme, rest);
     }
 
     // `key=value` and `key:value` in a single word.
@@ -316,6 +321,48 @@ fn redact_core(core: &str) -> String {
     redact_value(core)
 }
 
+/// Redacts the three places a URL can carry a credential, keeping the rest.
+///
+/// `scheme` is everything before `://` and `rest` everything after it.
+///
+/// The **userinfo** is the one this module used to miss, and it is not an
+/// exotic shape: `https://x-access-token:ghu_…@github.com/owner/repo.git` is
+/// the canonical token-authenticated git remote, so it is what `e2` and `e3`
+/// will have in hand when a clone or a download fails and they log the error
+/// they were given. The old `://` branch returned before the token-prefix and
+/// opaque-run rules could run, so that URL came out intact.
+///
+/// A **fragment** is stripped for the same reason a query string is: an OAuth
+/// implicit-flow response puts the token after the `#`, and the fragment is
+/// never load-bearing for diagnosing an HTTP call.
+fn redact_url(scheme: &str, rest: &str) -> String {
+    // The authority runs to the first `/`, `?` or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+
+    // `rsplit_once`, not `split_once`: a password may itself contain an `@`,
+    // and the host is what follows the *last* one.
+    let host = match authority.rsplit_once('@') {
+        // Replaced rather than deleted. That the request carried credentials at
+        // all is diagnostic — it is often the answer to "why did this 401?" —
+        // and it is the credential, not its existence, that must not be here.
+        Some((_userinfo, host)) => format!("{REDACTION}@{host}"),
+        None => authority.to_string(),
+    };
+
+    // Whichever of `?` and `#` comes first ends the diagnosable part; anything
+    // after it is replaced wholesale rather than parsed, because a token can be
+    // in any parameter and this module does not guess which.
+    match tail.find(['?', '#']) {
+        Some(cut) => {
+            let (path, query) = tail.split_at(cut);
+            let separator = &query[..1];
+            format!("{scheme}://{host}{path}{separator}{REDACTION}")
+        }
+        None => format!("{scheme}://{host}{tail}"),
+    }
+}
+
 /// The shape rules, applied to a bare value.
 fn redact_value(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
@@ -330,11 +377,48 @@ fn redact_value(value: &str) -> String {
         return PATH_REDACTION.to_string();
     }
 
+    // A digest is not a secret, and `07-security.md` makes checksum
+    // verification a security gate. The most useful thing `e2` can write when
+    // that gate fails is expected-versus-actual, and until this carve-out
+    // existed both sides came out as `[redacted]` — a gate that reports it
+    // failed and refuses to say how.
+    if let Some(digest) = as_sha256_digest(value) {
+        return digest;
+    }
+
     if value.len() >= OPAQUE_RUN_THRESHOLD && value.chars().all(is_opaque_char) {
         return REDACTION.to_string();
     }
 
     value.to_string()
+}
+
+/// The length of a SHA-256 digest written as lowercase hex.
+const SHA256_HEX_LEN: usize = 64;
+
+/// How much of a digest is shown.
+///
+/// 12 is the short-digest convention git and the OCI tooling use: 48 bits, far
+/// more than enough to tell an expected digest from the one that was actually
+/// computed, which is the only comparison a checksum failure needs. Truncating
+/// is also what makes this carve-out safe to have at all — a 64-character
+/// lowercase hex run is *usually* a digest, but an HMAC-SHA256 signature has
+/// the same shape, and 12 of its 64 characters are of no use to anybody.
+const DIGEST_PREFIX_LEN: usize = 12;
+
+/// Renders a value that is exactly a lowercase SHA-256 digest as a labelled
+/// prefix, or `None` when it is not one.
+///
+/// Deliberately strict: exactly 64 characters, and lowercase only. An uppercase
+/// or mixed-case run falls through to the opaque-run rule and is redacted,
+/// because the narrower this exception is, the less there is to reason about.
+fn as_sha256_digest(value: &str) -> Option<String> {
+    let is_digest = value.len() == SHA256_HEX_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() && c.is_ascii_hexdigit());
+
+    is_digest.then(|| format!("sha256:{}…", &value[..DIGEST_PREFIX_LEN]))
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -567,14 +651,20 @@ where
 /// The sink could not be installed.
 #[derive(Debug, thiserror::Error)]
 pub enum LoggingError {
-    /// The diagnostics directory could not be created.
+    /// The application-data directories could not be created.
+    ///
+    /// Carries a [`crate::paths::PathsError`] rather than a bare
+    /// [`std::io::Error`] because [`install`] creates `logs/` through
+    /// [`crate::paths::AppPaths::create_all`], which is what applies the `0700`
+    /// restriction; the source therefore names whichever of the four
+    /// directories actually failed, and that need not be `logs/`.
     #[error("cannot create the log directory {}: {source}", directory.display())]
     Directory {
-        /// The directory that could not be created.
+        /// The diagnostics directory [`install`] was asked to write into.
         directory: PathBuf,
         /// The underlying error.
         #[source]
-        source: std::io::Error,
+        source: crate::paths::PathsError,
     },
 
     /// A global subscriber was already installed.
@@ -611,11 +701,20 @@ pub fn install(
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
+    // `AppPaths::create_all`, not `create_dir_all`. The claim `create_all`
+    // documents — that a diagnostics file is not readable by other local
+    // accounts — is only true if `logs/` is created at `0700`, and this is the
+    // path a running daemon actually takes. Creating the directory here with a
+    // bare `create_dir_all` left it at the umask default whenever `install`
+    // won the race to create it, and `tracing_appender` then wrote 0644 files
+    // into it: the invariant held in the test that asserts it and nowhere else.
     let directory = paths.logs_dir().to_path_buf();
-    std::fs::create_dir_all(&directory).map_err(|source| LoggingError::Directory {
-        directory: directory.clone(),
-        source,
-    })?;
+    paths
+        .create_all()
+        .map_err(|source| LoggingError::Directory {
+            directory: directory.clone(),
+            source,
+        })?;
 
     let appender = tracing_appender::rolling::daily(&directory, "runner-manager.log");
     let (writer, worker) = tracing_appender::non_blocking(appender);
@@ -789,13 +888,68 @@ mod tests {
 
         let output = capture.text();
         for secret in secrets() {
-            if output.contains(secret) {
-                return Err(format!(
-                    "the sink emitted a secret verbatim: {secret}\n--- output ---\n{output}"
-                ));
+            for needle in needles(secret) {
+                if output.contains(&needle) {
+                    return Err(format!(
+                        "the sink emitted a secret verbatim: {secret}\n\
+                         (found as: {needle})\n--- output ---\n{output}"
+                    ));
+                }
             }
         }
         Ok(output)
+    }
+
+    /// Every spelling a secret can have in the sink's output.
+    ///
+    /// The sink writes JSON, so a secret containing a character `serde_json`
+    /// escapes never appears in the output as it was written. `WINDOWS_WORKSPACE`
+    /// is a raw string with single backslashes and is emitted with doubled ones,
+    /// so scanning for the literal could not have matched it — not even against
+    /// `PassthroughLayer`, which redacts nothing at all. The path really is
+    /// redacted, so this was a hole in the coverage rather than a leak, but a
+    /// needle that cannot match is a check that cannot fail.
+    fn needles(secret: &str) -> Vec<String> {
+        let json = serde_json::to_string(secret).expect("a string is serialisable");
+        // Strip the quotes `to_string` added; what is left is the secret
+        // exactly as it appears inside a JSON string literal.
+        let escaped = json[1..json.len() - 1].to_string();
+
+        if escaped == secret {
+            vec![secret.to_string()]
+        } else {
+            vec![secret.to_string(), escaped]
+        }
+    }
+
+    #[test]
+    fn the_scan_looks_for_a_needle_that_can_actually_occur() {
+        // Guards the helper above: if `needles` ever stops producing the
+        // JSON-escaped spelling, the Windows workspace silently stops being
+        // scanned for and every assertion about it becomes vacuous.
+        let windows = needles(WINDOWS_WORKSPACE);
+        assert_eq!(
+            windows.len(),
+            2,
+            "a backslash path has two spellings: {windows:?}"
+        );
+        assert!(
+            windows[1].contains(r"\\Users\\operator"),
+            "the escaped spelling is what a JSON line actually contains: {windows:?}"
+        );
+
+        // Confirms the premise: the raw spelling genuinely cannot occur in the
+        // sink's output, which is why scanning only for it proved nothing.
+        let rendered = serde_json::to_string(&Value::String(WINDOWS_WORKSPACE.to_string()))
+            .expect("serialisable");
+        assert!(
+            !rendered.contains(WINDOWS_WORKSPACE),
+            "if this ever contains the raw path, the original scan was fine after all: {rendered}"
+        );
+        assert!(rendered.contains(&windows[1]), "{rendered}");
+
+        // A secret with nothing to escape has exactly one spelling.
+        assert_eq!(needles(USER_TOKEN), vec![USER_TOKEN.to_string()]);
     }
 
     #[test]
@@ -1031,6 +1185,17 @@ mod tests {
                 format!("token={token}"),
                 format!("Authorization: Bearer {token}"),
                 format!("authorization={token}"),
+                // A URL's userinfo. This is the canonical token-authenticated
+                // git remote, so it is what a clone or fetch error carries, and
+                // it is the shape the `://` branch used to hand back verbatim.
+                format!("https://x-access-token:{token}@github.com/owner/repo.git"),
+                format!("fatal: could not read from https://{token}@github.com/o/r"),
+                // Userinfo with no password half.
+                format!("https://{token}@github.com/o/r.git"),
+                // A fragment, which used to be stripped only when it was a
+                // query string.
+                format!("https://github.com/login/oauth#access_token={token}"),
+                format!("https://github.com/x?a=1#token={token}"),
             ] {
                 let redacted = redact(&shape);
                 assert!(
@@ -1039,6 +1204,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_url_keeps_what_diagnoses_it_and_loses_what_authenticates_it() {
+        // The host and the path are the diagnosable part and must survive, or
+        // nobody keeps this redaction.
+        assert_eq!(
+            redact(
+                "https://x-access-token:ghu_16C7e42F292c6912E7710c838347Ae178B4a@github.com/owner/repo.git"
+            ),
+            format!("https://{REDACTION}@github.com/owner/repo.git")
+        );
+        assert_eq!(
+            redact("https://user:hunter2@api.github.com/repos/o/r?page=2"),
+            format!("https://{REDACTION}@api.github.com/repos/o/r?{REDACTION}")
+        );
+        // A password containing an `@`: the host is what follows the last one.
+        assert_eq!(
+            redact("https://user:p@ss@github.com/o/r"),
+            format!("https://{REDACTION}@github.com/o/r")
+        );
+        // Userinfo on a bare authority, with no path at all.
+        assert_eq!(
+            redact("https://token@github.com"),
+            format!("https://{REDACTION}@github.com")
+        );
+        // An `@` after the first `/` is part of the path, not userinfo.
+        assert_eq!(
+            redact("https://github.com/@owner/repo"),
+            "https://github.com/@owner/repo"
+        );
     }
 
     #[test]
@@ -1067,13 +1263,24 @@ mod tests {
     }
 
     #[test]
-    fn a_url_survives_but_its_query_string_does_not() {
+    fn a_url_survives_but_its_query_string_and_fragment_do_not() {
         assert_eq!(
             redact("GET https://api.github.com/repos/owner/repo/actions/runners"),
             "GET https://api.github.com/repos/owner/repo/actions/runners"
         );
         assert_eq!(
             redact("https://api.github.com/x?access_token=ghu_secret"),
+            format!("https://api.github.com/x?{REDACTION}")
+        );
+        // A fragment carries a token in an OAuth implicit-flow response, and
+        // is never needed to diagnose an HTTP call.
+        assert_eq!(
+            redact("https://api.github.com/x#access_token=ghu_secret"),
+            format!("https://api.github.com/x#{REDACTION}")
+        );
+        // Whichever comes first ends the diagnosable part.
+        assert_eq!(
+            redact("https://api.github.com/x?page=2#access_token=ghu_secret"),
             format!("https://api.github.com/x?{REDACTION}")
         );
     }
@@ -1116,14 +1323,66 @@ mod tests {
         }
     }
 
+    /// A SHA-256 is 64 opaque characters and would otherwise be swallowed by
+    /// the opaque-run rule. `07-security.md` makes checksum verification a
+    /// security gate, and a gate that cannot say *which* digest it got is a
+    /// gate nobody can act on, so a digest renders as a labelled prefix.
     #[test]
-    fn a_short_hex_digest_prefix_survives_while_a_full_one_does_not() {
-        // Documented behaviour rather than an accident: a full SHA-256 is 64
-        // opaque characters and is treated as a secret. `e2` should log a
-        // prefix when it wants a digest to be visible.
+    fn a_digest_renders_as_a_prefix_rather_than_disappearing() {
         let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        assert_eq!(redact(digest), REDACTION);
+
+        assert_eq!(redact(digest), "sha256:9f86d081884c…");
+        // The point of the change: expected-versus-actual stays legible.
+        let other = "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752";
+        assert_ne!(
+            redact(digest),
+            redact(other),
+            "two digests must stay distinguishable"
+        );
+
+        // In the sentence shape `e2` will actually write.
+        assert_eq!(
+            redact(&format!("checksum mismatch: expected {digest} got {other}")),
+            "checksum mismatch: expected sha256:9f86d081884c… got sha256:60303ae22b99…"
+        );
+
+        // A prefix a caller logged itself is below the threshold and untouched.
         assert_eq!(redact(&digest[..12]), digest[..12].to_string());
+
+        // Already-labelled digests were never caught by the opaque-run rule —
+        // the `:` is not an opaque character — and still are not.
+        assert_eq!(
+            redact(&format!("sha256:{digest}")),
+            format!("sha256:{digest}")
+        );
+    }
+
+    #[test]
+    fn the_digest_exception_is_exactly_sixty_four_lowercase_hex_and_nothing_else() {
+        // The narrower this carve-out is, the less there is to reason about.
+        // Anything that is not precisely a lowercase SHA-256 stays redacted by
+        // the opaque-run rule.
+        let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+        assert_eq!(
+            redact(&digest.to_ascii_uppercase()),
+            REDACTION,
+            "uppercase hex is not the shape this exception recognises"
+        );
+        assert_eq!(
+            redact(&format!("{digest}0")),
+            REDACTION,
+            "65 characters is not a SHA-256"
+        );
+        // 64 characters of base64, which is what an encoded secret of that
+        // length looks like: not hex, so not exempt.
+        let base64ish = "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxwvutsrqponmlkjihgfedcba98";
+        assert_eq!(base64ish.len(), 64);
+        assert_eq!(redact(base64ish), REDACTION);
+
+        // And the JIT blob, which is the thing the opaque-run rule exists for,
+        // must not have been weakened by any of this.
+        assert_eq!(redact(JIT_BLOB), REDACTION);
     }
 
     #[test]

@@ -195,11 +195,20 @@ impl AppPaths {
     /// Creates every directory that does not already exist.
     ///
     /// Idempotent, and restrictive where the platform expresses that through
-    /// mode bits: on Unix each leaf is set to `0700` after creation, so a
-    /// runner workspace, an attempt journal, and a diagnostics file are not
-    /// readable by other local accounts. Intermediate directories — `~/.local`,
+    /// mode bits: on Unix each leaf is created *at* `0700`, so a runner
+    /// workspace, an attempt journal, and a diagnostics file are not readable
+    /// by other local accounts. Intermediate directories — `~/.local`,
     /// `~/.config` — are left alone, because they are shared with every other
     /// application and are not this program's to tighten.
+    ///
+    /// The mode is passed to `mkdir(2)` rather than applied with a following
+    /// `chmod`, for the same reason [`crate::process::RestrictiveHandoff`]
+    /// passes it to `open(2)`: the two-step version leaves a window in which
+    /// `state/` and `runtime/` exist at the umask default — typically `0755` —
+    /// and those are the directories holding the attempt journal and the runner
+    /// workspaces. A directory that was *already* there is still tightened,
+    /// which is what keeps this idempotent and what upgrades a tree created by
+    /// an earlier version.
     ///
     /// On Windows the per-account `AppData` tree already denies other
     /// non-administrative users, and the one file whose exposure actually
@@ -211,15 +220,55 @@ impl AppPaths {
     /// [`PathsError::Create`], naming which of the four failed and why.
     pub fn create_all(&self) -> Result<(), PathsError> {
         for (purpose, path) in self.all() {
-            std::fs::create_dir_all(path).map_err(|source| PathsError::Create {
+            let failed = |source| PathsError::Create {
                 purpose,
                 path: path.to_path_buf(),
                 source,
-            })?;
-            restrict_directory(purpose, path)?;
+            };
+
+            // The parents are created at whatever the umask says, deliberately:
+            // they are `~/.local` and its like, and are not this program's to
+            // tighten.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(failed)?;
+            }
+
+            match create_restricted_leaf(path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Already there. It may predate this rule, or predate this
+                    // program, so tighten it rather than assume. A non-
+                    // directory at the path is still an error, exactly as it
+                    // was when this used `create_dir_all`.
+                    if !path.is_dir() {
+                        return Err(failed(source));
+                    }
+                    restrict_directory(purpose, path)?;
+                }
+                Err(source) => return Err(failed(source)),
+            }
         }
         Ok(())
     }
+}
+
+/// Creates one leaf directory with its final permissions already applied.
+///
+/// Fails with [`std::io::ErrorKind::AlreadyExists`] when anything is at the
+/// path; the caller decides what that means.
+#[cfg(unix)]
+fn create_restricted_leaf(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Windows has no mode bits to set at creation; the per-account `AppData` tree
+/// already denies other non-administrative users, and the one file whose
+/// exposure matters carries its own DACL.
+#[cfg(not(unix))]
+fn create_restricted_leaf(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
 }
 
 impl fmt::Display for AppPaths {
@@ -233,6 +282,10 @@ impl fmt::Display for AppPaths {
     }
 }
 
+/// Tightens a directory that already existed.
+///
+/// Only reached on that path now: a directory this program creates gets `0700`
+/// from `mkdir(2)` itself and never exists with anything else.
 #[cfg(unix)]
 fn restrict_directory(purpose: &'static str, path: &Path) -> Result<(), PathsError> {
     use std::os::unix::fs::PermissionsExt;
