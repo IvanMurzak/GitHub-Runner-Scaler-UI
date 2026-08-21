@@ -4,6 +4,26 @@
 # manual only and live in release.yml
 # (`.taskflow/2026-08-21-local-runner-manager/09-release-distribution.md`).
 #
+# ----------------------------------------------------------------------------
+# `workflow_call` IS NOT A RELEASE TRIGGER, AND IS NOT AN EXCEPTION TO THE LINE
+# ABOVE.
+# ----------------------------------------------------------------------------
+# release.yml's step 3 has to run "the same matrix as CI, on the release
+# commit". The alternative to calling this file is copying the matrix into
+# release.yml, and a copied gate is a gate that drifts: the release would go on
+# passing the checks CI used to run.
+#
+# `workflow_call` adds no event. Nothing in GitHub fires it; it is an entry
+# point that another workflow in this repository invokes with `uses:`, and the
+# only workflow that does is release.yml, which is itself `workflow_dispatch`
+# only. So the whole chain still starts at a human pressing a button, which is
+# the property D10 actually requires — and `crates/app/tests/release_workflow.rs`
+# asserts that release.yml reaches this file rather than reimplementing it.
+#
+# It also carries no new authority. A called workflow's permissions are capped
+# by the caller's and this file declares `contents: read` regardless, so being
+# callable does not let anything here touch the publishing credential.
+#
 # THE ACCEPTANCE SUITE IS NOT HERE. It lives in e2e.yml, on identical triggers,
 # because the shared disposable fixture has to be serialised at WORKFLOW level
 # and this file's own `concurrency` block below is incompatible with that in two
@@ -20,10 +40,18 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # The release gate's entry point. See the header: an entry point, not an
+  # event — only release.yml calls it, and only a human dispatch starts that.
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` resolves to the CALLING workflow's name, so a release run's
+# legs land in `ci-Release-<ref>` rather than contending with the pull-request
+# run of the same ref. `github.event_name` is likewise the caller's event —
+# `workflow_dispatch` — so `cancel-in-progress` evaluates false for a release
+# and no release test leg is ever cancelled by a later push.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

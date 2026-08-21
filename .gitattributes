@@ -1,0 +1,16 @@
+# owner: a2-release-workflow
+#
+# Shell scripts are checked out with LF endings on every platform.
+#
+# Without this, a Windows checkout with `core.autocrlf=true` -- the default that
+# Git for Windows installs, and what GitHub's windows runner image uses --
+# rewrites `.github/scripts/release.sh` to CRLF. `bash` then reads every line as
+# ending in a carriage return and passes it on to the command being run, so
+# `set -euo pipefail\r` is an unknown option and a quoted path picks up a
+# trailing `\r` that no file has in its name.
+#
+# It matters here rather than only in theory because
+# `crates/app/tests/release_workflow.rs` runs those scripts as part of
+# `cargo test`, on all three operating systems, and the release workflow's own
+# Windows build leg calls them under Git Bash.
+*.sh text eol=lf
