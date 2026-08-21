@@ -181,11 +181,17 @@ pub enum StoreError {
 
     /// One column holds something that is not the kind of value it is declared
     /// to hold. The row is named so an operator can find and fix it.
+    ///
+    /// **`value` is a clipped echo, never the whole payload** — see [`clip`].
+    /// The row id is what an operator needs to find the row; the payload only
+    /// helps them recognise it, and repeating all of it turns this error into a
+    /// disclosure the moment it reaches a log.
     #[error("{table}.{column} of row {id} holds {value}, which is not {expected}")]
     CorruptColumn {
         table: &'static str,
         column: &'static str,
         id: String,
+        /// At most [`ECHO_LIMIT`] characters of the offending payload.
         value: String,
         expected: &'static str,
     },
@@ -279,15 +285,27 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 /// them.
 const TABLES: &[&str] = &["schema_migrations", "hosts", "policies", "attempts"];
 
-fn current_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
+fn current_version(conn: &Connection) -> Result<u32, StoreError> {
     let max: Option<i64> =
         conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })?;
-    // A negative or absurd recorded version is corrupted bookkeeping. Reading it
-    // as "newer than anything this build knows" is the fail-closed direction: it
-    // refuses to run rather than re-applying a migration over live data.
-    Ok(max.map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX)))
+    // A negative recorded version is corrupted bookkeeping, and it is reported
+    // as that. Both directions of the old `unwrap_or(u32::MAX)` were wrong in
+    // the same way: it did fail closed, which is right, but it failed closed
+    // saying "this database is at schema version 4294967295", which is a number
+    // no database has ever been at. The operator's next move is to look at
+    // `schema_migrations`, and this says so.
+    match max {
+        None => Ok(0),
+        Some(raw) => u32::try_from(raw).map_err(|_| StoreError::CorruptColumn {
+            table: "schema_migrations",
+            column: "version",
+            id: raw.to_string(),
+            value: clip(&raw.to_string()),
+            expected: "a schema version this build could have written",
+        }),
+    }
 }
 
 /// Apply every step in `migrations` this database has not seen, in order.
@@ -466,15 +484,23 @@ pub trait Store: fmt::Debug + Send + Sync {
 /// connection pool would buy concurrency the database does not offer; what the
 /// mutex buys is `Sync`, so the agent can hold one handle across tasks.
 ///
-/// Opened in WAL mode with `synchronous = FULL`. WAL so that a reader — the TUI
-/// — does not block the agent's journal writes, and `FULL` because this journal
-/// exists precisely to survive an unclean stop: a handful of fsyncs per runner
-/// attempt is not a cost worth trading for the chance of losing the last write
-/// before a power cut.
+/// Opened with `synchronous = FULL` and a request for WAL. `FULL` because this
+/// journal exists precisely to survive an unclean stop: a handful of fsyncs per
+/// runner attempt is not a cost worth trading for the chance of losing the last
+/// write before a power cut. WAL so that a reader — the TUI — does not block the
+/// agent's journal writes.
+///
+/// **The WAL half is a request, not a guarantee**, which is why
+/// [`Self::journal_mode`] exists to report what actually happened. SQLite falls
+/// back to `delete` where the directory cannot host WAL's shared-memory file,
+/// and says so in the pragma's return row rather than by failing.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     path: Option<PathBuf>,
     schema_version: u32,
+    /// The journal mode this database actually ended up in, as SQLite reported
+    /// it. Not necessarily `wal`; see [`SqliteStore::journal_mode`].
+    journal_mode: String,
     clock_skew_repairs: AtomicU64,
 }
 
@@ -483,6 +509,7 @@ impl fmt::Debug for SqliteStore {
         f.debug_struct("SqliteStore")
             .field("path", &self.path)
             .field("schema_version", &self.schema_version)
+            .field("journal_mode", &self.journal_mode)
             .field(
                 "clock_skew_repairs",
                 &self.clock_skew_repairs.load(Ordering::Relaxed),
@@ -533,11 +560,38 @@ impl SqliteStore {
         path: Option<PathBuf>,
         migrations: &[Migration],
     ) -> Result<Self, StoreError> {
-        // A row-returning pragma, so it cannot go through `execute`. An
-        // in-memory database answers `memory` and that is fine; nothing here
-        // depends on the mode, only on not blocking a reader where the mode is
-        // available.
-        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        // A row-returning pragma, so it cannot go through `execute`, and the row
+        // it returns is the mode the database **ended up in** rather than the
+        // one that was asked for. Discarding it was a real gap: where WAL is
+        // unavailable -- it needs shared memory, which a network-mounted
+        // application data directory or some container `/tmp` does not provide
+        // -- SQLite quietly leaves the database in `delete` and says so in this
+        // row. Two things then went wrong at once. This type's own
+        // documentation promises "WAL so that a reader -- the TUI -- does not
+        // block the agent's journal writes", and that promise silently stopped
+        // holding in production with nothing anywhere to say so; and the `-wal`
+        // assertion in `tests/store_journal.rs` failed on an otherwise healthy
+        // build without explaining why.
+        //
+        // Recorded and warned about rather than refused. The journal is still
+        // *correct* in `delete` mode, only less concurrent, and an operator
+        // whose application data directory sits on a network mount wants a
+        // working agent more than a principled refusal to start. The fact is
+        // exposed through `SqliteStore::journal_mode` so a test can ask instead
+        // of assuming and an operator can see it in a support bundle. An
+        // in-memory database answers `memory`, which is correct and exempt.
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if path.is_some() && !journal_mode.eq_ignore_ascii_case("wal") {
+            tracing::warn!(
+                path = ?path,
+                journal_mode = %journal_mode,
+                "this database did not enter WAL mode, so a reader will block \
+                 the agent's journal writes. The usual cause is a directory \
+                 that cannot host WAL's shared-memory file, such as a network \
+                 mount."
+            );
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         // Two processes will contend (the TUI and a CLI invocation), and the
         // loser of a write lock should wait briefly rather than fail: a
@@ -558,6 +612,7 @@ impl SqliteStore {
             conn: Mutex::new(conn),
             path,
             schema_version,
+            journal_mode,
             clock_skew_repairs: AtomicU64::new(0),
         })
     }
@@ -566,6 +621,29 @@ impl SqliteStore {
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// The journal mode this database is actually in, lowercased by SQLite.
+    ///
+    /// `wal` for a healthy file store, `memory` for an in-memory one, and
+    /// something else — `delete`, usually — where the directory cannot host
+    /// WAL's shared-memory file. That last case is not a failure but it does
+    /// mean a reader blocks the agent's journal writes, so it is worth showing
+    /// an operator rather than assuming.
+    #[must_use]
+    pub fn journal_mode(&self) -> &str {
+        &self.journal_mode
+    }
+
+    /// Whether a reader can read this database without blocking the agent's
+    /// writes.
+    ///
+    /// True exactly when [`Self::journal_mode`] is `wal`. An in-memory store is
+    /// **not** included: it is private to one connection, so the question does
+    /// not arise for it.
+    #[must_use]
+    pub fn readers_do_not_block_writers(&self) -> bool {
+        self.journal_mode.eq_ignore_ascii_case("wal")
     }
 
     /// The path this store was opened from, or `None` for an in-memory one.
@@ -724,6 +802,25 @@ impl Store for SqliteStore {
                  service_start_mode    = excluded.service_start_mode,
                  refresh_interval_secs = excluded.refresh_interval_secs,
                  created_at            = excluded.created_at",
+            // `created_at` **is** in this DO UPDATE list, and `record_attempt`
+            // deliberately leaves it out of its own. The asymmetry is intended
+            // and the two columns are not the same kind of thing.
+            //
+            // An attempt's `created_at` is a domain fact with a rule attached:
+            // "created_at never moves", enforced by
+            // `RunnerAttempt::from_persisted`, which refuses a row whose other
+            // timestamps precede it. Journal writes happen repeatedly over one
+            // attempt's life, so excluding the column is what keeps the value
+            // written at allocation authoritative.
+            //
+            // A host's `created_at` is the record of when this host was
+            // registered, and `put_host` is a whole-record upsert of a value the
+            // caller assembled -- there is no partial-update path and no
+            // ordering rule against it. Writing back what the caller holds keeps
+            // the row equal to the `Host` it was given, which is what
+            // `a_host_round_trips_byte_identically_in_every_configuration`
+            // asserts. Excluding it would silently discard a correction an
+            // operator made on purpose.
             named_params! {
                 ":id": uuid_text(host.id.as_uuid()),
                 ":display_name": host.display_name.as_str(),
@@ -801,12 +898,32 @@ impl Store for SqliteStore {
         ));
 
         let mut conn = self.lock();
-        // IMMEDIATE, not the default DEFERRED: a deferred transaction takes its
-        // write lock only at the UPDATE, so two writers that both read and then
-        // upgrade produce SQLITE_BUSY on the second rather than a clean
-        // stale-revision answer. Taking the lock up front makes the loser wait
-        // and then see the winner's revision, which is the whole point of the
-        // token.
+        // IMMEDIATE, not the default DEFERRED -- but not for the reason this
+        // comment used to give, which was checkable and wrong.
+        //
+        // It claimed that DEFERRED would make two racing writers produce
+        // SQLITE_BUSY on the loser instead of a clean stale-revision answer.
+        // That hazard is real in SQLite (`SQLITE_BUSY_SNAPSHOT`, which the busy
+        // handler deliberately refuses to retry, because retrying would hand
+        // the reader a snapshot that has already moved) but it needs the *read*
+        // to be inside the transaction. Here it is not: the caller read the
+        // policy through `Store::policy`, in a separate implicit transaction
+        // that has already ended, and this transaction runs the UPDATE as its
+        // first statement. So the ordinary busy handler applies, the loser waits
+        // out `busy_timeout` and then matches against the winner's revision and
+        // gets `StaleRevision`. Measured: with `Deferred` here,
+        // `two_concurrent_writers_race_and_exactly_one_wins` passes 15 runs out
+        // of 15.
+        //
+        // What IMMEDIATE buys is that the paragraph above becomes true the day
+        // the read moves inside -- a re-read to report the current revision, a
+        // check-then-write, a batched multi-policy update. That is an ordinary
+        // refactor whose failure mode is a raw `database is locked` in an
+        // operator's face instead of the conflict this store promises to
+        // distinguish, and no test here would catch it, because both writers
+        // have to interleave *within* the transaction to show it. Taking the
+        // write lock up front costs one uncontended acquisition and removes the
+        // hazard before anyone can introduce it.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE policies SET
@@ -894,6 +1011,8 @@ impl Store for SqliteStore {
             // `created_at` is absent from the DO UPDATE list on purpose: the
             // domain says it never moves, so the value written at allocation is
             // the one that stands and no later journal write can rewrite it.
+            // `put_host` above does the opposite with its own `created_at`, and
+            // its comment says why the two are not the same case.
             &bind(&params)[..],
         )?;
         Ok(())
@@ -1178,10 +1297,26 @@ fn conflict_or_missing(
         )
         .optional()?;
     Ok(match found {
-        Some(found) => StoreError::StaleRevision {
-            id,
-            expected,
-            found: u64::try_from(found).unwrap_or(0),
+        // The revision is read raw here rather than through `u64_column`, so it
+        // is the one place a corrupt value could slip past the check every other
+        // column gets. It used to be coerced with `unwrap_or(0)`, which turned a
+        // hand-edited `-1` into the message "written against revision 0, but the
+        // stored revision is now 0" -- a self-contradiction that reads as a bug
+        // in this code and tells an operator nothing about the row that actually
+        // needs fixing.
+        Some(found) => match u64::try_from(found) {
+            Ok(found) => StoreError::StaleRevision {
+                id,
+                expected,
+                found,
+            },
+            Err(_) => StoreError::CorruptColumn {
+                table: "policies",
+                column: "revision",
+                id: id.to_string(),
+                value: clip(&found.to_string()),
+                expected: "a non-negative integer",
+            },
         },
         None => StoreError::NotFound {
             what: "policy",
@@ -1248,6 +1383,42 @@ fn u64_to_sql(what: &'static str, value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::UnrepresentableInteger { what, value })
 }
 
+/// The most of a column's payload an error message will ever repeat.
+///
+/// Sixty characters identifies a value without reproducing it: a malformed
+/// timestamp, an unrecognised token and a truncated UUID are all shorter than
+/// this, and anything longer is a payload rather than a value.
+pub const ECHO_LIMIT: usize = 60;
+
+/// One column's payload, trimmed to something safe to put in an error message.
+///
+/// **Why this is not paranoia about a schema that carries no credentials.**
+/// "No column carries a credential" is a claim about the *schema*, and the
+/// `attempts.outcome` column is the counterexample the test suite already
+/// contains: it holds the JSON of [`AttemptOutcome`], whose
+/// `FailureReason::Other(String)` is free-form text a caller chose, and
+/// `the_token_scanner_can_actually_fail` in `tests/store_journal.rs` plants a
+/// `ghu_…` in exactly that field to prove the field is a real carrier. A
+/// [`StoreError::CorruptColumn`] over that column echoed the whole payload into
+/// whatever log caught the error. `d1`'s redacting sink matches on shape, so it
+/// would probably catch a classic token — and an encoded JIT blob, which has no
+/// prefix to match, it would not.
+///
+/// Clipping rather than dropping the value entirely: an operator handed only a
+/// row id has to go and read the row, and the first sixty characters are
+/// usually enough to see what went wrong. The byte length is reported so a
+/// truncated echo cannot be mistaken for the whole value.
+fn clip(raw: &str) -> String {
+    match raw.char_indices().nth(ECHO_LIMIT) {
+        None => raw.to_string(),
+        Some((cut, _)) => format!(
+            "{}... ({} bytes in total, truncated)",
+            &raw[..cut],
+            raw.len()
+        ),
+    }
+}
+
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -1279,8 +1450,12 @@ fn uuid_column(
     Uuid::parse_str(&raw).map_err(|_| StoreError::CorruptColumn {
         table,
         column,
-        id: raw.clone(),
-        value: raw,
+        // The unparseable id is the only handle on this row there is, so it is
+        // both the id and the value here. Clipped in both places: a row whose
+        // primary key is a megabyte of text is exactly the row an error message
+        // must not repeat.
+        id: clip(&raw),
+        value: clip(&raw),
         expected: "a hyphenated UUID",
     })
 }
@@ -1297,7 +1472,7 @@ fn token_column<T: DeserializeOwned>(
             table,
             column,
             id: id.to_string(),
-            value: raw,
+            value: clip(&raw),
             expected: "one of this column's recognised tokens",
         }
     })
@@ -1318,7 +1493,7 @@ fn json_column<T: DeserializeOwned>(
                 table,
                 column,
                 id: id.to_string(),
-                value: raw,
+                value: clip(&raw),
                 expected,
             }),
     }
@@ -1358,7 +1533,7 @@ fn parse_timestamp(
             table,
             column,
             id: id.to_string(),
-            value: raw.to_string(),
+            value: clip(raw),
             expected: "an RFC 3339 timestamp",
         })
 }
@@ -1951,6 +2126,208 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_corrupt_schema_version_is_named_rather_than_reported_as_four_billion() {
+        // `current_version` used to coerce a negative recorded version with
+        // `unwrap_or(u32::MAX)`. That failed closed, which is right, but it did
+        // so by telling the operator "this database is at schema version
+        // 4294967295" -- a number no database has been at, and one that reads as
+        // a bug in this code rather than as a corrupt bookkeeping row.
+        //
+        // The bookkeeping table alone, holding one hand-edited row. `MAX` is
+        // what `current_version` reads, so a corrupt row only decides the answer
+        // when it is the highest one -- which for a negative value means it is
+        // the only one, and that is exactly the state an aborted or edited first
+        // migration leaves behind.
+        let mut conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(BOOTSTRAP_SQL).expect("bootstrapped");
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) \
+             VALUES (-1, 'hand_edited', ?1)",
+            rusqlite::params![timestamp_to_text(ts(2_000))],
+        )
+        .expect("insertable");
+
+        let error = current_version(&conn).expect_err("a negative version is not a version");
+        assert!(
+            matches!(
+                &error,
+                StoreError::CorruptColumn {
+                    table: "schema_migrations",
+                    column: "version",
+                    ..
+                }
+            ),
+            "expected a named corrupt column, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("-1") && !message.contains(&u32::MAX.to_string()),
+            "the message must name the row's actual value: {message}"
+        );
+
+        // And it still fails closed: nothing re-applies a migration over this.
+        assert!(apply_migrations(&mut conn, MIGRATIONS, &SystemClock).is_err());
+    }
+
+    #[test]
+    fn a_negative_stored_revision_is_a_corrupt_column_and_not_revision_zero() {
+        // `conflict_or_missing` reads `revision` raw, bypassing the check every
+        // other column gets, and used to coerce with `unwrap_or(0)`. Against a
+        // hand-edited `-1` that produced "written against revision 0, but the
+        // stored revision is now 0" -- a sentence that contradicts itself and
+        // sends the operator looking in the wrong place.
+        let store = store();
+        RawPolicy {
+            revision: -1,
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+
+        let policy = ScalePolicy::new(
+            policy_id(),
+            ScaleTarget::repository("o/r").expect("valid"),
+            1,
+            host_id(),
+            PolicyMode::autoscale(
+                RoutingLabels::from_host_label(Label::new("rm-home-win-x64").expect("valid")),
+                0,
+                NonZeroU16::new(2).expect("non-zero"),
+            )
+            .expect("valid"),
+            CachePolicy::default(),
+        );
+        let error = store
+            .update_policy(&policy, 0)
+            .expect_err("the row's revision is not 0, so this matches nothing");
+        assert!(
+            matches!(
+                &error,
+                StoreError::CorruptColumn {
+                    table: "policies",
+                    column: "revision",
+                    ..
+                }
+            ),
+            "expected a named corrupt column, got {error:?}"
+        );
+        assert!(
+            !error.is_conflict(),
+            "a corrupt row is not a lost race, and a caller told to re-read and \
+             retry would loop for ever on it"
+        );
+        assert!(
+            error.to_string().contains("-1"),
+            "the message must name the value that needs fixing: {error}"
+        );
+    }
+
+    // -- what an error message repeats --------------------------------------
+
+    #[test]
+    fn a_corrupt_column_error_clips_the_payload_it_echoes() {
+        assert_eq!(clip("short"), "short");
+
+        let exact = "a".repeat(ECHO_LIMIT);
+        assert_eq!(clip(&exact), exact, "the limit is an edge, not a target");
+
+        let over = "a".repeat(ECHO_LIMIT + 1);
+        let clipped = clip(&over);
+        assert!(clipped.starts_with(&exact));
+        assert!(
+            clipped.contains(&format!("{} bytes in total", over.len())),
+            "a clipped echo must say it is one: {clipped}"
+        );
+
+        // Multi-byte characters are cut on a character boundary, or this panics.
+        let wide = "é".repeat(ECHO_LIMIT * 2);
+        assert!(clip(&wide).starts_with(&"é".repeat(ECHO_LIMIT)));
+    }
+
+    #[test]
+    fn a_secret_in_a_free_form_column_is_not_echoed_whole_into_the_error() {
+        // "No column carries a credential" is a claim about the schema, and
+        // `attempts.outcome` is where it stops being true: it holds the JSON of
+        // an `AttemptOutcome`, and `FailureReason::Other(String)` inside that is
+        // free-form text a caller chose. `the_token_scanner_can_actually_fail`
+        // in `tests/store_journal.rs` plants a `ghu_...` there on purpose, to
+        // prove the field is a real carrier.
+        //
+        // A malformed value in that column produces a `CorruptColumn`, whose
+        // message goes wherever the error goes -- and `d1`'s redacting log sink
+        // matches on shape, so it would probably catch a prefixed token but not
+        // an encoded blob, which has no prefix at all.
+        let store = store();
+        let blob = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0\
+                    NTY3ODkrLwABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzA"
+            .to_string();
+        assert!(blob.len() > ECHO_LIMIT * 2);
+
+        RawAttempt {
+            state: "finished".to_string(),
+            outcome: Some(format!(r#"{{"outcome":"went_home","detail":"{blob}"}}"#)),
+            terminal_at: Some(timestamp_to_text(ts(2_000))),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+
+        let error = store
+            .attempt(attempt_id())
+            .expect_err("`went_home` is not an outcome");
+        let StoreError::CorruptColumn { value, .. } = &error else {
+            panic!("expected a corrupt column, got {error:?}");
+        };
+        assert!(
+            !value.contains(&blob),
+            "the whole payload must not be repeated: {value}"
+        );
+        assert!(
+            value.chars().count() < blob.chars().count(),
+            "the echo must be shorter than what it echoes"
+        );
+
+        // The row id is what an operator actually needs, and it is still there.
+        assert!(
+            error.to_string().contains(&attempt_id().to_string()),
+            "the error must name the row to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn the_journal_mode_is_read_back_rather_than_assumed() {
+        // The pragma answers with the mode the database *ended up in*. Where WAL
+        // is unavailable -- no shared-memory support, as on some network mounts
+        // -- SQLite silently leaves the database in `delete` and says so in that
+        // row, which this store used to discard.
+        let memory = store();
+        assert_eq!(
+            memory.journal_mode(),
+            "memory",
+            "an in-memory database is exempt by construction"
+        );
+        assert!(
+            !memory.readers_do_not_block_writers(),
+            "there is no second reader of a private in-memory database, so the \
+             question does not arise for it"
+        );
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+        let file = SqliteStore::open(&path).expect("opens");
+        assert_eq!(
+            file.journal_mode(),
+            "wal",
+            "an ordinary temporary directory supports WAL; if this ever fails \
+             the message is the finding, which is the whole point of recording \
+             the mode instead of assuming it"
+        );
+        assert!(file.readers_do_not_block_writers());
+        assert!(
+            format!("{file:?}").contains("wal"),
+            "an operator reading a support bundle should see the mode"
+        );
+    }
+
     // -- the column/field mapping ------------------------------------------
 
     #[test]
@@ -1964,6 +2341,16 @@ mod tests {
         // (both `Timestamp`) and `installation_id`/`revision` (both `u64`): each
         // transposes without a compile error, and each was a real defect in an
         // earlier positional signature.
+        //
+        // **This covers the read direction only**, and the name does not say so.
+        // Every row here is written by hand through a `Raw*::insert`, so a
+        // transposition in `policy_params` or `attempt_params` -- the write half
+        // of the same crossing -- is invisible to it. The write direction is
+        // pinned transitively instead, by the round-trip tests in
+        // `tests/store_journal.rs`: a read proven correct here plus a domain
+        // value that survives a store-and-load unchanged leaves no room for the
+        // write to be transposed. That inference holds, but it is an inference,
+        // and a reader of this test should know which half they are looking at.
         let store = store();
 
         RawHost {
