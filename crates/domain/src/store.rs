@@ -190,6 +190,20 @@ pub enum StoreError {
         expected: &'static str,
     },
 
+    /// An integer that does not fit in a SQLite integer.
+    ///
+    /// SQLite has no unsigned 64-bit type, so a `u64` above `i64::MAX` has no
+    /// representation. Refused rather than saturated: saturating stores one
+    /// number and reads a different one back, silently, and the two values the
+    /// domain carries as `u64` -- `installation_id` and `github_runner_id` --
+    /// both come from GitHub, so a caller can reach this without doing anything
+    /// unusual.
+    #[error(
+        "{what} is {value}, which does not fit in a SQLite integer; SQLite \
+         integers are signed 64-bit and this store will not silently truncate one"
+    )]
+    UnrepresentableInteger { what: &'static str, value: u64 },
+
     /// A runtime path that is not valid UTF-8 and therefore cannot be stored as
     /// text.
     ///
@@ -747,7 +761,7 @@ impl Store for SqliteStore {
 
     fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
         let fields = policy.to_persisted();
-        let params = policy_params(&fields);
+        let params = policy_params(&fields)?;
         let conn = self.lock();
         conn.execute(
             "INSERT INTO policies (
@@ -780,8 +794,11 @@ impl Store for SqliteStore {
         expected_revision: u64,
     ) -> Result<(), StoreError> {
         let fields = policy.to_persisted();
-        let mut params = policy_params(&fields);
-        params.push((":expected_revision", int(u64_to_sql(expected_revision))));
+        let mut params = policy_params(&fields)?;
+        params.push((
+            ":expected_revision",
+            int(u64_to_sql("the expected revision", expected_revision)?),
+        ));
 
         let mut conn = self.lock();
         // IMMEDIATE, not the default DEFERRED: a deferred transaction takes its
@@ -822,7 +839,7 @@ impl Store for SqliteStore {
             "DELETE FROM policies WHERE id = :id AND revision = :expected_revision",
             named_params! {
                 ":id": uuid_text(id.as_uuid()),
-                ":expected_revision": u64_to_sql(expected_revision),
+                ":expected_revision": u64_to_sql("the expected revision", expected_revision)?,
             },
         )?;
         if changed == 0 {
@@ -962,12 +979,18 @@ fn opt_int(value: Option<i64>) -> Value {
     value.map_or(Value::Null, Value::Integer)
 }
 
-fn policy_params(fields: &PersistedPolicy) -> NamedParams {
-    vec![
+fn policy_params(fields: &PersistedPolicy) -> Result<NamedParams, StoreError> {
+    Ok(vec![
         (":id", text(uuid_text(fields.id.as_uuid()))),
         (":target_scope", text(token(&fields.target.scope()))),
         (":target_slug", text(fields.target.slug())),
-        (":installation_id", int(u64_to_sql(fields.installation_id))),
+        (
+            ":installation_id",
+            int(u64_to_sql(
+                "policies.installation_id",
+                fields.installation_id,
+            )?),
+        ),
         (":host_id", text(uuid_text(fields.host_id.as_uuid()))),
         (
             ":routing_labels",
@@ -981,8 +1004,11 @@ fn policy_params(fields: &PersistedPolicy) -> NamedParams {
         (":enabled", int(i64::from(fields.enabled))),
         (":state", text(token(&fields.state))),
         (":cache_policy", text(token(&fields.cache_policy))),
-        (":revision", int(u64_to_sql(fields.revision))),
-    ]
+        (
+            ":revision",
+            int(u64_to_sql("policies.revision", fields.revision)?),
+        ),
+    ])
 }
 
 fn attempt_params(fields: &PersistedAttempt) -> Result<NamedParams, StoreError> {
@@ -999,7 +1025,12 @@ fn attempt_params(fields: &PersistedAttempt) -> Result<NamedParams, StoreError> 
         (":policy_id", text(uuid_text(fields.policy_id.as_uuid()))),
         (
             ":github_runner_id",
-            opt_int(fields.github_runner_id.map(u64_to_sql)),
+            opt_int(
+                fields
+                    .github_runner_id
+                    .map(|id| u64_to_sql("attempts.github_runner_id", id))
+                    .transpose()?,
+            ),
         ),
         (":state", text(token(&fields.state))),
         (":outcome", opt_text(fields.outcome.as_ref().map(json))),
@@ -1206,12 +1237,15 @@ fn uuid_text(value: &Uuid) -> String {
 }
 
 /// SQLite integers are signed 64-bit, so a `u64` above `i64::MAX` has no
-/// representation. Nothing in this domain produces one — a revision counts
-/// operator edits and an installation id is GitHub's — so the saturation is
-/// unreachable in practice and is written down rather than left as an unchecked
-/// cast.
-fn u64_to_sql(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+/// representation.
+///
+/// This refuses rather than saturating. Saturating would write `i64::MAX` and
+/// read `i64::MAX` back, so the value the caller stored and the value it later
+/// loaded would differ with nothing to say so — and the path is reachable, not
+/// theoretical: `RunnerAttempt::registered_idle` takes any `u64` as the GitHub
+/// runner id, and `ScalePolicy` takes any `u64` as the installation id.
+fn u64_to_sql(what: &'static str, value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::UnrepresentableInteger { what, value })
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -2644,6 +2678,85 @@ mod tests {
             .expect_err("a path that cannot round-trip must not be stored");
         assert!(
             matches!(error, StoreError::UnrepresentablePath { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_integer_too_large_for_a_sqlite_integer_is_refused_rather_than_truncated() {
+        // SQLite has no unsigned 64-bit type. Saturating at `i64::MAX` would
+        // store one number and read a different one back with nothing to say so,
+        // and both `u64` the domain carries -- the GitHub runner id and the
+        // installation id -- come from GitHub, so this is a path a caller can
+        // reach rather than a theoretical one.
+        let store = store();
+
+        let mut attempt =
+            RunnerAttempt::allocate(attempt_id(), policy_id(), "runtime/x", ts(1_000));
+        attempt.jit_received(ts(1_001)).expect("a legal transition");
+        attempt
+            .started(4_242, ts(1_002))
+            .expect("a legal transition");
+        attempt
+            .registered_idle(u64::MAX, ts(1_003))
+            .expect("the domain accepts any u64 as a runner id");
+        let error = store
+            .record_attempt(&attempt)
+            .expect_err("a value SQLite cannot hold must not be silently truncated");
+        assert!(
+            matches!(
+                error,
+                StoreError::UnrepresentableInteger {
+                    what: "attempts.github_runner_id",
+                    value: u64::MAX,
+                }
+            ),
+            "got {error:?}"
+        );
+
+        // The largest value that does fit still round-trips exactly, so the
+        // refusal is an edge and not a blanket ceiling.
+        let biggest = u64::try_from(i64::MAX).expect("i64::MAX is a valid u64");
+        let mut ok = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x0000_0101),
+            policy_id(),
+            "runtime/y",
+            ts(1_000),
+        );
+        ok.jit_received(ts(1_001)).expect("a legal transition");
+        ok.started(1, ts(1_002)).expect("a legal transition");
+        ok.registered_idle(biggest, ts(1_003))
+            .expect("a legal transition");
+        store.record_attempt(&ok).expect("journalled");
+        assert_eq!(
+            store
+                .attempt(ok.id)
+                .expect("loads")
+                .expect("present")
+                .github_runner_id(),
+            Some(biggest)
+        );
+
+        // And the same on the policy side.
+        let policy = ScalePolicy::new(
+            policy_id(),
+            ScaleTarget::repository("o/r").expect("valid"),
+            u64::MAX,
+            host_id(),
+            PolicyMode::monitor_only(),
+            CachePolicy::default(),
+        );
+        let error = store
+            .insert_policy(&policy)
+            .expect_err("an installation id SQLite cannot hold must not be truncated");
+        assert!(
+            matches!(
+                error,
+                StoreError::UnrepresentableInteger {
+                    what: "policies.installation_id",
+                    ..
+                }
+            ),
             "got {error:?}"
         );
     }
