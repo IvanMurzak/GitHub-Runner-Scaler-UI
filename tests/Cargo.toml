@@ -1,0 +1,44 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# The workspace-root acceptance suite (`h1`). It is a package, not a plain
+# `tests/` directory, because the root manifest is virtual: a directory here
+# would be compiled by nothing and `cargo test -p runner-manager-e2e` — the
+# fixed command the `e2e` CI job runs — would match no package.
+#
+# Everything is a dev-dependency so that `cargo build --workspace` does not pay
+# for the acceptance suite. The suite drives the real `runner-manager` binary
+# through `assert_cmd`; the `e2e` job builds the workspace before running it,
+# because `cargo test -p …` on its own builds only this package.
+
+[package]
+name = "runner-manager-e2e"
+description = "End-to-end acceptance and security-gate suite for runner-manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dev-dependencies]
+anyhow = { workspace = true }
+assert_cmd = { workspace = true }
+chrono = { workspace = true }
+predicates = { workspace = true }
+reqwest = { workspace = true }
+runner-manager-agent = { workspace = true }
+runner-manager-domain = { workspace = true }
+runner-manager-github = { workspace = true }
+runner-manager-platform = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

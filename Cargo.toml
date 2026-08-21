@@ -1,0 +1,173 @@
+# Virtual workspace manifest for `runner-manager`.
+#
+# `crates/` sits at the repository root; there is no nested product directory
+# (`.taskflow/2026-08-21-local-runner-manager/02-target-architecture.md`,
+# "Workspace shape").
+#
+# ----------------------------------------------------------------------------
+# ADDING A NEW EXTERNAL CRATE IS AN A-GROUP CHANGE.
+# ----------------------------------------------------------------------------
+# Task `a1` owns every `Cargo.toml` in this workspace and the whole
+# `[workspace.dependencies]` table below. Every member manifest consumes an
+# entry from it with `workspace = true` and never states a version of its own.
+#
+# The reason is mechanical, not stylistic: 22 later tasks run in parallel
+# against this tree. A task that edits a manifest also rewrites `Cargo.lock`,
+# and `Cargo.lock` is a single file that every one of them would then collide
+# on. So the member manifests below already list dependencies their crate does
+# not use yet, precisely so that no later task has to add one.
+#
+# If a task genuinely needs an external crate that is not listed here, that is
+# an A-group change: it is made in this file, by an A-group task, and not in a
+# member manifest.
+#
+# Versions are exact `major.minor.patch` selections; `Cargo.lock` is committed
+# and is what actually pins the resolved graph
+# (`02-target-architecture.md`: "Exact dependency versions are selected in
+# implementation, pinned with `Cargo.lock` and `rust-toolchain.toml`").
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent",
+    "crates/app",
+    "crates/domain",
+    "crates/github",
+    "crates/platform",
+    "crates/testkit",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+authors = ["Ivan Murzak"]
+repository = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
+homepage = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
+
+[workspace.dependencies]
+
+# --- Workspace members ------------------------------------------------------
+# Each carries a `version` as well as a `path` so the published `runner-manager`
+# crate (D11, `cargo install`) can resolve them from the registry.
+runner-manager-agent = { path = "crates/agent", version = "0.1.0" }
+runner-manager-domain = { path = "crates/domain", version = "0.1.0" }
+runner-manager-github = { path = "crates/github", version = "0.1.0" }
+runner-manager-platform = { path = "crates/platform", version = "0.1.0" }
+# `testkit` is never published; it is a dev-dependency everywhere and therefore
+# carries no `version`, which is what lets `cargo publish` strip it.
+runner-manager-testkit = { path = "crates/testkit" }
+
+# --- Async runtime and HTTP -------------------------------------------------
+tokio = { version = "1.53.1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+futures = "0.3.34"
+async-trait = "0.1.92"
+# `rustls` rather than the platform TLS stack: a released Linux binary that
+# links the system OpenSSL fails on hosts carrying a different major version,
+# and every documented install path here is "download the binary and run it"
+# (`09-release-distribution.md`).
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "charset",
+    "gzip",
+    "http2",
+    "json",
+    "rustls",
+    "system-proxy",
+] }
+url = "2.5.8"
+
+# --- Serialization and configuration ----------------------------------------
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Non-secret local configuration is TOML (`05-infrastructure.md`).
+toml = "1.1.4"
+base64 = "0.23.1"
+hex = "0.4.3"
+
+# --- Persistence ------------------------------------------------------------
+# `bundled` compiles SQLite from source, so no CI leg and no user machine needs
+# a system SQLite of a particular version.
+rusqlite = { version = "0.40.2", features = [
+    "bundled",
+    "chrono",
+    "serde_json",
+    "uuid",
+] }
+
+# --- Domain value types -----------------------------------------------------
+uuid = { version = "1.24.1", features = ["serde", "v4"] }
+chrono = { version = "0.4.45", default-features = false, features = [
+    "clock",
+    "serde",
+    "std",
+] }
+
+# --- Errors and diagnostics -------------------------------------------------
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = [
+    "env-filter",
+    "json",
+    "registry",
+] }
+# Rotating local agent diagnostics (`05-infrastructure.md`, `logs/`).
+tracing-appender = "0.2.5"
+# Keeps the user access token and the encoded JIT configuration out of `Debug`
+# output by construction rather than by review (`07-security.md`).
+secrecy = "0.10.3"
+
+# --- Terminal UI ------------------------------------------------------------
+# Ratatui 0.30 keeps Crossterm as its default backend and re-exports it
+# (`02-target-architecture.md`). Crossterm is *also* declared directly, at the
+# version Ratatui uses, so the `bracketed-paste` and `event-stream` features
+# that `g1` requires are unified into Ratatui's own copy. `ratatui::init()`
+# alone enables neither (`03-control-flows.md`, flow 6.1).
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"] }
+
+# --- Command line -----------------------------------------------------------
+clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
+
+# --- Filesystem, packaging, and hashing -------------------------------------
+# The runner package is a `.zip` on Windows and a `.tar.gz` elsewhere, and its
+# published SHA-256 is verified before extraction (`05-infrastructure.md`).
+sha2 = "0.11.0"
+flate2 = "1.1.9"
+tar = "0.4.46"
+zip = "8.6.0"
+tempfile = "3.27.0"
+directories = "6.0.0"
+rand = "0.10.2"
+
+# --- Windows-only platform adapters -----------------------------------------
+# DPAPI machine scope for the secret store (`d2`) and the service control
+# handler the Windows service host needs (`d3`).
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+windows-service = "0.8.1"
+
+# --- macOS-only platform adapters -------------------------------------------
+# System Keychain for the machine-scoped secret store (`d2`).
+security-framework = "3.7.0"
+
+# --- Test-only --------------------------------------------------------------
+insta = "1.48.0"
+wiremock = "0.6.5"
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+serial_test = "4.0.1"

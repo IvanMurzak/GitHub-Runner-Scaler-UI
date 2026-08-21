@@ -1,0 +1,8 @@
+# The toolchain is pinned to a specific stable version, never a channel alias
+# such as "stable": CI must compile the same compiler that a developer does, and
+# `-D warnings` makes a new lint in a newer stable a build break rather than a
+# note. Raising this version is an A-group change (see Cargo.toml).
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

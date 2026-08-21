@@ -1,0 +1,49 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# The OS-specific crates are target-gated so that a leg of the CI matrix never
+# compiles an adapter it cannot use: `windows`/`windows-service` for DPAPI
+# machine scope and the Windows service control handler (`d2`, `d3`), and
+# `security-framework` for the macOS System Keychain (`d2`). Linux needs no
+# extra crate — a `0600` file plus systemd credentials is `std` plus an
+# environment variable (`05-infrastructure.md`).
+
+[package]
+name = "runner-manager-platform"
+description = "Process, filesystem, machine-scoped secret store, service, and OS adapters for runner-manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+runner-manager-domain = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+windows-service = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serial_test = { workspace = true }

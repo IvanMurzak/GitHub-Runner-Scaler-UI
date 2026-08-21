@@ -1,0 +1,36 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+
+[package]
+name = "runner-manager-github"
+description = "Device flow and typed GitHub REST adapters (inventory, demand, JIT) for runner-manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+runner-manager-domain = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serial_test = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = { workspace = true }

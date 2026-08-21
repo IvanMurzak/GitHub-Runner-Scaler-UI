@@ -1,0 +1,32 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# `rusqlite` is declared for `b2`, which owns `src/store.rs`. It is deliberately
+# unused by `b1`'s modules: the domain's logic must stay testable with no
+# network, no filesystem, and no clock (`b1`, Definition of Done).
+
+[package]
+name = "runner-manager-domain"
+description = "Policy, capacity, and runner-attempt state machines for runner-manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+runner-manager-testkit = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }

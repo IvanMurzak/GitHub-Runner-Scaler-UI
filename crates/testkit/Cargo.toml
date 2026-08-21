@@ -1,0 +1,35 @@
+# Owned by task a1. Dependencies are added in the root [workspace.dependencies]
+# table, never here. See the header of the root Cargo.toml.
+#
+# This crate is a dev-dependency of every other crate, and it depends on
+# `runner-manager-domain` and `runner-manager-github` in turn — `b1` builds
+# fixtures over the domain types and `c3` builds a fake gateway over the github
+# crate's traits. Cargo permits the resulting cycle because the return edge is
+# a dev-dependency in every case.
+#
+# `publish = false` and the absence of a `version` in its workspace entry are
+# what let `cargo publish` strip this crate from the published manifests.
+
+[package]
+name = "runner-manager-testkit"
+description = "Fake clock, fake GitHub gateway, and fixture builders for runner-manager tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+runner-manager-domain = { workspace = true }
+runner-manager-github = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
