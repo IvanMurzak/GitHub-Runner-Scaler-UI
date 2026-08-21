@@ -290,33 +290,20 @@ jobs:
             os: ${{ vars.RUNNER_MANAGER_RELEASE_RUNS_ON_LINUX_ARM64 || 'ubuntu-24.04-arm' }}
             archive: tar.gz
     steps:
-      - name: Assert this runner is native for ${{ matrix.target }}
+      # The only reason this job checks anything out: the assertion below is a
+      # `release.sh` subcommand, so that `preflight` and `build` cannot drift
+      # into asserting two different things.
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Assert this label is a native runner for ${{ matrix.target }}
         env:
           TARGET: ${{ matrix.target }}
           RUNNER_ARCH: ${{ runner.arch }}
           RUNNER_OS: ${{ runner.os }}
         run: |
-          case "$TARGET" in
-            x86_64-*)  want_arch="X64" ;;
-            aarch64-*) want_arch="ARM64" ;;
-            *) echo "unknown architecture in target ${TARGET}" >&2; exit 1 ;;
-          esac
-          case "$TARGET" in
-            *-apple-darwin) want_os="macOS" ;;
-            *-windows-*)    want_os="Windows" ;;
-            *-linux-*)      want_os="Linux" ;;
-            *) echo "unknown operating system in target ${TARGET}" >&2; exit 1 ;;
-          esac
-          echo "target=${TARGET} wants=${want_os}/${want_arch}" \
-               "runner=${RUNNER_OS}/${RUNNER_ARCH}"
-          if [ "$RUNNER_ARCH" != "$want_arch" ] || [ "$RUNNER_OS" != "$want_os" ]; then
-            echo "REJECTED: ${TARGET} must be built on a ${want_os} ${want_arch}" >&2
-            echo "runner, but this runner reports ${RUNNER_OS} ${RUNNER_ARCH}." >&2
-            echo "Point the matching RUNNER_MANAGER_RELEASE_RUNS_ON_* repository" >&2
-            echo "variable at a native label." >&2
-            exit 1
-          fi
-          echo "this label is a native ${RUNNER_OS} ${RUNNER_ARCH} runner"
+          bash .github/scripts/release.sh check-native-runner \
+            "$TARGET" "$RUNNER_OS" "$RUNNER_ARCH"
 
   # --------------------------------------------------------------------------
   # Step 3. The same matrix as CI, by calling CI rather than copying it.
@@ -496,42 +483,13 @@ jobs:
           RUNNER_ARCH: ${{ runner.arch }}
           RUNNER_OS: ${{ runner.os }}
         run: |
-          # "Build on native runners" is a requirement, not a preference, and a
-          # hosted label silently repointing to another architecture is exactly
-          # how it would stop being true without anyone noticing. Verified here
-          # rather than assumed, the same way ci.yml asserts its macOS leg.
-          #
-          # `preflight` ran this same check before the tag was pushed. It runs
-          # again here because the two guard different things: there, that the
-          # labels resolve at all; here, that THIS runner is native for the
-          # binary this leg is about to produce.
-          #
-          # BOTH HALVES OF "NATIVE" ARE CHECKED, and the OS half is the one
-          # that matters most. `runner.os` is the single value deciding whether
-          # the macOS signature gate below runs at all, so a
-          # RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 override pointing at a
-          # Linux x64 label would produce an ELF named as a macOS artifact and
-          # skip the one check that would have noticed.
-          case "$TARGET" in
-            x86_64-*)  want_arch="X64" ;;
-            aarch64-*) want_arch="ARM64" ;;
-            *) echo "unknown architecture in target ${TARGET}" >&2; exit 1 ;;
-          esac
-          case "$TARGET" in
-            *-apple-darwin) want_os="macOS" ;;
-            *-windows-*)    want_os="Windows" ;;
-            *-linux-*)      want_os="Linux" ;;
-            *) echo "unknown operating system in target ${TARGET}" >&2; exit 1 ;;
-          esac
-          echo "target=${TARGET} wants=${want_os}/${want_arch}" \
-               "runner=${RUNNER_OS}/${RUNNER_ARCH}"
-          if [ "$RUNNER_ARCH" != "$want_arch" ] || [ "$RUNNER_OS" != "$want_os" ]; then
-            echo "REJECTED: ${TARGET} must be built on a ${want_os} ${want_arch}" >&2
-            echo "runner, but this runner reports ${RUNNER_OS} ${RUNNER_ARCH}." >&2
-            echo "Point the matching RUNNER_MANAGER_RELEASE_RUNS_ON_* repository" >&2
-            echo "variable at a native label." >&2
-            exit 1
-          fi
+          # `preflight` ran this same subcommand before the tag was pushed. It
+          # runs again here because the two guard different things: there, that
+          # the labels resolve at all; here, that THIS runner is native for the
+          # binary this leg is about to produce. Same subcommand both times, so
+          # the two cannot come to mean different things.
+          bash .github/scripts/release.sh check-native-runner \
+            "$TARGET" "$RUNNER_OS" "$RUNNER_ARCH"
 
       - name: Install the toolchain pinned by rust-toolchain.toml
         env:

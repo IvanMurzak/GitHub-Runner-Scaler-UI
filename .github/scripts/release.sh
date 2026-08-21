@@ -78,6 +78,10 @@ Usage: bash .github/scripts/release.sh <subcommand> [args]
       Assert that the manifest pins <version> in every such entry, and that
       no entry was skipped because of the shape it is written in.
 
+  check-native-runner <target> <runner-os> <runner-arch>
+      Steps 1-2 and 5. Exit non-zero unless the runner's OS and architecture
+      are both native for <target>. Nothing here cross-compiles.
+
   verify-macos-signature <binary>
       Step 5. Exit non-zero unless <binary> carries a valid signature.
 
@@ -679,6 +683,77 @@ cmd_verify_version() {
 }
 
 # ----------------------------------------------------------------------------
+# Steps 1-2 and 5 — is this runner native for the target it is building?
+# ----------------------------------------------------------------------------
+# "Build on native runners" is a requirement, not a preference: nothing here
+# cross-compiles, which is what lets the macOS signature check below look at a
+# real Mach-O for its own architecture. Two of the five `runs-on` labels are
+# overridable by repository variable, and `macos-15-intel` is a hosted label
+# GitHub has moved more than once -- so what a label resolves to is a fact to
+# check, not one to assume.
+#
+# BOTH HALVES OF "NATIVE" ARE CHECKED, AND THE OS HALF IS THE ONE THAT MATTERS
+# MOST. `runner.os` is the single value deciding whether the macOS signature
+# gate runs at all, so an override pointing the macOS-x64 label at a Linux x64
+# runner passes an architecture-only assertion, produces an ELF named as a macOS
+# artifact, and skips the one check that would have noticed.
+#
+# It lives here rather than inline for the usual reason, plus one more:
+# release.yml calls it from TWO jobs -- `preflight`, so an unresolvable or
+# mispointed label refuses the release before step 4 writes anything, and
+# `build`, so each leg's own runner is proved for the binary it is about to
+# produce. Written twice in step bodies it would be two decisions that nothing
+# compares. `crates/app/tests/release_workflow.rs` drives every combination
+# directly.
+cmd_check_native_runner() {
+    local target="${1-}" runner_os="${2-}" runner_arch="${3-}"
+    [[ -n "$target" ]] || die "check-native-runner: no target given"
+    [[ -n "$runner_os" ]] || die "check-native-runner: no runner OS given"
+    [[ -n "$runner_arch" ]] || die "check-native-runner: no runner architecture given"
+
+    # An unrecognised target is a rejection, not a pass. A `*)` arm that shrugged
+    # would make every future target native by default.
+    local want_arch want_os
+    case "$target" in
+    x86_64-*) want_arch="X64" ;;
+    aarch64-*) want_arch="ARM64" ;;
+    *) die "check-native-runner: unknown architecture in target '${target}'" ;;
+    esac
+
+    case "$target" in
+    *-apple-darwin) want_os="macOS" ;;
+    *-windows-*) want_os="Windows" ;;
+    *-linux-*) want_os="Linux" ;;
+    *) die "check-native-runner: unknown operating system in target '${target}'" ;;
+    esac
+
+    printf 'target=%s wants=%s/%s runner=%s/%s\n' \
+        "$target" "$want_os" "$want_arch" "$runner_os" "$runner_arch"
+
+    # Both mismatches are reported, not just the first: an operator repointing a
+    # repository variable should learn everything wrong with the label in one
+    # run rather than one fact per dispatch.
+    local failed=0
+    if [[ "$runner_os" != "$want_os" ]]; then
+        reject "${target} must be built on a ${want_os} runner; this one reports ${runner_os}."
+        failed=1
+    fi
+    if [[ "$runner_arch" != "$want_arch" ]]; then
+        reject "${target} must be built on a ${want_arch} runner; this one reports ${runner_arch}."
+        failed=1
+    fi
+
+    if ((failed != 0)); then
+        printf 'Point the matching RUNNER_MANAGER_RELEASE_RUNS_ON_* repository\n' >&2
+        printf 'variable at a native label. Nothing here cross-compiles, and the\n' >&2
+        printf 'macOS signature gate is conditional on the OS this reports.\n' >&2
+        exit 1
+    fi
+
+    printf 'native %s %s runner\n' "$runner_os" "$runner_arch"
+}
+
+# ----------------------------------------------------------------------------
 # Step 5 — the macOS signature check.
 # ----------------------------------------------------------------------------
 # An arm64 Mach-O carrying no signature does not execute on Apple Silicon at
@@ -955,6 +1030,7 @@ main() {
     latest-release-version) cmd_latest_release_version "$@" ;;
     set-version) cmd_set_version "$@" ;;
     verify-version) cmd_verify_version "$@" ;;
+    check-native-runner) cmd_check_native_runner "$@" ;;
     verify-macos-signature) cmd_verify_macos_signature "$@" ;;
     sha256) cmd_sha256 "$@" ;;
     sbom) cmd_sbom "$@" ;;

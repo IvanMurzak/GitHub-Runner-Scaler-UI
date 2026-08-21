@@ -819,23 +819,29 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
          Mach-O does not execute on Apple Silicon at all (D12).\n{output}"
     );
 
-    // -- the status branch, reachable by nothing else -------------------------
+    // -- the status branch, and NOTHING ELSE ----------------------------------
     // ------------------------------------------------------------------------
     // THIS ROW EXISTS TO GIVE `status=$?` SOMETHING TO PROVE.
     // ------------------------------------------------------------------------
-    // The message here matches none of the phrases `release.sh` looks for, and
-    // it carries no `Signature=`/`Authority=` line either -- but the exit
-    // status is non-zero, and that alone must stop the run. Without this row
-    // every rejection in this test arrives through the message branch, and
-    // deleting the status check from `release.sh` changes nothing that any
-    // assertion here can see.
+    // Every other row here is rejected by one of the two checks that read
+    // `codesign`'s WORDS, so `release.sh`'s check on its exit STATUS had no
+    // coverage at all: replacing `status=$?` with `status=0` left every
+    // assertion in this file passing.
     //
-    // The state is real, not contrived: `codesign` exits non-zero for a file it
-    // cannot parse as a Mach-O, for a resource-fork error, and for a bundle
-    // whose signature it cannot read at all.
+    // This configuration is built so that the status is the only thing left to
+    // reject on. The output names no "not signed" phrase, and it DOES carry a
+    // `Signature=` line, so the two message checks both pass it; `--verify`
+    // exits zero, so that passes too. Read the status as zero and this binary
+    // is accepted outright -- which is what makes the assertion below a test of
+    // the status check rather than of whatever happens to fail first.
+    //
+    // The state is not contrived: `codesign` reports what it managed to read
+    // and still exits non-zero when it hits an error afterwards -- a truncated
+    // or damaged signature, an unreadable resource fork, a file it cannot
+    // finish parsing as a Mach-O.
     stub_codesign(
         &stub_directory,
-        r#"printf '%s: unable to read the object\n' "$3" >&2"#,
+        r#"printf 'Executable=%s\nSignature=adhoc\n' "$3" >&2; printf 'error reading resources\n' >&2"#,
         1,
         0,
     );
@@ -844,13 +850,13 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
     assert!(
         !accepted,
         "`codesign --display` exiting non-zero must fail the run on the STATUS \
-         alone. Nothing in this configuration's output matches a phrase the \
-         script looks for, so if this passes, the status check is not there.\n{output}"
+         alone. Everything this configuration SAYS would pass -- there is a \
+         `Signature=` line, no \"not signed\" phrase, and `--verify` succeeds -- \
+         so if this is accepted, the exit status is not being read.\n{output}"
     );
     assert!(
         output.contains("could not read a signature"),
-        "the rejection must be the one the status branch produces, not an \
-         incidental failure somewhere else in the script.\n{output}"
+        "the rejection must be the one the status branch produces.\n{output}"
     );
 
     // -- a signature that is present but does not verify ----------------------
@@ -1643,6 +1649,11 @@ fn every_release_sh_decision_is_reached_from_a_step() {
             "step 4 -- without it the artifacts carry the old version",
         ),
         (
+            "release.sh check-native-runner",
+            "steps 1-2 and 5 -- without it a repointed `runs-on` label builds \
+             the wrong platform under the right artifact name",
+        ),
+        (
             "release.sh verify-macos-signature",
             "step 5 -- without it an unsigned arm64 binary ships, and it does \
              not execute on Apple Silicon at all (D12)",
@@ -1801,51 +1812,124 @@ fn every_build_label_is_proved_before_anything_is_written() {
 
 #[test]
 fn a_release_runner_must_be_native_in_both_os_and_architecture() {
-    // `runner.arch` alone does not say "native". An override pointing
-    // RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 at a Linux x64 label satisfies
-    // an arch-only assertion -- and `runner.os` is exactly the value the
-    // signature gate is conditional on, so that override would produce an ELF
-    // named as a macOS artifact and skip the one check that would have noticed.
-    let source = read_workflow("release.yml");
-    let steps = workflow_steps(&source);
-
-    let assertions: Vec<&WorkflowStep> = steps
-        .iter()
-        .filter(|step| step.run.contains("RUNNER_ARCH"))
-        .collect();
-    assert!(
-        !assertions.is_empty(),
-        "no step asserts anything about the runner's architecture"
-    );
-
-    for step in assertions {
+    // ------------------------------------------------------------------------
+    // `runner.arch` ALONE DOES NOT SAY "NATIVE".
+    // ------------------------------------------------------------------------
+    // An override pointing RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 at a Linux
+    // x64 label satisfies an architecture-only assertion. And `runner.os` is
+    // exactly the value the signature gate is conditional on, so that override
+    // would produce an ELF named as a macOS artifact and skip the one check
+    // that would have noticed it.
+    //
+    // Driven through the subcommand rather than by reading the workflow's text:
+    // an assertion that a `run:` body mentions `RUNNER_OS` is satisfied by a
+    // body that mentions it and never compares it.
+    let native = [
+        ("x86_64-pc-windows-msvc", "Windows", "X64"),
+        ("aarch64-apple-darwin", "macOS", "ARM64"),
+        ("x86_64-apple-darwin", "macOS", "X64"),
+        ("x86_64-unknown-linux-gnu", "Linux", "X64"),
+        ("aarch64-unknown-linux-gnu", "Linux", "ARM64"),
+    ];
+    for (target, os, arch) in native {
+        let (ok, output) = run_release_script(&["check-native-runner", target, os, arch]);
         assert!(
-            step.run.contains("RUNNER_OS"),
-            "the native-runner assertion in job `{}` checks the architecture \
-             and not the operating system:\n{}",
-            step.job,
-            step.run
+            ok,
+            "check-native-runner rejected {target} on a {os} {arch} runner, \
+             which is the native pairing this release matrix uses.\n{output}"
         );
-        for triple_shape in ["*-apple-darwin", "*-windows-*", "*-linux-*"] {
-            assert!(
-                step.run.contains(triple_shape),
-                "the assertion in job `{}` does not map `{triple_shape}` to an \
-                 expected `runner.os`:\n{}",
-                step.job,
-                step.run
-            );
-        }
     }
 
-    // Both jobs that use the matrix labels must carry it: `preflight` so the
-    // label is proved before the tag, `build` so this leg's own runner is
-    // proved for the binary it is about to produce.
+    // The architecture half.
+    for (target, os, arch) in [
+        ("x86_64-pc-windows-msvc", "Windows", "ARM64"),
+        ("aarch64-apple-darwin", "macOS", "X64"),
+        ("x86_64-unknown-linux-gnu", "Linux", "ARM64"),
+        ("aarch64-unknown-linux-gnu", "Linux", "X64"),
+    ] {
+        let (accepted, output) = run_release_script(&["check-native-runner", target, os, arch]);
+        assert!(
+            !accepted,
+            "{target} was accepted on a {arch} runner. Nothing here \
+             cross-compiles.\n{output}"
+        );
+    }
+
+    // The operating-system half, which an arch-only assertion misses entirely.
+    // The first row is the live risk: a repository variable is what supplies
+    // that label, and both values below are x64.
+    for (target, os, arch, why) in [
+        (
+            "x86_64-apple-darwin",
+            "Linux",
+            "X64",
+            "a Linux x64 label behind RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 \
+             would produce an ELF named as a macOS artifact -- and skip the \
+             signature gate, which is conditional on runner.os",
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "Linux",
+            "X64",
+            "a Linux runner cannot produce an MSVC binary",
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "macOS",
+            "X64",
+            "a macOS runner cannot produce a linux-gnu binary",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "Linux",
+            "ARM64",
+            "matching architecture is not matching platform",
+        ),
+    ] {
+        let (accepted, output) = run_release_script(&["check-native-runner", target, os, arch]);
+        assert!(
+            !accepted,
+            "{target} was accepted on a {os} {arch} runner: {why}.\n{output}"
+        );
+        assert!(
+            output.contains("must be built on a"),
+            "the rejection must name what the target needed.\n{output}"
+        );
+    }
+
+    // A target this mapping does not recognise must stop the run rather than
+    // fall through as "fine".
+    for target in [
+        "riscv64gc-unknown-linux-gnu",
+        "x86_64-unknown-freebsd",
+        "nonsense",
+    ] {
+        let (accepted, output) =
+            run_release_script(&["check-native-runner", target, "Linux", "X64"]);
+        assert!(
+            !accepted,
+            "check-native-runner accepted the unrecognised target {target}. A \
+             target it cannot classify is one it cannot vouch for.\n{output}"
+        );
+    }
+
+    // And both jobs that use the matrix labels must actually call it:
+    // `preflight` so the label is proved before the tag, `build` so this leg's
+    // own runner is proved for the binary it is about to produce.
+    let source = read_workflow("release.yml");
+    let steps = workflow_steps(&source);
     for job in ["preflight", "build"] {
         assert!(
             steps
                 .iter()
-                .any(|step| step.job == job && step.run.contains("RUNNER_ARCH")),
-            "job `{job}` must assert that its runner is native"
+                .any(|step| step.job == job && step.run.contains("release.sh check-native-runner")),
+            "job `{job}` must run `release.sh check-native-runner`. Parsed \
+             steps for it: {:?}",
+            steps
+                .iter()
+                .filter(|step| step.job == job)
+                .map(|step| &step.name)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -2058,6 +2142,7 @@ fn the_release_workflow_never_deletes_or_overwrites_what_it_published() {
         "release.sh check-monotonic",
         "release.sh latest-release-version",
         "release.sh set-version",
+        "release.sh check-native-runner",
         "release.sh verify-macos-signature",
         "release.sh sbom",
     ] {
