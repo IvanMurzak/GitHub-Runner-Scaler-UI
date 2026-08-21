@@ -13,7 +13,7 @@ Three separate results. They must not be conflated.
 
 ## 1. D17: GREEN at both scopes
 
-Device flow with `runner-manager-d17-spike` (`Iv23li39jMQVdEuupmI2`).
+Device flow with `runner-manager-d17-spike`.
 
 | Link | repo scope | org scope (`Tap-Top-Fun`) |
 |---|---|---|
