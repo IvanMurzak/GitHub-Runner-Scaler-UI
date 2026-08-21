@@ -7,7 +7,9 @@
 **Task status:** Re-derived 2026-08-21 (`/taskflow-tasks`) against the corrected
 design. 23 immutable specifications in [`tasks/`](tasks/), 9 conflict-domain
 groups, waves 0-4.
-**Implementation status:** Not started. One spike executed (`c1`, complete).
+**Implementation status:** In execution since 2026-08-21 via `/taskflow-execute`
+(`--parallel=6 --review=medium --scope=all --merge=on-green`). One spike
+complete (`c1`); round 1 dispatched `a1` and `v1`.
 **Last updated:** 2026-08-21
 
 **Execution host:** this repository, `IvanMurzak/GitHub-Runner-Scaler-UI`. The
@@ -107,11 +109,11 @@ Updated columns.
 | Task (spec) | needs | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|
 | **Wave 0** | | | | | | |
-| [a1-workspace-ci-foundation](tasks/a1-workspace-ci-foundation.md) | — | 10/5 | mid | ⬜ pending | | |
+| [a1-workspace-ci-foundation](tasks/a1-workspace-ci-foundation.md) | — | 10/5 | mid | 🔵 in progress | round 1 (local) | 2026-08-21 |
 | [b1-domain-core](tasks/b1-domain-core.md) | a1 | 10/8 | top | ⬜ pending | | |
 | [b2-sqlite-persistence](tasks/b2-sqlite-persistence.md) | b1 | 9/6 | mid | ⬜ pending | | |
 | **Wave 1** | | | | | | |
-| [v1-org-jit-verification](tasks/v1-org-jit-verification.md) | c1 | 9/3 | mid | ⬜ pending | | |
+| [v1-org-jit-verification](tasks/v1-org-jit-verification.md) | c1 | 9/3 | mid | 🔵 in progress | round 1 (local) | 2026-08-21 |
 | [c1-d17-scale-set-spike](tasks/c1-d17-scale-set-spike.md) | a1 | 10/8 | top | ✅ complete | `docs/spikes/d17-user-to-server-scale-set-chain.md` | 2026-08-21 |
 | [c2-device-flow-auth](tasks/c2-device-flow-auth.md) | c1, b1 | 10/7 | top | ⬜ pending | | |
 | [c3-rest-inventory-gateway](tasks/c3-rest-inventory-gateway.md) | c2 | 8/6 | mid | ⬜ pending | | |
@@ -135,8 +137,10 @@ Updated columns.
 | [a2-release-workflow](tasks/a2-release-workflow.md) | a1 | 8/6 | top | ⬜ pending | | |
 | [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | ⬜ pending | | |
 
-Status vocabulary: `⬜ pending`, `🟡 in progress`, `🔵 in review`,
-`✅ complete`, `🔴 blocked`.
+Status vocabulary (`/taskflow-execute`'s, adopted 2026-08-21 so board and
+orchestrator share one set): `⬜ pending`, `🔵 in progress`, `🟣 verified,
+merge held`, `✅ done`, `🔒 blocked on a gate`, `⛔ blocked on a dependency or
+failure`.
 
 ## Rules beside the board
 
@@ -187,3 +191,4 @@ Status vocabulary: `⬜ pending`, `🟡 in progress`, `🔵 in review`,
 | 2026-08-21 | `c1` executed. **D17 GREEN** at both scopes; **D4 RED** — scale-set creation denied `403 needs Administer Permissions` on four independent credential/scope combinations, while `generate-jitconfig` returned `201` on the same account and permission. Evidence: `docs/spikes/d17-user-to-server-scale-set-chain.md`. |
 | 2026-08-21 | `/taskflow-review` (second pass) completed. **D4 REVISED** to public REST JIT ephemeral runners on owner decision. **D17 RESOLVED GREEN**; the per-user-App contingency is not adopted. **D18** keeps both scopes but its org mechanism becomes `generate-jitconfig`, unverified. Corrections applied across all ten design documents: the Actions-service protocol, `AcquireJobs`, `protocol_flag`, `scale_set_id`, `scale_set_name`, and three derived credentials removed; routing moved from a scale-set name to a label set; the rate-limit analysis redone because demand polling now shares the 5,000/hour REST budget, capping a host at roughly 10 targets at the 60-second default. The first task set was declared superseded. |
 | 2026-08-21 | `/taskflow-tasks` (second derivation) completed against the corrected design. 23 specifications in 9 groups. `c5` deleted outright and the old `c4` replaced by `c4-demand-and-jit-gateway`; `v1-org-jit-verification` added as a new stop-the-line spike in its own group, so D18's untested organization endpoint is proven before code is built on it and without stalling group C behind a human prerequisite. Nine specifications carry forward byte-identical, twelve were revised — chiefly `b1` (routing-label derivation and `runs-on` matching replace the scale-set name; the surplus attempt becomes a first-class outcome), `e1` (no acquisition step, and the in-flight-attempt term that stops a still-queued job from starting a second runner), and `f2` (`add` creates nothing remotely, so the partial-creation failure mode is gone). Two scheduling changes recorded: `f2` moves to Wave 1 because configuration no longer touches GitHub state, and `v1` runs in Wave 1 against the throwaway App **before** it is deleted. Two design-level observations raised to the owner: an organization target's REST cost scales with its installed repository count, which the per-target budget table does not model; and `03-control-flows.md` flow 4.3 still says a 401 triggers a token "refresh" that D3 removed the means to perform. |
+| 2026-08-21 | `/taskflow-execute` run started: `--parallel=6 --review=medium --scope=all --merge=on-green`, execution tier `toolkit` (pipeline 0.24.0). Owner decisions recorded at preflight: (a) worker branches are **not** pushed and **no pull requests are opened** — each verified diff is merged into local `main`, and only `main` is pushed; (b) `main` carries no branch protection and no rulesets, so `on-green` has no API-defined green and falls back to a stated local gate — review complete, every DoD item verified against the tree, and the workspace build/test/fmt/clippy gate passing locally — with CI on `main` checked after each push; (c) GO for `v1` against the surviving throwaway App and its disposable organization; (d) standing constraint from the owner — **no GitHub organization, repository, or App is ever deleted by this run or any worker**; `v1` deletes only the one ephemeral runner it creates. Preflight also added `/.claude/worktrees/` to `.gitignore`, without which host-placed worker worktrees surface as untracked paths and halt the postflight isolation check. |
