@@ -1,0 +1,30 @@
+crates/app/tests/readme_disclosure.rs
+  s_5332f62e0ed5a7::t_7f3b722298bfde 149-153
+.github/scripts/channels.sh
+  s_5332f62e0ed5a7::t_695ff730893c3f 433-440
+crates/app/tests/release_channels.rs
+  s_5332f62e0ed5a7::t_e36a6d9bbc5f73 47-48
+  s_5332f62e0ed5a7::t_6515ebb6bd825d 1-46,49-62,67-135,145-165,170-190,192-210,215-241,245-316,321-453,458-595,602-754,758-930,937-1178
+  s_5332f62e0ed5a7::t_7f3b722298bfde 63-66,136-144,166-169,191,211-214,242-244,317-320,454-457,596-601,755-757,931-936
+crates/app/tests/common/mod.rs
+  s_5332f62e0ed5a7::t_7f3b722298bfde 209-212,255,414-415
+crates/app/tests/install_scripts.rs
+  s_5332f62e0ed5a7::t_f0939b3f8051a9 693-701
+  s_5332f62e0ed5a7::t_7f3b722298bfde 119-125,314,339-342,369,375,410-411,440-443,485,603-606,608-619,621-624,760-761,811-814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a7b9c198cc3a1f0a59d5dcc86d18b5947551cc74",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
