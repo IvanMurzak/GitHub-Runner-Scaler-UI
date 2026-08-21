@@ -63,12 +63,20 @@ Usage: bash .github/scripts/release.sh <subcommand> [args]
       Step 2. Exit non-zero unless <version> is strictly greater than BOTH
       sources. An empty third argument means no release is published yet.
 
+  latest-release-version <gh-api--i-response>
+      Step 2. Read the output of
+      `gh api -i repos/OWNER/REPO/releases/latest` and print the latest
+      published version, or nothing at all on a 404. Exit non-zero on any
+      other status: a second source that could not be READ is not a second
+      source that is ABSENT.
+
   set-version <version> <Cargo.toml>
-      Step 4. Write <version> to every line of the manifest that pins a
-      workspace member, then verify the result.
+      Step 4. Write <version> to every [workspace.dependencies] entry that
+      pins a path by version, plus [workspace.package], then verify it.
 
   verify-version <version> <Cargo.toml>
-      Assert that the manifest pins <version> everywhere it pins a member.
+      Assert that the manifest pins <version> in every such entry, and that
+      no entry was skipped because of the shape it is written in.
 
   verify-macos-signature <binary>
       Step 5. Exit non-zero unless <binary> carries a valid signature.
@@ -76,8 +84,11 @@ Usage: bash .github/scripts/release.sh <subcommand> [args]
   sha256 <file>
       Print "<hash>  <basename>" for <file>.
 
-  sbom <Cargo.lock> <output.json> <product-name> <product-version>
+  sbom <Cargo.lock> <output.json> <product-name> <product-version> [<in-scope>]
       Step 6. Write a CycloneDX 1.5 SBOM of the locked dependency graph.
+      <in-scope> is a file of "<name> <version>" lines naming the packages
+      that reach the released binary; everything else is marked
+      "scope": "excluded" rather than being claimed as a dependency of it.
 USAGE
 }
 
@@ -226,6 +237,91 @@ cmd_check_monotonic() {
 }
 
 # ----------------------------------------------------------------------------
+# Step 2 — reading the second source.
+# ----------------------------------------------------------------------------
+# `gh` needs a runner and a token, so the CALL stays in release.yml. The
+# DECISION it feeds lives here: which answer from the GitHub API means "nothing
+# has been released yet", and which means "the second source could not be read".
+#
+# THOSE ARE NOT THE SAME ANSWER, AND `gh api`'s EXIT CODE CANNOT TELL THEM
+# APART. It exits non-zero for a 404, for a rate limit, for a network blip, and
+# for a token whose scope was reduced. Treating all of them as "no release yet"
+# hands `check-monotonic` an empty third argument, which it correctly reads as
+# "a first release cannot regress" -- so the two-source gate silently becomes a
+# one-source gate at precisely the moment the second source stopped working.
+# The equal-version case would still be caught by the tag-collision check, but a
+# LOWER one would not: a manually reversed manifest plus one transient API
+# failure publishes 1.0.0 while 2.0.0 is the latest release.
+#
+# `gh api -i` prints the status line ahead of the body, and prints it for a
+# failing request too, so the STATUS is recoverable where the exit code is not.
+# Only 404 means "no release yet". Every other status stops the run.
+#
+# The version goes to stdout because the caller captures it; everything else
+# goes to stderr, so that a progress line can never be read as a version.
+cmd_latest_release_version() {
+    local response="${1-}"
+    [[ -n "$response" ]] || die "latest-release-version: no response file given"
+    [[ -f "$response" ]] || die "latest-release-version: no such file: $response"
+
+    local status_line http_status
+    status_line="$(head -n 1 "$response" | tr -d '\r')"
+
+    if [[ -z "$status_line" ]]; then
+        reject "the GitHub API returned no response for the latest release."
+        printf 'Expected an HTTP status line from `gh api -i`. Nothing was\n' >&2
+        printf 'produced at all, so the published-release source -- one of the two\n' >&2
+        printf 'sources step 2 compares against -- could not be read. That is a\n' >&2
+        printf 'failure, not an empty result: a release must be checked against\n' >&2
+        printf 'BOTH sources or against neither.\n' >&2
+        exit 1
+    fi
+
+    http_status="$(printf '%s\n' "$status_line" | awk '{ print $2 }')"
+
+    case "$http_status" in
+    404)
+        # The documented address of the latest PUBLISHED release. A 404 is the
+        # legitimate first-release state and the only status that is.
+        printf 'no published release yet (HTTP 404)\n' >&2
+        return 0
+        ;;
+    200) ;;
+    *)
+        reject "the GitHub API answered HTTP ${http_status} for the latest release."
+        printf '%s\n' "$status_line" >&2
+        printf 'Only 404 means "nothing has been released yet". Any other status\n' >&2
+        printf 'means the published-release source could not be read, and a run\n' >&2
+        printf 'that continued would be checking monotonicity against Cargo.toml\n' >&2
+        printf 'alone -- which a manual edit to Cargo.toml is enough to defeat.\n' >&2
+        printf 'Re-dispatch once the API is reachable.\n' >&2
+        exit 1
+        ;;
+    esac
+
+    local tag
+    tag="$(awk '
+        match($0, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            field = substr($0, RSTART, RLENGTH)
+            sub(/^"tag_name"[[:space:]]*:[[:space:]]*"/, "", field)
+            sub(/"$/, "", field)
+            print field
+            exit
+        }
+    ' "$response")"
+
+    [[ -n "$tag" ]] ||
+        die "latest-release-version: HTTP 200 carried no tag_name"
+
+    local version="${tag#v}"
+    is_semver "$version" ||
+        die "latest-release-version: latest release tag '$tag' is not vX.Y.Z"
+
+    printf 'latest published release: %s\n' "$tag" >&2
+    printf '%s\n' "$version"
+}
+
+# ----------------------------------------------------------------------------
 # Step 4 — write the version.
 # ----------------------------------------------------------------------------
 # THIS EDITS FIVE LINES, NOT ONE, AND IT HAS TO.
@@ -243,6 +339,76 @@ cmd_check_monotonic() {
 #            candidate versions found which didn't match: 1.2.3
 #
 # `verify-version` below is what keeps that from being rediscovered mid-release.
+#
+# ----------------------------------------------------------------------------
+# MATCHED ON `path`, NOT ON `path = "crates/`.
+# ----------------------------------------------------------------------------
+# Members do not all live under `crates/`: the root manifest already declares
+# `tests` as a member (it is `runner-manager-e2e` in the lock), and nothing
+# stops a later one from living anywhere else. A rewrite keyed to the `crates/`
+# prefix leaves such an entry pinning the old version, and -- worse -- the
+# check below used to AFFIRM success anyway, because its only floor was "at
+# least one entry matched" and four others did.
+#
+# So both halves key on the presence of a `path` key inside
+# `[workspace.dependencies]`, in any of the shapes TOML allows it to be written
+# in, and `verify-version` cross-checks its own coverage against the
+# `[workspace] members` list rather than reporting a count of one as enough.
+#
+# ----------------------------------------------------------------------------
+# TWO PASSES OVER THE MANIFEST, BECAUSE `path` NEED NOT PRECEDE `version`.
+# ----------------------------------------------------------------------------
+# In a one-line inline table both keys are on the line being rewritten, but in
+# an expanded `[workspace.dependencies.<name>]` table -- or a multi-line inline
+# table -- they are separate lines in either order. A single line-oriented pass
+# reaching `version` does not yet know whether the entry it belongs to has a
+# `path` at all. Pass one decides which lines to rewrite; pass two rewrites
+# them.
+readonly MANIFEST_ENTRY_SCANNER='
+    function reset_entry() {
+        entry_open = 0
+        entry_expanded = 0
+        entry_has_path = 0
+        entry_depth = 0
+        entry_versions = 0
+        entry_path = ""
+    }
+    # An entry written as `name = { ... }` ends when its braces balance, and
+    # one written with no braces at all ends on the line it started. An
+    # expanded `[workspace.dependencies.<name>]` table ends only at the next
+    # section header, so brace counting must not close it on its first line.
+    function advance(text) {
+        if (entry_expanded) { return }
+        entry_depth += gsub(/\{/, "\\&", text)
+        entry_depth -= gsub(/\}/, "\\&", text)
+        if (entry_depth <= 0) { close_entry() }
+    }
+    function quoted(text) {
+        if (match(text, /"[^"]*"/)) {
+            return substr(text, RSTART + 1, RLENGTH - 2)
+        }
+        return ""
+    }
+    function value_of(text, key,   field) {
+        if (!match(text, key "[[:space:]]*=[[:space:]]*\"[^\"]*\"")) { return "" }
+        field = substr(text, RSTART, RLENGTH)
+        return quoted(substr(field, index(field, "=")))
+    }
+    # Records what an entry line contributes. `path` may arrive before or after
+    # `version`, and both may arrive on the same line as each other.
+    function note(text, number) {
+        if (text ~ /path[[:space:]]*=[[:space:]]*"/) {
+            entry_has_path = 1
+            entry_path = value_of(text, "path")
+        }
+        if (text ~ /version[[:space:]]*=[[:space:]]*"/) {
+            entry_versions++
+            entry_version_line[entry_versions] = number
+            entry_version[entry_versions] = value_of(text, "version")
+        }
+    }
+'
+
 cmd_set_version() {
     local version="${1-}" manifest="${2-}"
     [[ -n "$version" ]] || die "set-version: no version given"
@@ -254,27 +420,79 @@ cmd_set_version() {
     previous="$(manifest_version_of "$manifest")"
     [[ -n "$previous" ]] || die "set-version: no [workspace.package] version in $manifest"
 
+    # The manifest is read TWICE -- hence the file named twice below.
     local rewritten="${manifest}.a2-set-version"
-    awk -v new="$version" '
+    awk -v new="$version" "$MANIFEST_ENTRY_SCANNER"'
+        function close_entry(   i) {
+            if (entry_open && entry_has_path) {
+                for (i = 1; i <= entry_versions; i++) {
+                    rewrite[entry_version_line[i]] = 1
+                }
+            }
+            reset_entry()
+        }
+
+        # ---- pass one: decide which lines carry a version to rewrite -------
+        NR == FNR {
+            line = $0
+            sub(/\r$/, "", line)
+
+            if (line ~ /^\[/) {
+                close_entry()
+                section = line
+                in_dependencies = (section ~ /^\[workspace\.dependencies(\]|\.)/)
+                # An expanded `[workspace.dependencies.<name>]` table IS the
+                # entry: it runs until the next section header.
+                if (section ~ /^\[workspace\.dependencies\./) {
+                    entry_open = 1
+                    entry_expanded = 1
+                }
+                next
+            }
+
+            if (section == "[workspace.package]" && line ~ /^version[[:space:]]*=/) {
+                package_version_line[FNR] = 1
+                next
+            }
+
+            if (!in_dependencies) { next }
+            if (line ~ /^[[:space:]]*#/) { next }
+
+            if (!entry_open) {
+                # A new entry begins at a bare key at the start of a line.
+                if (line !~ /^[^#[:space:]=][^=]*=/) { next }
+                entry_open = 1
+            }
+
+            note(line, FNR)
+            advance(line)
+            next
+        }
+
+        # The end of pass one: an entry still open at EOF has to be closed
+        # before its version lines are consulted. `END` cannot do it -- by then
+        # pass two has run -- so it happens at the first line of pass two.
+        NR != FNR && FNR == 1 { close_entry() }
+
+        # ---- pass two: rewrite exactly those lines -------------------------
         {
             line = $0
             eol = ""
             if (sub(/\r$/, "", line)) { eol = "\r" }
-        }
-        line ~ /^\[/ { section = line; print line eol; next }
-        section == "[workspace.package]" && line ~ /^version[[:space:]]*=/ {
-            print "version = \"" new "\"" eol
-            next
-        }
-        section == "[workspace.dependencies]" &&
-        line ~ /path[[:space:]]*=[[:space:]]*"crates\// &&
-        line ~ /version[[:space:]]*=[[:space:]]*"/ {
-            sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/, "version = \"" new "\"", line)
+
+            if (FNR in package_version_line) {
+                print "version = \"" new "\"" eol
+                next
+            }
+            if (FNR in rewrite) {
+                sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/,
+                    "version = \"" new "\"", line)
+                print line eol
+                next
+            }
             print line eol
-            next
         }
-        { print line eol }
-    ' "$manifest" >"$rewritten"
+    ' "$manifest" "$manifest" >"$rewritten"
 
     mv -f "$rewritten" "$manifest"
 
@@ -286,6 +504,26 @@ cmd_set_version() {
     printf 'set version %s -> %s in %s\n' "$previous" "$version" "$manifest"
 }
 
+# ----------------------------------------------------------------------------
+# THIS MUST NOT AFFIRM SUCCESS OVER AN ENTRY IT NEVER LOOKED AT.
+# ----------------------------------------------------------------------------
+# Its whole purpose is to move a resolution failure from `cargo build` -- which
+# in a release run happens AFTER the tag is pushed -- to before the commit. An
+# affirmation that means "every entry my scan happened to match is correct" is
+# worth nothing, because the entry that broke the release is by definition the
+# one the scan did not match.
+#
+# So there are two independent readings of the same file. The structured one
+# attributes every `path` to an entry. The dumb one records every `path` value
+# stated anywhere in the section, by regex, with no notion of entries at all. A
+# shape the structured reader does not understand shows up as a path the dumb
+# reader saw and the structured one did not, and that is a failure -- not a
+# silently smaller count.
+#
+# `[workspace] members` is the third reading, and it is what makes "how many
+# members should be pinned here?" answerable at all rather than assumed. It
+# also keeps the success line honest: it reports coverage instead of claiming
+# completeness.
 cmd_verify_version() {
     local version="${1-}" manifest="${2-}"
     [[ -n "$version" ]] || die "verify-version: no version given"
@@ -294,18 +532,70 @@ cmd_verify_version() {
     # `if awk ...` and not `awk ... && { ... }`: under `set -e` a failing
     # command at the head of an AND-list still terminates the shell, which
     # would skip the explanation below and report the failure as a crash.
-    if awk -v want="$version" '
-        function quoted(text,   inner) {
-            if (match(text, /"[^"]*"/)) {
-                return substr(text, RSTART + 1, RLENGTH - 2)
+    if awk -v want="$version" "$MANIFEST_ENTRY_SCANNER"'
+        function close_entry(   i, found) {
+            if (entry_open && entry_has_path) {
+                examined++
+                structured_path[entry_path] = 1
+                if (entry_versions > 0) {
+                    pinned++
+                    if (entry_path in declared) { pinned_members[entry_path] = 1 }
+                    for (i = 1; i <= entry_versions; i++) {
+                        found = entry_version[i]
+                        if (found != want) {
+                            printf("  the entry pinning path \"%s\" says version \"%s\", expected \"%s\"\n",
+                                   entry_path, found, want)
+                            bad++
+                        }
+                    }
+                }
             }
-            return ""
+            reset_entry()
         }
+        # Every quoted string on the line, added to the declared member set.
+        function collect_members(text) {
+            while (match(text, /"[^"]*"/)) {
+                declared[substr(text, RSTART + 1, RLENGTH - 2)] = 1
+                declared_count++
+                text = substr(text, RSTART + RLENGTH)
+            }
+        }
+        # The dumb reading: every `path = "..."` stated in the section, found
+        # by regex, with no notion of what entry it belongs to.
+        function collect_paths(text,   field) {
+            while (match(text, /path[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+                field = substr(text, RSTART, RLENGTH)
+                stated_path[quoted(substr(field, index(field, "=")))] = 1
+                text = substr(text, RSTART + RLENGTH)
+            }
+        }
+
         {
             line = $0
             sub(/\r$/, "", line)
         }
-        line ~ /^\[/ { section = line; next }
+
+        line ~ /^\[/ {
+            close_entry()
+            section = line
+            in_dependencies = (section ~ /^\[workspace\.dependencies(\]|\.)/)
+            if (section ~ /^\[workspace\.dependencies\./) {
+                entry_open = 1
+                entry_expanded = 1
+            }
+            collecting_members = 0
+            next
+        }
+
+        section == "[workspace]" && line ~ /^members[[:space:]]*=/ {
+            collecting_members = 1
+        }
+        collecting_members {
+            collect_members(line)
+            if (line ~ /\]/) { collecting_members = 0 }
+            next
+        }
+
         section == "[workspace.package]" && line ~ /^version[[:space:]]*=/ {
             package_versions++
             found = quoted(line)
@@ -315,34 +605,70 @@ cmd_verify_version() {
             }
             next
         }
-        section == "[workspace.dependencies]" &&
-        line ~ /path[[:space:]]*=[[:space:]]*"crates\// {
-            if (line !~ /version[[:space:]]*=[[:space:]]*"/) { next }
-            member_versions++
-            if (match(line, /version[[:space:]]*=[[:space:]]*"[^"]*"/)) {
-                found = quoted(substr(line, RSTART, RLENGTH))
-                if (found != want) {
-                    printf("  %s\n", line)
-                    printf("    pins \"%s\", expected \"%s\"\n", found, want)
-                    bad++
-                }
+
+        in_dependencies {
+            if (line ~ /^[[:space:]]*#/) { next }
+            collect_paths(line)
+
+            if (!entry_open) {
+                if (line !~ /^[^#[:space:]=][^=]*=/) { next }
+                entry_open = 1
             }
+            note(line, FNR)
+            advance(line)
             next
         }
+
         END {
+            close_entry()
+
             if (package_versions != 1) {
                 printf("  expected exactly one [workspace.package] version line, found %d\n",
                        package_versions)
                 bad++
             }
-            if (member_versions < 1) {
-                printf("  no [workspace.dependencies] entry pins a workspace member by path\n")
+
+            # Positive assertions first: each of the three readings has to have
+            # read something, or the comparisons between them are vacuous.
+            if (declared_count < 1) {
+                printf("  no [workspace] members list could be parsed, so the coverage\n")
+                printf("  cross-check below would pass over an empty set\n")
                 bad++
             }
-            if (bad > 0) { exit 1 }
+            if (pinned < 1) {
+                printf("  no [workspace.dependencies] entry pins a path by version\n")
+                bad++
+            }
+
+            # The reading the whole check turns on: a path the dumb reader saw
+            # and the structured reader did not is an entry written in a shape
+            # this check cannot understand -- so it was neither rewritten by
+            # set-version nor checked here, and reporting success over it is
+            # exactly the failure this function exists to prevent.
+            for (path in stated_path) {
+                if (!(path in structured_path)) {
+                    printf("  a [workspace.dependencies] entry declares path \"%s\" in a shape\n", path)
+                    printf("  this check does not understand, so nothing verified its version\n")
+                    bad++
+                }
+            }
+
+            members_pinned = 0
+            for (path in pinned_members) { members_pinned++ }
+
+            if (bad > 0) {
+                printf("  (%d of %d declared workspace members are pinned by path and version;\n",
+                       members_pinned, declared_count)
+                printf("   %d [workspace.dependencies] entries carry a path in total)\n", examined)
+                exit 1
+            }
+
+            printf("%d of %d declared workspace members are pinned by path and version, and\n",
+                   members_pinned, declared_count)
+            printf("all %d [workspace.dependencies] entries carrying a path were checked\n", examined)
         }
     ' "$manifest"; then
-        printf 'manifest pins %s everywhere it pins a workspace member\n' "$version"
+        printf 'manifest pins %s in every entry that pins a path by version\n' "$version"
         return 0
     fi
 
@@ -430,8 +756,15 @@ cmd_sha256() {
     directory="$(dirname "$file")"
     base="$(basename "$file")"
 
+    # `-b` is stated rather than relied on. MSYS2 coreutils -- the `sha256sum`
+    # the Windows build leg reaches under Git Bash -- already defaults to binary
+    # mode, so this changes no byte today. But the consumer is a3's install
+    # script, which ABORTS the install on a mismatch, and "correct because the
+    # default happens to be right" is not a property this file gets to assume
+    # about a coreutils build it does not pin. `shasum` needs no flag: it runs
+    # only on macOS, where there is no text mode for binary mode to differ from.
     if command -v sha256sum >/dev/null 2>&1; then
-        raw="$(cd "$directory" && sha256sum "$base")"
+        raw="$(cd "$directory" && sha256sum -b "$base")"
     elif command -v shasum >/dev/null 2>&1; then
         raw="$(cd "$directory" && shasum -a 256 "$base")"
     else
@@ -464,20 +797,55 @@ cmd_sha256() {
 # What this deliberately does NOT carry is licence text. `Cargo.lock` does not
 # record licences, and inventing them from crate names would be worse than
 # omitting them. CycloneDX does not require them.
+#
+# ----------------------------------------------------------------------------
+# `Cargo.lock` IS THE WHOLE WORKSPACE, AND THE BINARY IS NOT.
+# ----------------------------------------------------------------------------
+# Every `[[package]]` in the lock is listed, because omitting one would be a
+# hole in the inventory. But the lock is the resolved graph of the WORKSPACE:
+# it contains `wiremock`, `insta`, `assert_cmd`, `predicates`, `serial_test`
+# and the two internal test crates, which no released binary links; and it
+# contains `security-framework`, `windows-service` and `redox_syscall`, which
+# are conditional on operating systems a given artifact was not built for.
+# An SBOM that simply asserted all of them as contents of the binary would be a
+# false-positive generator for anyone running a CVE scan against the artifact
+# -- reporting an advisory in a crate the binary does not contain.
+#
+# So the optional <in-scope> argument carries the packages that actually reach
+# the released binary, and everything else is emitted with CycloneDX's
+# `"scope": "excluded"`: present in the document, explicitly NOT claimed as
+# part of the product. The caller produces that list with `cargo tree -e normal
+# -p <product> --target <triple>`, unioned over the published targets, which
+# needs no third-party tool and no marketplace action -- the whole reason this
+# generator exists rather than a fetched one.
+#
+# Omit the argument and no `scope` key is emitted at all: the document then
+# makes no claim either way, which is the honest thing for it to do when
+# nothing established one.
 cmd_sbom() {
     local lock="${1-}" output="${2-}" product="${3-}" product_version="${4-}"
+    local in_scope="${5-}"
     [[ -n "$lock" ]] || die "sbom: no Cargo.lock given"
     [[ -f "$lock" ]] || die "sbom: no such file: $lock"
     [[ -n "$output" ]] || die "sbom: no output path given"
     [[ -n "$product" ]] || die "sbom: no product name given"
     [[ -n "$product_version" ]] || die "sbom: no product version given"
 
+    if [[ -n "$in_scope" ]]; then
+        [[ -f "$in_scope" ]] || die "sbom: no such in-scope list: $in_scope"
+        # An empty list would mark the ENTIRE graph excluded and say so with a
+        # straight face, which is a worse document than one that claims nothing.
+        grep -q '[^[:space:]]' "$in_scope" ||
+            die "sbom: the in-scope list $in_scope is empty; every component would be marked excluded"
+    fi
+
     local timestamp
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     awk -v product="$product" \
         -v product_version="$product_version" \
-        -v timestamp="$timestamp" '
+        -v timestamp="$timestamp" \
+        -v in_scope="$in_scope" '
         function escape(text) {
             gsub(/\\/, "\\\\", text)
             gsub(/"/, "\\\"", text)
@@ -499,6 +867,10 @@ cmd_sbom() {
                 printf("      \"type\": \"library\",\n")
                 printf("      \"name\": \"%s\",\n", escape(name))
                 printf("      \"version\": \"%s\",\n", escape(version))
+                if (in_scope != "") {
+                    printf("      \"scope\": \"%s\",\n",
+                           ((name " " version) in scoped) ? "required" : "excluded")
+                }
                 if (checksum != "") {
                     printf("      \"hashes\": [\n")
                     printf("        { \"alg\": \"SHA-256\", \"content\": \"%s\" }\n",
@@ -513,6 +885,16 @@ cmd_sbom() {
         }
         BEGIN {
             emitted = 0
+            if (in_scope != "") {
+                # "<name> <version>" per line. Matched on both, because two
+                # versions of one crate routinely coexist in a locked graph and
+                # only one of them may reach the binary.
+                while ((getline scope_line < in_scope) > 0) {
+                    sub(/\r$/, "", scope_line)
+                    if (scope_line != "") { scoped[scope_line] = 1 }
+                }
+                close(in_scope)
+            }
             printf("{\n")
             printf("  \"bomFormat\": \"CycloneDX\",\n")
             printf("  \"specVersion\": \"1.5\",\n")
@@ -547,7 +929,13 @@ cmd_sbom() {
         }
     ' "$lock" >"$output"
 
-    printf 'wrote SBOM for %s %s to %s\n' "$product" "$product_version" "$output"
+    if [[ -n "$in_scope" ]]; then
+        printf 'wrote SBOM for %s %s to %s (scoped against %s)\n' \
+            "$product" "$product_version" "$output" "$in_scope"
+    else
+        printf 'wrote SBOM for %s %s to %s (no scope claimed)\n' \
+            "$product" "$product_version" "$output"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -564,6 +952,7 @@ main() {
     check-format) cmd_check_format "$@" ;;
     manifest-version) cmd_manifest_version "$@" ;;
     check-monotonic) cmd_check_monotonic "$@" ;;
+    latest-release-version) cmd_latest_release_version "$@" ;;
     set-version) cmd_set_version "$@" ;;
     verify-version) cmd_verify_version "$@" ;;
     verify-macos-signature) cmd_verify_macos_signature "$@" ;;

@@ -10,6 +10,9 @@
 #
 #   1. validate the version format          job `validate`
 #   2. validate monotonicity, both sources  job `validate`
+#      ...and that every build label resolves to a native runner, which is
+#      still a step-1-and-2 concern because it has to refuse the release
+#      before step 4 writes anything    job `preflight`
 #   3. run every test, the CI matrix        job `test`   (calls ci.yml)
 #   4. write the version, commit, tag       job `tag`
 #   5. build per target, verify signatures  job `build`
@@ -50,8 +53,26 @@
 # ----------------------------------------------------------------------------
 # Failure semantics are part of the contract (`09-release-distribution.md`).
 # The `tag` job pushes the version commit and the tag in ONE atomic push, so a
-# failure at or before step 4 leaves nothing behind: no tag, no moved branch,
-# re-dispatch and nothing else is needed.
+# failure at or before step 4 leaves nothing behind: no tag and no moved branch.
+# `--atomic` sends both ref updates in one request and GitHub applies a
+# pre-receive rejection to the whole push, so a protected-branch refusal, a
+# signed-commits requirement, or someone else pushing while the tests ran all
+# leave NEITHER ref.
+#
+# "Nothing to clean up" is not the same as "just re-dispatch", and the
+# difference is the operator's whole next move:
+#
+#   * A NON-FAST-FORWARD -- somebody pushed to the branch during step 3 -- is
+#     transient. Re-dispatch; the run re-reads the branch and succeeds.
+#   * A BRANCH PROTECTION or SIGNED-COMMITS refusal is not transient, and
+#     re-dispatching fails at exactly the same point forever. The push comes
+#     from `github-actions[bot]` using `GITHUB_TOKEN`, so the fix is either to
+#     dispatch from a branch that is not protected, or to grant that bot a
+#     bypass on the protected branch. Neither is something this workflow can
+#     do for itself, and no number of re-dispatches substitutes for it.
+#
+# Read the `git push` failure before re-dispatching: `protected branch hook
+# declined` and `non-fast-forward` need opposite responses.
 #
 # A failure AFTER that -- a build leg, the signature check, packaging, the SBOM,
 # or publication -- stops the run with the tag present and no release published.
@@ -138,6 +159,7 @@ jobs:
   validate:
     name: validate the version (steps 1-2)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -162,16 +184,20 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
 
           # `releases/latest` is GitHub's documented address for the latest
-          # PUBLISHED release; it excludes drafts and pre-releases. A 404 means
-          # nothing has been released yet, which is a legitimate state for the
-          # first release and not an error.
-          if tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null)"; then
-            release="${tag#v}"
-            echo "latest published release: $tag"
-          else
-            release=""
-            echo "no published release yet"
-          fi
+          # PUBLISHED release; it excludes drafts and pre-releases.
+          #
+          # `-i`, AND THE STATUS IS READ RATHER THAN THE EXIT CODE.
+          # `gh api` exits non-zero for a 404, for a rate limit, for a network
+          # blip and for a token whose scope was reduced, so a bare `if gh api
+          # ...; else` reads every one of them as "nothing released yet" and
+          # silently drops step 2 to a single source. Only 404 is that state;
+          # `release.sh latest-release-version` is what decides, and it fails
+          # the run on anything else. `|| true` keeps `set -e` from ending the
+          # step before the status can be looked at.
+          gh api -i "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            > latest-release.http 2>/dev/null || true
+          release="$(bash .github/scripts/release.sh latest-release-version latest-release.http)"
+          rm -f latest-release.http
           echo "release=$release" >> "$GITHUB_OUTPUT"
 
       - name: Step 2 - the version must exceed BOTH sources
@@ -203,6 +229,96 @@ jobs:
           echo "tag ${TAG} is free"
 
   # --------------------------------------------------------------------------
+  # Steps 1-2, continued: prove the build labels resolve BEFORE anything is
+  # written. This job exists because of what `tag` does next.
+  # --------------------------------------------------------------------------
+  # The native-runner assertion in `build` catches a label pointing at the
+  # WRONG architecture about thirty seconds into that leg. It cannot catch a
+  # label that resolves to NO RUNNER AT ALL -- which is the live risk here,
+  # because `macos-15-intel` is a hosted label GitHub has moved more than once
+  # and both Intel-macOS and arm64-Linux labels are overridable by repository
+  # variable. GitHub treats a label it does not recognise as a self-hosted
+  # label: the job does not fail, it QUEUES, and an assertion inside a job that
+  # never starts never runs.
+  #
+  # `build` needs `tag`, so without this job that queue happens AFTER the
+  # version commit and the tag have been pushed -- four legs green, one leg
+  # waiting, nothing published, and an operator left deleting a tag by hand
+  # (see the recovery in this file's header). Running the same assertion on the
+  # same five labels BEFORE `tag` moves both failure modes -- unresolvable
+  # label and wrong architecture -- in front of the irreversible step. A
+  # dispatch that cannot build is then a dispatch that changed nothing.
+  #
+  # The cost is five runner starts of roughly thirty seconds. There is no
+  # checkout and no toolchain here; the assertion needs neither.
+  preflight:
+    name: preflight ${{ matrix.target }} (steps 1-2)
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    # Bounds a leg that STARTS and then wedges. It does not bound a leg that
+    # never starts: GitHub's job timer runs from the moment a runner picks the
+    # job up, so an unresolvable label sits in the queue regardless of this
+    # value. That case is bounded by WHERE this job sits -- before `tag` -- and
+    # an operator cancelling the run then has nothing to clean up.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      # ----------------------------------------------------------------------
+      # THE SAME FIVE ENTRIES AS `build`, AND THAT IS ASSERTED, NOT TRUSTED.
+      # ----------------------------------------------------------------------
+      # Actions has no way to share a matrix between jobs, and a preflight that
+      # checked four of the five labels would be worse than none: it would read
+      # as proof. `crates/app/tests/release_workflow.rs` compares the two
+      # matrices on every pull request.
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: ${{ vars.RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 || 'macos-15-intel' }}
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ${{ vars.RUNNER_MANAGER_RELEASE_RUNS_ON_LINUX_ARM64 || 'ubuntu-24.04-arm' }}
+            archive: tar.gz
+    steps:
+      - name: Assert this runner is native for ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          case "$TARGET" in
+            x86_64-*)  want_arch="X64" ;;
+            aarch64-*) want_arch="ARM64" ;;
+            *) echo "unknown architecture in target ${TARGET}" >&2; exit 1 ;;
+          esac
+          case "$TARGET" in
+            *-apple-darwin) want_os="macOS" ;;
+            *-windows-*)    want_os="Windows" ;;
+            *-linux-*)      want_os="Linux" ;;
+            *) echo "unknown operating system in target ${TARGET}" >&2; exit 1 ;;
+          esac
+          echo "target=${TARGET} wants=${want_os}/${want_arch}" \
+               "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+          if [ "$RUNNER_ARCH" != "$want_arch" ] || [ "$RUNNER_OS" != "$want_os" ]; then
+            echo "REJECTED: ${TARGET} must be built on a ${want_os} ${want_arch}" >&2
+            echo "runner, but this runner reports ${RUNNER_OS} ${RUNNER_ARCH}." >&2
+            echo "Point the matching RUNNER_MANAGER_RELEASE_RUNS_ON_* repository" >&2
+            echo "variable at a native label." >&2
+            exit 1
+          fi
+          echo "this label is a native ${RUNNER_OS} ${RUNNER_ARCH} runner"
+
+  # --------------------------------------------------------------------------
   # Step 3. The same matrix as CI, by calling CI rather than copying it.
   # --------------------------------------------------------------------------
   test:
@@ -220,8 +336,13 @@ jobs:
   # --------------------------------------------------------------------------
   tag:
     name: write the version and tag it (step 4)
-    needs: [validate, test]
+    # `preflight` is here for the same reason `test` is: this job is the first
+    # thing that cannot be undone, so everything that can refuse a release has
+    # to have already run. A build label that resolves to nothing must stop the
+    # run while stopping it is still free.
+    needs: [validate, preflight, test]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     outputs:
@@ -302,7 +423,16 @@ jobs:
           # someone pushing while the tests ran) still leaves the tag on the
           # remote, which is the tagged-but-unpublished state an operator then
           # has to clean up by hand. With it, either both refs land or neither
-          # does, so every failure at or before this point needs no recovery.
+          # does, so every failure at or before this point leaves nothing to
+          # clean up -- though not every one of them is fixed by re-dispatching;
+          # see OPERATOR RECOVERY in this file's header.
+          #
+          # This push carries `GITHUB_TOKEN`, and a push authenticated with it
+          # does not trigger workflows. So the version commit lands on the
+          # branch without a CI run of its own. That is deliberate and it is
+          # acceptable: this commit differs from the one step 3 just tested by
+          # the version strings alone, and the artifacts are built from THIS
+          # sha, not from the branch head.
           git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
 
           echo "pushed ${sha} to ${BRANCH} and tag ${TAG}"
@@ -319,6 +449,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    # A release build of this workspace is minutes, not hours. Without this the
+    # 360-minute default applies to a leg that wedges -- a stuck `cargo fetch`,
+    # a hung linker -- and it would hang there with the tag already pushed.
+    # This does NOT bound a leg that never gets a runner at all; `preflight`
+    # above is what handles that, by failing before anything was written.
+    timeout-minutes: 20
     strategy:
       # One red leg must not hide the state of the other four.
       fail-fast: false
@@ -358,22 +494,42 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
         run: |
           # "Build on native runners" is a requirement, not a preference, and a
           # hosted label silently repointing to another architecture is exactly
           # how it would stop being true without anyone noticing. Verified here
           # rather than assumed, the same way ci.yml asserts its macOS leg.
+          #
+          # `preflight` ran this same check before the tag was pushed. It runs
+          # again here because the two guard different things: there, that the
+          # labels resolve at all; here, that THIS runner is native for the
+          # binary this leg is about to produce.
+          #
+          # BOTH HALVES OF "NATIVE" ARE CHECKED, and the OS half is the one
+          # that matters most. `runner.os` is the single value deciding whether
+          # the macOS signature gate below runs at all, so a
+          # RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 override pointing at a
+          # Linux x64 label would produce an ELF named as a macOS artifact and
+          # skip the one check that would have noticed.
           case "$TARGET" in
-            x86_64-*)  want="X64" ;;
-            aarch64-*) want="ARM64" ;;
+            x86_64-*)  want_arch="X64" ;;
+            aarch64-*) want_arch="ARM64" ;;
             *) echo "unknown architecture in target ${TARGET}" >&2; exit 1 ;;
           esac
-          echo "target=${TARGET} wants=${want} runner.arch=${RUNNER_ARCH}"
-          if [ "$RUNNER_ARCH" != "$want" ]; then
-            echo "REJECTED: ${TARGET} must be built on a ${want} runner," >&2
-            echo "but this runner reports ${RUNNER_ARCH}. Point the matching" >&2
-            echo "RUNNER_MANAGER_RELEASE_RUNS_ON_* repository variable at a" >&2
-            echo "native label." >&2
+          case "$TARGET" in
+            *-apple-darwin) want_os="macOS" ;;
+            *-windows-*)    want_os="Windows" ;;
+            *-linux-*)      want_os="Linux" ;;
+            *) echo "unknown operating system in target ${TARGET}" >&2; exit 1 ;;
+          esac
+          echo "target=${TARGET} wants=${want_os}/${want_arch}" \
+               "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+          if [ "$RUNNER_ARCH" != "$want_arch" ] || [ "$RUNNER_OS" != "$want_os" ]; then
+            echo "REJECTED: ${TARGET} must be built on a ${want_os} ${want_arch}" >&2
+            echo "runner, but this runner reports ${RUNNER_OS} ${RUNNER_ARCH}." >&2
+            echo "Point the matching RUNNER_MANAGER_RELEASE_RUNS_ON_* repository" >&2
+            echo "variable at a native label." >&2
             exit 1
           fi
 
@@ -465,20 +621,66 @@ jobs:
           retention-days: 7
 
   # --------------------------------------------------------------------------
-  # Step 6, continued. The SBOM describes the locked graph, so it is built once
-  # rather than per target.
+  # Step 6, continued. One SBOM for the release, covering the locked graph,
+  # with what actually reaches a binary marked as such.
   # --------------------------------------------------------------------------
+  # `Cargo.lock` is the resolved graph of the WHOLE WORKSPACE, and no released
+  # binary contains all of it: `wiremock`, `insta`, `assert_cmd`, `predicates`
+  # and `serial_test` are test-only, the two internal test crates ship nowhere,
+  # and `security-framework`, `windows-service` and `redox_syscall` are each
+  # conditional on an operating system that four of the five artifacts were not
+  # built for. Publishing that list as the contents of the binary is a
+  # false-positive generator for anyone scanning the artifact for advisories.
+  #
+  # So the lock supplies the inventory and `cargo tree` supplies the scope. The
+  # union is taken over all five published targets rather than generating five
+  # SBOMs, because one document per release is what the release page and every
+  # downstream manifest expect -- and CycloneDX has a field for exactly this.
   sbom:
     name: generate the SBOM (step 6)
     needs: [validate, tag]
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    timeout-minutes: 20
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Step 6 - resolve what reaches the released binary
+        run: |
+          # `--target` only changes which `cfg` gates evaluate true, so one
+          # Linux runner can answer this for all five triples without any
+          # cross toolchain installed. `--edges normal` drops dev- and
+          # build-dependencies: the test-only crates above are exactly what it
+          # removes. `--locked` keeps this from touching the lock the `tag` job
+          # just committed.
+          for target in $RELEASE_TARGETS; do
+            echo "--- ${target}" >&2
+            cargo tree --locked --edges normal --package runner-manager \
+              --target "$target" --prefix none
+          done > tree.txt
+
+          # `<name> <version>`, which is how the SBOM keys a component. Two
+          # versions of one crate routinely coexist in a locked graph and only
+          # one may reach the binary, so the version is part of the key.
+          awk '$2 ~ /^v[0-9]/ { sub(/^v/, "", $2); print $1, $2 }' tree.txt |
+            sort -u > in-scope.txt
+          rm -f tree.txt
+
+          echo "$(wc -l < in-scope.txt) packages reach the released binary"
+          # An empty list would mark the entire graph excluded and say so with
+          # a straight face. `release.sh sbom` refuses one, but failing here
+          # names the step that produced it.
+          test -s in-scope.txt
 
       - name: Step 6 - write the CycloneDX SBOM
         env:
@@ -487,7 +689,7 @@ jobs:
           name="runner-manager-${VERSION}-sbom.cdx.json"
           mkdir -p dist
           bash .github/scripts/release.sh sbom \
-            Cargo.lock "dist/${name}" runner-manager "$VERSION"
+            Cargo.lock "dist/${name}" runner-manager "$VERSION" in-scope.txt
           bash .github/scripts/release.sh sha256 "dist/${name}" > "dist/${name}.sha256"
           head -14 "dist/${name}"
           cat "dist/${name}.sha256"
@@ -507,6 +709,7 @@ jobs:
     name: publish the release (step 7)
     needs: [validate, tag, build, sbom]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
@@ -529,7 +732,13 @@ jobs:
           cd dist
           # Sorted by asset name so the file is byte-identical for a given set
           # of artifacts regardless of the order five parallel legs finished in.
-          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          #
+          # `LC_ALL=C` because `sort` collates by locale: under a UTF-8 locale
+          # it folds case and ignores punctuation, so `-` and `.` in the asset
+          # names order differently than they do under C. The runner image's
+          # locale is not something this repository pins, and "byte-identical"
+          # is a claim that has to survive the image changing.
+          cat ./*.sha256 | LC_ALL=C sort -k2 > SHA256SUMS
           rm ./*.sha256
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
@@ -601,11 +810,26 @@ jobs:
           cat > dist/NOTES.md <<'NOTES'
           ## Verify what you downloaded
 
-          Every asset is listed in `SHA256SUMS`, and `<asset>.cdx.json` is a
-          CycloneDX SBOM of the exact locked dependency graph this build used.
+          Every asset is listed in `SHA256SUMS`.
 
               sha256sum -c SHA256SUMS       # Linux, or Git Bash on Windows
               shasum -a 256 -c SHA256SUMS   # macOS
+
+          ## The SBOM
+
+          `runner-manager-<version>-sbom.cdx.json` is a CycloneDX 1.5 inventory
+          of this release's committed `Cargo.lock`. That is the resolved graph
+          of the whole workspace, not of any one artifact, so it is scoped
+          rather than presented as a parts list:
+
+          * `"scope": "required"` — reaches the released binaries. Taken from
+            `cargo tree --edges normal`, unioned over all five targets.
+          * `"scope": "excluded"` — present in the lock and **not** in any
+            binary here: test-only crates, and crates conditional on an
+            operating system you did not download.
+
+          A scan that ignores `scope` will report advisories against code these
+          artifacts do not contain.
 
           The macOS binaries carry an ad-hoc signature, which is what lets
           arm64 builds execute at all; the release workflow verifies it is
