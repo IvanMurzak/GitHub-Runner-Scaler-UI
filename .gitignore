@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is intentionally committed: this workspace ships a binary.
+
+# Local runtime and state produced by the agent during development
+/runtime/
+/state/
+/logs/
+
+# Editors and OS cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
