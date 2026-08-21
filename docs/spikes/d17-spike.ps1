@@ -123,9 +123,23 @@ $repoConn = Chain 'repo' "$API/repos/$Repo/actions/runners/registration-token" "
 if ($Org) { $orgConn = Chain 'org' "$API/orgs/$Org/actions/runners/registration-token" "https://github.com/$Org" }
 else      { Note 'link2-3-org' 'AMBER' 'no -Org supplied; organization scope (D18) NOT tested' }
 
-if (-not $repoConn) { Write-Host "`nRepository chain broken; stopping." -ForegroundColor Red; $evidence | ConvertTo-Json -Depth 6; exit 1 }
-$script:tenant = $repoConn.url; $script:admin = $repoConn.token
+if (-not $repoConn -and -not $orgConn) { Write-Host "`nBoth chains broken; stopping." -ForegroundColor Red; $evidence | ConvertTo-Json -Depth 6; exit 1 }
+
+# Links 4-6 run against the ORG connection whenever one is available.
+# Repository scope is already known to fail scale-set creation here, so
+# pointing these links at the repo again would test nothing.
+if ($orgConn) {
+  $use = $orgConn; $scope = 'org'
+  $script:regUrl = "$API/orgs/$Org/actions/runners/registration-token"
+  $script:cfgUrl = "https://github.com/$Org"
+} else {
+  $use = $repoConn; $scope = 'repo'
+  $script:regUrl = "$API/repos/$Repo/actions/runners/registration-token"
+  $script:cfgUrl = "https://github.com/$Repo"
+}
+$script:tenant = $use.url; $script:admin = $use.token
 $svc = @{ Authorization = "Bearer $($script:admin)"; Accept = 'application/json' }
+Write-Host "`n  links 4-6 run at '$scope' scope against $($script:cfgUrl)" -ForegroundColor White
 
 try {
   # -------------------------------------------------------------- link 4
@@ -140,14 +154,14 @@ try {
   $ss = Invoke-RestMethod -Method Post -Uri "$($script:tenant)_apis/runtime/runnerscalesets?api-version=$AV" `
     -Headers $svc -ContentType 'application/json' -Body $body
   $script:scaleSetId = $ss.id
-  Note 'link4-scaleset-create' 'GREEN' "id $($ss.id) name '$($ss.name)' group '$($ss.runnerGroupName)'"
+  Note "link4-scaleset-create-$scope" 'GREEN' "id $($ss.id) name '$($ss.name)' group '$($ss.runnerGroupName)'"
 
   $sess = Invoke-RestMethod -Method Post -Uri "$($script:tenant)_apis/runtime/runnerscalesets/$($ss.id)/sessions?api-version=$AV" `
     -Headers $svc -ContentType 'application/json' `
     -Body (@{ ownerName = "d17-spike-$([Environment]::MachineName)" } | ConvertTo-Json -Compress)
   $script:sessionId = $sess.sessionId
   $mqToken = $sess.messageQueueAccessToken
-  Note 'link4-session-create' 'GREEN' "session $($sess.sessionId), queue token len $($mqToken.Length)"
+  Note "link4-session-create-$scope" 'GREEN' "session $($sess.sessionId), queue token len $($mqToken.Length)"
 
   # -------------------------------------------------------------- link 5
   Write-Host "`n=== LINK 5: long poll -> demand -> AcquireJobs ===" -ForegroundColor Cyan
@@ -160,29 +174,29 @@ try {
   try {
     $msg = Invoke-RestMethod -Method Get -Uri $uri -Headers $mq -TimeoutSec $PollSeconds
   } catch {
-    if ($_.Exception.Message -match 'timed out|timeout') { Note 'link5-longpoll' 'AMBER' 'no message within the wait window (no job queued?)' }
+    if ($_.Exception.Message -match 'timed out|timeout') { Note "link5-longpoll-$scope" 'AMBER' 'no message within the wait window (no job queued?)' }
     else { throw }
   }
 
   if ($msg) {
     $stats = $msg.statistics
-    Note 'link5-longpoll' 'GREEN' "messageId $($msg.messageId), totalAssignedJobs $($stats.totalAssignedJobs), jobAvailable $($msg.jobAvailableMessages.Count)"
+    Note "link5-longpoll-$scope" 'GREEN' "messageId $($msg.messageId), totalAssignedJobs $($stats.totalAssignedJobs), jobAvailable $($msg.jobAvailableMessages.Count)"
 
     if ($msg.jobAvailableMessages.Count -gt 0) {
       $ids = @($msg.jobAvailableMessages | ForEach-Object { $_.runnerRequestId })
       $acq = Invoke-RestMethod -Method Post -Uri "$($script:tenant)_apis/runtime/runnerscalesets/$($ss.id)/acquirejobs?api-version=$AV" `
         -Headers @{ Authorization = "Bearer $mqToken"; Accept = 'application/json' } `
         -ContentType 'application/json' -Body ($ids | ConvertTo-Json -AsArray -Compress)
-      Note 'link5-acquirejobs' 'GREEN' "acquired $($acq.count) of $($ids.Count)"
+      Note "link5-acquirejobs-$scope" 'GREEN' "acquired $($acq.count) of $($ids.Count)"
     } else {
-      Note 'link5-acquirejobs' 'AMBER' 'no JobAvailable message to acquire'
+      Note "link5-acquirejobs-$scope" 'AMBER' 'no JobAvailable message to acquire'
     }
 
     # The queue URL carries a query string, so the message id goes on the PATH.
     # "$uri/$id" would produce "...?api-version=6.0-preview/42" and 404.
     $del = [UriBuilder]$uri; $del.Path = "$($del.Path)/$($msg.messageId)"
     Invoke-RestMethod -Method Delete -Uri $del.Uri.AbsoluteUri -Headers $mq | Out-Null
-    Note 'link5-deletemessage' 'GREEN' "acknowledged messageId $($msg.messageId)"
+    Note "link5-deletemessage-$scope" 'GREEN' "acknowledged messageId $($msg.messageId)"
   }
 
   # -------------------------------------------------------------- link 6
@@ -190,7 +204,7 @@ try {
   $jit = Invoke-RestMethod -Method Post -Uri "$($script:tenant)_apis/runtime/runnerscalesets/$($ss.id)/generatejitconfig?api-version=$AV" `
     -Headers $svc -ContentType 'application/json' `
     -Body (@{ name = "$setName-0"; workFolder = '_work' } | ConvertTo-Json -Compress)
-  Note 'link6-generatejitconfig' 'GREEN' "runner id $($jit.runner.id) name '$($jit.runner.name)', encodedJITConfig len $($jit.encodedJITConfig.Length) <redacted>"
+  Note "link6-generatejitconfig-$scope" 'GREEN' "runner id $($jit.runner.id) name '$($jit.runner.name)', encodedJITConfig len $($jit.encodedJITConfig.Length) <redacted>"
 }
 finally {
   Write-Host "`n=== cleanup ===" -ForegroundColor Cyan
@@ -198,12 +212,11 @@ finally {
   # outlive it, and an expired token here would strand a scale set on the
   # repository — so re-mint the chain before deleting anything.
   try {
-    $rt2 = (Invoke-RestMethod -Method Post -Headers $gh `
-      -Uri "$API/repos/$Repo/actions/runners/registration-token").token
+    $rt2 = (Invoke-RestMethod -Method Post -Headers $gh -Uri $script:regUrl).token
     $c2 = Invoke-RestMethod -Method Post -Uri "$API/actions/runner-registration" `
       -Headers @{ Authorization = "RemoteAuth $rt2"; Accept = 'application/json' } `
       -ContentType 'application/json' `
-      -Body (@{ url = "https://github.com/$Repo"; runner_event = 'register' } | ConvertTo-Json -Compress)
+      -Body (@{ url = $script:cfgUrl; runner_event = 'register' } | ConvertTo-Json -Compress)
     $svc = @{ Authorization = "Bearer $($c2.token)"; Accept = 'application/json' }
     $script:tenant = $c2.url
   } catch { Write-Host "  admin re-mint failed, using original token: $($_.Exception.Message)" -ForegroundColor DarkYellow }
