@@ -1,0 +1,24 @@
+crates/platform/src/logging.rs
+  s_5332f62e0ed5a7::t_3655cfdb96a9c9 1118-1161
+  s_5332f62e0ed5a7::t_4ca2301b7eee6d 1183-1190
+crates/platform/src/process.rs
+  s_5332f62e0ed5a7::t_16d20a76603b51 1590-1596
+  s_5332f62e0ed5a7::t_2efcf64f440e61 1915-1946
+  s_5332f62e0ed5a7::t_fd90d58c731a93 1006-1032
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "09cf418475b1f77ad47e84e2caf1e59587f44d4e",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
