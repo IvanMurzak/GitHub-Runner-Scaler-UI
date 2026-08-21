@@ -1192,11 +1192,29 @@ mod tests {
         );
     }
 
-    /// The retry must never reach the four terminal states. A user who declined
-    /// is not asked again, and an expired code is not re-presented.
+    /// The retry must never reach a terminal state. A user who declined is not
+    /// asked again, an expired code is not re-presented, and a misconfigured App
+    /// is not polled until the device code dies.
+    ///
+    /// The last two codes are the ones this list was missing. It iterated only
+    /// the three states that map to their own error variants, so
+    /// [`DeviceFlowError::AppMisconfigured`] and [`DeviceFlowError::Unexpected`]
+    /// — between them every remaining code GitHub can send — were covered by
+    /// `is_retryable`'s `match` arm and by nothing that would notice if the arm
+    /// moved. Making either retryable broke no test at all, and both would spin
+    /// the poll loop against an App that a maintainer has to fix.
     #[tokio::test]
     async fn the_terminal_states_are_never_retried() {
-        for code in ["access_denied", "expired_token", "incorrect_device_code"] {
+        for code in [
+            "access_denied",
+            "expired_token",
+            "incorrect_device_code",
+            // `AppMisconfigured`: a maintainer fix, never a retry.
+            "device_flow_disabled",
+            // `Unexpected`: an unrecognised code is an answer this client
+            // cannot interpret, which is not the same as a blip it can absorb.
+            "a_code_this_client_has_never_heard_of",
+        ] {
             let server = MockServer::start().await;
             mount_start(&server).await;
             mount_token(
