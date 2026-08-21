@@ -1,20 +1,80 @@
 # Manual release (D10).
 #
-# SKELETON ONLY. Task a1 creates this file with its trigger and permission
-# block already correct so that the acceptance check "release.yml contains
-# exactly one trigger, workflow_dispatch"
-# (`.taskflow/2026-08-21-local-runner-manager/09-release-distribution.md`) is
-# true from the first commit. Task a2 fills in the ordered steps: validate the
-# version format, validate monotonicity against both Cargo.toml and the latest
-# published release, run the full CI matrix on the release commit, write the
-# version and tag it, build and sign per-target artifacts, package them with
-# SHA256SUMS and an SBOM, and publish. Task a3 adds the downstream channel
-# update.
-#
 # EXACTLY ONE TRIGGER. There is no `push`, `tag`, `schedule`, or `release`
 # trigger and there must never be one: the release workflow holds the only
 # credential able to publish and never runs automatically
 # (`07-security.md`, operational requirement 7).
+#
+# The ordered steps below are `09-release-distribution.md`'s, and each one fails
+# the run:
+#
+#   1. validate the version format          job `validate`
+#   2. validate monotonicity, both sources  job `validate`
+#   3. run every test, the CI matrix        job `test`   (calls ci.yml)
+#   4. write the version, commit, tag       job `tag`
+#   5. build per target, verify signatures  job `build`
+#   6. package, checksums, SBOM             jobs `build` and `sbom`
+#   7. publish the GitHub Release           job `publish`
+#
+# Step 8 of that list -- install scripts, npm, and the Homebrew tap -- is task
+# a3's and is added to this workflow by a3.
+#
+# ----------------------------------------------------------------------------
+# THE DECISIONS LIVE IN .github/scripts/release.sh, NOT IN THESE STEP BODIES.
+# ----------------------------------------------------------------------------
+# Four of this workflow's acceptance criteria are claims about what it REFUSES
+# to do: reject a malformed version, reject a non-increasing one, reject an
+# unsigned macOS binary, publish nothing when a test fails. A refusal written
+# inline in a step body can only be observed by dispatching this workflow, and
+# dispatching this workflow publishes under the project's name -- so it would
+# be checked for the first time by the release that needed it to work.
+#
+# Every such decision is therefore a subcommand of `.github/scripts/release.sh`,
+# and `crates/app/tests/release_workflow.rs` runs those subcommands on every
+# pull request, on all three operating systems, with no credential and nothing
+# published. What stays here is what genuinely needs a runner: checkout, the
+# toolchain, `cargo`, `gh`, and `git push`.
+#
+# ----------------------------------------------------------------------------
+# THE `version` INPUT IS NEVER INTERPOLATED INTO A SHELL COMMAND.
+# ----------------------------------------------------------------------------
+# Every step that needs it passes it through `env:` and reads `"$VERSION"`.
+# `${{ inputs.version }}` written directly inside a `run:` body is substituted
+# into the script *before* the shell parses it, so a version input containing
+# shell syntax would execute -- and it would execute in step 1, whose entire
+# job is to reject inputs that are not `X.Y.Z`. The check would run after the
+# thing it exists to prevent.
+#
+# ----------------------------------------------------------------------------
+# OPERATOR RECOVERY: A FAILURE AFTER TAGGING.
+# ----------------------------------------------------------------------------
+# Failure semantics are part of the contract (`09-release-distribution.md`).
+# The `tag` job pushes the version commit and the tag in ONE atomic push, so a
+# failure at or before step 4 leaves nothing behind: no tag, no moved branch,
+# re-dispatch and nothing else is needed.
+#
+# A failure AFTER that -- a build leg, the signature check, packaging, the SBOM,
+# or publication -- stops the run with the tag present and no release published.
+# That state is deliberate, and this workflow never repairs it by itself:
+# nothing here deletes a tag, and nothing here deletes a release. Deleting a
+# published release breaks every checksum anyone pinned against it, so it is an
+# operator decision every time.
+#
+# To recover, an operator with write access:
+#
+#     1. confirms no release was published:  gh release view vX.Y.Z
+#     2. deletes the tag, locally and on the remote:
+#            git push origin :refs/tags/vX.Y.Z
+#            git tag -d vX.Y.Z
+#     3. reverts or fixes the version commit on the branch, if it landed:
+#            git revert <sha>   (the `tag` job prints the sha it pushed)
+#     4. fixes the cause, then dispatches this workflow again with the SAME
+#        version.
+#
+# Step 2 is the operator's, not this workflow's, and that is why the tag-already
+# -exists check in `validate` refuses rather than overwrites: a re-dispatch that
+# silently reused a tag would move a version that somebody may already have
+# fetched.
 name: Release
 
 on:
@@ -26,17 +86,554 @@ on:
         type: string
 
 # The minimum needed to publish, and no more.
+#
+# Every job below also names its own scopes, because a job-level block REPLACES
+# this one rather than being bounded by it -- so this line alone constrains only
+# the jobs that forgot to. `id-token: write` and `packages: write` are refused
+# outright by `crates/app/tests/workflow_triggers.rs`: they would let the one
+# workflow holding a publishing credential mint more. Nothing here needs them.
+# Artifact integrity is SHA-256 plus an SBOM, and the macOS signature is the
+# free ad-hoc one the linker applies (D12), so no OIDC identity is involved.
 permissions:
   contents: write
 
+# Two dispatches at once would race for the same tag. `cancel-in-progress:
+# false` because cancelling a release mid-run is how a tag ends up pushed with
+# nothing published; a queued second dispatch being dropped before it starts is
+# the harmless failure.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # bash exists on all three runner images, so a step is one script rather
+    # than one script per OS. The Windows packaging step overrides this.
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+  # The published target set (`09-release-distribution.md`, step 5).
+  #
+  # DUPLICATED IN THE `build` MATRIX BELOW, AND IT HAS TO BE: the `env` context
+  # is not available in `jobs.<id>.strategy`, so the matrix cannot be built from
+  # this list. `publish` reads this list to assert that every target produced an
+  # asset, and `crates/app/tests/release_workflow.rs` asserts that the two lists
+  # are the same set -- which is what catches a target added to the matrix but
+  # not to the publication check, the drift that would otherwise ship a release
+  # quietly missing a platform.
+  RELEASE_TARGETS: >-
+    x86_64-pc-windows-msvc
+    aarch64-apple-darwin
+    x86_64-apple-darwin
+    x86_64-unknown-linux-gnu
+    aarch64-unknown-linux-gnu
+
 jobs:
-  release:
-    name: release
+  # --------------------------------------------------------------------------
+  # Steps 1 and 2. Nothing is written anywhere by this job.
+  # --------------------------------------------------------------------------
+  validate:
+    name: validate the version (steps 1-2)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ inputs.version }}
+      tag: v${{ inputs.version }}
     steps:
-      - name: The release steps are not implemented yet
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Step 1 - the version input must be X.Y.Z
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash .github/scripts/release.sh check-format "$VERSION"
+
+      - name: Read both monotonicity sources
+        id: sources
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Requested version: ${{ inputs.version }}"
-          echo "runner-manager has no release pipeline yet; task a2 implements it."
-          echo "Failing deliberately: a dispatch that publishes nothing must not report success."
-          exit 1
+          manifest="$(bash .github/scripts/release.sh manifest-version Cargo.toml)"
+          echo "Cargo.toml says: $manifest"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+
+          # `releases/latest` is GitHub's documented address for the latest
+          # PUBLISHED release; it excludes drafts and pre-releases. A 404 means
+          # nothing has been released yet, which is a legitimate state for the
+          # first release and not an error.
+          if tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null)"; then
+            release="${tag#v}"
+            echo "latest published release: $tag"
+          else
+            release=""
+            echo "no published release yet"
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Step 2 - the version must exceed BOTH sources
+        env:
+          VERSION: ${{ inputs.version }}
+          MANIFEST_VERSION: ${{ steps.sources.outputs.manifest }}
+          RELEASE_VERSION: ${{ steps.sources.outputs.release }}
+        run: |
+          bash .github/scripts/release.sh check-monotonic \
+            "$VERSION" "$MANIFEST_VERSION" "$RELEASE_VERSION"
+
+      - name: The tag must not already exist
+        env:
+          TAG: v${{ inputs.version }}
+        run: |
+          # Step 2 compares against `releases/latest`, which cannot see a draft
+          # or a pre-release. A tag CAN exist for a version that check reports
+          # nothing about -- notably after a failed run that got as far as step
+          # 4. Since nothing in this workflow deletes a tag, a collision has to
+          # stop the run here rather than at `git push` after the tests have
+          # run.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "REJECTED: tag ${TAG} already exists on the remote." >&2
+            echo "If a previous run failed after tagging, follow the operator" >&2
+            echo "recovery in this workflow's header: delete the tag, then" >&2
+            echo "re-dispatch. This workflow will not overwrite it." >&2
+            exit 1
+          fi
+          echo "tag ${TAG} is free"
+
+  # --------------------------------------------------------------------------
+  # Step 3. The same matrix as CI, by calling CI rather than copying it.
+  # --------------------------------------------------------------------------
+  test:
+    name: full test matrix (step 3)
+    needs: validate
+    permissions:
+      contents: read
+    # A local `uses:` runs ci.yml at THIS run's commit, so the gate is the CI
+    # definition that ships with the code being released, not whatever ci.yml
+    # said on some default branch.
+    uses: ./.github/workflows/ci.yml
+
+  # --------------------------------------------------------------------------
+  # Step 4. The first job that writes anything, and it writes atomically.
+  # --------------------------------------------------------------------------
+  tag:
+    name: write the version and tag it (step 4)
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Refuse to release from anything but a branch
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # The version commit has to land somewhere durable. Dispatched
+          # against a tag there is no branch to push to, and the commit would
+          # exist only as the tag's target -- so `Cargo.toml` on every branch
+          # would still carry the old version and step 2's manifest source
+          # would go stale from that release onward.
+          if [ "$REF_TYPE" != "branch" ]; then
+            echo "REJECTED: dispatched against ${REF_TYPE} '${REF_NAME}'." >&2
+            echo "Dispatch a release from a branch." >&2
+            exit 1
+          fi
+          echo "releasing from branch ${REF_NAME}"
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Step 4 - write the version and refresh Cargo.lock
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          bash .github/scripts/release.sh set-version "$VERSION" Cargo.toml
+
+          # Refreshes only the workspace members' own entries in the lock file.
+          # A bare `cargo update` would also bump every external dependency,
+          # which would release a dependency graph no CI leg has ever built.
+          cargo update --workspace
+
+          echo "--- what changed ---"
+          git --no-pager diff --stat
+
+          # A version bump touches the manifest and the lock and nothing else.
+          # Anything more means `set-version` or `cargo update` did something
+          # unintended, and this is the last moment before it becomes a commit.
+          changed="$(git diff --name-only | sort | tr '\n' ' ')"
+          if [ "$changed" != "Cargo.lock Cargo.toml " ]; then
+            echo "REJECTED: unexpected working-tree changes: ${changed}" >&2
+            exit 1
+          fi
+
+          # Proves the refreshed lock actually resolves before it is committed.
+          cargo metadata --locked --format-version 1 > /dev/null
+          echo "version ${VERSION} written and the lock resolves"
+
+      - name: Commit, tag, and push both atomically
+        id: commit
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: ${VERSION}"
+          git tag -a "$TAG" -m "runner-manager ${VERSION}"
+
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          # ONE atomic push, and that is the whole failure story for step 4.
+          # Without `--atomic` a rejected branch update (a protected branch, or
+          # someone pushing while the tests ran) still leaves the tag on the
+          # remote, which is the tagged-but-unpublished state an operator then
+          # has to clean up by hand. With it, either both refs land or neither
+          # does, so every failure at or before this point needs no recovery.
+          git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
+
+          echo "pushed ${sha} to ${BRANCH} and tag ${TAG}"
+          echo "From here on, a failure leaves ${TAG} present and nothing published;"
+          echo "see the operator recovery in this workflow's header."
+
+  # --------------------------------------------------------------------------
+  # Steps 5 and 6. One native runner per target -- no cross-compilation, so the
+  # macOS signature check below is looking at a real Mach-O for its own arch.
+  # --------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }} (steps 5-6)
+    needs: [validate, tag]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      # One red leg must not hide the state of the other four.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          # macos-latest is Apple Silicon. This is the leg that matters most
+          # for D12: an arm64 Mach-O with no signature does not execute at all.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          # Intel macOS is the one hosted label GitHub has moved more than once
+          # (macos-12, macos-13, and now an explicitly-named Intel image), so it
+          # is overridable by a repository variable. Retargeting it must not
+          # cost an edit to this workflow, and the arch assertion below is what
+          # keeps an override honest.
+          - target: x86_64-apple-darwin
+            os: ${{ vars.RUNNER_MANAGER_RELEASE_RUNS_ON_MACOS_X64 || 'macos-15-intel' }}
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ${{ vars.RUNNER_MANAGER_RELEASE_RUNS_ON_LINUX_ARM64 || 'ubuntu-24.04-arm' }}
+            archive: tar.gz
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+        with:
+          # The commit the `tag` job created, not the dispatched ref: the
+          # artifacts must carry the version that was just written.
+          ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Assert this runner is native for ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          # "Build on native runners" is a requirement, not a preference, and a
+          # hosted label silently repointing to another architecture is exactly
+          # how it would stop being true without anyone noticing. Verified here
+          # rather than assumed, the same way ci.yml asserts its macOS leg.
+          case "$TARGET" in
+            x86_64-*)  want="X64" ;;
+            aarch64-*) want="ARM64" ;;
+            *) echo "unknown architecture in target ${TARGET}" >&2; exit 1 ;;
+          esac
+          echo "target=${TARGET} wants=${want} runner.arch=${RUNNER_ARCH}"
+          if [ "$RUNNER_ARCH" != "$want" ]; then
+            echo "REJECTED: ${TARGET} must be built on a ${want} runner," >&2
+            echo "but this runner reports ${RUNNER_ARCH}. Point the matching" >&2
+            echo "RUNNER_MANAGER_RELEASE_RUNS_ON_* repository variable at a" >&2
+            echo "native label." >&2
+            exit 1
+          fi
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$TARGET"
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Step 5 - build the release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # `--locked` proves the build used the lock file exactly as the `tag`
+          # job committed it. Without it a resolver change here would ship a
+          # dependency graph that no test leg ever ran.
+          cargo build --release --locked --package runner-manager --target "$TARGET"
+
+      - name: Step 5 - verify the macOS binary is signed
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # D12 buys no certificate, but the free ad-hoc signature is not
+          # optional: macOS refuses to execute unsigned native arm64 code. The
+          # linker normally applies it -- which is precisely why this verifies
+          # instead of assuming.
+          bash .github/scripts/release.sh verify-macos-signature \
+            "target/${TARGET}/release/runner-manager"
+
+      - name: Stage the archive contents
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          stem="runner-manager-${VERSION}-${TARGET}"
+          echo "STEM=${stem}" >> "$GITHUB_ENV"
+
+          mkdir -p "dist/${stem}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/${TARGET}/release/runner-manager.exe" "dist/${stem}/"
+          else
+            cp "target/${TARGET}/release/runner-manager" "dist/${stem}/"
+          fi
+          cp LICENSE "dist/${stem}/"
+
+          # a3 writes the README. Copied when it exists so that a3 never has to
+          # edit this workflow to get it into the archives.
+          if [ -f README.md ]; then
+            cp README.md "dist/${stem}/"
+          fi
+
+          ls -l "dist/${stem}"
+
+      - name: Step 6 - package (.tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf "dist/${STEM}.tar.gz" -C dist "${STEM}"
+
+      - name: Step 6 - package (.zip)
+        if: matrix.archive == 'zip'
+        # PowerShell rather than bash: Git Bash's `tar` is GNU tar and cannot
+        # write a zip, and `zip` is not on the Windows image. `Compress-Archive`
+        # ships with the shell itself.
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:STEM" -DestinationPath "dist/$env:STEM.zip"
+
+      - name: Step 6 - checksum the archive
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          archive="dist/${STEM}.${ARCHIVE}"
+          test -f "$archive"
+          bash .github/scripts/release.sh sha256 "$archive" > "dist/${STEM}.sha256"
+          cat "dist/${STEM}.sha256"
+
+      - name: Upload this target's archive and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/${{ env.STEM }}.${{ matrix.archive }}
+            dist/${{ env.STEM }}.sha256
+          # A leg that produced nothing must fail here, not silently contribute
+          # nothing to a release that then ships one platform short.
+          if-no-files-found: error
+          retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # Step 6, continued. The SBOM describes the locked graph, so it is built once
+  # rather than per target.
+  # --------------------------------------------------------------------------
+  sbom:
+    name: generate the SBOM (step 6)
+    needs: [validate, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Step 6 - write the CycloneDX SBOM
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          name="runner-manager-${VERSION}-sbom.cdx.json"
+          mkdir -p dist
+          bash .github/scripts/release.sh sbom \
+            Cargo.lock "dist/${name}" runner-manager "$VERSION"
+          bash .github/scripts/release.sh sha256 "dist/${name}" > "dist/${name}.sha256"
+          head -14 "dist/${name}"
+          cat "dist/${name}.sha256"
+
+      - name: Upload the SBOM and its checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom
+          path: dist/runner-manager-*
+          if-no-files-found: error
+          retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # Step 7. The only job that publishes, and the last one to run.
+  # --------------------------------------------------------------------------
+  publish:
+    name: publish the release (step 7)
+    needs: [validate, tag, build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Collect every build leg's output
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cd dist
+          # Sorted by asset name so the file is byte-identical for a given set
+          # of artifacts regardless of the order five parallel legs finished in.
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm ./*.sha256
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+          # The checksum file is worthless if it does not describe what shipped,
+          # so verify it here rather than leaving the install script (a3) to be
+          # the first thing that ever checks it.
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Every published target must have produced an asset
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # Reads RELEASE_TARGETS, the workflow-level list. A target present in
+          # the build matrix but missing from that list -- or the reverse -- is
+          # caught on every pull request by
+          # `crates/app/tests/release_workflow.rs`, not here.
+          missing=0
+          for target in $RELEASE_TARGETS; do
+            case "$target" in
+              *-windows-*) extension="zip" ;;
+              *)           extension="tar.gz" ;;
+            esac
+            asset="dist/runner-manager-${VERSION}-${target}.${extension}"
+            if [ -f "$asset" ]; then
+              echo "present: ${asset}"
+            else
+              echo "MISSING: ${asset}" >&2
+              missing=1
+            fi
+          done
+
+          for required in "dist/runner-manager-${VERSION}-sbom.cdx.json" "dist/SHA256SUMS"; do
+            if [ -f "$required" ]; then
+              echo "present: ${required}"
+            else
+              echo "MISSING: ${required}" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "REJECTED: refusing to publish an incomplete release." >&2
+            exit 1
+          fi
+
+      - name: A release for this tag must not already exist
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # This workflow never deletes or overwrites a published release:
+          # every checksum anyone pinned against it would stop matching. If one
+          # exists, the run stops and an operator decides.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "REJECTED: a release for ${TAG} already exists." >&2
+            echo "This workflow never replaces a published release." >&2
+            exit 1
+          fi
+          echo "no release exists for ${TAG}"
+
+      - name: Step 7 - publish the GitHub Release
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > dist/NOTES.md <<'NOTES'
+          ## Verify what you downloaded
+
+          Every asset is listed in `SHA256SUMS`, and `<asset>.cdx.json` is a
+          CycloneDX SBOM of the exact locked dependency graph this build used.
+
+              sha256sum -c SHA256SUMS       # Linux, or Git Bash on Windows
+              shasum -a 256 -c SHA256SUMS   # macOS
+
+          The macOS binaries carry an ad-hoc signature, which is what lets
+          arm64 builds execute at all; the release workflow verifies it is
+          present before publishing. There is no paid code-signing certificate
+          on any platform, and every documented install path is a terminal
+          command, so no supported install triggers Gatekeeper or SmartScreen.
+          NOTES
+
+          # `--verify-tag` refuses to invent a tag: the tag must be the one the
+          # `tag` job pushed. Without it a typo here would publish a release
+          # against a brand-new tag pointing at the default branch.
+          gh release create "$TAG" \
+            --title "runner-manager ${VERSION}" \
+            --notes-file dist/NOTES.md \
+            --verify-tag \
+            dist/runner-manager-"${VERSION}"-*.zip \
+            dist/runner-manager-"${VERSION}"-*.tar.gz \
+            dist/runner-manager-"${VERSION}"-sbom.cdx.json \
+            dist/SHA256SUMS
+
+      - name: Report what was published
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" --json assets --jq '.assets[].name' | sort | tee published.txt
+          {
+            echo "### Published ${TAG}"
+            echo
+            sed 's/^/- /' published.txt
+          } >> "$GITHUB_STEP_SUMMARY"
