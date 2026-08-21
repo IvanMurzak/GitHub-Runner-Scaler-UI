@@ -1,0 +1,19 @@
+crates/platform/src/logging.rs
+  s_5332f62e0ed5a7::t_1dfa9a10e018bb 271-283,289,296-300,302,322-330,332-341,343-344,347-372,374,939-961,1380-1425,1528-1543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "cc930a37d9c9b77e6141b3f0726d1d32ca3e2f0c",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
