@@ -29,10 +29,10 @@ service install [--start-at boot|login] | service uninstall | service status
 ```
 
 **`daemon run`.** Take the single-instance lock (`d1`), load active policies,
-start their long-poll sessions, run `e1`'s reconciliation with `e3`'s launcher,
-and shut down gracefully: stop accepting new work, let busy runners finish, and
-release the lock. A second `daemon run` on the same host is refused with an
-actionable message naming the holder.
+start their demand-polling loops on the configured interval, run `e1`'s
+reconciliation with `e3`'s launcher, and shut down gracefully: stop accepting
+new work, let busy runners finish, and release the lock. A second `daemon run`
+on the same host is refused with an actionable message naming the holder.
 
 **`service` commands.** Register `daemon run` for the current host through
 `d3`, defaulting to `--start-at boot`. `service status` reports the start mode,

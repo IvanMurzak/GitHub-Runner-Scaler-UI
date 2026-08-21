@@ -22,7 +22,7 @@ splitting them would mean writing that three more times.
 ## Scope & seams
 
 Owns `crates/app/src/tui/screens.rs`. Reads the in-memory snapshot only; the
-agent refreshes it independently on a bounded interval, and long-poll demand
+agent refreshes it independently on a bounded interval, and demand polling
 continues while the TUI is closed.
 
 | Screen | Content | Interactions |
@@ -35,6 +35,14 @@ continues while the TUI is closed.
 **Numbers that are not the same number.** In-progress workflow count, assigned
 jobs, and busy runners are three distinct aggregates. Render them distinctly;
 conflating them is the most likely way this screen misleads an operator.
+
+**An idle exit is not a failure.** With no job reservation, a runner may start
+and find that another host took the work, then exit on its idle timeout
+(`03-control-flows.md`, flow 2.7). The activity view shows that outcome
+distinctly from a failed attempt; `b1` records which one occurred, so this
+screen reads the distinction rather than inferring it. Presenting a normal
+surplus exit as an error would send an operator hunting a fault that does not
+exist.
 
 **Ownership and mode are visible.** Locally owned runners are **visually
 distinct** from external ones, and legacy persistent runners appear through
@@ -69,6 +77,8 @@ any row in one additional action regardless of list length.
   three distinct values and are asserted to differ in a fixture where they do.
 - Locally owned runners, external runners, and monitor-only policies are each
   distinguishable **without colour** — asserted on a colourless render.
+- An attempt that exited idle without work renders distinctly from a failed
+  attempt in the activity view, asserted on a fixture containing both.
 - The offline state is reachable in one action from each of the four screens
   and states the 24-hour queue-cancellation bound verbatim.
 - A refresh preserves focus, selected row, sort order, and scroll position when

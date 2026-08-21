@@ -59,6 +59,15 @@ and the active secret-store variant. Never infer a capacity value from runner
 count — human gate 3 exists because that number comes from an observed
 workload measurement.
 
+`host show` also displays the **shared REST budget** (`c3`): the configured
+refresh interval, the projected hourly request count for the current target
+set, and the maximum number of targets this host can serve at that interval.
+After D4 demand polling shares one 5,000 requests/hour ceiling with inventory,
+which is what bounds a host to roughly 10 targets at the 60-second default
+(`04-subsystem-contracts.md`). The design requires that limit to be visible in
+host settings; `g3` shows the same numbers in the TUI, and this is the CLI half
+of that parity.
+
 **`status --json`.** A stable, scriptable snapshot for headless operation. Its
 schema is a compatibility surface: version it, and never emit a credential into
 it.
@@ -81,7 +90,8 @@ exposing credentials, and names the command that fixes it.
 - `auth logout` leaves no token in the store and states the GitHub-side
   revocation step.
 - `host set-capacity` persists and `host show` displays the value, the current
-  in-use total, the start mode, and the store variant.
+  in-use total, the start mode, the store variant, the refresh interval, the
+  projected hourly request count, and the maximum target count at that interval.
 - `status --json` emits a versioned, schema-stable document containing no
   credential; a scripted consumer parses it without special-casing.
 - Every command returns a distinct non-zero exit code per failure class, usable

@@ -1,6 +1,6 @@
 ---
 id: "c3-rest-inventory-gateway"
-title: "REST inventory: paginated runners, in-progress workflow counts, runner downloads, rate limits, and the testkit fake gateway"
+title: "REST inventory: paginated runners, in-progress workflow counts, runner downloads, rate limits, shared request budget, and the testkit fake gateway"
 group: "C"
 sequence: 3
 repo: "."
@@ -23,7 +23,8 @@ and G test against it without a network.
 ## Scope & seams
 
 Owns `crates/github/src/rest.rs` and `crates/testkit/src/github.rs`. Builds on
-`c2`'s authenticated client; adds no second auth path.
+`c2`'s authenticated client; adds no second auth path. Demand polling and JIT
+configuration are `c4`, and they consume this task's budget accounting.
 
 | Operation | Endpoint | Result |
 |---|---|---|
@@ -42,21 +43,30 @@ in-flight request. Rate limiting increases the refresh delay and is
 **surfaced**, never hidden (`04-subsystem-contracts.md`, Refresh and
 backpressure).
 
-**Budget projection.** Expose the projected hourly request budget for a
-candidate refresh interval, so `f2`'s `repo add` can refuse a configuration
-that would exceed half of the 5,000 requests/hour floor. The default interval
-is 60 seconds with a hard floor of 30 seconds per repository.
+**The shared request budget (D4 consequence).** Under scale sets, demand
+arrived over a long poll that did not touch this budget. It does now, and that
+makes the budget a product constraint rather than an implementation detail:
+demand, runner inventory, and in-progress counts draw on **one** ceiling of
+5,000 requests/hour. Own the budget model here, because this is the layer that
+sees every request:
+
+- Account for all three request classes, at roughly 240 requests per target per
+  hour at the 60-second default and 480 at the 30-second floor
+  (`04-subsystem-contracts.md`).
+- An **organization** target's demand and activity cost scales with the number
+  of repositories the App is installed on there, because workflow runs are a
+  per-repository resource. Project an organization target from its installed
+  repository count, not as a flat per-target constant, or the projection will
+  understate the real cost by exactly that factor.
+- Expose the projection for a candidate interval and target set, so `f2`'s
+  `repo add` and `org add` can refuse a configuration that would exceed **half**
+  the floor, and so `f1`'s `host show` and `g3`'s host settings can display the
+  remaining headroom and the resulting maximum target count.
 
 `sha256_checksum` being optional in GitHub's schema is a fact this layer must
 pass through faithfully — as an optional value, never as an empty string or a
 default. Task `e2` fails closed on its absence, and it can only do that if this
 layer does not paper over it.
-
-**Not in scope:** the Actions-service protocol (`c4`, `c5`), and the public
-`generate-jitconfig` REST endpoint, which is **not used at all**. It requires a
-`runner_group_id` and a `labels` array, registers a runner into a runner
-*group* rather than a scale set, and produces a runner the scale-set session
-can never assign work to (`01-current-architecture.md`, edge case 5).
 
 ## Definition of Done
 
@@ -71,9 +81,12 @@ can never assign work to (`01-current-architecture.md`, edge case 5).
   request; a cancelled request stops in-flight work.
 - An absent `sha256_checksum` surfaces as absent and is distinguishable from an
   empty value.
-- The projected hourly budget for a given interval and target count is computed
-  and asserted against the documented floor.
-- The public `generate-jitconfig` endpoint appears nowhere in the crate.
+- The projected hourly budget is computed for a given interval and target set
+  and asserted against the documented ceiling, including a case that shows an
+  organization target with N installed repositories costing materially more
+  than a repository target.
+- The projection reproduces the documented figures: roughly 10 targets per host
+  at the 60-second default and 5 at the 30-second floor.
 - `crates/testkit/src/github.rs` offers a fake gateway with programmable
   pagination, rate limits, revoked-token `401`, and lockout `403`, and is used
   by at least one test outside this crate.

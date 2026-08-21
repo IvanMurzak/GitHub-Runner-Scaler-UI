@@ -1,12 +1,12 @@
 ---
 id: "f2-cli-policy-commands"
-title: "repo and org command families: non-arming add, monitor-only mode, capacity, set-scale, drain and remove"
+title: "repo and org command families: non-arming add, monitor-only mode, routing labels, budget refusal, capacity, set-scale, drain and remove"
 group: "F"
 sequence: 2
 repo: "."
-depends_on: ["f1-cli-auth-host-status", "c4-actions-service-admin"]
+depends_on: ["f1-cli-auth-host-status"]
 importance: 9
-complexity: 7
+complexity: 6
 security_critical: false
 production_touching: false
 model_hint: "mid"
@@ -38,21 +38,48 @@ org  list | org set-capacity | org set-scale --enabled BOOL | org remove [--purg
 enables scaling. Enabling is an explicit `set-scale`. The cost is one extra
 command in Journey 1 and it is deliberate.
 
-**`add` validation** (`03-control-flows.md`, flow 1, step 4): confirm the
-target is installed for the App; validate host OS/architecture against the
-supported matrix and warn that ARM64 is public preview; validate
-`min_capacity <= max_capacity`; create or resolve the host-owned scale set at
-the policy's scope; write one local transaction. Refuse a configuration whose
-projected hourly request budget would exceed half the documented floor (`c3`).
-Print the scale-set name to put in `runs-on`, and the next command. Never echo
-a secret.
+**`add` creates nothing remotely (D4).** This is the change that most reduces
+this task's risk relative to the scale-set design: there is no remote object to
+create at add time, so the partial-creation failure mode is gone entirely
+(`03-control-flows.md`, flow 1.4). `repair_required` survives only for a policy
+whose **local** transaction is inconsistent, and the command still prints an
+explicit repair operation rather than silently retrying anything destructive.
+
+**`add` validation** (`03-control-flows.md`, flow 1, step 4), all local or
+read-only:
+
+1. Confirm the target is installed for the App.
+2. Validate host OS and architecture against the supported matrix (`d1`) and
+   warn that ARM64 is public preview; surface that container actions and
+   service containers require Linux when the host is macOS or Windows.
+3. Validate `min_capacity <= max_capacity`.
+4. Derive the host-scoped routing label (`b1`) and print it, so the operator can
+   put it in `runs-on`.
+5. Check the projected hourly REST budget (`c3`) and **refuse** a configuration
+   that would exceed half the 5,000 requests/hour floor, showing the computed
+   numbers and the resulting maximum target count. An operator who adds an
+   eleventh repository needs to know why it was refused
+   (`04-subsystem-contracts.md`). For an organization target the projection
+   scales with its installed repository count, so the refusal can arrive
+   earlier than a repository target would suggest — say so in the message.
+6. Write one local transaction, then print the next command.
+
+Never echo a secret.
+
+**Two hosts, one label.** The printed label is host-scoped by construction
+because there is no job reservation: two hosts given the same label will both
+start runners for the same queued job, and the surplus one exits having wasted
+a slot (`01-current-architecture.md`, edge case 6). If the operator overrides
+the derived label with one already recorded for another host, say what that
+means rather than silently accepting it.
 
 **Monitor-only (D19).** Omitting `--max-capacity` creates a `MonitorOnly`
-policy: no scale set is created, the command stops after recording the target,
-and the output states plainly that no runner will ever be started for it — and
-repeats the `Administration: Read and write` disclosure, because a
+policy: no routing label is reserved, the command stops after recording the
+target, and the output states plainly that no runner will ever be started for
+it — and repeats the `Administration: Read and write` disclosure, because a
 dashboard-only user is the one least likely to expect a write grant (D21).
-`set-capacity` later promotes the policy to `Autoscale`.
+`set-capacity` later promotes the policy to `Autoscale`, which is also when its
+routing label is derived.
 
 **Scope advice.** Where both scopes are possible, say that organization scope
 operates under the narrower `Organization → Self-hosted runners` grant and is
@@ -69,10 +96,8 @@ never promises immediate termination. Deleting requires an explicit `--purge`;
 disabling never deletes cache or historical diagnostics.
 
 **Failure states.** A missing installation, a duplicate policy, an invalid
-capacity, an inverted `min`/`max` pair, or an unavailable GitHub API leaves no
-active policy. A partially created remote scale set is recorded as
-`repair_required` and the command prints an explicit repair operation rather
-than silently retrying a destructive deletion.
+capacity, an inverted `min`/`max` pair, a budget refusal, or an unavailable
+GitHub API leaves no active policy and explains itself in one screenful.
 
 ## Definition of Done
 
@@ -80,17 +105,23 @@ than silently retrying a destructive deletion.
   equivalence, not two copies.
 - `add` leaves the policy `pending` and scaling disabled in every case,
   including with `--max-capacity`.
-- `add` with no `--max-capacity` creates a `MonitorOnly` policy, creates no
-  scale set, states that no runner will start, and repeats the permission
-  disclosure. `set-capacity` promotes it to `Autoscale` and the round trip is
-  asserted.
+- `add` makes no state-changing GitHub request — asserted against the fake
+  gateway, which fails the test if one is issued.
+- `add` prints the derived routing label, and the label differs for the same
+  target added from two different `--host-label` values.
+- `add` with no `--max-capacity` creates a `MonitorOnly` policy, reserves no
+  routing label, states that no runner will start, and repeats the permission
+  disclosure. `set-capacity` promotes it to `Autoscale`, derives its label, and
+  the round trip is asserted.
+- A configuration exceeding half the projected rate-limit floor is refused with
+  the computed numbers and the maximum target count shown, for a repository
+  target and for an organization target whose installed repository count is
+  what pushes it over.
 - Each failure case — missing installation, duplicate, invalid capacity,
   inverted `min`/`max`, API unavailable — leaves no active policy and explains
   itself in one screenful with no credential in the output.
-- A simulated partial remote creation yields `repair_required` plus a printed
+- An inconsistent local transaction yields `repair_required` plus a printed
   repair operation, and no delete is attempted.
-- A configuration exceeding half the projected rate-limit floor is refused with
-  the computed numbers shown.
 - Disabling with active runners requires confirmation, reports "draining" with
   the active count, and does not terminate a busy runner.
 - `remove` without `--purge` preserves cache and diagnostics; with `--purge` it

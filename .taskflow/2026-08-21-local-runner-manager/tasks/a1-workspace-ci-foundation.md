@@ -49,7 +49,7 @@ comment stating that adding a new external crate is an A-group change.
 crates/app/src/main.rs, cli/{mod,auth,host,policy,status,daemon,service}.rs,
                         tui/{mod,shell,screens,settings}.rs
 crates/domain/src/{lib,model,policy,attempt,capacity,store}.rs
-crates/github/src/{lib,device_flow,rest}.rs, scaleset/{mod,auth,session}.rs
+crates/github/src/{lib,device_flow,rest,demand,jit}.rs
 crates/agent/src/{lib,reconcile,package,lifecycle}.rs
 crates/platform/src/{lib,os,paths,lock,process,secrets,service,logging}.rs
 crates/testkit/src/{lib,clock,fixtures,github}.rs

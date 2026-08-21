@@ -1,9 +1,11 @@
 # Local Runner Manager
 
-**Status:** Tasks specified 2026-08-21 (`/taskflow-tasks`); ready for
-`/taskflow-execute`. 23 immutable specifications in `tasks/`; waves, human
-gates, and live state are in `ROADMAP.md`.
-**Design status:** Reviewed 2026-08-21 (`/taskflow-review`)
+**Status:** Tasks re-derived 2026-08-21 (`/taskflow-tasks`) against the
+D4-revised design; ready for `/taskflow-execute`. 23 immutable specifications in
+`tasks/`, 9 conflict-domain groups; waves, human gates, and live state are in
+`ROADMAP.md`.
+**Design status:** Reviewed twice 2026-08-21 (`/taskflow-review`); D4 REVISED,
+D17 RESOLVED GREEN
 **Scope:** This repository — `IvanMurzak/GitHub-Runner-Scaler-UI` (public, MIT).
 The taskflow was drafted in the separate `IvanMurzak/ai-pipeline` repository and
 transferred here. It proposes no change to `ai-pipeline`, and implementation
@@ -77,7 +79,7 @@ policy path.
 | `08-user-workflows.md` | Operator journeys and measurable TUI/CLI UX budgets. |
 | `09-release-distribution.md` | CI, manual release workflow, install script, and distribution channels. |
 | `ROADMAP.md` | This taskflow's implementation ledger: waves, human gates, and the task status board. |
-| `tasks/` | 23 immutable task specifications, grouped by merge-conflict domain. |
+| `tasks/` | 23 immutable task specifications in 9 merge-conflict domains, plus the record of what the D4 revision changed between the first and second derivation. |
 
 ## Glossary
 

@@ -27,13 +27,21 @@ Owns `crates/app/src/tui/settings.rs`.
 **Host settings (`h`).** Show the current `host_capacity` **and** the current
 total in use across policies before any edit. Edit and confirm. Show and switch
 the service start mode between `boot` and `login` without reinstalling (`d3`),
-and set the refresh interval, respecting the 30-second per-repository floor.
+and set the refresh interval, respecting the 30-second per-target floor.
+
+Because demand polling now shares one REST budget with inventory (D4), this
+screen also shows the projected hourly request count for the current target set
+and the maximum target count at the chosen interval — the same numbers `f1`'s
+`host show` prints. Changing the interval updates them before the operator
+confirms, so the cost of a faster refresh is visible at the moment it is
+chosen rather than discovered later as a rate-limit backoff.
 
 **Policy settings (`s`).** Toggle scaling enabled, set `max_capacity`, show the
-generated scale-set name and local host identity, set the cache policy, and
+policy's **routing labels** and local host identity, set the cache policy, and
 give a safe preview before confirming. Both limits always display their current
 value before an edit (D9) — an operator must never have to guess what they are
-changing from.
+changing from. The routing labels are what a workflow puts in `runs-on`, so
+they must be readable and copy-safe here.
 
 **Monitor-only.** A `MonitorOnly` policy shows its mode plainly and offers
 promotion by setting `max_capacity`; the screen must not present controls that
@@ -58,6 +66,11 @@ the projected rate-limit budget refusal, and the `pending`-on-create rule.
   counted and asserted.
 - Both `host_capacity` and `max_capacity` display their current value, and
   `host_capacity` displays the current total in use, before an edit.
+- Host settings show the projected hourly request count and the maximum target
+  count, and both update when the refresh interval changes; the 30-second floor
+  cannot be crossed from this screen.
+- Policy settings display the routing labels in a form that can be copied into
+  `runs-on`.
 - CLI/TUI parity tests assert that the TUI mutation and the equivalent CLI
   command produce byte-identical persisted state, for: host capacity, policy
   capacity, enable, disable, and monitor-only promotion.

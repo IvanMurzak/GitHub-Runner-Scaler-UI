@@ -1,6 +1,6 @@
 ---
 id: "e3-jit-lifecycle-recovery"
-title: "JIT attempt lifecycle: runtime allocation, secure JIT handoff, process supervision, cleanup, and restart recovery"
+title: "JIT attempt lifecycle: runtime allocation, secure JIT handoff, process supervision, idle-exit and cleanup, and restart recovery"
 group: "E"
 sequence: 3
 repo: "."
@@ -30,7 +30,8 @@ Owns `crates/agent/src/lifecycle.rs`.
    record the attempt as `allocated` in the journal (`b2`) **before** anything
    remote happens, so a crash leaves a recoverable trace rather than an
    invisible one.
-2. Request one scale-set JIT configuration per runner from `c5`.
+2. Request one JIT configuration per runner from `c4`, at the policy's scope,
+   carrying the policy's routing labels.
 3. Write the JIT configuration **only** to a restrictive temporary file (`d1`),
    launch the runner process, and remove the file immediately after successful
    handoff. The JIT configuration is **never** a command-line argument — a
@@ -42,11 +43,19 @@ Owns `crates/agent/src/lifecycle.rs`.
 5. On exit, preserve redacted diagnostics, remove the workspace and every JIT
    artifact, and mark the attempt terminal, then `cleaned`.
 
+**The idle exit is a first-class path** (`03-control-flows.md`, flow 2.7).
+Because there is no job reservation, a runner may accept one job **or** find
+none and exit on its idle timeout after another host took the work. Both are
+terminal and both are cleaned identically, but the attempt records which one
+happened (`b1`), because the dashboard must show an idle exit distinctly from a
+failure and the operator must not be sent chasing a fault that did not occur.
+
 **Retry policy.** A failed JIT request, download, process start, or a runner
 exit before job acceptance is retried with bounded exponential backoff **while
-the job remains assigned**. An expired JIT configuration is discarded, its
-runtime directory removed, and a new configuration requested only if current
-demand still requires the capacity. The agent never reports a job as complete —
+the demand that justified it persists**. An expired JIT configuration is
+discarded, its runtime directory removed, and a new configuration requested only
+if current demand still requires the capacity. A `403` from `c4` is terminal and
+operator-actionable, never retried. The agent never reports a job as complete —
 GitHub remains the source of truth for workflow outcome.
 
 **Recovery** (`03-control-flows.md`, flow 3.2). On startup, read the lifecycle
@@ -64,6 +73,9 @@ workflow can leave data for a later job.
 
 - A full attempt runs `allocated` → `jit_received` → `starting` → `busy` →
   `finished` → `cleaned` against fakes, with the journal written at each step.
+- An attempt that receives no job runs `allocated` → … → `idle` → terminal →
+  `cleaned`, recorded as an idle exit and asserted to be distinguishable from a
+  failed attempt in both the journal and the emitted events.
 - A native process-inspection test confirms the JIT configuration never appears
   in any process command line on any supported OS.
 - The JIT temporary file is deleted after a successful handoff **and** after a
@@ -71,9 +83,10 @@ workflow can leave data for a later job.
 - A two-job contamination test proves the second job sees nothing from the
   first: the workspace is removed after both a successful and a failed run.
 - Spawn failure, JIT-request failure, and exit-before-acceptance each retry with
-  bounded backoff while assigned, and stop when the assignment goes away.
-- An expired JIT configuration removes its runtime directory and only re-requests
-  when demand still calls for it.
+  bounded backoff while demand persists, and stop when it goes away; a `403`
+  produces no retry at all.
+- An expired JIT configuration removes its runtime directory and only
+  re-requests when demand still calls for it.
 - Restart recovery: a journal containing a live process adopts it without
   starting a duplicate; a journal containing a dead process with no GitHub
   runner marks it `orphaned` and cleans it; neither case creates a new runner

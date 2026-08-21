@@ -62,9 +62,11 @@ so colour alone never encodes busy, error, or ownership; a small terminal shows
 a deliberate compact layout and key-help overlay rather than clipped controls.
 
 **Redaction at the render boundary.** No screen may display the user access
-token, an Actions-service admin token, a message-queue token, an encoded JIT
-configuration, or a command line containing any of them. Enforce it here, once,
-rather than per screen.
+token, an encoded JIT configuration, or a command line containing either — the
+two are the product's entire sensitive surface after D4 (`07-security.md`,
+credential inventory). The device-flow *user code* is the one exception and is
+shown by design during `auth login` only. Enforce this here, once, rather than
+per screen.
 
 ## Definition of Done
 
