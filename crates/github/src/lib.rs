@@ -3659,7 +3659,9 @@ mod tests {
 
     const MANIFEST: (&str, &str) = ("Cargo.toml", include_str!("../Cargo.toml"));
 
-    /// Every `.rs` file in `src/`.
+    /// Every `.rs` file at or below `src/`, named by its `/`-joined path
+    /// relative to `src/` — so a nested module is `("rest/runners.rs",
+    /// include_str!("rest/runners.rs"))`, not just its file name.
     ///
     /// This list used to *be* the claim "every source file in the crate", and a
     /// hard-coded list is not that claim — it is a snapshot of it. `c3` and `c4`
@@ -3667,7 +3669,8 @@ mod tests {
     /// guaranteed to go stale on exactly the work that most needed scanning: a
     /// new `pagination.rs` holding a confidential credential passed silently.
     /// [`the_confidential_credential_scan_covers_every_source_file`] pins this
-    /// against `read_dir`, so adding a file and not adding it here fails.
+    /// by walking the directory tree, so adding a file — at the top level or in
+    /// a subdirectory — and not adding it here fails.
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("demand.rs", include_str!("demand.rs")),
         ("device_flow.rs", include_str!("device_flow.rs")),
@@ -3841,28 +3844,86 @@ mod tests {
     /// Reading the directory here is what turns the claim back into a claim. It
     /// cannot be done in the scan itself — `include_str!` needs a literal path
     /// at compile time — so the list stays, and this pins it.
+    ///
+    /// # Why it walks the tree instead of listing one directory
+    ///
+    /// It used to call `read_dir("src")` once and keep the entries ending in
+    /// `.rs`. That reads like a directory scan and is not one: a subdirectory
+    /// module — `src/rest/mod.rs`, `src/rest/runners.rs` — arrives as the single
+    /// entry `rest`, which does not end in `.rs`, so the filter dropped it and
+    /// took the files underneath with it. The pin went on passing while those
+    /// files were scanned by nothing at all.
+    ///
+    /// That defeated the pin in exactly the case it was written for. `c3` is the
+    /// REST inventory gateway, a module directory is the ordinary Rust shape for
+    /// it, and the failure is silent on both sides: the credential scan does not
+    /// read the file, and the test whose whole job is to notice that reports
+    /// success.
+    ///
+    /// Recursing is the fix, rather than asserting that `src/` holds no
+    /// subdirectories. The claim being pinned is about *files*, not about
+    /// layout; banning the directory would fail `c3` for choosing a normal
+    /// module shape, and a gate that fails correct work is a gate the next round
+    /// loosens to get its own work compiling — which is how the normalisation
+    /// half of this same scan was weakened once already.
+    ///
+    /// Names are `/`-joined paths relative to `src/`, which is what
+    /// `include_str!` takes on every platform, so a nested file is listed as
+    /// `("rest/runners.rs", include_str!("rest/runners.rs"))` and the two sides
+    /// compare directly.
     #[test]
     fn the_confidential_credential_scan_covers_every_source_file() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
-            .expect("the crate's own source directory is readable")
-            .map(|entry| entry.expect("a readable directory entry").file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".rs"))
-            .collect();
+        // Every `.rs` file at or below `dir`, named by its `/`-joined path
+        // relative to `src/`.
+        //
+        // `file_type()` is deliberately not followed through symlinks: a link
+        // cannot walk this into a cycle, and a symlinked `.rs` file still lands
+        // in the list through the extension test. A directory is recursed into
+        // before the extension is considered, so a directory named `foo.rs`
+        // is walked rather than mistaken for a file.
+        fn collect(dir: &std::path::Path, prefix: &str, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("the source directory is readable") {
+                let entry = entry.expect("a readable directory entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let relative = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.file_type().expect("a readable entry type").is_dir() {
+                    collect(&entry.path(), &relative, found);
+                } else if name.ends_with(".rs") {
+                    found.push(relative);
+                }
+            }
+        }
+
+        let mut on_disk = Vec::new();
+        collect(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            "",
+            &mut on_disk,
+        );
         on_disk.sort();
 
-        let scanned: Vec<String> = CRATE_SOURCES
+        // Sorted, rather than taken in declaration order. Comparing a sorted
+        // `on_disk` against an unsorted `scanned` made this assertion depend on
+        // `CRATE_SOURCES` happening to be declared alphabetically. It is — but
+        // nothing said so, and the failure that would follow from reordering the
+        // list is a diff of two lists holding the same names, which reads as a
+        // coverage gap rather than as the ordering nit it would actually be.
+        let mut scanned: Vec<String> = CRATE_SOURCES
             .iter()
             .map(|(name, _)| (*name).to_string())
             .collect();
+        scanned.sort();
 
         assert_eq!(
             scanned, on_disk,
             "`src/` and the scanned list have diverged. Add the new file to `CRATE_SOURCES` \
-             with an `include_str!`; leaving it out means the confidential-credential scan \
-             silently stops covering `every source file in the crate`, which is the claim it \
-             makes."
+             with an `include_str!`, naming it by its `/`-joined path relative to `src/`; \
+             leaving it out means the confidential-credential scan silently stops covering \
+             `every source file in the crate`, which is the claim it makes."
         );
     }
 
