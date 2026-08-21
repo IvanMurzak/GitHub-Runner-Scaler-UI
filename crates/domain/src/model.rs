@@ -455,6 +455,31 @@ impl fmt::Display for RefreshInterval {
 /// unless both sides are folded first. Folding on construction makes every
 /// comparison in this crate — `Eq`, `Ord`, `Hash`, set membership — case
 /// insensitive for free, so no call site can forget.
+///
+/// **The fold is ASCII, matching [`HostLabel`] and the target [`Name`] types.**
+/// The only case folding this crate has evidence for is GitHub's, and the only
+/// evidence is the spike above, which is entirely ASCII. Unicode
+/// `to_lowercase()` would also make folding length-changing — `İ` (U+0130)
+/// lowercases to two chars — which is how a 256-character label could exceed
+/// [`Self::MAX_LEN`] *after* construction. ASCII folding is length-preserving,
+/// so that class of bug cannot occur, and the length check below is applied to
+/// the folded value regardless so the stored string is what was measured.
+///
+/// **What the character rules are for.** They are round-trippability rules, not
+/// injection defences, and reading them as the latter is how a rule that
+/// defends nothing gets added. A `Label` is never interpolated into a shell: it
+/// travels as one element of the runner's comma-separated `--labels` argument
+/// and as a JSON string. So exactly two characters break the round trip — the
+/// comma, which is the separator itself, and control characters, which break
+/// both the argument and the JSON framing. Nothing else does, and a quote rule
+/// in particular is neither necessary (no shell is involved) nor sufficient
+/// (`<`, `>`, `$`, `` ` ``, `;`, `|`, `&` and whitespace would all still pass).
+///
+/// An explicit allow-list was considered and rejected: real GitHub labels
+/// include `c#`, `.net`, `x86_64` and similar, so any allow-list narrow enough
+/// to be worth having would reject legitimate `runs-on` values and turn a
+/// cosmetic concern into a demand-matching failure in
+/// [`crate::policy::RunsOn::required_labels`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Label(String);
@@ -466,29 +491,31 @@ impl Label {
     /// # Errors
     /// Empty, over-long, comma-bearing, or control-character-bearing input. A
     /// comma is rejected because it separates labels in the runner's own
-    /// configuration, so a label containing one is not round-trippable.
+    /// configuration, so a label containing one is not round-trippable; control
+    /// characters break the same argument and the JSON encoding around it. See
+    /// the type documentation for why the list stops there.
     pub fn new(raw: impl AsRef<str>) -> Result<Self, ValidationError> {
         let trimmed = raw.as_ref().trim();
         if trimmed.is_empty() {
             return Err(ValidationError::Empty { what: "a label" });
         }
-        if trimmed.chars().count() > Self::MAX_LEN {
-            return Err(ValidationError::TooLong {
-                what: "a label",
-                max: Self::MAX_LEN,
-                actual: trimmed.chars().count(),
-            });
-        }
-        if let Some(bad) = trimmed
-            .chars()
-            .find(|c| *c == ',' || c.is_control() || *c == '"' || *c == '\'')
-        {
+        if let Some(bad) = trimmed.chars().find(|c| *c == ',' || c.is_control()) {
             return Err(ValidationError::IllegalCharacter {
                 what: "a label",
                 found: bad,
             });
         }
-        Ok(Self(trimmed.to_lowercase()))
+        // Folded first, then measured: the length that matters is the length of
+        // the value this type will actually hold and hand to GitHub.
+        let folded = trimmed.to_ascii_lowercase();
+        if folded.chars().count() > Self::MAX_LEN {
+            return Err(ValidationError::TooLong {
+                what: "a label",
+                max: Self::MAX_LEN,
+                actual: folded.chars().count(),
+            });
+        }
+        Ok(Self(folded))
     }
 
     #[must_use]
@@ -1129,6 +1156,56 @@ mod tests {
             Err(ValidationError::TooLong { .. })
         ));
         assert!(Label::new("x".repeat(Label::MAX_LEN)).is_ok());
+    }
+
+    #[test]
+    fn the_label_character_rules_are_about_round_tripping_not_injection() {
+        // A quote is not rejected. It has no authority behind it: a Label is
+        // never interpolated into a shell, so quoting cannot break anything, and
+        // rejecting quotes while accepting every one of the characters below
+        // would be a rule that defends nothing while looking like it defends
+        // something.
+        assert_eq!(Label::new(r#"say"hi"#).unwrap().as_str(), r#"say"hi"#);
+        assert_eq!(Label::new("it's").unwrap().as_str(), "it's");
+
+        // The characters an injection rule would have to cover, all accepted --
+        // this is the "neither necessary nor sufficient" half, pinned so that a
+        // future quote-style rule has to confront it.
+        for raw in ["a<b", "a>b", "a$b", "a`b", "a;b", "a|b", "a&b", "a b"] {
+            assert!(
+                Label::new(raw).is_ok(),
+                "{raw:?} must construct: the rule set is round-trippability, not \
+                 shell safety"
+            );
+        }
+
+        // Real GitHub labels an allow-list would have had to enumerate.
+        for raw in ["c#", ".net", "x86_64", "ubuntu-22.04"] {
+            assert!(Label::new(raw).is_ok(), "{raw:?} is a real GitHub label");
+        }
+    }
+
+    #[test]
+    fn label_folding_is_ascii_and_the_length_is_measured_after_folding() {
+        // Consistent with HostLabel and with the target Name type, both of which
+        // fold with to_ascii_lowercase.
+        assert_eq!(
+            Label::new("RM-Home-Win-X64").unwrap().as_str(),
+            "rm-home-win-x64"
+        );
+
+        // U+0130 lowercases to two chars under Unicode folding. Under ASCII
+        // folding it is left alone, so a MAX_LEN input stays MAX_LEN and cannot
+        // exceed the ceiling after construction -- which is what the old
+        // fold-after-measure order allowed.
+        let mut raw = "x".repeat(Label::MAX_LEN - 1);
+        raw.push('\u{0130}');
+        let label = Label::new(&raw).expect("exactly MAX_LEN characters");
+        assert_eq!(
+            label.as_str().chars().count(),
+            Label::MAX_LEN,
+            "a constructed Label must never be longer than MAX_LEN"
+        );
     }
 
     #[test]

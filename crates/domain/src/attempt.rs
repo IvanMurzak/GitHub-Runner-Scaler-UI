@@ -69,6 +69,12 @@ pub enum AttemptError {
         state: AttemptState,
         outcome: AttemptOutcome,
     },
+
+    #[error("{state} is a terminal state and requires a terminal_at, but none was recorded")]
+    TerminalWithoutTimestamp { state: AttemptState },
+
+    #[error("{state} is not terminal, so it must not carry a terminal_at")]
+    NonTerminalWithTimestamp { state: AttemptState },
 }
 
 /// Ownership rule 2: "A host agent may act only on attempts persisted under its
@@ -411,7 +417,63 @@ pub struct RunnerAttempt {
     last_state_change_at: Timestamp,
 }
 
+/// Every stored column of one attempt, named rather than positional.
+///
+/// **Why this is a struct.** [`RunnerAttempt::from_persisted`] took ten
+/// positional arguments, and two of them — `created_at` and
+/// `last_state_change_at` — are both `Timestamp`. Transposing them type-checked,
+/// compiled, and silently reverted `last_state_change_at` to `created_at`, which
+/// is precisely the bug that field exists to prevent: every recovery timeout
+/// would then have measured from allocation rather than from the current state,
+/// so a long-running `busy` attempt would be read as a stuck one. `terminal_at`
+/// is a third `Option<Timestamp>` in the same list.
+///
+/// `b2` maps database columns onto this type. With a struct that mapping is
+/// checked by name at compile time; positionally it was checked by nothing.
+///
+/// Construct it with a struct literal so every field is written down at the call
+/// site — that is the whole point, and a builder or a `Default` would give the
+/// omission back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAttempt {
+    pub id: AttemptId,
+    pub policy_id: PolicyId,
+    pub github_runner_id: Option<u64>,
+    pub state: AttemptState,
+    pub outcome: Option<AttemptOutcome>,
+    pub process_id: Option<u32>,
+    pub runtime_path: PathBuf,
+    /// When the runtime directory was allocated. Never moves.
+    pub created_at: Timestamp,
+    /// Set when, and only when, the attempt concluded.
+    pub terminal_at: Option<Timestamp>,
+    /// When the attempt entered its **current** state. Recovery timeouts run
+    /// from here, not from `created_at`.
+    pub last_state_change_at: Timestamp,
+}
+
 impl RunnerAttempt {
+    /// Every stored column of this attempt, for `b2` to write back.
+    ///
+    /// The exact inverse of [`Self::from_persisted`], so a round trip through
+    /// the journal is expressible without reaching for a field accessor per
+    /// column and without this type exposing its private fields for writing.
+    #[must_use]
+    pub fn to_persisted(&self) -> PersistedAttempt {
+        PersistedAttempt {
+            id: self.id,
+            policy_id: self.policy_id,
+            github_runner_id: self.github_runner_id,
+            state: self.state,
+            outcome: self.outcome.clone(),
+            process_id: self.process_id,
+            runtime_path: self.runtime_path.clone(),
+            created_at: self.created_at,
+            terminal_at: self.terminal_at,
+            last_state_change_at: self.last_state_change_at,
+        }
+    }
+
     /// The first step of `e3`'s per-attempt flow: a runtime directory is
     /// allocated and journalled **before** anything remote happens, so a crash
     /// leaves a recoverable trace rather than an invisible one.
@@ -439,22 +501,24 @@ impl RunnerAttempt {
     /// Rebuild a journalled attempt.
     ///
     /// # Errors
-    /// Any state/outcome combination that this crate's own transitions cannot
-    /// produce, so a hand-edited journal cannot inject a `failed` attempt that
-    /// claims to have run a job.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_persisted(
-        id: AttemptId,
-        policy_id: PolicyId,
-        github_runner_id: Option<u64>,
-        state: AttemptState,
-        outcome: Option<AttemptOutcome>,
-        process_id: Option<u32>,
-        runtime_path: impl Into<PathBuf>,
-        created_at: Timestamp,
-        terminal_at: Option<Timestamp>,
-        last_state_change_at: Timestamp,
-    ) -> Result<Self, AttemptError> {
+    /// Any state/outcome/timestamp combination that this crate's own transitions
+    /// cannot produce, so a hand-edited journal cannot inject a `failed` attempt
+    /// that claims to have run a job, or a `finished` one that never reached a
+    /// terminal state.
+    pub fn from_persisted(fields: PersistedAttempt) -> Result<Self, AttemptError> {
+        let PersistedAttempt {
+            id,
+            policy_id,
+            github_runner_id,
+            state,
+            outcome,
+            process_id,
+            runtime_path,
+            created_at,
+            terminal_at,
+            last_state_change_at,
+        } = fields;
+
         match (&outcome, state.is_terminal()) {
             (None, true) => return Err(AttemptError::TerminalWithoutOutcome { state }),
             (Some(outcome), false) => {
@@ -475,6 +539,20 @@ impl RunnerAttempt {
             (None, false) => {}
         }
 
+        // `terminal_at` is validated on exactly the same footing as `outcome`,
+        // and for the same stated reason. `conclude` is the only writer of both
+        // and sets them together, so `state.is_terminal()` and
+        // `terminal_at.is_some()` are equivalent in anything this crate
+        // produced; a row where they disagree was edited by hand. Without this,
+        // a `finished` attempt with no `terminal_at` loaded cleanly and every
+        // consumer of `terminal_at()` -- retention, reporting, `g2`'s ordering
+        // -- silently saw an attempt that had never concluded.
+        match (terminal_at, state.is_terminal()) {
+            (None, true) => return Err(AttemptError::TerminalWithoutTimestamp { state }),
+            (Some(_), false) => return Err(AttemptError::NonTerminalWithTimestamp { state }),
+            _ => {}
+        }
+
         Ok(Self {
             id,
             policy_id,
@@ -482,7 +560,7 @@ impl RunnerAttempt {
             state,
             outcome,
             process_id,
-            runtime_path: runtime_path.into(),
+            runtime_path,
             created_at,
             terminal_at,
             last_state_change_at,
@@ -817,14 +895,45 @@ pub fn recovery_decision(
     match state {
         S::Allocated | S::JitReceived => {
             if observation.process_alive {
+                // Precedence rule 3's other half: local process state is
+                // authoritative for a child process this agent owns. `e3`: an
+                // attempt whose process still runs is adopted, not duplicated.
                 RecoveryDecision::Adopt
-            } else if elapsed >= timeouts.jit_handoff {
-                RecoveryDecision::NoLegalTransition {
-                    from: state,
-                    wanted: S::Failed,
-                }
             } else {
-                RecoveryDecision::Wait
+                match observation.github {
+                    // The crash window `e3` exists for. A runner cannot register
+                    // without having received its JIT configuration and started,
+                    // so a registration is proof the attempt got further than
+                    // the journal records: the `starting` write was lost, not
+                    // the attempt. This branch used to consult only
+                    // `process_alive` and the clock, which abandoned a live
+                    // runner as `failed` and left its registration at GitHub
+                    // unreconciled and unremoved.
+                    //
+                    // Each state takes the one legal edge out of itself, so
+                    // recovery walks the diagram rather than jumping across it:
+                    // `allocated -> jit_received` (the registration proves the
+                    // JIT configuration arrived) and `jit_received -> starting`.
+                    // `busy` is deliberately not consulted here -- neither state
+                    // has an edge to it, and the next pass, from `starting`, is
+                    // where that distinction becomes legal and is drawn.
+                    G::Registered { .. } => RecoveryDecision::Observe(if state == S::Allocated {
+                        S::JitReceived
+                    } else {
+                        S::Starting
+                    }),
+                    G::NotRegistered => {
+                        if elapsed >= timeouts.jit_handoff {
+                            RecoveryDecision::NoLegalTransition {
+                                from: state,
+                                wanted: S::Failed,
+                            }
+                        } else {
+                            RecoveryDecision::Wait
+                        }
+                    }
+                    G::Unreachable => unreachable!("handled above"),
+                }
             }
         }
 
@@ -914,6 +1023,26 @@ pub fn active_count<'a>(attempts: impl IntoIterator<Item = &'a RunnerAttempt>) -
         .fold(0u16, |acc, _| acc.saturating_add(1))
 }
 
+/// How many of these attempts still occupy a slot **and belong to one policy**.
+///
+/// The per-policy counterpart of [`active_count`], and the term
+/// [`crate::capacity::HostAllocator::allocate`] subtracts. The two are not
+/// interchangeable: [`active_count`] is the host-wide total that bounds D9's
+/// ceiling, this one is the per-policy figure that bounds D7's, and substituting
+/// either for the other is silent — the host-wide count in a per-policy slot
+/// starves every policy but the first, and a zero in place of this one starts a
+/// duplicate runner on every poll.
+#[must_use]
+pub fn active_count_for<'a>(
+    policy_id: PolicyId,
+    attempts: impl IntoIterator<Item = &'a RunnerAttempt>,
+) -> u16 {
+    attempts
+        .into_iter()
+        .filter(|a| a.policy_id == policy_id && a.counts_against_capacity())
+        .fold(0u16, |acc, _| acc.saturating_add(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1083,13 @@ mod tests {
         // exactly why the state-machine tests live here.
         attempt.state = state;
         attempt.last_state_change_at = ts(entered_at);
+        attempt
+    }
+
+    /// The same, under a nominated policy, for the per-policy count.
+    fn attempt_for(policy_id: PolicyId, state: AttemptState, entered_at: i64) -> RunnerAttempt {
+        let mut attempt = attempt_in(state, entered_at);
+        attempt.policy_id = policy_id;
         attempt
     }
 
@@ -1287,92 +1423,163 @@ mod tests {
         assert_eq!(active_count(&attempts), 3);
     }
 
+    #[test]
+    fn the_per_policy_active_count_is_not_the_host_wide_one() {
+        // Substituting either for the other is silent, so the difference is
+        // pinned rather than left to the reader of two similar names.
+        let mine = PolicyId::from_u128(1);
+        let theirs = PolicyId::from_u128(2);
+
+        let mut attempts = vec![
+            attempt_for(mine, AttemptState::Starting, 0),
+            attempt_for(mine, AttemptState::Busy, 0),
+            attempt_for(theirs, AttemptState::Busy, 0),
+            attempt_for(theirs, AttemptState::Idle, 0),
+            attempt_for(theirs, AttemptState::Allocated, 0),
+        ];
+
+        assert_eq!(active_count(&attempts), 5, "the host-wide total, for D9");
+        assert_eq!(active_count_for(mine, &attempts), 2, "this policy, for D7");
+        assert_eq!(active_count_for(theirs, &attempts), 3);
+        assert_eq!(
+            active_count_for(PolicyId::from_u128(3), &attempts),
+            0,
+            "a policy with nothing in flight"
+        );
+
+        // Terminal attempts drop out of the per-policy count on the same rule as
+        // the host-wide one.
+        attempts.push(attempt_for(mine, AttemptState::Finished, 0));
+        attempts.push(attempt_for(mine, AttemptState::Cleaned, 0));
+        assert_eq!(active_count_for(mine, &attempts), 2);
+    }
+
     // =======================================================================
     // Persistence gate
     // =======================================================================
 
+    /// A journal row the domain accepts, for a test to spoil one field of.
+    fn row(state: AttemptState, outcome: Option<AttemptOutcome>) -> PersistedAttempt {
+        PersistedAttempt {
+            id: AttemptId::from_u128(1),
+            policy_id: PolicyId::from_u128(1),
+            github_runner_id: Some(73),
+            state,
+            outcome,
+            process_id: Some(9),
+            runtime_path: "runtime/p/a".into(),
+            created_at: ts(0),
+            terminal_at: state.is_terminal().then(|| ts(9)),
+            last_state_change_at: ts(9),
+        }
+    }
+
     #[test]
     fn a_hand_edited_journal_row_with_an_impossible_outcome_is_rejected() {
-        let ok = RunnerAttempt::from_persisted(
-            AttemptId::from_u128(1),
-            PolicyId::from_u128(1),
-            Some(73),
-            AttemptState::Finished,
-            Some(AttemptOutcome::ExitedIdleWithoutWork),
-            Some(9),
-            "runtime/p/a",
-            ts(0),
-            Some(ts(9)),
-            ts(9),
+        assert!(
+            RunnerAttempt::from_persisted(row(
+                AttemptState::Finished,
+                Some(AttemptOutcome::ExitedIdleWithoutWork)
+            ))
+            .is_ok()
         );
-        assert!(ok.is_ok());
 
         // Terminal with no outcome.
         assert!(matches!(
-            RunnerAttempt::from_persisted(
-                AttemptId::from_u128(1),
-                PolicyId::from_u128(1),
-                None,
-                AttemptState::Failed,
-                None,
-                None,
-                "p",
-                ts(0),
-                Some(ts(1)),
-                ts(1),
-            ),
+            RunnerAttempt::from_persisted(row(AttemptState::Failed, None)),
             Err(AttemptError::TerminalWithoutOutcome { .. })
         ));
 
         // Non-terminal carrying one.
         assert!(matches!(
-            RunnerAttempt::from_persisted(
-                AttemptId::from_u128(1),
-                PolicyId::from_u128(1),
-                None,
+            RunnerAttempt::from_persisted(row(
                 AttemptState::Busy,
-                Some(AttemptOutcome::CompletedJob),
-                None,
-                "p",
-                ts(0),
-                None,
-                ts(1),
-            ),
+                Some(AttemptOutcome::CompletedJob)
+            )),
             Err(AttemptError::NonTerminalWithOutcome { .. })
         ));
 
         // A `failed` row that claims to have run a job.
         assert!(matches!(
-            RunnerAttempt::from_persisted(
-                AttemptId::from_u128(1),
-                PolicyId::from_u128(1),
-                None,
+            RunnerAttempt::from_persisted(row(
                 AttemptState::Failed,
-                Some(AttemptOutcome::CompletedJob),
-                None,
-                "p",
-                ts(0),
-                Some(ts(1)),
-                ts(1),
-            ),
+                Some(AttemptOutcome::CompletedJob)
+            )),
             Err(AttemptError::OutcomeStateMismatch { .. })
         ));
 
         // `cleaned` keeps whichever outcome preceded it.
         assert!(
-            RunnerAttempt::from_persisted(
-                AttemptId::from_u128(1),
-                PolicyId::from_u128(1),
-                None,
+            RunnerAttempt::from_persisted(row(
                 AttemptState::Cleaned,
-                Some(AttemptOutcome::Orphaned),
-                None,
-                "p",
-                ts(0),
-                Some(ts(1)),
-                ts(2),
-            )
+                Some(AttemptOutcome::Orphaned)
+            ))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_journal_row_with_an_impossible_terminal_at_is_rejected() {
+        // `terminal_at` is on the same footing as `outcome`: `conclude` is the
+        // only writer of either and sets them together, so a row where
+        // `state.is_terminal()` and `terminal_at.is_some()` disagree is one this
+        // crate cannot have produced. Before this gate existed, a `finished` row
+        // with `terminal_at: None` loaded cleanly and every reader of
+        // `terminal_at()` saw an attempt that had never concluded.
+        let mut terminal_without = row(AttemptState::Finished, Some(AttemptOutcome::CompletedJob));
+        terminal_without.terminal_at = None;
+        assert!(
+            matches!(
+                RunnerAttempt::from_persisted(terminal_without),
+                Err(AttemptError::TerminalWithoutTimestamp {
+                    state: AttemptState::Finished
+                })
+            ),
+            "a terminal row with no terminal_at must be refused, exactly as a \
+             terminal row with no outcome is"
+        );
+
+        // The other direction: a live attempt that claims to have concluded.
+        let mut live_with = row(AttemptState::Busy, None);
+        live_with.terminal_at = Some(ts(9));
+        assert!(matches!(
+            RunnerAttempt::from_persisted(live_with),
+            Err(AttemptError::NonTerminalWithTimestamp {
+                state: AttemptState::Busy
+            })
+        ));
+
+        // `cleaned` follows a concluded state, so it keeps that state's
+        // timestamp and is not a special case.
+        let mut cleaned = row(AttemptState::Cleaned, Some(AttemptOutcome::Orphaned));
+        cleaned.terminal_at = Some(ts(4));
+        assert!(RunnerAttempt::from_persisted(cleaned).is_ok());
+    }
+
+    #[test]
+    fn an_attempt_round_trips_through_its_persisted_form() {
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(3),
+            PolicyId::from_u128(4),
+            "runtime/p/a",
+            ts(0),
+        );
+        attempt.jit_received(ts(1)).unwrap();
+        attempt.started(7, ts(2)).unwrap();
+        attempt.registered_idle(7, ts(3)).unwrap();
+        attempt
+            .conclude(AttemptOutcome::ExitedIdleWithoutWork, ts(4))
+            .unwrap();
+
+        let restored = RunnerAttempt::from_persisted(attempt.to_persisted())
+            .expect("a row this crate produced must load");
+        assert_eq!(restored, attempt);
+        assert_eq!(restored.terminal_at(), Some(ts(4)));
+        assert_ne!(
+            restored.last_state_change_at(),
+            restored.created_at,
+            "the two timestamps must not collapse onto each other; that \
+             transposition is what PersistedAttempt exists to prevent"
         );
     }
 
@@ -1603,6 +1810,96 @@ mod tests {
                 &clock,
             ),
             RecoveryDecision::Observe(AttemptState::Idle)
+        );
+    }
+
+    #[test]
+    fn a_pre_registration_attempt_believes_github_over_its_own_stale_journal() {
+        // The crash window `e3` exists for: the process started and registered
+        // at GitHub, but the write recording it was lost. GitHub is telling the
+        // agent the runner is alive.
+        //
+        // This branch used to consult only `process_alive` and the clock, so the
+        // observation below produced
+        // `NoLegalTransition { from: JitReceived, wanted: Failed }` -- the
+        // attempt was abandoned as failed while its registration stayed at
+        // GitHub, never reconciled and never removed. Nothing in the suite
+        // noticed, because nothing asked.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        // Well past the JIT handoff deadline, so the old code's timeout arm is
+        // the one being displaced.
+        let clock = StubClock::at(10_000);
+
+        for busy in [true, false] {
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(AttemptState::JitReceived, 0),
+                    RecoveryObservation {
+                        process_alive: false,
+                        github: GithubRunnerObservation::Registered { busy },
+                    },
+                    timeouts,
+                    &clock,
+                ),
+                RecoveryDecision::Observe(AttemptState::Starting),
+                "jit_received + Registered{{busy:{busy}}}: the runner cannot have \
+                 registered without starting, and `jit_received -> starting` is \
+                 an edge the diagram already has"
+            );
+
+            // `allocated` has no `-> starting` edge, so it takes the one legal
+            // step it does have. The registration proves the JIT configuration
+            // arrived, which is exactly what that edge records; the next pass
+            // continues from `jit_received`.
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(AttemptState::Allocated, 0),
+                    RecoveryObservation {
+                        process_alive: false,
+                        github: GithubRunnerObservation::Registered { busy },
+                    },
+                    timeouts,
+                    &clock,
+                ),
+                RecoveryDecision::Observe(AttemptState::JitReceived),
+                "allocated + Registered{{busy:{busy}}}"
+            );
+        }
+
+        // Unchanged where GitHub knows nothing: the timeout still decides, and a
+        // live process is still adopted rather than duplicated.
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::JitReceived, 0),
+                RecoveryObservation {
+                    process_alive: false,
+                    github: GithubRunnerObservation::NotRegistered,
+                },
+                timeouts,
+                &clock,
+            ),
+            RecoveryDecision::NoLegalTransition {
+                from: AttemptState::JitReceived,
+                wanted: AttemptState::Failed,
+            }
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::JitReceived, 0),
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::Registered { busy: false },
+                },
+                timeouts,
+                &clock,
+            ),
+            RecoveryDecision::Adopt,
+            "precedence rule 3's other half: local process state is \
+             authoritative for a child process this agent owns"
         );
     }
 
