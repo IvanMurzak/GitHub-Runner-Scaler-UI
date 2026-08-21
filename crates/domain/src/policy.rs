@@ -53,6 +53,25 @@ pub enum PolicyError {
     )]
     AutoscaleWithoutMaxCapacity,
 
+    /// A **stored shape** is illegal. This says the row is wrong, not that the
+    /// caller asked for the wrong thing — an operation that merely needs an
+    /// autoscale policy reports [`PolicyError::NotAutoscale`] instead.
+    ///
+    /// **Nothing in this crate constructs it, and that is a finding rather than
+    /// an oversight.** It used to be raised by `add_routing_label` and
+    /// `remove_routing_label` in the *other* meaning, which is the confusion it
+    /// is now free of. In its own meaning it is unreachable because
+    /// [`PolicyMode::from_persisted`] infers the mode from the columns rather
+    /// than reading a stored discriminant: a row carrying routing labels is
+    /// autoscale-shaped by definition, so labels-without-`max_capacity` is
+    /// caught as [`PolicyError::AutoscaleWithoutMaxCapacity`] first and
+    /// "monitor-only *with* labels" cannot be expressed at all.
+    ///
+    /// It is kept because whether it becomes reachable is `b2`'s decision: a
+    /// schema that stores the mode discriminant explicitly makes the illegal
+    /// shape expressible, and this is the error for it. If `b2` infers the mode
+    /// as this crate does, delete the variant rather than leaving `f2` a match
+    /// arm that can never fire.
     #[error("a MonitorOnly policy must not carry routing labels; it owns nothing (D19)")]
     MonitorOnlyWithRoutingLabels,
 
@@ -184,6 +203,16 @@ impl RoutingLabels {
 
     /// Build from an explicit host label, for the operator override `f2`
     /// supports, and for `b2` reloading a stored set.
+    ///
+    /// **This accepts any [`Label`] as the host label, including one that is not
+    /// host-scoped at all.** "Host-scoped by construction" is a property of
+    /// [`Self::derive`], not of this type: `f2` deliberately supports an
+    /// operator override, so a hard rejection here would break a supported
+    /// workflow, and this is also the serde path, so `b2` reaches it for every
+    /// stored row. A hand-edited row can therefore set `host_label` to
+    /// `self-hosted`, and [`Self::remove`] will then defend *that* as immovable
+    /// while two hosts happily serve each other's jobs. Ask
+    /// [`Self::is_derived_shape`] before trusting the collision control.
     #[must_use]
     pub fn from_parts(host_label: Label, additional: impl IntoIterator<Item = Label>) -> Self {
         let additional = additional
@@ -206,6 +235,46 @@ impl RoutingLabels {
     #[must_use]
     pub fn host_label(&self) -> &Label {
         &self.host_label
+    }
+
+    /// Whether the host label still has the shape [`Self::derive`] produces:
+    /// `rm-<host>-<os>-<arch>`, with the OS and architecture segments being
+    /// tokens this crate actually emits.
+    ///
+    /// **This is a warning predicate, not a validation rule.** It is `false` for
+    /// an operator override, and an override is supported — `f2` offers one on
+    /// purpose. What it detects is that the *collision control has been turned
+    /// off*: the derived shape is what keeps two hosts from answering each
+    /// other's jobs, so a policy whose host label is `self-hosted` or
+    /// `ubuntu-latest` will route work that belongs to another machine, and
+    /// [`Self::remove`] will refuse to remove that label because it cannot tell
+    /// the difference. `f2` and `g2` should say so rather than fail; nothing
+    /// here rejects it.
+    ///
+    /// Matching is structural rather than a check against a known host label,
+    /// because the host label this was derived from is not stored — only the
+    /// concatenation is.
+    #[must_use]
+    pub fn is_derived_shape(&self) -> bool {
+        let segments: Vec<&str> = self.host_label.as_str().split('-').collect();
+        // `rm` / host / os / arch. The host segment is a HostLabel, which never
+        // contains `-`... except that it may: `--host-label home-win` is legal
+        // and derives `rm-home-win-win-x64`. So the fixed ends are what is
+        // checked, and everything between them is the host identity.
+        let [prefix, middle @ .., os, arch] = segments.as_slice() else {
+            return false;
+        };
+        // `Os::ALL` / `Arch::ALL` rather than a literal list, so a fourth OS or
+        // architecture is recognised here the moment it exists.
+        *prefix == Self::PREFIX
+            && !middle.is_empty()
+            && middle.iter().all(|segment| !segment.is_empty())
+            && Os::ALL
+                .iter()
+                .any(|candidate| candidate.label_token() == *os)
+            && Arch::ALL
+                .iter()
+                .any(|candidate| candidate.label_token() == *arch)
     }
 
     /// The optional descriptive labels, in sorted order.
@@ -483,6 +552,17 @@ impl RunsOn {
     }
 
     /// The normalised labels this job requires.
+    ///
+    /// **Whitespace-only array elements are dropped, not rejected.** A
+    /// `runs-on: ["self-hosted", "", "linux"]` is a workflow that GitHub itself
+    /// accepts, and the empty element carries no routing meaning, so treating it
+    /// as an [`UnresolvableRunsOn::InvalidLabel`] would report a job as
+    /// unresolvable — and so exclude it from demand and surface it to an
+    /// operator — over a stray comma in someone's YAML. The elements that
+    /// remain are what the job actually requires. If *every* element is
+    /// whitespace the array resolves to nothing at all, and that **is**
+    /// reported, as [`UnresolvableRunsOn::NoLabels`] or
+    /// [`UnresolvableRunsOn::RunnerGroupWithoutLabels`].
     ///
     /// # Errors
     /// Every reason the value cannot be turned into a label set — each of which
@@ -868,6 +948,42 @@ pub struct ScalePolicy {
     revision: u64,
 }
 
+/// Every stored column of one policy, named rather than positional.
+///
+/// **Why this is a struct.** [`ScalePolicy::from_persisted`] took eleven
+/// positional arguments under `#[allow(clippy::too_many_arguments)]`, and two of
+/// them — `installation_id` and `revision` — are both bare `u64`. Transposing
+/// them type-checked and compiled: the policy would then have authenticated
+/// against an installation id of `0` or `1` while presenting its installation id
+/// as an optimistic-concurrency token, so every write would have raced and every
+/// GitHub call would have failed to authenticate, with nothing in either
+/// signature to catch it.
+///
+/// `b2` maps database columns onto this type. With a struct that mapping is
+/// checked by name at compile time; positionally it was checked by nothing.
+///
+/// Construct it with a struct literal so every field is written down at the call
+/// site — that is the whole point, and a builder or a `Default` would give the
+/// omission back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedPolicy {
+    pub id: PolicyId,
+    pub target: ScaleTarget,
+    /// The GitHub App installation this policy authenticates through.
+    pub installation_id: u64,
+    pub host_id: HostId,
+    /// `Some` for an Autoscale policy, `None` for a MonitorOnly one (D19).
+    pub routing_labels: Option<RoutingLabels>,
+    pub min_capacity: u16,
+    pub max_capacity: Option<NonZeroU16>,
+    /// Operator intent, independent of `state`.
+    pub enabled: bool,
+    pub state: PolicyState,
+    pub cache_policy: CachePolicy,
+    /// Optimistic-concurrency token. Not an identifier of anything.
+    pub revision: u64,
+}
+
 impl ScalePolicy {
     /// A newly added policy.
     ///
@@ -875,6 +991,12 @@ impl ScalePolicy {
     /// `enabled == false`, and only an explicit `set-scale` moves it on. That is
     /// true for a policy created with `--max-capacity` too, which is why this is
     /// a property of the constructor rather than of the caller.
+    ///
+    /// **This is the `add` path, not the load path.** It resets `state` to
+    /// `Pending`, `enabled` to `false` and `revision` to `0`, so calling it on a
+    /// row read back from storage silently disarms a live policy and resets its
+    /// concurrency token. [`Self::from_persisted`] is the one that reloads a
+    /// stored policy; it sits directly below this and takes all three.
     #[must_use]
     pub fn new(
         id: PolicyId,
@@ -899,22 +1021,26 @@ impl ScalePolicy {
 
     /// Rebuild a stored policy, re-validating D19's shape.
     ///
+    /// This is the load path. Unlike [`Self::new`] it preserves `state`,
+    /// `enabled` and `revision` exactly as stored.
+    ///
     /// # Errors
     /// Any illegal `PolicyMode` shape, per [`PolicyMode::from_persisted`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_persisted(
-        id: PolicyId,
-        target: ScaleTarget,
-        installation_id: u64,
-        host_id: HostId,
-        routing_labels: Option<RoutingLabels>,
-        min_capacity: u16,
-        max_capacity: Option<NonZeroU16>,
-        enabled: bool,
-        state: PolicyState,
-        cache_policy: CachePolicy,
-        revision: u64,
-    ) -> Result<Self, PolicyError> {
+    pub fn from_persisted(fields: PersistedPolicy) -> Result<Self, PolicyError> {
+        let PersistedPolicy {
+            id,
+            target,
+            installation_id,
+            host_id,
+            routing_labels,
+            min_capacity,
+            max_capacity,
+            enabled,
+            state,
+            cache_policy,
+            revision,
+        } = fields;
+
         let mode = PolicyMode::from_persisted(routing_labels, min_capacity, max_capacity)?;
         Ok(Self {
             id,
@@ -927,6 +1053,28 @@ impl ScalePolicy {
             cache_policy,
             revision,
         })
+    }
+
+    /// Every stored column of this policy, for `b2` to write back.
+    ///
+    /// The exact inverse of [`Self::from_persisted`], so a round trip through
+    /// storage is expressible without this type exposing `mode`, `enabled`,
+    /// `state` and `revision` for writing.
+    #[must_use]
+    pub fn to_persisted(&self) -> PersistedPolicy {
+        PersistedPolicy {
+            id: self.id,
+            target: self.target.clone(),
+            installation_id: self.installation_id,
+            host_id: self.host_id,
+            routing_labels: self.routing_labels().cloned(),
+            min_capacity: self.min_capacity(),
+            max_capacity: self.max_capacity(),
+            enabled: self.enabled,
+            state: self.state,
+            cache_policy: self.cache_policy,
+            revision: self.revision,
+        }
     }
 
     #[must_use]
@@ -1012,8 +1160,39 @@ impl ScalePolicy {
         Ok(())
     }
 
+    /// Whether [`Self::activate`] would succeed right now.
+    ///
+    /// Exposed so `f2` can implement the idempotent CLI behaviour described on
+    /// [`Self::activate`] without either duplicating the state table or calling
+    /// and discarding an error.
+    #[must_use]
+    pub fn can_activate(&self) -> bool {
+        self.state.can_transition_to(PolicyState::Active)
+    }
+
+    /// Whether [`Self::request_disable`] would succeed right now.
+    #[must_use]
+    pub fn can_request_disable(&self) -> bool {
+        self.state.can_transition_to(PolicyState::Draining)
+    }
+
     /// `set-scale --enabled true` on a `Pending` policy (`03-control-flows.md`,
     /// flow 1.6).
+    ///
+    /// **Not idempotent, and that is intended.** This is a *transition*
+    /// operation, not a desired-state one: it reports what the state machine
+    /// permits and never silently accepts a call the diagram has no edge for.
+    /// Calling it on an already-`Active` policy is [`PolicyError::IllegalTransition`],
+    /// not a no-op.
+    ///
+    /// The idempotent reading — "make this policy enabled, whatever it is now" —
+    /// is a *command-level* behaviour, and it belongs to `f2` because the answer
+    /// depends on what `set-scale --enabled true` should mean for a `draining`,
+    /// `disabled`, `repair_required` or `authentication_failed` policy, and each
+    /// of those is a product decision rather than a domain one. Collapsing them
+    /// here would make the domain answer them by accident. `f2` should branch on
+    /// [`Self::can_activate`] and report the already-satisfied case as success
+    /// without calling this at all.
     ///
     /// # Errors
     /// [`PolicyError::IllegalTransition`] when the policy is not `Pending`.
@@ -1029,6 +1208,15 @@ impl ScalePolicy {
     /// immediately — which alone is enough to stop new runners, because
     /// [`Self::may_start_runners`] reads it — and the observed state moves to
     /// `Draining`, where busy runners are left to finish.
+    ///
+    /// **Not idempotent, for the reason given on [`Self::activate`].** In
+    /// particular `set-scale --enabled false` on a `pending` policy is
+    /// `IllegalTransition { from: pending, to: draining }` rather than a no-op,
+    /// even though a `pending` policy is already `enabled == false` and so is
+    /// already starting nothing. `f2` translates that through
+    /// [`Self::can_request_disable`]: a policy that cannot legally drain and is
+    /// already not enabled has nothing to do, which is a successful outcome for
+    /// the command and not an error to print.
     ///
     /// # Errors
     /// [`PolicyError::IllegalTransition`] when the policy is not `Active`.
@@ -1129,11 +1317,16 @@ impl ScalePolicy {
     /// Add an optional descriptive routing label.
     ///
     /// # Errors
-    /// [`PolicyError::MonitorOnlyWithRoutingLabels`] for a monitor-only policy,
-    /// which owns no label set to add to.
+    /// [`PolicyError::NotAutoscale`] for a monitor-only policy, which owns no
+    /// label set to add to. Deliberately **not**
+    /// [`PolicyError::MonitorOnlyWithRoutingLabels`]: that variant states that a
+    /// *stored row* has an illegal shape, which is a different claim from "this
+    /// operation needs an autoscale policy", and reusing it here would have had
+    /// `f2` render a validation failure for what is an ordinary
+    /// wrong-mode refusal.
     pub fn add_routing_label(&mut self, label: Label) -> Result<bool, PolicyError> {
         match &mut self.mode {
-            PolicyMode::MonitorOnly => Err(PolicyError::MonitorOnlyWithRoutingLabels),
+            PolicyMode::MonitorOnly => Err(PolicyError::NotAutoscale),
             PolicyMode::Autoscale(cfg) => {
                 let added = cfg.routing_labels_mut().add(label);
                 if added {
@@ -1148,10 +1341,12 @@ impl ScalePolicy {
     ///
     /// # Errors
     /// [`PolicyError::HostLabelNotRemovable`] for the derived host label, or
-    /// [`PolicyError::MonitorOnlyWithRoutingLabels`] for a monitor-only policy.
+    /// [`PolicyError::NotAutoscale`] for a monitor-only policy — see
+    /// [`Self::add_routing_label`] for why that variant and not
+    /// [`PolicyError::MonitorOnlyWithRoutingLabels`].
     pub fn remove_routing_label(&mut self, label: &Label) -> Result<bool, PolicyError> {
         match &mut self.mode {
-            PolicyMode::MonitorOnly => Err(PolicyError::MonitorOnlyWithRoutingLabels),
+            PolicyMode::MonitorOnly => Err(PolicyError::NotAutoscale),
             PolicyMode::Autoscale(cfg) => {
                 let removed = cfg.routing_labels_mut().remove(label)?;
                 if removed {
@@ -2036,10 +2231,26 @@ mod tests {
              is computed and then ignored"
         );
 
-        // And it owns no label set to edit.
+        // And it owns no label set to edit. `NotAutoscale`, not
+        // `MonitorOnlyWithRoutingLabels`: the caller asked for the wrong thing,
+        // the stored row is not malformed. The two now mean one thing each.
         assert!(matches!(
             policy.add_routing_label(label("gpu")),
-            Err(PolicyError::MonitorOnlyWithRoutingLabels)
+            Err(PolicyError::NotAutoscale)
+        ));
+        assert!(matches!(
+            policy.remove_routing_label(&label("gpu")),
+            Err(PolicyError::NotAutoscale)
+        ));
+        // The load path reports a *shape* problem, and it is a different one:
+        // a row carrying routing labels is autoscale-shaped by definition, so
+        // the mode is never in doubt and `MonitorOnlyWithRoutingLabels` is
+        // unreachable. See its documentation -- this assertion is what makes
+        // that claim fail loudly if `PolicyMode::from_persisted` ever starts
+        // reading a stored discriminant instead of inferring the mode.
+        assert!(matches!(
+            PolicyMode::from_persisted(Some(host_labels("home")), 0, None),
+            Err(PolicyError::AutoscaleWithoutMaxCapacity)
         ));
     }
 
@@ -2086,6 +2297,81 @@ mod tests {
         assert!(!policy.is_owned_by(theirs));
     }
 
+    #[test]
+    fn an_overridden_host_label_is_detectable_without_being_rejected() {
+        // `f2` supports an operator override, so `from_parts` must accept any
+        // label -- but "host-scoped by construction" then holds only for
+        // `derive`, and the difference has to be visible to something.
+        assert!(host_labels("home").is_derived_shape());
+        assert!(
+            RoutingLabels::derive(&HostLabel::new("home-win").unwrap(), Os::Linux, Arch::Arm64)
+                .is_derived_shape(),
+            "a host label containing `-` still derives a four-plus-segment name"
+        );
+
+        // The case the predicate exists for: a hand-edited row that has quietly
+        // disabled the collision control. Not an error -- `remove` will still
+        // defend it as immovable -- but `f2`/`g2` can now say so.
+        for raw in [
+            "self-hosted",
+            "ubuntu-latest",
+            "rm-home-win",
+            "rm-home-win-x64-extra",
+        ] {
+            assert!(
+                !RoutingLabels::from_host_label(label(raw)).is_derived_shape(),
+                "{raw:?} is not the derived shape"
+            );
+        }
+        // Right segment count, wrong tokens.
+        assert!(!RoutingLabels::from_host_label(label("rm-home-bsd-x64")).is_derived_shape());
+        assert!(!RoutingLabels::from_host_label(label("rm-home-win-riscv")).is_derived_shape());
+        assert!(!RoutingLabels::from_host_label(label("xx-home-win-x64")).is_derived_shape());
+
+        // The additional labels play no part: only host identity is at stake.
+        let mut overridden = RoutingLabels::from_host_label(label("self-hosted"));
+        overridden.add(label("rm-home-win-x64"));
+        assert!(!overridden.is_derived_shape());
+    }
+
+    #[test]
+    fn the_lifecycle_commands_are_transitions_not_desired_state_requests() {
+        // Documented as intended: `activate` and `request_disable` report what
+        // the diagram permits, and `f2` translates that into an idempotent CLI
+        // using the two predicates rather than by calling and discarding errors.
+        let mut policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(7),
+            3,
+        );
+
+        assert!(policy.can_activate());
+        assert!(
+            !policy.can_request_disable(),
+            "a pending policy cannot drain; it is also already not enabled, \
+             which is what makes the command a no-op rather than a failure"
+        );
+        assert!(matches!(
+            policy.request_disable(),
+            Err(PolicyError::IllegalTransition {
+                from: PolicyState::Pending,
+                to: PolicyState::Draining,
+            })
+        ));
+
+        policy.activate().unwrap();
+        assert!(!policy.can_activate(), "already active");
+        assert!(policy.can_request_disable());
+        assert!(matches!(
+            policy.activate(),
+            Err(PolicyError::IllegalTransition { .. })
+        ));
+
+        policy.request_disable().unwrap();
+        assert!(!policy.can_request_disable(), "already draining");
+        assert!(!policy.enabled());
+    }
+
     // =======================================================================
     // D18 target equivalence -- one body, both variants
     // =======================================================================
@@ -2098,6 +2384,17 @@ mod tests {
     /// test body, not by two copies of the same assertions", and the reason is
     /// not tidiness: two copies drift, and the moment they drift the domain has
     /// quietly acquired a scope-dependent rule that D18 says does not exist.
+    ///
+    /// **The trace must cover every rule the contract names, not every rule
+    /// that happens to live in this file.** `04-subsystem-contracts.md` names
+    /// three — "ownership, capacity, and lifecycle rules are identical" — and
+    /// two of them are implemented in other modules. A version of this trace
+    /// that only exercised `policy.rs` proved lifecycle and left the other two
+    /// unguarded: a scope branch in `HostAllocator::allocate` firing only on
+    /// `demand > 0`, and one in `attempt::authorize` returning `ForeignHost` for
+    /// every organization policy, both left the whole suite green. Anything
+    /// added to the contract's list belongs in this body, wherever it is
+    /// implemented.
     fn assert_target_behaves_identically(target: ScaleTarget) -> Vec<String> {
         let host = HostId::from_u128(7);
         let mut trace = Vec::new();
@@ -2136,6 +2433,68 @@ mod tests {
             tally.demand(),
             tally.not_matched,
             tally.unresolvable.len()
+        ));
+
+        // Capacity (`crate::capacity`). D9's host ceiling and D7's per-policy
+        // one are the contract's "capacity rules"; without these lines a scope
+        // branch inside `HostAllocator::allocate` is invisible to the suite.
+        let host_record = crate::model::Host::new(
+            host,
+            "home-pc",
+            Os::Windows,
+            Arch::X64,
+            nz(4),
+            crate::model::Timestamp::from_timestamp(0, 0).unwrap(),
+        )
+        .unwrap();
+        let mut allocator = crate::capacity::HostAllocator::new(&host_record, 0);
+        let allocation = allocator.allocate(&policy, 3, &[]);
+        trace.push(format!(
+            "alloc demand={} desired={} active_owned={} headroom_before={} \
+             to_start={} limiting={}",
+            allocation.demand,
+            allocation.desired,
+            allocation.active_owned,
+            allocation.headroom_before,
+            allocation.to_start,
+            allocation.limiting_factor
+        ));
+        trace.push(format!("headroom_after={}", allocator.headroom()));
+        // Zero demand as well, so a branch keyed on `demand > 0` cannot hide in
+        // the gap between the two.
+        trace.push(format!(
+            "alloc_zero_to_start={}",
+            allocator.allocate(&policy, 0, &[]).to_start
+        ));
+
+        // Ownership (`crate::attempt`). Ownership rules 1 and 2 are the
+        // contract's "ownership rules", and `authorize` is where they are
+        // enforced -- `is_owned_by` above only covers rule 2's policy half.
+        let attempt = crate::attempt::RunnerAttempt::allocate(
+            crate::model::AttemptId::from_u128(11),
+            policy.id,
+            "C:/runners/eq",
+            crate::model::Timestamp::from_timestamp(0, 0).unwrap(),
+        );
+        trace.push(format!(
+            "authorize_own_host={:?}",
+            crate::attempt::authorize(host, &policy, &attempt).is_ok()
+        ));
+        trace.push(format!(
+            "authorize_other_host={}",
+            crate::attempt::authorize(HostId::from_u128(8), &policy, &attempt)
+                .expect_err("an agent on another host must be refused")
+        ));
+        let foreign_attempt = crate::attempt::RunnerAttempt::allocate(
+            crate::model::AttemptId::from_u128(12),
+            PolicyId::from_u128(999),
+            "C:/runners/eq-other",
+            crate::model::Timestamp::from_timestamp(0, 0).unwrap(),
+        );
+        trace.push(format!(
+            "authorize_other_policy={}",
+            crate::attempt::authorize(host, &policy, &foreign_attempt)
+                .expect_err("an attempt under another policy must be refused")
         ));
 
         // Drain.

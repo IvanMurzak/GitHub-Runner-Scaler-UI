@@ -23,7 +23,9 @@
 
 use std::num::NonZeroU16;
 
-use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
+use runner_manager_domain::attempt::{
+    AttemptOutcome, AttemptState, FailureReason, PersistedAttempt, RunnerAttempt,
+};
 use runner_manager_domain::model::{
     Arch, AttemptId, CachePolicy, Host, HostId, HostLabel, Label, Os, PolicyId, RefreshInterval,
     ScaleTarget, StartMode, Timestamp,
@@ -526,18 +528,18 @@ impl AttemptBuilder {
         let entered_state_at = self.entered_state_at.unwrap_or(self.created_at);
         let terminal_at = self.state.is_terminal().then_some(entered_state_at);
 
-        RunnerAttempt::from_persisted(
-            self.id,
-            self.policy_id,
-            self.github_runner_id,
-            self.state,
+        RunnerAttempt::from_persisted(PersistedAttempt {
+            id: self.id,
+            policy_id: self.policy_id,
+            github_runner_id: self.github_runner_id,
+            state: self.state,
             outcome,
-            self.process_id,
-            self.runtime_path,
-            self.created_at,
+            process_id: self.process_id,
+            runtime_path: self.runtime_path.into(),
+            created_at: self.created_at,
             terminal_at,
-            entered_state_at,
-        )
+            last_state_change_at: entered_state_at,
+        })
         .expect("fixture attempt is a state/outcome pair the domain accepts")
     }
 }
