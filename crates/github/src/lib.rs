@@ -2469,8 +2469,14 @@ mod tests {
     }
 
     /// The Definition of Done's second item, made checkable rather than
-    /// reviewed: the two files `c2` owns are scanned for the identifiers a
-    /// renewal path or a confidential client would have to use.
+    /// reviewed: "no refresh-token code path exists, and no client secret
+    /// appears anywhere in the crate **or its configuration**".
+    ///
+    /// The two files `c2` owns are scanned, and so is the crate's manifest —
+    /// that is what "or its configuration" means for a crate with no config file
+    /// of its own. `rest.rs`, `demand.rs` and `jit.rs` are deliberately **not**
+    /// scanned: they belong to `c3` and `c4`, and a test here that failed on
+    /// their work would be this task reaching across an ownership boundary.
     ///
     /// Prose in this crate deliberately writes "renewal token" and "client
     /// secret" with a space so that this scan stays meaningful.
@@ -2479,6 +2485,7 @@ mod tests {
         for (name, source) in [
             ("lib.rs", include_str!("lib.rs")),
             ("device_flow.rs", include_str!("device_flow.rs")),
+            ("Cargo.toml", include_str!("../Cargo.toml")),
         ] {
             // Spelled in halves so that this test's own source does not trip it.
             for forbidden in [
