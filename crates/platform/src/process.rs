@@ -1003,6 +1003,33 @@ fn parse_proc_stat(stat: &str) -> Option<ProcStat<'_>> {
     Some(ProcStat { state, start_ticks })
 }
 
+/// Whether a failed start-time probe means the process is *gone*, as opposed to
+/// unreadable for some other reason.
+///
+/// `no_such_process` is the platform's `ESRCH`, passed in rather than read from
+/// `libc` here for the same reason [`parse_proc_stat`] lives outside the
+/// `#[cfg(unix)]` module: this is a security-relevant decision that is
+/// otherwise only compiled on two of the three CI legs and testable on neither
+/// a Windows developer's machine nor the Windows leg. As a plain function over
+/// an `Option<i32>` it is exercised everywhere.
+///
+/// **Only `ESRCH` is "gone".** Every other answer — `EPERM` for a process this
+/// account may not inspect, or a zero `errno` from a call that failed without
+/// setting one — is an error. This is the same rule the Windows leg applies to
+/// `ERROR_ACCESS_DENIED`, and for the same reason: an unexplained failure is
+/// not evidence of absence, and reporting [`Adoption::Gone`] for one is how an
+/// agent decides to start a duplicate runner.
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "called from the Unix start-time probes; unit tested on every platform"
+    )
+)]
+const fn probe_failure_means_gone(errno: Option<i32>, no_such_process: i32) -> bool {
+    matches!(errno, Some(code) if code == no_such_process)
+}
+
 // ---------------------------------------------------------------------------
 // Platform implementations
 // ---------------------------------------------------------------------------
@@ -1560,18 +1587,13 @@ mod sys {
 
         if written <= 0 {
             let error = io::Error::last_os_error();
-            // ESRCH is "no such process". Everything else — EPERM for a process
-            // this account may not inspect, and a zero `errno` for a
-            // `proc_pidinfo` that failed without setting one — stays an error.
-            //
-            // Zero used to be folded in here, and that was wrong for the same
-            // reason `ERROR_ACCESS_DENIED` is kept an error on the Windows leg:
-            // an unexplained failure is not evidence that the process is gone,
-            // and reporting `Gone` for one is how an agent decides to start a
-            // duplicate runner.
-            return match error.raw_os_error() {
-                Some(libc::ESRCH) => Ok(None),
-                _ => Err(error),
+            // See `super::probe_failure_means_gone`, which is where this rule
+            // lives so that it can be tested on a leg that has no `libc`.
+            // Only ESRCH is "gone"; EPERM and a zero `errno` are errors.
+            return if super::probe_failure_means_gone(error.raw_os_error(), libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
             };
         }
         if written != size {
@@ -1888,6 +1910,38 @@ mod tests {
         survivor
             .stop(Duration::from_secs(10))
             .expect("the second child stops");
+    }
+
+    /// Only `ESRCH` means the process is gone.
+    ///
+    /// Runs on every leg, including the one with no `libc`, because the rule is
+    /// a function over an `Option<i32>` rather than a `match` buried in a
+    /// `#[cfg(target_os = "macos")]` body. `ESRCH` is 3 on both Unix platforms,
+    /// but it is passed in rather than assumed, so this stays true of a
+    /// platform where it is not.
+    #[test]
+    fn only_no_such_process_means_gone() {
+        const ESRCH: i32 = 3;
+        const EPERM: i32 = 1;
+
+        assert!(probe_failure_means_gone(Some(ESRCH), ESRCH));
+
+        // The finding this guards. A zero `errno` was once folded in with
+        // `ESRCH`, which contradicted the Windows policy on
+        // `ERROR_ACCESS_DENIED`: an unexplained failure is not evidence that
+        // the process is gone, and answering `Gone` for one is how an agent
+        // decides to start a second runner for an attempt that already has one.
+        assert!(
+            !probe_failure_means_gone(Some(0), ESRCH),
+            "a zero errno is an unexplained failure, not an absent process"
+        );
+
+        // A process owned by another account. Reporting this as `Gone` would
+        // silently un-adopt every runner after a service-account change.
+        assert!(!probe_failure_means_gone(Some(EPERM), ESRCH));
+
+        // No errno at all is not evidence of anything either.
+        assert!(!probe_failure_means_gone(None, ESRCH));
     }
 
     /// The three-way answer, on synthesised tokens, on every platform.

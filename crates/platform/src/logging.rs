@@ -1115,6 +1115,50 @@ mod tests {
         assert!(!output.contains(JIT_BLOB), "a span field leaked:\n{output}");
     }
 
+    /// Asserts that [`install`] created its directories the restrictive way.
+    ///
+    /// `install` used to call `std::fs::create_dir_all(logs_dir)` directly.
+    /// That is invisible on Windows and *nearly* invisible on Unix — the
+    /// directory exists either way, and `AppPaths::create_all`'s own test still
+    /// passed, because it tests `create_all` rather than the path a running
+    /// daemon actually takes. So this checks the two things that distinguish
+    /// them:
+    ///
+    /// 1. **All four directories exist.** `create_dir_all(logs_dir)` makes
+    ///    exactly one. This half runs on every platform, which matters because
+    ///    Windows is the leg most likely to be run locally.
+    /// 2. **On Unix the mode is `0700`.** This is the invariant `create_all`
+    ///    documents — that a diagnostics file is not readable by other local
+    ///    accounts — and `tracing_appender` writes 0644 files into whatever
+    ///    directory it is given, so a `0755` `logs/` defeats it entirely.
+    fn assert_install_created_restricted_directories(paths: &crate::paths::AppPaths) {
+        for (purpose, path) in paths.all() {
+            assert!(
+                path.is_dir(),
+                "install must create the {purpose} directory too: going through \
+                 AppPaths::create_all is what applies the restriction, and creating only \
+                 logs/ is the bug this asserts against ({})",
+                path.display()
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let mode = std::fs::metadata(path)
+                    .expect("the directory exists")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o700,
+                    "the {purpose} directory is mode {mode:04o}; a diagnostics file under a \
+                     group- or world-readable directory is readable by other local accounts"
+                );
+            }
+        }
+    }
+
     /// The one test that exercises [`install`] rather than assembling a
     /// subscriber by hand: the rolling file appender, the non-blocking writer,
     /// and the guard that has to be held for any of it to reach disk.
@@ -1136,7 +1180,14 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths = crate::paths::AppPaths::rooted_at(root.path());
 
-        let Ok(guard) = install(&paths, "trace") else {
+        let outcome = install(&paths, "trace");
+
+        // Asserted before the early return below, because `install` creates the
+        // directories before it touches the global subscriber: this holds
+        // whether or not this test won the race to install one.
+        assert_install_created_restricted_directories(&paths);
+
+        let Ok(guard) = outcome else {
             // Another test binary in the same process already installed one.
             // Not this test's failure, and not worth making the suite
             // order-dependent over.
