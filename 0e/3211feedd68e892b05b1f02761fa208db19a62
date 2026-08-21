@@ -1,0 +1,70 @@
+.taskflow/2026-08-21-local-runner-manager/tasks/e2-runner-package-cache.md
+  s_8734642ae13f9b::t_59ed6d3f0351c8 1-69
+.taskflow/2026-08-21-local-runner-manager/tasks/b1-domain-core.md
+  s_8734642ae13f9b::t_7d0d48248befa9 1-102
+.taskflow/2026-08-21-local-runner-manager/tasks/b2-sqlite-persistence.md
+  s_8734642ae13f9b::t_7d0d48248befa9 1-58
+.taskflow/2026-08-21-local-runner-manager/tasks/e3-jit-lifecycle-recovery.md
+  s_8734642ae13f9b::t_ef2e1377b2a13e 1-83
+.taskflow/2026-08-21-local-runner-manager/tasks/f2-cli-policy-commands.md
+  s_8734642ae13f9b::t_b31840009aeae8 1-99
+.taskflow/2026-08-21-local-runner-manager/tasks/f3-cli-daemon-service.md
+  s_8734642ae13f9b::t_69969dfad97fb6 1-57
+.taskflow/2026-08-21-local-runner-manager/tasks/g2-tui-screens.md
+  s_8734642ae13f9b::t_dc3ac4af237fe1 1-76
+.taskflow/2026-08-21-local-runner-manager/tasks/c1-d17-scale-set-spike.md
+  s_8734642ae13f9b::t_a332749239dc2a 1-89
+.taskflow/2026-08-21-local-runner-manager/tasks/g3-tui-settings-parity.md
+  s_8734642ae13f9b::t_064538479dd5a3 1-72
+.taskflow/2026-08-21-local-runner-manager/tasks/c5-scale-set-message-protocol.md
+  s_8734642ae13f9b::t_6e3a75a35e99ab 1-85
+.taskflow/2026-08-21-local-runner-manager/tasks/h1-e2e-security-acceptance.md
+  s_8734642ae13f9b::t_c1c8f3f6b6649c 1-80
+.taskflow/2026-08-21-local-runner-manager/README.md
+  s_8734642ae13f9b::t_0df3ee2b8d2f19 3-6
+  s_8734642ae13f9b::t_70be7db6cd7370 79-80
+.taskflow/2026-08-21-local-runner-manager/tasks/a1-workspace-ci-foundation.md
+  s_8734642ae13f9b::t_313ab2379bbf29 1-95
+.taskflow/2026-08-21-local-runner-manager/tasks/g1-tui-shell-input.md
+  s_8734642ae13f9b::t_d4e867d3943875 1-86
+.taskflow/2026-08-21-local-runner-manager/tasks/README.md
+  s_8734642ae13f9b::t_ef053319a0bb5b 1-71
+.taskflow/2026-08-21-local-runner-manager/tasks/a3-distribution-and-readme.md
+  s_8734642ae13f9b::t_1553e8ceb662ab 1-84
+.taskflow/2026-08-21-local-runner-manager/tasks/c2-device-flow-auth.md
+  s_8734642ae13f9b::t_14d6c2aa2519c4 1-84
+.taskflow/2026-08-21-local-runner-manager/tasks/c4-actions-service-admin.md
+  s_8734642ae13f9b::t_23cc1c16eef588 1-86
+.taskflow/2026-08-21-local-runner-manager/tasks/e1-reconciliation-capacity.md
+  s_8734642ae13f9b::t_8746a16686f7ed 1-90
+.taskflow/2026-08-21-local-runner-manager/tasks/d3-service-installers.md
+  s_8734642ae13f9b::t_f60b486991b8d2 1-76
+.taskflow/2026-08-21-local-runner-manager/ROADMAP.md
+  s_8734642ae13f9b::t_caa0b4c5a2a2c2 7,12-17,25-27,31-51,54-75,79-81,84-132,144
+.taskflow/2026-08-21-local-runner-manager/tasks/a2-release-workflow.md
+  s_8734642ae13f9b::t_1553e8ceb662ab 1-70
+.taskflow/2026-08-21-local-runner-manager/tasks/d2-machine-secret-store.md
+  s_8734642ae13f9b::t_fb79f9a6a783e0 1-71
+.taskflow/2026-08-21-local-runner-manager/tasks/c3-rest-inventory-gateway.md
+  s_8734642ae13f9b::t_6d09d2ee98c187 1-79
+.taskflow/2026-08-21-local-runner-manager/tasks/d1-platform-core.md
+  s_8734642ae13f9b::t_2cdfe32ba7fd59 1-80
+.taskflow/2026-08-21-local-runner-manager/tasks/f1-cli-auth-host-status.md
+  s_8734642ae13f9b::t_d71bc9c368a696 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "0e3211feedd68e892b05b1f02761fa208db19a62",
+  "prompts": {},
+  "sessions": {
+    "s_8734642ae13f9b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "39499f71-503a-481b-b0fe-6b972d803dc1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
