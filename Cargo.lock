@@ -2433,6 +2433,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -2451,15 +2452,18 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -2505,6 +2509,7 @@ dependencies = [
  "runner-manager-github",
  "runner-manager-platform",
  "runner-manager-testkit",
+ "secrecy",
  "serde",
  "serde_json",
  "serial_test",
@@ -2532,6 +2537,7 @@ dependencies = [
  "runner-manager-github",
  "runner-manager-platform",
  "runner-manager-testkit",
+ "secrecy",
  "serde",
  "serde_json",
  "serial_test",
@@ -2559,6 +2565,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2619,6 +2626,7 @@ dependencies = [
  "chrono",
  "directories",
  "insta",
+ "libc",
  "runner-manager-domain",
  "runner-manager-testkit",
  "secrecy",
@@ -2899,6 +2907,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -3867,6 +3887,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

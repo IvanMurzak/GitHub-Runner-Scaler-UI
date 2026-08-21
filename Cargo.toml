@@ -78,12 +78,25 @@ async-trait = "0.1.92"
 # links the system OpenSSL fails on hosts carrying a different major version,
 # and every documented install path here is "download the binary and run it"
 # (`09-release-distribution.md`).
+#
+# `query` gates `RequestBuilder::query()`, which every paginated GitHub call
+# needs: `c3` pages the runner inventory and filters in-progress runs, `c4`
+# pages queued runs and their jobs. Both are group C, so without this feature
+# both tasks would have to edit `crates/github/Cargo.toml`.
+#
+# `stream` gates `Response::bytes_stream()`. `e2` downloads the GitHub runner
+# package — 150-300 MB — and must verify its SHA-256 *before* extraction and
+# delete the partial file on mismatch. Without a stream the only option is
+# buffering the whole package in RAM on a home host, and there is no partial
+# file left on disk to remove.
 reqwest = { version = "0.13.4", default-features = false, features = [
     "charset",
     "gzip",
     "http2",
     "json",
+    "query",
     "rustls",
+    "stream",
     "system-proxy",
 ] }
 url = "2.5.8"
@@ -155,15 +168,65 @@ rand = "0.10.2"
 # --- Windows-only platform adapters -----------------------------------------
 # DPAPI machine scope for the secret store (`d2`) and the service control
 # handler the Windows service host needs (`d3`).
+#
+# The `windows` crate gates every binding behind a feature module, so a missing
+# module is a compile error in the task that needs the call, not a runtime
+# surprise. Each one below is here because a named task's Definition of Done
+# cannot be met without it:
+#
+#   Win32_Foundation             `LocalFree`, `HANDLE`, `CloseHandle` — the
+#                                types every other module below returns.
+#   Win32_Security               parent of the two security modules; also
+#                                `SECURITY_ATTRIBUTES` for the restrictive
+#                                handles `d1` and `e3` create.
+#   Win32_Security_Cryptography  `CryptProtectData`/`CryptUnprotectData`, the
+#                                DPAPI machine scope behind `d2`.
+#   Win32_Security_Authorization `SetNamedSecurityInfoW`/`GetNamedSecurityInfoW`
+#                                — `d2` must ACL the stored token to the service
+#                                account so an ordinary local user cannot read
+#                                it, and its DoD asserts that per OS, which
+#                                means reading the ACL back.
+#   Win32_System_Threading       `OpenProcess` + `GetProcessTimes`. `d1` needs a
+#                                process identity that survives a restart and
+#                                does *not* match a recycled PID; process start
+#                                time is the discriminator. `e3`'s
+#                                restart-recovery DoD rests on the same
+#                                primitive.
+#   Win32_Storage_FileSystem     `CreateFileW` taking `SECURITY_ATTRIBUTES`, for
+#                                `d1`'s restrictive handoff and `e3`'s
+#                                restrictive temporary file.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
 ] }
 windows-service = "0.8.1"
 
 # --- macOS-only platform adapters -------------------------------------------
 # System Keychain for the machine-scoped secret store (`d2`).
 security-framework = "3.7.0"
+
+# --- Unix-only platform adapters --------------------------------------------
+# The Unix half of the same process-identity primitive the Windows block above
+# describes: `d1` needs a process identity that a recycled PID cannot forge, so
+# it pairs the PID with the process start time. Windows reads that through
+# `GetProcessTimes`; macOS reads it through `sysctl(KERN_PROC)` and Linux
+# through field 22 of `/proc/<pid>/stat`, neither of which `std` exposes.
+#
+# `libc` rather than `sysinfo`, on three grounds. (1) `sysinfo` would only be
+# doing the Unix half anyway — Windows already goes through the `windows` crate
+# for `GetProcessTimes` — so it buys one platform path and leaves two sources
+# of truth for the same fact. (2) `sysinfo` reports process start time as whole
+# seconds since the epoch, which is coarser than a PID-recycling discriminator
+# wants, and it refreshes a whole process table to answer a question about one
+# PID. (3) `libc` is already in the resolved graph transitively, so declaring
+# it adds no package to `Cargo.lock` and nothing new to audit. The cost is the
+# two `unsafe` platform paths in `d1`, both short and both testable against the
+# calling process itself.
+libc = "0.2.189"
 
 # --- Test-only --------------------------------------------------------------
 insta = "1.48.0"

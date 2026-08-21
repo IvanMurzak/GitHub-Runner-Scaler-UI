@@ -17,7 +17,7 @@ repository.workspace = true
 homepage.workspace = true
 # No `readme` key: the repository README belongs to a3, and a path pointing
 # outside `crates/app/` is not packageable anyway.
-keywords =["github-actions", "self-hosted-runner", "autoscaling", "tui", "cli"]
+keywords = ["github-actions", "self-hosted-runner", "autoscaling", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
@@ -35,6 +35,9 @@ runner-manager-agent = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }
+# `f1` hands the user access token to the `d2` secret store, and it must carry
+# it in the redacting wrapper the whole way (`07-security.md`).
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -50,3 +53,5 @@ predicates = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+# `f3`'s daemon shutdown and backoff tests drive `tokio::time::pause()`.
+tokio = { workspace = true, features = ["test-util"] }

@@ -27,6 +27,10 @@ reqwest = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }
+# `e3` writes the JIT runner configuration to a restrictive temporary file, and
+# getting the bytes back out of the redacting wrapper `c4` returns needs
+# `ExposeSecret` in scope here (`07-security.md`).
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
