@@ -75,6 +75,19 @@ pub enum AttemptError {
 
     #[error("{state} is not terminal, so it must not carry a terminal_at")]
     NonTerminalWithTimestamp { state: AttemptState },
+
+    #[error(
+        "{state} carries {field} at {found}, which is before its created_at of \
+         {created_at}; an attempt cannot have changed state or concluded before \
+         it was allocated"
+    )]
+    TimestampsOutOfOrder {
+        state: AttemptState,
+        /// Which of the two orderable timestamps is out of order.
+        field: &'static str,
+        created_at: Timestamp,
+        found: Timestamp,
+    },
 }
 
 /// Ownership rule 2: "A host agent may act only on attempts persisted under its
@@ -107,10 +120,12 @@ pub enum OwnershipError {
 // ---------------------------------------------------------------------------
 
 /// The runner-attempt lifecycle, exactly as `04-subsystem-contracts.md` draws
-/// it:
+/// it after its 2026-08-21 amendment:
 ///
 /// ```text
 /// allocated -> jit_received -> starting -> idle | busy
+/// idle -> busy
+/// allocated | jit_received | starting -> failed | orphaned
 /// idle | busy -> finished | failed | orphaned
 /// finished | failed | orphaned -> cleaned
 /// ```
@@ -120,22 +135,34 @@ pub enum OwnershipError {
 /// product has none, by D7.
 ///
 /// **Every transition outside that diagram is rejected**, which `b1`'s
-/// Definition of Done requires. Three consequences are surprising enough to name
-/// here, because they are properties of the *diagram*, not of this
-/// implementation, and each is recorded as a finding rather than quietly patched:
+/// Definition of Done requires. `cleaned` is absorbing, which is correct and
+/// intended.
 ///
-/// * There is no `idle -> busy` edge. The diagram treats `idle` and `busy` as
-///   alternative outcomes of `starting`, so a runner observed idle and then
-///   assigned a job has nowhere legal to go.
-/// * There is no terminal edge out of `allocated`, `jit_received`, or
-///   `starting`. An attempt whose JIT request fails, whose process fails to
-///   spawn, or that is found dead after a restart before it ever registered
-///   cannot be recorded as `failed` or `orphaned`.
-/// * `cleaned` is absorbing, which is correct and intended.
+/// **The last two edge sets were added by amendment, and the reasons matter to
+/// anyone reading this state machine.** `b1` first implemented the original
+/// diagram faithfully and surfaced its gaps as an explicit
+/// `NoLegalTransition` decision rather than inventing edges; the amendment
+/// closed them at the design level, and that decision value is gone with them:
 ///
-/// [`recovery_decision`] returns [`RecoveryDecision::NoLegalTransition`] at
-/// exactly the points where the second and third bullets bite, so the gap is
-/// discoverable from a test run rather than from a careful reading.
+/// * **`idle -> busy`.** `e3`'s Scope step 4 moves an attempt through
+///   `jit_received`, `starting`, `idle`, `busy` *in sequence*, and the
+///   definition of `idle` above describes a state that by construction precedes
+///   a job. Without this edge a runner observed idle and then assigned a job had
+///   nowhere legal to go.
+/// * **Terminal edges out of the three pre-registration states.** An attempt
+///   counts against host capacity for exactly as long as it is non-terminal
+///   ([`Self::counts_against_capacity`]), so an attempt that could not reach a
+///   terminal state **held a host capacity slot permanently**: two failed JIT
+///   requests on a `host_capacity: 2` host wedged that host into starting zero
+///   runners, with no error state and no cleanup path. `orphaned` is included
+///   for the restart case, where a pre-registration attempt is found after the
+///   agent restarts.
+///
+/// Those edges are also what make five of the seven [`FailureReason`] variants
+/// reachable at all — `JitRequestFailed`, `JitExpired`,
+/// `RunnerPackageUnverified`, `RunnerVersionRejected` and `ProcessStartFailed`
+/// each occur at a pre-registration state, and `03-control-flows.md` flow 2
+/// names every one as a condition the agent must record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -165,19 +192,45 @@ impl AttemptState {
 
     /// The complete legal transition list. A self-transition is not in it.
     pub const LEGAL: &'static [(AttemptState, AttemptState)] = &[
+        // `allocated -> jit_received -> starting -> idle | busy`.
         (AttemptState::Allocated, AttemptState::JitReceived),
         (AttemptState::JitReceived, AttemptState::Starting),
         (AttemptState::Starting, AttemptState::Idle),
         (AttemptState::Starting, AttemptState::Busy),
+        // `idle -> busy`.
+        (AttemptState::Idle, AttemptState::Busy),
+        // `allocated | jit_received | starting -> failed | orphaned`.
+        (AttemptState::Allocated, AttemptState::Failed),
+        (AttemptState::Allocated, AttemptState::Orphaned),
+        (AttemptState::JitReceived, AttemptState::Failed),
+        (AttemptState::JitReceived, AttemptState::Orphaned),
+        (AttemptState::Starting, AttemptState::Failed),
+        (AttemptState::Starting, AttemptState::Orphaned),
+        // `idle | busy -> finished | failed | orphaned`.
         (AttemptState::Idle, AttemptState::Finished),
         (AttemptState::Idle, AttemptState::Failed),
         (AttemptState::Idle, AttemptState::Orphaned),
         (AttemptState::Busy, AttemptState::Finished),
         (AttemptState::Busy, AttemptState::Failed),
         (AttemptState::Busy, AttemptState::Orphaned),
+        // `finished | failed | orphaned -> cleaned`.
         (AttemptState::Finished, AttemptState::Cleaned),
         (AttemptState::Failed, AttemptState::Cleaned),
         (AttemptState::Orphaned, AttemptState::Cleaned),
+    ];
+
+    /// The five states an attempt can still be concluded from: every
+    /// non-terminal state. After the amendment this is exactly
+    /// "not [`Self::is_terminal`]", which is what closed the permanently-held
+    /// capacity slot — but it is written out rather than derived, because the
+    /// two are only equal while the diagram gives every live state a terminal
+    /// edge, and that equality is a property worth failing loudly on.
+    pub const CONCLUDABLE_FROM: &'static [AttemptState] = &[
+        AttemptState::Allocated,
+        AttemptState::JitReceived,
+        AttemptState::Starting,
+        AttemptState::Idle,
+        AttemptState::Busy,
     ];
 
     #[must_use]
@@ -361,7 +414,15 @@ impl AttemptOutcome {
         matches!(self, AttemptOutcome::CompletedJob)
     }
 
-    /// The state an attempt must be in for this outcome to be reachable.
+    /// The states an attempt must be in for this outcome to be reachable.
+    ///
+    /// Two of the four outcomes are narrower than the diagram's terminal edges,
+    /// and deliberately so: `finished` is reachable from both `idle` and `busy`,
+    /// but only one of them can have produced each of the two outcomes that lead
+    /// there. Failure and orphaning are as wide as the diagram — every live
+    /// state has a `-> failed | orphaned` edge since the amendment, and
+    /// narrowing them per [`FailureReason`] here would invent product rules no
+    /// document states.
     const fn required_from(&self) -> &'static [AttemptState] {
         match self {
             // Only a runner that was assigned a job can have run one.
@@ -369,7 +430,7 @@ impl AttemptOutcome {
             // Only a runner that was registered and waiting can have exited idle.
             AttemptOutcome::ExitedIdleWithoutWork => &[AttemptState::Idle],
             AttemptOutcome::Failed { .. } | AttemptOutcome::Orphaned => {
-                &[AttemptState::Idle, AttemptState::Busy]
+                AttemptState::CONCLUDABLE_FROM
             }
         }
     }
@@ -430,6 +491,14 @@ pub struct RunnerAttempt {
 ///
 /// `b2` maps database columns onto this type. With a struct that mapping is
 /// checked by name at compile time; positionally it was checked by nothing.
+///
+/// **That guarantee covers the Rust side of the mapping and no more.** It is
+/// the *field* names that the compiler checks, not the column names they are
+/// read from: `PersistedAttempt { created_at: row.get("last_state_change_at")?,
+/// … }` compiles exactly as happily as the correct version, and reintroduces the
+/// very transposition described above. `b2` still owes a test that loads a row
+/// whose columns hold distinguishable values and asserts each landed in the
+/// field of the same name; this type does not supply one.
 ///
 /// Construct it with a struct literal so every field is written down at the call
 /// site — that is the whole point, and a builder or a `Default` would give the
@@ -553,6 +622,34 @@ impl RunnerAttempt {
             _ => {}
         }
 
+        // Presence was checked above; *ordering* is checked here, and it is a
+        // separate hazard. `created_at` never moves and every other timestamp is
+        // written by a transition that happens after it, so a row where either
+        // precedes it is one this crate cannot have produced. Without this, a
+        // `finished` row with `created_at: ts(100), terminal_at: Some(ts(0))`
+        // loaded cleanly -- an attempt that concluded a hundred seconds before
+        // it was created -- and every duration computed from the pair came out
+        // negative or wrapped. The hand-edited-journal threat model that
+        // motivates the presence gate covers this equally.
+        if last_state_change_at < created_at {
+            return Err(AttemptError::TimestampsOutOfOrder {
+                state,
+                field: "last_state_change_at",
+                created_at,
+                found: last_state_change_at,
+            });
+        }
+        if let Some(terminal_at) = terminal_at
+            && terminal_at < created_at
+        {
+            return Err(AttemptError::TimestampsOutOfOrder {
+                state,
+                field: "terminal_at",
+                created_at,
+                found: terminal_at,
+            });
+        }
+
         Ok(Self {
             id,
             policy_id,
@@ -660,12 +757,14 @@ impl RunnerAttempt {
         Ok(())
     }
 
-    /// `starting -> busy`: the runner was assigned its one job.
+    /// `starting | idle -> busy`: the runner was assigned its one job.
+    ///
+    /// Both sources are real. A runner may be observed taking a job directly out
+    /// of `starting`, or it may be seen `idle` first and pick the job up on a
+    /// later pass — `e3`'s Scope step 4 walks the second sequence explicitly.
     ///
     /// # Errors
-    /// [`AttemptError::IllegalTransition`] from any other state — including
-    /// `idle`, which the diagram in `04-subsystem-contracts.md` gives no edge
-    /// out of into `busy`. See the note on [`AttemptState`].
+    /// [`AttemptError::IllegalTransition`] from any other state.
     pub fn assigned_job(
         &mut self,
         github_runner_id: u64,
@@ -846,20 +945,23 @@ pub enum RecoveryDecision {
     /// (flow 3.3).
     Defer,
     /// Move the attempt to this state to match what was observed.
+    ///
+    /// **Where the observed state is live, the caller must adopt supervision of
+    /// the process independently of this decision.** `RecoveryDecision` has no
+    /// way to express "adopt *and* observe" — the two are separate variants —
+    /// so `Starting` with `process_alive` and `Registered { busy: false }`
+    /// returns `Observe(Idle)` and never [`Self::Adopt`], because GitHub is
+    /// authoritative for the remote status while the local process is
+    /// authoritative for supervision, and both facts are true at once.
+    ///
+    /// **An `Observe` decision must be applied *and persisted*, or it repeats
+    /// forever.** The decision is a pure function of the journalled state and
+    /// the observation, so a caller that moves the in-memory attempt without
+    /// writing the new state back will read the same stale state on the next
+    /// pass and be handed the same decision, indefinitely.
     Observe(AttemptState),
     /// Conclude the attempt with this outcome.
     Conclude(AttemptOutcome),
-    /// The observation calls for a transition the state diagram does not contain.
-    ///
-    /// This is not a defensive branch; it is a finding surfaced as a value. See
-    /// the note on [`AttemptState`] — the diagram in `04-subsystem-contracts.md`
-    /// has no terminal edge out of `allocated`, `jit_received`, or `starting`,
-    /// and no `idle -> busy` edge, so a dead pre-registration attempt and an idle
-    /// attempt that GitHub reports as busy both land here.
-    NoLegalTransition {
-        from: AttemptState,
-        wanted: AttemptState,
-    },
 }
 
 /// Decide what to do about one journalled attempt after a restart, or on any
@@ -910,24 +1012,43 @@ pub fn recovery_decision(
                     // runner as `failed` and left its registration at GitHub
                     // unreconciled and unremoved.
                     //
-                    // Each state takes the one legal edge out of itself, so
+                    // Each state takes the one *forward* edge out of itself, so
                     // recovery walks the diagram rather than jumping across it:
                     // `allocated -> jit_received` (the registration proves the
                     // JIT configuration arrived) and `jit_received -> starting`.
                     // `busy` is deliberately not consulted here -- neither state
                     // has an edge to it, and the next pass, from `starting`, is
                     // where that distinction becomes legal and is drawn.
+                    //
+                    // This is a genuine recovery path and not a workaround for a
+                    // missing edge: GitHub really is reporting a live runner,
+                    // and each step really did happen. It survived the diagram
+                    // amendment unchanged.
                     G::Registered { .. } => RecoveryDecision::Observe(if state == S::Allocated {
                         S::JitReceived
                     } else {
                         S::Starting
                     }),
+                    // Past the handoff deadline with nothing at GitHub and no
+                    // process: the attempt died before registering, and since
+                    // the amendment it can say so directly. It previously had to
+                    // report `NoLegalTransition` and hold its host capacity slot
+                    // for ever.
+                    //
+                    // The two states get different reasons because they know
+                    // different things. At `allocated` no configuration was ever
+                    // recorded as arriving, so the request itself did not
+                    // complete; at `jit_received` one arrived and was never
+                    // claimed, which is flow 4.4's expiry.
                     G::NotRegistered => {
                         if elapsed >= timeouts.jit_handoff {
-                            RecoveryDecision::NoLegalTransition {
-                                from: state,
-                                wanted: S::Failed,
-                            }
+                            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                                if state == S::Allocated {
+                                    FailureReason::JitRequestFailed
+                                } else {
+                                    FailureReason::JitExpired
+                                },
+                            ))
                         } else {
                             RecoveryDecision::Wait
                         }
@@ -945,14 +1066,17 @@ pub fn recovery_decision(
             // A live process inside its startup window is adopted, the same as
             // in every other pre-terminal state: `e3` must take over supervision
             // rather than start a second runner for the same work.
+            //
+            // Anything else here is a runner that did not come up: flow 2's
+            // "runner exit before job acceptance". Since the amendment that is
+            // recordable, so the attempt concludes and gives its slot back.
             G::NotRegistered => {
                 if observation.process_alive && elapsed < timeouts.startup {
                     RecoveryDecision::Adopt
                 } else {
-                    RecoveryDecision::NoLegalTransition {
-                        from: S::Starting,
-                        wanted: S::Failed,
-                    }
+                    RecoveryDecision::Conclude(AttemptOutcome::failed(
+                        FailureReason::ProcessExitedUnexpectedly,
+                    ))
                 }
             }
             G::Unreachable => unreachable!("handled above"),
@@ -982,12 +1106,11 @@ pub fn recovery_decision(
                 G::Registered { busy: false } => {
                     RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
                 }
-                // GitHub says this runner took a job. The diagram has no
-                // `idle -> busy` edge, so there is nothing legal to record.
-                G::Registered { busy: true } => RecoveryDecision::NoLegalTransition {
-                    from: S::Idle,
-                    wanted: S::Busy,
-                },
+                // GitHub says this runner took a job, and GitHub is
+                // authoritative for remote job status. `idle -> busy` is an edge
+                // since the amendment, so this is now recorded rather than
+                // reported as unrepresentable.
+                G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
                 G::Unreachable => unreachable!("handled above"),
             }
         }
@@ -1122,22 +1245,35 @@ mod tests {
     ///
     /// ```text
     /// allocated -> jit_received -> starting -> idle | busy
+    /// idle -> busy
+    /// allocated | jit_received | starting -> failed | orphaned
     /// idle | busy -> finished | failed | orphaned
     /// finished | failed | orphaned -> cleaned
     /// ```
     fn diagram_edges() -> Vec<(AttemptState, AttemptState)> {
         use AttemptState::*;
+        // Line 1.
         let mut edges = vec![
             (Allocated, JitReceived),
             (JitReceived, Starting),
             (Starting, Idle),
             (Starting, Busy),
         ];
+        // Line 2, added by the 2026-08-21 amendment.
+        edges.push((Idle, Busy));
+        // Line 3, added by the same amendment.
+        for from in [Allocated, JitReceived, Starting] {
+            for to in [Failed, Orphaned] {
+                edges.push((from, to));
+            }
+        }
+        // Line 4.
         for from in [Idle, Busy] {
             for to in [Finished, Failed, Orphaned] {
                 edges.push((from, to));
             }
         }
+        // Line 5.
         for from in [Finished, Failed, Orphaned] {
             edges.push((from, Cleaned));
         }
@@ -1149,7 +1285,7 @@ mod tests {
         let expected = diagram_edges();
         assert_eq!(
             expected.len(),
-            13,
+            20,
             "the transcription itself changed; check it against the diagram"
         );
 
@@ -1186,8 +1322,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_seen, 13);
-        assert_eq!(illegal_seen, 81 - 13);
+        assert_eq!(legal_seen, 20);
+        assert_eq!(illegal_seen, 81 - 20);
 
         // And the published constant matches the transcription.
         let mut published = AttemptState::LEGAL.to_vec();
@@ -1195,6 +1331,48 @@ mod tests {
         published.sort_unstable();
         transcribed.sort_unstable();
         assert_eq!(published, transcribed);
+    }
+
+    #[test]
+    fn every_live_state_has_a_terminal_edge_so_no_attempt_can_hold_a_slot_forever() {
+        // The operational half of the amendment, asserted as the property it is
+        // rather than as a list of edges. An attempt occupies a host capacity
+        // slot for exactly as long as it is non-terminal, so a live state with
+        // no terminal edge is a state an attempt can be stranded in -- which is
+        // how two failed JIT requests wedged a `host_capacity: 2` host into
+        // starting zero runners, with no error and no cleanup path.
+        for state in AttemptState::ALL {
+            if state.is_terminal() {
+                continue;
+            }
+            assert!(
+                state.counts_against_capacity(),
+                "{state} is non-terminal, so it holds a slot"
+            );
+            assert!(
+                state.can_transition_to(AttemptState::Failed)
+                    || state.can_transition_to(AttemptState::Finished),
+                "{state} has no way to conclude, so an attempt in it holds a host \
+                 capacity slot permanently"
+            );
+            assert!(
+                state.can_transition_to(AttemptState::Orphaned),
+                "{state} has no orphan edge, so an attempt found in it after a \
+                 restart cannot be recorded"
+            );
+            assert!(
+                AttemptState::CONCLUDABLE_FROM.contains(&state),
+                "{state} is live but missing from CONCLUDABLE_FROM"
+            );
+        }
+        assert_eq!(
+            AttemptState::CONCLUDABLE_FROM.len(),
+            AttemptState::ALL
+                .iter()
+                .filter(|s| !s.is_terminal())
+                .count(),
+            "CONCLUDABLE_FROM must list every non-terminal state and nothing else"
+        );
     }
 
     #[test]
@@ -1342,26 +1520,98 @@ mod tests {
             })
         ));
 
-        // Failures and orphaning are reachable from both.
-        attempt_in(AttemptState::Idle, 0)
-            .conclude(AttemptOutcome::failed(FailureReason::JitExpired), ts(1))
-            .unwrap();
-        attempt_in(AttemptState::Busy, 0)
-            .conclude(AttemptOutcome::Orphaned, ts(1))
-            .unwrap();
+        // Failure and orphaning are reachable from every live state, including
+        // the three pre-registration ones the amendment gave terminal edges.
+        for state in AttemptState::CONCLUDABLE_FROM {
+            attempt_in(*state, 0)
+                .conclude(AttemptOutcome::failed(FailureReason::JitExpired), ts(1))
+                .unwrap_or_else(|e| panic!("{state} must be able to fail: {e}"));
+            attempt_in(*state, 0)
+                .conclude(AttemptOutcome::Orphaned, ts(1))
+                .unwrap_or_else(|e| panic!("{state} must be able to orphan: {e}"));
+        }
 
-        // But not from a pre-registration state.
-        for state in [
-            AttemptState::Allocated,
-            AttemptState::JitReceived,
-            AttemptState::Starting,
-        ] {
+        // And from a terminal state nothing can be concluded at all -- a second
+        // conclusion would overwrite the first.
+        for state in AttemptState::ALL.iter().filter(|s| s.is_terminal()) {
             assert!(
-                attempt_in(state, 0)
+                attempt_in(*state, 0)
                     .conclude(AttemptOutcome::Orphaned, ts(1))
                     .is_err(),
-                "the diagram gives {state} no terminal edge"
+                "{state} has already concluded"
             );
+        }
+    }
+
+    #[test]
+    fn all_seven_failure_reasons_are_reachable_from_the_state_that_produces_them() {
+        // `03-control-flows.md` flow 2 names every one of these by name as a
+        // condition the agent must record. Before the diagram amendment five of
+        // the seven were unreachable: each occurs at a pre-registration state,
+        // and `allocated`, `jit_received` and `starting` had no terminal edge, so
+        // `conclude` answered `OutcomeUnreachable` from every state that could
+        // actually have produced them. A `FailureReason` variant that nothing can
+        // reach is a variant `g2` renders a match arm for and no test can cover.
+        //
+        // The state paired with each reason is the earliest one at which the
+        // agent learns that fact, taken from flow 2's own step order.
+        let cases: [(FailureReason, AttemptState); 7] = [
+            // Step 5: the package is verified before the JIT request is made.
+            (
+                FailureReason::RunnerPackageUnverified,
+                AttemptState::Allocated,
+            ),
+            // Step 5: `generate-jitconfig` did not return a configuration.
+            (FailureReason::JitRequestFailed, AttemptState::Allocated),
+            // Flow 4.4: a configuration arrived and was never claimed.
+            (FailureReason::JitExpired, AttemptState::JitReceived),
+            // Step 6: the child process could not be spawned.
+            (FailureReason::ProcessStartFailed, AttemptState::JitReceived),
+            // Edge case 7: GitHub refuses the registration on version grounds.
+            (FailureReason::RunnerVersionRejected, AttemptState::Starting),
+            // Flow 2's "runner exit before job acceptance".
+            (
+                FailureReason::ProcessExitedUnexpectedly,
+                AttemptState::Starting,
+            ),
+            (
+                FailureReason::Other("a reason b1 did not anticipate".into()),
+                AttemptState::Busy,
+            ),
+        ];
+
+        // Every variant is covered exactly once, so adding an eighth without
+        // giving it a reachable state fails here rather than silently.
+        assert_eq!(
+            cases.len(),
+            7,
+            "FailureReason has seven variants; each needs a state it is reachable \
+             from"
+        );
+
+        for (reason, from) in cases {
+            let mut attempt = attempt_in(from, 0);
+            attempt
+                .conclude(AttemptOutcome::failed(reason.clone()), ts(5))
+                .unwrap_or_else(|e| panic!("{reason:?} must be recordable from {from}, got {e}"));
+
+            assert_eq!(attempt.state(), AttemptState::Failed);
+            assert_eq!(attempt.terminal_at(), Some(ts(5)));
+            assert_eq!(
+                attempt.outcome(),
+                Some(&AttemptOutcome::failed(reason.clone()))
+            );
+            assert!(
+                !attempt.counts_against_capacity(),
+                "{reason:?} from {from} must give the host capacity slot back; \
+                 that is what the amendment was for"
+            );
+
+            // And it survives the persistence gate, so the row `b2` writes for
+            // it can be read back.
+            let restored = RunnerAttempt::from_persisted(attempt.to_persisted())
+                .unwrap_or_else(|e| panic!("{reason:?} from {from} must reload: {e}"));
+            assert_eq!(restored, attempt);
         }
     }
 
@@ -1554,6 +1804,65 @@ mod tests {
         let mut cleaned = row(AttemptState::Cleaned, Some(AttemptOutcome::Orphaned));
         cleaned.terminal_at = Some(ts(4));
         assert!(RunnerAttempt::from_persisted(cleaned).is_ok());
+    }
+
+    #[test]
+    fn a_hand_edited_journal_row_whose_timestamps_run_backwards_is_rejected() {
+        // Presence was already gated; ordering was not, so a row saying an
+        // attempt concluded a hundred seconds before it was created loaded
+        // cleanly and every duration derived from the pair came out negative.
+        // The same hand-edited-journal threat model that motivates the presence
+        // gate covers this, and `b2` is the task that will meet it.
+        let mut concluded_before_created =
+            row(AttemptState::Finished, Some(AttemptOutcome::CompletedJob));
+        concluded_before_created.created_at = ts(100);
+        concluded_before_created.last_state_change_at = ts(100);
+        concluded_before_created.terminal_at = Some(ts(0));
+        assert_eq!(
+            RunnerAttempt::from_persisted(concluded_before_created),
+            Err(AttemptError::TimestampsOutOfOrder {
+                state: AttemptState::Finished,
+                field: "terminal_at",
+                created_at: ts(100),
+                found: ts(0),
+            })
+        );
+
+        // The same for the timestamp every recovery timeout is measured from. A
+        // `last_state_change_at` before `created_at` makes `now - it` larger
+        // than the attempt's whole life, so every timeout reads as expired.
+        let mut changed_before_created = row(AttemptState::Busy, None);
+        changed_before_created.created_at = ts(100);
+        changed_before_created.last_state_change_at = ts(0);
+        assert_eq!(
+            RunnerAttempt::from_persisted(changed_before_created),
+            Err(AttemptError::TimestampsOutOfOrder {
+                state: AttemptState::Busy,
+                field: "last_state_change_at",
+                created_at: ts(100),
+                found: ts(0),
+            })
+        );
+
+        // Equal is not out of order: `allocate` writes the same instant to both,
+        // so the very first row of every attempt has `created_at ==
+        // last_state_change_at`, and an attempt concluded in the same second it
+        // was allocated has all three equal.
+        let mut same_instant = row(AttemptState::Failed, Some(AttemptOutcome::Orphaned));
+        same_instant.outcome = Some(AttemptOutcome::failed(FailureReason::JitRequestFailed));
+        same_instant.created_at = ts(7);
+        same_instant.last_state_change_at = ts(7);
+        same_instant.terminal_at = Some(ts(7));
+        assert!(RunnerAttempt::from_persisted(same_instant).is_ok());
+
+        // And a well-ordered row is untouched by the new arm.
+        assert!(
+            RunnerAttempt::from_persisted(row(
+                AttemptState::Finished,
+                Some(AttemptOutcome::CompletedJob)
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1871,7 +2180,9 @@ mod tests {
         }
 
         // Unchanged where GitHub knows nothing: the timeout still decides, and a
-        // live process is still adopted rather than duplicated.
+        // live process is still adopted rather than duplicated. What changed at
+        // the amendment is only what the timeout produces -- a conclusion
+        // instead of a report that none was expressible.
         assert_eq!(
             recovery_decision(
                 &attempt_in(AttemptState::JitReceived, 0),
@@ -1882,10 +2193,7 @@ mod tests {
                 timeouts,
                 &clock,
             ),
-            RecoveryDecision::NoLegalTransition {
-                from: AttemptState::JitReceived,
-                wanted: AttemptState::Failed,
-            }
+            RecoveryDecision::Conclude(AttemptOutcome::failed(FailureReason::JitExpired))
         );
         assert_eq!(
             recovery_decision(
@@ -1938,13 +2246,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_registration_attempt_waits_until_its_deadline_then_has_nowhere_legal_to_go() {
-        // This test documents a gap in the state diagram rather than a decision
-        // this crate made. `04-subsystem-contracts.md` gives `allocated`,
-        // `jit_received`, and `starting` no edge to `failed` or `orphaned`, so a
-        // dead attempt that never registered cannot be concluded at all. `b1`'s
-        // Scope requires every transition outside the diagram to be rejected, so
-        // the decision reports the missing edge instead of inventing it.
+    fn a_pre_registration_attempt_waits_until_its_deadline_then_concludes() {
+        // This test used to document a gap in the state diagram: `allocated`,
+        // `jit_received` and `starting` had no edge to `failed` or `orphaned`,
+        // so a dead attempt that never registered could not be concluded at all
+        // and the decision reported the missing edge instead of inventing one.
+        // The 2026-08-21 amendment added those edges, and the whole point of
+        // adding them was that this attempt now gives its capacity slot back.
         let timeouts = RecoveryTimeouts::new(
             Elapsed::seconds(60),
             Elapsed::seconds(120),
@@ -1956,7 +2264,14 @@ mod tests {
             github: GithubRunnerObservation::NotRegistered,
         };
 
-        for state in [AttemptState::Allocated, AttemptState::JitReceived] {
+        // The two pre-JIT states conclude with different reasons, because they
+        // know different things: at `allocated` no configuration was ever
+        // recorded as arriving, at `jit_received` one arrived and was never
+        // claimed.
+        for (state, reason) in [
+            (AttemptState::Allocated, FailureReason::JitRequestFailed),
+            (AttemptState::JitReceived, FailureReason::JitExpired),
+        ] {
             let attempt = attempt_in(state, 1_000);
             assert_eq!(
                 recovery_decision(&attempt, observation, timeouts, &clock),
@@ -1966,17 +2281,15 @@ mod tests {
             clock.set(1_060);
             assert_eq!(
                 recovery_decision(&attempt, observation, timeouts, &clock),
-                RecoveryDecision::NoLegalTransition {
-                    from: state,
-                    wanted: AttemptState::Failed,
-                },
-                "{state} past its handoff window has no legal terminal edge"
+                RecoveryDecision::Conclude(AttemptOutcome::failed(reason)),
+                "{state} past its handoff window concludes rather than stranding \
+                 the attempt"
             );
             clock.set(1_059);
         }
 
-        // The same for `starting`, and for the one case where GitHub itself says
-        // an idle runner took a job.
+        // `starting` past its own, longer deadline: flow 2's "runner exit before
+        // job acceptance".
         clock.set(1_121);
         assert_eq!(
             recovery_decision(
@@ -1985,11 +2298,45 @@ mod tests {
                 timeouts,
                 &clock
             ),
-            RecoveryDecision::NoLegalTransition {
-                from: AttemptState::Starting,
-                wanted: AttemptState::Failed,
-            }
+            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            ))
         );
+
+        // Every one of those decisions must be applicable to the attempt it was
+        // made about; a decision the state machine then refuses would strand the
+        // attempt just as the missing edges did.
+        for (state, decision) in [
+            (
+                AttemptState::Allocated,
+                AttemptOutcome::failed(FailureReason::JitRequestFailed),
+            ),
+            (
+                AttemptState::JitReceived,
+                AttemptOutcome::failed(FailureReason::JitExpired),
+            ),
+            (
+                AttemptState::Starting,
+                AttemptOutcome::failed(FailureReason::ProcessExitedUnexpectedly),
+            ),
+        ] {
+            let mut attempt = attempt_in(state, 1_000);
+            attempt
+                .conclude(decision, ts(1_200))
+                .unwrap_or_else(|e| panic!("recovery decided {state} concludes, but: {e}"));
+            assert!(!attempt.counts_against_capacity());
+        }
+    }
+
+    #[test]
+    fn an_idle_runner_that_github_reports_as_busy_is_recorded_as_busy() {
+        // The `idle -> busy` half of the amendment, at the point it bites in
+        // recovery. GitHub is authoritative for remote job status (precedence
+        // rule 3), and before the amendment this observation was not
+        // representable at all: the decision reported that no legal transition
+        // existed and the attempt stayed `idle` for ever while a job ran on it.
+        let timeouts = RecoveryTimeouts::provisional();
+        let clock = StubClock::at(1_121);
         assert_eq!(
             recovery_decision(
                 &attempt_in(AttemptState::Idle, 1_000),
@@ -2000,12 +2347,29 @@ mod tests {
                 timeouts,
                 &clock,
             ),
-            RecoveryDecision::NoLegalTransition {
-                from: AttemptState::Idle,
-                wanted: AttemptState::Busy,
-            },
-            "the diagram has no `idle -> busy` edge, so GitHub reporting an idle \
-             runner as busy is not representable"
+            RecoveryDecision::Observe(AttemptState::Busy)
+        );
+
+        // And the decision is applicable: `idle -> busy` is an edge, so the
+        // caller can actually carry it out.
+        let mut attempt = attempt_in(AttemptState::Idle, 1_000);
+        attempt.assigned_job(73, ts(1_200)).unwrap();
+        assert_eq!(attempt.state(), AttemptState::Busy);
+        assert_eq!(attempt.github_runner_id(), Some(73));
+
+        // A live process still wins: local process state is authoritative for
+        // supervision, so the agent adopts before it reconciles.
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::Registered { busy: true },
+                },
+                timeouts,
+                &clock,
+            ),
+            RecoveryDecision::Adopt
         );
     }
 
