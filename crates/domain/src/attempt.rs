@@ -354,12 +354,22 @@ impl FailureReason {
     /// `Other`'s detail is empty because what a caller enumerates is the
     /// *variant*; no consumer should read the string out of this constant.
     ///
-    /// **This list is hand-written and can go stale on its own.** What stops it
-    /// is not the array length — a length written as `8` next to eight elements
-    /// asserts nothing — but the exhaustive, wildcard-free `match` in
-    /// `tests::all_failure_reasons_are_reachable_from_the_state_that_produces_them`,
-    /// which stops compiling the moment a variant is added and so puts the
-    /// author who adds one in front of this constant.
+    /// **This list is hand-written, and what keeps it honest is not its own
+    /// length.** A length written as `8` next to eight elements asserts
+    /// nothing — that was the defect in the assertion this constant replaced.
+    /// What catches a new variant is the exhaustive, wildcard-free `match` in
+    /// `tests::earliest_state_producing`, which stops the test target compiling
+    /// the moment one is added and so puts the author in front of this list.
+    ///
+    /// **The residual gap, measured rather than assumed.** An author who adds a
+    /// variant, writes its `Display` arm and its `earliest_state_producing` arm,
+    /// and then adds it to *neither* this constant nor the test's `cases` table,
+    /// gets a green suite with the variant untested. Adding it to exactly one of
+    /// the two fails the length check; adding it to neither does not. Rust has
+    /// no stable way to close that without a derive macro
+    /// (`std::mem::variant_count` is unstable), so it is written down here
+    /// instead: **if you are reading this because the compiler sent you, the
+    /// variant goes in both places.**
     pub const ALL: [FailureReason; 8] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
