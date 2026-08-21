@@ -20,9 +20,13 @@ machine. Both survive this task by owner instruction.
 
 | Resource | Identifier | Note |
 |---|---|---|
-| Throwaway GitHub App | **`runner-manager-d17-spike`** (`Iv23li39jMQVdEuupmI2`) | Device flow enabled. Shared with the D17 spike. |
-| Disposable organization | **`Tap-Top-Fun`** | Free plan. Org installation id `155426287`. |
-| Personal installation of the same App | account `IvanMurzak`, installation id `155419555` | Not exercised by this spike; listed for completeness. |
+| Throwaway GitHub App | **`runner-manager-d17-spike`** | Device flow enabled. Shared with the D17 spike. |
+| Disposable organization | **`Tap-Top-Fun`** | Free plan. The App is installed here. |
+| Personal installation of the same App | account `IvanMurzak` | Not exercised by this spike; listed so cleanup does not miss it. |
+
+Named, not identified: the App slug and the organization name are what a human
+needs to find and delete these. The App's `client_id` and the two installation
+ids were removed from this table — see **Secret hygiene** below.
 
 The spike created and deleted **four ephemeral runners** and **one runner
 group**. It deleted no organization, no repository and no App.
@@ -209,8 +213,18 @@ No token and no JIT blob is recorded here or anywhere in the repository.
 - Tokens are held in memory for the life of a run and never written to disk.
 - Evidence JSON was written **outside** the repository, to the session
   scratchpad, not to `docs/spikes/`.
-- The committed scripts contain the public `client_id` only, which is designed
-  to be public in a device flow and is paired with no secret.
+- The committed scripts contain **no client id, no organization name and no
+  installation id**. `d18-org-jit-spike.ps1`, `d18-org-jit-probe2.ps1` and
+  `d18-app-permissions.ps1` each declare `-ClientId` and `-Org` as
+  `[Parameter(Mandatory)]` with no default, so both are supplied at the command
+  line. The only client id written into any of the three is the placeholder
+  `Iv23xxxxxxxx`, in round 1's usage comment.
+- The real `client_id` and the two installation ids were recorded in **this
+  document**, not in the scripts, and have been removed from it. A device-flow
+  client id is not on its own a credential, but the repository is public and
+  this task's scope rule forbids committing one paired with the App,
+  organization and account it belongs to. Name the resources; do not identify
+  them.
 
 ## What is still untested
 
