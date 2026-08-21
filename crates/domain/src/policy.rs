@@ -53,28 +53,17 @@ pub enum PolicyError {
     )]
     AutoscaleWithoutMaxCapacity,
 
-    /// A **stored shape** is illegal. This says the row is wrong, not that the
-    /// caller asked for the wrong thing — an operation that merely needs an
-    /// autoscale policy reports [`PolicyError::NotAutoscale`] instead.
-    ///
-    /// **Nothing in this crate constructs it, and that is a finding rather than
-    /// an oversight.** It used to be raised by `add_routing_label` and
-    /// `remove_routing_label` in the *other* meaning, which is the confusion it
-    /// is now free of. In its own meaning it is unreachable because
-    /// [`PolicyMode::from_persisted`] infers the mode from the columns rather
-    /// than reading a stored discriminant: a row carrying routing labels is
-    /// autoscale-shaped by definition, so labels-without-`max_capacity` is
-    /// caught as [`PolicyError::AutoscaleWithoutMaxCapacity`] first and
-    /// "monitor-only *with* labels" cannot be expressed at all.
-    ///
-    /// It is kept because whether it becomes reachable is `b2`'s decision: a
-    /// schema that stores the mode discriminant explicitly makes the illegal
-    /// shape expressible, and this is the error for it. If `b2` infers the mode
-    /// as this crate does, delete the variant rather than leaving `f2` a match
-    /// arm that can never fire.
-    #[error("a MonitorOnly policy must not carry routing labels; it owns nothing (D19)")]
-    MonitorOnlyWithRoutingLabels,
-
+    // There was a `MonitorOnlyWithRoutingLabels` variant here, meaning "this
+    // *stored row* has an illegal shape". It is deleted rather than kept for
+    // `b2`, because nothing can construct it and nothing can construct it later
+    // either: `PolicyMode::from_persisted` matches exhaustively across four arms
+    // and never returns it, and `PersistedPolicy` -- the only shape `b2` loads
+    // through -- has no `mode` field, so no schema reachable from here can
+    // express "monitor-only *with* labels" in the first place. A row carrying
+    // routing labels is autoscale-shaped by definition, and
+    // labels-without-`max_capacity` is caught as `AutoscaleWithoutMaxCapacity`
+    // first. Keeping it would have had `f2` write a match arm and a user-facing
+    // message for a condition that cannot occur and that no test can cover.
     #[error(
         "a MonitorOnly policy must not carry a non-zero min_capacity ({min}); it \
          never starts a runner (D19)"
@@ -254,6 +243,19 @@ impl RoutingLabels {
     /// Matching is structural rather than a check against a known host label,
     /// because the host label this was derived from is not stored — only the
     /// concatenation is.
+    ///
+    /// **The middle segments are not inspected, only counted.** An earlier
+    /// version also required every one of them to be non-empty, meaning to
+    /// reject an empty host segment — but a [`HostLabel`] cannot be empty, so
+    /// that condition never rejected anything [`Self::derive`] could produce and
+    /// only ever produced false negatives: `HostLabel::new("home--pc")` is legal
+    /// (only a *leading* or *trailing* `-` is refused), derives
+    /// `rm-home--pc-win-x64`, and was reported as not derived. The consequence
+    /// was `f2`/`g2` warning an operator that their collision control was off
+    /// when they had done nothing wrong, which is worse than the residual it
+    /// leaves: a hand-edited `rm--win-x64` now reads as derived. That row is
+    /// still host-scoped in shape, so it does not mislead in the direction this
+    /// predicate exists to catch.
     #[must_use]
     pub fn is_derived_shape(&self) -> bool {
         let segments: Vec<&str> = self.host_label.as_str().split('-').collect();
@@ -268,7 +270,6 @@ impl RoutingLabels {
         // architecture is recognised here the moment it exists.
         *prefix == Self::PREFIX
             && !middle.is_empty()
-            && middle.iter().all(|segment| !segment.is_empty())
             && Os::ALL
                 .iter()
                 .any(|candidate| candidate.label_token() == *os)
@@ -962,6 +963,14 @@ pub struct ScalePolicy {
 /// `b2` maps database columns onto this type. With a struct that mapping is
 /// checked by name at compile time; positionally it was checked by nothing.
 ///
+/// **That guarantee covers the Rust side of the mapping and no more.** It is the
+/// *field* names that the compiler checks, not the column names they are read
+/// from: `PersistedPolicy { installation_id: row.get("revision")?, … }` compiles
+/// exactly as happily as the correct version, and reintroduces the very
+/// transposition described above. `b2` still owes a test that loads a row whose
+/// columns hold distinguishable values and asserts each landed in the field of
+/// the same name; this type does not supply one.
+///
 /// Construct it with a struct literal so every field is written down at the call
 /// site — that is the whole point, and a builder or a `Default` would give the
 /// omission back.
@@ -1318,12 +1327,11 @@ impl ScalePolicy {
     ///
     /// # Errors
     /// [`PolicyError::NotAutoscale`] for a monitor-only policy, which owns no
-    /// label set to add to. Deliberately **not**
-    /// [`PolicyError::MonitorOnlyWithRoutingLabels`]: that variant states that a
-    /// *stored row* has an illegal shape, which is a different claim from "this
-    /// operation needs an autoscale policy", and reusing it here would have had
-    /// `f2` render a validation failure for what is an ordinary
-    /// wrong-mode refusal.
+    /// label set to add to. This once reported a `MonitorOnlyWithRoutingLabels`
+    /// variant, which said that a *stored row* had an illegal shape — a
+    /// different claim from "this operation needs an autoscale policy", and one
+    /// that had `f2` rendering a validation failure for an ordinary wrong-mode
+    /// refusal. That variant is now gone entirely; see the note where it stood.
     pub fn add_routing_label(&mut self, label: Label) -> Result<bool, PolicyError> {
         match &mut self.mode {
             PolicyMode::MonitorOnly => Err(PolicyError::NotAutoscale),
@@ -1342,8 +1350,7 @@ impl ScalePolicy {
     /// # Errors
     /// [`PolicyError::HostLabelNotRemovable`] for the derived host label, or
     /// [`PolicyError::NotAutoscale`] for a monitor-only policy — see
-    /// [`Self::add_routing_label`] for why that variant and not
-    /// [`PolicyError::MonitorOnlyWithRoutingLabels`].
+    /// [`Self::add_routing_label`] for why that variant.
     pub fn remove_routing_label(&mut self, label: &Label) -> Result<bool, PolicyError> {
         match &mut self.mode {
             PolicyMode::MonitorOnly => Err(PolicyError::NotAutoscale),
@@ -1984,6 +1991,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_policy_round_trips_through_its_persisted_form() {
+        // `PersistedPolicy` exists to stop `installation_id` and `revision` --
+        // two bare `u64`s -- being transposed on the way to and from storage.
+        // Nothing exercised that: `PersistedPolicy` was constructed nowhere
+        // outside `to_persisted`, `ScalePolicy::from_persisted` had no caller
+        // and no test, and transposing the two fields inside `to_persisted` left
+        // the whole suite green. The defect the type was introduced to prevent
+        // was closed for attempts and left open for policies.
+        let mut policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(7),
+            3,
+        );
+        policy.add_routing_label(label("gpu")).unwrap();
+        // `activate` is what makes the round trip worth asserting: it moves
+        // `state` off `Pending`, `enabled` off `false`, and `revision` off `0`,
+        // so all three are non-default and a field that failed to survive the
+        // trip shows up as an inequality rather than as a default that happens
+        // to match.
+        policy.activate().unwrap();
+        assert_eq!(policy.state(), PolicyState::Active);
+        assert!(policy.enabled());
+
+        let stored = policy.to_persisted();
+        assert_ne!(
+            stored.installation_id, stored.revision,
+            "the fixture must distinguish the two u64 columns, or transposing \
+             them is unobservable and this test proves nothing"
+        );
+        assert_eq!(stored.installation_id, 42);
+        assert_eq!(stored.revision, policy.revision());
+
+        let restored =
+            ScalePolicy::from_persisted(stored).expect("a row this crate produced must load");
+        assert_eq!(restored, policy);
+        assert_eq!(restored.installation_id, 42);
+        assert_eq!(restored.revision(), policy.revision());
+        assert_eq!(restored.state(), PolicyState::Active);
+        assert!(restored.enabled());
+        assert_eq!(
+            restored.routing_labels().unwrap().count().get(),
+            2,
+            "the optional label survives alongside the host label"
+        );
+    }
+
+    #[test]
+    fn a_monitor_only_policy_round_trips_through_its_persisted_form() {
+        // The other half of the mode inference. `to_persisted` writes a
+        // MonitorOnly policy out through `min_capacity() == 0`,
+        // `max_capacity() == None` and `routing_labels() == None`, and
+        // `PolicyMode::from_persisted` reads the mode back *from those three
+        // columns* rather than from a stored discriminant. That inference is the
+        // reason `PolicyError::MonitorOnlyWithRoutingLabels` is unconstructible,
+        // and until now it was never exercised end to end.
+        let mut policy = ScalePolicy::new(
+            PolicyId::from_u128(2),
+            ScaleTarget::organization("acme").unwrap(),
+            9,
+            HostId::from_u128(7),
+            PolicyMode::monitor_only(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+
+        let stored = policy.to_persisted();
+        assert!(stored.routing_labels.is_none());
+        assert_eq!(stored.min_capacity, 0);
+        assert!(stored.max_capacity.is_none());
+        assert_ne!(stored.installation_id, stored.revision);
+
+        let restored =
+            ScalePolicy::from_persisted(stored).expect("a row this crate produced must load");
+        assert_eq!(restored, policy);
+        assert!(
+            restored.mode().is_monitor_only(),
+            "the mode is inferred back from the three columns, not stored"
+        );
+        assert!(!restored.owns_runners());
+        assert_eq!(restored.installation_id, 9);
+        assert_eq!(restored.revision(), 1);
+    }
+
     // =======================================================================
     // PolicyState
     // =======================================================================
@@ -2231,9 +2322,8 @@ mod tests {
              is computed and then ignored"
         );
 
-        // And it owns no label set to edit. `NotAutoscale`, not
-        // `MonitorOnlyWithRoutingLabels`: the caller asked for the wrong thing,
-        // the stored row is not malformed. The two now mean one thing each.
+        // And it owns no label set to edit. This is a wrong-mode refusal: the
+        // caller asked for the wrong thing, the stored row is not malformed.
         assert!(matches!(
             policy.add_routing_label(label("gpu")),
             Err(PolicyError::NotAutoscale)
@@ -2242,12 +2332,13 @@ mod tests {
             policy.remove_routing_label(&label("gpu")),
             Err(PolicyError::NotAutoscale)
         ));
-        // The load path reports a *shape* problem, and it is a different one:
-        // a row carrying routing labels is autoscale-shaped by definition, so
-        // the mode is never in doubt and `MonitorOnlyWithRoutingLabels` is
-        // unreachable. See its documentation -- this assertion is what makes
-        // that claim fail loudly if `PolicyMode::from_persisted` ever starts
-        // reading a stored discriminant instead of inferring the mode.
+        // The load path reports a *shape* problem, and it is a different one: a
+        // row carrying routing labels is autoscale-shaped by definition, so the
+        // mode is never in doubt and "monitor-only with labels" has no error to
+        // report because it cannot be expressed. This assertion is what pins
+        // that -- it fails loudly if `PolicyMode::from_persisted` ever starts
+        // reading a stored discriminant instead of inferring the mode, which is
+        // the change that would make the deleted variant reachable again.
         assert!(matches!(
             PolicyMode::from_persisted(Some(host_labels("home")), 0, None),
             Err(PolicyError::AutoscaleWithoutMaxCapacity)
@@ -2307,6 +2398,20 @@ mod tests {
             RoutingLabels::derive(&HostLabel::new("home-win").unwrap(), Os::Linux, Arch::Arm64)
                 .is_derived_shape(),
             "a host label containing `-` still derives a four-plus-segment name"
+        );
+        // `HostLabel::new` refuses only a leading or trailing `-`, so `home--pc`
+        // is a legal host label an operator can really type. It derives
+        // `rm-home--pc-win-x64`, and reporting that as *not* derived told an
+        // operator who had done nothing wrong that their collision control was
+        // off.
+        assert_eq!(
+            host_labels("home--pc").host_label().as_str(),
+            "rm-home--pc-win-x64"
+        );
+        assert!(
+            host_labels("home--pc").is_derived_shape(),
+            "consecutive dashes are legal inside a host label; the empty middle \
+             segment they produce is not evidence of an override"
         );
 
         // The case the predicate exists for: a hand-edited row that has quietly
@@ -2447,8 +2552,8 @@ mod tests {
             crate::model::Timestamp::from_timestamp(0, 0).unwrap(),
         )
         .unwrap();
-        let mut allocator = crate::capacity::HostAllocator::new(&host_record, 0);
-        let allocation = allocator.allocate(&policy, 3, &[]);
+        let mut allocator = crate::capacity::HostAllocator::from_attempts(&host_record, &[]);
+        let allocation = allocator.allocate(&policy, 3);
         trace.push(format!(
             "alloc demand={} desired={} active_owned={} headroom_before={} \
              to_start={} limiting={}",
@@ -2464,7 +2569,7 @@ mod tests {
         // the gap between the two.
         trace.push(format!(
             "alloc_zero_to_start={}",
-            allocator.allocate(&policy, 0, &[]).to_start
+            allocator.allocate(&policy, 0).to_start
         ));
 
         // Ownership (`crate::attempt`). Ownership rules 1 and 2 are the
