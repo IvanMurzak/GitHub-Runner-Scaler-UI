@@ -30,8 +30,24 @@ insta = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-# Test-only, and it does not weaken this crate's "no clock" rule: `test-util`
-# exists so that a backoff or timeout assertion advances time with
-# `tokio::time::pause()` instead of sleeping. `e1`'s jittered-backoff cases need
-# it, and it is a dev-dependency, so nothing in `src/` can reach it.
+# A PLACEHOLDER. It is here only so that no later task has to edit this
+# manifest and therefore `Cargo.lock` (see the header of the root Cargo.toml).
+# Nothing in this crate uses it today, and no named task is its consumer:
+# `e1` owns `crates/agent/src/reconcile.rs`, and `crates/agent` already declares
+# `test-util` in its own manifest.
+#
+# ----------------------------------------------------------------------------
+# `b1` MUST NOT REACH FOR THIS.
+# ----------------------------------------------------------------------------
+# `b1` owns `crates/testkit/src/clock.rs`, and its Definition of Done requires
+# recovery and backoff decisions to be tested AGAINST THE FAKE CLOCK —
+# `testkit::clock`, not `tokio::time::pause()`. The two are not
+# interchangeable here. Pausing tokio's clock would satisfy the words "no real
+# time dependency" while contradicting the DoD clause that names the fake
+# clock, and it would drag an async runtime into a crate that is deliberately
+# synchronous and deterministic: this domain's logic must stay testable with no
+# network, no filesystem, no runtime, and no clock.
+#
+# If you are implementing `b1` and this line made you consider
+# `tokio::time::pause()`, the answer is `testkit::clock`.
 tokio = { workspace = true, features = ["test-util"] }

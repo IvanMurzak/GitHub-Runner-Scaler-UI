@@ -27,6 +27,13 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
+# `c3` builds the fake gateway over the github crate's traits, and those traits
+# surface the user access token and the encoded JIT configuration through the
+# redacting wrapper (`07-security.md`). A fake that implements them has to
+# CONSTRUCT one, so `secrecy` has to be in scope here — otherwise `c3` would
+# have to edit this manifest, which is the exact outcome `a1` exists to
+# prevent.
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -34,6 +34,12 @@ runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }
 runner-manager-testkit = { workspace = true }
+# `h1`'s secret-injection gate scans emitted logs for the real token and the
+# encoded JIT configuration, which means holding the real values to compare
+# against — and every API that carries them is the redacting wrapper
+# (`07-security.md`). Declared here so that `h1` never has to edit this
+# manifest.
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }

@@ -1,1 +1,1732 @@
 // owner: b1-domain-core
+
+//! One runner attempt: its lifecycle, its outcome, who may act on it, and what
+//! to do about it after a restart.
+//!
+//! Two things here are easy to get subtly wrong, so they are stated before the
+//! code:
+//!
+//! **The idle exit is a normal outcome, not a failure.** Because there is no
+//! `AcquireJobs` equivalent on the REST path, nothing reserves a queued job for
+//! this host. A runner may start, find that another host took the work, and exit
+//! on its idle timeout (`03-control-flows.md`, flow 2.7). That attempt is
+//! terminal and is cleaned like any other, but [`AttemptOutcome`] records *which*
+//! terminal thing happened, because `g2` must render it distinctly from a
+//! failure and can only do so if the domain wrote the distinction down. Showing a
+//! normal surplus exit as an error sends an operator hunting a fault that does
+//! not exist.
+//!
+//! **A `busy` attempt is never cleaned to free capacity.** Scale-down reclaims a
+//! slot when an attempt reaches a terminal state and at no other time
+//! (`04-subsystem-contracts.md`: "`busy` cannot transition to cleanup due to a
+//! scale-down request"). [`RunnerAttempt::clean`] refuses it by name rather than
+//! by a generic transition error, so the refusal is legible in a log.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{AttemptId, Clock, Elapsed, HostId, PolicyId, Timestamp};
+use crate::policy::ScalePolicy;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttemptError {
+    #[error("{to} is not a legal transition from {from}")]
+    IllegalTransition {
+        from: AttemptState,
+        to: AttemptState,
+    },
+
+    #[error(
+        "a busy attempt must not be cleaned; capacity is reclaimed only when an \
+         attempt reaches a terminal state, never by stopping a runner that is \
+         executing a job"
+    )]
+    BusyCannotBeCleaned,
+
+    #[error("the outcome {outcome:?} cannot be reached from {from}")]
+    OutcomeUnreachable {
+        from: AttemptState,
+        outcome: AttemptOutcome,
+    },
+
+    #[error("{state} is a terminal state and requires an outcome, but none was recorded")]
+    TerminalWithoutOutcome { state: AttemptState },
+
+    #[error("{state} is not terminal, so it must not carry the outcome {outcome:?}")]
+    NonTerminalWithOutcome {
+        state: AttemptState,
+        outcome: AttemptOutcome,
+    },
+
+    #[error("the recorded outcome {outcome:?} does not belong to the recorded state {state}")]
+    OutcomeStateMismatch {
+        state: AttemptState,
+        outcome: AttemptOutcome,
+    },
+}
+
+/// Ownership rule 2: "A host agent may act only on attempts persisted under its
+/// `host_id`."
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnershipError {
+    #[error(
+        "attempt {attempt} belongs to policy {attempt_policy}, but was checked \
+         against policy {policy}"
+    )]
+    PolicyMismatch {
+        attempt: AttemptId,
+        attempt_policy: PolicyId,
+        policy: PolicyId,
+    },
+
+    #[error(
+        "policy {policy} belongs to host {owner}; this agent runs on host \
+         {agent} and must not act on its attempts"
+    )]
+    ForeignHost {
+        policy: PolicyId,
+        owner: HostId,
+        agent: HostId,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// AttemptState
+// ---------------------------------------------------------------------------
+
+/// The runner-attempt lifecycle, exactly as `04-subsystem-contracts.md` draws
+/// it:
+///
+/// ```text
+/// allocated -> jit_received -> starting -> idle | busy
+/// idle | busy -> finished | failed | orphaned
+/// finished | failed | orphaned -> cleaned
+/// ```
+///
+/// `idle` means the runner process is registered and awaiting its single job
+/// assignment. It is short-lived and is **not** an idle persistent runner — this
+/// product has none, by D7.
+///
+/// **Every transition outside that diagram is rejected**, which `b1`'s
+/// Definition of Done requires. Three consequences are surprising enough to name
+/// here, because they are properties of the *diagram*, not of this
+/// implementation, and each is recorded as a finding rather than quietly patched:
+///
+/// * There is no `idle -> busy` edge. The diagram treats `idle` and `busy` as
+///   alternative outcomes of `starting`, so a runner observed idle and then
+///   assigned a job has nowhere legal to go.
+/// * There is no terminal edge out of `allocated`, `jit_received`, or
+///   `starting`. An attempt whose JIT request fails, whose process fails to
+///   spawn, or that is found dead after a restart before it ever registered
+///   cannot be recorded as `failed` or `orphaned`.
+/// * `cleaned` is absorbing, which is correct and intended.
+///
+/// [`recovery_decision`] returns [`RecoveryDecision::NoLegalTransition`] at
+/// exactly the points where the second and third bullets bite, so the gap is
+/// discoverable from a test run rather than from a careful reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptState {
+    Allocated,
+    JitReceived,
+    Starting,
+    Idle,
+    Busy,
+    Finished,
+    Failed,
+    Orphaned,
+    Cleaned,
+}
+
+impl AttemptState {
+    pub const ALL: [AttemptState; 9] = [
+        AttemptState::Allocated,
+        AttemptState::JitReceived,
+        AttemptState::Starting,
+        AttemptState::Idle,
+        AttemptState::Busy,
+        AttemptState::Finished,
+        AttemptState::Failed,
+        AttemptState::Orphaned,
+        AttemptState::Cleaned,
+    ];
+
+    /// The complete legal transition list. A self-transition is not in it.
+    pub const LEGAL: &'static [(AttemptState, AttemptState)] = &[
+        (AttemptState::Allocated, AttemptState::JitReceived),
+        (AttemptState::JitReceived, AttemptState::Starting),
+        (AttemptState::Starting, AttemptState::Idle),
+        (AttemptState::Starting, AttemptState::Busy),
+        (AttemptState::Idle, AttemptState::Finished),
+        (AttemptState::Idle, AttemptState::Failed),
+        (AttemptState::Idle, AttemptState::Orphaned),
+        (AttemptState::Busy, AttemptState::Finished),
+        (AttemptState::Busy, AttemptState::Failed),
+        (AttemptState::Busy, AttemptState::Orphaned),
+        (AttemptState::Finished, AttemptState::Cleaned),
+        (AttemptState::Failed, AttemptState::Cleaned),
+        (AttemptState::Orphaned, AttemptState::Cleaned),
+    ];
+
+    #[must_use]
+    pub fn can_transition_to(self, next: AttemptState) -> bool {
+        Self::LEGAL.contains(&(self, next))
+    }
+
+    /// Terminal states, at which capacity is reclaimed.
+    ///
+    /// `e1`: "capacity is reclaimed only when an attempt reaches a terminal
+    /// state." `cleaned` is included because it follows a terminal state.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            AttemptState::Finished
+                | AttemptState::Failed
+                | AttemptState::Orphaned
+                | AttemptState::Cleaned
+        )
+    }
+
+    /// Whether this attempt still occupies one of the host's capacity slots.
+    ///
+    /// This is the term the reconciliation formula subtracts, and getting it
+    /// wrong is silent: counting a terminal attempt starves the host, and failing
+    /// to count a `starting` one starts a second runner for a job already being
+    /// served.
+    #[must_use]
+    pub const fn counts_against_capacity(self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// The three terminal states that require an outcome before `cleaned`.
+    #[must_use]
+    pub const fn is_concluded(self) -> bool {
+        matches!(
+            self,
+            AttemptState::Finished | AttemptState::Failed | AttemptState::Orphaned
+        )
+    }
+}
+
+impl fmt::Display for AttemptState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AttemptState::Allocated => "allocated",
+            AttemptState::JitReceived => "jit_received",
+            AttemptState::Starting => "starting",
+            AttemptState::Idle => "idle",
+            AttemptState::Busy => "busy",
+            AttemptState::Finished => "finished",
+            AttemptState::Failed => "failed",
+            AttemptState::Orphaned => "orphaned",
+            AttemptState::Cleaned => "cleaned",
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outcome
+// ---------------------------------------------------------------------------
+
+/// Why an attempt failed.
+///
+/// `Other` exists so `e3` is not blocked by a reason this task did not
+/// anticipate; `crates/domain/src/attempt.rs` belongs to `b1` and `e3` cannot
+/// extend this enum itself.
+///
+/// **Nothing that reaches this type may contain a credential.** It is written to
+/// the journal by `b2` and rendered by `g2`, and `07-security.md`'s log scan runs
+/// over both. A JIT blob, an `Authorization` header, or a token in an `Other`
+/// string would defeat that gate from inside the domain, where the redacting log
+/// sink (`d1`) never gets a chance to see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    /// `generate-jitconfig` did not return a configuration.
+    JitRequestFailed,
+    /// The configuration was never claimed and expired (flow 4.4).
+    JitExpired,
+    /// The runner package's published checksum was absent or did not match
+    /// (`05-infrastructure.md`: the agent fails closed).
+    RunnerPackageUnverified,
+    /// GitHub rejects runners more than 30 days behind the latest release
+    /// (`01-current-architecture.md`, edge case 7). Terminal and
+    /// operator-actionable, never retried.
+    RunnerVersionRejected,
+    /// The child process could not be spawned.
+    ProcessStartFailed,
+    /// The child process exited before it could do its one job.
+    ProcessExitedUnexpectedly,
+    /// Anything else. Must carry no credential.
+    Other(String),
+}
+
+impl fmt::Display for FailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FailureReason::JitRequestFailed => f.write_str("the JIT configuration request failed"),
+            FailureReason::JitExpired => f.write_str("the JIT configuration expired unclaimed"),
+            FailureReason::RunnerPackageUnverified => {
+                f.write_str("the runner package could not be verified")
+            }
+            FailureReason::RunnerVersionRejected => {
+                f.write_str("GitHub rejected the runner version")
+            }
+            FailureReason::ProcessStartFailed => f.write_str("the runner process failed to start"),
+            FailureReason::ProcessExitedUnexpectedly => {
+                f.write_str("the runner process exited unexpectedly")
+            }
+            FailureReason::Other(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// What terminally happened to an attempt.
+///
+/// The state and the outcome are not two independent fields that a caller has to
+/// keep consistent: [`AttemptOutcome::terminal_state`] derives the state from the
+/// outcome, and [`RunnerAttempt::conclude`] is the only way to set either. A
+/// `failed` attempt whose outcome says it ran a job is therefore not a bug this
+/// code can have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// The runner accepted its one job and the job ended. This says the *runner*
+    /// finished, never that the workflow succeeded — GitHub remains the source of
+    /// truth for workflow outcome (`03-control-flows.md`, flow 2, Failure).
+    CompletedJob,
+    /// The surplus case. The runner registered, no job arrived, and it exited on
+    /// its idle timeout (flow 2.7). Normal, bounded, and **not** a failure.
+    ExitedIdleWithoutWork,
+    /// The attempt failed.
+    Failed { reason: FailureReason },
+    /// Supervision was lost: the process is gone and the attempt could not be
+    /// reconciled with GitHub (`e3`, restart recovery).
+    Orphaned,
+}
+
+impl AttemptOutcome {
+    #[must_use]
+    pub fn failed(reason: FailureReason) -> Self {
+        Self::Failed { reason }
+    }
+
+    /// The one terminal state this outcome corresponds to.
+    #[must_use]
+    pub const fn terminal_state(&self) -> AttemptState {
+        match self {
+            AttemptOutcome::CompletedJob | AttemptOutcome::ExitedIdleWithoutWork => {
+                AttemptState::Finished
+            }
+            AttemptOutcome::Failed { .. } => AttemptState::Failed,
+            AttemptOutcome::Orphaned => AttemptState::Orphaned,
+        }
+    }
+
+    /// True for the outcomes an operator should be told to look at.
+    ///
+    /// `g2` renders this differently from [`Self::is_idle_exit`], and `e1`'s
+    /// Definition of Done requires that a surplus attempt "is not reported as a
+    /// failure".
+    #[must_use]
+    pub const fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            AttemptOutcome::Failed { .. } | AttemptOutcome::Orphaned
+        )
+    }
+
+    /// True only for the surplus case.
+    #[must_use]
+    pub const fn is_idle_exit(&self) -> bool {
+        matches!(self, AttemptOutcome::ExitedIdleWithoutWork)
+    }
+
+    /// True only when this runner actually took a job.
+    #[must_use]
+    pub const fn ran_a_job(&self) -> bool {
+        matches!(self, AttemptOutcome::CompletedJob)
+    }
+
+    /// The state an attempt must be in for this outcome to be reachable.
+    const fn required_from(&self) -> &'static [AttemptState] {
+        match self {
+            // Only a runner that was assigned a job can have run one.
+            AttemptOutcome::CompletedJob => &[AttemptState::Busy],
+            // Only a runner that was registered and waiting can have exited idle.
+            AttemptOutcome::ExitedIdleWithoutWork => &[AttemptState::Idle],
+            AttemptOutcome::Failed { .. } | AttemptOutcome::Orphaned => {
+                &[AttemptState::Idle, AttemptState::Busy]
+            }
+        }
+    }
+}
+
+impl fmt::Display for AttemptOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttemptOutcome::CompletedJob => f.write_str("ran a job"),
+            AttemptOutcome::ExitedIdleWithoutWork => f.write_str("exited idle without work"),
+            AttemptOutcome::Failed { reason } => write!(f, "failed: {reason}"),
+            AttemptOutcome::Orphaned => f.write_str("orphaned"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunnerAttempt
+// ---------------------------------------------------------------------------
+
+/// One ephemeral runner, from directory allocation to cleanup.
+///
+/// The fields `04-subsystem-contracts.md` names are all here. Two are not in that
+/// list and are added deliberately:
+///
+/// * `outcome`, because `b1`'s Scope requires the attempt to "carry an outcome
+///   distinguishing 'ran a job' from 'exited idle without work'".
+/// * `last_state_change_at`, because recovery decisions measure elapsed time in
+///   the *current* state — an idle timeout runs from entering `idle`, not from
+///   `created_at` — and `b1`'s Definition of Done requires those decisions to be
+///   testable against a fake clock.
+///
+/// `b2` persists both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerAttempt {
+    pub id: AttemptId,
+    pub policy_id: PolicyId,
+    github_runner_id: Option<u64>,
+    state: AttemptState,
+    outcome: Option<AttemptOutcome>,
+    process_id: Option<u32>,
+    runtime_path: PathBuf,
+    pub created_at: Timestamp,
+    terminal_at: Option<Timestamp>,
+    last_state_change_at: Timestamp,
+}
+
+impl RunnerAttempt {
+    /// The first step of `e3`'s per-attempt flow: a runtime directory is
+    /// allocated and journalled **before** anything remote happens, so a crash
+    /// leaves a recoverable trace rather than an invisible one.
+    #[must_use]
+    pub fn allocate(
+        id: AttemptId,
+        policy_id: PolicyId,
+        runtime_path: impl Into<PathBuf>,
+        now: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            policy_id,
+            github_runner_id: None,
+            state: AttemptState::Allocated,
+            outcome: None,
+            process_id: None,
+            runtime_path: runtime_path.into(),
+            created_at: now,
+            terminal_at: None,
+            last_state_change_at: now,
+        }
+    }
+
+    /// Rebuild a journalled attempt.
+    ///
+    /// # Errors
+    /// Any state/outcome combination that this crate's own transitions cannot
+    /// produce, so a hand-edited journal cannot inject a `failed` attempt that
+    /// claims to have run a job.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted(
+        id: AttemptId,
+        policy_id: PolicyId,
+        github_runner_id: Option<u64>,
+        state: AttemptState,
+        outcome: Option<AttemptOutcome>,
+        process_id: Option<u32>,
+        runtime_path: impl Into<PathBuf>,
+        created_at: Timestamp,
+        terminal_at: Option<Timestamp>,
+        last_state_change_at: Timestamp,
+    ) -> Result<Self, AttemptError> {
+        match (&outcome, state.is_terminal()) {
+            (None, true) => return Err(AttemptError::TerminalWithoutOutcome { state }),
+            (Some(outcome), false) => {
+                return Err(AttemptError::NonTerminalWithOutcome {
+                    state,
+                    outcome: outcome.clone(),
+                });
+            }
+            (Some(outcome), true) => {
+                let expected = outcome.terminal_state();
+                if state != expected && state != AttemptState::Cleaned {
+                    return Err(AttemptError::OutcomeStateMismatch {
+                        state,
+                        outcome: outcome.clone(),
+                    });
+                }
+            }
+            (None, false) => {}
+        }
+
+        Ok(Self {
+            id,
+            policy_id,
+            github_runner_id,
+            state,
+            outcome,
+            process_id,
+            runtime_path: runtime_path.into(),
+            created_at,
+            terminal_at,
+            last_state_change_at,
+        })
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> AttemptState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> Option<&AttemptOutcome> {
+        self.outcome.as_ref()
+    }
+
+    #[must_use]
+    pub const fn github_runner_id(&self) -> Option<u64> {
+        self.github_runner_id
+    }
+
+    #[must_use]
+    pub const fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    #[must_use]
+    pub fn runtime_path(&self) -> &Path {
+        &self.runtime_path
+    }
+
+    #[must_use]
+    pub const fn terminal_at(&self) -> Option<Timestamp> {
+        self.terminal_at
+    }
+
+    /// When the attempt entered its current state. Recovery timeouts run from
+    /// here.
+    #[must_use]
+    pub const fn last_state_change_at(&self) -> Timestamp {
+        self.last_state_change_at
+    }
+
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+
+    /// Whether this attempt still holds one of the host's capacity slots.
+    #[must_use]
+    pub const fn counts_against_capacity(&self) -> bool {
+        self.state.counts_against_capacity()
+    }
+
+    fn move_to(&mut self, next: AttemptState, now: Timestamp) -> Result<(), AttemptError> {
+        if !self.state.can_transition_to(next) {
+            return Err(AttemptError::IllegalTransition {
+                from: self.state,
+                to: next,
+            });
+        }
+        self.state = next;
+        self.last_state_change_at = now;
+        Ok(())
+    }
+
+    /// `allocated -> jit_received`.
+    ///
+    /// # Errors
+    /// [`AttemptError::IllegalTransition`] from any other state.
+    pub fn jit_received(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        self.move_to(AttemptState::JitReceived, now)
+    }
+
+    /// `jit_received -> starting`, recording the child process identity.
+    ///
+    /// # Errors
+    /// [`AttemptError::IllegalTransition`] from any other state.
+    pub fn started(&mut self, process_id: u32, now: Timestamp) -> Result<(), AttemptError> {
+        self.move_to(AttemptState::Starting, now)?;
+        self.process_id = Some(process_id);
+        Ok(())
+    }
+
+    /// `starting -> idle`: the runner registered and is awaiting its one
+    /// assignment.
+    ///
+    /// # Errors
+    /// [`AttemptError::IllegalTransition`] from any other state.
+    pub fn registered_idle(
+        &mut self,
+        github_runner_id: u64,
+        now: Timestamp,
+    ) -> Result<(), AttemptError> {
+        self.move_to(AttemptState::Idle, now)?;
+        self.github_runner_id = Some(github_runner_id);
+        Ok(())
+    }
+
+    /// `starting -> busy`: the runner was assigned its one job.
+    ///
+    /// # Errors
+    /// [`AttemptError::IllegalTransition`] from any other state — including
+    /// `idle`, which the diagram in `04-subsystem-contracts.md` gives no edge
+    /// out of into `busy`. See the note on [`AttemptState`].
+    pub fn assigned_job(
+        &mut self,
+        github_runner_id: u64,
+        now: Timestamp,
+    ) -> Result<(), AttemptError> {
+        self.move_to(AttemptState::Busy, now)?;
+        self.github_runner_id = Some(github_runner_id);
+        Ok(())
+    }
+
+    /// Record the terminal outcome, moving to the state it implies.
+    ///
+    /// # Errors
+    /// [`AttemptError::OutcomeUnreachable`] when the outcome does not belong to
+    /// the current state — `CompletedJob` from anything but `busy`, or
+    /// `ExitedIdleWithoutWork` from anything but `idle` — and
+    /// [`AttemptError::IllegalTransition`] otherwise.
+    pub fn conclude(
+        &mut self,
+        outcome: AttemptOutcome,
+        now: Timestamp,
+    ) -> Result<(), AttemptError> {
+        if !outcome.required_from().contains(&self.state) {
+            return Err(AttemptError::OutcomeUnreachable {
+                from: self.state,
+                outcome,
+            });
+        }
+        self.move_to(outcome.terminal_state(), now)?;
+        self.terminal_at = Some(now);
+        self.outcome = Some(outcome);
+        Ok(())
+    }
+
+    /// `finished | failed | orphaned -> cleaned`.
+    ///
+    /// # Errors
+    /// [`AttemptError::BusyCannotBeCleaned`] for a `busy` attempt — the
+    /// scale-down case `04-subsystem-contracts.md` forbids — and
+    /// [`AttemptError::IllegalTransition`] for any other non-terminal state or
+    /// for an already-cleaned attempt.
+    pub fn clean(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.state == AttemptState::Busy {
+            return Err(AttemptError::BusyCannotBeCleaned);
+        }
+        self.move_to(AttemptState::Cleaned, now)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ownership
+// ---------------------------------------------------------------------------
+
+/// Ownership rules 1 and 2 (`04-subsystem-contracts.md`).
+///
+/// An attempt records its `policy_id`, and the policy records its `host_id`, so
+/// authorising an attempt is a two-link check and both links matter. `e3`'s
+/// restart recovery runs this before it touches a process it found on the
+/// machine: adopting, terminating, or cleaning another host's attempt is the
+/// failure this rule exists to prevent.
+///
+/// # Errors
+/// [`OwnershipError::PolicyMismatch`] when the attempt does not belong to the
+/// policy, and [`OwnershipError::ForeignHost`] when the policy does not belong to
+/// this agent's host.
+pub fn authorize(
+    agent_host: HostId,
+    policy: &ScalePolicy,
+    attempt: &RunnerAttempt,
+) -> Result<(), OwnershipError> {
+    if attempt.policy_id != policy.id {
+        return Err(OwnershipError::PolicyMismatch {
+            attempt: attempt.id,
+            attempt_policy: attempt.policy_id,
+            policy: policy.id,
+        });
+    }
+    if !policy.is_owned_by(agent_host) {
+        return Err(OwnershipError::ForeignHost {
+            policy: policy.id,
+            owner: policy.host_id,
+            agent: agent_host,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+/// How long an attempt may sit in each pre-terminal state before recovery treats
+/// it as stuck.
+///
+/// **No document in this taskflow states these durations.** `03-control-flows.md`
+/// flow 2.7 says a surplus runner "exits on its idle timeout" without giving one,
+/// and flow 4.4 says an expired JIT configuration is discarded without saying
+/// when it expires. [`RecoveryTimeouts::provisional`] therefore returns values
+/// chosen here, named so that a caller cannot mistake them for a product
+/// decision, and there is deliberately no `Default` impl — `e1` and `e3` should
+/// have to write the numbers down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryTimeouts {
+    /// How long `allocated` or `jit_received` may last before the JIT
+    /// configuration is assumed lost.
+    pub jit_handoff: Elapsed,
+    /// How long `starting` may last before the runner is assumed not to be
+    /// coming up.
+    pub startup: Elapsed,
+    /// How long `idle` may last before an exit is read as the surplus case
+    /// rather than a crash.
+    pub idle: Elapsed,
+}
+
+impl RecoveryTimeouts {
+    #[must_use]
+    pub const fn new(jit_handoff: Elapsed, startup: Elapsed, idle: Elapsed) -> Self {
+        Self {
+            jit_handoff,
+            startup,
+            idle,
+        }
+    }
+
+    /// Placeholder values. Not a product decision — see the type documentation.
+    #[must_use]
+    pub fn provisional() -> Self {
+        Self {
+            jit_handoff: Elapsed::seconds(120),
+            startup: Elapsed::seconds(300),
+            idle: Elapsed::seconds(300),
+        }
+    }
+}
+
+/// What GitHub says about this attempt's runner.
+///
+/// Precedence rule 3: "GitHub runner status is authoritative for remote job
+/// status; local process state is authoritative only for a child process owned by
+/// this agent." Both halves are inputs here, and neither is allowed to stand in
+/// for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubRunnerObservation {
+    /// GitHub could not be reached this cycle. Flow 3.3: start nothing, retain
+    /// what is running, back off. It is emphatically **not** the same as
+    /// `NotRegistered`, and conflating the two would delete live runners during
+    /// an outage.
+    Unreachable,
+    /// GitHub knows no runner for this attempt.
+    NotRegistered,
+    /// GitHub knows the runner.
+    Registered { busy: bool },
+}
+
+/// One attempt's observed reality at recovery time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryObservation {
+    /// Whether the child process this agent recorded is still alive. `d1` supplies
+    /// a process identity that survives a reboot, because a bare PID is reused.
+    pub process_alive: bool,
+    pub github: GithubRunnerObservation,
+}
+
+/// What to do about one attempt found in the journal at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryDecision {
+    /// Already cleaned; there is nothing left to do.
+    Nothing,
+    /// Terminal but not yet cleaned: remove the runtime directory and mark it
+    /// `cleaned`.
+    Clean,
+    /// The process is alive and this attempt is still ours. `e3`: "an attempt
+    /// whose process still runs is adopted, not duplicated."
+    Adopt,
+    /// Nothing is decidable yet; look again next cycle.
+    Wait,
+    /// GitHub is unreachable. Decide nothing destructive during an outage
+    /// (flow 3.3).
+    Defer,
+    /// Move the attempt to this state to match what was observed.
+    Observe(AttemptState),
+    /// Conclude the attempt with this outcome.
+    Conclude(AttemptOutcome),
+    /// The observation calls for a transition the state diagram does not contain.
+    ///
+    /// This is not a defensive branch; it is a finding surfaced as a value. See
+    /// the note on [`AttemptState`] — the diagram in `04-subsystem-contracts.md`
+    /// has no terminal edge out of `allocated`, `jit_received`, or `starting`,
+    /// and no `idle -> busy` edge, so a dead pre-registration attempt and an idle
+    /// attempt that GitHub reports as busy both land here.
+    NoLegalTransition {
+        from: AttemptState,
+        wanted: AttemptState,
+    },
+}
+
+/// Decide what to do about one journalled attempt after a restart, or on any
+/// reconciliation pass.
+///
+/// Time enters only through `clock`, and only as `now - attempt.
+/// last_state_change_at()`, so the whole function is exercised by advancing a
+/// [`crate::model::Clock`] the test controls.
+#[must_use]
+pub fn recovery_decision(
+    attempt: &RunnerAttempt,
+    observation: RecoveryObservation,
+    timeouts: RecoveryTimeouts,
+    clock: &dyn Clock,
+) -> RecoveryDecision {
+    use AttemptState as S;
+    use GithubRunnerObservation as G;
+
+    let state = attempt.state();
+
+    if state == S::Cleaned {
+        return RecoveryDecision::Nothing;
+    }
+    if state.is_terminal() {
+        return RecoveryDecision::Clean;
+    }
+    if observation.github == G::Unreachable {
+        return RecoveryDecision::Defer;
+    }
+
+    let elapsed = clock.now() - attempt.last_state_change_at();
+
+    match state {
+        S::Allocated | S::JitReceived => {
+            if observation.process_alive {
+                RecoveryDecision::Adopt
+            } else if elapsed >= timeouts.jit_handoff {
+                RecoveryDecision::NoLegalTransition {
+                    from: state,
+                    wanted: S::Failed,
+                }
+            } else {
+                RecoveryDecision::Wait
+            }
+        }
+
+        S::Starting => match observation.github {
+            // GitHub is authoritative for remote job status, and both of these
+            // are legal edges out of `starting`.
+            G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
+            G::Registered { busy: false } => RecoveryDecision::Observe(S::Idle),
+            // A live process inside its startup window is adopted, the same as
+            // in every other pre-terminal state: `e3` must take over supervision
+            // rather than start a second runner for the same work.
+            G::NotRegistered => {
+                if observation.process_alive && elapsed < timeouts.startup {
+                    RecoveryDecision::Adopt
+                } else {
+                    RecoveryDecision::NoLegalTransition {
+                        from: S::Starting,
+                        wanted: S::Failed,
+                    }
+                }
+            }
+            G::Unreachable => unreachable!("handled above"),
+        },
+
+        S::Idle => {
+            if observation.process_alive {
+                return RecoveryDecision::Adopt;
+            }
+            match observation.github {
+                // The surplus case, and the crash case, separated by the clock:
+                // a runner that sat out its whole idle timeout and then exited
+                // with no registration left behind did what flow 2.7 describes.
+                // One that vanished early did not.
+                G::NotRegistered => {
+                    if elapsed >= timeouts.idle {
+                        RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork)
+                    } else {
+                        RecoveryDecision::Conclude(AttemptOutcome::failed(
+                            FailureReason::ProcessExitedUnexpectedly,
+                        ))
+                    }
+                }
+                // The runner is still registered at GitHub but this agent no
+                // longer owns a process for it: supervision is lost and the
+                // remote registration needs removing.
+                G::Registered { busy: false } => {
+                    RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
+                }
+                // GitHub says this runner took a job. The diagram has no
+                // `idle -> busy` edge, so there is nothing legal to record.
+                G::Registered { busy: true } => RecoveryDecision::NoLegalTransition {
+                    from: S::Idle,
+                    wanted: S::Busy,
+                },
+                G::Unreachable => unreachable!("handled above"),
+            }
+        }
+
+        S::Busy => {
+            if observation.process_alive {
+                RecoveryDecision::Adopt
+            } else {
+                // `e3`: "an attempt whose process is gone and whose runner is
+                // unknown to GitHub is `orphaned` and cleaned". The agent never
+                // reports a job as complete, so a lost supervision is recorded as
+                // exactly that and not guessed into a success.
+                RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
+            }
+        }
+
+        S::Finished | S::Failed | S::Orphaned | S::Cleaned => {
+            unreachable!("terminal states are handled above")
+        }
+    }
+}
+
+/// How many of these attempts still occupy a host capacity slot.
+///
+/// Saturating rather than wrapping: a host cannot hold more than `u16::MAX`
+/// attempts, and if some caller ever produced that many, reporting the ceiling is
+/// safe where wrapping to zero would let the allocator start `u16::MAX` more.
+#[must_use]
+pub fn active_count<'a>(attempts: impl IntoIterator<Item = &'a RunnerAttempt>) -> u16 {
+    attempts
+        .into_iter()
+        .filter(|a| a.counts_against_capacity())
+        .fold(0u16, |acc, _| acc.saturating_add(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Arch, CachePolicy, HostLabel, Os, ScaleTarget};
+    use crate::policy::{PolicyMode, RoutingLabels};
+    use std::num::NonZeroU16;
+
+    #[derive(Debug)]
+    struct StubClock(std::sync::Mutex<Timestamp>);
+
+    impl StubClock {
+        fn at(secs: i64) -> Self {
+            Self(std::sync::Mutex::new(ts(secs)))
+        }
+        fn set(&self, secs: i64) {
+            *self.0.lock().unwrap() = ts(secs);
+        }
+    }
+
+    impl Clock for StubClock {
+        fn now(&self) -> Timestamp {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn ts(secs: i64) -> Timestamp {
+        chrono::DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    fn attempt_in(state: AttemptState, entered_at: i64) -> RunnerAttempt {
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "runtime/p/a",
+            ts(0),
+        );
+        // Set the state directly: only possible from inside the module, which is
+        // exactly why the state-machine tests live here.
+        attempt.state = state;
+        attempt.last_state_change_at = ts(entered_at);
+        attempt
+    }
+
+    fn a_policy(host: HostId, policy_id: PolicyId) -> ScalePolicy {
+        ScalePolicy::new(
+            policy_id,
+            ScaleTarget::repository("o/r").unwrap(),
+            1,
+            host,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Windows, Arch::X64),
+                0,
+                NonZeroU16::new(1).unwrap(),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        )
+    }
+
+    // =======================================================================
+    // The state machine, both directions
+    // =======================================================================
+
+    /// The diagram from `04-subsystem-contracts.md`, transcribed by hand.
+    ///
+    /// **Deliberately a second copy of [`AttemptState::LEGAL`]**, for the reason
+    /// given on `policy::tests::diagram_edges`: a test whose expectation is read
+    /// out of the constant under test asserts only that the constant equals
+    /// itself, and would accept any edge someone added to it.
+    ///
+    /// ```text
+    /// allocated -> jit_received -> starting -> idle | busy
+    /// idle | busy -> finished | failed | orphaned
+    /// finished | failed | orphaned -> cleaned
+    /// ```
+    fn diagram_edges() -> Vec<(AttemptState, AttemptState)> {
+        use AttemptState::*;
+        let mut edges = vec![
+            (Allocated, JitReceived),
+            (JitReceived, Starting),
+            (Starting, Idle),
+            (Starting, Busy),
+        ];
+        for from in [Idle, Busy] {
+            for to in [Finished, Failed, Orphaned] {
+                edges.push((from, to));
+            }
+        }
+        for from in [Finished, Failed, Orphaned] {
+            edges.push((from, Cleaned));
+        }
+        edges
+    }
+
+    #[test]
+    fn every_attempt_state_transition_is_legal_exactly_where_the_diagram_says() {
+        let expected = diagram_edges();
+        assert_eq!(
+            expected.len(),
+            13,
+            "the transcription itself changed; check it against the diagram"
+        );
+
+        let mut legal_seen = 0usize;
+        let mut illegal_seen = 0usize;
+
+        for from in AttemptState::ALL {
+            for to in AttemptState::ALL {
+                let expected_legal = expected.contains(&(from, to));
+                let mut attempt = attempt_in(from, 0);
+                let result = attempt.move_to(to, ts(10));
+
+                if expected_legal {
+                    legal_seen += 1;
+                    assert!(
+                        result.is_ok(),
+                        "{from} -> {to} is in the diagram and must be accepted"
+                    );
+                    assert_eq!(attempt.state(), to);
+                    assert_eq!(attempt.last_state_change_at(), ts(10));
+                } else {
+                    illegal_seen += 1;
+                    assert!(
+                        matches!(result, Err(AttemptError::IllegalTransition { .. })),
+                        "{from} -> {to} is not in the diagram and must be rejected"
+                    );
+                    assert_eq!(
+                        attempt.state(),
+                        from,
+                        "a refused transition changes nothing"
+                    );
+                    assert_eq!(attempt.last_state_change_at(), ts(0));
+                }
+            }
+        }
+
+        assert_eq!(legal_seen, 13);
+        assert_eq!(illegal_seen, 81 - 13);
+
+        // And the published constant matches the transcription.
+        let mut published = AttemptState::LEGAL.to_vec();
+        let mut transcribed = expected;
+        published.sort_unstable();
+        transcribed.sort_unstable();
+        assert_eq!(published, transcribed);
+    }
+
+    #[test]
+    fn an_attempt_state_cannot_transition_to_itself() {
+        for state in AttemptState::ALL {
+            assert!(
+                !state.can_transition_to(state),
+                "{state} -> {state} is not an edge in the diagram"
+            );
+        }
+    }
+
+    #[test]
+    fn cleaned_is_absorbing() {
+        for to in AttemptState::ALL {
+            assert!(
+                !AttemptState::Cleaned.can_transition_to(to),
+                "cleaned -> {to} must not exist; a cleaned runtime directory is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn the_documented_happy_path_walks_allocated_to_cleaned() {
+        // `e3`: "A full attempt runs allocated -> jit_received -> starting ->
+        // busy -> finished -> cleaned".
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "runtime/p/a",
+            ts(0),
+        );
+        assert_eq!(attempt.state(), AttemptState::Allocated);
+        assert!(attempt.counts_against_capacity());
+
+        attempt.jit_received(ts(1)).unwrap();
+        attempt.started(4242, ts(2)).unwrap();
+        assert_eq!(attempt.process_id(), Some(4242));
+
+        attempt.assigned_job(73, ts(3)).unwrap();
+        assert_eq!(attempt.state(), AttemptState::Busy);
+        assert_eq!(attempt.github_runner_id(), Some(73));
+
+        attempt
+            .conclude(AttemptOutcome::CompletedJob, ts(9))
+            .unwrap();
+        assert_eq!(attempt.state(), AttemptState::Finished);
+        assert_eq!(attempt.terminal_at(), Some(ts(9)));
+        assert!(!attempt.counts_against_capacity());
+
+        attempt.clean(ts(10)).unwrap();
+        assert_eq!(attempt.state(), AttemptState::Cleaned);
+    }
+
+    // =======================================================================
+    // Outcome: the surplus attempt
+    // =======================================================================
+
+    #[test]
+    fn an_attempt_that_exits_idle_without_work_is_terminal_and_not_a_failure() {
+        // `b1`: "An attempt that exits idle without work reaches a terminal state
+        // carrying an outcome distinguishable from a failure."
+        let mut surplus = RunnerAttempt::allocate(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "runtime/p/a",
+            ts(0),
+        );
+        surplus.jit_received(ts(1)).unwrap();
+        surplus.started(1, ts(2)).unwrap();
+        surplus.registered_idle(73, ts(3)).unwrap();
+        surplus
+            .conclude(AttemptOutcome::ExitedIdleWithoutWork, ts(300))
+            .unwrap();
+
+        assert!(surplus.is_terminal());
+        assert_eq!(surplus.state(), AttemptState::Finished);
+
+        let outcome = surplus.outcome().expect("a terminal attempt carries one");
+        assert!(outcome.is_idle_exit());
+        assert!(
+            !outcome.is_failure(),
+            "the surplus runner is an accepted, bounded cost of having no job \
+             reservation -- presenting it as a fault sends an operator hunting \
+             something that did not happen"
+        );
+        assert!(!outcome.ran_a_job());
+
+        // And it is cleaned like any other terminal attempt.
+        surplus.clean(ts(301)).unwrap();
+        assert_eq!(surplus.state(), AttemptState::Cleaned);
+    }
+
+    #[test]
+    fn an_idle_exit_is_distinguishable_from_a_failure_and_from_a_completed_job() {
+        // The three outcomes `g2` must render apart.
+        let idle = AttemptOutcome::ExitedIdleWithoutWork;
+        let failed = AttemptOutcome::failed(FailureReason::ProcessStartFailed);
+        let done = AttemptOutcome::CompletedJob;
+
+        assert_ne!(idle, failed);
+        assert_ne!(idle, done);
+        assert_ne!(failed, done);
+
+        assert_eq!(idle.terminal_state(), AttemptState::Finished);
+        assert_eq!(done.terminal_state(), AttemptState::Finished);
+        assert_eq!(failed.terminal_state(), AttemptState::Failed);
+        assert_eq!(
+            AttemptOutcome::Orphaned.terminal_state(),
+            AttemptState::Orphaned
+        );
+
+        // `finished` alone does not say which happened; the outcome does. This is
+        // the assertion that would fail if someone dropped the outcome field and
+        // let `g2` infer from the state.
+        assert_eq!(idle.terminal_state(), done.terminal_state());
+        assert_ne!(idle, done);
+
+        assert!(!idle.is_failure());
+        assert!(failed.is_failure());
+        assert!(AttemptOutcome::Orphaned.is_failure());
+    }
+
+    #[test]
+    fn an_outcome_cannot_be_recorded_from_a_state_that_could_not_produce_it() {
+        // A runner that never got a job cannot have run one.
+        let mut idle = attempt_in(AttemptState::Idle, 0);
+        assert!(matches!(
+            idle.conclude(AttemptOutcome::CompletedJob, ts(1)),
+            Err(AttemptError::OutcomeUnreachable {
+                from: AttemptState::Idle,
+                ..
+            })
+        ));
+        assert_eq!(idle.state(), AttemptState::Idle);
+        assert!(idle.outcome().is_none());
+
+        // And a runner that was executing a job did not exit idle without work.
+        let mut busy = attempt_in(AttemptState::Busy, 0);
+        assert!(matches!(
+            busy.conclude(AttemptOutcome::ExitedIdleWithoutWork, ts(1)),
+            Err(AttemptError::OutcomeUnreachable {
+                from: AttemptState::Busy,
+                ..
+            })
+        ));
+
+        // Failures and orphaning are reachable from both.
+        attempt_in(AttemptState::Idle, 0)
+            .conclude(AttemptOutcome::failed(FailureReason::JitExpired), ts(1))
+            .unwrap();
+        attempt_in(AttemptState::Busy, 0)
+            .conclude(AttemptOutcome::Orphaned, ts(1))
+            .unwrap();
+
+        // But not from a pre-registration state.
+        for state in [
+            AttemptState::Allocated,
+            AttemptState::JitReceived,
+            AttemptState::Starting,
+        ] {
+            assert!(
+                attempt_in(state, 0)
+                    .conclude(AttemptOutcome::Orphaned, ts(1))
+                    .is_err(),
+                "the diagram gives {state} no terminal edge"
+            );
+        }
+    }
+
+    // =======================================================================
+    // Busy protection
+    // =======================================================================
+
+    #[test]
+    fn a_busy_attempt_cannot_be_cleaned() {
+        // `04-subsystem-contracts.md`: "`busy` cannot transition to cleanup due
+        // to a scale-down request."
+        let mut busy = attempt_in(AttemptState::Busy, 0);
+        let err = busy.clean(ts(1)).unwrap_err();
+        assert_eq!(
+            err,
+            AttemptError::BusyCannotBeCleaned,
+            "the refusal must be named, not a generic transition error, so that a \
+             scale-down that tried it is legible in a log"
+        );
+        assert_eq!(busy.state(), AttemptState::Busy);
+        assert!(busy.counts_against_capacity());
+    }
+
+    #[test]
+    fn only_a_terminal_attempt_can_be_cleaned() {
+        for state in AttemptState::ALL {
+            let mut attempt = attempt_in(state, 0);
+            let result = attempt.clean(ts(1));
+            if state.is_concluded() {
+                assert!(result.is_ok(), "{state} is terminal and must be cleanable");
+                assert_eq!(attempt.state(), AttemptState::Cleaned);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{state} is not terminal and must not be cleanable"
+                );
+                assert_eq!(attempt.state(), state);
+            }
+        }
+    }
+
+    #[test]
+    fn capacity_is_reclaimed_exactly_at_the_terminal_states() {
+        for state in AttemptState::ALL {
+            assert_eq!(
+                attempt_in(state, 0).counts_against_capacity(),
+                !state.is_terminal(),
+                "{state}"
+            );
+        }
+
+        let attempts = vec![
+            attempt_in(AttemptState::Allocated, 0),
+            attempt_in(AttemptState::Starting, 0),
+            attempt_in(AttemptState::Busy, 0),
+            attempt_in(AttemptState::Finished, 0),
+            attempt_in(AttemptState::Cleaned, 0),
+        ];
+        assert_eq!(active_count(&attempts), 3);
+    }
+
+    // =======================================================================
+    // Persistence gate
+    // =======================================================================
+
+    #[test]
+    fn a_hand_edited_journal_row_with_an_impossible_outcome_is_rejected() {
+        let ok = RunnerAttempt::from_persisted(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            Some(73),
+            AttemptState::Finished,
+            Some(AttemptOutcome::ExitedIdleWithoutWork),
+            Some(9),
+            "runtime/p/a",
+            ts(0),
+            Some(ts(9)),
+            ts(9),
+        );
+        assert!(ok.is_ok());
+
+        // Terminal with no outcome.
+        assert!(matches!(
+            RunnerAttempt::from_persisted(
+                AttemptId::from_u128(1),
+                PolicyId::from_u128(1),
+                None,
+                AttemptState::Failed,
+                None,
+                None,
+                "p",
+                ts(0),
+                Some(ts(1)),
+                ts(1),
+            ),
+            Err(AttemptError::TerminalWithoutOutcome { .. })
+        ));
+
+        // Non-terminal carrying one.
+        assert!(matches!(
+            RunnerAttempt::from_persisted(
+                AttemptId::from_u128(1),
+                PolicyId::from_u128(1),
+                None,
+                AttemptState::Busy,
+                Some(AttemptOutcome::CompletedJob),
+                None,
+                "p",
+                ts(0),
+                None,
+                ts(1),
+            ),
+            Err(AttemptError::NonTerminalWithOutcome { .. })
+        ));
+
+        // A `failed` row that claims to have run a job.
+        assert!(matches!(
+            RunnerAttempt::from_persisted(
+                AttemptId::from_u128(1),
+                PolicyId::from_u128(1),
+                None,
+                AttemptState::Failed,
+                Some(AttemptOutcome::CompletedJob),
+                None,
+                "p",
+                ts(0),
+                Some(ts(1)),
+                ts(1),
+            ),
+            Err(AttemptError::OutcomeStateMismatch { .. })
+        ));
+
+        // `cleaned` keeps whichever outcome preceded it.
+        assert!(
+            RunnerAttempt::from_persisted(
+                AttemptId::from_u128(1),
+                PolicyId::from_u128(1),
+                None,
+                AttemptState::Cleaned,
+                Some(AttemptOutcome::Orphaned),
+                None,
+                "p",
+                ts(0),
+                Some(ts(1)),
+                ts(2),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_attempt_round_trips_through_serde() {
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(3),
+            PolicyId::from_u128(4),
+            "runtime/p/a",
+            ts(0),
+        );
+        attempt.jit_received(ts(1)).unwrap();
+        attempt.started(7, ts(2)).unwrap();
+        attempt.registered_idle(73, ts(3)).unwrap();
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::Other("no detail".into())),
+                ts(4),
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&attempt).unwrap();
+        let back: RunnerAttempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(attempt, back);
+    }
+
+    // =======================================================================
+    // Ownership
+    // =======================================================================
+
+    #[test]
+    fn an_attempt_belonging_to_another_host_is_rejected() {
+        // Ownership rule 2: "A host agent may act only on attempts persisted
+        // under its `host_id`."
+        let mine = HostId::from_u128(7);
+        let theirs = HostId::from_u128(8);
+        let policy_id = PolicyId::from_u128(11);
+
+        let their_policy = a_policy(theirs, policy_id);
+        let attempt =
+            RunnerAttempt::allocate(AttemptId::from_u128(1), policy_id, "runtime/p/a", ts(0));
+
+        let err = authorize(mine, &their_policy, &attempt).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OwnershipError::ForeignHost {
+                    owner,
+                    agent,
+                    ..
+                } if owner == theirs && agent == mine
+            ),
+            "got {err:?}"
+        );
+
+        // The same attempt under our own policy is fine.
+        let my_policy = a_policy(mine, policy_id);
+        assert!(authorize(mine, &my_policy, &attempt).is_ok());
+    }
+
+    #[test]
+    fn an_attempt_checked_against_the_wrong_policy_is_rejected() {
+        let host = HostId::from_u128(7);
+        let policy = a_policy(host, PolicyId::from_u128(11));
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(12),
+            "runtime/p/a",
+            ts(0),
+        );
+        assert!(matches!(
+            authorize(host, &policy, &attempt),
+            Err(OwnershipError::PolicyMismatch { .. })
+        ));
+    }
+
+    // =======================================================================
+    // Recovery, against a controlled clock
+    // =======================================================================
+
+    #[test]
+    fn recovery_never_reads_the_system_clock() {
+        // The whole decision surface moves when the fake clock moves, and by
+        // nothing else. If any branch called `Utc::now()` the two decisions below
+        // would be identical.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let attempt = attempt_in(AttemptState::Idle, 1_000);
+        let observation = RecoveryObservation {
+            process_alive: false,
+            github: GithubRunnerObservation::NotRegistered,
+        };
+
+        let clock = StubClock::at(1_000 + 299);
+        assert_eq!(
+            recovery_decision(&attempt, observation, timeouts, &clock),
+            RecoveryDecision::Conclude(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            )),
+            "one second before its idle timeout, a vanished runner crashed"
+        );
+
+        clock.set(1_000 + 300);
+        assert_eq!(
+            recovery_decision(&attempt, observation, timeouts, &clock),
+            RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork),
+            "at its idle timeout, the same runner is the surplus case from flow 2.7"
+        );
+    }
+
+    #[test]
+    fn a_live_process_is_adopted_rather_than_duplicated() {
+        // `e3`: "an attempt whose process still runs is adopted, not duplicated."
+        let timeouts = RecoveryTimeouts::provisional();
+        let clock = StubClock::at(1_000_000);
+        for state in [
+            AttemptState::Allocated,
+            AttemptState::JitReceived,
+            AttemptState::Starting,
+            AttemptState::Idle,
+            AttemptState::Busy,
+        ] {
+            // `entered_at` is the clock's own instant, so every state is inside
+            // its window and the only thing being asserted is the live-process
+            // rule.
+            let attempt = attempt_in(state, 1_000_000);
+            assert_eq!(
+                recovery_decision(
+                    &attempt,
+                    RecoveryObservation {
+                        process_alive: true,
+                        github: GithubRunnerObservation::NotRegistered,
+                    },
+                    timeouts,
+                    &clock,
+                ),
+                RecoveryDecision::Adopt,
+                "{state} with a live process"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_busy_attempt_is_orphaned_rather_than_guessed_into_a_success() {
+        // The agent never reports a job as complete; GitHub remains the source of
+        // truth for workflow outcome (flow 2, Failure).
+        let clock = StubClock::at(1_000_000);
+        for github in [
+            GithubRunnerObservation::NotRegistered,
+            GithubRunnerObservation::Registered { busy: true },
+            GithubRunnerObservation::Registered { busy: false },
+        ] {
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(AttemptState::Busy, 0),
+                    RecoveryObservation {
+                        process_alive: false,
+                        github,
+                    },
+                    RecoveryTimeouts::provisional(),
+                    &clock,
+                ),
+                RecoveryDecision::Conclude(AttemptOutcome::Orphaned),
+                "{github:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreachable_github_defers_every_decision() {
+        // Flow 3.3: while offline, start nothing and retain what is running. An
+        // agent that treated "unreachable" as "not registered" would conclude and
+        // clean every live attempt during a network outage.
+        let clock = StubClock::at(1_000_000);
+        for state in [
+            AttemptState::Allocated,
+            AttemptState::JitReceived,
+            AttemptState::Starting,
+            AttemptState::Idle,
+            AttemptState::Busy,
+        ] {
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(state, 0),
+                    RecoveryObservation {
+                        process_alive: false,
+                        github: GithubRunnerObservation::Unreachable,
+                    },
+                    RecoveryTimeouts::provisional(),
+                    &clock,
+                ),
+                RecoveryDecision::Defer,
+                "{state} while GitHub is unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_starting_attempt_follows_what_github_reports() {
+        // Precedence rule 3: GitHub runner status is authoritative for remote job
+        // status. Both edges are in the diagram.
+        let clock = StubClock::at(1_000);
+        let attempt = attempt_in(AttemptState::Starting, 0);
+
+        assert_eq!(
+            recovery_decision(
+                &attempt,
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::Registered { busy: true },
+                },
+                RecoveryTimeouts::provisional(),
+                &clock,
+            ),
+            RecoveryDecision::Observe(AttemptState::Busy)
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt,
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::Registered { busy: false },
+                },
+                RecoveryTimeouts::provisional(),
+                &clock,
+            ),
+            RecoveryDecision::Observe(AttemptState::Idle)
+        );
+    }
+
+    #[test]
+    fn a_terminal_attempt_is_cleaned_and_a_cleaned_one_is_left_alone() {
+        let clock = StubClock::at(1_000_000);
+        let observation = RecoveryObservation {
+            process_alive: false,
+            github: GithubRunnerObservation::NotRegistered,
+        };
+        for state in [
+            AttemptState::Finished,
+            AttemptState::Failed,
+            AttemptState::Orphaned,
+        ] {
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(state, 0),
+                    observation,
+                    RecoveryTimeouts::provisional(),
+                    &clock
+                ),
+                RecoveryDecision::Clean,
+                "{state}"
+            );
+        }
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Cleaned, 0),
+                observation,
+                RecoveryTimeouts::provisional(),
+                &clock
+            ),
+            RecoveryDecision::Nothing
+        );
+    }
+
+    #[test]
+    fn a_pre_registration_attempt_waits_until_its_deadline_then_has_nowhere_legal_to_go() {
+        // This test documents a gap in the state diagram rather than a decision
+        // this crate made. `04-subsystem-contracts.md` gives `allocated`,
+        // `jit_received`, and `starting` no edge to `failed` or `orphaned`, so a
+        // dead attempt that never registered cannot be concluded at all. `b1`'s
+        // Scope requires every transition outside the diagram to be rejected, so
+        // the decision reports the missing edge instead of inventing it.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let clock = StubClock::at(1_059);
+        let observation = RecoveryObservation {
+            process_alive: false,
+            github: GithubRunnerObservation::NotRegistered,
+        };
+
+        for state in [AttemptState::Allocated, AttemptState::JitReceived] {
+            let attempt = attempt_in(state, 1_000);
+            assert_eq!(
+                recovery_decision(&attempt, observation, timeouts, &clock),
+                RecoveryDecision::Wait,
+                "{state} inside its handoff window"
+            );
+            clock.set(1_060);
+            assert_eq!(
+                recovery_decision(&attempt, observation, timeouts, &clock),
+                RecoveryDecision::NoLegalTransition {
+                    from: state,
+                    wanted: AttemptState::Failed,
+                },
+                "{state} past its handoff window has no legal terminal edge"
+            );
+            clock.set(1_059);
+        }
+
+        // The same for `starting`, and for the one case where GitHub itself says
+        // an idle runner took a job.
+        clock.set(1_121);
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Starting, 1_000),
+                observation,
+                timeouts,
+                &clock
+            ),
+            RecoveryDecision::NoLegalTransition {
+                from: AttemptState::Starting,
+                wanted: AttemptState::Failed,
+            }
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                RecoveryObservation {
+                    process_alive: false,
+                    github: GithubRunnerObservation::Registered { busy: true },
+                },
+                timeouts,
+                &clock,
+            ),
+            RecoveryDecision::NoLegalTransition {
+                from: AttemptState::Idle,
+                wanted: AttemptState::Busy,
+            },
+            "the diagram has no `idle -> busy` edge, so GitHub reporting an idle \
+             runner as busy is not representable"
+        );
+    }
+
+    #[test]
+    fn a_dead_idle_runner_still_registered_at_github_is_orphaned() {
+        let clock = StubClock::at(1_000_000);
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 0),
+                RecoveryObservation {
+                    process_alive: false,
+                    github: GithubRunnerObservation::Registered { busy: false },
+                },
+                RecoveryTimeouts::provisional(),
+                &clock,
+            ),
+            RecoveryDecision::Conclude(AttemptOutcome::Orphaned),
+            "the remote registration outlived our process and needs removing"
+        );
+    }
+}
