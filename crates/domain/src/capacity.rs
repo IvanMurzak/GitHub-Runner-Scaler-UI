@@ -110,39 +110,52 @@ impl Allocation {
 /// call [`HostAllocator::allocate`] once per policy. Each grant reduces the
 /// remaining headroom, so the sum of `to_start` across all policies in one pass
 /// can never exceed `host_capacity - active_total`.
+///
+/// **The allocator holds the attempt set, and that is the whole design.**
+/// [`Self::from_attempts`] is the only constructor, so both ceilings are derived
+/// from one supply point: the host-wide total (D9) and every per-policy count
+/// (D7) are two different questions asked of the same set. The alternative —
+/// `new(&host, active_total: u16)` alongside a per-call `attempts` argument —
+/// left `HostAllocator::new(&host, 0)` compiling and silently disabling D9's
+/// ceiling, which is exactly the forgettable `u16` the module documentation
+/// above rules out one level up: "a first-class allocator over all policies, not
+/// a check a caller may forget". It also allowed the set to be supplied twice
+/// and disagree with itself. Neither is expressible now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostAllocator {
+pub struct HostAllocator<'a> {
     host_id: HostId,
     host_capacity: NonZeroU16,
+    /// Every attempt on the machine, across every policy.
+    attempts: Vec<&'a RunnerAttempt>,
     active_total: u16,
 }
 
-impl HostAllocator {
-    /// Build from an explicit active total.
-    ///
-    /// The total is saturated at `host_capacity`: a machine that somehow holds
-    /// more attempts than its ceiling has zero headroom, not negative headroom
-    /// that wraps into a large positive one.
-    #[must_use]
-    pub fn new(host: &Host, active_total: u16) -> Self {
-        Self {
-            host_id: host.id,
-            host_capacity: host.host_capacity,
-            active_total,
-        }
-    }
-
+impl<'a> HostAllocator<'a> {
     /// Build by counting the attempts the machine actually holds.
     ///
-    /// Prefer this. Passing every attempt across every policy is what makes the
-    /// host ceiling a fact about the machine rather than a number a caller
-    /// remembered to compute.
+    /// Passing every attempt across every policy is what makes the host ceiling
+    /// a fact about the machine rather than a number a caller remembered to
+    /// compute.
+    ///
+    /// The total is **not** clamped to `host_capacity` — [`Self::active_total`]
+    /// reports the raw count, over-subscription included, because an operator
+    /// looking at a machine holding more attempts than its ceiling needs to see
+    /// that. What saturates is [`Self::headroom`], which floors at zero: an
+    /// over-subscribed machine has no headroom, rather than negative headroom
+    /// that wraps into a large positive one.
     #[must_use]
-    pub fn from_attempts<'a>(
+    pub fn from_attempts(
         host: &Host,
         attempts: impl IntoIterator<Item = &'a RunnerAttempt>,
     ) -> Self {
-        Self::new(host, crate::attempt::active_count(attempts))
+        let attempts: Vec<&'a RunnerAttempt> = attempts.into_iter().collect();
+        let active_total = crate::attempt::active_count(attempts.iter().copied());
+        Self {
+            host_id: host.id,
+            host_capacity: host.host_capacity,
+            attempts,
+            active_total,
+        }
     }
 
     #[must_use]
@@ -164,12 +177,25 @@ impl HostAllocator {
 
     /// Decide how many runners to start for one policy, and spend the headroom.
     ///
-    /// `active_owned` is this policy's own in-flight attempts — the term that
-    /// stops a job still sitting in the queue from being served twice. It is a
-    /// separate argument from the allocator's running total because they are
-    /// different quantities: the total is host-wide (D9), this one is per-policy
-    /// (D7), and `to_start` is bound by both.
-    pub fn allocate(&mut self, policy: &ScalePolicy, demand: u32, active_owned: u16) -> Allocation {
+    /// `active_owned` — the attempts belonging to `policy` and still occupying a
+    /// slot — is selected from the set this allocator was built with. It is the
+    /// term that stops a job still sitting in the queue from being served twice,
+    /// and it is deliberately read from the *same* set as the host-wide total:
+    /// the two are different questions over one set, the total being host-wide
+    /// (D9) and this one per-policy (D7), and `to_start` is bound by both.
+    ///
+    /// **Why neither this nor the total is a `u16` parameter.** Both were, in
+    /// turn, and each omission is silent rather than loud. A caller passing a
+    /// literal `0` for `active_owned` compiled, ran, and started a fresh runner
+    /// on every poll for a job that was already being served; a caller passing
+    /// `0` for the host total disabled D9's ceiling outright. There is no longer
+    /// a way to write either call. If a caller genuinely holds a pre-computed
+    /// count it can still reach [`crate::attempt::active_count_for`] or
+    /// [`crate::attempt::active_count`] directly and see what it is asking for
+    /// by name.
+    pub fn allocate(&mut self, policy: &ScalePolicy, demand: u32) -> Allocation {
+        let active_owned =
+            crate::attempt::active_count_for(policy.id, self.attempts.iter().copied());
         let headroom_before = self.headroom();
 
         let refuse = |limiting_factor| Allocation {
@@ -244,7 +270,9 @@ impl HostAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
+    use crate::attempt::{
+        AttemptOutcome, AttemptState, FailureReason, PersistedAttempt, RunnerAttempt,
+    };
     use crate::model::{
         Arch, AttemptId, CachePolicy, HostLabel, Os, PolicyId, ScaleTarget, Timestamp,
     };
@@ -259,6 +287,12 @@ mod tests {
     }
 
     const HOST: HostId = HostId::from_u128(7);
+
+    /// A machine holding nothing. Spelled out rather than written as a bare
+    /// `&[]` so that "this host has no attempts on it" is an assertion the test
+    /// makes on purpose, which is the whole difference between this and the
+    /// `HostAllocator::new(&host, 0)` it replaced.
+    const NO_ATTEMPTS: &[RunnerAttempt] = &[];
 
     fn host(capacity: u16) -> Host {
         Host::new(HOST, "home-pc", Os::Windows, Arch::X64, nz(capacity), ts(0)).expect("valid host")
@@ -294,18 +328,18 @@ mod tests {
             AttemptState::Orphaned => AttemptOutcome::Orphaned,
             _ => AttemptOutcome::CompletedJob,
         });
-        RunnerAttempt::from_persisted(
-            AttemptId::from_u128(id),
-            PolicyId::from_u128(policy),
-            None,
+        RunnerAttempt::from_persisted(PersistedAttempt {
+            id: AttemptId::from_u128(id),
+            policy_id: PolicyId::from_u128(policy),
+            github_runner_id: None,
             state,
             outcome,
-            None,
-            "runtime/p/a",
-            ts(0),
-            state.is_terminal().then(|| ts(0)),
-            ts(0),
-        )
+            process_id: None,
+            runtime_path: "runtime/p/a".into(),
+            created_at: ts(0),
+            terminal_at: state.is_terminal().then(|| ts(0)),
+            last_state_change_at: ts(0),
+        })
         .expect("a state/outcome pair the domain accepts")
     }
 
@@ -319,23 +353,23 @@ mod tests {
         let policy = active_policy(1, "home", 3);
 
         // Above the ceiling.
-        let mut alloc = HostAllocator::new(&host, 0);
-        let above = alloc.allocate(&policy, 10, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let above = alloc.allocate(&policy, 10);
         assert_eq!(above.desired, 3, "max_capacity beats reported demand");
         assert_eq!(above.to_start, 3);
         assert_eq!(above.limiting_factor, LimitingFactor::MaxCapacity);
 
         // Inside the range.
-        let mut alloc = HostAllocator::new(&host, 0);
-        let inside = alloc.allocate(&policy, 2, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let inside = alloc.allocate(&policy, 2);
         assert_eq!(inside.desired, 2);
         assert_eq!(inside.to_start, 2);
         assert_eq!(inside.limiting_factor, LimitingFactor::Demand);
 
         // At the floor. D7 fixes min_capacity at 0 in v1, so no demand means no
         // runners -- the "no idle runners when unused" requirement.
-        let mut alloc = HostAllocator::new(&host, 0);
-        let none = alloc.allocate(&policy, 0, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let none = alloc.allocate(&policy, 0);
         assert_eq!(none.desired, 0);
         assert_eq!(none.to_start, 0);
         assert!(none.starts_nothing());
@@ -357,8 +391,8 @@ mod tests {
         );
         policy.activate().unwrap();
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&policy, 0, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&policy, 0);
         assert_eq!(got.desired, 2);
         assert_eq!(got.to_start, 2);
         assert_eq!(got.limiting_factor, LimitingFactor::MinCapacity);
@@ -385,8 +419,8 @@ mod tests {
         // Poll 1: nothing in flight.
         let demand = policy.tally(&queued).demand();
         assert_eq!(demand, 1);
-        let mut alloc = HostAllocator::new(&host, 0);
-        let first = alloc.allocate(&policy, demand, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let first = alloc.allocate(&policy, demand);
         assert_eq!(first.to_start, 1);
 
         // The runner is allocated and starting. The job is *still queued*.
@@ -398,7 +432,7 @@ mod tests {
             assert_eq!(demand, 1, "poll {poll}: the job has not left the queue");
 
             let mut alloc = HostAllocator::from_attempts(&host, &attempts);
-            let again = alloc.allocate(&policy, demand, 1);
+            let again = alloc.allocate(&policy, demand);
             assert_eq!(
                 again.to_start, 0,
                 "poll {poll} started another runner for a job already being \
@@ -423,7 +457,7 @@ mod tests {
         let mut alloc = HostAllocator::from_attempts(&host, &in_flight);
         assert_eq!(alloc.active_total(), 3);
         assert_eq!(alloc.headroom(), 1);
-        assert_eq!(alloc.allocate(&policy, 4, 3).to_start, 1);
+        assert_eq!(alloc.allocate(&policy, 4).to_start, 1);
 
         // The same three, all concluded: their slots are back.
         let done = vec![
@@ -434,7 +468,51 @@ mod tests {
         let mut alloc = HostAllocator::from_attempts(&host, &done);
         assert_eq!(alloc.active_total(), 0);
         assert_eq!(alloc.headroom(), 4);
-        assert_eq!(alloc.allocate(&policy, 4, 0).to_start, 4);
+        assert_eq!(alloc.allocate(&policy, 4).to_start, 4);
+    }
+
+    #[test]
+    fn one_attempt_set_answers_both_ceilings() {
+        // `HostAllocator::new(&host, active_total: u16)` used to sit beside
+        // `from_attempts`, and `HostAllocator::new(&host, 0)` compiled while
+        // silently disabling D9's ceiling -- the same forgettable `u16` that was
+        // removed from `allocate` one level down. `allocate` also took its own
+        // `attempts` argument, so the set could be supplied twice and disagree
+        // with itself: the residual "pass `&[]` twice" hole.
+        //
+        // Both are closed by there being exactly one supply point. This test
+        // asserts the consequence: the host-wide total and the per-policy count
+        // are read from the same set, without the caller getting a second say.
+        let host = host(10);
+        let mine = active_policy(1, "home", 9);
+        let theirs = active_policy(2, "office", 9);
+
+        let on_the_machine = vec![
+            attempt_in(AttemptState::Busy, 1, 1),
+            attempt_in(AttemptState::Starting, 2, 1),
+            attempt_in(AttemptState::Idle, 3, 2),
+            // Terminal, so it holds no slot in either count.
+            attempt_in(AttemptState::Finished, 4, 1),
+        ];
+
+        let mut alloc = HostAllocator::from_attempts(&host, &on_the_machine);
+        assert_eq!(alloc.active_total(), 3, "host-wide (D9), from the one set");
+
+        let got = alloc.allocate(&mine, 9);
+        assert_eq!(
+            got.active_owned, 2,
+            "per-policy (D7), from the same set and with no second argument that \
+             could have said otherwise"
+        );
+        assert_eq!(got.headroom_before, 7);
+        assert_eq!(got.to_start, 7, "9 wanted, 2 already in flight, 7 free");
+
+        let got = alloc.allocate(&theirs, 9);
+        assert_eq!(got.active_owned, 1);
+        assert_eq!(
+            got.to_start, 0,
+            "the first grant spent the headroom the second would have used"
+        );
     }
 
     // =======================================================================
@@ -449,9 +527,9 @@ mod tests {
         let a = active_policy(1, "home", 3);
         let b = active_policy(2, "home", 3);
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let first = alloc.allocate(&a, 10, 0);
-        let second = alloc.allocate(&b, 10, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let first = alloc.allocate(&a, 10);
+        let second = alloc.allocate(&b, 10);
 
         assert_eq!(first.to_start, 3, "the first policy takes the whole host");
         assert_eq!(
@@ -475,10 +553,10 @@ mod tests {
         let b = active_policy(2, "home", 4);
         let c = active_policy(3, "home", 4);
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let first = alloc.allocate(&a, 4, 0);
-        let second = alloc.allocate(&b, 4, 0);
-        let third = alloc.allocate(&c, 4, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let first = alloc.allocate(&a, 4);
+        let second = alloc.allocate(&b, 4);
+        let third = alloc.allocate(&c, 4);
 
         assert_eq!(first.to_start, 4);
         assert_eq!(second.to_start, 1, "one slot of headroom left");
@@ -503,7 +581,7 @@ mod tests {
         let mut alloc = HostAllocator::from_attempts(&host, &full);
         assert_eq!(alloc.headroom(), 0);
 
-        let got = alloc.allocate(&policy, u32::from(u16::MAX), 2);
+        let got = alloc.allocate(&policy, u32::from(u16::MAX));
         assert_eq!(got.to_start, 0);
         assert_eq!(got.headroom_before, 0);
         assert_eq!(got.limiting_factor, LimitingFactor::MaxCapacity);
@@ -525,7 +603,7 @@ mod tests {
         let mut alloc = HostAllocator::from_attempts(&host, &others);
         assert_eq!(alloc.headroom(), 2, "four slots are held by another policy");
 
-        let got = alloc.allocate(&policy, 5, 0);
+        let got = alloc.allocate(&policy, 5);
         assert_eq!(got.desired, 5, "the policy's own ceiling would allow five");
         assert_eq!(got.to_start, 2, "but the host has only two slots free");
         assert_eq!(got.limiting_factor, LimitingFactor::HostCapacity);
@@ -534,14 +612,26 @@ mod tests {
 
     #[test]
     fn an_over_subscribed_host_reports_zero_headroom_rather_than_wrapping() {
-        // If some caller ever hands in more active attempts than the ceiling,
-        // `host_capacity - active_total` must not wrap to 65535 and authorise a
-        // storm of runners.
+        // If a machine ever genuinely holds more active attempts than its
+        // ceiling -- a lowered `host_capacity`, or a journal written by an older
+        // build -- `host_capacity - active_total` must not wrap to 65535 and
+        // authorise a storm of runners.
         let host = host(2);
         let policy = active_policy(1, "home", 10);
-        let mut alloc = HostAllocator::new(&host, 9);
+        // Nine live attempts on a host whose ceiling is two. They belong to
+        // another policy, so this is purely about the host-wide term.
+        let oversubscribed: Vec<RunnerAttempt> = (1..=9)
+            .map(|id| attempt_in(AttemptState::Busy, id, 99))
+            .collect();
+
+        let mut alloc = HostAllocator::from_attempts(&host, &oversubscribed);
+        assert_eq!(
+            alloc.active_total(),
+            9,
+            "the raw count is reported, over-subscription included"
+        );
         assert_eq!(alloc.headroom(), 0);
-        assert_eq!(alloc.allocate(&policy, 10, 0).to_start, 0);
+        assert_eq!(alloc.allocate(&policy, 10).to_start, 0);
     }
 
     // =======================================================================
@@ -564,8 +654,8 @@ mod tests {
         );
         policy.activate().unwrap();
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&policy, 1_000, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&policy, 1_000);
         assert_eq!(got.to_start, 0);
         assert_eq!(got.limiting_factor, LimitingFactor::MonitorOnly);
         assert_eq!(
@@ -589,16 +679,16 @@ mod tests {
             PolicyMode::autoscale(labels("home"), 0, nz(5)).unwrap(),
             CachePolicy::default(),
         );
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&pending, 5, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&pending, 5);
         assert_eq!(got.to_start, 0);
         assert_eq!(got.limiting_factor, LimitingFactor::NotReconciling);
 
         // Draining: precedence rule 4, a user-requested disable beats demand.
         let mut draining = active_policy(2, "home", 5);
         draining.request_disable().unwrap();
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&draining, 5, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&draining, 5);
         assert_eq!(got.to_start, 0);
         assert_eq!(got.limiting_factor, LimitingFactor::NotReconciling);
         assert_eq!(alloc.headroom(), 10);
@@ -617,8 +707,8 @@ mod tests {
         );
         theirs.activate().unwrap();
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&theirs, 4, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&theirs, 4);
         assert_eq!(got.to_start, 0);
         assert_eq!(got.limiting_factor, LimitingFactor::ForeignHost);
         assert_eq!(alloc.headroom(), 4);
@@ -634,8 +724,8 @@ mod tests {
         let host = host(2);
         let policy = active_policy(1, "home", 4);
 
-        let mut alloc = HostAllocator::new(&host, 0);
-        let got = alloc.allocate(&policy, 9, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
+        let got = alloc.allocate(&policy, 9);
 
         assert_eq!(got.demand, 9);
         assert_eq!(got.desired, 4, "max_capacity beats reported demand");
@@ -649,9 +739,9 @@ mod tests {
         // traceability table). The whole allocator must return zero.
         let host = host(8);
         let policies = [active_policy(1, "home", 4), active_policy(2, "home", 4)];
-        let mut alloc = HostAllocator::new(&host, 0);
+        let mut alloc = HostAllocator::from_attempts(&host, NO_ATTEMPTS);
         for policy in &policies {
-            let got = alloc.allocate(policy, 0, 0);
+            let got = alloc.allocate(policy, 0);
             assert_eq!(got.to_start, 0);
             assert_eq!(got.desired, 0);
         }
