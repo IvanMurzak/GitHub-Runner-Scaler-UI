@@ -146,7 +146,11 @@ fn every_documented_channel_appears_in_the_readme() {
     let script = source
         .find(INSTALL_COMMANDS[0].0)
         .expect("checked above: the install script command is present");
-    for (command, what) in [INSTALL_COMMANDS[2], INSTALL_COMMANDS[3], INSTALL_COMMANDS[4]] {
+    for (command, what) in [
+        INSTALL_COMMANDS[2],
+        INSTALL_COMMANDS[3],
+        INSTALL_COMMANDS[4],
+    ] {
         let offset = source
             .find(command)
             .expect("checked above: every channel is present");

@@ -430,7 +430,14 @@ cmd_npm_stage() {
         rm -rf "$unpack"
         mkdir -p "$unpack"
         case "$extension" in
-        tar.gz) tar -xzf "${archives}/${asset}" -C "$unpack" ;;
+        # READ FROM STDIN, NOT BY NAME. GNU tar treats an archive argument
+        # containing a colon before the first slash as `host:path` and tries to
+        # reach a remote tape drive, so a Windows path -- which is what
+        # `release_channels.rs` hands this on the windows CI leg -- fails with
+        # "Cannot connect to C: resolve failed". `--force-local` fixes it on GNU
+        # tar and does not exist on the bsdtar macOS ships. A redirect avoids
+        # the question: `-C` is a directory operand and gets no such treatment.
+        tar.gz) tar -xz -C "$unpack" -f - <"${archives}/${asset}" ;;
         zip)
             command -v unzip >/dev/null 2>&1 ||
                 die "npm-stage: unzip is required to unpack ${asset}"

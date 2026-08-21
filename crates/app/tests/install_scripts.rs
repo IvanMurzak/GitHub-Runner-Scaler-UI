@@ -116,7 +116,13 @@ fn run_installed(binary: &Path) -> String {
 fn installed_entries(directory: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(directory)
         .unwrap_or_else(|err| panic!("cannot list {}: {err}", directory.display()))
-        .map(|entry| entry.expect("a directory entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     names
@@ -305,12 +311,7 @@ fn prepare(version: &str) -> Installed {
 #[test]
 fn install_sh_verifies_the_published_digest_and_installs_a_working_binary() {
     let fixture = prepare("1.2.3");
-    let (ok, output) = run_install_sh(
-        &LINUX_X64,
-        &fixture.release.assets,
-        &fixture.directory,
-        &[],
-    );
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
     assert!(ok, "install.sh failed on a good release:\n{output}");
 
     // The digest is not merely computed, it is REPORTED. A user who never sees
@@ -335,7 +336,10 @@ fn install_sh_verifies_the_published_digest_and_installs_a_working_binary() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&binary).expect("metadata").permissions().mode();
+        let mode = std::fs::metadata(&binary)
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert!(
             mode & 0o111 != 0,
             "the installed binary is not executable (mode {mode:o}). A file \
@@ -362,23 +366,13 @@ fn install_sh_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alon
     // a working install and the host's boot-start service with it. So this
     // installs a good version first and asserts it still runs afterwards.
     let fixture = prepare("1.2.3");
-    let (ok, output) = run_install_sh(
-        &LINUX_X64,
-        &fixture.release.assets,
-        &fixture.directory,
-        &[],
-    );
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
     assert!(ok, "the first install must succeed:\n{output}");
     let before = run_installed(&fixture.binary());
 
     corrupt(&fixture.release.archive("x86_64-unknown-linux-gnu"));
 
-    let (ok, output) = run_install_sh(
-        &LINUX_X64,
-        &fixture.release.assets,
-        &fixture.directory,
-        &[],
-    );
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
     assert!(
         !ok,
         "install.sh installed an archive whose digest does not match the \
@@ -413,12 +407,8 @@ fn install_sh_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alon
 fn install_sh_is_idempotent() {
     let fixture = prepare("1.2.3");
     for attempt in 1..=2 {
-        let (ok, output) = run_install_sh(
-            &LINUX_X64,
-            &fixture.release.assets,
-            &fixture.directory,
-            &[],
-        );
+        let (ok, output) =
+            run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
         assert!(ok, "install.sh failed on attempt {attempt}:\n{output}");
     }
 
@@ -447,7 +437,10 @@ fn install_sh_installs_the_exact_version_asked_for_or_nothing() {
         &["--version", "1.2.3"],
     );
     assert!(ok, "--version 1.2.3 must install release 1.2.3:\n{output}");
-    assert!(fixture.binary().is_file(), "nothing was installed:\n{output}");
+    assert!(
+        fixture.binary().is_file(),
+        "nothing was installed:\n{output}"
+    );
 
     // One that is not must be a refusal, and it must name both versions. This
     // is the case a remote 404 would normally catch and a local or mirrored
@@ -489,12 +482,7 @@ fn install_sh_refuses_a_release_that_publishes_nothing_for_this_platform() {
     );
     std::fs::write(fixture.release.sums(), thinned).expect("rewriting SHA256SUMS");
 
-    let (ok, output) = run_install_sh(
-        &LINUX_X64,
-        &fixture.release.assets,
-        &fixture.directory,
-        &[],
-    );
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
     assert!(!ok, "install.sh installed something anyway:\n{output}");
     assert!(
         output.contains("lists no archive for x86_64-unknown-linux-gnu"),
@@ -612,13 +600,28 @@ fn install_sh_stays_runnable_by_a_posix_shell() {
 
     for (bashism, why) in [
         ("<<<", "here-strings are bash-only"),
-        ("declare ", "`declare` is bash-only; POSIX has no equivalent"),
+        (
+            "declare ",
+            "`declare` is bash-only; POSIX has no equivalent",
+        ),
         ("${!", "indirect expansion is bash-only"),
-        (",,}", "case conversion in a parameter expansion is bash-only"),
-        ("^^}", "case conversion in a parameter expansion is bash-only"),
-        ("function ", "`function name()` is bash syntax; POSIX is `name()`"),
+        (
+            ",,}",
+            "case conversion in a parameter expansion is bash-only",
+        ),
+        (
+            "^^}",
+            "case conversion in a parameter expansion is bash-only",
+        ),
+        (
+            "function ",
+            "`function name()` is bash syntax; POSIX is `name()`",
+        ),
         ("+=(", "arrays are bash-only"),
-        ("local -", "`local -a`/`local -n` are bash-only; plain `local` is fine"),
+        (
+            "local -",
+            "`local -a`/`local -n` are bash-only; plain `local` is fine",
+        ),
     ] {
         assert!(
             !source.contains(bashism),
@@ -687,12 +690,15 @@ fn powershell_or_skip() -> Option<PathBuf> {
     if let Some(found) = powershell_program() {
         return Some(found);
     }
-    assert!(
-        !cfg!(windows),
-        "no PowerShell found on a Windows host. Windows PowerShell 5.1 is part \
-         of the operating system, so this is a broken PATH rather than a \
-         missing dependency."
-    );
+    // Written as a branch rather than `assert!(!cfg!(windows), ...)`, which
+    // clippy reads -- correctly -- as an assertion on a constant.
+    if cfg!(windows) {
+        panic!(
+            "no PowerShell found on a Windows host. Windows PowerShell 5.1 is \
+             part of the operating system, so this is a broken PATH rather than \
+             a missing dependency."
+        );
+    }
     assert!(
         std::env::var_os("CI").is_none(),
         "no `pwsh` on PATH in CI. PowerShell 7 is preinstalled on GitHub's \
@@ -751,12 +757,8 @@ fn install_ps1_selects_the_windows_artifact_for_both_architectures() {
     // install a `"cpu": ["x64"]` package onto an arm64 host -- so this is the
     // one platform where the install script reaches a user npm cannot.
     for architecture in ["AMD64", "ARM64"] {
-        let (ok, output) = run_install_ps1(
-            &shell,
-            base,
-            base,
-            &["-PrintPlan", "-Arch", architecture],
-        );
+        let (ok, output) =
+            run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", architecture]);
         assert!(ok, "install.ps1 refused {architecture}:\n{output}");
         assert_eq!(
             plan_value(&output, "target"),
@@ -806,7 +808,10 @@ fn install_ps1_defaults_to_the_documented_directory() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success(), "install.ps1 --print-plan failed:\n{text}");
+    assert!(
+        output.status.success(),
+        "install.ps1 --print-plan failed:\n{text}"
+    );
 
     let directory = plan_value(&text, "install_dir");
     // Asserted on the shape rather than on an exact string: `Join-Path` uses

@@ -206,8 +206,10 @@ impl FixtureRelease {
             .iter()
             .find(|(name, _, _)| *name == target)
             .unwrap_or_else(|| panic!("unknown target {target}"));
-        self.assets
-            .join(format!("runner-manager-{}-{target}.{extension}", self.version))
+        self.assets.join(format!(
+            "runner-manager-{}-{target}.{extension}",
+            self.version
+        ))
     }
 
     /// What the fake binary for `target` prints when run.
@@ -250,10 +252,7 @@ pub fn build_release(root: &Path, version: &str) -> FixtureRelease {
                 let (ok, output) = run_tar(&stage, &stem, &archive);
                 assert!(ok, "packing {stem}.tar.gz failed:\n{output}");
             }
-            "zip" => write_stored_zip(
-                &archive,
-                &[(format!("{stem}/{binary}"), body.as_bytes())],
-            ),
+            "zip" => write_stored_zip(&archive, &[(format!("{stem}/{binary}"), body.as_bytes())]),
             other => panic!("unknown archive extension {other}"),
         }
 
@@ -412,7 +411,8 @@ pub fn write_stored_zip(path: &Path, entries: &[(String, &[u8])]) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("zip parent directory");
     }
-    std::fs::write(path, &out).unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
+    std::fs::write(path, &out)
+        .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
 }
 
 /// Appends bytes to a file, so that its digest stops matching `SHA256SUMS`.
