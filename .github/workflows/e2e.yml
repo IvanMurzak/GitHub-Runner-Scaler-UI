@@ -1,0 +1,215 @@
+# End-to-end acceptance suite (D10), against the shared disposable fixture.
+#
+# ----------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE FILE FROM ci.yml.
+# ----------------------------------------------------------------------------
+# The three legs share ONE disposable repo and ONE disposable org, and h1's
+# post-conditions sweep them repo-wide ("no runner remains registered", "the old
+# routing label has not been reused"). Two legs mutating that fixture at once,
+# or a push-to-main run overlapping a pull-request run, makes those sweeps flaky
+# in a way the suite cannot fix from the inside. So the fixture has to be
+# serialised — and serialising it correctly is what forces the split.
+#
+# A JOB-level `concurrency` group cannot do it. GitHub holds at most one
+# in-progress plus one pending job per group, and when a third job goes pending
+# the one already pending is CANCELLED. That cancellation is not governed by
+# `cancel-in-progress`, which only decides the fate of the in-progress holder.
+# So three matrix legs sharing one static group would not queue behind each
+# other: leg 1 would hold the group, leg 2 would go pending, and leg 3 going
+# pending would cancel leg 2. `fail-fast: false` does not help, because a
+# cancelled leg is not a skipped leg. The mechanism meant to serialise the legs
+# would be the thing that destroyed them.
+#
+# A job-level group also cannot escape its parent. ci.yml's workflow-level block
+# sets `cancel-in-progress` true for pull requests, and a job-level
+# `cancel-in-progress: false` does not override a workflow-level cancellation —
+# so a second push to a same-repo pull request (the only kind where these
+# secrets exist and this suite actually runs) would kill a leg mid-scenario,
+# stranding a registered runner in the fixture org. That is the exact state the
+# serialisation exists to prevent.
+#
+# At WORKFLOW level, in this file, both problems go away. Only whole runs
+# contend for `e2e-fixture`; the worst case is a queued RUN being dropped before
+# it starts, never a leg cancelled mid-scenario; and `cancel-in-progress: false`
+# is the only setting that applies, because there is no parent block above it.
+#
+# ----------------------------------------------------------------------------
+# h1 MUST NEVER NEED TO EDIT THIS FILE.
+# ----------------------------------------------------------------------------
+# The acceptance command below is fixed and the suite selects its own scenarios
+# through `#[ignore]`; the four-input guard, the fixture-credential contract and
+# the parameterised runner labels are all carried here in full for the same
+# reason. Adding a scenario is a change to `tests/`, never to this workflow.
+#
+# TRIGGERS ARE DELIBERATELY IDENTICAL TO ci.yml's. Splitting the file must not
+# change WHEN the acceptance suite runs. The one behaviour the split does give
+# up is ci.yml's `needs: check` edge — GitHub has no cross-workflow `needs`, and
+# the alternatives (`workflow_run`) are triggers this repository's trigger
+# allow-list forbids for a file that holds these two secrets. The cost is that a
+# red `check` no longer suppresses a fixture run; the suite still skips in one
+# second whenever the fixture inputs are absent, which is every fork pull
+# request and every offline contributor.
+name: E2E
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Keyed on the shared FIXTURE, deliberately not on `github.ref` like ci.yml —
+# the fixture is what is contended, and two different refs contend for it just
+# as hard as two runs of the same one. `cancel-in-progress: false` because
+# cancelling mid-scenario strands a registered runner in the fixture org, which
+# is the exact state the next run's post-conditions would then report as a
+# failure.
+concurrency:
+  group: e2e-fixture
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should say why, not print a backtrace-less panic.
+  RUST_BACKTRACE: 1
+
+jobs:
+  e2e:
+    # The workspace-root acceptance suite (task h1). h1 fills the suite in
+    # without editing this workflow: the command below is fixed, and the suite
+    # selects its own scenarios through `#[ignore]`.
+    #
+    # The job SKIPS, rather than fails, when any of its four inputs is absent,
+    # so a fork pull request and an offline contributor are not blocked. A
+    # job-level `if` cannot read the `secrets` context, so the guard is a first
+    # step that publishes an output every later step keys on.
+    name: e2e (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One red leg must not hide the state of the other two.
+      fail-fast: false
+      # Serialises the legs WITHIN a run. The workflow-level `concurrency`
+      # block above serialises runs against each other; these are two different
+      # mechanisms and both are needed.
+      max-parallel: 1
+      matrix:
+        include:
+          # `runs-on` is parameterised rather than hardcoded to the hosted
+          # labels. h1 scenario 5 is boot-start recovery after a REAL reboot
+          # with no interactive login, and its DoD adds a rollback drill once
+          # per supported OS; a GitHub-hosted runner can neither reboot nor
+          # resume the job it was running. Pointing one of these variables at a
+          # self-hosted label is therefore how that scenario ever becomes a CI
+          # gate — and it must not cost an edit to this workflow, because h1 is
+          # forbidden from making one. Unset falls back to the hosted label, so
+          # the default behaviour is unchanged.
+          #
+          # Until such a label is configured, scenario 5 and the rollback drill
+          # remain out-of-CI manual gates. That is a fixture decision, not a
+          # workflow change.
+          - name: windows-x86_64
+            os: ${{ vars.RUNNER_MANAGER_E2E_RUNS_ON_WINDOWS || 'windows-latest' }}
+          - name: macos-arm64
+            os: ${{ vars.RUNNER_MANAGER_E2E_RUNS_ON_MACOS || 'macos-latest' }}
+          - name: linux-x86_64
+            os: ${{ vars.RUNNER_MANAGER_E2E_RUNS_ON_LINUX || 'ubuntu-latest' }}
+    defaults:
+      run:
+        # bash exists on all three runner images, so every step below is one
+        # script rather than one script per OS.
+        shell: bash
+    steps:
+      - name: Decide whether the acceptance suite can run
+        id: guard
+        env:
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+          RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
+          RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
+          RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+        run: |
+          # All four, not just the token. A token set with the repo and org
+          # unset used to run the suite against empty strings and fail
+          # obscurely, several minutes in, instead of skipping in one second.
+          missing=""
+          for name in \
+            RUNNER_MANAGER_E2E_TOKEN \
+            RUNNER_MANAGER_E2E_FIXTURE_TOKEN \
+            RUNNER_MANAGER_E2E_REPO \
+            RUNNER_MANAGER_E2E_ORG
+          do
+            # `${!name}` is bash indirection; every leg of this job runs bash.
+            if [ -z "${!name:-}" ]; then
+              missing="$missing $name"
+            fi
+          done
+
+          if [ -z "$missing" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=e2e skipped::the acceptance suite needs all four inputs; missing:$missing. Skipping rather than failing."
+          fi
+
+      - name: Check out the repository
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/checkout@v5
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        if: steps.guard.outputs.enabled == 'true'
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      - name: Cache the cargo registry and build artifacts
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      # The suite drives the real binary, and `cargo test -p <pkg>` builds only
+      # that package, so the binary has to exist first.
+      - name: Build the workspace
+        if: steps.guard.outputs.enabled == 'true'
+        run: cargo build --workspace
+
+      - name: Run the acceptance suite
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          # ------------------------------------------------------------------
+          # TWO TOKENS, AND THEY ARE NOT INTERCHANGEABLE.
+          # ------------------------------------------------------------------
+          # RUNNER_MANAGER_E2E_TOKEN is the PRODUCT credential: a user access
+          # token for the published App, carrying exactly the permission set
+          # `07-security.md` specifies — Repository Administration read/write,
+          # Repository Actions READ, Repository Metadata read, Organization
+          # Self-hosted runners read/write. The suite uses it to exercise
+          # runner-manager the way a real user's token would, so its scope must
+          # stay exactly that. Widening it to make a test pass would mean the
+          # tests no longer prove the product works within its stated
+          # permissions.
+          #
+          # RUNNER_MANAGER_E2E_FIXTURE_TOKEN is the FIXTURE credential, and it
+          # exists because the product token deliberately cannot do what
+          # setting up a scenario requires. Every one of h1's eight scenarios
+          # needs a QUEUED job to exist, which means committing a workflow file
+          # whose `runs-on` names the generated routing label (`contents:
+          # write`) and dispatching a run of it (`actions: write`). The product
+          # token has neither, and must not be given either. This second
+          # credential is scoped to the disposable fixture repo and org ONLY.
+          #
+          # Never use the fixture token to drive runner-manager itself, and
+          # never use the product token to build a fixture.
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+          RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
+          RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
+          RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+        run: cargo test -p runner-manager-e2e -- --ignored
