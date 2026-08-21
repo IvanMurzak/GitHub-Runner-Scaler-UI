@@ -16,3 +16,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Host-managed worker isolation worktrees (/taskflow-execute --parallel>1).
+# These land inside the checkout path; without this entry they surface as
+# untracked paths and read as a leaked isolation boundary.
+/.claude/worktrees/
