@@ -890,6 +890,25 @@ mod tests {
     /// The same, on the platform the persona is least likely to be using but
     /// the CI matrix definitely is.
     const WINDOWS_WORKSPACE: &str = r"C:\Users\operator\AppData\Local\runner-manager\runtime\9f2c";
+    /// A GitHub App installation assertion: a JSON Web Token.
+    ///
+    /// Its two `.` separators are the point. `is_opaque_char` excludes `.`, so
+    /// the opaque-run rule sees three short runs rather than one long one, and
+    /// every other secret here is caught by that rule when it stands alone.
+    const JWT: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\
+                       eyJpc3MiOiIxMjM0NTYiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDYwMH0.\
+                       c2lnbmF0dXJlLXRoYXQtaXMtb3BhcXVlLWFuZC1sb25nLWVub3VnaC10by1tYXR0ZXI";
+
+    /// An error whose `Debug` carries the HTTP body it was given.
+    ///
+    /// This is the shape `d2`'s secret store and `d3`'s installer will hand to
+    /// `tracing::error!(reason = ?err)`, and it is not the same shape as any of
+    /// the JSON above: `Debug` on a `String` escapes the quotes inside it, so
+    /// the keys arrive spelled `\"password\"` rather than `"password"`.
+    #[derive(Debug)]
+    struct StoreError {
+        body: String,
+    }
 
     fn secrets() -> Vec<&'static str> {
         vec![
@@ -897,6 +916,7 @@ mod tests {
             SERVER_TOKEN,
             FINE_GRAINED,
             JIT_BLOB,
+            JWT,
             WORKSPACE,
             WINDOWS_WORKSPACE,
         ]
@@ -957,6 +977,56 @@ mod tests {
                 tracing::error!("response: {{\"authorization\":\"Bearer {secret}\"}}");
                 tracing::error!("response: {{ \"authorization\": \"Bearer {secret}\" }}");
                 tracing::error!("response: authorization:Bearer {secret}");
+
+                // 9. A compact object with **more than one field**, the
+                //    credential key second. Shape 6 above differs from this by
+                //    field order and by nothing else, and `serde_json::to_string`
+                //    is what chooses the order -- so shape 6 could pass while an
+                //    error body from a struct with two fields leaked. The rules
+                //    split a word once, on the first separator they find, so
+                //    only `runner_id` was ever examined.
+                for key in ["encoded_jit_config", "runner_token", "access_token"] {
+                    tracing::error!(
+                        "registration failed: {{\"runner_id\":42,\"{key}\":\"{secret}\"}}"
+                    );
+                    tracing::error!(
+                        "registration failed: {{\"status\":422,\"message\":\"bad\",\"{key}\":\"{secret}\"}}"
+                    );
+                    // The spaced spelling of the same thing, which was already
+                    // safe -- by accident, because the value is its own word.
+                    tracing::error!(
+                        "registration failed: {{ \"runner_id\": 42, \"{key}\": \"{secret}\" }}"
+                    );
+                }
+
+                // 10. Nested, one level and two. The value recursion goes to
+                //     `redact_value`, which is a leaf and never re-enters
+                //     `redact_core`, so an object inside an object was emitted
+                //     whole.
+                tracing::error!("response: {{\"body\":{{\"runner_token\":\"{secret}\"}}}}");
+                tracing::error!(
+                    "response: {{\"error\":{{\"status\":422,\"body\":{{\"encoded_jit_config\":\"{secret}\"}}}}}}"
+                );
+
+                // 11. A form-encoded body with the credential parameter second.
+                //     `&` was not a separator this module knew, so the whole
+                //     body was one word and only `scope` was ever judged.
+                tracing::error!("token exchange failed: scope=repo&access_token={secret}");
+                tracing::error!(
+                    "token exchange failed: grant_type=refresh&refresh_token={secret}&scope=repo"
+                );
+
+                // 12. Backslash-escaped JSON, through `Debug` rather than
+                //     `Display`. Shape 5 is also `Debug`, but it puts the
+                //     secret on an *unlisted* field, which is dropped wholesale
+                //     -- so the `Debug` lens and the compact-JSON lens were both
+                //     here and had never been crossed. `reason` is allowed, so
+                //     this one reaches the scrubber, with its keys spelled
+                //     `\"runner_token\"`.
+                let failure = StoreError {
+                    body: format!("{{\"runner_token\":\"{secret}\"}}"),
+                };
+                tracing::error!(reason = ?failure, "the secret store rejected the request");
 
                 // 8. Carried on a span rather than on the event.
                 let span = tracing::info_span!("attempt", jit_config = %secret);
@@ -1421,6 +1491,190 @@ mod tests {
         let redacted = redact(&body);
         assert!(redacted.starts_with("registration failed: "), "{redacted}");
         assert!(redacted.contains("encoded_jit_config"), "{redacted}");
+    }
+
+    #[test]
+    fn a_credential_key_is_found_wherever_it_sits_in_a_compact_structure() {
+        // Every shape the test above covers puts the credential in the
+        // *first* key/value pair, and the rules split a word once, on the
+        // first separator they find. So redaction was a function of field
+        // order -- and `serde_json::to_string` is what decides field order for
+        // any struct with more than one field, which is what an error body is.
+        //
+        // Nesting and a form-encoded body are the same defect wearing
+        // different punctuation: the value recursion ends at `redact_value`,
+        // which is a leaf, and `&` was not a separator at all.
+        for shape in [
+            // The credential key second, in a compact object.
+            format!("{{\"runner_id\":42,\"encoded_jit_config\":\"{JIT_BLOB}\"}}"),
+            format!("{{\"status\":422,\"message\":\"bad\",\"runner_token\":\"{USER_TOKEN}\"}}"),
+            // Nested one level, and two.
+            format!("{{\"body\":{{\"runner_token\":\"{USER_TOKEN}\"}}}}"),
+            format!(
+                "{{\"error\":{{\"status\":422,\"body\":{{\"encoded_jit_config\":\"{JIT_BLOB}\"}}}}}}"
+            ),
+            // An array of objects, which is what a list endpoint returns.
+            format!("[{{\"id\":1}},{{\"access_token\":\"{USER_TOKEN}\"}}]"),
+            // Form-encoded, credential second and in the middle.
+            format!("scope=repo&access_token={USER_TOKEN}"),
+            format!("grant_type=refresh&refresh_token={USER_TOKEN}&scope=repo"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(JIT_BLOB) && !redacted.contains(USER_TOKEN),
+                "leaked from {shape}:\n{redacted}"
+            );
+            assert!(redacted.contains(REDACTION), "{shape} -> {redacted}");
+        }
+
+        // The pairs around it stay legible. A body whose every field came back
+        // `[redacted]` diagnoses nothing, and is how a redaction gets turned
+        // off rather than fixed.
+        let redacted = redact(&format!(
+            "failed: {{\"runner_id\":42,\"encoded_jit_config\":\"{JIT_BLOB}\"}}"
+        ));
+        assert!(redacted.starts_with("failed: "), "{redacted}");
+        assert!(redacted.contains("\"runner_id\":42"), "{redacted}");
+        assert!(redacted.contains("encoded_jit_config"), "{redacted}");
+
+        // A credential short enough to clear the opaque-run threshold and
+        // carrying no GitHub prefix has nothing but its key to give it away,
+        // so it is the case the shape rules cannot rescue.
+        for shape in [
+            "{\"user\":\"operator\",\"password\":\"hunter2\"}",
+            "{\"body\":{\"password\":\"hunter2\"}}",
+            "user=operator&password=hunter2",
+        ] {
+            assert!(
+                !redact(shape).contains("hunter2"),
+                "leaked from {shape}: {}",
+                redact(shape)
+            );
+        }
+
+        // Ordinary punctuation still survives the cut, or the structure that
+        // makes a log line readable is gone with the secret.
+        assert_eq!(redact("desired 3, active 1, headroom 2"), "desired 3, active 1, headroom 2");
+        assert_eq!(redact("labels=[linux,x64,self-hosted]"), "labels=[linux,x64,self-hosted]");
+    }
+
+    #[test]
+    fn a_backslash_escaped_key_is_still_a_key() {
+        // `tracing::error!(reason = ?err)` reaches this module through
+        // `record_debug` and `format!("{:?}")`, and `Debug` on a `String`
+        // escapes the quotes inside it. So an error whose `Debug` embeds an
+        // HTTP body arrives with its keys spelled `\"password\"` -- and `\`
+        // is not in `WRAPPERS`, so `trim_matches(WRAPPERS)` left it welded on
+        // and no list contained the result. `reason` is on ALLOWED_FIELDS, so
+        // this reaches the scrubber rather than being dropped.
+        let rendered = format!(
+            "{:?}",
+            StoreError {
+                body: "{\"password\":\"hunter2\"}".to_string(),
+            }
+        );
+        // The premise, asserted rather than assumed: `Debug` really does
+        // produce the escaped spelling. If it ever stops, this test is
+        // measuring something else.
+        assert!(
+            rendered.contains("\\\"password\\\""),
+            "the premise is that Debug escapes the quotes: {rendered}"
+        );
+        assert!(
+            !redact(&rendered).contains("hunter2"),
+            "leaked: {}",
+            redact(&rendered)
+        );
+
+        for shape in [
+            "{\\\"password\\\":\\\"hunter2\\\"}",
+            "Error { body: \"{\\\"access_token\\\":\\\"hunter2\\\"}\" }",
+        ] {
+            assert!(
+                !redact(shape).contains("hunter2"),
+                "leaked from {shape}: {}",
+                redact(shape)
+            );
+        }
+
+        // The escaped spelling of a long secret leaked too, and for the same
+        // reason: the key was unrecognised, so nothing below it ever ran.
+        let escaped = format!("{{\\\"encoded_jit_config\\\":\\\"{JIT_BLOB}\\\"}}");
+        assert!(!redact(&escaped).contains(JIT_BLOB), "{}", redact(&escaped));
+
+        // The fix belongs on the *key* side only. `split_wrappers` runs before
+        // `looks_like_path`, so putting `\` in `WRAPPERS` would trim away the
+        // leading `\\` that UNC detection keys on and turn a share path back
+        // into ordinary text.
+        assert_eq!(redact(r"\\fileserver\share\jit"), PATH_REDACTION);
+        assert_eq!(redact(r"\\?\C:\Users\operator\runtime"), PATH_REDACTION);
+    }
+
+    #[test]
+    fn a_bare_jwt_is_redacted_despite_its_dots() {
+        // `is_opaque_char` excludes `.`, so a JWT is three opaque runs rather
+        // than one, each under the threshold, and a 100-character credential
+        // printed verbatim. `Authorization: Bearer <jwt>` is caught by the
+        // scheme rule and a credential-keyed one by the key rule, so this bit
+        // only where a token stood alone or under a name nobody listed.
+        assert!(JWT.len() > 100, "the premise is a long token: {}", JWT.len());
+        assert_eq!(redact(JWT), REDACTION);
+        assert_eq!(
+            redact(&format!("minted {JWT} for the installation")),
+            format!("minted {REDACTION} for the installation")
+        );
+        // Sentence-final punctuation is trimmed as a wrapper first, so the
+        // token is still recognised.
+        assert!(!redact(&format!("minted {JWT}.")).contains(JWT));
+        // Under a key nobody listed.
+        assert!(!redact(&format!("assertion={JWT}")).contains(JWT));
+        assert!(!redact(&format!("{{\"assertion\":\"{JWT}\"}}")).contains(JWT));
+
+        // Narrow on purpose. Adding `.` to `is_opaque_char` is the obvious fix
+        // and the wrong one: it swallows every long dotted word there is.
+        for ordinary in [
+            "com.example.runner.manager.platform.process.identity.token",
+            "runner-manager.2026.08.21.log",
+            "api.github.com",
+            "9f2c1a44-0000-4000-8000-000000000001.attempt.json",
+        ] {
+            assert_eq!(redact(ordinary), ordinary, "over-redacted {ordinary}");
+        }
+    }
+
+    #[test]
+    fn the_sink_redacts_a_short_credential_that_only_its_key_gives_away() {
+        // `scan_for_leaks` cannot carry this case. A credential short enough
+        // to clear the opaque-run threshold and carrying no GitHub prefix is
+        // indistinguishable from an ordinary word when it is logged bare, so
+        // injecting it through shape 1 would demand a redaction no shape rule
+        // can deliver. Here the key is always present, which is the situation
+        // `d2`'s secret store is actually in -- and it is through the sink,
+        // not through `redact` alone, because that distinction is why these
+        // shapes survived a round.
+        let capture = Capture::default();
+        let output = emit(&capture, || {
+            tracing::error!("store rejected: {{\"user\":\"operator\",\"password\":\"hunter2\"}}");
+            tracing::error!("store rejected: {{\"body\":{{\"password\":\"hunter2\"}}}}");
+            tracing::error!("store rejected: user=operator&password=hunter2");
+            let failure = StoreError {
+                body: "{\"password\":\"hunter2\"}".to_string(),
+            };
+            tracing::error!(reason = ?failure, "store rejected the request");
+        });
+
+        assert!(
+            !output.contains("hunter2"),
+            "a short credential leaked through the sink:\n{output}"
+        );
+        assert!(output.contains(REDACTION), "{output}");
+        // Four lines, or the sink was never reached and "no secret found" is
+        // true of an empty string.
+        assert_eq!(
+            output.lines().filter(|line| !line.trim().is_empty()).count(),
+            4,
+            "{output}"
+        );
     }
 
     #[test]
