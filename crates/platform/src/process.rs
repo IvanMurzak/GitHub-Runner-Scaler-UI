@@ -1020,10 +1020,10 @@ fn parse_proc_stat(stat: &str) -> Option<ProcStat<'_>> {
 /// not evidence of absence, and reporting [`Adoption::Gone`] for one is how an
 /// agent decides to start a duplicate runner.
 #[cfg_attr(
-    windows,
+    not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "called from the Unix start-time probes; unit tested on every platform"
+        reason = "called from the macOS start-time probe; unit tested on every platform"
     )
 )]
 const fn probe_failure_means_gone(errno: Option<i32>, no_such_process: i32) -> bool {
