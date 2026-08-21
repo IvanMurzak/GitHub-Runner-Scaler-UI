@@ -38,7 +38,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# `test-util` for the acceptance scenarios that assert on backoff and timeout
+# windows without waiting them out (`tokio::time::pause()`).
+tokio = { workspace = true, features = ["test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

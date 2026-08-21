@@ -30,3 +30,8 @@ insta = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+# Test-only, and it does not weaken this crate's "no clock" rule: `test-util`
+# exists so that a backoff or timeout assertion advances time with
+# `tokio::time::pause()` instead of sleeping. `e1`'s jittered-backoff cases need
+# it, and it is a dev-dependency, so nothing in `src/` can reach it.
+tokio = { workspace = true, features = ["test-util"] }

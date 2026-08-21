@@ -43,7 +43,16 @@ windows-service = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }
 
+# `d1` pairs a PID with the process start time so that a recycled PID cannot
+# impersonate a runner that is gone. `std` exposes no start time, so the Unix
+# legs read `sysctl(KERN_PROC)` on macOS and `/proc/<pid>/stat` field 22 on
+# Linux; the Windows leg uses `GetProcessTimes` from the `windows` crate above.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 insta = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
+# `d1`'s lock-contention tests drive `tokio::time::pause()`.
+tokio = { workspace = true, features = ["test-util"] }
