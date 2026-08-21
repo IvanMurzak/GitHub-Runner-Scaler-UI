@@ -10,8 +10,8 @@ and expect both machines to resume work by themselves after a reboot.
 
 1. Run one install command for the platform: the install script
    (`curl -fsSL ... | sh`, or `irm ... | iex` on Windows), `npm i -g
-   runner-manager`, `brew install <tap>/runner-manager`, `scoop install
-   <bucket>/runner-manager`, or `cargo install runner-manager`.
+   runner-manager`, `brew install <tap>/runner-manager`, or
+   `cargo install runner-manager`.
 2. Run `runner-manager --version` to confirm.
 
 **Release gate:** One command installs a working binary on each supported OS

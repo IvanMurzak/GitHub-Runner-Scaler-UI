@@ -189,27 +189,23 @@ and only then.
 | Human-friendly modern view | Dashboard, focused tables, health/error states, text-plus-color status. | Journey gates in `08-user-workflows.md`. |
 | Tested on every PR and merge (D10) | `.github/workflows/ci.yml` matrix. | CI required-check status on the pull request. |
 | Manual, validated, tested releases (D10) | `.github/workflows/release.yml`, `workflow_dispatch` only. | Release-workflow rehearsal in `09-release-distribution.md`. |
-| One-command install per OS (D11) | Install script, npm wrapper, Homebrew tap, Scoop bucket, `cargo install`. | Per-channel install smoke test on each OS, asserting no security prompt. |
+| One-command install per OS (D11) | Install script, npm wrapper, Homebrew tap, `cargo install`. | Per-channel install smoke test on each OS, asserting no security prompt, including a Windows host with no Node. |
 | Three-action onboarding (D3) | Device flow against the published App, then an installation URL. | Device-flow round-trip test and Journey 1 gate in `08-user-workflows.md`. |
 | Repository and organization scale sets (D18) | `ScaleTarget` sum type; `repo` and `org` command families sharing one domain path. | Target-equivalence domain tests and one live organization-scoped job. |
 | Optional autoscaling / monitor-only (D19) | `PolicyMode`, enforced shape invariants, reconciliation skips `MonitorOnly`. | Monitor-only policy starts no runner; promotion to `autoscale` round-trip test. |
 
 ## Owner-facing open questions
 
-1. **One published App or two.** D19 gives users a monitor-only mode, but a
-   GitHub App declares a single permission set for every installation, so a
-   monitor-only user still grants `Administration: Read and write` — the grant
-   that also permits repository deletion, transfer, and collaborator changes.
-   Genuine least privilege for monitor-only would need a second published App
-   declaring only `Administration: read`, `Actions: read`, and `Metadata: read`,
-   with the tool choosing which App to authenticate against. That doubles the
-   registration, audit, and onboarding surface. Wave 1 must decide before the
-   published App is registered, because changing an App's permissions later
-   forces every existing installation to re-consent.
+None. D21 settled the last one on 2026-08-21: the project publishes exactly
+one GitHub App, and monitor-only users therefore grant the full permission
+set. The disclosure obligation that follows is a requirement in
+`07-security.md`, not an open question.
 
 The product name is settled: the binary, workspace root package, published
 crate, and npm package are all named `runner-manager` (RESOLVED 2026-08-21).
 The repository keeps its own name, `IvanMurzak/GitHub-Runner-Scaler-UI`.
 
-D1-D14 in `README.md` resolve every other product-policy decision needed to
-begin implementation.
+D1-D21 in `README.md` resolve every product-policy decision needed to begin
+implementation. The only unresolved item is technical, not product: the D17
+spike must confirm that a user-to-server token drives the Actions-service
+scale-set chain.

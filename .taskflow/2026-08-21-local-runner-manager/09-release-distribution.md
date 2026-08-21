@@ -54,9 +54,8 @@ Ordered steps, each of which fails the run:
 6. **Package** as `.zip` for Windows and `.tar.gz` for macOS/Linux, and emit
    `SHA256SUMS` plus an SBOM.
 7. **Publish** the GitHub Release with all artifacts attached.
-8. **Update the downstream channels** — the install scripts, npm packages,
-   Homebrew tap formula, and Scoop bucket manifest — each pinned to the
-   published checksums.
+8. **Update the downstream channels** — the install scripts, npm packages, and
+   the Homebrew tap formula — each pinned to the published checksums.
 
 If a step after tagging fails, the run stops with the tag present and no
 release published; the operator deletes the tag and re-dispatches. The workflow
@@ -67,15 +66,16 @@ never deletes a published release.
 | Channel | Platforms | Notes |
 |---|---|---|
 | Install script | all | `curl -fsSL <url>/install.sh \| sh`, and `irm <url>/install.ps1 \| iex` on Windows. The universal fallback for a host with no package manager — notably Linux, where Homebrew is uncommon and no `.deb`/`.rpm` is produced. |
-| npm wrapper package | all | Thin package with per-platform binaries as `optionalDependencies`, the pattern esbuild and similar tools use. This is why `winget` is excluded. |
+| npm wrapper package | all | Thin package with per-platform binaries as `optionalDependencies`, the pattern esbuild and similar tools use. |
 | Homebrew tap | macOS, Linux | One formula in a `homebrew-tap` repository, updated by the release workflow. |
-| Scoop bucket | Windows | One JSON manifest. Serves Windows operators who do not have Node. |
 | `cargo install` | all | Builds from source; free for a Rust project and matches the audience. |
 | GitHub Releases archives | all | The substrate every channel above pulls from and pins checksums against. Published every release, but not an advertised install path (D14). |
 
-`winget` is not a product channel. npm covers Windows, and
-`microsoft/winget-pkgs` moderation would put an external reviewer on the
-critical path of every release.
+Neither `winget` nor Scoop is a product channel. On Windows, npm serves anyone
+with Node and `irm <url>/install.ps1 | iex` serves everyone else, so a third
+Windows channel would add a manifest to keep in sync on every release without
+reaching a user the first two miss. `microsoft/winget-pkgs` would also put an
+external reviewer on the critical path of every release.
 
 ### The install script
 
@@ -103,7 +103,7 @@ operators who will not pipe a remote script into a shell.
 
 Gatekeeper acts only on files carrying `com.apple.quarantine`, and SmartScreen
 acts only on files carrying Mark-of-the-Web. Browsers set these attributes;
-`curl`, `irm`, `tar`, `brew`, `scoop`, `npm`, and `cargo` do not. Since D14
+`curl`, `irm`, `tar`, `brew`, `npm`, and `cargo` do not. Since D14
 removed direct-download buttons, **every documented install path is a terminal
 path**, so no user meets a security prompt on any supported OS and no
 certificate is needed to avoid one.
@@ -131,8 +131,10 @@ listed first.
 
 ## README structure (D14)
 
-The repository `README.md` opens with copy-paste install commands, one block
-per channel, install script first. There are no direct-download buttons and no
+The repository `README.md` states the GitHub App permission set and what
+`Administration: Read and write` implies **before** the install commands (D21),
+then gives copy-paste install commands, one block per channel, install script
+first. There are no direct-download buttons and no
 download images: every advertised path is a terminal command.
 
 Release archives remain published and linkable at
@@ -155,4 +157,5 @@ required to understand how to install or use the product.
 | One-command install per OS | Journey 0 gate in `08-user-workflows.md`, run on a machine that has never built the product. |
 | No install path triggers a security prompt | Each channel installed and launched on a clean Windows and a clean macOS host with no Gatekeeper block and no SmartScreen warning. |
 | Install script verifies integrity | Script aborts on a deliberately corrupted asset. |
+| Permission disclosure is present (D21) | README states the grant before the install commands; `auth login` and monitor-only `add` repeat it. Copy reviewed each release. |
 | Install path survives a toolchain change | Service still starts after a Node version switch, or `service status` reports the stale path as an error. |

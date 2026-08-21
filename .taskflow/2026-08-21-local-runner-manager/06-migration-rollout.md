@@ -67,9 +67,9 @@ threat-table tests from `07-security.md` passing on both.
 ## Phase 4: public beta
 
 - Publish the first release through the manual release workflow.
-- Publish the install scripts, npm wrapper, Homebrew tap, and Scoop bucket, and
-  verify a clean one-command install on each OS from a machine that has never
-  built the product.
+- Publish the install scripts, npm wrapper, and Homebrew tap, and verify a
+  clean one-command install on each OS from a machine that has never built the
+  product, including a Windows host with no Node installed.
 - Verify that no install path triggers a Gatekeeper block or SmartScreen
   warning on a clean macOS and a clean Windows host.
 - Verify device-flow onboarding end to end as a user who has never seen the

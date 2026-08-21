@@ -64,14 +64,24 @@ App, this is a one-time product-wide decision that every future user inherits,
 and it must be stated prominently wherever the App is offered — not left for
 GitHub's installation screen to disclose.
 
-**This binds monitor-only users too.** D19 lets a user run the product purely as
-a dashboard, but a GitHub App grants its whole declared permission set on
-installation; there is no per-installation subset. A user who wants only
-in-progress workflow counts still grants the ability to delete their
-repositories. Splitting the product across two published Apps is the only way
-to fix that, and it is an open question in `02-target-architecture.md` that must
-be settled before the App is registered — an App's permissions cannot be
-narrowed later without forcing every installation to re-consent.
+**This binds monitor-only users too, and that is an accepted cost (D21).** D19
+lets a user run the product purely as a dashboard, but a GitHub App grants its
+whole declared permission set on installation; there is no per-installation
+subset. A user who wants only in-progress workflow counts still grants the
+ability to delete their repositories. Splitting the product across two
+published Apps would fix that and was rejected on 2026-08-21 to keep one
+registration, one audit surface, and one onboarding path.
+
+Because the cost is accepted rather than removed, disclosure becomes a
+requirement rather than a courtesy:
+
+- The repository `README.md` states the permission set and what
+  `Administration: Read and write` implies, before the install commands.
+- `auth login` prints the same statement before opening the browser, and
+  `repo add`/`org add` repeat it when creating a monitor-only policy, where a
+  user is least likely to expect a write grant.
+- The permission set cannot be narrowed later without forcing every existing
+  installation to re-consent, so it is fixed at registration time.
 
 GitHub Apps cannot authenticate runners at the enterprise level at all, so
 D18's two scopes are the complete set.
@@ -166,9 +176,10 @@ unattended restart.
 - The published App's configuration is audited: device flow enabled, user-token
   expiration opted out, no private key generated, no webhook URL, permission
   set unchanged from the table above.
-- Service account permissions are documented and verified least privilege, and
-  the `Administration: Read and write` consequence is recorded as accepted and
-  disclosed to users at install time.
+- Service account permissions are documented and verified least privilege.
+- The `Administration: Read and write` disclosure appears in the README before
+  the install commands, in `auth login` output, and in `repo add`/`org add`
+  output for monitor-only policies. Copy is reviewed each release.
 - Every published artifact has a SHA-256 checksum and an SBOM. Paid code
   signing is not a v1 gate (D12); the free ad-hoc signature required for arm64
   macOS execution is verified present on the macOS artifacts.
