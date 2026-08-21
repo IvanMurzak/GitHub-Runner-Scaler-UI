@@ -62,6 +62,8 @@ well-defined. `min_capacity` is fixed at 0 in v1.
 
 ```text
 allocated -> jit_received -> starting -> idle | busy
+idle -> busy
+allocated | jit_received | starting -> failed | orphaned
 idle | busy -> finished | failed | orphaned
 finished | failed | orphaned -> cleaned
 ```
@@ -70,6 +72,39 @@ finished | failed | orphaned -> cleaned
 assignment; it is short-lived and is not an idle *persistent* runner. Only
 terminal attempts may be cleaned. `busy` cannot transition to cleanup due to a
 scale-down request.
+
+**AMENDED 2026-08-21, on owner decision during execution.** Two edge sets were
+added: `idle -> busy`, and terminal edges out of the three pre-registration
+states. The original diagram was internally inconsistent and had a concrete
+operational consequence, all three of which `b1`'s implementation and its
+review made executable rather than theoretical.
+
+- **`idle -> busy` was missing** while `e3`'s Scope step 4 moves an attempt
+  through `jit_received`, `starting`, `idle`, `busy` *in sequence*. The diagram
+  read `idle` and `busy` as alternative outcomes of `starting`, so a runner that
+  registered, was observed idle, and then picked up a job had nowhere legal to
+  go. The definition of `idle` immediately above — "registered and awaiting its
+  single job assignment" — describes a state that by construction precedes a
+  job, which settles it in `e3`'s favour.
+- **No terminal edge existed out of `allocated`, `jit_received` or `starting`.**
+  Because an attempt counts against host capacity for exactly as long as it is
+  non-terminal, an attempt that could not reach a terminal state **held a host
+  capacity slot permanently**: two failed JIT requests on a `host_capacity: 2`
+  host wedged that host into starting zero runners, with no error state, no
+  cleanup path, and nothing operator-visible. `orphaned` is included for the
+  restart case, where a pre-registration attempt is found after the agent
+  restarts.
+- **Five of the seven `FailureReason` variants were unreachable** —
+  `JitRequestFailed`, `JitExpired`, `RunnerPackageUnverified`,
+  `RunnerVersionRejected` and `ProcessStartFailed` — although
+  `03-control-flows.md` flow 2 names each by name as a condition the agent must
+  record. Every one of them occurs at a pre-registration state.
+
+`b1` implemented the original diagram faithfully rather than inventing edges,
+and surfaced the gap as an explicit `NoLegalTransition` outcome with a test
+named for it. That was the correct behaviour for an implementer facing an
+inconsistent contract, and it is why the defect was found before `e3` was
+written rather than after.
 
 `PolicyState` is:
 
