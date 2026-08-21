@@ -1,0 +1,19 @@
+.taskflow/2026-08-21-local-runner-manager/04-subsystem-contracts.md
+  s_5332f62e0ed5a7::t_b9612babdba673 65-66,76-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "cdc6c086293c92ae3fc2399d2c8121af2cd8277b",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
