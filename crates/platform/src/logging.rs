@@ -45,6 +45,9 @@
 //!   as a labelled 12-character prefix rather than disappearing. A digest is
 //!   not a secret, and `07-security.md` makes checksum verification a security
 //!   gate whose most useful diagnostic is expected-versus-actual.
+//! - A JSON Web Token is redacted whole. Its `.` separators split it into runs
+//!   the opaque-run rule is too short-sighted to catch, so it is recognised by
+//!   shape instead: two or three base64url segments whose header begins `eyJ`.
 //! - A URL keeps its scheme, host and path and loses everything that
 //!   authenticates it: the `user:password@` userinfo, the query string, and the
 //!   fragment. The userinfo matters more than it looks — a
@@ -54,6 +57,21 @@
 //! - A word ending in `:` or `=` whose stem is a credential header name causes
 //!   the next two words to be redacted, so `Authorization: Bearer ghu_…` loses
 //!   both the scheme and the token.
+//!
+//! A word is cut on structural punctuation — `,`, `{`, `}`, `[`, `]` and `&` —
+//! before any of that runs, and each fragment is judged on its own. Without
+//! that cut only the *first* key/value pair in a compact structure is ever
+//! examined, and redaction becomes a function of field order:
+//! `{"encoded_jit_config":"…"}` was caught and
+//! `{"runner_id":42,"encoded_jit_config":"…"}` was not, while
+//! `serde_json::to_string` is what decides which of the two an error body is.
+//! Nesting and a form-encoded body were the same defect in different
+//! punctuation.
+//!
+//! A key is also trimmed of backslashes, which a value never is: `Debug` on a
+//! `String` escapes the quotes inside it, so a body reached through
+//! `error!(reason = ?err)` spells its keys `\"password\"`. See [`trim_key`]
+//! for why the same trim must not be applied to a value.
 //!
 //! Every one of those is a case where being wrong costs a slightly less
 //! readable log line, against a case where being wrong the other way costs a
@@ -167,6 +185,8 @@ const CREDENTIAL_KEYS: &[&str] = &[
     "x.api.key",
     "x.auth.token",
     "x.github.token",
+    "x.hub.signature",
+    "x.hub.signature.256",
 ];
 
 /// Authentication scheme words. Whatever follows one of these is the
@@ -197,14 +217,57 @@ const WRAPPERS: &[char] = &[
     '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '.', '!', '?',
 ];
 
+/// Punctuation that separates one key/value pair from the next *inside* a
+/// single whitespace-delimited word.
+///
+/// [`redact_core`] judges a fragment by splitting it once, on the first `=` or
+/// `:` it finds. That is enough for `key=value` and for a one-field object,
+/// and it is why every shape this module was tested against put the credential
+/// in the first pair. It is not enough for anything `serde_json::to_string`
+/// actually emits: a struct with two fields becomes
+/// `{"runner_id":42,"encoded_jit_config":"…"}`, where the only pair ever
+/// examined is `runner_id`. Nesting is the same defect one level down, and a
+/// form-encoded body is the same defect spelled with `&`.
+///
+/// So a word is cut on these before any of that runs, and each fragment is
+/// judged on its own. The separators go back verbatim, because the structure
+/// around a redaction is what keeps the line diagnosable.
+const STRUCTURAL: &[char] = &[',', '{', '}', '[', ']', '&'];
+
 /// Whether this sink will emit a field's value rather than replacing it.
 #[must_use]
 pub fn is_field_allowed(name: &str) -> bool {
     ALLOWED_FIELDS.binary_search(&name).is_ok()
 }
 
+/// Trims the punctuation a *key* can arrive wrapped in: [`WRAPPERS`], plus the
+/// backslash.
+///
+/// The backslash is here rather than in [`WRAPPERS`] on purpose, and the
+/// distinction is load-bearing in both directions.
+///
+/// It has to be trimmed somewhere. `tracing::error!(reason = ?err)` reaches
+/// this module through `record_debug` and `format!("{:?}")`, and `Debug` on a
+/// `String` escapes the quotes inside it — so an error whose `Debug` embeds an
+/// HTTP body arrives with its keys spelled `\"password\"`. Trimming only
+/// [`WRAPPERS`] leaves the backslash welded on, and `\"password\` is on no
+/// list. That is `d2`'s shape: a secret-store failure carrying the body it was
+/// handed.
+///
+/// It must not be trimmed unconditionally. [`split_wrappers`] runs before
+/// [`looks_like_path`], so a `\` in [`WRAPPERS`] would strip the leading
+/// `\\` that UNC detection keys on, and `\\server\share` would stop being
+/// recognised as a path. A key is the one place a backslash can never be part
+/// of the value, so it is the one place the trim is unconditional;
+/// [`trim_start_wrappers`] takes the same backslash off a *value* only when it
+/// is escaping punctuation.
+fn trim_key(key: &str) -> &str {
+    key.trim()
+        .trim_matches(|c: char| c == '\\' || WRAPPERS.contains(&c))
+}
+
 fn normalise_key(key: &str) -> String {
-    key.trim().to_ascii_lowercase().replace(['-', '_'], ".")
+    trim_key(key).to_ascii_lowercase().replace(['-', '_'], ".")
 }
 
 fn is_credential_key(key: &str) -> bool {
@@ -273,12 +336,63 @@ fn split_trailing_whitespace(chunk: &str) -> (&str, &str) {
 ///
 /// Shared by [`redact_word`] and [`redact_core`], because both have to judge a
 /// fragment on its core while emitting it with its punctuation intact.
+///
+/// [`WRAPPERS`], and an *escaped* quote as well. Escaped text is exactly what
+/// a `Debug` rendering of a string is, and in it every quote arrives with a
+/// backslash welded on — so a value spelled `\"ghu_…\"` is wrapped in the
+/// same way `"ghu_…"` is, and none of the shape rules can see the token until
+/// the wrapper comes off. Trimming the key alone is not enough: `runner_token`
+/// is deliberately *not* on [`CREDENTIAL_KEYS`], because a name is not what
+/// makes a value a secret, so that pair is caught by the token-prefix rule
+/// reading its value or it is not caught at all.
 fn split_wrappers(fragment: &str) -> (&str, &str, &str) {
-    let leading = fragment.len() - fragment.trim_start_matches(WRAPPERS).len();
+    let leading = fragment.len() - trim_start_wrappers(fragment).len();
     let (prefix, rest) = fragment.split_at(leading);
-    let core_len = rest.trim_end_matches(WRAPPERS).len();
+    let core_len = trim_end_wrappers(rest).len();
     let (core, suffix) = rest.split_at(core_len);
     (prefix, core, suffix)
+}
+
+/// Trims wrapping punctuation from the front of a fragment.
+///
+/// A backslash counts as punctuation **only when it escapes punctuation**, and
+/// that restriction is the whole of what keeps this safe. `\"value` is a
+/// quoted value spelled the way an escaped rendering spells it, and the
+/// backslash is not part of the value. `\\server\share` is a UNC path whose
+/// leading backslashes escape nothing and *are* the value — trimming them is
+/// exactly what would stop [`looks_like_path`] recognising it, and this runs
+/// before [`looks_like_path`] does. `\\` is not a backslash-escaping-a-
+/// wrapper, so the two cases separate cleanly.
+fn trim_start_wrappers(fragment: &str) -> &str {
+    let mut rest = fragment;
+    loop {
+        let trimmed = rest.trim_start_matches(WRAPPERS);
+        let trimmed = match trimmed.strip_prefix('\\') {
+            Some(after) if after.starts_with(WRAPPERS) => after,
+            _ => trimmed,
+        };
+        if trimmed.len() == rest.len() {
+            return rest;
+        }
+        rest = trimmed;
+    }
+}
+
+/// Trims wrapping punctuation from the end of a fragment.
+///
+/// A trailing backslash goes with it, and needs no adjacency test: trimming
+/// runs right to left, so a backslash that has reached the end is one whose
+/// quote has already been taken off. A path that ends in a separator is still
+/// a path without it.
+fn trim_end_wrappers(fragment: &str) -> &str {
+    let mut rest = fragment;
+    loop {
+        let trimmed = rest.trim_end_matches(WRAPPERS).trim_end_matches('\\');
+        if trimmed.len() == rest.len() {
+            return rest;
+        }
+        rest = trimmed;
+    }
 }
 
 /// Redacts one whitespace-delimited word, and says how many following words the
@@ -299,7 +413,7 @@ fn redact_word(word: &str) -> (String, u32) {
     // no list. A long value survived this anyway by way of the opaque-run rule,
     // so the gap only ever showed on a short one.
     let stem = core.trim_end_matches([':', '=']);
-    if stem.len() < core.len() && is_credential_key(stem.trim_matches(WRAPPERS)) {
+    if stem.len() < core.len() && is_credential_key(stem) {
         // Two, so that `Authorization: Bearer <token>` loses the scheme and the
         // token rather than only the scheme.
         return (word.to_string(), 2);
@@ -328,20 +442,64 @@ fn redact_core(core: &str) -> String {
         return PATH_REDACTION.to_string();
     }
 
-    // `key=value` and `key:value` in a single word.
+    // A compact structure holds more than one key/value pair, and the rules
+    // below examine exactly one of them: `split_once` stops at the first
+    // separator it finds. So `{"encoded_jit_config":"…"}` was caught and
+    // `{"runner_id":42,"encoded_jit_config":"…"}` was not — the two differ by
+    // field order and by nothing else, and `serde_json::to_string` is what
+    // chooses the order. Nesting was the same defect: the value recursion
+    // below ends at `redact_value`, which is a leaf and never comes back
+    // here, so an object inside an object went out whole. A form-encoded body
+    // was the same defect again, with `&` as a separator nothing knew.
+    //
+    // Cutting on [`STRUCTURAL`] first turns all three into the shape the rules
+    // already handle, and does it at any depth: the cut is flat, so
+    // `{"a":{"b":{"token":"…"}}}` yields the same fragments a one-level object
+    // would. A fragment contains no structural character by construction, so
+    // this recurses exactly one level and cannot loop.
+    if core.contains(STRUCTURAL) {
+        let mut out = String::with_capacity(core.len());
+        let mut rest = core;
+        while let Some(index) = rest.find(STRUCTURAL) {
+            let (fragment, tail) = rest.split_at(index);
+            if !fragment.is_empty() {
+                out.push_str(&redact_core(fragment));
+            }
+            // Every character in `STRUCTURAL` is ASCII, so the separator is
+            // one byte and this cannot split a code point.
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+        }
+        if !rest.is_empty() {
+            out.push_str(&redact_core(rest));
+        }
+        return out;
+    }
+
+    // `key=value` and `key:value` in a single fragment.
     //
     // Pass one asks only whether either separator names a credential, and it
     // runs to completion before any value is inspected, because the *first*
-    // separator in a word is not necessarily the structural one. A base64
-    // payload carries `=` padding, so `{"encoded_jit_config":"eyJ…In0="}`
-    // splits on an `=` inside the blob into two halves that mean nothing, and
-    // the `:` that actually names the key is never reached.
+    // separator in a fragment is not necessarily the structural one. A base64
+    // payload carries `=` padding, and what follows that padding decides
+    // whether one pass would have done.
     //
-    // Both halves are judged unwrapped: compact JSON welds a quote to each,
-    // so the key arrives as `encoded_jit_config"`, which is on no list.
+    // `{"encoded_jit_config":"eyJ…In0="}` on its own is *not* that case, and
+    // this comment used to claim it was. Base64 padding is trailing-only, so
+    // the `=` split yields an empty value and the `value.is_empty()` guard in
+    // pass two already falls through to the `:`. The case that genuinely needs
+    // two passes is a **multi-field** object, where the text after the padding
+    // is not empty: `{"encoded_jit_config":"eyJ…In0=","runner_id":42}` is cut
+    // on `,` above into a fragment still ending `…In0="`, so the `=` split
+    // hands back a value of `"` — non-empty, inspected, found innocent, and
+    // returned before the `:` that names the key is ever reached.
+    //
+    // Both halves are judged through `trim_key`: compact JSON welds a quote to
+    // each, so the key arrives as `encoded_jit_config"`, and a `Debug`
+    // rendering welds a backslash as well.
     for separator in ['=', ':'] {
         if let Some((key, _)) = core.split_once(separator)
-            && is_credential_key(key.trim_matches(WRAPPERS))
+            && is_credential_key(key)
         {
             return format!("{key}{separator}{REDACTION}");
         }
@@ -366,7 +524,7 @@ fn redact_core(core: &str) -> String {
             // truncated -- which the unrecursed `:` path never did, and which
             // is worth having, because an HMAC-SHA256 signature has exactly a
             // digest's shape and was previously printed in full.
-            if key.trim_matches(WRAPPERS).eq_ignore_ascii_case("sha256")
+            if trim_key(key).eq_ignore_ascii_case("sha256")
                 && let Some(bare) = redacted.strip_prefix("sha256:")
             {
                 return format!("{key}{separator}{lead}{bare}{trail}");
@@ -443,6 +601,10 @@ fn redact_value(value: &str) -> String {
         return digest;
     }
 
+    if looks_like_jwt(value) {
+        return REDACTION.to_string();
+    }
+
     if value.len() >= OPAQUE_RUN_THRESHOLD && value.chars().all(is_opaque_char) {
         return REDACTION.to_string();
     }
@@ -476,6 +638,44 @@ fn as_sha256_digest(value: &str) -> Option<String> {
             .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() && c.is_ascii_hexdigit());
 
     is_digest.then(|| format!("sha256:{}…", &value[..DIGEST_PREFIX_LEN]))
+}
+
+/// The most `.`-separated segments a JSON Web Token has: header, payload,
+/// signature.
+const JWT_SEGMENTS: usize = 3;
+
+/// Whether a value is a JSON Web Token.
+///
+/// The opaque-run rule cannot see one. [`is_opaque_char`] excludes `.`, and a
+/// JWT is base64url runs joined by two of them, so a 100-character credential
+/// arrives as three runs that are each under the threshold and prints
+/// verbatim. `Authorization: Bearer <jwt>` is caught by the scheme-word rule
+/// and a credential-keyed one by the key rule, so this only ever bit a token
+/// logged bare or under a name nobody listed — which is what a GitHub App
+/// installation assertion is when it reaches a log at all.
+///
+/// Narrow deliberately, because the obvious fix is the wrong one: adding `.`
+/// to [`is_opaque_char`] would swallow every long dotted word there is —
+/// package names, dated filenames, dotted identifiers. A JWT header is
+/// base64url of `{"alg":…`, which always begins `eyJ`, and that is a
+/// discriminator ordinary text does not have.
+fn looks_like_jwt(value: &str) -> bool {
+    if value.len() < OPAQUE_RUN_THRESHOLD || !value.starts_with("eyJ") {
+        return false;
+    }
+
+    let mut segments = 0usize;
+    for segment in value.split('.') {
+        segments += 1;
+        if !segment.chars().all(is_opaque_char) {
+            return false;
+        }
+    }
+
+    // Two segments as well as three: an unsigned token has an empty signature,
+    // and the trailing `.` that would have made the third is trimmed as
+    // wrapping punctuation before this is reached.
+    (2..=JWT_SEGMENTS).contains(&segments)
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -1554,12 +1754,18 @@ mod tests {
 
         // Ordinary punctuation still survives the cut, or the structure that
         // makes a log line readable is gone with the secret.
-        assert_eq!(redact("desired 3, active 1, headroom 2"), "desired 3, active 1, headroom 2");
-        assert_eq!(redact("labels=[linux,x64,self-hosted]"), "labels=[linux,x64,self-hosted]");
+        assert_eq!(
+            redact("desired 3, active 1, headroom 2"),
+            "desired 3, active 1, headroom 2"
+        );
+        assert_eq!(
+            redact("labels=[linux,x64,self-hosted]"),
+            "labels=[linux,x64,self-hosted]"
+        );
     }
 
     #[test]
-    fn a_backslash_escaped_key_is_still_a_key() {
+    fn backslash_escaped_json_reaches_the_key_rules_and_the_value_rules() {
         // `tracing::error!(reason = ?err)` reaches this module through
         // `record_debug` and `format!("{:?}")`, and `Debug` on a `String`
         // escapes the quotes inside it. So an error whose `Debug` embeds an
@@ -1602,12 +1808,41 @@ mod tests {
         let escaped = format!("{{\\\"encoded_jit_config\\\":\\\"{JIT_BLOB}\\\"}}");
         assert!(!redact(&escaped).contains(JIT_BLOB), "{}", redact(&escaped));
 
-        // The fix belongs on the *key* side only. `split_wrappers` runs before
-        // `looks_like_path`, so putting `\` in `WRAPPERS` would trim away the
-        // leading `\\` that UNC detection keys on and turn a share path back
-        // into ordinary text.
+        // Trimming the key is only half of it, and it is the half that is
+        // easy to mistake for the whole. `runner_token` is deliberately *not*
+        // on CREDENTIAL_KEYS -- a field name is not what makes a value a
+        // secret, and this module's own documentation says so -- so that pair
+        // is caught by the token-prefix rule reading its *value*, or it is not
+        // caught at all. The escaped quote hid the value from that rule
+        // exactly as it hid the key from the key rules, and a key-only fix
+        // leaves this one leaking through the sink.
+        assert!(
+            !is_credential_key("runner_token"),
+            "the premise of this case is an unlisted key; once it is listed, \
+             this stops exercising the value side at all"
+        );
+        let escaped_value = format!("{{\\\"runner_token\\\":\\\"{USER_TOKEN}\\\"}}");
+        assert!(
+            !redact(&escaped_value).contains(USER_TOKEN),
+            "the value side leaked: {}",
+            redact(&escaped_value)
+        );
+
+        // The trim is unconditional on a key and conditional on a value: a
+        // backslash comes off a value only where it is escaping punctuation.
+        // `split_wrappers` runs before `looks_like_path`, so putting `\` in
+        // `WRAPPERS` would trim away the leading `\\` that UNC detection keys
+        // on and turn a share path back into ordinary text.
         assert_eq!(redact(r"\\fileserver\share\jit"), PATH_REDACTION);
         assert_eq!(redact(r"\\?\C:\Users\operator\runtime"), PATH_REDACTION);
+        // And the escaped spelling of a share path is still a share path:
+        // `\\` escapes nothing, so it survives the trim that `\"` does not.
+        assert_eq!(redact(r"\\\\fileserver\\share\\jit"), PATH_REDACTION);
+        // A path ending in its own separator is still a path without it. The
+        // separator is punctuation, so it is trimmed, judged, and put back.
+        let trailing = redact("C:\\Users\\operator\\runtime\\");
+        assert!(trailing.starts_with(PATH_REDACTION), "{trailing}");
+        assert!(!trailing.contains("operator"), "{trailing}");
     }
 
     #[test]
@@ -1617,7 +1852,11 @@ mod tests {
         // printed verbatim. `Authorization: Bearer <jwt>` is caught by the
         // scheme rule and a credential-keyed one by the key rule, so this bit
         // only where a token stood alone or under a name nobody listed.
-        assert!(JWT.len() > 100, "the premise is a long token: {}", JWT.len());
+        assert!(
+            JWT.len() > 100,
+            "the premise is a long token: {}",
+            JWT.len()
+        );
         assert_eq!(redact(JWT), REDACTION);
         assert_eq!(
             redact(&format!("minted {JWT} for the installation")),
@@ -1671,7 +1910,10 @@ mod tests {
         // Four lines, or the sink was never reached and "no secret found" is
         // true of an empty string.
         assert_eq!(
-            output.lines().filter(|line| !line.trim().is_empty()).count(),
+            output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
             4,
             "{output}"
         );
@@ -1735,6 +1977,33 @@ mod tests {
             redact("Cookie: session=abc"),
             format!("Cookie: {REDACTION}")
         );
+
+        // A webhook signature is not a credential the way a token is -- it is
+        // derived, and it verifies rather than authenticates -- but it has a
+        // SHA-256's exact shape, so the digest carve-out rendered it as a
+        // labelled 12-character prefix rather than redacting it. Twelve hex
+        // characters of an HMAC are of no use to anybody, which is why the
+        // carve-out is safe in general; the header is on the list anyway,
+        // because there is no diagnostic worth having in a signature and one
+        // entry is cheaper than the argument.
+        let hmac = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert_eq!(
+            redact(&format!("X-Hub-Signature-256: sha256={hmac}")),
+            format!("X-Hub-Signature-256: {REDACTION}")
+        );
+        assert_eq!(
+            redact(&format!("{{\"x-hub-signature-256\":\"sha256={hmac}\"}}")),
+            format!("{{\"x-hub-signature-256\":{REDACTION}\"}}")
+        );
+        // The SHA-1 spelling GitHub still sends alongside it.
+        assert_eq!(
+            redact(&format!("X-Hub-Signature: sha1={hmac}")),
+            format!("X-Hub-Signature: {REDACTION}")
+        );
+        // The carve-out itself is untouched: a bare digest still renders as a
+        // prefix, because a checksum gate that cannot say which digest it got
+        // is a gate nobody can act on.
+        assert_eq!(redact(hmac), "sha256:9f86d081884c…");
     }
 
     #[test]
