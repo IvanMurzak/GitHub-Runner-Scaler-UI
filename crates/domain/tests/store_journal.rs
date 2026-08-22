@@ -349,10 +349,19 @@ fn the_journal_survives_process_death_and_yields_the_same_attempts() {
     // Nothing reopens the database here. A second `SqliteStore` would close
     // cleanly at the end of its statement, and a clean close checkpoints the
     // write-ahead log away -- which is precisely the file being asserted on.
+    // What this first assertion checks is the letter case, and it now says so.
+    // It used to read `assert_eq!(wal, mode == "wal")` under a message about
+    // `readers_do_not_block_writers` agreeing with the reported mode -- but that
+    // method *is* `journal_mode().eq_ignore_ascii_case("wal")`, so the two sides
+    // could only ever have differed on case. Case is worth pinning, because this
+    // string is compared literally both below and in `store.rs`; agreement is
+    // worth pinning too, and that is the next assertion, which reads a second
+    // source rather than the same fact twice.
     assert_eq!(
-        wal,
-        mode == "wal",
-        "`readers_do_not_block_writers` must agree with the reported mode"
+        mode,
+        mode.to_ascii_lowercase(),
+        "SQLite reports the mode lowercased and every comparison against it is \
+         literal, so a change of case here would silently unhook them"
     );
     assert_eq!(
         path.with_extension("sqlite3-wal").exists(),
@@ -410,19 +419,23 @@ fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
     // branch either way. Confirmed by mutating the store: that transposition
     // passed this test while two others failed it.
     //
-    // So the attempt is allocated at T0 and enters `idle` a full idle timeout
-    // later, and the clock is advanced to match. The transposition now moves
-    // `last_state_change_at` *earlier* by exactly one timeout, which is enough
-    // to push the first assertion below onto the wrong branch.
+    // So both attempts are allocated at T0 and enter the state they are in a
+    // full idle timeout later, and the clock is advanced to match. The
+    // transposition now moves `last_state_change_at` *earlier* by exactly one
+    // timeout, which is enough to push the first assertion below onto the wrong
+    // branch.
     let allocated_at = clock.now();
-    let entered_idle_at = allocated_at + timeouts.idle;
+    // Named for the column rather than for `idle`: `busy` below is built from
+    // the same instant, and calling it `entered_idle_at` there said something
+    // that was not true of it.
+    let entered_state_at = allocated_at + timeouts.idle;
     let idle = fixtures::attempt()
         .id(AttemptId::from_u128(0x401))
         .state(AttemptState::Idle)
         .github_runner_id(73)
         .process_id(4_242)
         .created_at(allocated_at)
-        .entered_state_at(entered_idle_at)
+        .entered_state_at(entered_state_at)
         .build();
     let busy = fixtures::attempt()
         .id(AttemptId::from_u128(0x402))
@@ -430,13 +443,18 @@ fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
         .github_runner_id(74)
         .process_id(4_243)
         .created_at(allocated_at)
-        .entered_state_at(entered_idle_at)
+        .entered_state_at(entered_state_at)
         .build();
-    assert_ne!(
-        idle.created_at,
-        idle.last_state_change_at(),
-        "if these are equal, nothing below can tell the two columns apart"
-    );
+    // Both attempts, not just the one the assertions below happen to read
+    // first: `busy` is reloaded and decided on too, so it needs the same two
+    // columns to be distinguishable.
+    for attempt in [&idle, &busy] {
+        assert_ne!(
+            attempt.created_at,
+            attempt.last_state_change_at(),
+            "if these are equal, nothing below can tell the two columns apart"
+        );
+    }
 
     // Now is the moment the runner entered `idle`, so no time has yet elapsed
     // *in that state* -- while a whole idle timeout has elapsed since
