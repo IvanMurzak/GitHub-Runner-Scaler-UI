@@ -2336,9 +2336,16 @@ mod tests {
         // prove the field is a real carrier.
         //
         // A malformed value in that column produces a `CorruptColumn`, whose
-        // message goes wherever the error goes -- and `d1`'s redacting log sink
-        // matches on shape, so it would probably catch a prefixed token but not
-        // an encoded blob, which has no prefix at all.
+        // message goes wherever the error goes. This test was written when the
+        // answer was a sixty-character clip, and its rationale was that `d1`'s
+        // shape-matching sink would probably catch a prefixed token downstream
+        // even if one leaked. It no longer rests on that, and should not: the
+        // sink is a control that a *truncated* token can walk straight past,
+        // which is the argument in `FREE_FORM_COLUMNS`. Nothing from this column
+        // is echoed at all now, so the long payload below is a case of the rule
+        // rather than the reason for it, and
+        // `a_short_secret_in_the_free_form_column_is_not_echoed_at_all` covers
+        // the length a clip could never have protected.
         let store = store();
         let blob = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0\
                     NTY3ODkrLwABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzA"
@@ -2366,6 +2373,13 @@ mod tests {
         assert!(
             value.chars().count() < blob.chars().count(),
             "the echo must be shorter than what it echoes"
+        );
+        // And not a prefix of it either. A base64 blob has no prefix for `d1`'s
+        // sink to match on, so a leading fragment of one is exactly as
+        // unredactable as the whole thing is.
+        assert!(
+            !value.contains(&blob[..8]),
+            "no leading fragment of the payload may travel either: {value}"
         );
 
         // The row id is what an operator actually needs, and it is still there.
