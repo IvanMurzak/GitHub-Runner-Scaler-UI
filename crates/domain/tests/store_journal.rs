@@ -353,15 +353,29 @@ fn the_journal_survives_process_death_and_yields_the_same_attempts() {
     // It used to read `assert_eq!(wal, mode == "wal")` under a message about
     // `readers_do_not_block_writers` agreeing with the reported mode -- but that
     // method *is* `journal_mode().eq_ignore_ascii_case("wal")`, so the two sides
-    // could only ever have differed on case. Case is worth pinning, because this
-    // string is compared literally both below and in `store.rs`; agreement is
-    // worth pinning too, and that is the next assertion, which reads a second
-    // source rather than the same fact twice.
+    // could only ever have differed on case. Agreement is worth pinning too, and
+    // that is the next assertion, which reads a second source rather than the
+    // same fact twice.
+    //
+    // **What the case pin protects is the tests, not production.** Both
+    // production comparisons fold case -- `store.rs`'s WAL warning at open, and
+    // `readers_do_not_block_writers` -- so a `WAL` from some future SQLite would
+    // not change the agent's behaviour by one branch. The literal comparisons
+    // are both in `store.rs`'s own test module: `assert_eq!(memory.
+    // journal_mode(), "memory")` and `matches!(mode, "wal" | "delete")`. Those
+    // are what a change of case would red, and they would red loudly rather than
+    // silently, which is the outcome to want. Below in *this* file `mode` is
+    // only interpolated into failure messages, so nothing here compares it at
+    // all.
+    //
+    // So this is a canary on an assumption the suite is built on, not a guard on
+    // a live code path -- worth keeping, worth not overstating.
     assert_eq!(
         mode,
         mode.to_ascii_lowercase(),
-        "SQLite reports the mode lowercased and every comparison against it is \
-         literal, so a change of case here would silently unhook them"
+        "SQLite reports the mode lowercased, and `store.rs`'s tests compare it \
+         literally, so a change of case here would red them somewhere less \
+         obvious than this"
     );
     assert_eq!(
         path.with_extension("sqlite3-wal").exists(),

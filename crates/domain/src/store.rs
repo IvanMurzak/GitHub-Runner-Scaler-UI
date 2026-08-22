@@ -190,10 +190,11 @@ pub enum StoreError {
     /// `table` and `column` are carried for the operator's sake and are also
     /// what decides the echo: a column whose shape the schema fixes gets a
     /// clipped echo of at most [`ECHO_LIMIT`] characters, and one that may hold
-    /// text a caller chose gets position only, with none of the payload. The
-    /// rule and the measurement behind it are on `FREE_FORM_COLUMNS`, beside the
-    /// decoder that applies it. (Named rather than linked: it is private, and a
-    /// link from here would not resolve for a reader of the public docs.)
+    /// text the agent captured from a failure gets position only, with none of
+    /// the payload. The rule and the measurement behind it are on
+    /// `FREE_FORM_COLUMNS`, beside the decoder that applies it. (Named rather
+    /// than linked: it is private, and a link from here would not resolve for a
+    /// reader of the public docs.)
     #[error("{table}.{column} of row {id} holds {value}, which is not {expected}")]
     CorruptColumn {
         table: &'static str,
@@ -1404,8 +1405,8 @@ fn u64_to_sql(what: &'static str, value: u64) -> Result<i64, StoreError> {
 /// a fixed character budget is the wrong instrument there, and what replaced it.
 pub const ECHO_LIMIT: usize = 60;
 
-/// The columns whose payload includes text a **caller** chose, and which an
-/// error message therefore may not echo at all.
+/// The columns whose payload includes text the **agent captured from a
+/// failure**, and which an error message therefore may not echo at all.
 ///
 /// **Why this is a per-column list and not one budget for every column.**
 /// [`ECHO_LIMIT`] is a fixed character budget with no idea which column it is
@@ -1430,22 +1431,42 @@ pub const ECHO_LIMIT: usize = 60;
 ///
 /// **What is echoed instead.** For a column on this list,
 /// [`StoreError::CorruptColumn`] reports position only — how many bytes the
-/// column holds and where the parse gave up — and none of the payload. That
-/// costs nothing at every other column: `uuid_column`, `token_column`,
-/// `parse_timestamp` and `current_version` all decode values whose shape the
-/// *schema* fixes, so nothing a caller chose can reach them, and they keep the
-/// full [`clip`] echo the diagnosability argument was made for.
+/// column holds and, where serde recorded one, the position the parse gave up
+/// at (see [`position_only`], which measures how often it does) — and none of
+/// the payload. That costs nothing at every other column: `uuid_column`,
+/// `token_column`, `parse_timestamp` and `current_version` all decode values
+/// whose shape the *schema* fixes, so no captured text can reach them, and they
+/// keep the full [`clip`] echo the diagnosability argument was made for.
 ///
 /// **Why this list has one entry.** `attempts.outcome` is the column
 /// `the_token_scanner_can_actually_fail` in `tests/store_journal.rs` proves is a
-/// carrier, by planting a `ghu_…` in exactly that field. `policies.routing_labels`
-/// is the other column read through `json_column`; its contents are operator
-/// configuration rather than agent-captured failure text, and no test plants a
-/// credential there. It is a list so that a second carrier can be added to it
-/// without touching the decoder.
+/// carrier, by planting a `ghu_…` in exactly that field.
+/// `policies.routing_labels` is the other column read through `json_column`, and
+/// it is off the list on a narrower rule than "free-form".
+///
+/// **The rule is: text the *agent* captured from a failure.** Not "text a caller
+/// chose", which was how this was once written and which does not separate the
+/// two columns at all — [`crate::model::Label`] admits 256 characters and
+/// rejects only commas and control characters, so a token *is* a valid label and
+/// `routing_labels` *is* text a caller chose. What distinguishes them is where
+/// the text comes from. `FailureReason::Other` is filled from whatever the agent
+/// found while a start went wrong — a subprocess's stderr, an HTTP body, an
+/// error a library formatted — none of which the agent inspects before writing
+/// it down, and any of which can have swept up a token. `routing_labels` is
+/// typed by an operator into a scale policy as configuration, is read back and
+/// acted on as configuration, and reaching a credential into it takes a
+/// deliberate act rather than an accident of capture.
+///
+/// That is an argument about the source of the text, and it is the whole of the
+/// argument. It is deliberately *not* supported by "no test plants a credential
+/// there": no test plants one in most columns, and a column nobody has attacked
+/// is not thereby a column that cannot carry a secret. If `routing_labels` ever
+/// starts being populated from something the agent captured rather than
+/// something an operator typed, it belongs on this list — which is a list, and
+/// not a hard-coded pair, so that adding it costs nothing in the decoder.
 const FREE_FORM_COLUMNS: &[(&str, &str)] = &[("attempts", "outcome")];
 
-/// Whether this column may have a caller's own text in it.
+/// Whether this column may hold text the agent captured from a failure.
 fn carries_free_form_text(table: &str, column: &str) -> bool {
     FREE_FORM_COLUMNS
         .iter()
@@ -1456,8 +1477,9 @@ fn carries_free_form_text(table: &str, column: &str) -> bool {
 /// error message.
 ///
 /// **Only for a column whose shape the schema fixes.** A column that can hold
-/// text a caller chose goes through [`position_only`] instead; see
-/// [`FREE_FORM_COLUMNS`] for the measurement that separates the two.
+/// text the agent captured from a failure goes through [`position_only`]
+/// instead; see [`FREE_FORM_COLUMNS`] for the measurement that separates the
+/// two.
 ///
 /// Clipping rather than dropping the value entirely: an operator handed only a
 /// row id has to go and read the row, and the first sixty characters are
@@ -1475,24 +1497,76 @@ fn clip(raw: &str) -> String {
 }
 
 /// Everything an error may say about a [`FREE_FORM_COLUMNS`] payload: how much
-/// of it there is, and where it stopped being parseable.
+/// of it there is, and — when serde recorded one — where it stopped being
+/// parseable.
 ///
 /// Neither figure is derived from the *content* of the value, so no part of it
 /// can travel in the message — which is the point, since a prefix of it is
 /// exactly what would evade `d1`'s shape-matching sink downstream.
 ///
 /// It is still enough to work with. A byte count separates "this column is
-/// empty" from "this column holds a megabyte", and a position separates a row
-/// truncated mid-write from one whose first character is already wrong. The row
-/// id, which is what an operator actually needs in order to go and look, is
-/// carried by [`StoreError::CorruptColumn`] itself and is unaffected.
+/// empty" from "this column holds a megabyte", and the row id — which is what an
+/// operator actually needs in order to go and look — is carried by
+/// [`StoreError::CorruptColumn`] itself and is unaffected.
+///
+/// **A position is reported only when serde has one, which on this column is the
+/// minority of failures.** [`AttemptOutcome`] is an internally tagged enum, so
+/// serde buffers the object's content and re-reads it from memory to dispatch on
+/// the tag. Every error raised inside that buffer has lost its place in the
+/// original text, and `serde_json` reports `line 0, column 0` for it — a
+/// sentinel meaning "unknown", not a position, since real ones are 1-based.
+/// Measured over this column:
+///
+/// | input | `classify()` | line | column |
+/// |---|---|---|---|
+/// | object truncated mid-write | `Eof` | 1 | 54 |
+/// | unknown `reason` variant | `Data` | **0** | **0** |
+/// | `reason` of the wrong type | `Data` | **0** | **0** |
+/// | `reason` missing | `Data` | **0** | **0** |
+/// | `other` holding a number | `Data` | **0** | **0** |
+/// | unknown *outcome* tag | `Data` | 1 | 21 |
+/// | trailing characters | `Syntax` | 1 | 24 |
+///
+/// One probe string per row, so the exact column figures are properties of those
+/// strings and not constants; what the table is about is which rows have a
+/// position at all, and zero is not one of the answers a 1-based position can
+/// legitimately take.
+///
+/// The four positionless rows are the *likely* ones in practice — schema drift,
+/// a variant name an older build wrote, a hand-edited journal — and the row that
+/// does carry a position is the rarer torn write. So this said "it stops parsing
+/// at line 0, column 0" on the common path, which reads as a real position
+/// pointing at the payload's first character and is not one. It now says the
+/// position was not recorded.
+///
+/// **The discriminator is `line() == 0`, not `classify()`.** The table is why:
+/// an unknown *outcome* tag is a `Data` error and still carries a real position,
+/// because serde reads the tag straight from the input stream before it buffers
+/// the rest of the object. Branching on `classify()` would throw that position
+/// away.
+///
+/// **None of this is a leak, and that is the part worth being precise about.**
+/// This function reads `raw.len()`, `error.line()` and `error.column()` and
+/// never `error.to_string()` — which on exactly the positionless path *does*
+/// carry the payload, as ``unknown variant `ghs_9tokenish` ``. Both branches are
+/// payload-free; what differed was only how honest the message was about what it
+/// knew.
 fn position_only(raw: &str, error: &serde_json::Error) -> String {
-    format!(
-        "a {}-byte payload that is not echoed (it stops parsing at line {}, column {})",
-        raw.len(),
-        error.line(),
-        error.column()
-    )
+    if error.line() == 0 {
+        format!(
+            "a {}-byte payload that is not echoed (serde records no position \
+             for this failure, so where in the payload it went wrong is not \
+             known)",
+            raw.len()
+        )
+    } else {
+        format!(
+            "a {}-byte payload that is not echoed (it stops parsing at line {}, column {})",
+            raw.len(),
+            error.line(),
+            error.column()
+        )
+    }
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -1554,9 +1628,10 @@ fn token_column<T: DeserializeOwned>(
     })
 }
 
-/// The one decoder that reads a column which may carry a caller's own text, and
-/// therefore the one that has to ask which column it is looking at before it
-/// says anything about the payload. See [`FREE_FORM_COLUMNS`].
+/// The one decoder that reads a column which may carry text the agent captured
+/// from a failure, and therefore the one that has to ask which column it is
+/// looking at before it says anything about the payload. See
+/// [`FREE_FORM_COLUMNS`].
 fn json_column<T: DeserializeOwned>(
     row: &Row<'_>,
     table: &'static str,
@@ -2334,9 +2409,10 @@ mod tests {
         // "No column carries a credential" is a claim about the schema, and
         // `attempts.outcome` is where it stops being true: it holds the JSON of
         // an `AttemptOutcome`, and `FailureReason::Other(String)` inside that is
-        // free-form text a caller chose. `the_token_scanner_can_actually_fail`
-        // in `tests/store_journal.rs` plants a `ghu_...` there on purpose, to
-        // prove the field is a real carrier.
+        // free-form text the agent captured while a start went wrong.
+        // `the_token_scanner_can_actually_fail` in `tests/store_journal.rs`
+        // plants a `ghu_...` there on purpose, to prove the field is a real
+        // carrier.
         //
         // A malformed value in that column produces a `CorruptColumn`, whose
         // message goes wherever the error goes. This test was written when the
@@ -2465,17 +2541,129 @@ mod tests {
             rendered.contains(&attempt_id().to_string()),
             "the error must name the row to fix: {rendered}"
         );
+
+        // -- the other path, which is the likelier one ---------------------
+        //
+        // Everything above is the *torn write*: the object stops mid-text, so
+        // serde fails at a place in the original input and has a position to
+        // report. The common corruption in practice has no position at all.
+        // `AttemptOutcome` is internally tagged, so serde buffers the content
+        // and re-reads it to dispatch on the tag, and anything that goes wrong
+        // inside that buffer has lost its place in the text: `line() == 0`,
+        // `column() == 0`. Schema drift, a variant name an older build wrote, a
+        // hand-edited journal all land there.
+        //
+        // This half was untested, and while it was, `position_only` printed
+        // "line 0, column 0" for it -- which reads as a position pointing at the
+        // payload's first character and is not one; it is serde's sentinel for
+        // "unknown".
+        let drifted = "ghs_9tokenish";
+        let raw = format!(r#"{{"outcome":"failed","reason":"{drifted}"}}"#);
+
+        // The row parses as JSON and is well-formed; only the *variant* is
+        // unknown, which is what puts the failure inside the buffer.
+        serde_json::from_str::<serde_json::Value>(&raw).expect("this row is valid JSON");
+        let inner = serde_json::from_str::<AttemptOutcome>(&raw)
+            .expect_err("`ghs_9tokenish` is not a FailureReason");
+        assert_eq!(
+            (inner.line(), inner.column()),
+            (0, 0),
+            "the premise of this half of the test: serde has no position here"
+        );
+
+        // And the counterfactual that makes the payload-free rule load-bearing
+        // rather than decorative: serde's own message *does* carry the value, so
+        // a `position_only` written in terms of `error.to_string()` would have
+        // published the secret on precisely this path.
+        assert!(
+            inner.to_string().contains(drifted),
+            "serde names the offending variant, so the message is not safe to \
+             forward: {inner}"
+        );
+
+        // `self::store` rather than `store`: the binding above shadows the
+        // fixture function for the rest of this body, and this half needs a
+        // database that does not already hold the row it is about to write.
+        let drift_store = self::store();
+        RawAttempt {
+            state: "failed".to_string(),
+            outcome: Some(raw.clone()),
+            terminal_at: Some(timestamp_to_text(ts(2_000))),
+            ..RawAttempt::default()
+        }
+        .insert(&drift_store);
+
+        let rendered = drift_store
+            .attempt(attempt_id())
+            .expect_err("an unknown reason variant is not an attempt outcome")
+            .to_string();
+
+        assert!(
+            !rendered.contains(drifted),
+            "the secret must not appear here either: {rendered}"
+        );
+        for len in 4..=drifted.len() {
+            assert!(
+                !rendered.contains(&drifted[..len]),
+                "no prefix of the secret may survive, and {:?} did: {rendered}",
+                &drifted[..len]
+            );
+        }
+
+        // The byte count still works, because it is computed from the column
+        // rather than taken from the error.
+        assert!(
+            rendered.contains(&format!("{}-byte", raw.len())),
+            "the message must say how much is there: {rendered}"
+        );
+        assert!(
+            rendered.contains(&attempt_id().to_string()),
+            "the error must name the row to fix: {rendered}"
+        );
+
+        // The substance of this half: no fabricated position. "line 0, column 0"
+        // is not a location an operator can act on, and printing it as though it
+        // were sends them looking at the start of a payload that is very likely
+        // fine.
+        assert!(
+            !rendered.contains("line 0")
+                && !rendered.contains("column 0")
+                && !rendered.contains("stops parsing at"),
+            "a position serde did not record must not be printed as one: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("no position"),
+            "and the message has to say so, or the absence is indistinguishable \
+             from an omission: {rendered}"
+        );
     }
 
     #[test]
     fn a_constrained_column_still_echoes_what_it_holds() {
         // The other half of the per-column rule: the echo is removed at the one
-        // column that can carry a caller's text, and nowhere else. A malformed
-        // timestamp has the shape the schema fixes -- nothing a caller chose
-        // can reach it -- so an operator still gets to see the value that needs
-        // fixing, which is the diagnosability the clip was argued for.
+        // column that carries text the agent captured from a failure, and
+        // nowhere else. A malformed timestamp has the shape the schema fixes --
+        // nothing free-form can reach it -- so an operator still gets to see the
+        // value that needs fixing, which is the diagnosability the clip was
+        // argued for.
         assert!(!carries_free_form_text("attempts", "created_at"));
         assert!(!carries_free_form_text("policies", "routing_labels"));
+
+        // `routing_labels` is off the list on the *source* of its text, not on
+        // its shape, and this is the assertion that keeps that honest: a token
+        // is a perfectly legal `Label`, so "the schema constrains it" is not
+        // available as the reason. What is available is that an operator types
+        // a routing label into a scale policy as configuration, whereas
+        // `FailureReason::Other` is filled from whatever the agent scraped off a
+        // failure without reading it. If that ever stops being true of
+        // `routing_labels`, this assertion still passes and the column still
+        // belongs on `FREE_FORM_COLUMNS`.
+        assert!(
+            Label::new("ghu_16CharsOfPaddingAndThenSomeMore1234567").is_ok(),
+            "a credential-shaped string is a valid Label, so the length and \
+             character rules are not what keeps `routing_labels` off the list"
+        );
 
         let store = store();
         RawAttempt {
