@@ -1199,6 +1199,64 @@ mod tests {
         );
     }
 
+    /// **A known gap, pinned so it stays visible.** `f2`'s refusal *decision*
+    /// can consume the measured demand cost; the number it prints alongside the
+    /// refusal cannot.
+    ///
+    /// [`crate::rest::BudgetProjection::admit`] takes the candidate
+    /// [`TargetCost`] from its caller, so an `f2` that builds it through
+    /// [`target_cost`] gets an admission computed from the real cost.
+    /// [`crate::rest::BudgetProjection::max_repository_targets`] builds
+    /// [`TargetCost::repository`] internally, which cannot see the seam and
+    /// therefore still prices demand at the pre-decision estimate of two.
+    ///
+    /// The two then disagree, and an operator sees both: the projection says
+    /// "roughly 10 repository targets per host" — the figure
+    /// `04-subsystem-contracts.md` quotes — while `admit` will actually take
+    /// thirteen. The direction is the safe one (the printed limit is
+    /// conservative, so nothing is admitted that should not be), but the numbers
+    /// contradict each other in the same output.
+    ///
+    /// It is not fixable from this file. Both remedies —
+    /// changing [`crate::rest::DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`] to
+    /// one, or giving `max_repository_targets` a [`TargetCost`] argument — are
+    /// edits to `crates/github/src/rest.rs`, which `c3` owns. This test records
+    /// the discrepancy with its arithmetic so that whoever holds that file can
+    /// act on it, and fails if it is ever closed, at which point this test and
+    /// the note above should go.
+    #[test]
+    fn the_printed_target_ceiling_still_projects_the_pre_decision_estimate() {
+        use crate::rest::{BudgetProjection, budget_allowance};
+        use runner_manager_domain::model::RefreshInterval;
+
+        let interval = RefreshInterval::default();
+        let printed = BudgetProjection::max_repository_targets(interval);
+        let per_hour_estimated = TargetCost::repository().requests_per_hour(interval);
+        let per_hour_measured = TargetCost::repository()
+            .with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
+            .requests_per_hour(interval);
+
+        // 4 requests per refresh * 60 refreshes, against 3 * 60.
+        assert_eq!(per_hour_estimated, 240);
+        assert_eq!(per_hour_measured, 180);
+        assert_eq!(
+            printed, 10,
+            "the printed ceiling is `04-subsystem-contracts.md`'s figure, computed from \
+             the estimate"
+        );
+        assert_eq!(
+            budget_allowance() / per_hour_measured,
+            13,
+            "while the cost this module actually issues would allow thirteen"
+        );
+        assert!(
+            printed < budget_allowance() / per_hour_measured,
+            "the gap is in the conservative direction, which is why this is a reporting \
+             discrepancy rather than a budget overrun -- if it ever inverts, the printed \
+             ceiling would be admitting targets the budget cannot pay for"
+        );
+    }
+
     /// One archived repository must not take down an organization's whole
     /// demand poll — and must not read as zero either.
     #[tokio::test]
