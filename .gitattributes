@@ -14,3 +14,13 @@
 # `cargo test`, on all three operating systems, and the release workflow's own
 # Windows build leg calls them under Git Bash.
 *.sh text eol=lf
+
+# owner: a3-distribution-and-readme
+#
+# `install/install.ps1` is published as a release asset and fetched by
+# `irm ... | iex`, so its bytes are part of what ships. Pinning the line
+# endings keeps a Windows checkout from producing a different file -- and a
+# different SHA-256 -- than a Linux one, which is what the release workflow
+# uploads from. Scoped to `install/` rather than `*.ps1` on purpose: the spike
+# scripts under `docs/spikes/` are recorded evidence and are not renormalised.
+install/*.ps1 text eol=lf
