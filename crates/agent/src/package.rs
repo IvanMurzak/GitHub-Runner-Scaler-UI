@@ -2402,22 +2402,48 @@ mod tests {
     }
 
     #[test]
-    fn a_parsed_version_is_a_single_safe_path_component() {
-        // The property the parser exists to buy, asserted directly rather than
-        // inferred from the rejection list above.
-        let parsed = version("2.330.0");
-        let joined = Path::new("root").join(parsed.as_str());
-        assert_eq!(
-            joined.components().count(),
-            2,
-            "a version must add exactly one component to a path"
-        );
-        assert!(
-            !joined
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::RootDir)),
-            "a version must never introduce a traversal or a root"
-        );
+    fn anything_that_parses_as_a_version_is_a_single_safe_path_component() {
+        // The property the parser exists to buy. Asserted over the *dangerous*
+        // candidates as well as the good ones: a version that parses is a
+        // version that becomes a directory name, so the interesting claim is
+        // "nothing that parses can escape", not "this one good value is fine".
+        //
+        // Asserting it over `2.330.0` alone was decorative — it stayed green
+        // through a mutation that made `parse` accept `..`, because `2.330.0`
+        // is a safe component whatever the parser does.
+        for candidate in [
+            "2.330.0",
+            "2.9",
+            "1.2.3.4",
+            "",
+            ".",
+            "..",
+            "../..",
+            "2",
+            "a.b",
+            "2/330",
+            "2\\330",
+            "/2.330.0",
+            "C:2.330.0",
+            "2..0",
+            "2.330.0/../..",
+        ] {
+            let Ok(parsed) = RunnerVersion::parse(candidate) else {
+                continue;
+            };
+            let joined = Path::new("root").join(parsed.as_str());
+            assert_eq!(
+                joined.components().count(),
+                2,
+                "`{candidate}` parsed but adds more than one path component"
+            );
+            assert!(
+                !joined
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::RootDir)),
+                "`{candidate}` parsed but introduces a traversal or a root"
+            );
+        }
     }
 
     #[test]
@@ -2914,12 +2940,18 @@ mod tests {
         let before = snapshot(first.root());
         assert!(before.contains_key("planted-by-the-test"));
 
-        // Move past the check interval so the catalog IS consulted again. The
-        // no-op must be proved at the entry, not by the interval short-circuit
-        // that would otherwise hide it.
+        // Past the freshness window, with the SAME version still published.
+        //
+        // Advancing only past `check_interval` is not enough, and measuring
+        // that is what fixed this test: the entry then still sits inside the
+        // freshness window, so deleting the already-installed short-circuit
+        // changed nothing — the freshness branch returned the same cached entry
+        // and the test stayed green through a mutation that should have killed
+        // it. Past the window that branch no longer covers, and the entry
+        // short-circuit is the only thing between this call and a re-download.
         harness
             .clock
-            .advance(Elapsed::hours(CHECK_INTERVAL_HOURS + 1));
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
 
         let second = cache.ensure_installed().await.expect("the second install");
 
@@ -2944,6 +2976,30 @@ mod tests {
             before,
             "no file in a cache entry may change after it lands"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_entry_that_is_still_the_published_version_is_reused() {
+        // Past the freshness deadline, but GitHub has published nothing newer.
+        // There is no fresher package to fetch, so re-downloading identical
+        // bytes would cost 150-300 MB and change nothing. This is the branch
+        // the no-op test above rides on, asserted in its own right.
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let first = cache.ensure_installed().await.expect("an install");
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+
+        let again = cache.ensure_installed().await.expect("the same entry");
+
+        assert!(
+            cache.is_stale(&first, harness.clock.now()),
+            "the entry really is past the deadline"
+        );
+        assert_eq!(again.version(), first.version());
+        assert_eq!(harness.fetcher.count(), 1);
+        assert_eq!(cache.installed().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3427,7 +3483,7 @@ mod tests {
             }
 
             cache
-                .prune(&held, &[concluded.clone()])
+                .prune(&held, std::slice::from_ref(&concluded))
                 .unwrap_or_else(|error| panic!("state `{state}` should allow a prune: {error}"));
 
             assert!(
@@ -3512,7 +3568,11 @@ mod tests {
         cache.lease(&live, &version("2.340.0")).expect("a lease");
 
         // The held one is refused, the unheld one is not.
-        assert!(cache.prune(&version("2.340.0"), &[live.clone()]).is_err());
+        assert!(
+            cache
+                .prune(&version("2.340.0"), std::slice::from_ref(&live))
+                .is_err()
+        );
         cache
             .prune(&version("2.330.0"), &[live])
             .expect("the unheld version prunes");
@@ -3561,14 +3621,21 @@ mod tests {
     // =====================================================================
 
     #[tokio::test]
-    async fn a_workspace_inside_the_cache_is_refused_a_lease() {
+    async fn a_lease_refuses_a_workspace_inside_the_cache_and_accepts_one_outside_it() {
+        // Both directions in one test, deliberately.
+        //
+        // Split across two tests, the refusal half stayed green through a
+        // mutation that made the containment check answer `true` for
+        // everything — a lease that refuses every workspace satisfies "inside
+        // is refused" perfectly. The acceptance half is what makes the refusal
+        // mean something, and a reviewer reading one test cannot miss it the
+        // way a reviewer reading two can.
         let (harness, _, _) = linux_fixture();
         let cache = cache_with_one_entry(&harness).await;
         let held = version("2.330.0");
 
-        // The mistake this guard exists to catch: `e3` deriving a runtime path
-        // from the cache entry it copied from, rather than from the runtime
-        // directory.
+        // Refused: the mistake this guard exists to catch is `e3` deriving a
+        // runtime path from the cache entry it copied from.
         for inside in [
             cache.root().join("2.330.0").join("_work"),
             cache.root().join("workspaces").join("attempt-1"),
@@ -3592,22 +3659,13 @@ mod tests {
                 "a refused lease must not have been written"
             );
         }
-    }
 
-    #[tokio::test]
-    async fn a_workspace_under_the_runtime_directory_is_accepted() {
-        // The other half: without this, the refusal above could be refusing
-        // everything and the test would still be green.
-        let (harness, _, _) = linux_fixture();
-        let cache = cache_with_one_entry(&harness).await;
-        let held = version("2.330.0");
-        let attempt = attempt_in(&harness, 0x100, AttemptState::Busy);
-
+        // Accepted: a workspace where `d1` actually puts one.
+        let proper = attempt_in(&harness, 0x100, AttemptState::Busy);
         cache
-            .lease(&attempt, &held)
+            .lease(&proper, &held)
             .expect("a runtime under the runtime directory is where it belongs");
-
-        assert_eq!(cache.holders(&held).unwrap(), vec![attempt.id]);
+        assert_eq!(cache.holders(&held).unwrap(), vec![proper.id]);
     }
 
     #[test]
@@ -3723,10 +3781,28 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_entry_that_escapes_writes_nothing_outside_the_target() {
+    fn an_archive_entry_that_escapes_is_refused_and_writes_nothing_outside_the_target() {
+        // This asserts a *property* — nothing lands outside the extraction
+        // directory — and that property is held up by two independent layers:
+        // this module's `resolve_inside`, and the archive crates' own guards
+        // (`ZipFile::enclosed_name` answering `None`, `Entry::unpack_in`
+        // answering `false`). Gutting either layer alone leaves the property
+        // standing, which is what defence in depth is for and is also why this
+        // test alone does not prove `resolve_inside` does anything. The unit
+        // test `an_archive_entry_may_not_resolve_outside_the_directory_it_is_
+        // extracted_into` is what pins this module's own layer; the two are
+        // complementary and neither replaces the other.
         let dir = tempfile::tempdir().expect("a temporary root");
         let target = dir.path().join("target");
         let outside = dir.path().join("escaped.txt");
+
+        // Negative control: a legitimate archive really does extract here, so a
+        // refusal below is a refusal of the escape rather than of everything.
+        let good = dir.path().join("good.archive");
+        fs::write(&good, tar_gz_bytes(&package_entries())).unwrap();
+        extract(&good, ArchiveKind::TarGz, &target).expect("a legitimate archive extracts");
+        assert!(target.join("run.sh").is_file());
+        fs::remove_dir_all(&target).unwrap();
 
         for (label, bytes, kind) in [
             (
@@ -3755,20 +3831,16 @@ mod tests {
                 !outside.exists(),
                 "{label}: an entry escaped the extraction directory"
             );
-            // Either the entry was refused outright, or the extractor
-            // normalised it into the target. Both are safe; writing outside is
-            // not, and that is what the assertion above pins.
-            if let Err(error) = result {
-                assert!(
-                    matches!(error, PackageError::UnsafeArchiveEntry { .. }),
-                    "{label}: expected a refusal, got {error:?}"
-                );
-                assert!(error.is_terminal());
-                assert_eq!(
-                    error.failure_reason(),
-                    Some(FailureReason::RunnerPackageUnverified)
-                );
-            }
+            let error = result.expect_err(&format!("{label}: the escape must be refused"));
+            assert!(
+                matches!(error, PackageError::UnsafeArchiveEntry { .. }),
+                "{label}: expected an unsafe-entry refusal, got {error:?}"
+            );
+            assert!(error.is_terminal());
+            assert_eq!(
+                error.failure_reason(),
+                Some(FailureReason::RunnerPackageUnverified)
+            );
         }
     }
 
