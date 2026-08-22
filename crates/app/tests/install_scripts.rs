@@ -627,19 +627,28 @@ fn install_sh_stays_runnable_by_a_posix_shell() {
             "`local -a`/`local -n` are bash-only; plain `local` is fine",
         ),
         // --------------------------------------------------------------------
-        // THE ONE MOST LIKELY TO ARRIVE BY COPY-PASTE, AND IT WAS NOT LISTED.
+        // THE ONE MOST LIKELY TO ARRIVE BY COPY-PASTE -- AND THE ONE THE dash
+        // RUN BELOW WOULD NOT CATCH.
         // --------------------------------------------------------------------
         // BOTH sibling scripts open with `set -euo pipefail` (release.sh:36,
         // channels.sh:36) because both are `#!/usr/bin/env bash`. Anyone
-        // hardening this file will reach for the line they can see two
-        // directories away -- and dash does not merely ignore `pipefail`, it
-        // rejects the whole `set` outright, on line 1, before anything else
-        // runs. `set -eu` is the POSIX subset and is what this file uses.
+        // hardening this file reaches for the line they can see two directories
+        // away.
+        //
+        // And this is the entry that shows why the static scan is not made
+        // redundant by `install_sh_installs_end_to_end_under_a_real_posix_shell`.
+        // MEASURED, both ways: dash 0.5.12 and later ACCEPT `set -o pipefail`
+        // -- it was added upstream in 2022 -- so the dash leg runs green with
+        // this line in place. BusyBox ash, which is Alpine's `/bin/sh`, and any
+        // dash older than 0.5.12 reject it and stop on line 1, before anything
+        // else runs. So the shell that would actually break is the one no CI
+        // leg here has, and a substring is the only thing that notices.
         (
             "set -o pipefail",
-            "`pipefail` is a bash/ksh option; dash rejects `set -o pipefail` \
-             outright. Both sibling scripts here use it, which is exactly why \
-             it is the likeliest thing to be pasted in",
+            "`pipefail` is a bash/ksh option that only recent dash grew. \
+             BusyBox ash -- Alpine's `/bin/sh` -- and dash before 0.5.12 reject \
+             the whole `set` on line 1. Both sibling scripts here use it, which \
+             is exactly why it is the likeliest thing to be pasted in",
         ),
         (
             "&>",
@@ -1443,6 +1452,97 @@ fn the_documented_windows_two_step_form_installs_under_a_restricted_policy() {
     }
 }
 
+#[test]
+fn install_sh_removes_its_staging_file_when_the_install_step_fails() {
+    // ------------------------------------------------------------------------
+    // THE ONE TEMPORARY FILE THAT IS NOT IN THE TEMPORARY DIRECTORY.
+    // ------------------------------------------------------------------------
+    // The staged copy cannot live under `$work`, and that is not an oversight:
+    // a rename is only atomic within a filesystem, so the staging file has to
+    // be written beside the destination. `$work` is a temp directory that may
+    // well be on another mount.
+    //
+    // Which means the EXIT trap removing only `$work` left
+    // `.runner-manager.install-tmp` sitting in the user's install directory
+    // whenever `chmod` or `mv` failed -- a full disk, a mount option, a
+    // destination that is a running executable. install.ps1 has always removed
+    // its own in the `catch` that wraps the same two steps.
+    //
+    // Reaching that branch needs a filesystem that misbehaves, so `mv` is
+    // shadowed with a command that always fails. That is portable, and it is
+    // the only thing here that executes the trap's second line.
+    let fixture = prepare("1.2.3");
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
+    assert!(ok, "the first install must succeed:\n{output}");
+
+    let shim = fixture.release.root.join("shim");
+    std::fs::create_dir_all(&shim).expect("a shim directory");
+    let failing_mv = shim.join("mv");
+    std::fs::write(&failing_mv, "#!/bin/sh\nexit 1\n").expect("a failing mv");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&failing_mv, std::fs::Permissions::from_mode(0o755))
+            .expect("the shim must be executable");
+    }
+
+    // PATH is prepended INSIDE the shell rather than handed to the process.
+    // Git for Windows' `bash.exe` front-loads its own `/mingw64/bin:/usr/bin`
+    // ahead of whatever PATH it inherits, so an inherited entry can never win
+    // there -- measured. Doing it after the shell has started also sidesteps
+    // spelling the directory in the shell's own path form: `$PWD` already is.
+    let wrapper = format!(
+        "cd '{}' && PATH=\"$PWD:$PATH\" && export PATH && exec '{}'",
+        posix(&shim),
+        posix(&install_script("install.sh"))
+    );
+
+    let mut command = Command::new(bash_program());
+    command.arg("-c").arg(&wrapper);
+    command.env("RUNNER_MANAGER_INSTALL_UNAME_S", LINUX_X64.uname_s);
+    command.env("RUNNER_MANAGER_INSTALL_UNAME_M", LINUX_X64.uname_m);
+    command.env(
+        "RUNNER_MANAGER_INSTALL_BASE_URL",
+        posix(&fixture.release.assets),
+    );
+    command.env("RUNNER_MANAGER_INSTALL_DIR", posix(&fixture.directory));
+    let finished = command.output().expect("cannot run install.sh");
+    let ok = finished.status.success();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+
+    // The positive guard: if the shim were not reached, the install would
+    // SUCCEED and the assertion below would be checking a clean directory that
+    // no failure ever touched.
+    assert!(
+        !ok,
+        "`mv` was shadowed with a command that always fails and install.sh \
+         still reported success, so the branch this test exists for was never \
+         entered:\n{output}"
+    );
+    assert!(
+        output.contains("could not install into"),
+        "the failure must name the step that failed:\n{output}"
+    );
+
+    assert_eq!(
+        installed_entries(&fixture.directory),
+        vec!["runner-manager".to_string()],
+        "install.sh left its staging file in the install directory after a \
+         failed install. The EXIT trap has to remove the staged path as well as \
+         `$work`: the staged path is the one temporary file that is NOT under \
+         `$work`, and nothing else will ever clean it up."
+    );
+    assert_eq!(
+        run_installed(&fixture.binary()),
+        fixture.release.expected_output("x86_64-unknown-linux-gnu"),
+        "the binary that was already working must survive a failed upgrade"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // Windows PowerShell 5.1 on a machine that ALSO has PowerShell 7.
 // ----------------------------------------------------------------------------
@@ -1830,12 +1930,20 @@ fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
 /// every bashism happily, so `install_sh_stays_runnable_by_a_posix_shell` -- a
 /// list of forbidden substrings -- was the only thing standing between this
 /// file and a script that fails on Debian, Ubuntu and Alpine. A list catches
-/// only what somebody thought to write down, and the omission that prompted
-/// this was `set -o pipefail`, which both sibling scripts use.
+/// only what somebody thought to write down.
 ///
 /// Ubuntu's `/bin/sh` IS dash and Git for Windows ships `usr/bin/dash.exe`, so
 /// two of the three CI legs run the real thing for the cost of resolving a
 /// path. macOS ships no dash and is the one leg that skips.
+///
+/// ----------------------------------------------------------------------------
+/// IT DOES NOT REPLACE THE SCAN, AND THE SCAN DOES NOT REPLACE IT.
+/// ----------------------------------------------------------------------------
+/// Measured against this machine's dash, which is 0.5.12-era: `${var:0:3}` is a
+/// `Bad substitution` here and the scan catches it too, but `set -o pipefail` is
+/// ACCEPTED -- upstream dash added it in 2022 -- while BusyBox ash still rejects
+/// it. So each of the two finds things the other misses, and neither is the
+/// redundant one.
 fn dash_program() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("RUNNER_MANAGER_DASH") {
         let path = PathBuf::from(explicit);
