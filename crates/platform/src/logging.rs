@@ -58,15 +58,27 @@
 //!   the next two words to be redacted, so `Authorization: Bearer ghu_…` loses
 //!   both the scheme and the token.
 //!
-//! A word is cut on structural punctuation — `,`, `{`, `}`, `[`, `]` and `&` —
-//! before any of that runs, and each fragment is judged on its own. Without
-//! that cut only the *first* key/value pair in a compact structure is ever
-//! examined, and redaction becomes a function of field order:
-//! `{"encoded_jit_config":"…"}` was caught and
+//! A word is cut on structural punctuation — `,`, `;`, `{`, `}`, `[`, `]`,
+//! `<`, `>` and `&` — before any of that runs, and each fragment is then judged
+//! the way a whole word is: unwrapped, judged on its core, and re-emitted with
+//! its punctuation put back. Without that cut only the *first* key/value pair
+//! in a compact structure is ever examined, and redaction becomes a function of
+//! field order: `{"encoded_jit_config":"…"}` was caught and
 //! `{"runner_id":42,"encoded_jit_config":"…"}` was not, while
 //! `serde_json::to_string` is what decides which of the two an error body is.
-//! Nesting and a form-encoded body were the same defect in different
-//! punctuation.
+//! Nesting, a form-encoded body, a `;`-separated connection string and a plist
+//! element are all that same defect in different punctuation. So is an array
+//! element, one step further down — a fragment judged *with* its quote still
+//! attached matches no shape rule at all, and an array element is the one
+//! fragment that has no key of its own to give it away.
+//!
+//! A URL is cut out of the text around it rather than being allowed to own the
+//! rest of the word. Its scheme is the run of scheme characters immediately
+//! before the `://`, and it ends at the first character that cannot appear in a
+//! URL; everything on either side goes back through the rules. So
+//! `{"documentation_url":"https://…","token":"ghu_…"}` — which is what a GitHub
+//! REST error body looks like — keeps the URL and redacts the token, rather
+//! than the URL swallowing the token.
 //!
 //! A key is also trimmed of backslashes, which a value never is: `Debug` on a
 //! `String` escapes the quotes inside it, so a body reached through
@@ -232,9 +244,22 @@ const WRAPPERS: &[char] = &[
 /// form-encoded body is the same defect spelled with `&`.
 ///
 /// So a word is cut on these before any of that runs, and each fragment is
-/// judged on its own. The separators go back verbatim, because the structure
-/// around a redaction is what keeps the line diagnosable.
-const STRUCTURAL: &[char] = &[',', '{', '}', '[', ']', '&'];
+/// judged on its own, by [`redact_fragment`]. The separators go back verbatim,
+/// because the structure around a redaction is what keeps the line diagnosable.
+///
+/// `;` is here for the reason `&` is: it separates the pairs of a Windows
+/// connection string (`Server=host;Database=x;Password=…`), of a credential
+/// string, and of a cookie header written without a space after the separator.
+/// It was already in [`WRAPPERS`] — recognised as punctuation, and so never
+/// used to cut — which left `Set-Cookie: theme=dark; session=…` safe only
+/// because of the space. `d2` logs keychain, DPAPI and libsecret failures, and
+/// that is the shape they arrive in.
+///
+/// `<` and `>` are here because [`split_wrappers`] strips only the *outermost*
+/// pair, so `<string>ghu_…</string>` reached the rules as
+/// `string>ghu_…</string`, which is on no list and matches no shape. `d3`'s
+/// installers handle launchd plists, which is where that shape comes from.
+const STRUCTURAL: &[char] = &[',', ';', '{', '}', '[', ']', '<', '>', '&'];
 
 /// Whether this sink will emit a field's value rather than replacing it.
 #[must_use]
@@ -427,12 +452,55 @@ fn redact_word(word: &str) -> (String, u32) {
     (format!("{prefix}{}{suffix}", redact_core(core)), 0)
 }
 
+/// Redacts one fragment of a cut-up word, judging it on its core.
+///
+/// [`redact_core`] used to recurse on the *raw* fragment, and its terminal
+/// fallback then handed that fragment to [`redact_value`] with its wrapping
+/// punctuation still attached. A fragment carrying no `:` or `=` of its own —
+/// which is exactly what an array element is — therefore reached the shape
+/// rules as `"ghu_…`, where `starts_with("ghu_")` fails, [`is_opaque_char`]
+/// fails on the quote, the `eyJ` test fails, and [`looks_like_path`] never gets
+/// a clean look at `"C:\Users\…`.
+///
+/// That is the defect the structural cut was written to close, one step further
+/// down: *"only the first key/value pair is ever examined"* became *"a value
+/// with no key of its own is never examined"*. It survived a round because the
+/// secret-injection scan had no array among its shapes, which is the same
+/// lesson in a different place — a check that cannot fail proves nothing.
+///
+/// So a fragment is treated the way [`redact_word`] treats a word: split,
+/// judge the core, put the punctuation back. The follow-on rules are
+/// deliberately *not* repeated here. *"The value is the next word"* is a
+/// statement about whitespace, and there is no next word inside a fragment.
+fn redact_fragment(fragment: &str) -> String {
+    let (prefix, core, suffix) = split_wrappers(fragment);
+    if core.is_empty() {
+        return fragment.to_string();
+    }
+    format!("{prefix}{}{suffix}", redact_core(core))
+}
+
 /// Redacts one word with its wrapping punctuation already removed.
 fn redact_core(core: &str) -> String {
     // A URL survives, minus everything on it that carries a credential. The
     // scheme, host and path are what makes a log line diagnosable.
-    if let Some((scheme, rest)) = core.split_once("://") {
-        return redact_url(scheme, rest);
+    //
+    // The URL is *cut out* of the text around it rather than being allowed to
+    // own the rest of the fragment, and both sides of the cut come back through
+    // here. [`split_url`] documents what the old unbounded `split_once("://")`
+    // cost. This still runs ahead of the structural cut, because a query string
+    // is `redact_url`'s to own: `?` and `#` are not structural characters, and
+    // an OAuth implicit-flow response puts the token after one of them.
+    if let Some((prefix, scheme, url, remainder)) = split_url(core) {
+        let mut out = String::with_capacity(core.len());
+        if !prefix.is_empty() {
+            out.push_str(&redact_core(prefix));
+        }
+        out.push_str(&redact_url(scheme, url));
+        if !remainder.is_empty() {
+            out.push_str(&redact_core(remainder));
+        }
+        return out;
     }
 
     // A Windows drive path is `key:value`-shaped by accident, and
@@ -457,15 +525,23 @@ fn redact_core(core: &str) -> String {
     // Cutting on [`STRUCTURAL`] first turns all three into the shape the rules
     // already handle, and does it at any depth: the cut is flat, so
     // `{"a":{"b":{"token":"…"}}}` yields the same fragments a one-level object
-    // would. A fragment contains no structural character by construction, so
-    // this recurses exactly one level and cannot loop.
+    // would.
+    //
+    // Each fragment goes through [`redact_fragment`] rather than straight back
+    // in here, because a fragment carries its own wrapping punctuation and a
+    // value judged with its quote attached matches nothing at all.
+    //
+    // The recursion terminates: a fragment contains no structural character by
+    // construction, so `redact_fragment` cannot reach this branch again, and
+    // the only other re-entry — the URL branch above — is called on strictly
+    // shorter slices of its own argument.
     if core.contains(STRUCTURAL) {
         let mut out = String::with_capacity(core.len());
         let mut rest = core;
         while let Some(index) = rest.find(STRUCTURAL) {
             let (fragment, tail) = rest.split_at(index);
             if !fragment.is_empty() {
-                out.push_str(&redact_core(fragment));
+                out.push_str(&redact_fragment(fragment));
             }
             // Every character in `STRUCTURAL` is ASCII, so the separator is
             // one byte and this cannot split a code point.
@@ -473,7 +549,7 @@ fn redact_core(core: &str) -> String {
             rest = &tail[1..];
         }
         if !rest.is_empty() {
-            out.push_str(&redact_core(rest));
+            out.push_str(&redact_fragment(rest));
         }
         return out;
     }
@@ -482,28 +558,41 @@ fn redact_core(core: &str) -> String {
     //
     // Pass one asks only whether either separator names a credential, and it
     // runs to completion before any value is inspected, because the *first*
-    // separator in a fragment is not necessarily the structural one. A base64
-    // payload carries `=` padding, and what follows that padding decides
-    // whether one pass would have done.
+    // separator in a fragment is not necessarily the one that names the key.
     //
-    // `{"encoded_jit_config":"eyJ…In0="}` on its own is *not* that case, and
-    // this comment used to claim it was. Base64 padding is trailing-only, so
-    // the `=` split yields an empty value and the `value.is_empty()` guard in
-    // pass two already falls through to the `:`. The case that genuinely needs
-    // two passes is a **multi-field** object, where the text after the padding
-    // is not empty: `{"encoded_jit_config":"eyJ…In0=","runner_id":42}` is cut
-    // on `,` above into a fragment still ending `…In0="`, so the `=` split
-    // hands back a value of `"` — non-empty, inspected, found innocent, and
-    // returned before the `:` that names the key is ever reached.
+    // The witness is a webhook signature header in its compact-JSON spelling,
+    // `{"x-hub-signature-256":"sha256=<hmac>"}`, and
+    // `a_credential_header_loses_its_scheme_and_its_value` holds it. The `=`
+    // comes first and names nothing, but what follows it is a whole HMAC —
+    // *non-empty*, so a merged pass inspects that value, renders it as a
+    // digest prefix, and returns without ever reaching the `:` that names
+    // `x-hub-signature-256`. `{"password":"a=b"}` is the same witness with
+    // nothing else going on: merged, it comes out whole.
+    //
+    // Two earlier spellings of this comment named
+    // `{"encoded_jit_config":"eyJ…In0="}` and then
+    // `{"encoded_jit_config":"eyJ…In0=","runner_id":42}`, and neither
+    // demonstrates the invariant: base64 padding is trailing-only, so the `=`
+    // split yields a value that `split_wrappers` trims to empty, and the
+    // `value.is_empty()` guard in pass two falls through to the `:` anyway. A
+    // comment naming a case that does not demonstrate its own invariant is how
+    // the invariant gets deleted by the next person, so the witness above is
+    // one that reds a named test when the two passes are merged.
     //
     // Both halves are judged through `trim_key`: compact JSON welds a quote to
     // each, so the key arrives as `encoded_jit_config"`, and a `Debug`
     // rendering welds a backslash as well.
     for separator in ['=', ':'] {
-        if let Some((key, _)) = core.split_once(separator)
+        if let Some((key, raw_value)) = core.split_once(separator)
             && is_credential_key(key)
         {
-            return format!("{key}{separator}{REDACTION}");
+            // The value's own wrapping punctuation goes back, exactly as pass
+            // two puts it back. Dropping it emitted `{"password":[redacted]"}`
+            // — an unbalanced quote in a line this module argues, correctly,
+            // has to stay diagnosable, and a reader who cannot parse the line
+            // cannot tell a redaction from a truncation.
+            let (lead, _, trail) = split_wrappers(raw_value);
+            return format!("{key}{separator}{lead}{REDACTION}{trail}");
         }
     }
 
@@ -536,6 +625,74 @@ fn redact_core(core: &str) -> String {
     }
 
     redact_value(core)
+}
+
+/// Characters a URL scheme is made of: RFC 3986 allows a letter followed by
+/// letters, digits, `+`, `-` and `.`.
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+/// Characters that cannot appear inside a URL, and therefore end one.
+///
+/// `\` is deliberately absent, even though it cannot appear in a URL either.
+/// The shape it would have been there for is a `Debug`-escaped body, which
+/// spells its quotes `\"` — and the quote already ends the URL. Making the
+/// backslash a terminator as well costs a real redaction: a Windows path used
+/// as a URL password, `https://x-access-token:C:\Users\…@github.com/o/r.git`,
+/// would then end its URL at the first `\`, which puts the `@` that identifies
+/// the userinfo *outside* the span, and [`redact_url`] echoes what it is given.
+/// Measured: with `\` a terminator, that line emits the path verbatim; without
+/// it, the userinfo is replaced as it should be.
+fn is_url_terminator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | ',' | '{' | '}' | '[' | ']' | '<' | '>')
+}
+
+/// Finds the first URL in a fragment and cuts it out of the text around it.
+///
+/// Returns the text before the URL, its scheme, the URL itself with the `://`
+/// removed, and the text after it — or `None` when the fragment holds no URL.
+///
+/// **Both bounds are the point.** `split_once("://")` treated *everything*
+/// before the separator as the scheme and everything after it as the URL, and
+/// the terminal arm of [`redact_url`] echoes both verbatim — so a single URL
+/// anywhere in a word put the whole of the rest of that word beyond every rule
+/// below it. `documentation_url` is in essentially every GitHub REST error
+/// body, so that was *any* such body logged alongside a credential:
+///
+/// ```text
+/// {"documentation_url":"https://docs.github.com/rest","token":"ghu_…"}
+/// ```
+///
+/// came out intact. The reverse order leaked for the mirror reason —
+/// everything before the `://` became the "scheme" — and a nested object behind
+/// a URL was missed even when the URL's own userinfo was caught, because the
+/// miss and the catch happened in the same call. The only thing that saved the
+/// shape at all was a `?` or `#` *inside* the URL, which made [`redact_url`]
+/// replace the tail.
+///
+/// An empty scheme run means the `://` is not introducing a URL, and the
+/// fragment is left to the rules below rather than handed over as a URL with no
+/// scheme.
+fn split_url(fragment: &str) -> Option<(&str, &str, &str, &str)> {
+    let separator = fragment.find("://")?;
+    let before = &fragment[..separator];
+
+    // Scheme characters are ASCII, so a byte count is a character boundary.
+    let scheme_len = before
+        .bytes()
+        .rev()
+        .take_while(|byte| is_scheme_byte(*byte))
+        .count();
+    if scheme_len == 0 {
+        return None;
+    }
+    let (prefix, scheme) = before.split_at(before.len() - scheme_len);
+
+    let after = &fragment[separator + "://".len()..];
+    let (url, remainder) = after.split_at(after.find(is_url_terminator).unwrap_or(after.len()));
+
+    Some((prefix, scheme, url, remainder))
 }
 
 /// Redacts the three places a URL can carry a credential, keeping the rest.
@@ -2325,9 +2482,19 @@ mod tests {
             redact(&format!("X-Hub-Signature-256: sha256={hmac}")),
             format!("X-Hub-Signature-256: {REDACTION}")
         );
+        // Pass one puts the value's wrapping quote back, so what comes out is
+        // still the object that went in. It used to emit
+        // `{"x-hub-signature-256":[redacted]"}` -- an unbalanced quote in a
+        // line this module argues has to stay diagnosable.
+        //
+        // This case is also `redact_core`'s two-pass witness, and the comment
+        // there names it: the `=` comes first and names nothing, but what
+        // follows it is a whole HMAC -- non-empty -- so a merged pass inspects
+        // that value and returns before ever reaching the `:` that names
+        // `x-hub-signature-256`.
         assert_eq!(
             redact(&format!("{{\"x-hub-signature-256\":\"sha256={hmac}\"}}")),
-            format!("{{\"x-hub-signature-256\":{REDACTION}\"}}")
+            format!("{{\"x-hub-signature-256\":\"{REDACTION}\"}}")
         );
         // The SHA-1 spelling GitHub still sends alongside it.
         assert_eq!(
