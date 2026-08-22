@@ -591,7 +591,24 @@ fn redact_core(core: &str) -> String {
             // — an unbalanced quote in a line this module argues, correctly,
             // has to stay diagnosable, and a reader who cannot parse the line
             // cannot tell a redaction from a truncation.
-            let (lead, _, trail) = split_wrappers(raw_value);
+            let (lead, value, trail) = split_wrappers(raw_value);
+
+            // An empty value is nothing to redact, and pass two declines one
+            // for the same reason. A credential key whose value is empty *in
+            // this fragment* has its value in the next fragment or the next
+            // word, where the structural cut and the follow-on rule reach it.
+            // Claiming `[redacted]` here says a secret was somewhere none was,
+            // which is a false signal in the one log a reader consults to find
+            // out whether anything leaked.
+            //
+            // It is also load-bearing for the URL branch above, which sends
+            // the text before a URL back through here: `{"token":"https://…"}`
+            // leaves this pass a key of `token` and a value of nothing, and
+            // redacting that emitted `token":"[redacted]https://…` — the URL
+            // still standing behind the redaction meant to have replaced it.
+            if value.is_empty() {
+                continue;
+            }
             return format!("{key}{separator}{lead}{REDACTION}{trail}");
         }
     }
@@ -2167,6 +2184,26 @@ mod tests {
             redact("GET https://api.github.com/repos/o/r/actions/runners"),
             "GET https://api.github.com/repos/o/r/actions/runners"
         );
+
+        // A URL that is a credential key's *own* value keeps its scheme, host
+        // and path like every other URL -- a URL is not a token, and this
+        // module keeps exactly that much of one everywhere else. What must not
+        // happen is the key's empty value being redacted on the way past,
+        // which put the URL out behind a `[redacted]` that had replaced
+        // nothing: `token=[redacted]https://evil.example/x`. Bounding the URL
+        // is what created that shape, and pass one declining an empty value is
+        // what closes it.
+        assert_eq!(
+            redact("token=https://evil.example/x"),
+            "token=https://evil.example/x"
+        );
+        assert_eq!(
+            redact("{\"token\":\"https://evil.example/x\"}"),
+            "{\"token\":\"https://evil.example/x\"}"
+        );
+        // An empty credential value is nothing to redact wherever it sits, and
+        // saying otherwise reports a secret in a place none was.
+        assert_eq!(redact("{\"password\":\"\"}"), "{\"password\":\"\"}");
     }
 
     #[test]
