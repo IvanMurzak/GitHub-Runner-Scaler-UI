@@ -53,20 +53,61 @@
 //!   fragment. The userinfo matters more than it looks — a
 //!   token-authenticated git remote is
 //!   `https://x-access-token:ghu_…@github.com/owner/repo.git`, so it is the
-//!   shape a clone or fetch failure arrives in.
+//!   shape a clone or fetch failure arrives in. The path stays diagnosable but
+//!   is not exempt: each segment goes through the same shape rules on its own,
+//!   because a token in `…/raw/ghu_…/f` is a token, and the alternative was the
+//!   one place the belt never ran. A 40-character git object name is opaque
+//!   enough to go with it.
 //! - A word ending in `:` or `=` whose stem is a credential header name causes
 //!   the next two words to be redacted, so `Authorization: Bearer ghu_…` loses
 //!   both the scheme and the token.
 //!
-//! A word is cut on structural punctuation — `,`, `{`, `}`, `[`, `]` and `&` —
-//! before any of that runs, and each fragment is judged on its own. Without
-//! that cut only the *first* key/value pair in a compact structure is ever
-//! examined, and redaction becomes a function of field order:
-//! `{"encoded_jit_config":"…"}` was caught and
+//! A word is cut on structural punctuation — `,`, `;`, `{`, `}`, `[`, `]`,
+//! `<`, `>` and `&` — before any of that runs, and each fragment is then judged
+//! the way a whole word is: unwrapped, judged on its core, and re-emitted with
+//! its punctuation put back. Without that cut only the *first* key/value pair
+//! in a compact structure is ever examined, and redaction becomes a function of
+//! field order: `{"encoded_jit_config":"…"}` was caught and
 //! `{"runner_id":42,"encoded_jit_config":"…"}` was not, while
 //! `serde_json::to_string` is what decides which of the two an error body is.
-//! Nesting and a form-encoded body were the same defect in different
-//! punctuation.
+//! Nesting, a form-encoded body, a `;`-separated connection string and a plist
+//! element are all that same defect in different punctuation. So is an array
+//! element, one step further down — a fragment judged *with* its quote still
+//! attached matches no shape rule at all, and an array element is the one
+//! fragment that has no key of its own to give it away.
+//!
+//! Because the cut is flat, a credential's value does not have to be in the
+//! same fragment as the key that names it — `{"password":["hunter2"]}`,
+//! `{"password":{"v":"hunter2"}}` and a plist's
+//! `<key>password</key><string>hunter2</string>` all put it one or more
+//! fragments away — so a *carry* is threaded along the fragments to say that a
+//! key is still waiting for its value, or that a quoted value was cut before
+//! its closing quote. It steps over element names, because markup is not the
+//! value a key named, and it stops at the punctuation that visibly closes the
+//! value, because a redaction reported where no secret was is a false signal in
+//! the one log a reader consults to find out whether anything leaked.
+//!
+//! A URL is cut out of the text around it rather than being allowed to own the
+//! rest of the word. Its scheme is the run of scheme characters immediately
+//! before the `://`, and it ends at the first character that cannot appear in a
+//! URL — plus, *ahead of its query string only*, at a `;` or an `&`, which are
+//! structural characters everywhere else and are query syntax after the `?`.
+//! Everything on either side goes back through the rules. So
+//! `{"documentation_url":"https://…","token":"ghu_…"}` — which is what a GitHub
+//! REST error body looks like — keeps the URL and redacts the token, rather
+//! than the URL swallowing the token, and
+//! `Server=https://vault.local/api;Password=…` keeps the URL and redacts the
+//! password rather than the URL swallowing the `;` that separates them.
+//!
+//! **The text after a URL is iterated over, not recursed into.** That is a
+//! memory-safety property, not a style: recursing there made stack depth linear
+//! in the length of the message, and ~86 KB of URL-carrying JSON exited
+//! `STATUS_STACK_OVERFLOW`. A stack overflow is not catchable and takes the
+//! process with it, so an attacker-influenceable error body could kill the
+//! agent from inside its own log sink — and a sink that is not running redacts
+//! nothing at all. For the same reason every search in `split_url` is bounded
+//! by the URL's own end: a pass that never returns is as effective a denial as
+//! one that overflows.
 //!
 //! A key is also trimmed of backslashes, which a value never is: `Debug` on a
 //! `String` escapes the quotes inside it, so a body reached through
@@ -232,9 +273,22 @@ const WRAPPERS: &[char] = &[
 /// form-encoded body is the same defect spelled with `&`.
 ///
 /// So a word is cut on these before any of that runs, and each fragment is
-/// judged on its own. The separators go back verbatim, because the structure
-/// around a redaction is what keeps the line diagnosable.
-const STRUCTURAL: &[char] = &[',', '{', '}', '[', ']', '&'];
+/// judged on its own, by [`redact_fragment`]. The separators go back verbatim,
+/// because the structure around a redaction is what keeps the line diagnosable.
+///
+/// `;` is here for the reason `&` is: it separates the pairs of a Windows
+/// connection string (`Server=host;Database=x;Password=…`), of a credential
+/// string, and of a cookie header written without a space after the separator.
+/// It was already in [`WRAPPERS`] — recognised as punctuation, and so never
+/// used to cut — which left `Set-Cookie: theme=dark; session=…` safe only
+/// because of the space. `d2` logs keychain, DPAPI and libsecret failures, and
+/// that is the shape they arrive in.
+///
+/// `<` and `>` are here because [`split_wrappers`] strips only the *outermost*
+/// pair, so `<string>ghu_…</string>` reached the rules as
+/// `string>ghu_…</string`, which is on no list and matches no shape. `d3`'s
+/// installers handle launchd plists, which is where that shape comes from.
+const STRUCTURAL: &[char] = &[',', ';', '{', '}', '[', ']', '<', '>', '&'];
 
 /// Whether this sink will emit a field's value rather than replacing it.
 #[must_use]
@@ -397,6 +451,68 @@ fn trim_end_wrappers(fragment: &str) -> &str {
     }
 }
 
+/// What a credential key left outstanding at the end of the text that named it.
+///
+/// The structural cut is flat and a credential's value does not have to be in
+/// the same fragment as the key that names it, so something has to carry the
+/// key across the cut. Nothing did, which is [`redact_core`]'s empty-value
+/// case: the comment there claimed the value would be reached "in the next
+/// fragment, where the structural cut reaches it", and no such thing happened.
+///
+/// The two variants are not the same claim, and collapsing them over-redacts:
+///
+/// - [`Carry::Expecting`] is *"a key named a value that has not appeared yet"*.
+///   It has to step over markup, because `<key>password</key><string>…</string>`
+///   puts `/key` and `string` between the key and its value.
+/// - [`Carry::Unclosed`] is *"a quoted value was redacted and its closing quote
+///   is not in this fragment"*, so the value continues past the cut. Inside an
+///   open quote `<` and `>` are literal text rather than markup, so this one
+///   must *not* step over anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Carry {
+    /// Nothing outstanding.
+    None,
+    /// A credential key supplied no value of its own.
+    Expecting,
+    /// A redacted credential value was cut before its closing quote.
+    Unclosed,
+}
+
+/// Whether wrapping punctuation closes the value it followed.
+///
+/// A quote closes a string and a bracket closes a structure, so either one
+/// means the credential value ended here and a carry must stop. `,` and `;` are
+/// on the list for the reason [`redact`] already stops its word-level follow-on
+/// at them: they end a header value, and what comes after is the next header's
+/// name.
+///
+/// `>` is deliberately absent. It closes a *tag*, not a value —
+/// `<key>password</key>` ends in one with the credential's value still to come
+/// — and treating it as a terminator is what would leave the multi-word plist
+/// spelling leaking.
+fn closes_a_value(wrappers: &str) -> bool {
+    wrappers.contains(['"', '\'', '`', ',', ';', ']', '}', ')'])
+}
+
+/// Whether a value opened a quote that its own fragment did not close.
+fn opens_an_unclosed_quote(lead: &str, trail: &str) -> bool {
+    const QUOTES: [char; 3] = ['"', '\'', '`'];
+    lead.contains(QUOTES) && !trail.contains(QUOTES)
+}
+
+/// Whether a fragment sits where an element *name* goes rather than where its
+/// content does.
+///
+/// `<` and `>` are in [`STRUCTURAL`] because `<string>ghu_…</string>` reached
+/// the rules as `string>ghu_…</string` and matched nothing. Having cut on them,
+/// the loop knows which side of a tag it is on, and a [`Carry::Expecting`] must
+/// not be spent on `/key` or `string` when the value it is waiting for is the
+/// element's content. A tag name is still judged by every other rule — this
+/// says only that it is not the value a credential key named.
+fn is_tag_name(preceding: Option<char>, following: Option<char>) -> bool {
+    preceding == Some('<') && following == Some('>')
+}
+
 /// Redacts one whitespace-delimited word, and says how many following words the
 /// word implicates.
 fn redact_word(word: &str) -> (String, u32) {
@@ -424,15 +540,206 @@ fn redact_word(word: &str) -> (String, u32) {
         return (word.to_string(), 1);
     }
 
-    (format!("{prefix}{}{suffix}", redact_core(core)), 0)
+    let (rendered, carry) = redact_core(core, suffix);
+
+    // A value the word did not finish is the *next* word's problem, which is
+    // the follow-on rule the word level already has, reached from one level
+    // down. A pretty-printed plist is why it is needed: `<key>password</key>`
+    // and `<string>hunter2</string>` are on separate lines, so the key and its
+    // value are not even in the same word.
+    //
+    // The two carries ask for different amounts, for the same reason the stem
+    // rule above asks for two words and not one:
+    //
+    // - [`Carry::Expecting`] means the value has not been seen *at all*, so it
+    //   may be introduced by a word of its own — `<string>correct` and then
+    //   `horse</string>`. Two, exactly as `Authorization: Bearer <token>` needs
+    //   two.
+    // - [`Carry::Unclosed`] means the value has already started and was cut, so
+    //   only its remainder is outstanding. One.
+    //
+    // Trailing punctuation that closes the value withdraws the claim, for the
+    // same reason pass one declines an empty value: `{"password":""}` names a
+    // credential and supplies nothing, and redacting the next word there would
+    // report a secret where none was.
+    let follow_on = if closes_a_value(suffix) {
+        0
+    } else {
+        match carry {
+            Carry::None => 0,
+            Carry::Unclosed => 1,
+            Carry::Expecting => 2,
+        }
+    };
+    (format!("{prefix}{rendered}{suffix}"), follow_on)
 }
 
-/// Redacts one word with its wrapping punctuation already removed.
-fn redact_core(core: &str) -> String {
+/// Redacts one fragment of a cut-up word, judging it on its core.
+///
+/// [`redact_core`] used to recurse on the *raw* fragment, and its terminal
+/// fallback then handed that fragment to [`redact_value`] with its wrapping
+/// punctuation still attached. A fragment carrying no `:` or `=` of its own —
+/// which is exactly what an array element is — therefore reached the shape
+/// rules as `"ghu_…`, where `starts_with("ghu_")` fails, [`is_opaque_char`]
+/// fails on the quote, the `eyJ` test fails, and [`looks_like_path`] never gets
+/// a clean look at `"C:\Users\…`.
+///
+/// That is the defect the structural cut was written to close, one step further
+/// down: *"only the first key/value pair is ever examined"* became *"a value
+/// with no key of its own is never examined"*. It survived a round because the
+/// secret-injection scan had no array among its shapes, which is the same
+/// lesson in a different place — a check that cannot fail proves nothing.
+///
+/// So a fragment is treated the way [`redact_word`] treats a word: split,
+/// judge the core, put the punctuation back.
+///
+/// The *word-level* follow-on rule is still not repeated here, and the reason
+/// stands: *"the value is the next word"* is a statement about whitespace, and
+/// there is no next word inside a fragment. What that argument does not cover —
+/// and what an earlier spelling of it wrongly took itself to have settled — is
+/// the *fragment-level* claim: **the value is the next fragment**. That one is
+/// a statement about the structural cut, it is true, and nothing implemented
+/// it, which is why `{"password":["hunter2"]}` and
+/// `<key>password</key><string>hunter2</string>` went out whole. [`Carry`] is
+/// that claim, threaded through the loop in [`redact_core`].
+///
+/// `trailing` says this is the last fragment of its core, and it is what keeps
+/// the carry from escaping a word it has already been spent inside: consuming
+/// a claim in the middle of a core settles it, while consuming it at the end
+/// leaves open the possibility that the value runs on into the next word.
+fn redact_fragment(
+    fragment: &str,
+    carry: Carry,
+    tag_name: bool,
+    trailing: bool,
+) -> (String, Carry) {
+    let (prefix, core, suffix) = split_wrappers(fragment);
+    if core.is_empty() {
+        return (fragment.to_string(), carry);
+    }
+
+    let claimed = match carry {
+        Carry::None => false,
+        // Markup is not the value a credential key named.
+        Carry::Expecting => !tag_name,
+        // Inside an open quote there is no markup, only text.
+        Carry::Unclosed => true,
+    };
+
+    if claimed {
+        // Two different reasons to think the value has more to come, and one
+        // answer: it is `Unclosed` from here, never the `Expecting` it may have
+        // arrived as, because the value has now started.
+        //
+        // - `carry == Unclosed` — still inside an open quote, so the value runs
+        //   into the next fragment as well.
+        // - `trailing` — a claim spent on the *last* fragment of a core is one
+        //   whose value reached the end of the word with nothing closing it, so
+        //   it may continue into the next word.
+        //   `<key>password</key><string>` + `correct horse</string>` is that
+        //   shape.
+        //
+        // Anything else was spent in the middle of a core, where the value was
+        // and is done — and punctuation that closes a string or a structure
+        // settles it either way.
+        let next = if !closes_a_value(suffix) && (carry == Carry::Unclosed || trailing) {
+            Carry::Unclosed
+        } else {
+            Carry::None
+        };
+        return (format!("{prefix}{REDACTION}{suffix}"), next);
+    }
+
+    let (rendered, next) = redact_core(core, suffix);
+    let next = if closes_a_value(suffix) {
+        Carry::None
+    } else if next == Carry::None {
+        // **An unclaimed fragment preserves the claim rather than clearing
+        // it.** This is the whole of what lets a plist work: `/key` and
+        // `string` sit between `<key>password</key>` and the `<string>` content
+        // that is the value, they are tag names so they do not spend the claim,
+        // and a fragment that neither spends nor arms one must leave it exactly
+        // as it found it. Overwriting with this fragment's own (empty) result
+        // is how `<key>password</key><string>hunter2</string>` kept leaking
+        // after the carry existed.
+        carry
+    } else {
+        next
+    };
+    (format!("{prefix}{rendered}{suffix}"), next)
+}
+
+/// Redacts one word with its wrapping punctuation already removed, and reports
+/// what it left outstanding for whatever follows it.
+///
+/// `closing` is the wrapping punctuation the caller stripped off the end of
+/// this core. It is not emitted here — the caller puts it back — but the loop
+/// below has to see it, because the character that follows the *last* fragment
+/// is what says whether that fragment is an element name or an element's
+/// content.
+fn redact_core(core: &str, closing: &str) -> (String, Carry) {
     // A URL survives, minus everything on it that carries a credential. The
     // scheme, host and path are what makes a log line diagnosable.
-    if let Some((scheme, rest)) = core.split_once("://") {
-        return redact_url(scheme, rest);
+    //
+    // The URL is *cut out* of the text around it rather than being allowed to
+    // own the rest of the fragment, and both sides of the cut come back through
+    // here. [`split_url`] documents what the old unbounded `split_once("://")`
+    // cost. This still runs ahead of the structural cut, because a query string
+    // is `redact_url`'s to own: `?` and `#` are not structural characters, and
+    // an OAuth implicit-flow response puts the token after one of them.
+    //
+    // **The tail is iterated, not recursed into, and that is a memory-safety
+    // property rather than a matter of taste.** An earlier spelling called
+    // `redact_core` on the remainder, and argued only that the recursion
+    // *terminates*: every call is on a strictly shorter slice, which is true
+    // and is not enough. Termination says nothing about **depth**, and depth
+    // was linear in the length of the input — one frame per URL. A message of
+    // ~2000 `{"url":"https://…"},` items, about 86 KB, exited
+    // `0xc00000fd STATUS_STACK_OVERFLOW`.
+    //
+    // A stack overflow is not a `panic`: it is not catchable, it does not
+    // unwind, and it takes the process with it. A large HTTP error body is
+    // content an attacker can influence, so that was a way to kill the agent
+    // from inside its own log sink — and a sink that is not running redacts
+    // nothing at all, which is worse than any single leak.
+    //
+    // With the loop, every remaining re-entry is depth-bounded by construction
+    // rather than by argument:
+    //
+    // - `prefix` holds everything before the *first* `://`, so it contains no
+    //   `://` and cannot reach this branch again.
+    // - `rest` is what is left when the loop finds no further `://`, for the
+    //   same reason.
+    // - the structural branch below calls [`redact_fragment`], whose fragments
+    //   contain no structural character by construction and so cannot reach it
+    //   again either.
+    //
+    // Three levels, whatever the input is. Anything added here that recurses on
+    // a slice whose length is not bounded by a constant re-opens this.
+    if let Some((prefix, scheme, url, remainder)) = split_url(core) {
+        let mut out = String::with_capacity(core.len());
+        if !prefix.is_empty() {
+            out.push_str(&redact_core(prefix, "").0);
+        }
+        out.push_str(&redact_url(scheme, url));
+
+        let mut rest = remainder;
+        while let Some((prefix, scheme, url, remainder)) = split_url(rest) {
+            if !prefix.is_empty() {
+                out.push_str(&redact_core(prefix, "").0);
+            }
+            out.push_str(&redact_url(scheme, url));
+            rest = remainder;
+        }
+        if !rest.is_empty() {
+            out.push_str(&redact_core(rest, "").0);
+        }
+
+        // A URL is a complete value: it carries its own credentials in its own
+        // places, and `redact_url` has already dealt with them. Nothing is
+        // outstanding, which is also what keeps `{"token":"https://…"}` from
+        // arming a claim against whatever follows the URL.
+        return (out, Carry::None);
     }
 
     // A Windows drive path is `key:value`-shaped by accident, and
@@ -441,7 +748,7 @@ fn redact_core(core: &str) -> String {
     // matches nothing, so it has to be judged whole, before the separators
     // get at it.
     if looks_like_path(core) {
-        return PATH_REDACTION.to_string();
+        return (PATH_REDACTION.to_string(), Carry::None);
     }
 
     // A compact structure holds more than one key/value pair, and the rules
@@ -457,53 +764,152 @@ fn redact_core(core: &str) -> String {
     // Cutting on [`STRUCTURAL`] first turns all three into the shape the rules
     // already handle, and does it at any depth: the cut is flat, so
     // `{"a":{"b":{"token":"…"}}}` yields the same fragments a one-level object
-    // would. A fragment contains no structural character by construction, so
-    // this recurses exactly one level and cannot loop.
+    // would.
+    //
+    // Each fragment goes through [`redact_fragment`] rather than straight back
+    // in here, because a fragment carries its own wrapping punctuation and a
+    // value judged with its quote attached matches nothing at all.
+    //
+    // The recursion terminates *and is depth-bounded*: a fragment contains no
+    // structural character by construction, so `redact_fragment` cannot reach
+    // this branch again, and the URL branch above iterates over its tail rather
+    // than recursing into it. The loop here is a loop for the same reason — a
+    // fragment per separator, at whatever length the input has.
+    //
+    // A [`Carry`] is threaded along it because the cut is flat and a
+    // credential's value need not be in the same fragment as its key. Without
+    // it the empty-value skip in pass one was a promise nothing kept: the value
+    // was said to be reachable "in the next fragment", and no next fragment
+    // ever heard about the key.
     if core.contains(STRUCTURAL) {
         let mut out = String::with_capacity(core.len());
+        let mut carry = Carry::None;
         let mut rest = core;
+        // The separator on each side of a fragment is what says whether it is
+        // an element name or an element's content.
+        let mut preceding: Option<char> = None;
         while let Some(index) = rest.find(STRUCTURAL) {
             let (fragment, tail) = rest.split_at(index);
-            if !fragment.is_empty() {
-                out.push_str(&redact_core(fragment));
-            }
             // Every character in `STRUCTURAL` is ASCII, so the separator is
-            // one byte and this cannot split a code point.
+            // one byte, this cannot split a code point, and the byte is the
+            // whole character.
+            let separator = char::from(tail.as_bytes()[0]);
+            if !fragment.is_empty() {
+                let (rendered, next) = redact_fragment(
+                    fragment,
+                    carry,
+                    is_tag_name(preceding, Some(separator)),
+                    false,
+                );
+                out.push_str(&rendered);
+                carry = next;
+            }
             out.push_str(&tail[..1]);
+            preceding = Some(separator);
             rest = &tail[1..];
         }
         if !rest.is_empty() {
-            out.push_str(&redact_core(rest));
+            // The last fragment's *following* character is the caller's closing
+            // punctuation: in `<key>password</key>` the final `/key` is a tag
+            // name only because the `>` that ends it was stripped as a wrapper
+            // before this ran.
+            let following = closing.chars().next();
+            let (rendered, next) =
+                redact_fragment(rest, carry, is_tag_name(preceding, following), true);
+            out.push_str(&rendered);
+            carry = next;
         }
-        return out;
+        return (out, carry);
     }
 
     // `key=value` and `key:value` in a single fragment.
     //
     // Pass one asks only whether either separator names a credential, and it
     // runs to completion before any value is inspected, because the *first*
-    // separator in a fragment is not necessarily the structural one. A base64
-    // payload carries `=` padding, and what follows that padding decides
-    // whether one pass would have done.
+    // separator in a fragment is not necessarily the one that names the key.
     //
-    // `{"encoded_jit_config":"eyJ…In0="}` on its own is *not* that case, and
-    // this comment used to claim it was. Base64 padding is trailing-only, so
-    // the `=` split yields an empty value and the `value.is_empty()` guard in
-    // pass two already falls through to the `:`. The case that genuinely needs
-    // two passes is a **multi-field** object, where the text after the padding
-    // is not empty: `{"encoded_jit_config":"eyJ…In0=","runner_id":42}` is cut
-    // on `,` above into a fragment still ending `…In0="`, so the `=` split
-    // hands back a value of `"` — non-empty, inspected, found innocent, and
-    // returned before the `:` that names the key is ever reached.
+    // The witness is a webhook signature header in its compact-JSON spelling,
+    // `{"x-hub-signature-256":"sha256=<hmac>"}`, and
+    // `a_credential_header_loses_its_scheme_and_its_value` holds it. The `=`
+    // comes first and names nothing, but what follows it is a whole HMAC —
+    // *non-empty*, so a merged pass inspects that value, renders it as a
+    // digest prefix, and returns without ever reaching the `:` that names
+    // `x-hub-signature-256`. `{"password":"a=b"}` is the same witness with
+    // nothing else going on: merged, it comes out whole.
+    //
+    // Two earlier spellings of this comment named
+    // `{"encoded_jit_config":"eyJ…In0="}` and then
+    // `{"encoded_jit_config":"eyJ…In0=","runner_id":42}`, and neither
+    // demonstrates the invariant: base64 padding is trailing-only, so the `=`
+    // split yields a value that `split_wrappers` trims to empty, and the
+    // `value.is_empty()` guard in pass two falls through to the `:` anyway. A
+    // comment naming a case that does not demonstrate its own invariant is how
+    // the invariant gets deleted by the next person, so the witness above is
+    // one that reds a named test when the two passes are merged.
     //
     // Both halves are judged through `trim_key`: compact JSON welds a quote to
     // each, so the key arrives as `encoded_jit_config"`, and a `Debug`
     // rendering welds a backslash as well.
+    // Whether pass one saw a credential key and was given nothing to redact.
+    let mut names_a_credential = false;
+
     for separator in ['=', ':'] {
-        if let Some((key, _)) = core.split_once(separator)
+        if let Some((key, raw_value)) = core.split_once(separator)
             && is_credential_key(key)
         {
-            return format!("{key}{separator}{REDACTION}");
+            // The value's own wrapping punctuation goes back, exactly as pass
+            // two puts it back. Dropping it emitted `{"password":[redacted]"}`
+            // — an unbalanced quote in a line this module argues, correctly,
+            // has to stay diagnosable, and a reader who cannot parse the line
+            // cannot tell a redaction from a truncation.
+            let (lead, value, trail) = split_wrappers(raw_value);
+
+            // An empty value is nothing to redact, and pass two declines one
+            // for the same reason. Claiming `[redacted]` here says a secret was
+            // somewhere none was, which is a false signal in the one log a
+            // reader consults to find out whether anything leaked.
+            //
+            // It is also load-bearing for the URL branch above, which sends
+            // the text before a URL back through here: `{"token":"https://…"}`
+            // leaves this pass a key of `token` and a value of nothing, and
+            // redacting that emitted `token":"[redacted]https://…` — the URL
+            // still standing behind the redaction meant to have replaced it.
+            //
+            // **What it is not is a reason to forget the key.** An earlier
+            // spelling of this comment said the value would be found "in the
+            // next fragment or the next word, where the structural cut and the
+            // follow-on rule reach it", and half of that was false: the
+            // follow-on rule does reach the next *word*, and nothing whatever
+            // reached the next *fragment*, because `redact_fragment`
+            // deliberately carries no follow-on. So `{"password":["hunter2"]}`,
+            // `{"password":{"v":"hunter2"}}` and `Password=;hunter2` — a
+            // credential key with its value one fragment away, which is what an
+            // array, a nested object and an empty pair all are — went out
+            // whole, with the key sitting in plain sight next to them.
+            //
+            // That is the failure this module warns about two comments down: a
+            // comment naming a case that does not demonstrate its own
+            // invariant. The claim is now true because [`Carry::Expecting`]
+            // implements it, and `the_fragment_carry_stops_where_the_value_does`
+            // holds both halves — that the claim is made, and that it is
+            // withdrawn where the value visibly ended.
+            if value.is_empty() {
+                names_a_credential = true;
+                continue;
+            }
+
+            // A quoted value whose closing quote is not in this fragment is a
+            // value the cut ran through the middle of: `{"password":"p&ss"}`
+            // reaches here as `password":"p`, and `ss` is the rest of the
+            // secret. Adding `;`, `<` and `>` to `STRUCTURAL` this round made
+            // three more characters able to do that, and punctuated passwords
+            // are ordinary.
+            let carry = if opens_an_unclosed_quote(lead, trail) {
+                Carry::Unclosed
+            } else {
+                Carry::None
+            };
+            return (format!("{key}{separator}{lead}{REDACTION}{trail}"), carry);
         }
     }
 
@@ -529,13 +935,139 @@ fn redact_core(core: &str) -> String {
             if trim_key(key).eq_ignore_ascii_case("sha256")
                 && let Some(bare) = redacted.strip_prefix("sha256:")
             {
-                return format!("{key}{separator}{lead}{bare}{trail}");
+                return (format!("{key}{separator}{lead}{bare}{trail}"), Carry::None);
             }
-            return format!("{key}{separator}{lead}{redacted}{trail}");
+            return (
+                format!("{key}{separator}{lead}{redacted}{trail}"),
+                Carry::None,
+            );
         }
     }
 
-    redact_value(core)
+    // A credential key with no value at all — either `password:` with nothing
+    // after it, or a bare `password` between a plist's tags. Both name a value
+    // that is somewhere else, and the caller is the only one who can see where.
+    let carry = if names_a_credential || is_credential_key(core) {
+        Carry::Expecting
+    } else {
+        Carry::None
+    };
+    (redact_value(core), carry)
+}
+
+/// Characters a URL scheme is made of: RFC 3986 allows a letter followed by
+/// letters, digits, `+`, `-` and `.`.
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+/// Characters that cannot appear inside a URL, and therefore end one.
+///
+/// `\` is deliberately absent, even though it cannot appear in a URL either.
+/// The shape it would have been there for is a `Debug`-escaped body, which
+/// spells its quotes `\"` — and the quote already ends the URL. Making the
+/// backslash a terminator as well costs a real redaction: a Windows path used
+/// as a URL password, `https://x-access-token:C:\Users\…@github.com/o/r.git`,
+/// would then end its URL at the first `\`, which puts the `@` that identifies
+/// the userinfo *outside* the span, and [`redact_url`] echoes what it is given.
+/// Measured: with `\` a terminator, that line emits the path verbatim; without
+/// it, the userinfo is replaced as it should be.
+fn is_url_terminator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | ',' | '{' | '}' | '[' | ']' | '<' | '>')
+}
+
+/// The same, plus the two [`STRUCTURAL`] characters that end a URL only *ahead
+/// of its query string*.
+///
+/// [`STRUCTURAL`] has nine characters and [`is_url_terminator`] recognises seven
+/// of them; `;` and `&` were missing. Because the URL branch runs ahead of the
+/// structural cut, a URL earlier in a word made [`split_url`] swallow
+/// everything to the next terminator — including the separator that would have
+/// cut the word — and [`redact_url`]'s terminal arm echoes what it is given. So
+/// `Server=https://vault.local/api;Password=hunter2` and
+/// `cb=https://a.com/x&access_token=ghu_…` went out whole: the fix that bounds
+/// a URL and the fix that cuts on `;` and `&` each worked alone and did not
+/// compose.
+///
+/// **Adding them to [`is_url_terminator`] outright is the obvious fix and the
+/// wrong one**, which is why there are two predicates rather than one extended
+/// list. `&` is what separates the parameters *inside* a query string, and
+/// [`redact_url`] replaces a query wholesale precisely because a token can be
+/// in any parameter and this module does not guess which. Measured:
+/// `https://a.com/cb?code=1&state=hunter2` goes from `?[redacted]` to
+/// `?[redacted]&state=hunter2`. `;` is the same story — it is a legal query
+/// separator too.
+///
+/// Ahead of the `?` there is no such conflict: a `;` or an `&` in an authority
+/// or a path is not URL syntax this module needs to keep, and something else in
+/// the word is much the likelier reading.
+fn is_url_head_terminator(c: char) -> bool {
+    is_url_terminator(c) || matches!(c, ';' | '&')
+}
+
+/// Finds the first URL in a fragment and cuts it out of the text around it.
+///
+/// Returns the text before the URL, its scheme, the URL itself with the `://`
+/// removed, and the text after it — or `None` when the fragment holds no URL.
+///
+/// **Both bounds are the point.** `split_once("://")` treated *everything*
+/// before the separator as the scheme and everything after it as the URL, and
+/// the terminal arm of [`redact_url`] echoes both verbatim — so a single URL
+/// anywhere in a word put the whole of the rest of that word beyond every rule
+/// below it. `documentation_url` is in essentially every GitHub REST error
+/// body, so that was *any* such body logged alongside a credential:
+///
+/// ```text
+/// {"documentation_url":"https://docs.github.com/rest","token":"ghu_…"}
+/// ```
+///
+/// came out intact. The reverse order leaked for the mirror reason —
+/// everything before the `://` became the "scheme" — and a nested object behind
+/// a URL was missed even when the URL's own userinfo was caught, because the
+/// miss and the catch happened in the same call. The only thing that saved the
+/// shape at all was a `?` or `#` *inside* the URL, which made [`redact_url`]
+/// replace the tail.
+///
+/// An empty scheme run means the `://` is not introducing a URL, and the
+/// fragment is left to the rules below rather than handed over as a URL with no
+/// scheme.
+fn split_url(fragment: &str) -> Option<(&str, &str, &str, &str)> {
+    let separator = fragment.find("://")?;
+    let before = &fragment[..separator];
+
+    // Scheme characters are ASCII, so a byte count is a character boundary.
+    let scheme_len = before
+        .bytes()
+        .rev()
+        .take_while(|byte| is_scheme_byte(*byte))
+        .count();
+    if scheme_len == 0 {
+        return None;
+    }
+    let (prefix, scheme) = before.split_at(before.len() - scheme_len);
+
+    let after = &fragment[separator + "://".len()..];
+
+    // Where the URL ends no matter what, and **the bound every other search
+    // here is taken inside**. Searching the rest of the fragment first is a
+    // correct answer computed quadratically: a body of *n* URLs would scan the
+    // whole remaining text once per URL looking for a `?` that is not there,
+    // which on the 860 KB regression case in
+    // `a_large_message_does_not_overflow_the_stack` is 17 billion character
+    // comparisons. That test is a guard against this module taking the process
+    // down, and a redaction pass that never returns takes it down just as
+    // effectively as an overflow does.
+    let end = after.find(is_url_terminator).unwrap_or(after.len());
+    let url = &after[..end];
+
+    // The head is the authority and path — everything ahead of the first `?` or
+    // `#`. Only there do `;` and `&` end the URL; inside a query string they
+    // are query syntax, and the query is `redact_url`'s to replace wholesale.
+    let query = url.find(['?', '#']).unwrap_or(url.len());
+    let end = url[..query].find(is_url_head_terminator).unwrap_or(end);
+    let (url, remainder) = after.split_at(end);
+
+    Some((prefix, scheme, url, remainder))
 }
 
 /// Redacts the three places a URL can carry a credential, keeping the rest.
@@ -574,10 +1106,47 @@ fn redact_url(scheme: &str, rest: &str) -> String {
         Some(cut) => {
             let (path, query) = tail.split_at(cut);
             let separator = &query[..1];
-            format!("{scheme}://{host}{path}{separator}{REDACTION}")
+            format!(
+                "{scheme}://{host}{}{separator}{REDACTION}",
+                redact_path(path)
+            )
         }
-        None => format!("{scheme}://{host}{tail}"),
+        None => format!("{scheme}://{host}{}", redact_path(tail)),
     }
+}
+
+/// Applies the shape rules to a URL path, one segment at a time.
+///
+/// The path is the diagnosable part of a URL and stays that way: a segment is
+/// judged on its own, and an ordinary one — `repos`, `owner`, `actions-runner-
+/// linux-x64-2.330.0.tar.gz` — is not a secret and is not touched. What this
+/// closes is that [`redact_url`] previously applied *no* rule to a path at all,
+/// so `https://github.com/o/r/raw/ghu_…/f` was echoed whole while the identical
+/// token one character to the left of the `/` would have been replaced. The
+/// token-prefix rule is documented as a belt that catches a credential
+/// *anywhere*, and a path was the one place it never ran.
+///
+/// Segment at a time rather than whole, because [`redact_value`] would
+/// otherwise see the `/` and hand the whole path to [`looks_like_path`], which
+/// is exactly the over-redaction the module documentation promises a full URL
+/// escapes.
+///
+/// Worth knowing: [`OPAQUE_RUN_THRESHOLD`] is 40, and a git object name written
+/// as hex is exactly 40 characters, so a `…/raw/<sha1>/f` URL loses its commit
+/// to `[redacted]`. That is the module's standing trade — a less readable line
+/// against a disclosed credential — and it is called out here because a commit
+/// SHA is the one path segment somebody may miss.
+fn redact_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if !segment.is_empty() {
+            out.push_str(&redact_value(segment));
+        }
+    }
+    out
 }
 
 /// The shape rules, applied to a bare value.
@@ -1229,6 +1798,144 @@ mod tests {
                     body: format!("{{\"runner_token\":\"{secret}\"}}"),
                 };
                 tracing::error!(reason = ?failure, "the secret store rejected the request");
+
+                // 13. A URL earlier in the same word. `redact_core` split on the
+                //     first `://` and handed everything before it to
+                //     `redact_url` as a "scheme" and everything after it as
+                //     the URL -- and the terminal arm of `redact_url` echoes
+                //     both verbatim. So one URL anywhere in a word put the
+                //     whole of the rest of that word beyond every rule below.
+                //     `documentation_url` is in essentially every GitHub REST
+                //     error body, which makes that "any error body logged
+                //     alongside a credential".
+                tracing::error!(
+                    "api failed: {{\"message\":\"Bad credentials\",\"documentation_url\":\"https://docs.github.com/rest\",\"token\":\"{secret}\"}}"
+                );
+                // The reverse order leaked for the mirror reason: everything
+                // before the `://` became the scheme, and was echoed.
+                tracing::error!(
+                    "api failed: {{\"token\":\"{secret}\",\"documentation_url\":\"https://docs.github.com/rest\"}}"
+                );
+                // A nested object behind a URL, which is the shape a clone
+                // failure arrives in.
+                tracing::error!(
+                    "clone failed: {{\"remote\":\"https://github.com/o/r.git\",\"body\":{{\"password\":\"{secret}\"}}}}"
+                );
+
+                // 14. A value with no key of its own: an array element. The
+                //     structural cut recursed on the *raw* fragment, and the
+                //     terminal fallback then handed it to `redact_value` with
+                //     its quote still attached -- so `"ghu_…` failed
+                //     `starts_with("ghu_")`, failed `is_opaque_char` on the
+                //     quote, failed the `eyJ` test, and failed
+                //     `looks_like_path`. This is shape 9's defect one step
+                //     down: "only the first pair is examined" became "a value
+                //     with no key of its own is never examined", and it
+                //     survived because there was no array among the twelve
+                //     shapes above.
+                tracing::error!("registration failed: {{\"tokens\":[\"{secret}\",\"x\"]}}");
+                tracing::error!("registration failed: {{\"tokens\":[\"x\",\"{secret}\"]}}");
+                tracing::error!("registration failed: [\"x\",\"{secret}\"]");
+                tracing::error!("registration failed: [{{\"id\":1}},[\"{secret}\"]]");
+                let listed = StoreError {
+                    body: format!("{{\"tokens\":[\"x\",\"{secret}\"]}}"),
+                };
+                tracing::error!(reason = ?listed, "the secret store rejected the list");
+
+                // 15. `;` as the separator. It is in `WRAPPERS`, so it was
+                //     recognised as punctuation, and it was not in
+                //     `STRUCTURAL`, so it never cut a word. It is what
+                //     separates the pairs of a Windows connection string, of a
+                //     credential string, and of a cookie header written
+                //     without a space -- `d2`'s territory exactly.
+                tracing::error!("store rejected: Server=host;Database=x;Password={secret};");
+                tracing::error!("store rejected: user=operator;password={secret}");
+                tracing::error!("store rejected: theme=dark;session={secret}");
+
+                // 16. Wrapped in an element rather than in a quote.
+                //     `split_wrappers` strips only the *outermost* `<` and
+                //     `>`, so `<string>…</string>` arrived as
+                //     `string>…</string`, which matches no rule at all. `d3`'s
+                //     installers handle launchd plists, which is where this
+                //     shape comes from.
+                tracing::error!("plist rejected: <string>{secret}</string>");
+                tracing::error!("plist rejected: <key>token</key><string>{secret}</string>");
+
+                // 17. A `;` or an `&` *after a URL in the same word*. This is
+                //     shape 15 and shape 11 with one thing changed: a URL
+                //     earlier in the word. `STRUCTURAL` has nine characters and
+                //     `is_url_terminator` recognised seven of them -- `;` and
+                //     `&` were missing -- and the URL branch runs *ahead* of
+                //     the structural cut. So `split_url` swallowed everything
+                //     to the next terminator, including the separator that
+                //     would have cut the word, and `redact_url`'s terminal arm
+                //     echoed it verbatim.
+                //
+                //     The L3 fix (bounding the URL) and the L1 fix (cutting on
+                //     `;` and `&`) each work alone and did not compose: this
+                //     commit added `;` to `STRUCTURAL` *for connection strings*
+                //     while leaving the path a URL opens straight through it.
+                //     A connection string whose `Server=` is a URL is exactly
+                //     `d2`'s shape, and a systemd `Environment=` line is
+                //     `d3`'s.
+                tracing::error!(
+                    "store rejected: Server=https://vault.local/api;Password={secret};"
+                );
+                tracing::error!("keychain error: url=https://kc.local;secret={secret}");
+                tracing::error!("unit rejected: Environment=API=https://a.com/v1;TOKEN={secret}");
+                tracing::error!("token exchange failed: cb=https://a.com/x&access_token={secret}");
+                tracing::error!(
+                    "dsn rejected: dsn=https://sentry.local/1;password={secret};user=x"
+                );
+                tracing::error!(
+                    "callback failed: redirect=https://a.com/cb&state=1&access_token={secret}"
+                );
+                let routed = StoreError {
+                    body: format!("Server=https://vault.local/api;Password={secret};"),
+                };
+                tracing::error!(reason = ?routed, "the secret store rejected the connection string");
+
+                // 18. A credential key whose value is not in its own fragment.
+                //     The empty-value skip is right, but its justification --
+                //     "the value is in the next fragment, where the structural
+                //     cut reaches it" -- was false: `redact_fragment` carried
+                //     nothing across the cut, so nothing ever reached it. An
+                //     array, a nested object, an empty pair and a plist
+                //     key/value pair are four spellings of the same gap.
+                tracing::error!("store rejected: {{\"password\":[\"{secret}\"]}}");
+                tracing::error!("store rejected: {{\"password\":{{\"v\":\"{secret}\"}}}}");
+                tracing::error!("store rejected: Password=;{secret}");
+                tracing::error!("plist rejected: <key>password</key><string>{secret}</string>");
+
+                // 19. A structural character *inside* a credential value. `,`
+                //     and `&` could already split a secret; this commit added
+                //     `;`, `<` and `>`, so each of those became a new character
+                //     that can cut a punctuated password in half and leave the
+                //     tail standing.
+                tracing::error!("store rejected: {{\"password\":\"a<{secret}>b\"}}");
+                tracing::error!("store rejected: {{\"password\":\"a&{secret},b\"}}");
+
+                // 20. A secret in a URL *path*. `redact_url` applies no shape
+                //     rule to the path at all, so a token that reaches one is
+                //     echoed whole -- and the token-prefix rule is documented
+                //     as a belt that catches a credential anywhere.
+                //
+                //     The two workspace paths are excluded, and the exclusion
+                //     is a real limitation rather than a convenience. A path is
+                //     judged one segment at a time, because judging the whole
+                //     of a URL path with `looks_like_path` would redact every
+                //     URL with two segments in it -- which is the
+                //     over-redaction the module documentation explicitly
+                //     promises a full URL escapes. A filesystem path pasted
+                //     into a URL path is therefore indistinguishable from an
+                //     ordinary deep URL path: `/var/lib/…` and `/repos/o/r/…`
+                //     are the same shape, segment by segment. A *credential* in
+                //     a path is caught, because a credential has a shape of its
+                //     own; a path in a path is not.
+                if !looks_like_path(secret) {
+                    tracing::error!("download failed: https://github.com/o/r/raw/{secret}/f");
+                    tracing::error!("download failed: https://github.com/o/r/raw/{secret}");
+                }
 
                 // 8. Carried on a span rather than on the event.
                 let span = tracing::info_span!("attempt", jit_config = %secret);
@@ -1890,6 +2597,254 @@ mod tests {
     }
 
     #[test]
+    fn a_url_does_not_make_the_rest_of_its_word_unredactable() {
+        // `redact_core` split on the first `://` and handed *everything*
+        // before it to `redact_url` as a scheme and everything after it as a
+        // URL. The terminal arm of `redact_url` echoes both verbatim, so a
+        // single URL anywhere in a word turned the whole of the rest of that
+        // word into text no rule below could reach. The only thing that saved
+        // the shape was a `?` or `#` inside the URL, which made `redact_url`
+        // replace the tail.
+        //
+        // `documentation_url` is in essentially every GitHub REST error body,
+        // so this was any such body logged alongside a credential.
+        let body = format!(
+            "{{\"message\":\"Bad credentials\",\"documentation_url\":\"https://docs.github.com/rest\",\"token\":\"{USER_TOKEN}\"}}"
+        );
+        let redacted = redact(&body);
+        assert!(!redacted.contains(USER_TOKEN), "leaked: {redacted}");
+        // The URL is the diagnosable part and must survive, or nobody keeps
+        // this redaction.
+        assert!(
+            redacted.contains("https://docs.github.com/rest"),
+            "the URL should survive: {redacted}"
+        );
+
+        // The mirror order: everything before the `://` became the "scheme".
+        let reversed = format!(
+            "{{\"token\":\"{USER_TOKEN}\",\"documentation_url\":\"https://docs.github.com/rest\"}}"
+        );
+        let redacted = redact(&reversed);
+        assert!(!redacted.contains(USER_TOKEN), "leaked: {redacted}");
+
+        // A nested object behind a URL was missed even when the URL's own
+        // userinfo was caught, because the miss and the catch happened in the
+        // same call.
+        let clone = format!(
+            "{{\"remote\":\"https://x-access-token:{USER_TOKEN}@github.com/o/r.git\",\"body\":{{\"password\":\"hunter2\"}}}}"
+        );
+        let redacted = redact(&clone);
+        assert!(!redacted.contains(USER_TOKEN), "leaked: {redacted}");
+        assert!(!redacted.contains("hunter2"), "leaked: {redacted}");
+        assert!(
+            redacted.contains("@github.com/o/r.git"),
+            "the remote should stay diagnosable: {redacted}"
+        );
+
+        // A URL still owns its own query string, which is why the URL check
+        // sits ahead of the structural cut: `?` and `#` are not structural
+        // characters, and an OAuth response puts the token after one of them.
+        assert_eq!(
+            redact(&format!(
+                "{{\"url\":\"https://api.github.com/x?token={USER_TOKEN}\"}}"
+            )),
+            format!("{{\"url\":\"https://api.github.com/x?{REDACTION}\"}}")
+        );
+        // And a URL standing on its own is untouched.
+        assert_eq!(
+            redact("GET https://api.github.com/repos/o/r/actions/runners"),
+            "GET https://api.github.com/repos/o/r/actions/runners"
+        );
+
+        // A URL that is a credential key's *own* value keeps its scheme, host
+        // and path like every other URL -- a URL is not a token, and this
+        // module keeps exactly that much of one everywhere else. What must not
+        // happen is the key's empty value being redacted on the way past,
+        // which put the URL out behind a `[redacted]` that had replaced
+        // nothing: `token=[redacted]https://evil.example/x`. Bounding the URL
+        // is what created that shape, and pass one declining an empty value is
+        // what closes it.
+        assert_eq!(
+            redact("token=https://evil.example/x"),
+            "token=https://evil.example/x"
+        );
+        assert_eq!(
+            redact("{\"token\":\"https://evil.example/x\"}"),
+            "{\"token\":\"https://evil.example/x\"}"
+        );
+        // An empty credential value is nothing to redact wherever it sits, and
+        // saying otherwise reports a secret in a place none was.
+        assert_eq!(redact("{\"password\":\"\"}"), "{\"password\":\"\"}");
+    }
+
+    #[test]
+    fn an_array_element_is_judged_without_the_quote_that_wraps_it() {
+        // The structural cut recursed on the *raw* fragment, and the terminal
+        // fallback then called `redact_value` with the wrappers still on. A
+        // fragment carrying no `:` or `=` of its own -- which is exactly what
+        // an array element is -- therefore reached the shape rules as
+        // `"ghu_…`: `starts_with("ghu_")` fails, `is_opaque_char` fails on the
+        // quote, `starts_with("eyJ")` fails, and `looks_like_path` never gets
+        // a clean look at `"C:\Users\…`.
+        //
+        // This is the defect the structural cut was written to close, one step
+        // further down: "only the first key/value pair is ever examined"
+        // became "a value with no key of its own is never examined". It
+        // survived a round because `scan_for_leaks` had no array among its
+        // twelve shapes.
+        for shape in [
+            format!("{{\"tokens\":[\"{USER_TOKEN}\",\"x\"]}}"),
+            format!("{{\"tokens\":[\"x\",\"{USER_TOKEN}\"]}}"),
+            format!("[\"x\",\"{USER_TOKEN}\"]"),
+            format!("[{{\"id\":1}},[\"{USER_TOKEN}\"]]"),
+            // The `Debug`-escaped spelling of the same thing.
+            format!("{{\\\"tokens\\\":[\\\"x\\\",\\\"{USER_TOKEN}\\\"]}}"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN),
+                "leaked from {shape}: {redacted}"
+            );
+            assert!(redacted.contains(REDACTION), "{shape} -> {redacted}");
+        }
+
+        // Every other shape rule was reachable the same way.
+        let jit = format!("{{\"items\":[\"{JIT_BLOB}\"]}}");
+        assert!(!redact(&jit).contains(JIT_BLOB), "{}", redact(&jit));
+        let assertions = format!("{{\"assertions\":[\"{JWT}\"]}}");
+        assert!(
+            !redact(&assertions).contains(JWT),
+            "{}",
+            redact(&assertions)
+        );
+        let opaque = "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxwvut";
+        assert!(opaque.len() > OPAQUE_RUN_THRESHOLD, "{}", opaque.len());
+        let listed = format!("[\"x\",\"{opaque}\"]");
+        assert!(!redact(&listed).contains(opaque), "{}", redact(&listed));
+
+        // A path in an array. `07-security.md` requires paths redacted, and
+        // only `looks_like_path` can see one -- with a clean look at the value
+        // and not before.
+        let roots = format!("{{\"roots\":[\"x\",\"{WINDOWS_WORKSPACE}\"]}}");
+        let redacted = redact(&roots);
+        assert!(!redacted.contains(WINDOWS_WORKSPACE), "leaked: {redacted}");
+        assert!(redacted.contains(PATH_REDACTION), "{redacted}");
+
+        // The array survives being scrubbed: this is a scrubber, not a
+        // deleter.
+        assert_eq!(
+            redact("labels=[\"linux\",\"x64\"]"),
+            "labels=[\"linux\",\"x64\"]"
+        );
+    }
+
+    #[test]
+    fn a_semicolon_cuts_a_word_the_way_a_comma_does() {
+        // `;` was in `WRAPPERS` -- recognised as punctuation -- and not in
+        // `STRUCTURAL`, so it never cut a word. It is the separator for a
+        // Windows connection string, for a credential string, and for cookie
+        // pairs written without a space, which is `d2`'s territory exactly.
+        // `Set-Cookie: theme=dark; session=…` was safe only because of the
+        // space after the `;`.
+        for shape in [
+            "store rejected: Server=host;Database=x;Password=hunter2;",
+            "store rejected: user=operator;password=hunter2",
+            "Server=host;Password=hunter2;Database=x",
+        ] {
+            let redacted = redact(shape);
+            assert!(
+                !redacted.contains("hunter2"),
+                "leaked from {shape}: {redacted}"
+            );
+        }
+
+        let cookies = format!("theme=dark;session={USER_TOKEN}");
+        let redacted = redact(&cookies);
+        assert!(!redacted.contains(USER_TOKEN), "leaked: {redacted}");
+
+        // Separators go back verbatim, so ordinary prose is unaffected.
+        assert_eq!(
+            redact("started; then reconciled; then idled"),
+            "started; then reconciled; then idled"
+        );
+        assert_eq!(
+            redact("desired 3;active 1;headroom 2"),
+            "desired 3;active 1;headroom 2"
+        );
+    }
+
+    #[test]
+    fn an_element_wrapped_value_is_redacted() {
+        // `split_wrappers` strips only the *outermost* `<` and `>`, so
+        // `<string>ghu_…</string>` arrived as `string>ghu_…</string`, which
+        // matches no rule at all. `d3`'s installers handle launchd plists,
+        // which is where this shape comes from; a systemd unit line is the
+        // `key=value` spelling and was already covered.
+        for shape in [
+            format!("<string>{USER_TOKEN}</string>"),
+            format!("<key>token</key><string>{USER_TOKEN}</string>"),
+            format!("<dict><key>Token</key><string>{USER_TOKEN}</string></dict>"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN),
+                "leaked from {shape}: {redacted}"
+            );
+            assert!(redacted.contains(REDACTION), "{shape} -> {redacted}");
+        }
+
+        // The element names survive: they are what says the line was about a
+        // plist at all.
+        let plist = format!("<key>token</key><string>{JIT_BLOB}</string>");
+        let redacted = redact(&plist);
+        assert!(!redacted.contains(JIT_BLOB), "leaked: {redacted}");
+        assert!(redacted.contains("<key>token</key>"), "{redacted}");
+
+        // An angle bracket in ordinary text is re-emitted verbatim.
+        assert_eq!(redact("Custom<Io>"), "Custom<Io>");
+    }
+
+    #[test]
+    fn a_redacted_value_keeps_the_punctuation_that_wrapped_it() {
+        // Pass one returned `format!("{key}{separator}{REDACTION}")` and
+        // dropped the value's trailing wrapper, so a redacted object came out
+        // with an unbalanced quote: `{"password":[redacted]"}`. Pass two
+        // already put `lead` and `trail` back.
+        //
+        // Worth fixing because this module argues, correctly, that the
+        // structure around a redaction is what keeps a line diagnosable -- and
+        // a reader who cannot parse the line cannot tell a redaction from a
+        // truncation.
+        assert_eq!(
+            redact("{\"password\":\"hunter2\"}"),
+            format!("{{\"password\":\"{REDACTION}\"}}")
+        );
+        assert_eq!(
+            redact(&format!("{{\"access_token\":\"{USER_TOKEN}\"}}")),
+            format!("{{\"access_token\":\"{REDACTION}\"}}")
+        );
+        assert_eq!(
+            redact(&format!(
+                "[{{\"id\":1}},{{\"access_token\":\"{USER_TOKEN}\"}}]"
+            )),
+            format!("[{{\"id\":1}},{{\"access_token\":\"{REDACTION}\"}}]")
+        );
+        // The `Debug`-escaped spelling keeps its escaped quotes.
+        assert_eq!(
+            redact("{\\\"password\\\":\\\"hunter2\\\"}"),
+            format!("{{\\\"password\\\":\\\"{REDACTION}\\\"}}")
+        );
+
+        // The point of all of it: what the sink writes is still the JSON it
+        // was handed, minus the secret.
+        let line = redact(&format!(
+            "{{\"runner_id\":42,\"access_token\":\"{USER_TOKEN}\"}}"
+        ));
+        serde_json::from_str::<Value>(&line)
+            .unwrap_or_else(|error| panic!("a redacted body must still parse: {line} ({error})"));
+    }
+
+    #[test]
     fn a_bare_jwt_is_redacted_despite_its_dots() {
         // `is_opaque_char` excludes `.`, so a JWT is three opaque runs rather
         // than one, each under the threshold, and a 100-character credential
@@ -1944,23 +2899,155 @@ mod tests {
                 body: "{\"password\":\"hunter2\"}".to_string(),
             };
             tracing::error!(reason = ?failure, "store rejected the request");
+
+            // A `;` or an `&` after a URL in the same word. The URL branch runs
+            // ahead of the structural cut and `split_url` did not stop at
+            // either character, so the separator that would have cut the word
+            // was swallowed into the URL and echoed.
+            tracing::error!("store rejected: Server=https://vault.local/api;Password=hunter2;");
+            tracing::error!("keychain error: url=https://kc.local;password=hunter2");
+            tracing::error!("unit rejected: Environment=API=https://a.com/v1;PASSWORD=hunter2");
+            tracing::error!("token exchange failed: cb=https://a.com/x&password=hunter2");
+
+            // A credential key whose value is in a *later* fragment. The
+            // empty-value skip is right; the claim that the structural cut
+            // reaches such a value was not, because nothing carried the key
+            // across the cut.
+            tracing::error!("store rejected: {{\"password\":[\"hunter2\"]}}");
+            tracing::error!("store rejected: {{\"password\":{{\"v\":\"hunter2\"}}}}");
+            tracing::error!("store rejected: Password=;hunter2");
+            tracing::error!("plist rejected: <key>password</key><string>hunter2</string>");
+            tracing::error!(
+                "plist rejected: <dict><key>password</key><string>hunter2</string></dict>"
+            );
+
+            // A structural character inside the value. `,` and `&` could
+            // already split a secret; this commit added `;`, `<` and `>`.
+            //
+            // The pieces are spelled so that none of them is a substring of
+            // anything the line legitimately keeps -- `ss` would have "found" a
+            // leak in the surviving key `password`, which is a check that fails
+            // for the wrong reason and is no better than one that cannot fail.
+            tracing::error!("store rejected: {{\"password\":\"qq<vv>xx\"}}");
+            tracing::error!("store rejected: {{\"password\":\"j1&k2,m3\"}}");
+            tracing::error!("store rejected: {{\"password\":\"n4;p5<q6>r7,t8\"}}");
         });
 
         assert!(
             !output.contains("hunter2"),
             "a short credential leaked through the sink:\n{output}"
         );
+        // The punctuated passwords: every piece a structural character can cut
+        // one into has to go, not just the piece that kept the key company.
+        for piece in [
+            "qq", "vv", "xx", "j1", "k2", "m3", "n4", "p5", "q6", "r7", "t8",
+        ] {
+            assert!(
+                !output.contains(piece),
+                "a structural character split a secret and the tail survived \
+                 ({piece}):\n{output}"
+            );
+        }
         assert!(output.contains(REDACTION), "{output}");
-        // Four lines, or the sink was never reached and "no secret found" is
+        // Sixteen lines, or the sink was never reached and "no secret found" is
         // true of an empty string.
         assert_eq!(
             output
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .count(),
-            4,
+            16,
             "{output}"
         );
+    }
+
+    /// The multi-word plist spelling, which is worse than the one-word one:
+    /// the credential key and the value are in the same word, but the value
+    /// itself is two words, so closing it needs the fragment carry to reach the
+    /// word-level follow-on rule.
+    #[test]
+    fn a_credential_value_that_runs_past_its_own_word_is_still_redacted() {
+        let capture = Capture::default();
+        let output = emit(&capture, || {
+            tracing::error!("plist rejected: <key>password</key><string>correct horse</string>");
+            tracing::error!("plist rejected: <key>password</key> <string>correct horse</string>");
+        });
+        for piece in ["correct", "horse"] {
+            assert!(
+                !output.contains(piece),
+                "a multi-word credential value leaked ({piece}):\n{output}"
+            );
+        }
+    }
+
+    /// The other half of the fragment carry: it must not swallow the ordinary,
+    /// *closed* pairs sitting next to a credential.
+    ///
+    /// Every shape here is one the carry has an opportunity to over-redact —
+    /// a closed empty value, a neighbouring key, the pairs of a connection
+    /// string, and the element names of a plist. Redaction that eats the
+    /// diagnostics is redaction nobody keeps, and a carry with no terminator
+    /// is exactly how that happens.
+    #[test]
+    fn the_fragment_carry_stops_where_the_value_does() {
+        for (input, expected) in [
+            (
+                "{\"password\":\"abc\",\"user\":\"bob\"}",
+                format!("{{\"password\":\"{REDACTION}\",\"user\":\"bob\"}}"),
+            ),
+            (
+                "Server=host;Password=hunter2;User=bob",
+                format!("Server=host;Password={REDACTION};User=bob"),
+            ),
+            (
+                "{\"password\":\"\",\"user\":\"bob\"}",
+                "{\"password\":\"\",\"user\":\"bob\"}".to_string(),
+            ),
+            (
+                "<dict><key>password</key><string>hunter2</string></dict>",
+                format!("<dict><key>password</key><string>{REDACTION}</string></dict>"),
+            ),
+            (
+                "{\"password\":\"qq<vv>xx\"}",
+                format!("{{\"password\":\"{REDACTION}<{REDACTION}>{REDACTION}\"}}"),
+            ),
+        ] {
+            assert_eq!(redact(input), expected, "from {input}");
+        }
+
+        // A closed value ends the claim, so the word after it is ordinary text.
+        assert_eq!(
+            redact("{\"password\":\"x\"} ok"),
+            format!("{{\"password\":\"{REDACTION}\"}} ok")
+        );
+        assert_eq!(
+            redact("Server=host;Password=hunter2; ok"),
+            format!("Server=host;Password={REDACTION}; ok")
+        );
+
+        // `{"password":""} ok` is *not* on that list, and the reason is worth
+        // recording rather than asserting away. `split_wrappers` strips the
+        // empty value with the rest of the trailing punctuation, so the word
+        // reaches `redact_word` as the core `password":` — a bare credential
+        // key, which the stem rule has always read as "the value is the next
+        // word". That rule predates the carry, is untouched by it, and fires
+        // first; the empty-value skip below it never gets a look. So the `ok`
+        // is redacted, exactly as it was before any of this.
+        assert_eq!(
+            redact("{\"password\":\"\"} ok"),
+            format!("{{\"password\":\"\"}} {REDACTION}")
+        );
+        // What the empty-value skip does still guarantee is the thing it was
+        // written for: no `[redacted]` is invented *inside* the pair itself.
+        assert_eq!(redact("{\"password\":\"\"}"), "{\"password\":\"\"}");
+
+        // Ordinary prose is untouched: the carry is only ever armed by a
+        // credential key.
+        assert_eq!(
+            redact("started; then reconciled; then idled"),
+            "started; then reconciled; then idled"
+        );
+        assert_eq!(redact("Custom<Io>"), "Custom<Io>");
     }
 
     #[test]
@@ -2001,6 +3088,157 @@ mod tests {
         );
     }
 
+    /// `;` and `&` end a URL, but only ahead of its query string.
+    ///
+    /// `STRUCTURAL` has nine characters and `is_url_terminator` recognised
+    /// seven of them. Because the URL branch runs *ahead* of the structural
+    /// cut, a URL earlier in a word made `split_url` swallow everything to the
+    /// next terminator — including the `;` or `&` that would have cut the word
+    /// — and `redact_url`'s terminal arm echoes what it is given. So the L3 fix
+    /// (bounding a URL) and the L1 fix (cutting on `;` and `&`) did not
+    /// compose, and this commit added `;` to `STRUCTURAL` for connection
+    /// strings while leaving the path a URL opens straight through it.
+    #[test]
+    fn a_separator_after_a_url_still_cuts_the_word() {
+        for shape in [
+            format!("store rejected: Server=https://vault.local/api;Password={USER_TOKEN};"),
+            format!("keychain error: url=https://kc.local;secret={USER_TOKEN}"),
+            format!("unit rejected: Environment=API=https://a.com/v1;TOKEN={USER_TOKEN}"),
+            format!("token exchange failed: cb=https://a.com/x&access_token={USER_TOKEN}"),
+            format!("dsn rejected: dsn=https://sentry.local/1;password={USER_TOKEN};user=x"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN),
+                "leaked from {shape}:\n{redacted}"
+            );
+        }
+
+        // The URL itself still survives, or nobody keeps this redaction.
+        assert_eq!(
+            redact("store rejected: Server=https://vault.local/api;Password=hunter2;"),
+            format!("store rejected: Server=https://vault.local/api;Password={REDACTION};")
+        );
+
+        // The obvious fix is the wrong one, and this is what it costs. Making
+        // `;` and `&` terminators everywhere ends a URL *inside* its own query
+        // string, and `redact_url` replaces a query wholesale precisely because
+        // a token can be in any parameter and this module does not guess which:
+        // `?[redacted]` would become `?[redacted]&state=hunter2`. So the cut is
+        // restricted to the part of the URL ahead of the first `?` or `#`.
+        assert_eq!(
+            redact("https://a.com/cb?code=1&state=hunter2"),
+            format!("https://a.com/cb?{REDACTION}")
+        );
+        assert_eq!(
+            redact("https://a.com/cb#code=1&state=hunter2"),
+            format!("https://a.com/cb#{REDACTION}")
+        );
+        assert_eq!(
+            redact(&format!(
+                "https://a.com/cb?a=1;b=2&access_token={USER_TOKEN}"
+            )),
+            format!("https://a.com/cb?{REDACTION}")
+        );
+
+        // And leaving `\` out of the terminators is still right: a Windows
+        // path used as a URL password puts the `@` that identifies the
+        // userinfo behind the first backslash, and `redact_url` echoes what it
+        // is given.
+        assert_eq!(
+            redact(r"https://x-access-token:C:\Users\op\p@github.com/o/r.git"),
+            format!("https://{REDACTION}@github.com/o/r.git")
+        );
+    }
+
+    /// A secret in a URL *path* is echoed verbatim.
+    ///
+    /// `redact_url` applied no shape rule to the path at all. The design
+    /// intends a path to be diagnosable — and it still is — but the
+    /// token-prefix rule is documented as a belt that catches a credential
+    /// *anywhere*, and a path was the one place it never ran.
+    #[test]
+    fn a_secret_in_a_url_path_is_redacted_and_the_rest_of_the_path_is_not() {
+        for shape in [
+            format!("https://github.com/o/r/raw/{USER_TOKEN}/f"),
+            format!("https://api.github.com/{JIT_BLOB}"),
+            format!("https://a.com/x/{JWT}?page=2"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN)
+                    && !redacted.contains(JIT_BLOB)
+                    && !redacted.contains(JWT),
+                "leaked from {shape}:\n{redacted}"
+            );
+        }
+
+        assert_eq!(
+            redact(&format!("https://github.com/o/r/raw/{USER_TOKEN}/f")),
+            format!("https://github.com/o/r/raw/{REDACTION}/f")
+        );
+
+        // The rest of the path is exactly as diagnosable as it was: a segment
+        // is judged on its own, and an ordinary one is not a secret.
+        for url in [
+            "https://api.github.com/repos/owner/repo/actions/runners",
+            "https://github.com/actions/runner/releases/download/v2.330.0/actions-runner-linux-x64-2.330.0.tar.gz",
+            "https://github.com/o/r.git",
+            "https://github.com/@owner/repo",
+            "https://api.github.com/repos/o/r/actions/runners/42",
+        ] {
+            assert_eq!(redact(url), url, "over-redacted a diagnosable path: {url}");
+        }
+    }
+
+    /// A large message must not take the process down.
+    ///
+    /// The URL branch recursed into `redact_core` on both sides of the cut. The
+    /// termination argument was sound — every call is on a strictly shorter
+    /// slice — and it was silent on *depth*, which was linear in the length of
+    /// the input. A message of ~2000 URL-carrying items, about 86 KB, exited
+    /// `0xc00000fd STATUS_STACK_OVERFLOW`.
+    ///
+    /// **A stack overflow is not catchable — it aborts the process.** A large
+    /// HTTP error body is attacker-influenceable content, so this was a way to
+    /// kill the agent from inside its own log sink, which is worse than any
+    /// leak: a sink that is not running redacts nothing.
+    ///
+    /// Note what this test can and cannot do. An overflow aborts the test
+    /// binary rather than failing an assertion, so the value of this test is
+    /// that **the suite completes at all**; the assertions below only confirm
+    /// it did the work rather than skipping it.
+    #[test]
+    fn a_large_message_does_not_overflow_the_stack() {
+        // 20000 items is ~860 KB and an order of magnitude past the ~2000 that
+        // was measured to abort. It is also what the commit *before* the URL
+        // branch survived, because that branch returned without recursing --
+        // so this is a regression guard with the margin the regression had.
+        const ITEMS: usize = 20_000;
+        let body = r#"{"url":"https://api.github.com/repos/o/r"},"#.repeat(ITEMS);
+        assert!(body.len() > 800_000, "the premise is a large body");
+
+        let redacted = redact(&body);
+        assert!(
+            redacted.contains("https://api.github.com/repos/o/r"),
+            "the URLs are the diagnosable part and must survive"
+        );
+
+        // The same depth, reached through the structural cut and through a
+        // credential value rather than through a bare URL.
+        let nested = format!("{{\"error\":{{\"body\":{{\"list\":[{}]}}}}}}", body);
+        assert!(!redact(&nested).is_empty());
+
+        // A long run with no URL in it at all, so the structural loop is
+        // exercised on its own.
+        let flat = "{\"a\":1},".repeat(ITEMS);
+        assert!(!redact(&flat).is_empty());
+
+        // And one long unbroken URL, where the *path* loop is what iterates.
+        let long_path = format!("https://a.com/{}", "seg/".repeat(ITEMS));
+        assert!(!redact(&long_path).is_empty());
+    }
+
     #[test]
     fn a_credential_header_loses_its_scheme_and_its_value() {
         assert_eq!(
@@ -2035,9 +3273,19 @@ mod tests {
             redact(&format!("X-Hub-Signature-256: sha256={hmac}")),
             format!("X-Hub-Signature-256: {REDACTION}")
         );
+        // Pass one puts the value's wrapping quote back, so what comes out is
+        // still the object that went in. It used to emit
+        // `{"x-hub-signature-256":[redacted]"}` -- an unbalanced quote in a
+        // line this module argues has to stay diagnosable.
+        //
+        // This case is also `redact_core`'s two-pass witness, and the comment
+        // there names it: the `=` comes first and names nothing, but what
+        // follows it is a whole HMAC -- non-empty -- so a merged pass inspects
+        // that value and returns before ever reaching the `:` that names
+        // `x-hub-signature-256`.
         assert_eq!(
             redact(&format!("{{\"x-hub-signature-256\":\"sha256={hmac}\"}}")),
-            format!("{{\"x-hub-signature-256\":{REDACTION}\"}}")
+            format!("{{\"x-hub-signature-256\":\"{REDACTION}\"}}")
         );
         // The SHA-1 spelling GitHub still sends alongside it.
         assert_eq!(
