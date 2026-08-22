@@ -563,13 +563,8 @@ fn reason_phrase(status: u16) -> &'static str {
 ///
 /// Two suites walk the data directory looking for a planted secret, and they
 /// had a copy of this each -- under two names, with two spellings of the
-/// substring check, over the same directory for the same needle. One of them
-/// hand-rolled a byte-window scan while the other went through
-/// `String::from_utf8_lossy`, which are not quite the same test: the byte-window
-/// version finds a needle inside a file that is not valid UTF-8, and the lossy
-/// one can miss it. Both live here now, and [`file_contains`] is the byte-window
-/// one, because a secret store's blob is exactly the non-UTF-8 file where the
-/// difference matters.
+/// substring check, over the same directory for the same needle. Both live here
+/// now.
 #[must_use]
 pub fn files_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -592,9 +587,30 @@ pub fn files_under(root: &Path) -> Vec<PathBuf> {
 
 /// Whether a file's bytes contain `needle`, unreadable files counting as no.
 ///
-/// A byte-window search rather than a `String` one: a DPAPI blob and a keychain
-/// database are not valid UTF-8, and a lossy conversion of one can replace the
-/// very bytes being searched for.
+/// # The two spellings are equivalent here, and this one is the direct one
+///
+/// This started life as a byte-window scan in one suite and a
+/// `String::from_utf8_lossy(..).contains(..)` in the other, and the reason
+/// first recorded for keeping the byte window was **wrong**: it claimed a lossy
+/// conversion could eat the needle out of a DPAPI blob or a keychain database.
+/// It cannot. UTF-8 is self-synchronising and no ASCII byte is ever a
+/// continuation byte, so `from_utf8_lossy` never consumes an ASCII byte into a
+/// replacement character -- and every needle these suites look for is ASCII.
+/// Both spellings find an ASCII needle wrapped in arbitrary invalid UTF-8.
+///
+/// So the choice is not correctness, and saying it was would mislead whoever
+/// reads this next -- the same failure mode as a comment that overstates its
+/// test. The byte window is kept because it is the more direct of the two: it
+/// allocates nothing, and it assumes nothing about the needle's encoding, which
+/// leaves it right for a future needle that is not ASCII, where the equivalence
+/// above stops holding.
+///
+/// `no_secret_reaches_command_output.rs` still builds its corpus through
+/// `from_utf8_lossy`, deliberately: its fragments are text -- command stdout and
+/// stderr arrive as `String` already -- and it scans them all together rather
+/// than file by file. Converting that to bytes would buy nothing while the
+/// needles are ASCII, and the note above is what a future non-ASCII needle
+/// should send somebody back to.
 #[must_use]
 pub fn file_contains(path: &Path, needle: &str) -> bool {
     let Ok(haystack) = std::fs::read(path) else {

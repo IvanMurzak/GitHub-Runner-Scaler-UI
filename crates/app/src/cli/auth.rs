@@ -51,7 +51,7 @@ use runner_manager_github::{
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 
-use super::{AuthCommand, CliError, Context, Failure, write_failed};
+use super::{AuthCommand, CliError, Context, Failure, NO_OPERATOR_REMEDY, write_failed};
 
 // ---------------------------------------------------------------------------
 // The disclosure
@@ -280,19 +280,21 @@ pub fn dispatch(
 /// # Errors
 /// Every class in [`Failure`] that authentication can reach.
 pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this sign-in");
+
     // ---- the disclosure, before any request is issued --------------------
     //
     // This ordering is the D21 obligation, and the flush is part of it: a login
     // that then fails to reach GitHub must still have disclosed, and buffered
     // output that dies with the process has disclosed nothing.
-    write_disclosure(out).map_err(write_failed("this sign-in"))?;
-    out.flush().map_err(write_failed("this sign-in"))?;
+    write_disclosure(out).map_err(failed)?;
+    out.flush().map_err(failed)?;
 
     let app = context.app_registration()?;
     let flow = DeviceFlow::new(app.clone(), context.endpoints().clone())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_action_one(out).map_err(write_failed("this sign-in"))?;
+    write_action_one(out).map_err(failed)?;
 
     let runtime = super::runtime()?;
     let store = context.store()?;
@@ -303,8 +305,8 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(flow.start())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_login_prompt(out, &flow, &authorization).map_err(write_failed("this sign-in"))?;
-    out.flush().map_err(write_failed("this sign-in"))?;
+    write_login_prompt(out, &flow, &authorization).map_err(failed)?;
+    out.flush().map_err(failed)?;
 
     let token = runtime
         .block_on(flow.complete(&authorization, &TokioSleeper))
@@ -321,7 +323,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         "\nSigned in. The token is in the {} and nowhere else.",
         secrets.location()
     )
-    .map_err(write_failed("this sign-in"))?;
+    .map_err(failed)?;
 
     // ---- what the credential reaches, and the third action if any --------
     let client = AuthenticatedClient::new(context.endpoints().clone(), token, context.clock())
@@ -331,7 +333,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(client.discover_installations(&app))
         .map_err(|source| github_failure(&source))?;
 
-    write_discovery(out, &discovery, true).map_err(write_failed("this sign-in"))?;
+    write_discovery(out, &discovery, true).map_err(failed)?;
     Ok(())
 }
 
@@ -479,14 +481,15 @@ pub fn credential_state(
 /// The state's own [`CredentialState::failure`], plus store and registration
 /// failures.
 pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this credential's status");
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
     let secrets = context.secret_store(start_mode)?;
     let state = credential_state(context, &secrets)?;
 
-    writeln!(out, "Credential: {}", state.as_str()).map_err(write_failed("this sign-in"))?;
-    writeln!(out, "Store:      {}", secrets.location()).map_err(write_failed("this sign-in"))?;
-    write_state_explanation(out, &state).map_err(write_failed("this sign-in"))?;
+    writeln!(out, "Credential: {}", state.as_str()).map_err(failed)?;
+    writeln!(out, "Store:      {}", secrets.location()).map_err(failed)?;
+    write_state_explanation(out, &state).map_err(failed)?;
 
     match state.failure() {
         None => Ok(()),
@@ -722,6 +725,7 @@ pub fn write_revocation_notice(out: &mut dyn Write) -> io::Result<()> {
 /// [`Failure::SecretStore`] when a value is there and cannot be removed —
 /// which the same procedure needs to hear about, loudly.
 pub fn logout(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this sign-out");
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
     let secrets = context.secret_store(start_mode)?;
@@ -742,26 +746,15 @@ pub fn logout(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
             secrets.location()
         ),
     }
-    .map_err(write_failed("this sign-in"))?;
+    .map_err(failed)?;
 
-    write_revocation_notice(out).map_err(write_failed("this sign-in"))?;
+    write_revocation_notice(out).map_err(failed)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Failure mapping
 // ---------------------------------------------------------------------------
-
-/// The phrase a failure uses when nothing the operator can type will help.
-///
-/// Stated as a constant because it is load-bearing rather than decorative:
-/// `every_device_flow_failure_says_what_to_do_next` treats "carries a remedy"
-/// and "says plainly that no remedy exists" as the two allowed answers, and
-/// checks them as an exact bi-implication. Without a phrase to match, that test
-/// degenerates into accepting any message at all — which it did, by matching
-/// the substring `"Nothing was stored."` that several arms emit *alongside* a
-/// remedy.
-pub const NO_OPERATOR_REMEDY: &str = "there is no command here that fixes this";
 
 /// Turns `c2`'s error matrix into exit codes and one-screenful advice.
 ///
@@ -852,10 +845,23 @@ fn github_failure(source: &GithubError) -> CliError {
             source.to_string(),
             "runner-manager auth status",
         ),
-        GithubError::Decode { .. } | GithubError::Malformed { .. } => {
-            CliError::new(Failure::UnusableResponse, source.to_string())
-        }
-        GithubError::Config(_) => CliError::new(Failure::AppNotPublished, source.to_string()),
+        // Same judgement as the device flow's matching arm: a response that
+        // did not decode says nothing about the credential, so asking again is
+        // a reasonable thing to try. `auth status` rather than `auth login`,
+        // because the sibling `Forbidden`/`Status` arms above send the operator
+        // there and a decode failure is no more a credential problem than they
+        // are.
+        GithubError::Decode { .. } | GithubError::Malformed { .. } => CliError::with_remedy(
+            Failure::UnusableResponse,
+            source.to_string(),
+            "runner-manager auth status",
+        ),
+        // A property of the build, not of this host. No operator command
+        // changes it, and offering one would send somebody round a loop.
+        GithubError::Config(_) => CliError::new(
+            Failure::AppNotPublished,
+            format!("{source}. That is a property of this build, so {NO_OPERATOR_REMEDY}."),
+        ),
     }
 }
 
@@ -1365,8 +1371,45 @@ mod tests {
         );
     }
 
-    /// Every authentication failure this file can produce names a remedy, or
-    /// states that no operator command is one.
+    /// The rule every failure mapper in this crate obeys: name the command that
+    /// fixes it, or say plainly that none does — and never both, and never
+    /// neither.
+    ///
+    /// Checked as an exact bi-implication against [`NO_OPERATOR_REMEDY`]. An
+    /// earlier version was a disjunction that accepted the substring
+    /// `"Nothing was stored."` as evidence that no remedy exists, which several
+    /// arms emit *alongside* a remedy — so it was satisfiable by copy saying
+    /// nothing about what to do next, which is the property it claims to
+    /// enforce.
+    fn assert_says_what_to_do_next(error: &CliError, what: &str) {
+        assert_eq!(
+            error.remedy().is_some(),
+            !error.message().contains(NO_OPERATOR_REMEDY),
+            "{what}: `{}` must either name the command that fixes it or say plainly, in \
+             the words of NO_OPERATOR_REMEDY, that none does -- and never both. remedy: \
+             {:?}",
+            error.message(),
+            error.remedy()
+        );
+        assert!(
+            !error.message().is_empty() && error.message().len() < 500,
+            "{what}: one screenful, not a stack trace: {}",
+            error.message()
+        );
+    }
+
+    /// Both halves of the rule have to be exercised by the cases below, or one
+    /// of them is asserted by nothing at all.
+    fn assert_both_halves_were_seen(errors: &[CliError], what: &str) {
+        let with_remedy = errors.iter().filter(|e| e.remedy().is_some()).count();
+        let without = errors.len() - with_remedy;
+        assert!(
+            with_remedy > 0 && without > 0,
+            "{what}: both halves of the rule must be exercised: {with_remedy} with a \
+             remedy, {without} without"
+        );
+    }
+
     #[test]
     fn every_device_flow_failure_says_what_to_do_next() {
         let cases = [
@@ -1391,39 +1434,95 @@ mod tests {
                 value: "::".to_string(),
             },
         ];
-        let mut with_remedy = 0;
-        let mut without = 0;
-        for case in cases {
-            let error = device_flow_failure(&case);
-            // An exact bi-implication, not a disjunction. The previous version
-            // accepted the substring "Nothing was stored." as evidence that no
-            // remedy exists -- and several arms emit that *alongside* a remedy,
-            // so the check was satisfiable by copy saying nothing about what to
-            // do next, which is the property it claims to enforce.
-            assert_eq!(
-                error.remedy().is_some(),
-                !error.message().contains(NO_OPERATOR_REMEDY),
-                "`{}` must either name the command that fixes it or say plainly, in the \
-                 words of NO_OPERATOR_REMEDY, that none does -- and never both. remedy: \
-                 {:?}",
-                error.message(),
-                error.remedy()
-            );
-            if error.remedy().is_some() {
-                with_remedy += 1;
-            } else {
-                without += 1;
-            }
-            assert!(
-                !error.message().is_empty() && error.message().len() < 500,
-                "one screenful, not a stack trace: {}",
-                error.message()
-            );
+        let errors: Vec<CliError> = cases.iter().map(device_flow_failure).collect();
+        for error in &errors {
+            assert_says_what_to_do_next(error, "device_flow_failure");
         }
+        assert_both_halves_were_seen(&errors, "device_flow_failure");
+    }
+
+    /// The sibling mapper, which had no test at all.
+    ///
+    /// `device_flow_failure` was tightened and `github_failure` — one function
+    /// below it, reached by `auth status` on every run — was left with two arms
+    /// carrying neither a remedy nor the phrase. Fixing the assertion in one
+    /// mapper and not looking at the other is how that survived, so this exists
+    /// as much to keep the pair together as to check today's arms.
+    ///
+    /// `GithubError::Transport` is absent because it cannot be constructed
+    /// here: it wraps a `reqwest::Error`, `reqwest` is not a dependency of this
+    /// crate, and the type has no public constructor. Its remedy is covered
+    /// end to end instead, by
+    /// `auth_states.rs::an_unreachable_github_is_not_reported_as_a_bad_credential`,
+    /// which drives the real binary at a dead port and asserts on what it
+    /// prints.
+    #[test]
+    fn every_github_failure_says_what_to_do_next() {
+        use runner_manager_github::{ConfigError, HeaderMap};
+
+        let decode_error =
+            serde_json::from_str::<u32>("not a number").expect_err("a deliberate decode failure");
+        let cases = [
+            GithubError::AuthenticationFailed,
+            GithubError::AuthenticationLockout {
+                retry_after: Duration::from_secs(60),
+            },
+            GithubError::Forbidden {
+                method: "GET".to_string(),
+                path: "/user/installations".to_string(),
+                message: Some("Resource not accessible by integration".to_string()),
+                headers: Box::new(HeaderMap::new()),
+            },
+            GithubError::Status {
+                status: 500,
+                method: "GET".to_string(),
+                path: "/user/installations".to_string(),
+                message: None,
+                headers: Box::new(HeaderMap::new()),
+            },
+            GithubError::Decode {
+                what: "an installations",
+                expected: "a page",
+                source: decode_error,
+            },
+            GithubError::Malformed {
+                what: "a repository full_name",
+                value: "not/a/slug".to_string(),
+            },
+            GithubError::Config(ConfigError::Empty { what: "client_id" }),
+        ];
+        let errors: Vec<CliError> = cases.iter().map(github_failure).collect();
+        for error in &errors {
+            assert_says_what_to_do_next(error, "github_failure");
+        }
+        assert_both_halves_were_seen(&errors, "github_failure");
+    }
+
+    /// The third mapper that owes the same guarantee, and the reason
+    /// [`NO_OPERATOR_REMEDY`] lives in `mod.rs` rather than here.
+    ///
+    /// A build with no published App registration is a build problem: Phase 0
+    /// of the rollout has not happened, and no command the operator types
+    /// changes that.
+    #[test]
+    fn a_missing_app_registration_says_that_no_command_fixes_it() {
+        let temporary = tempfile::tempdir().expect("a temporary directory");
+        let mut discarded = Vec::new();
+        let context = Context::resolve(Some(temporary.path()), &mut discarded)
+            .expect("a context rooted at a temporary directory");
+
+        // Only meaningful while this build carries no registration, which is
+        // the state `no_plausible_client_id_is_compiled_in` pins. An override
+        // in the environment would make the call succeed and this test vacuous,
+        // so the `Err` is required rather than assumed.
+        let error = context
+            .app_registration()
+            .expect_err("this build carries no published App registration");
+        assert_eq!(error.class(), Failure::AppNotPublished);
+        assert_says_what_to_do_next(&error, "Context::app_registration");
         assert!(
-            with_remedy > 0 && without > 0,
-            "both halves of the rule must be exercised, or one of them is asserted by \
-             nothing: {with_remedy} with a remedy, {without} without"
+            error.remedy().is_none(),
+            "there is no operator command that publishes a GitHub App: {error}"
         );
     }
 

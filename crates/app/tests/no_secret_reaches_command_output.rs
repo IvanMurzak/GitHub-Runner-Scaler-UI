@@ -204,6 +204,15 @@ fn corpus_from_the_full_command_set(verbose: bool) -> (tempfile::TempDir, Vec<Fr
     record("auth logout".to_string(), &["auth", "logout"]);
 
     // Everything the commands left on disk, except the store itself.
+    //
+    // Read through `from_utf8_lossy` rather than as bytes, and deliberately so:
+    // a fragment here is *text*, because stdout and stderr arrive as `String`
+    // already and the scan runs over all of them together. That is safe while
+    // every needle is ASCII — UTF-8 is self-synchronising and no ASCII byte is
+    // ever a continuation byte, so a lossy conversion never consumes one into a
+    // replacement character. `support::file_contains` is the byte-exact
+    // spelling, and its documentation is where a future non-ASCII needle should
+    // send somebody.
     for path in files_under(data_dir.path()) {
         if is_the_secret_store(&path) {
             continue;

@@ -349,6 +349,23 @@ impl fmt::Display for CliError {
     }
 }
 
+/// The phrase a failure uses when nothing the operator can type will help.
+///
+/// Stated as a constant because it is load-bearing rather than decorative.
+/// `every_failure_says_what_to_do_next` treats "carries a remedy" and "says
+/// plainly that no remedy exists" as the two allowed answers and checks them as
+/// an exact bi-implication, so a phrase is what makes the second answer
+/// recognisable. Without one that test degenerated into accepting any message
+/// at all — it matched the substring `"Nothing was stored."`, which several
+/// arms emit *alongside* a remedy.
+///
+/// It lives here rather than in [`auth`] because three different mappers owe
+/// the same guarantee: `auth`'s two error mappers and
+/// [`Context::app_registration`]. The first version of this constant was
+/// `auth`-local, and the mapper one function away from it was left carrying
+/// neither a remedy nor the phrase.
+pub const NO_OPERATOR_REMEDY: &str = "there is no command here that fixes this";
+
 /// The failure every command reaches when its output sink gives way.
 ///
 /// One definition rather than one per command file. `auth`, `host` and `status`
@@ -360,7 +377,18 @@ impl fmt::Display for CliError {
 /// terminal" is the same sentence whether a status document or a permission
 /// disclosure was cut short, and the two are worth telling apart in a bug
 /// report.
-pub fn write_failed(what: &str) -> impl FnOnce(io::Error) -> CliError + '_ {
+///
+/// # Bind it once per command, do not spell it at each call site
+///
+/// The return type is `Fn + Copy` rather than `FnOnce` for one reason: so a
+/// command can write `let failed = write_failed("this sign-out");` at the top
+/// and pass `failed` to every `map_err` below it. Repeating the string at each
+/// call site is how `auth status` and `auth logout` ended up reporting *"cannot
+/// write this sign-in"* — a bulk edit gave one string to a file that holds
+/// three commands, and nothing in the shape of the code objected. One binding
+/// per command makes that particular mistake unwritable, and puts the string
+/// next to the function whose name has to agree with it.
+pub fn write_failed(what: &str) -> impl Fn(io::Error) -> CliError + Copy + '_ {
     move |source| {
         CliError::new(
             Failure::Unclassified,
@@ -705,9 +733,11 @@ impl Context {
         AppRegistration::new(client_id, slug).map_err(|_| {
             CliError::new(
                 Failure::AppNotPublished,
-                "this build carries no published GitHub App registration, so there is nothing \
-                 to sign in to. Registering and publishing the App is Phase 0 of the rollout \
-                 and has not happened yet.",
+                format!(
+                    "this build carries no published GitHub App registration, so there is \
+                     nothing to sign in to. Registering and publishing the App is Phase 0 of \
+                     the rollout and has not happened yet, so {NO_OPERATOR_REMEDY}."
+                ),
             )
         })
     }
@@ -1024,7 +1054,8 @@ mod tests {
             assert_ne!(
                 class.code(),
                 2,
-                "{class} would be indistinguishable from clap's usage error, which exits 2                  before any of this code runs"
+                "{class} would be indistinguishable from clap's usage error, which exits 2 \
+                 before any of this code runs"
             );
             if let Some(previous) = seen.insert(class.code(), class) {
                 panic!("{previous} and {class} both exit {}", class.code());
@@ -1058,7 +1089,8 @@ mod tests {
     fn every_class_is_reachable_from_all_and_names_itself_uniquely() {
         assert!(
             Failure::ALL.len() >= 19,
-            "the taxonomy has only ever grown; a shorter `ALL` means classes were              removed without the scripting contract being revisited"
+            "the taxonomy has only ever grown; a shorter `ALL` means classes were \
+             removed without the scripting contract being revisited"
         );
 
         let mut names = std::collections::BTreeMap::new();
@@ -1075,11 +1107,93 @@ mod tests {
             }
         }
         assert_eq!(names.len(), Failure::ALL.len());
+    }
 
-        // Every code in `ALL` round-trips through `Display`, so a class cannot
-        // be in the list under a name nothing else uses.
-        for class in Failure::ALL.iter().copied() {
-            assert_eq!(class.to_string(), class.as_str());
+    /// A sink that fails on the first byte, so every command's write path can
+    /// be driven to its error branch.
+    #[derive(Debug)]
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "the pipe closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "the pipe closed"))
+        }
+    }
+
+    /// Every command reports the operation **it** was performing when its
+    /// output sink gave way.
+    ///
+    /// This is the assertion that was missing. `write_failed` takes the noun as
+    /// a parameter, and a bulk edit handed one noun to a file holding three
+    /// commands: `auth status` and `auth logout` both reported *"cannot write
+    /// this sign-in"*. Nothing objected, because a wrong string is still a
+    /// string — and error copy that names the wrong operation is the same class
+    /// of defect as error copy that names the wrong remedy, which this task's
+    /// Definition of Done rules out explicitly.
+    ///
+    /// The table is checked in both directions: each command's message must
+    /// carry its own noun **and** none of the others'. A one-directional check
+    /// would have passed the very bug it is here to catch, because "this
+    /// sign-in" really was present in the logout message.
+    #[test]
+    fn every_command_names_the_operation_whose_output_failed() {
+        let temporary = tempfile::tempdir().expect("a temporary directory");
+        let mut discarded = Vec::new();
+        let context = Context::resolve(Some(temporary.path()), &mut discarded)
+            .expect("a context rooted at a temporary directory");
+
+        // (what the command is, the noun it must use)
+        let expected: [(&str, &str); 6] = [
+            ("auth login", "this sign-in"),
+            ("auth status", "this credential's status"),
+            ("auth logout", "this sign-out"),
+            ("host set-capacity", "this host's new capacity"),
+            ("host show", "this host's settings"),
+            ("status", "this host's status"),
+        ];
+
+        let run_one = |command: &str| -> CliError {
+            let out: &mut dyn Write = &mut BrokenPipe;
+            let outcome = match command {
+                "auth login" => auth::login(&context, out),
+                "auth status" => auth::status(&context, out),
+                "auth logout" => auth::logout(&context, out),
+                "host set-capacity" => {
+                    host::set_capacity(&context, &HostSetCapacityArgs { capacity: 1 }, out)
+                }
+                "host show" => host::show(&context, out),
+                "status" => status::dispatch(&context, &StatusArgs { json: false }, out),
+                other => panic!("unknown command {other}"),
+            };
+            outcome.expect_err("a sink that fails on the first byte must fail the command")
+        };
+
+        for (command, noun) in expected {
+            let error = run_one(command);
+            assert_eq!(
+                error.class(),
+                Failure::Unclassified,
+                "`{command}` must report a write failure as a write failure, not as \
+                 something about GitHub or the local database: {error}"
+            );
+            assert!(
+                error.message().contains(noun),
+                "`{command}` must say it could not write {noun:?}; it said: {error}"
+            );
+            for (other_command, other_noun) in expected {
+                if other_noun == noun {
+                    continue;
+                }
+                assert!(
+                    !error.message().contains(other_noun),
+                    "`{command}` reported {other_noun:?}, which belongs to \
+                     `{other_command}`: {error}"
+                );
+            }
         }
     }
 

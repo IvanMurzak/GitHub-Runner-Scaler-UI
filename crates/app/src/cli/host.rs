@@ -402,6 +402,7 @@ pub fn set_capacity(
     args: &HostSetCapacityArgs,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    let failed = write_failed("this host's new capacity");
     let capacity = NonZeroU16::new(args.capacity).ok_or_else(|| {
         CliError::with_remedy(
             Failure::InvalidArgument,
@@ -426,10 +427,10 @@ pub fn set_capacity(
         "host_capacity: {previous} -> {}   (in use right now: {in_use})",
         capacity.get()
     )
-    .map_err(write_failed("this host's settings"))?;
+    .map_err(failed)?;
 
     if in_use > capacity.get() {
-        writeln!(out).map_err(write_failed("this host's settings"))?;
+        writeln!(out).map_err(failed)?;
         writeln!(
             out,
             "This host already holds {in_use} runner attempts, which is more than the ceiling\n\
@@ -437,7 +438,7 @@ pub fn set_capacity(
              down. No new attempt will start until the total falls below {}.",
             capacity.get()
         )
-        .map_err(write_failed("this host's settings"))?;
+        .map_err(failed)?;
     }
     Ok(())
 }
@@ -455,6 +456,7 @@ pub fn set_capacity(
 /// # Errors
 /// The local-state and secret-store failures.
 pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this host's settings");
     let store = context.store()?;
     let host = local_host(&store)?;
 
@@ -465,8 +467,8 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
                 "This machine has no host record yet, so the values below are the defaults a\n\
                  host would be created with. `host set-capacity` creates one."
             )
-            .map_err(write_failed("this host's settings"))?;
-            writeln!(out).map_err(write_failed("this host's settings"))?;
+            .map_err(failed)?;
+            writeln!(out).map_err(failed)?;
         }
         Some(host) => {
             writeln!(
@@ -474,9 +476,8 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
                 "Host: {} ({} {})",
                 host.display_name, host.os, host.architecture
             )
-            .map_err(write_failed("this host's settings"))?;
-            writeln!(out, "  id                        {}", host.id)
-                .map_err(write_failed("this host's settings"))?;
+            .map_err(failed)?;
+            writeln!(out, "  id                        {}", host.id).map_err(failed)?;
         }
     }
 
@@ -496,18 +497,15 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         None => 0,
     };
 
-    writeln!(out, "  host_capacity             {capacity}")
-        .map_err(write_failed("this host's settings"))?;
-    writeln!(out, "  in use across policies    {in_use}")
-        .map_err(write_failed("this host's settings"))?;
+    writeln!(out, "  host_capacity             {capacity}").map_err(failed)?;
+    writeln!(out, "  in use across policies    {in_use}").map_err(failed)?;
     writeln!(
         out,
         "  headroom                  {}",
         capacity.saturating_sub(in_use)
     )
-    .map_err(write_failed("this host's settings"))?;
-    writeln!(out, "  service start mode        {start_mode}")
-        .map_err(write_failed("this host's settings"))?;
+    .map_err(failed)?;
+    writeln!(out, "  service start mode        {start_mode}").map_err(failed)?;
 
     // -- the secret store ------------------------------------------------
     let secrets = context.secret_store(start_mode)?;
@@ -516,13 +514,11 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         "  secret store              {}-scoped",
         secrets.scope()
     )
-    .map_err(write_failed("this host's settings"))?;
-    writeln!(out, "  store location            {}", secrets.location())
-        .map_err(write_failed("this host's settings"))?;
+    .map_err(failed)?;
+    writeln!(out, "  store location            {}", secrets.location()).map_err(failed)?;
     match secrets.protection() {
         Ok(protection) => {
-            writeln!(out, "  protected by              {protection}")
-                .map_err(write_failed("this host's settings"))?;
+            writeln!(out, "  protected by              {protection}").map_err(failed)?;
         }
         Err(source) => {
             // Not a failure of `host show`: on a host that has never signed in
@@ -532,10 +528,10 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
                 out,
                 "  protected by              not readable yet ({source})"
             )
-            .map_err(write_failed("this host's settings"))?;
+            .map_err(failed)?;
         }
     }
-    writeln!(out).map_err(write_failed("this host's settings"))?;
+    writeln!(out).map_err(failed)?;
 
     // -- the shared budget ------------------------------------------------
     let targets: Vec<ScaleTarget> = store
@@ -546,7 +542,7 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .collect();
     HostBudget::of(interval, &targets)
         .write(out)
-        .map_err(write_failed("this host's settings"))?;
+        .map_err(failed)?;
     Ok(())
 }
 

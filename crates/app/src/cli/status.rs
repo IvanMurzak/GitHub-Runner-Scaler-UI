@@ -300,13 +300,14 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
 /// # Errors
 /// The local-state and secret-store failures.
 pub fn dispatch(context: &Context, args: &StatusArgs, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this host's status");
     let document = snapshot(context)?;
     if args.json {
         write_json(out, &document)
     } else {
         write_text(out, &document)
     }
-    .map_err(write_failed("this host's status"))
+    .map_err(failed)
 }
 
 /// Pretty-printed rather than compact, and with a trailing newline.
