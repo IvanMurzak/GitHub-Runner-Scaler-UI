@@ -180,9 +180,15 @@ fn nothing_sets_a_capacity_except_set_capacity() {
             command.args(&arguments);
             command
         });
-        assert!(
-            outcome.code == 0 || outcome.code == 3,
-            "`{}` failed unexpectedly: {}",
+        // Every one of these succeeds on a fresh data directory. `auth logout`
+        // included: a host that held nothing to purge has still complied, which
+        // is what `05-infrastructure.md`'s disclosure procedure needs. An
+        // `|| code == 3` arm here would be dead, and would loosen the assertion
+        // to admit an `auth status`-shaped failure that cannot occur.
+        assert_eq!(
+            outcome.code,
+            0,
+            "`{}` must succeed on a fresh data directory: {}",
             arguments.join(" "),
             outcome.stderr
         );

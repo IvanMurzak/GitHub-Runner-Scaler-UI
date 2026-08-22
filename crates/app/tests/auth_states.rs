@@ -20,7 +20,10 @@
 
 mod support;
 
-use support::{FakeGithub, Reply, fixture_token, run, runner_manager, runner_manager_against};
+use support::{
+    FakeGithub, Reply, file_contains, files_under, fixture_token, run, runner_manager,
+    runner_manager_against,
+};
 
 /// Signs in for real, so the following command reads a credential this suite
 /// did not plant by hand.
@@ -329,6 +332,10 @@ fn an_unreachable_github_is_not_reported_as_a_bad_credential() {
 
 /// The four states `f1` names reach four different exit codes, measured over
 /// the binary rather than over the enum.
+///
+/// All four, including the lockout — an earlier version of this test compared
+/// three and the doc claimed four, which is the kind of gap that survives
+/// precisely because the sentence above it reads correctly.
 #[test]
 fn the_reported_states_reach_distinct_exit_codes() {
     // not_authenticated
@@ -364,13 +371,23 @@ fn the_reported_states_reach_distinct_exit_codes() {
     })
     .code;
 
-    let codes = [not_authenticated, authenticated, revoked];
+    // locked out
+    let lockout_github = FakeGithub::start();
+    lockout_github.with_authentication_lockout(120);
+    let locked_out = run({
+        let mut command = runner_manager_against(signed.path(), &lockout_github);
+        command.args(["auth", "status"]);
+        command
+    })
+    .code;
+
+    let codes = [not_authenticated, authenticated, revoked, locked_out];
     let distinct: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
     assert_eq!(
         distinct.len(),
         codes.len(),
-        "authenticated, not-authenticated and revoked must be tellable apart from a \
-         script: {codes:?}"
+        "authenticated, not-authenticated, revoked and locked-out must all be tellable \
+         apart from a script: {codes:?}"
     );
     assert_eq!(authenticated, 0, "only success exits zero");
 }
@@ -427,10 +444,8 @@ fn logout_leaves_no_token_and_names_the_authoritative_revocation() {
     // And nothing anywhere in the data directory holds the token.
     let planted = fixture_token();
     let mut offenders = Vec::new();
-    for entry in walk(data_dir.path()) {
-        if let Ok(bytes) = std::fs::read(&entry)
-            && contains(&bytes, planted.as_bytes())
-        {
+    for entry in files_under(data_dir.path()) {
+        if file_contains(&entry, &planted) {
             offenders.push(entry.display().to_string());
         }
     }
@@ -471,31 +486,4 @@ fn logout_on_a_host_that_was_never_signed_in_succeeds() {
         "the notice is owed either way:\n{}",
         outcome.stdout
     );
-}
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else {
-                found.push(path);
-            }
-        }
-    }
-    found
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }

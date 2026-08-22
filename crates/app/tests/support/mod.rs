@@ -29,7 +29,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -553,4 +553,66 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         _ => "Unknown",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Looking at what a run left on disk
+// ---------------------------------------------------------------------------
+
+/// Every file under `root`, recursively.
+///
+/// Two suites walk the data directory looking for a planted secret, and they
+/// had a copy of this each -- under two names, with two spellings of the
+/// substring check, over the same directory for the same needle. One of them
+/// hand-rolled a byte-window scan while the other went through
+/// `String::from_utf8_lossy`, which are not quite the same test: the byte-window
+/// version finds a needle inside a file that is not valid UTF-8, and the lossy
+/// one can miss it. Both live here now, and [`file_contains`] is the byte-window
+/// one, because a secret store's blob is exactly the non-UTF-8 file where the
+/// difference matters.
+#[must_use]
+pub fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Whether a file's bytes contain `needle`, unreadable files counting as no.
+///
+/// A byte-window search rather than a `String` one: a DPAPI blob and a keychain
+/// database are not valid UTF-8, and a lossy conversion of one can replace the
+/// very bytes being searched for.
+#[must_use]
+pub fn file_contains(path: &Path, needle: &str) -> bool {
+    let Ok(haystack) = std::fs::read(path) else {
+        return false;
+    };
+    let needle = needle.as_bytes();
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether a path is inside the machine-scoped secret store.
+///
+/// The store is the **one** place the token is allowed to be -- that is what it
+/// is for -- and on Linux `d2` keeps it there as a `0600` file rather than as
+/// ciphertext, so a scan that included it would fail on one platform for the
+/// correct behaviour. `d2`'s own `no_token_outside_the_store.rs` draws the same
+/// line, and this is the CLI-side half of it.
+#[must_use]
+pub fn is_the_secret_store(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "secrets")
 }

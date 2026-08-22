@@ -177,9 +177,10 @@ fn the_action_count_would_reject_a_fourth_step() {
         "the parser must see a fourth action if one is printed, or the count above is a \
          spelling check over three lines that happen to exist"
     );
-    assert!(
-        actions.len() > ONBOARDING_ACTIONS,
-        "and four must be over the budget of three"
+    assert_eq!(
+        actions[3].index, 4,
+        "and the extra one must be read as the fourth action rather than as noise, or the \
+         parser could be hiding a step instead of counting it"
     );
 }
 

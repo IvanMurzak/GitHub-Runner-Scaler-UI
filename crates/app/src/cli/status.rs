@@ -38,7 +38,7 @@ use runner_manager_platform::secrets::SecretStore;
 use serde::Serialize;
 
 use super::host::{FALLBACK_COST_MULTIPLE, HostBudget, local_host, max_repository_targets};
-use super::{CliError, Context, Failure, StatusArgs};
+use super::{CliError, Context, Failure, StatusArgs, write_failed};
 
 /// The version of the `status --json` document.
 ///
@@ -46,6 +46,11 @@ use super::{CliError, Context, Failure, StatusArgs};
 /// break: a removed field, a renamed one, or a changed meaning. Adding a field
 /// leaves it alone, because a consumer that reads the fields it knows is
 /// unaffected by one it does not.
+///
+/// Still `1` after `store_agrees_with_start_mode` was dropped, because that
+/// happened before v1 was ever released — see [`Credential`] for why it went.
+/// A field removed after release would be exactly the case this number exists
+/// for.
 pub const SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -76,14 +81,35 @@ pub struct Product {
 ///
 /// `present` is the answer to "is there a value in the store", and nothing
 /// here is the value. A consumer that needs to know whether GitHub still
-/// accepts it runs `auth status`, which has four answers and an exit code for
+/// accepts it runs `auth status`, which has five answers and an exit code for
 /// each.
+///
+/// # There is deliberately no `store_agrees_with_start_mode`
+///
+/// An earlier draft of schema v1 carried one, from `d2`'s
+/// `ActiveStore::agrees_with_start_mode`, and it was **constant `true`**:
+/// [`Context::secret_store`] derives the scope
+/// as `SecretScope::for_start_mode(start_mode)` and the same `start_mode` was
+/// then handed back for the comparison, so it computed `f(x) == f(x)`.
+///
+/// `d2` justifies that check as comparing *"two independently persisted
+/// facts"* — the store a process opened against the start mode recorded for the
+/// **installed service** — and through this composition root they are not
+/// independent, because one is computed from the other. It is `service status`'s
+/// check (`f3`), where the recorded start mode really is a separate fact, and it
+/// degenerates here.
+///
+/// A field that can never be `false` in a versioned compatibility surface is
+/// worse than no field: a consumer branching on it gets assurance the document
+/// cannot supply. It is dropped rather than faked, and nothing is lost — the two
+/// values it was derived from, [`Credential::store_scope`] and
+/// [`HostSnapshot::service_start_mode`], are both still here, so a consumer that
+/// wants the comparison can make it and will know exactly what it compared.
 #[derive(Debug, Clone, Serialize)]
 pub struct Credential {
     pub present: bool,
     pub store_scope: String,
     pub store_location: String,
-    pub store_agrees_with_start_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,7 +245,6 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
             )
         })?
         .is_some();
-    let active_store = runner_manager_platform::secrets::ActiveStore::of(&secrets, start_mode);
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
@@ -234,9 +259,8 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         github_contacted: false,
         credential: Credential {
             present,
-            store_scope: active_store.scope().to_string(),
-            store_location: active_store.location().to_string(),
-            store_agrees_with_start_mode: active_store.agrees_with_start_mode(),
+            store_scope: secrets.scope().to_string(),
+            store_location: secrets.location(),
         },
         host: HostSnapshot {
             configured: host.is_some(),
@@ -282,7 +306,7 @@ pub fn dispatch(context: &Context, args: &StatusArgs, out: &mut dyn Write) -> Re
     } else {
         write_text(out, &document)
     }
-    .map_err(write_failed)
+    .map_err(write_failed("this host's status"))
 }
 
 /// Pretty-printed rather than compact, and with a trailing newline.
@@ -341,16 +365,6 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         },
         document.credential.store_scope
     )?;
-    if !document.credential.store_agrees_with_start_mode {
-        writeln!(
-            out,
-            "  MISMATCH: the store in use is not the one this start mode needs. A boot-start"
-        )?;
-        writeln!(
-            out,
-            "  service will not find a credential in a user-scoped store."
-        )?;
-    }
     writeln!(
         out,
         "  GitHub contacted          no (this is a local snapshot; `auth status` asks GitHub)"
@@ -388,13 +402,6 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     Ok(())
 }
 
-fn write_failed(source: io::Error) -> CliError {
-    CliError::new(
-        Failure::Unclassified,
-        format!("cannot write this host's status: {source}"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,7 +421,6 @@ mod tests {
                 present: true,
                 store_scope: "machine".to_string(),
                 store_location: "C:/ProgramData/runner-manager/secrets".to_string(),
-                store_agrees_with_start_mode: true,
             },
             host: HostSnapshot {
                 configured: true,
@@ -498,12 +504,7 @@ mod tests {
         assert_eq!(keys(&emitted, "/product"), ["name", "version"]);
         assert_eq!(
             keys(&emitted, "/credential"),
-            [
-                "present",
-                "store_agrees_with_start_mode",
-                "store_location",
-                "store_scope",
-            ]
+            ["present", "store_location", "store_scope"]
         );
         assert_eq!(
             keys(&emitted, "/host"),

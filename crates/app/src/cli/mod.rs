@@ -143,121 +143,131 @@ pub const DEFAULT_HOST_CAPACITY: u16 = 1;
 /// having precisely so that "we forgot to classify this" is visible rather than
 /// disguised as one of the named classes.
 //
+// ----------------------------------------------------------------------------
+// THE TAXONOMY IS DECLARED ONCE AND EVERYTHING IS DERIVED FROM THAT DECLARATION.
+// ----------------------------------------------------------------------------
+// `Failure::ALL` used to be a hand-maintained array typed `[Failure; 19]`,
+// parallel to the enum rather than derived from it. That is a real hole and not
+// a stylistic one: adding a variant forces an edit to `as_str`'s exhaustive
+// match — the compiler sees to that — but nothing forced an edit to `ALL`, so a
+// new class was invisible to every test that iterates it.
+//
+// Worth being exact about which half rustc already covers, because the two are
+// easy to conflate. A *duplicate* discriminant is a compile error either way:
+// this is a `#[repr(u8)]` enum with an explicit value on every variant, so
+// `RateLimited = 4` beside `AuthenticationFailed = 4` is E0081 and never
+// reaches a test. What rustc does not catch is a class on a *fresh* value that
+// is nonetheless wrong — `RateLimited = 2`, on the code clap already owns for a
+// usage error. Under the old shape that compiled, `ALL` stayed at nineteen,
+// `the_exit_codes_are_distinct_and_non_zero` never iterated the new class, and
+// the whole suite passed: measured, 39 passed / 0 failed. Under this shape the
+// same edit fails that test on `assert_ne!(class.code(), 2)`. The Definition of
+// Done reads "every command returns a distinct non-zero exit code per failure
+// class", and that is the gap it was leaving open.
+//
+// Rust cannot enumerate an enum's variants without a macro or a derive, and no
+// derive crate is available here (`a1` owns every manifest). So the list below
+// is the *only* place a class is written down: the enum, `ALL`, and `as_str`
+// are all expanded from it. Adding a class to the enum without adding it to
+// `ALL` is no longer something a person can do — there is one list, and it
+// feeds all three.
+//
 // `dead_code` is allowed for the same reason the command tree above is declared
 // whole: the taxonomy is a scripting contract, and the classes `f2` and `f3`
 // will raise (`NotFound`, `Conflict`, `BudgetRefused`) have to hold their
 // numbers before those tasks land, or the numbers move under a script that was
 // already written against them. This crate is a `[[bin]]`, so an unused `pub`
 // item is dead code rather than public API.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Failure {
+macro_rules! failure_taxonomy {
+    (
+        $(
+            $(#[$documentation:meta])*
+            $variant:ident = $code:literal => $name:literal,
+        )+
+    ) => {
+        #[allow(dead_code)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(u8)]
+        pub enum Failure {
+            $(
+                $(#[$documentation])*
+                $variant = $code,
+            )+
+        }
+
+        impl Failure {
+            /// Every class, expanded from the same declaration as the enum, so
+            /// it cannot fall behind it.
+            #[allow(
+                dead_code,
+                reason = "read by the distinctness proof in this file's tests"
+            )]
+            pub const ALL: &'static [Failure] = &[$(Failure::$variant,)+];
+
+            /// The stable name a `--json` document and a log field use.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+        }
+    };
+}
+
+failure_taxonomy! {
     /// Something went wrong that this taxonomy does not name yet.
-    Unclassified = 1,
+    Unclassified = 1 => "unclassified",
     /// No credential is stored on this host. Remedy: `auth login`.
-    NotAuthenticated = 3,
+    NotAuthenticated = 3 => "not_authenticated",
     /// GitHub rejected the stored credential. Remedy: `auth login`.
-    AuthenticationFailed = 4,
+    AuthenticationFailed = 4 => "authentication_failed",
     /// GitHub's temporary authentication lockout. Remedy: wait.
-    AuthenticationLockout = 5,
+    AuthenticationLockout = 5 => "authentication_lockout",
     /// The user declined the login on GitHub. **Not** a case to retry: the same
     /// login presented again re-prompts somebody who has already said no.
-    AuthenticationDeclined = 6,
+    AuthenticationDeclined = 6 => "authentication_declined",
     /// GitHub could not be reached at all.
-    GithubUnavailable = 7,
+    GithubUnavailable = 7 => "github_unavailable",
     /// GitHub answered, refusing on rate-limit or permission grounds.
-    GithubRefused = 8,
+    GithubRefused = 8 => "github_refused",
     /// An argument was well-formed for clap and wrong for the domain.
-    InvalidArgument = 9,
+    InvalidArgument = 9 => "invalid_argument",
     /// The thing named does not exist locally.
-    NotFound = 10,
+    NotFound = 10 => "not_found",
     /// A concurrent change, a duplicate, or a held lock.
-    Conflict = 11,
+    Conflict = 11 => "conflict",
     /// The projected REST budget will not admit this configuration.
-    BudgetRefused = 12,
+    BudgetRefused = 12 => "budget_refused",
     /// The machine-scoped secret store could not be reached.
-    SecretStore = 13,
+    SecretStore = 13 => "secret_store",
     /// Local configuration or the SQLite journal could not be read or written.
-    LocalState = 14,
+    LocalState = 14 => "local_state",
     /// This host's OS or architecture is outside GitHub's documented matrix.
-    UnsupportedHost = 15,
+    UnsupportedHost = 15 => "unsupported_host",
     /// This build carries no published GitHub App registration.
-    AppNotPublished = 16,
+    AppNotPublished = 16 => "app_not_published",
     /// A declared command whose implementing task has not landed.
-    NotImplemented = 17,
+    NotImplemented = 17 => "not_implemented",
     /// The device code expired, or GitHub stopped recognising it. Unlike
     /// [`Failure::AuthenticationDeclined`], starting a fresh login is the right
     /// response and a script may do it unattended.
-    AuthenticationExpired = 18,
+    AuthenticationExpired = 18 => "authentication_expired",
     /// GitHub says the published App itself is wrong — device flow not
     /// enabled, or a `client_id` it does not know. No operator action helps;
     /// a maintainer must fix the registration.
-    AppMisconfigured = 19,
+    AppMisconfigured = 19 => "app_misconfigured",
     /// GitHub's answer could not be used: it did not decode, it carried a value
     /// this client cannot accept, or — the security case — it pointed the login
     /// at a verification page that is not GitHub's own.
-    UnusableResponse = 20,
+    UnusableResponse = 20 => "unusable_response",
 }
 
 impl Failure {
-    /// Every class, so a test can prove the codes are distinct.
-    #[allow(
-        dead_code,
-        reason = "read by the distinctness proof in this file's tests"
-    )]
-    pub const ALL: [Failure; 19] = [
-        Failure::Unclassified,
-        Failure::NotAuthenticated,
-        Failure::AuthenticationFailed,
-        Failure::AuthenticationLockout,
-        Failure::AuthenticationDeclined,
-        Failure::GithubUnavailable,
-        Failure::GithubRefused,
-        Failure::InvalidArgument,
-        Failure::NotFound,
-        Failure::Conflict,
-        Failure::BudgetRefused,
-        Failure::SecretStore,
-        Failure::LocalState,
-        Failure::UnsupportedHost,
-        Failure::AppNotPublished,
-        Failure::NotImplemented,
-        Failure::AuthenticationExpired,
-        Failure::AppMisconfigured,
-        Failure::UnusableResponse,
-    ];
-
     /// The process exit code for this class.
     #[must_use]
     pub const fn code(self) -> u8 {
         self as u8
-    }
-
-    /// The stable name a `--json` document and a log field use.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unclassified => "unclassified",
-            Self::NotAuthenticated => "not_authenticated",
-            Self::AuthenticationFailed => "authentication_failed",
-            Self::AuthenticationLockout => "authentication_lockout",
-            Self::AuthenticationDeclined => "authentication_declined",
-            Self::GithubUnavailable => "github_unavailable",
-            Self::GithubRefused => "github_refused",
-            Self::InvalidArgument => "invalid_argument",
-            Self::NotFound => "not_found",
-            Self::Conflict => "conflict",
-            Self::BudgetRefused => "budget_refused",
-            Self::SecretStore => "secret_store",
-            Self::LocalState => "local_state",
-            Self::UnsupportedHost => "unsupported_host",
-            Self::AppNotPublished => "app_not_published",
-            Self::NotImplemented => "not_implemented",
-            Self::AuthenticationExpired => "authentication_expired",
-            Self::AppMisconfigured => "app_misconfigured",
-            Self::UnusableResponse => "unusable_response",
-        }
     }
 }
 
@@ -336,6 +346,26 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
+    }
+}
+
+/// The failure every command reaches when its output sink gives way.
+///
+/// One definition rather than one per command file. `auth`, `host` and `status`
+/// each had a byte-identical copy of this, and `f2` and `f3` would have added a
+/// fourth and a fifth — every one of them constructing the same
+/// [`Failure::Unclassified`] from the same `io::Error`.
+///
+/// `what` names the thing that was being written, because "cannot write to this
+/// terminal" is the same sentence whether a status document or a permission
+/// disclosure was cut short, and the two are worth telling apart in a bug
+/// report.
+pub fn write_failed(what: &str) -> impl FnOnce(io::Error) -> CliError + '_ {
+    move |source| {
+        CliError::new(
+            Failure::Unclassified,
+            format!("cannot write {what}: {source}"),
+        )
     }
 }
 
@@ -637,22 +667,7 @@ impl Context {
                 format!("{GITHUB_BASE_URL_VARIABLE} is not usable as an endpoint base: {source}"),
             )
         })?;
-        let host = endpoints
-            .api_base()
-            .host_str()
-            .unwrap_or_default()
-            .to_string();
-        if !is_loopback_host(&host) {
-            return Err(CliError::new(
-                Failure::InvalidArgument,
-                format!(
-                    "{GITHUB_BASE_URL_VARIABLE} may only point at a loopback address, and \
-                     {raw:?} resolves to host {host:?}, which is not one. This variable \
-                     redirects the device flow, and the device flow ends by handing a GitHub \
-                     credential to whatever answered it."
-                ),
-            ));
-        }
+        refuse_unless_every_origin_is_loopback(&endpoints, &raw)?;
         let _ = writeln!(
             err,
             "warning: talking to {raw} instead of GitHub, because \
@@ -748,6 +763,52 @@ impl Context {
     pub fn recorded_start_mode(&self, store: &dyn Store) -> Result<StartMode, CliError> {
         Ok(host::local_host(store)?.map_or_else(StartMode::default, |h| h.service_start_mode))
     }
+}
+
+/// Refuses an override unless **every** origin it produced is loopback.
+///
+/// # Why both bases, and not the one this check used to read
+///
+/// [`Endpoints`] carries two: `api_base` for `api.github.com`, and `web_base`
+/// for `github.com`. The bearer token is exchanged at
+/// `Endpoints::access_token_url`, which joins **`web_base`** — and `web_base` is
+/// also what `c2` compares the device-flow `verification_uri` against, so it is
+/// the origin behind both of this variable's security properties.
+///
+/// This check used to read `api_base` alone. That was sound only because
+/// `Endpoints::for_test_server` builds both bases from one root, which is an
+/// invariant `c2` owns and could reasonably change — a loosening there would
+/// silently unhook the one check whose whole purpose is to be unbypassable.
+/// Reading both costs a line and removes the cross-crate dependence.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`], naming which base failed.
+fn refuse_unless_every_origin_is_loopback(
+    endpoints: &Endpoints,
+    raw: &str,
+) -> Result<(), CliError> {
+    let bases = [
+        ("the API base", endpoints.api_base()),
+        (
+            "the web base, which is where the device flow hands over the token",
+            endpoints.web_base(),
+        ),
+    ];
+    for (what, base) in bases {
+        let host = base.host_str().unwrap_or_default();
+        if !is_loopback_host(host) {
+            return Err(CliError::new(
+                Failure::InvalidArgument,
+                format!(
+                    "{GITHUB_BASE_URL_VARIABLE} may only point at a loopback address. \
+                     {raw:?} put {what} on host {host:?}, which is not one. This variable \
+                     redirects the device flow, and the device flow ends by handing a \
+                     GitHub credential to whatever answered it."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a URL host component names this machine.
@@ -954,7 +1015,7 @@ mod tests {
     #[test]
     fn the_exit_codes_are_distinct_and_non_zero() {
         let mut seen = std::collections::BTreeMap::new();
-        for class in Failure::ALL {
+        for class in Failure::ALL.iter().copied() {
             assert_ne!(
                 class.code(),
                 0,
@@ -963,8 +1024,7 @@ mod tests {
             assert_ne!(
                 class.code(),
                 2,
-                "{class} would be indistinguishable from clap's usage error, which exits 2 \
-                 before any of this code runs"
+                "{class} would be indistinguishable from clap's usage error, which exits 2                  before any of this code runs"
             );
             if let Some(previous) = seen.insert(class.code(), class) {
                 panic!("{previous} and {class} both exit {}", class.code());
@@ -977,35 +1037,49 @@ mod tests {
         );
     }
 
-    /// `Failure::ALL` is what the test above iterates, so a class missing from
-    /// it is a class the distinctness proof never sees.
+    /// The distinctness proof above is only worth its name if `ALL` really is
+    /// every class, so this pins the property that makes it so.
+    ///
+    /// `ALL` is expanded from the `failure_taxonomy!` declaration, alongside the
+    /// enum itself and `as_str`, so a class that exists and is missing from
+    /// `ALL` is not a thing that can be written. The previous version of this
+    /// test asserted `!class.as_str().is_empty()` over an exhaustive match —
+    /// which is true by construction, because every arm returns a string
+    /// literal, and which left the actual hole open: `ALL` was a separate
+    /// hand-maintained array, and a new variant compiled without being added
+    /// to it.
+    ///
+    /// What is checked here is the one thing the macro does *not* guarantee:
+    /// that two classes were not given the same name. The names reach
+    /// `status --json` and the `tracing` fields, where a duplicate would make
+    /// two different failures indistinguishable to a consumer for the same
+    /// reason a shared exit code would.
     #[test]
-    fn every_failure_class_is_listed_in_all() {
-        // Exhaustive `match` on a value from `ALL`: adding a variant without
-        // adding it here stops compiling, which is the point.
-        for class in Failure::ALL {
-            let named = match class {
-                Failure::Unclassified
-                | Failure::NotAuthenticated
-                | Failure::AuthenticationFailed
-                | Failure::AuthenticationLockout
-                | Failure::AuthenticationDeclined
-                | Failure::GithubUnavailable
-                | Failure::GithubRefused
-                | Failure::InvalidArgument
-                | Failure::NotFound
-                | Failure::Conflict
-                | Failure::BudgetRefused
-                | Failure::SecretStore
-                | Failure::LocalState
-                | Failure::UnsupportedHost
-                | Failure::AppNotPublished
-                | Failure::NotImplemented
-                | Failure::AuthenticationExpired
-                | Failure::AppMisconfigured
-                | Failure::UnusableResponse => class.as_str(),
-            };
-            assert!(!named.is_empty());
+    fn every_class_is_reachable_from_all_and_names_itself_uniquely() {
+        assert!(
+            Failure::ALL.len() >= 19,
+            "the taxonomy has only ever grown; a shorter `ALL` means classes were              removed without the scripting contract being revisited"
+        );
+
+        let mut names = std::collections::BTreeMap::new();
+        for class in Failure::ALL.iter().copied() {
+            assert!(
+                !class.as_str().is_empty(),
+                "{class:?} has no stable name for a `--json` document to carry"
+            );
+            if let Some(previous) = names.insert(class.as_str(), class) {
+                panic!(
+                    "{previous:?} and {class:?} are both called {:?}",
+                    class.as_str()
+                );
+            }
+        }
+        assert_eq!(names.len(), Failure::ALL.len());
+
+        // Every code in `ALL` round-trips through `Display`, so a class cannot
+        // be in the list under a name nothing else uses.
+        for class in Failure::ALL.iter().copied() {
+            assert_eq!(class.to_string(), class.as_str());
         }
     }
 
@@ -1030,11 +1104,8 @@ mod tests {
             "http://LOCALHOST:8080/",
         ] {
             let endpoints = Endpoints::for_test_server(raw).expect("a valid URL");
-            let host = endpoints.api_base().host_str().unwrap_or_default();
-            assert!(
-                is_loopback_host(host),
-                "{raw} must be accepted (host {host:?})"
-            );
+            refuse_unless_every_origin_is_loopback(&endpoints, raw)
+                .unwrap_or_else(|error| panic!("{raw} must be accepted: {error}"));
         }
 
         for raw in [
@@ -1045,18 +1116,53 @@ mod tests {
             "http://[2001:db8::1]/",
         ] {
             let endpoints = Endpoints::for_test_server(raw).expect("a valid URL");
-            let host = endpoints.api_base().host_str().unwrap_or_default();
             assert!(
-                !is_loopback_host(host),
-                "{raw} must be refused (host {host:?}): this variable redirects the device \
-                 flow, and the device flow ends by handing a GitHub credential to whatever \
-                 answered"
+                refuse_unless_every_origin_is_loopback(&endpoints, raw).is_err(),
+                "{raw} must be refused: this variable redirects the device flow, and the \
+                 device flow ends by handing a GitHub credential to whatever answered"
             );
         }
 
         // A URL with no host component at all must not be read as loopback by
         // the `unwrap_or_default()` that turns `None` into `""`.
         assert!(!is_loopback_host(""), "an absent host is not loopback");
+    }
+
+    /// The token is exchanged at `web_base`, so a guard that only inspected
+    /// `api_base` would pass a pair whose web half is remote.
+    ///
+    /// `Endpoints::for_test_server` cannot build such a pair — it sets both from
+    /// one root — which is precisely why the old single-base check was sound in
+    /// practice and unsound in principle: it depended on an invariant owned by
+    /// `crates/github`. `Endpoints::new` can build it, so the case is testable
+    /// here without touching that crate, and this test fails if the guard is
+    /// ever narrowed back to one base.
+    #[test]
+    fn a_pair_whose_web_base_is_remote_is_refused_even_when_the_api_base_is_loopback() {
+        let loopback = Endpoints::for_test_server("http://127.0.0.1:8080/").expect("valid");
+        let production = Endpoints::production();
+
+        let split = Endpoints::new(loopback.api_base().clone(), production.web_base().clone());
+        assert!(
+            is_loopback_host(split.api_base().host_str().unwrap_or_default()),
+            "the API half of this pair is loopback, which is what makes it the case the \
+             old check would have waved through"
+        );
+        let refusal = refuse_unless_every_origin_is_loopback(&split, "http://127.0.0.1:8080/")
+            .expect_err(
+                "a pair whose web base is github.com must be refused: `access_token_url` \
+                 joins `web_base`, so that is the origin the bearer token is handed to",
+            );
+        assert!(
+            refusal.message().contains("hands over the token"),
+            "the refusal must name which base failed: {refusal}"
+        );
+
+        // And the mirror image, so the loop is not simply refusing everything.
+        let both_loopback =
+            Endpoints::new(loopback.api_base().clone(), loopback.web_base().clone());
+        refuse_unless_every_origin_is_loopback(&both_loopback, "http://127.0.0.1:8080/")
+            .expect("a pair that is loopback on both bases must be accepted");
     }
 
     /// The empty default is load-bearing: it is what turns "the App has not

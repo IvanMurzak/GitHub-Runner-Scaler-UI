@@ -51,7 +51,7 @@ use runner_manager_github::{
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 
-use super::{AuthCommand, CliError, Context, Failure};
+use super::{AuthCommand, CliError, Context, Failure, write_failed};
 
 // ---------------------------------------------------------------------------
 // The disclosure
@@ -285,14 +285,14 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     // This ordering is the D21 obligation, and the flush is part of it: a login
     // that then fails to reach GitHub must still have disclosed, and buffered
     // output that dies with the process has disclosed nothing.
-    write_disclosure(out).map_err(write_failed)?;
-    out.flush().map_err(write_failed)?;
+    write_disclosure(out).map_err(write_failed("this sign-in"))?;
+    out.flush().map_err(write_failed("this sign-in"))?;
 
     let app = context.app_registration()?;
     let flow = DeviceFlow::new(app.clone(), context.endpoints().clone())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_action_one(out).map_err(write_failed)?;
+    write_action_one(out).map_err(write_failed("this sign-in"))?;
 
     let runtime = super::runtime()?;
     let store = context.store()?;
@@ -303,8 +303,8 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(flow.start())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_login_prompt(out, &flow, &authorization).map_err(write_failed)?;
-    out.flush().map_err(write_failed)?;
+    write_login_prompt(out, &flow, &authorization).map_err(write_failed("this sign-in"))?;
+    out.flush().map_err(write_failed("this sign-in"))?;
 
     let token = runtime
         .block_on(flow.complete(&authorization, &TokioSleeper))
@@ -321,7 +321,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         "\nSigned in. The token is in the {} and nowhere else.",
         secrets.location()
     )
-    .map_err(write_failed)?;
+    .map_err(write_failed("this sign-in"))?;
 
     // ---- what the credential reaches, and the third action if any --------
     let client = AuthenticatedClient::new(context.endpoints().clone(), token, context.clock())
@@ -331,7 +331,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(client.discover_installations(&app))
         .map_err(|source| github_failure(&source))?;
 
-    write_discovery(out, &discovery, true).map_err(write_failed)?;
+    write_discovery(out, &discovery, true).map_err(write_failed("this sign-in"))?;
     Ok(())
 }
 
@@ -484,9 +484,9 @@ pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     let secrets = context.secret_store(start_mode)?;
     let state = credential_state(context, &secrets)?;
 
-    writeln!(out, "Credential: {}", state.as_str()).map_err(write_failed)?;
-    writeln!(out, "Store:      {}", secrets.location()).map_err(write_failed)?;
-    write_state_explanation(out, &state).map_err(write_failed)?;
+    writeln!(out, "Credential: {}", state.as_str()).map_err(write_failed("this sign-in"))?;
+    writeln!(out, "Store:      {}", secrets.location()).map_err(write_failed("this sign-in"))?;
+    write_state_explanation(out, &state).map_err(write_failed("this sign-in"))?;
 
     match state.failure() {
         None => Ok(()),
@@ -742,15 +742,26 @@ pub fn logout(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
             secrets.location()
         ),
     }
-    .map_err(write_failed)?;
+    .map_err(write_failed("this sign-in"))?;
 
-    write_revocation_notice(out).map_err(write_failed)?;
+    write_revocation_notice(out).map_err(write_failed("this sign-in"))?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Failure mapping
 // ---------------------------------------------------------------------------
+
+/// The phrase a failure uses when nothing the operator can type will help.
+///
+/// Stated as a constant because it is load-bearing rather than decorative:
+/// `every_device_flow_failure_says_what_to_do_next` treats "carries a remedy"
+/// and "says plainly that no remedy exists" as the two allowed answers, and
+/// checks them as an exact bi-implication. Without a phrase to match, that test
+/// degenerates into accepting any message at all — which it did, by matching
+/// the substring `"Nothing was stored."` that several arms emit *alongside* a
+/// remedy.
+pub const NO_OPERATOR_REMEDY: &str = "there is no command here that fixes this";
 
 /// Turns `c2`'s error matrix into exit codes and one-screenful advice.
 ///
@@ -773,8 +784,8 @@ fn device_flow_failure(source: &DeviceFlowError) -> CliError {
         DeviceFlowError::AppMisconfigured { .. } => CliError::new(
             Failure::AppMisconfigured,
             format!(
-                "{source}. This is a defect in the published App, not in this host's setup: \
-                 no command you run here will change it. Please report it against the project."
+                "{source}. This is a defect in the published App, not in this host's setup, \
+                 so {NO_OPERATOR_REMEDY}. Please report it against the project."
             ),
         ),
         DeviceFlowError::UntrustedVerificationUri { origin } => CliError::new(
@@ -782,7 +793,9 @@ fn device_flow_failure(source: &DeviceFlowError) -> CliError {
             format!(
                 "refusing to continue: the device-flow response pointed the approval page at \
                  {origin:?}, which is not GitHub. Your code has not been shown and nothing has \
-                 been stored. Treat this as an interception attempt on this network."
+                 been stored. Treat this as an interception attempt on this network -- \
+                 {NO_OPERATOR_REMEDY}, and signing in again from here would present the code \
+                 to the same party."
             ),
         ),
         DeviceFlowError::Transport(_) => CliError::with_remedy(
@@ -797,13 +810,22 @@ fn device_flow_failure(source: &DeviceFlowError) -> CliError {
                 "runner-manager auth login",
             )
         }
-        DeviceFlowError::Decode { .. } | DeviceFlowError::Malformed { .. } => CliError::new(
-            Failure::UnusableResponse,
-            format!("{source}. Nothing was stored."),
-        ),
+        // A response that did not decode says nothing about the login itself,
+        // so a fresh one is a reasonable thing to try -- unlike the two arms
+        // above it, which are answers rather than accidents.
+        DeviceFlowError::Decode { .. } | DeviceFlowError::Malformed { .. } => {
+            CliError::with_remedy(
+                Failure::UnusableResponse,
+                format!("{source}. Nothing was stored."),
+                "runner-manager auth login",
+            )
+        }
         DeviceFlowError::Config(_) => CliError::new(
             Failure::AppNotPublished,
-            format!("the App registration this build carries is unusable: {source}"),
+            format!(
+                "the App registration this build carries is unusable: {source}. That is a \
+                 property of the build rather than of this host, so {NO_OPERATOR_REMEDY}."
+            ),
         ),
     }
 }
@@ -859,13 +881,6 @@ fn secret_store_failure(source: &SecretStoreError) -> CliError {
             "runner-manager host show   (reports where the store is and what protects it)",
         ),
     }
-}
-
-fn write_failed(source: io::Error) -> CliError {
-    CliError::new(
-        Failure::Unclassified,
-        format!("cannot write to this terminal: {source}"),
-    )
 }
 
 #[cfg(test)]
@@ -985,11 +1000,24 @@ mod tests {
     /// A transcript built from the *product's own* writers, in the order
     /// [`login`] calls them.
     ///
-    /// The two steps `login` takes between them — starting the device flow and
-    /// polling it — issue requests and write nothing, so substituting them out
-    /// changes no byte of this transcript. That the real command calls these
-    /// writers in this order is what the integration walkthrough asserts, over
-    /// the real binary's stdout.
+    /// ## This is a copy-ordering test, not a product-ordering test
+    ///
+    /// Read that sentence before trusting anything below it. The order here is
+    /// **hardcoded in this function**, so moving `write_disclosure` below
+    /// `write_login_prompt` inside `login` changes no byte of this transcript
+    /// and fails nothing in this module. `crates/app` is a `[[bin]]` with no
+    /// `[lib]` target and `DeviceAuthorization` has no public constructor, so
+    /// there is no way to drive the real `login` from a unit test.
+    ///
+    /// What these tests do measure is worth having and is all they claim: that
+    /// the copy says what D21 requires, and that the offset comparison
+    /// discriminates (`the_position_check_can_fail`).
+    ///
+    /// **The control for product ordering is
+    /// `crates/app/tests/auth_onboarding.rs`** — real binary, real stdout, byte
+    /// offsets, plus a case that kills the first HTTP request and requires the
+    /// full disclosure with no `Action 2 of` present. Those are what caught the
+    /// sabotage; these would have passed it.
     fn transcript() -> String {
         text(|out| {
             write_disclosure(out)?;
@@ -1363,23 +1391,40 @@ mod tests {
                 value: "::".to_string(),
             },
         ];
+        let mut with_remedy = 0;
+        let mut without = 0;
         for case in cases {
             let error = device_flow_failure(&case);
-            let has_remedy = error.remedy().is_some();
-            let says_nothing_helps = error.message().contains("no command you run here")
-                || error.message().contains("Treat this as an interception")
-                || error.message().contains("Nothing was stored.");
-            assert!(
-                has_remedy || says_nothing_helps,
-                "`{}` must name the command that fixes it, or say plainly that none does",
-                error.message()
+            // An exact bi-implication, not a disjunction. The previous version
+            // accepted the substring "Nothing was stored." as evidence that no
+            // remedy exists -- and several arms emit that *alongside* a remedy,
+            // so the check was satisfiable by copy saying nothing about what to
+            // do next, which is the property it claims to enforce.
+            assert_eq!(
+                error.remedy().is_some(),
+                !error.message().contains(NO_OPERATOR_REMEDY),
+                "`{}` must either name the command that fixes it or say plainly, in the \
+                 words of NO_OPERATOR_REMEDY, that none does -- and never both. remedy: \
+                 {:?}",
+                error.message(),
+                error.remedy()
             );
+            if error.remedy().is_some() {
+                with_remedy += 1;
+            } else {
+                without += 1;
+            }
             assert!(
                 !error.message().is_empty() && error.message().len() < 500,
                 "one screenful, not a stack trace: {}",
                 error.message()
             );
         }
+        assert!(
+            with_remedy > 0 && without > 0,
+            "both halves of the rule must be exercised, or one of them is asserted by \
+             nothing: {with_remedy} with a remedy, {without} without"
+        );
     }
 
     // -- logout ------------------------------------------------------------

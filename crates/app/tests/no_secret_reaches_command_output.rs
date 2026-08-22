@@ -28,13 +28,53 @@
 //
 // Without both, "no secret was found" is indistinguishable from "nothing was
 // looked at".
+//
+// ----------------------------------------------------------------------------
+// WHICH THIRD OF THIS GATE IS ACTUALLY f1's, NEEDLE BY NEEDLE.
+// ----------------------------------------------------------------------------
+// An earlier version of this header concluded that the log half of the scan is
+// redundant with `d1`'s redacting sink. That is right for two needles and wrong
+// for the third, and the third is the one `07-security.md` singles out.
+//
+//   * The TOKEN is caught by `d1` on shape alone: `ghu_` is in
+//     `TOKEN_PREFIXES` (`crates/platform/src/logging.rs:243`), so it is
+//     scrubbed from a log whatever this crate does. Measured: leaking it as a
+//     `tracing` FIELD and again interpolated into a `tracing` MESSAGE left both
+//     log scans green. Writing it to STDOUT reddened both -- and nothing in
+//     `d1` touches process stdout, so the stdout/stderr half of this scan is
+//     unambiguously f1's own control.
+//
+//   * The DEVICE CODE is NOT caught by `d1`. `fixture_device_code()` is 36
+//     characters -- under `OPAQUE_RUN_THRESHOLD = 40` (logging.rs:251) -- it
+//     matches no `TOKEN_PREFIXES` entry, is not a JWT, and holds no `=`, `:` or
+//     structural character for `redact_core` to split on, so it passes through
+//     `redact_value` intact. Measured: interpolated into a `tracing` message it
+//     reached `logs/runner-manager.log` and `no_secret_reaches_the_diagnostics_at_trace_level`
+//     failed naming the file, while the `warn`-level scan stayed green because
+//     `info!` was filtered out. For the device code the log half of this scan is
+//     the ONLY control there is, and it must not be deleted as duplicated
+//     coverage.
+//
+//   * The JIT BLOB cannot fire here at all. Nothing under `crates/app/src/`
+//     mints or handles a JIT configuration and the fixture serves no route
+//     returning one, so this needle is a forward-looking guard rather than a
+//     measurement of this diff. That third of the gate is discharged by `e3`
+//     and `h1`, which do handle one; the needle stays because it costs nothing
+//     and because the command set here will grow.
+//
+// So: three needles, one measured by this file (the device code, in logs and on
+// stdout), one measured by this file only on stdout (the token), and one not
+// measured here at all (the JIT blob). "None found" means less than three
+// clean results would suggest, and saying so is cheaper than a reader
+// discovering it later.
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use support::{
-    FIXTURE_USER_CODE, FakeGithub, fixture_device_code, fixture_token, run, runner_manager_against,
+    FIXTURE_USER_CODE, FakeGithub, file_contains, files_under, fixture_device_code, fixture_token,
+    is_the_secret_store, run, runner_manager_against,
 };
 
 /// Every command in `02-target-architecture.md`'s exhaustive list, with
@@ -86,6 +126,10 @@ const COMMANDS: &[&[&str]] = &[
 ];
 
 /// The three values that must never appear, with the name each is known by.
+///
+/// See the header for which of the three this file actually measures. They are
+/// scanned together because a caller adding a fourth needle should not have to
+/// decide which sub-scan it belongs to.
 fn needles() -> Vec<(&'static str, String)> {
     vec![
         ("the user access token", fixture_token()),
@@ -115,37 +159,6 @@ fn scan(corpus: &[Fragment]) -> Vec<String> {
         }
     }
     found
-}
-
-fn files_under(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else {
-                found.push(path);
-            }
-        }
-    }
-    found
-}
-
-/// Whether a path is inside the machine-scoped secret store.
-///
-/// The store is the **one** place the token is allowed to be — that is what it
-/// is for — and on Linux `d2` keeps it there as a `0600` file rather than as
-/// ciphertext, so a scan that included it would fail on one platform for the
-/// correct behaviour. `d2`'s own `no_token_outside_the_store.rs` draws the same
-/// line, and this is the CLI-side half of it.
-fn is_the_secret_store(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == "secrets")
 }
 
 /// Runs the whole command surface with a real credential in the store and
@@ -224,10 +237,14 @@ fn no_secret_reaches_the_output_of_any_command() {
     );
 }
 
-/// The same, with diagnostics turned all the way up. `d1`'s sink redacts by
-/// allowlist, so a field it has not been told about is redacted rather than
-/// printed — but a value interpolated into a *message* is not a field, and
-/// `trace` is where such a message would be.
+/// The same, with diagnostics turned all the way up.
+///
+/// This is the only control that guards the **device code**, and it is not
+/// redundant with `d1`: at 36 characters the fixture falls under every shape
+/// rule `d1` has, so it survives `redact_value` and reaches the log file. The
+/// header sets out the measurement. `trace` rather than the default `warn`
+/// because an `info!` carrying a secret is filtered out at `warn` and would
+/// leave this green while the leak was real.
 #[test]
 fn no_secret_reaches_the_diagnostics_at_trace_level() {
     let (_data_dir, corpus) = corpus_from_the_full_command_set(true);
@@ -380,9 +397,7 @@ fn the_token_is_in_the_store_and_nowhere_else_under_the_data_directory() {
             store_files += 1;
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&path)
-            && String::from_utf8_lossy(&bytes).contains(&fixture_token())
-        {
+        if file_contains(&path, &fixture_token()) {
             outside.push(path.display().to_string());
         }
     }
