@@ -1,0 +1,41 @@
+crates/app/tests/install_scripts.rs
+  s_5332f62e0ed5a7::t_a7971e17f322d8 1987-1989
+  s_5332f62e0ed5a7::t_4cd161e7194589 1969-1979
+  s_5332f62e0ed5a7::t_f429de30ba7542 2013-2014
+  s_5332f62e0ed5a7::t_8f2b0c5f5602dd 1424-1450
+  s_5332f62e0ed5a7::t_de2cfbbcfbc6b9 1850-1867,1869-1887,1901-1948
+crates/app/tests/readme_disclosure.rs
+  s_5332f62e0ed5a7::t_0940c39da0f421 313,333-344,346-354,359-386
+.github/workflows/release.yml
+  s_5332f62e0ed5a7::t_27e82ad007ce09 1079-1082,1084
+  s_5332f62e0ed5a7::t_10611e4fe67391 958-1000
+crates/app/tests/release_channels.rs
+  s_5332f62e0ed5a7::t_0940c39da0f421 1416-1422,1503-1526,1545-1560,1569-1584,1591-1607
+install/install.ps1
+  s_5332f62e0ed5a7::t_e7b7a4ef47b371 156-176
+  s_5332f62e0ed5a7::t_3203d596614da1 391-413
+  s_5332f62e0ed5a7::t_90a8cbc94db448 522-548
+README.md
+  s_5332f62e0ed5a7::t_87fe3e4e4f4288 220-226
+install/install.sh
+  s_5332f62e0ed5a7::t_4457a6dc1e9c7d 435-454
+crates/app/tests/common/mod.rs
+  s_5332f62e0ed5a7::t_29ccc534ae0764 436-471
+  s_5332f62e0ed5a7::t_ec5f3f45c90107 389-400
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "bee5d81afaf5cfbf04b2e5673e389ed3932e3013",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
