@@ -120,9 +120,12 @@ pub const JITCONFIG_PATH: &str = "/actions/runners/generate-jitconfig";
 
 /// What GitHub answers a successful registration with.
 ///
-/// Named because two tests and one `debug_assert` compare against it, and
-/// because `201` rather than `200` is a fact about this endpoint that a reader
-/// should not have to re-derive.
+/// Named because `201` rather than `200` is a fact about this endpoint that a
+/// reader should not have to re-derive, and because
+/// [`RestJit::generate_jit_config`] says so in a log line when the answer is
+/// anything else. It is **not** a gate: a different success status is reported
+/// and then decoded anyway, because the body is what this module needs and a
+/// `200` would carry the same one.
 pub const CREATED: u16 = 201;
 
 // ---------------------------------------------------------------------------
@@ -750,13 +753,22 @@ impl JitGateway for RestJit {
             .await
             .map_err(|error| Self::from_inventory(error, target, group))?;
 
-        debug_assert_eq!(
-            response.status().as_u16(),
-            CREATED,
-            "`AuthenticatedClient::send` returns `Ok` only for a success status, and this \
-             endpoint's success status is 201; anything else here means the client's \
-             classification changed underneath this module"
-        );
+        // A `warn!` and not a `debug_assert!`, and the difference is deliberate.
+        // `c3`'s `total_count` tripwire asserts because the number it guards is
+        // read *off* the field it doubts; this status is guarding nothing — the
+        // body is what matters, and a `200` would decode identically. An assert
+        // here would panic a debug build, and so kill a developer's agent, over
+        // a status code that changed nothing. The unexpected status is still
+        // worth saying out loud, because it would mean GitHub or
+        // `AuthenticatedClient::send` changed underneath this module.
+        if response.status().as_u16() != CREATED {
+            tracing::warn!(
+                status = response.status().as_u16(),
+                expected = CREATED,
+                "`generate-jitconfig` answered a success status other than 201; the \
+                 registration is still decoded, but this endpoint has always answered 201"
+            );
+        }
 
         let decoded: JitResponse = response.json().map_err(JitError::Github)?;
         // Copied into the wrapper, then the intermediate scrubbed. serde owns
@@ -977,6 +989,32 @@ mod tests {
             );
             assert_eq!(gateway.requests_issued(), 1);
         }
+    }
+
+    /// An unexpected success status is reported, not fatal.
+    ///
+    /// The status guards nothing here — the body is what this module needs, and
+    /// a `200` carries the same one. An assertion would panic a debug build, and
+    /// so kill a developer's agent, over a code that changed nothing; this pins
+    /// that the registration still succeeds.
+    #[tokio::test]
+    async fn a_success_status_other_than_201_is_still_decoded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(RestJit::path(&repo_target())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(created_body(&["a"])))
+            .mount(&server)
+            .await;
+
+        let registration = gateway(&server)
+            .generate_jit_config(&repo_target(), &request(), &CancelToken::new())
+            .await
+            .expect("a 200 carries the same body a 201 does and must not be fatal");
+        assert_eq!(registration.config().expose(), FIXTURE_JIT_CONFIG);
+        assert_ne!(
+            200, CREATED,
+            "the fixture has to be a status the code notices, or this proves nothing"
+        );
     }
 
     /// The path differs between scopes and nothing else does.

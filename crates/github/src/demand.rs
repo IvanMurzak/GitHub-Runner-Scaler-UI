@@ -390,6 +390,31 @@ pub fn target_cost(scope: &ActivityScope) -> TargetCost {
 /// tested against `runner_manager_testkit::github::FakeGithub` with no network
 /// and no `wiremock` in their dependency graphs. [`RestDemand`] is the one
 /// implementation that talks to GitHub.
+///
+/// # Why the scope type is `c3`'s `ActivityScope` and not a new one
+///
+/// The name says "activity" and this is demand, so the reuse is worth
+/// justifying rather than leaving to look like an oversight.
+///
+/// [`ActivityScope`] is not a description of the in-progress count; it is the
+/// answer to "which repositories does one per-repository workflow-runs
+/// aggregate cover", and demand asks that question with exactly the same
+/// answer. Both hit `/repos/{o}/{r}/actions/runs`, both have no
+/// organization-wide form, and both take the repository list from the same
+/// caller-held set — `c3` documents that the list "has to come from the caller,
+/// [because] `f1` and `e1` already hold it, from
+/// [`crate::AuthenticatedClient::discover_installations`], and re-discovering it
+/// on every refresh would cost more requests than the count itself".
+///
+/// A `DemandScope` beside it would be that type with a different name, and the
+/// cost of the duplicate is concrete rather than aesthetic: `e1` polls both read
+/// models in one refresh, and two scope types are two chances for them to
+/// disagree about which repositories are in scope — which would make the demand
+/// total and the activity total describe different sets while being rendered
+/// side by side. What is *not* shared is the cost function:
+/// [`ActivityScope::requests_per_refresh`] prices the activity count, and
+/// [`demand_requests_per_poll`] prices this one, because those really are two
+/// different numbers.
 #[async_trait::async_trait]
 pub trait DemandGateway: fmt::Debug + Send + Sync {
     /// Queued workflow runs across `scope`.
