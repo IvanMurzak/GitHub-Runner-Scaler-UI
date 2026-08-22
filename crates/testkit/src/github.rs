@@ -29,10 +29,35 @@
 //!   `rel="next"` that is not first, a next-page URL containing a comma, the
 //!   `MAX_PAGES` ceiling — is proven against real HTTP in
 //!   `crates/github/src/rest.rs`, which is the only place it can be proven.
+//! * **Demand.** [`FakeGithub::with_queued_runs`] sets a repository's queued
+//!   workflow-run count — the number `e1` clamps. It is a separate knob from the
+//!   in-progress count for the same reason those two are separate aggregates:
+//!   `status=queued` is work waiting for a runner that does not exist, and
+//!   `status=in_progress` is work that already has one. A consumer that polled
+//!   the wrong one is caught by [`FakeCall`] rather than by a wrong number.
+//!
+//!   **The count is of runs, not of jobs.** That under-count is an owner
+//!   decision, documented at length in `runner_manager_github::demand`, and this
+//!   fake models the product rather than the API it wishes it had. Job-level
+//!   `runs-on` fixtures are `b1`'s — [`crate::fixtures::queued_job`] and its
+//!   neighbours — because after the decision no endpoint here returns jobs.
+//!
+//!   [`FakeGithub::with_truncated_queued_runs`] and
+//!   [`FakeGithub::with_unavailable_demand`] produce the two ways a count can be
+//!   short, which a consumer rendering "unknown" rather than "idle" needs.
+//! * **Just-in-time registration.** [`FakeGithub::with_jit_config`] sets what
+//!   `generate-jitconfig` hands back; the registered runner reports exactly the
+//!   labels and runner group the request asked for, because `v1` established
+//!   that GitHub adds none and stores them lower-cased.
 //! * **Failures.** [`FakeFailure`] covers a rate limit at either of GitHub's two
 //!   limits, a revoked token's `401`, the authentication lockout's `403`, a
 //!   permissions `403`, any other status, and cancellation.
 //!   [`FakeGithub::fail_next`] queues one; [`FakeGithub::fail_always`] latches.
+//!   [`FakeGithub::fail_next_registration`] queues one for the registration path
+//!   specifically, which is what lets a test refuse a registration while demand
+//!   still answers — and the same `FakeFailure` maps onto `c4`'s three distinct
+//!   registration outcomes, so a `403`, a `404` and a `422` stay three answers
+//!   rather than one.
 //!
 //! # What is observable
 //!
@@ -52,6 +77,8 @@ use std::{
 use runner_manager_domain::model::{Clock, OwnerRepo, ScaleTarget, Timestamp};
 use runner_manager_github::{
     GithubError, HeaderMap,
+    demand::{DemandGateway, QueuedDemand},
+    jit::{EncodedJitConfig, JitError, JitGateway, JitRegistration, JitRunner, JitRunnerRequest},
     rest::{
         ActivityCount, ActivityScope, CancelToken, InventoryError, InventoryGateway,
         RateLimitHeadroom, RateLimitKind, RateLimited, Runner, RunnerDownload, RunnerDownloads,
@@ -64,6 +91,25 @@ use crate::clock::FakeClock;
 /// Runners per page unless [`FakeGithub::with_page_size`] says otherwise.
 /// GitHub's own maximum, which is what the real gateway asks for.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// What [`FakeGithub`] hands back as an encoded just-in-time configuration.
+///
+/// Shaped like the real thing — base64url of a JSON envelope, which is what
+/// `v1` observed at 4,088 characters — and unmistakably not one. A consumer's
+/// secret-scan test needs a value it can search *for*, so this is a constant
+/// rather than a random string, and it says in its own plaintext what its
+/// appearance in a log would mean.
+pub const DEFAULT_JIT_CONFIG: &str = concat!(
+    "eyJmaXh0dXJlIjoibm90LWEtcmVhbC1qaXQtY29uZmlndXJhdGlvbiIsIm5vdGUiOiJpZi",
+    "B0aGlzIHN0cmluZyBhcHBlYXJzIGluIGEgbG9nIHRoZSByZWRhY3Rpb24gZmFpbGVkIn0"
+);
+
+/// The GitHub runner id the first registration reports.
+///
+/// `73` is the id `v1` was assigned at organization scope. It starts high enough
+/// that it cannot be confused with an index, and it increments per registration
+/// so that two runners in one test are distinguishable.
+pub const FIRST_RUNNER_ID: u64 = 73;
 
 // ---------------------------------------------------------------------------
 // Programmable failures
@@ -173,6 +219,70 @@ impl FakeFailure {
             Self::Cancelled => InventoryError::Cancelled,
         }
     }
+
+    /// The same programmed failure, as the registration path reports it.
+    ///
+    /// A second mapping rather than a conversion from [`InventoryError`], because
+    /// the two taxonomies genuinely differ at the point that matters: a `403`,
+    /// a `404` and a `422` are one `InventoryError::Github` between them and
+    /// three separate [`JitError`] variants, and the whole reason `c4` split them
+    /// is that an operator's next action differs for each. Routing a
+    /// registration failure through the inventory taxonomy first would collapse
+    /// exactly the distinction a consumer is testing.
+    ///
+    /// `target` and `runner_group_id` are the request's own, which is where the
+    /// real gateway takes them from too: a failing response has nothing in it to
+    /// name the group that was refused.
+    fn into_jit_error(self, target: &ScaleTarget, runner_group_id: u64) -> JitError {
+        let slug = target.slug();
+        match self {
+            Self::RateLimited {
+                kind,
+                retry_after_secs,
+                remaining,
+                reset_unix_secs,
+            } => JitError::RateLimited(RateLimited {
+                kind,
+                retry_after: retry_after_secs.map(Duration::from_secs),
+                remaining,
+                reset_unix_secs,
+            }),
+            Self::Forbidden { message } => JitError::Forbidden {
+                target: slug,
+                runner_group_id,
+                message,
+            },
+            Self::Status {
+                status: 404,
+                message,
+            } => JitError::NotFound {
+                target: slug,
+                runner_group_id,
+                message,
+            },
+            Self::Status {
+                status: 422,
+                message,
+            } => JitError::Rejected {
+                target: slug,
+                message,
+            },
+            Self::Cancelled => JitError::Cancelled,
+            Self::RevokedToken => JitError::Github(GithubError::AuthenticationFailed),
+            Self::AuthenticationLockout { retry_after_secs } => {
+                JitError::Github(GithubError::AuthenticationLockout {
+                    retry_after: Duration::from_secs(retry_after_secs),
+                })
+            }
+            Self::Status { status, message } => JitError::Github(GithubError::Status {
+                status,
+                method: "POST".to_string(),
+                path: slug,
+                message,
+                headers: Box::new(HeaderMap::new()),
+            }),
+        }
+    }
 }
 
 /// One call a consumer made, in the order it made them.
@@ -181,6 +291,18 @@ pub enum FakeCall {
     ListRunners(ScaleTarget),
     InProgressActivity(ScaleTarget),
     RunnerDownloads(ScaleTarget),
+    /// A demand poll. Distinct from [`FakeCall::InProgressActivity`] because the
+    /// two ask GitHub different questions — `status=queued` against
+    /// `status=in_progress` — and a consumer that polled the wrong one would
+    /// otherwise look identical here.
+    QueuedDemand(ScaleTarget),
+    /// A just-in-time registration, with the request that was sent.
+    ///
+    /// The whole request travels rather than only the target, because the two
+    /// things most worth asserting about a registration are in it: the labels
+    /// (`v1`: none are added implicitly, so what is asked for is what exists)
+    /// and the runner group id (mandatory, with no server-side default).
+    GenerateJitConfig(ScaleTarget, JitRunnerRequest),
 }
 
 // ---------------------------------------------------------------------------
@@ -197,11 +319,35 @@ struct FakeState {
     /// Repositories that cannot be counted at all, and the reason each gives.
     unavailable_activity: BTreeMap<OwnerRepo, String>,
     downloads: Vec<RunnerDownload>,
-    queued_failures: VecDeque<FakeFailure>,
-    latched_failure: Option<FakeFailure>,
+    /// Queued workflow **runs** per repository — the demand signal.
+    ///
+    /// Deliberately a separate map from `activity`, and not because the numbers
+    /// might differ by accident: they answer different questions. `activity` is
+    /// `status=in_progress`, which is work that already has a runner; this is
+    /// `status=queued`, which is work waiting for one that does not exist. A
+    /// fixture that could only set them together could not catch a consumer
+    /// that read the wrong one.
+    queued: BTreeMap<OwnerRepo, u32>,
+    /// Repositories whose queued count is a **floor**, as the bounded fallback
+    /// walk leaves them.
+    truncated_queued: BTreeSet<OwnerRepo>,
+    /// Repositories that cannot be polled at all, and the reason each gives.
+    unavailable_queued: BTreeMap<OwnerRepo, String>,
+    /// What `generate-jitconfig` answers with.
+    jit_config: String,
+    /// The id the next registration reports, incremented per call so that two
+    /// registrations in one test are distinguishable.
+    next_runner_id: u64,
+    /// Registration failures, kept apart from `queued_failures` so that a test
+    /// can refuse a registration while demand still answers — which is the
+    /// ordinary case an `e1` test needs and the one a shared queue cannot
+    /// express.
+    queued_jit_failures: VecDeque<FakeFailure>,
     calls: Vec<FakeCall>,
     requests_issued: u64,
     headroom: Option<RateLimitHeadroom>,
+    queued_failures: VecDeque<FakeFailure>,
+    latched_failure: Option<FakeFailure>,
 }
 
 /// A GitHub gateway that answers from what a test put in it.
@@ -228,7 +374,11 @@ impl FakeGithub {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(FakeState::default()),
+            state: Mutex::new(FakeState {
+                jit_config: DEFAULT_JIT_CONFIG.to_string(),
+                next_runner_id: FIRST_RUNNER_ID,
+                ..FakeState::default()
+            }),
             page_size: DEFAULT_PAGE_SIZE,
             clock: Arc::new(FakeClock::default()),
         }
@@ -346,6 +496,102 @@ impl FakeGithub {
         self
     }
 
+    /// This repository's queued workflow-run count — its demand signal.
+    ///
+    /// # This is a count of runs, not of jobs
+    ///
+    /// The real gateway reads `total_count` from `?status=queued`, which counts
+    /// **workflow runs**, and a run can hold many jobs each needing its own
+    /// runner. That under-count is an owner decision and accepted product
+    /// behaviour (`runner_manager_github::demand`), so a fixture that let a test
+    /// set "queued jobs" would be modelling a number the product never sees.
+    ///
+    /// Job-level fixtures do exist and are `b1`'s:
+    /// [`crate::fixtures::queued_job`], [`crate::fixtures::queued_jobs`] and
+    /// [`crate::fixtures::unresolvable_job`] build the `RunsOn` values
+    /// `RoutingLabels::tally` matches. They belong to the domain's label
+    /// predicate rather than to this gateway, because after the owner decision
+    /// there is no endpoint here that would return them.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_queued_runs(self, repository: OwnerRepo, count: u32) -> Self {
+        self.lock().queued.insert(repository, count);
+        self
+    }
+
+    /// This repository's queued count as a **floor** rather than a total.
+    ///
+    /// What the real gateway produces when GitHub sends no `total_count` and the
+    /// fallback walk stops at its page bound. Pair with
+    /// [`Self::with_unavailable_demand`] and keep the two distinct: a floor is a
+    /// lower bound that is safe to scale **up** from, an unavailable repository
+    /// is unknown and is not.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_truncated_queued_runs(self, repository: OwnerRepo, floor: u32) -> Self {
+        let mut state = self.lock();
+        state.queued.insert(repository.clone(), floor);
+        state.truncated_queued.insert(repository);
+        drop(state);
+        self
+    }
+
+    /// A repository whose demand cannot be polled at all, and why.
+    ///
+    /// Reported through [`QueuedDemand::unavailable`] rather than as a zero,
+    /// which is the distinction that matters most on this read model: a zero
+    /// tells `e1` there is nothing to serve, and `e1` acts on that by starting
+    /// no runners. It is left **out** of [`QueuedDemand::per_repository`]
+    /// entirely, exactly as the real gateway leaves it.
+    ///
+    /// The request is still charged — the real gateway spends one before
+    /// learning the repository is unreadable.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_unavailable_demand(self, repository: OwnerRepo, reason: impl Into<String>) -> Self {
+        self.lock()
+            .unavailable_queued
+            .insert(repository, reason.into());
+        self
+    }
+
+    /// The encoded configuration `generate-jitconfig` hands back.
+    ///
+    /// Defaults to [`DEFAULT_JIT_CONFIG`]. Override it when a test needs to
+    /// distinguish two registrations, or needs a value its own log scan searches
+    /// for.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_jit_config(self, config: impl Into<String>) -> Self {
+        self.lock().jit_config = config.into();
+        self
+    }
+
+    /// Fail the next **registration**, then recover.
+    ///
+    /// Separate from [`FakeGithub::fail_next`] on purpose: the ordinary case an
+    /// `e1` test needs is a target whose demand answers normally and whose
+    /// registration is refused, and one shared queue cannot express it — the
+    /// demand poll would consume the failure before the registration ever ran.
+    ///
+    /// [`FakeGithub::fail_always`] still latches across **both**, because the
+    /// failures it is for — a revoked token, an exhausted quota — really are
+    /// facts about the credential rather than about one endpoint.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    pub fn fail_next_registration(&self, failure: FakeFailure) {
+        self.lock().queued_jit_failures.push_back(failure);
+    }
+
     /// What [`InventoryGateway::headroom`] reports.
     ///
     /// # Panics
@@ -382,6 +628,7 @@ impl FakeGithub {
         let mut state = self.lock();
         state.latched_failure = None;
         state.queued_failures.clear();
+        state.queued_jit_failures.clear();
     }
 
     /// Every call a consumer made, in order.
@@ -437,6 +684,29 @@ impl FakeGithub {
         }
         match state.queued_failures.pop_front() {
             Some(failure) => Err(failure.into_error(path)),
+            None => Ok(()),
+        }
+    }
+
+    /// The registration path's counterpart, over the registration taxonomy.
+    ///
+    /// The latched failure is shared with [`Self::begin`] and the one-shot queue
+    /// is not; see [`FakeGithub::fail_next_registration`] for why the two are
+    /// split that way.
+    fn begin_registration(
+        &self,
+        target: &ScaleTarget,
+        request: &JitRunnerRequest,
+    ) -> Result<(), JitError> {
+        let mut state = self.lock();
+        state
+            .calls
+            .push(FakeCall::GenerateJitConfig(target.clone(), request.clone()));
+        if let Some(latched) = state.latched_failure.clone() {
+            return Err(latched.into_jit_error(target, request.runner_group_id()));
+        }
+        match state.queued_jit_failures.pop_front() {
+            Some(failure) => Err(failure.into_jit_error(target, request.runner_group_id())),
             None => Ok(()),
         }
     }
@@ -664,6 +934,97 @@ impl InventoryGateway for FakeGithub {
 
     fn now(&self) -> Timestamp {
         self.clock.now()
+    }
+}
+
+#[async_trait::async_trait]
+impl DemandGateway for FakeGithub {
+    async fn queued_demand(
+        &self,
+        scope: &ActivityScope,
+        cancel: &CancelToken,
+    ) -> Result<QueuedDemand, InventoryError> {
+        cancel.check()?;
+        self.begin(
+            FakeCall::QueuedDemand(scope.target().clone()),
+            &scope.target().slug(),
+        )?;
+
+        let mut state = self.lock();
+        // One request per repository, exactly as the real gateway spends them.
+        // An organization reaching ten repositories costs ten, and this is the
+        // number `f2`'s `add` refusals are computed from, so a consumer that
+        // quietly started costing more should fail here rather than in
+        // production.
+        state.requests_issued += u64::try_from(scope.repositories().len()).unwrap_or(u64::MAX);
+
+        let counts = scope
+            .repositories()
+            .iter()
+            .filter(|repository| !state.unavailable_queued.contains_key(*repository))
+            .map(|repository| {
+                let count = state.queued.get(repository).copied().unwrap_or(0);
+                (repository.clone(), count)
+            })
+            .collect();
+
+        let mut demand = QueuedDemand::new(counts);
+        for repository in scope.repositories() {
+            if let Some(reason) = state.unavailable_queued.get(repository) {
+                demand = demand.with_unavailable(repository.clone(), reason.clone());
+            } else if state.truncated_queued.contains(repository) {
+                demand = demand.with_truncated(repository.clone());
+            }
+        }
+        Ok(demand)
+    }
+
+    fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+}
+
+#[async_trait::async_trait]
+impl JitGateway for FakeGithub {
+    async fn generate_jit_config(
+        &self,
+        target: &ScaleTarget,
+        request: &JitRunnerRequest,
+        cancel: &CancelToken,
+    ) -> Result<JitRegistration, JitError> {
+        if cancel.is_cancelled() {
+            return Err(JitError::Cancelled);
+        }
+        self.begin_registration(target, request)?;
+
+        let mut state = self.lock();
+        state.requests_issued += 1;
+        let id = state.next_runner_id;
+        state.next_runner_id += 1;
+        let config = EncodedJitConfig::new(state.jit_config.clone());
+
+        Ok(JitRegistration::new(
+            config,
+            JitRunner {
+                id,
+                name: request.name().to_string(),
+                os: "windows".to_string(),
+                // `v1` read back `offline`: the runner is registered but its
+                // process has not started, which is the state `e3` finds it in.
+                status: "offline".to_string(),
+                busy: false,
+                runner_group_id: Some(request.runner_group_id()),
+                // Exactly the labels requested, lower-cased — the two facts `v1`
+                // established about what GitHub stores. A fake that added
+                // `self-hosted` here would let a consumer's test pass on a
+                // runner the real GitHub never creates.
+                labels: request
+                    .labels()
+                    .iter()
+                    .map(|label| label.to_ascii_lowercase())
+                    .collect(),
+            },
+        ))
     }
 }
 
@@ -969,5 +1330,347 @@ mod tests {
             None,
             "nothing observed is not the same as a full quota"
         );
+    }
+
+    // -- demand and just-in-time registration -------------------------------
+
+    /// The reconciliation loop `e1` will write, driven entirely against this
+    /// fake: read demand, clamp it against the policy's ceiling, and register
+    /// that many runners.
+    ///
+    /// This is the test `c4`'s Definition of Done asks for — "the fake gateway
+    /// … is used by an `e1` test". `crates/agent/src/reconcile.rs` is still a
+    /// one-line stub owned by `e1`, so the test lives here, where it can be
+    /// written without editing another task's file. What it proves is what `e1`
+    /// needs the fake to be able to express: a demand number, a clamp, a
+    /// registration per runner, and a request count that matches the budget
+    /// model.
+    #[tokio::test]
+    async fn a_reconciliation_loop_reads_demand_clamps_it_and_registers_that_many_runners() {
+        use crate::fixtures;
+        use runner_manager_domain::capacity::{HostAllocator, LimitingFactor};
+        use runner_manager_github::jit::JitRunnerRequest;
+
+        let gateway = FakeGithub::new()
+            .with_queued_runs(repo(), 5)
+            .with_queued_runs(other_repo(), 2);
+        let scope = org_scope([repo(), other_repo()]);
+        let cancel = CancelToken::new();
+
+        let demand = gateway
+            .queued_demand(&scope, &cancel)
+            .await
+            .expect("a demand reading");
+        assert_eq!(
+            demand.total(),
+            7,
+            "the aggregate is the sum of its repositories"
+        );
+        assert!(demand.is_complete());
+
+        // `b1`'s real allocator, not an inline `clamp`: `max_capacity` beats
+        // reported demand and `host_capacity` beats `max_capacity`
+        // (`04-subsystem-contracts.md`, precedence rules 5 and 6), and driving
+        // the fake's number through the type that enforces both is what makes
+        // this an `e1`-shaped test rather than an arithmetic one.
+        let host = fixtures::host().capacity(8).build();
+        let policy = fixtures::policy().autoscale("home", 3).active().build();
+        let mut allocator = HostAllocator::from_attempts(&host, []);
+        let allocation = allocator.allocate(&policy, demand.total());
+
+        assert_eq!(
+            allocation.desired, 3,
+            "seven queued runs against a ceiling of three"
+        );
+        assert_eq!(allocation.to_start, 3);
+        assert_eq!(
+            allocation.limiting_factor,
+            LimitingFactor::MaxCapacity,
+            "the ceiling bound before the host did, and an operator has to be told which"
+        );
+
+        let wanted = allocation.to_start;
+        for index in 0..wanted {
+            let request = JitRunnerRequest::new(
+                format!("rm-home-win-x64-{index:04}"),
+                1,
+                ["rm-home-win-x64"],
+            );
+            let registration = gateway
+                .generate_jit_config(scope.target(), &request, &cancel)
+                .await
+                .expect("a registration");
+            assert_eq!(
+                registration.runner().id,
+                FIRST_RUNNER_ID + u64::from(index),
+                "each registration reports a distinct runner id, or a consumer cannot \
+                 tell two attempts apart"
+            );
+            assert_eq!(registration.config().expose(), DEFAULT_JIT_CONFIG);
+        }
+
+        assert_eq!(
+            gateway.requests_issued(),
+            2 + u64::from(wanted),
+            "one request per repository for demand, plus one per registration -- the \
+             number `f2` computes its `add` refusals from"
+        );
+        assert_eq!(
+            gateway.calls().len(),
+            1 + wanted as usize,
+            "one demand poll over the whole scope, then one call per runner"
+        );
+        assert!(matches!(gateway.calls()[0], FakeCall::QueuedDemand(_)));
+    }
+
+    /// Demand and the in-progress count are separate knobs, and a consumer that
+    /// reads the wrong one is visible in `calls()`.
+    #[tokio::test]
+    async fn queued_demand_and_in_progress_activity_are_different_numbers() {
+        let gateway = FakeGithub::new()
+            .with_queued_runs(repo(), 4)
+            .with_in_progress(repo(), 11);
+        let scope = ActivityScope::repository(repo());
+        let cancel = CancelToken::new();
+
+        let demand = gateway
+            .queued_demand(&scope, &cancel)
+            .await
+            .expect("demand");
+        let activity = gateway
+            .in_progress_activity(&scope, &cancel)
+            .await
+            .expect("activity");
+
+        assert_eq!(
+            demand.total(),
+            4,
+            "work waiting for a runner that does not exist"
+        );
+        assert_eq!(activity.total(), 11, "work that already has one");
+        assert_ne!(
+            demand.total(),
+            activity.total(),
+            "a fixture that could only set them together could not catch a consumer \
+             that conflated them"
+        );
+        assert_eq!(
+            gateway.calls(),
+            vec![
+                FakeCall::QueuedDemand(scope.target().clone()),
+                FakeCall::InProgressActivity(scope.target().clone()),
+            ]
+        );
+    }
+
+    /// A demand count can be short in two ways, and the fake can produce both.
+    #[tokio::test]
+    async fn a_demand_reading_can_be_a_floor_or_can_be_missing_a_repository() {
+        let gateway = FakeGithub::new()
+            .with_truncated_queued_runs(repo(), 400)
+            .with_unavailable_demand(other_repo(), "repository archived");
+
+        let demand = gateway
+            .queued_demand(&org_scope([repo(), other_repo()]), &CancelToken::new())
+            .await
+            .expect("an aggregate steps over a repository it cannot poll");
+
+        assert_eq!(demand.total(), 400);
+        assert!(!demand.is_complete());
+        assert!(demand.is_truncated(&repo()));
+        assert_eq!(demand.unavailable().len(), 1);
+        assert_eq!(
+            demand.for_repository(&other_repo()),
+            None,
+            "a repository that could not be polled is absent from the map, not present \
+             as a zero -- `e1` would read a zero as `start no runners`"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            2,
+            "the request that discovered the repository was unreadable was still spent"
+        );
+    }
+
+    /// Each registration failure mode is a distinct outcome the fake can
+    /// program, and none of them is the same value as another.
+    #[tokio::test]
+    async fn every_registration_failure_mode_is_programmable_and_distinct() {
+        use runner_manager_github::jit::{JitError, JitRunnerRequest};
+
+        let request = JitRunnerRequest::new("runner-1", 2, ["rm-home-win-x64"]);
+        let target = ScaleTarget::Organization(
+            runner_manager_domain::model::Org::new("octo-org").expect("a valid login"),
+        );
+
+        /// The outcome a consumer is expected to branch on for one programmed
+        /// failure. Named rather than written inline because `clippy` refuses
+        /// the tuple otherwise, and because the name is what says the predicate
+        /// is a *consumer's* `match` arm rather than an equality check.
+        type ExpectedOutcome = fn(&JitError) -> bool;
+
+        let cases: Vec<(FakeFailure, ExpectedOutcome)> = vec![
+            (
+                FakeFailure::Forbidden {
+                    message: Some("GitHub hosted runner groups cannot be modified".into()),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        JitError::Forbidden {
+                            runner_group_id: 2,
+                            ..
+                        }
+                    )
+                },
+            ),
+            (FakeFailure::not_found(), |error| {
+                matches!(
+                    error,
+                    JitError::NotFound {
+                        runner_group_id: 2,
+                        ..
+                    }
+                )
+            }),
+            (
+                FakeFailure::Status {
+                    status: 422,
+                    message: Some("Invalid property /labels".into()),
+                },
+                |error| matches!(error, JitError::Rejected { .. }),
+            ),
+            (FakeFailure::secondary_rate_limit(60), |error| {
+                error.rate_limited().is_some()
+            }),
+            (FakeFailure::RevokedToken, |error| {
+                error.is_terminal() && error.rate_limited().is_none()
+            }),
+            (FakeFailure::Cancelled, JitError::is_cancelled),
+        ];
+
+        for (failure, expected) in cases {
+            let gateway = FakeGithub::new();
+            gateway.fail_next_registration(failure.clone());
+            let error = gateway
+                .generate_jit_config(&target, &request, &CancelToken::new())
+                .await
+                .expect_err("the programmed failure");
+            assert!(
+                expected(&error),
+                "{failure:?} did not produce the outcome a consumer branches on: {error:?}"
+            );
+
+            // And the failure is one-shot: the next call succeeds, which is what
+            // `fail_next` means and what a recovery test depends on.
+            gateway
+                .generate_jit_config(&target, &request, &CancelToken::new())
+                .await
+                .expect("a queued failure is consumed once");
+        }
+    }
+
+    /// A refused registration must not need demand to fail with it.
+    ///
+    /// This is why the registration queue is separate from the inventory one: a
+    /// shared queue would have the demand poll consume the failure, and the
+    /// scenario `e1` most needs — demand answers, registration is refused —
+    /// would be unwritable.
+    #[tokio::test]
+    async fn a_registration_can_be_refused_while_demand_still_answers() {
+        let gateway = FakeGithub::new().with_queued_runs(repo(), 3);
+        gateway.fail_next_registration(FakeFailure::Forbidden {
+            message: Some("Resource not accessible by integration".into()),
+        });
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("demand is unaffected by a registration failure");
+        assert_eq!(demand.total(), 3);
+
+        let error = gateway
+            .generate_jit_config(
+                &target(),
+                &runner_manager_github::jit::JitRunnerRequest::new("r", 1, ["a"]),
+                &CancelToken::new(),
+            )
+            .await
+            .expect_err("the registration is refused");
+        assert!(error.is_terminal());
+    }
+
+    /// A latched failure is a fact about the credential and reaches both paths.
+    #[tokio::test]
+    async fn a_latched_failure_reaches_the_registration_path_too() {
+        let gateway = FakeGithub::new();
+        gateway.fail_always(FakeFailure::RevokedToken);
+
+        assert!(
+            gateway
+                .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            gateway
+                .generate_jit_config(
+                    &target(),
+                    &runner_manager_github::jit::JitRunnerRequest::new("r", 1, ["a"]),
+                    &CancelToken::new()
+                )
+                .await
+                .is_err(),
+            "a revoked token is not a property of one endpoint"
+        );
+
+        gateway.recover();
+        assert!(
+            gateway
+                .generate_jit_config(
+                    &target(),
+                    &runner_manager_github::jit::JitRunnerRequest::new("r", 1, ["a"]),
+                    &CancelToken::new()
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The registered runner reports exactly the labels asked for, lower-cased,
+    /// with nothing added.
+    ///
+    /// `v1`'s finding, modelled here rather than assumed: a fake that added
+    /// `self-hosted` would let a consumer's test pass against a runner the real
+    /// GitHub never creates, and the workflow would then not match in
+    /// production.
+    #[tokio::test]
+    async fn the_fake_adds_no_labels_of_its_own_and_lower_cases_what_it_is_given() {
+        let gateway = FakeGithub::new();
+        let request = runner_manager_github::jit::JitRunnerRequest::new(
+            "runner-1",
+            7,
+            ["RM-Home-Win-X64", "Windows"],
+        );
+
+        let registration = gateway
+            .generate_jit_config(&target(), &request, &CancelToken::new())
+            .await
+            .expect("a registration");
+
+        assert_eq!(
+            registration.runner().labels,
+            vec!["rm-home-win-x64".to_string(), "windows".to_string()],
+            "GitHub stores labels lower-cased"
+        );
+        assert!(
+            !registration
+                .runner()
+                .labels
+                .iter()
+                .any(|label| label == "self-hosted"),
+            "no labels are added implicitly"
+        );
+        assert_eq!(registration.runner().runner_group_id, Some(7));
     }
 }

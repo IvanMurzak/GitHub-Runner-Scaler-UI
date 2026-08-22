@@ -916,9 +916,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(runs_path.clone()))
             .and(query_param("page", "3"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(queued_body_without_total(50)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(queued_body_without_total(50)))
             .mount(&server)
             .await;
         Mock::given(method("GET"))

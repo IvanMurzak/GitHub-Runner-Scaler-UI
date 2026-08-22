@@ -181,7 +181,11 @@ impl JitRunnerRequest {
     /// **no labels are added implicitly**, so a label the operator expects to be
     /// matchable has to be in this array or it does not exist on the runner.
     #[must_use]
-    pub fn for_policy(name: impl Into<String>, runner_group_id: u64, labels: &RoutingLabels) -> Self {
+    pub fn for_policy(
+        name: impl Into<String>,
+        runner_group_id: u64,
+        labels: &RoutingLabels,
+    ) -> Self {
         Self::new(name, runner_group_id, labels.as_registration_labels())
     }
 
@@ -266,7 +270,14 @@ struct JitRequestBody<'a> {
 /// * **It is not [`Clone`].** A clone of a secret is a second copy with its own
 ///   lifetime, and this value's whole security property is a short one.
 ///
-/// ```compile_fail
+/// The error code is pinned, and that is the whole value of the doctest. A bare
+/// `compile_fail` passes when the snippet fails to compile for *any* reason — a
+/// typo, a renamed type, a missing import — so it would keep passing after
+/// someone added a `Serialize` derive and broke something else in the same
+/// edit. `E0277` is "the trait bound is not satisfied", which is the one reason
+/// this claim is about.
+///
+/// ```compile_fail,E0277
 /// # use runner_manager_github::jit::EncodedJitConfig;
 /// fn is_serialisable<T: serde::Serialize>(_: &T) {}
 /// let config = EncodedJitConfig::new("not-a-real-jit-configuration");
@@ -648,11 +659,9 @@ impl RestJit {
     #[must_use]
     pub fn path(target: &ScaleTarget) -> String {
         match target {
-            ScaleTarget::Repository(repo) => format!(
-                "/repos/{}/{}{JITCONFIG_PATH}",
-                repo.owner(),
-                repo.repo()
-            ),
+            ScaleTarget::Repository(repo) => {
+                format!("/repos/{}/{}{JITCONFIG_PATH}", repo.owner(), repo.repo())
+            }
             ScaleTarget::Organization(org) => {
                 format!("/orgs/{}{JITCONFIG_PATH}", org.as_str())
             }
@@ -698,7 +707,11 @@ impl RestJit {
         }
     }
 
-    fn from_inventory(error: InventoryError, target: &ScaleTarget, runner_group_id: u64) -> JitError {
+    fn from_inventory(
+        error: InventoryError,
+        target: &ScaleTarget,
+        runner_group_id: u64,
+    ) -> JitError {
         match error {
             InventoryError::Cancelled => JitError::Cancelled,
             InventoryError::RateLimited(limit) => JitError::RateLimited(limit),
@@ -1034,7 +1047,10 @@ mod tests {
              make a runner answer a `runs-on` the operator never asked it to"
         );
         assert!(
-            request.labels().iter().all(|l| l == &l.to_ascii_lowercase()),
+            request
+                .labels()
+                .iter()
+                .all(|l| l == &l.to_ascii_lowercase()),
             "GitHub stores labels lower-cased, so what is sent and what is stored must be \
              the same string"
         );
@@ -1062,7 +1078,13 @@ mod tests {
                 .await
                 .expect_err("a 403 is a failure");
             assert!(
-                matches!(error, JitError::Forbidden { runner_group_id: 3, .. }),
+                matches!(
+                    error,
+                    JitError::Forbidden {
+                        runner_group_id: 3,
+                        ..
+                    }
+                ),
                 "a 403 must be its own outcome and must name the group: {error:?}"
             );
             assert!(error.is_terminal(), "a 403 is terminal");
@@ -1086,7 +1108,13 @@ mod tests {
                 .await
                 .expect_err("a 404 is a failure");
             assert!(
-                matches!(error, JitError::NotFound { runner_group_id: 3, .. }),
+                matches!(
+                    error,
+                    JitError::NotFound {
+                        runner_group_id: 3,
+                        ..
+                    }
+                ),
                 "a 404 must be its own outcome: {error:?}"
             );
             assert!(error.is_terminal());
@@ -1135,7 +1163,11 @@ mod tests {
         )
         .await;
         let hosted_group = gateway(&server)
-            .generate_jit_config(&target, &JitRunnerRequest::new("n", 2, ["a"]), &CancelToken::new())
+            .generate_jit_config(
+                &target,
+                &JitRunnerRequest::new("n", 2, ["a"]),
+                &CancelToken::new(),
+            )
             .await
             .expect_err("group 2 is not administrable");
 
@@ -1150,8 +1182,20 @@ mod tests {
             .await
             .expect_err("group 99999 does not exist");
 
-        assert!(matches!(hosted_group, JitError::Forbidden { runner_group_id: 2, .. }));
-        assert!(matches!(missing_group, JitError::NotFound { runner_group_id: 99_999, .. }));
+        assert!(matches!(
+            hosted_group,
+            JitError::Forbidden {
+                runner_group_id: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            missing_group,
+            JitError::NotFound {
+                runner_group_id: 99_999,
+                ..
+            }
+        ));
         assert_ne!(
             hosted_group.operator_action(),
             missing_group.operator_action(),
@@ -1236,7 +1280,10 @@ mod tests {
 
         let debug = format!("{config:?}");
         let display = format!("{config}");
-        assert!(!debug.contains(FIXTURE_JIT_CONFIG), "Debug leaked it: {debug}");
+        assert!(
+            !debug.contains(FIXTURE_JIT_CONFIG),
+            "Debug leaked it: {debug}"
+        );
         assert!(
             !display.contains(FIXTURE_JIT_CONFIG),
             "Display leaked it: {display}"
@@ -1266,7 +1313,10 @@ mod tests {
             !rendered.contains(FIXTURE_JIT_CONFIG),
             "the registration's Debug leaked it: {rendered}"
         );
-        assert!(rendered.contains("runner"), "and still says something useful");
+        assert!(
+            rendered.contains("runner"),
+            "and still says something useful"
+        );
     }
 
     /// The scan above can actually see a leak.
