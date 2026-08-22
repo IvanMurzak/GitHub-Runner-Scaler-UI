@@ -545,6 +545,7 @@ pub struct NextPoll {
 pub struct PollSchedule {
     interval: RefreshInterval,
     consecutive_offline: u32,
+    offline_since: Option<Timestamp>,
 }
 
 impl PollSchedule {
@@ -553,6 +554,7 @@ impl PollSchedule {
         Self {
             interval,
             consecutive_offline: 0,
+            offline_since: None,
         }
     }
 
@@ -571,6 +573,20 @@ impl PollSchedule {
     #[must_use]
     pub const fn consecutive_offline(&self) -> u32 {
         self.consecutive_offline
+    }
+
+    /// How long GitHub has been unreachable, or `None` when it is not.
+    ///
+    /// Measured from the first poll of the current run rather than inferred
+    /// from [`Self::consecutive_offline`] times the interval. The two diverge
+    /// as soon as the back-off starts doubling, and this is the number the
+    /// 24-hour queue-cancellation warning is compared against — an estimate
+    /// would make that warning fire early or late, and it is the one thing the
+    /// offline state exists to say.
+    #[must_use]
+    pub fn offline_for(&self, now: Timestamp) -> Option<Duration> {
+        let since = self.offline_since?;
+        now.signed_duration_since(since).to_std().ok()
     }
 
     /// The hard floor no computed delay may go below.
@@ -596,7 +612,7 @@ impl PollSchedule {
 
         let next = match failure {
             None => {
-                self.consecutive_offline = 0;
+                self.recovered();
                 NextPoll {
                     delay: nominal,
                     pace: PollPace::Nominal,
@@ -604,6 +620,8 @@ impl PollSchedule {
             }
             Some(RefreshState::Offline) => {
                 self.consecutive_offline = self.consecutive_offline.saturating_add(1);
+                // The instant the *run* began, not the instant of this poll.
+                self.offline_since.get_or_insert(now);
                 NextPoll {
                     delay: self.offline_delay(nominal, jitter),
                     pace: PollPace::Offline {
@@ -612,7 +630,7 @@ impl PollSchedule {
                 }
             }
             Some(state @ RefreshState::RateLimited(limit)) => {
-                self.consecutive_offline = 0;
+                self.recovered();
                 NextPoll {
                     // `max`, never `+`. See the type documentation.
                     delay: retry_floor(state, now).max(nominal),
@@ -620,7 +638,7 @@ impl PollSchedule {
                 }
             }
             Some(state @ RefreshState::LockedOut { .. }) => {
-                self.consecutive_offline = 0;
+                self.recovered();
                 NextPoll {
                     delay: retry_floor(state, now).max(nominal),
                     pace: PollPace::LockedOut,
@@ -632,7 +650,9 @@ impl PollSchedule {
             // does not stop, because the poll is also how a re-authentication
             // is noticed.
             Some(_) => {
-                self.consecutive_offline = 0;
+                // GitHub answered, so it is reachable: whatever is wrong, it is
+                // not an outage, and an outage run that was open must close.
+                self.recovered();
                 NextPoll {
                     delay: nominal,
                     pace: PollPace::Blocked,
@@ -645,6 +665,12 @@ impl PollSchedule {
             "the 30-second floor is a rate-budget constraint and no branch may go below it"
         );
         next
+    }
+
+    /// GitHub answered something. Whatever it was, the outage run is over.
+    fn recovered(&mut self) {
+        self.consecutive_offline = 0;
+        self.offline_since = None;
     }
 
     fn offline_delay(&self, nominal: Duration, jitter: &dyn Jitter) -> Duration {
@@ -1393,6 +1419,9 @@ pub struct ReconcileReport {
     pub deferred: u16,
     /// The most severe failure across the targets polled, when there was one.
     pub failure: Option<RefreshState>,
+    /// What to display while GitHub is unreachable, including how long the
+    /// outage has run and therefore whether queued work has already been lost.
+    pub offline: Option<OfflineState>,
     /// When to poll next, and why then.
     pub next_poll: NextPoll,
     /// Demand requests this pass projected against the shared hourly ceiling.
@@ -1417,13 +1446,8 @@ impl ReconcileReport {
 
     /// The offline state to display, when this pass was one.
     #[must_use]
-    pub fn offline_state(&self) -> Option<OfflineState> {
-        match self.next_poll.pace {
-            PollPace::Offline { consecutive } => {
-                Some(OfflineState::new(consecutive, self.next_poll.delay))
-            }
-            _ => None,
-        }
+    pub const fn offline_state(&self) -> Option<&OfflineState> {
+        self.offline.as_ref()
     }
 
     /// Attempts this pass created. The idle-host assertion reads this.
@@ -1616,6 +1640,16 @@ impl Reconciler {
             .schedule
             .next_poll(failure.as_ref(), now, self.jitter.as_ref());
         report.failure = failure;
+        // Flow 3.3's fourth obligation: the offline state carries the 24-hour
+        // bound, and it can only say whether that bound has passed if it is
+        // given the real elapsed time rather than an estimate from the interval.
+        if let PollPace::Offline { consecutive } = report.next_poll.pace {
+            let state = OfflineState::new(consecutive, report.next_poll.delay);
+            report.offline = Some(match self.schedule.offline_for(now) {
+                Some(elapsed) => state.since(elapsed),
+                None => state,
+            });
+        }
         self.events.emit(LifecycleEvent::PollScheduled {
             retry_in_ms: u64::try_from(report.next_poll.delay.as_millis()).unwrap_or(u64::MAX),
             pace: report.next_poll.pace,
@@ -2048,6 +2082,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeDemand {
         outcome: Mutex<Option<PollOutcome>>,
+        /// Answers programmed for one target, which beat the blanket one.
+        per_target: Mutex<BTreeMap<ScaleTarget, PollOutcome>>,
         scopes: Mutex<Vec<ActivityScope>>,
     }
 
@@ -2071,6 +2107,14 @@ mod tests {
             *self.outcome.lock().unwrap() = Some(outcome);
         }
 
+        /// Program one target's answer, overriding the blanket one.
+        fn set_for(&self, target: &ScaleTarget, outcome: PollOutcome) {
+            self.per_target
+                .lock()
+                .unwrap()
+                .insert(target.clone(), outcome);
+        }
+
         fn polls(&self) -> Vec<ActivityScope> {
             self.scopes.lock().unwrap().clone()
         }
@@ -2080,6 +2124,9 @@ mod tests {
     impl DemandSource for FakeDemand {
         async fn poll(&self, scope: &ActivityScope) -> PollOutcome {
             self.scopes.lock().unwrap().push(scope.clone());
+            if let Some(outcome) = self.per_target.lock().unwrap().get(scope.target()) {
+                return outcome.clone();
+            }
             self.outcome
                 .lock()
                 .unwrap()
@@ -3119,21 +3166,136 @@ mod tests {
         assert_eq!(launcher.live_count(), 2);
     }
 
+    /// One unreachable target must not idle a whole host.
+    ///
+    /// The failure that decides the *schedule* is the most severe across every
+    /// target polled — backing the whole loop off during an outage is the safe
+    /// error, and `f3` runs one reconciler per target anyway, so in production
+    /// the two are usually the same thing. What must not follow from that is
+    /// refusing to serve a policy whose own target answered perfectly well, and
+    /// the two are easy to conflate because the offline reading is sitting in
+    /// the same map.
     #[tokio::test]
     async fn one_offline_target_does_not_stop_a_reachable_one() {
-        // Severity is picked across targets for the *schedule*, but a policy
-        // whose own target answered is still served. Anything else would let one
-        // unreachable repository idle a whole host.
-        let mut harness = Harness::simple(4, 2, "acme/app");
-        harness
-            .demand
-            .set(PollOutcome::Failed(RefreshState::Offline));
+        let mut harness = Harness::simple(8, 0, "acme/app");
+        harness.demand.set_for(
+            &ScaleTarget::repository("acme/app").unwrap(),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), 2)),
+        );
+        harness.demand.set_for(
+            &ScaleTarget::repository("acme/broken").unwrap(),
+            PollOutcome::Failed(RefreshState::Offline),
+        );
+
         let report = harness
             .reconciler
-            .reconcile(&[policy(1, "acme/app", 4)])
+            .reconcile(&[policy(1, "acme/app", 4), policy(2, "acme/broken", 4)])
             .await;
-        assert_eq!(report.started, 0);
+
+        assert_eq!(
+            report.started, 2,
+            "the reachable target was served; an unreachable sibling repository must not \
+             idle the host"
+        );
+        assert_eq!(report.unreadable, vec![PolicyId::from_u128(2)]);
+        assert_eq!(harness.demand.polls().len(), 2, "both targets were polled");
+
+        // And the schedule takes the worse of the two.
         assert!(report.is_offline());
+        assert_eq!(report.next_poll.pace, PollPace::Offline { consecutive: 1 });
+    }
+
+    /// The 24-hour bound has to be reachable in production, not only in a unit
+    /// test of [`OfflineState`].
+    ///
+    /// This was a real gap: the reconciler built its offline state from the
+    /// back-off count alone, so `offline_for` was always `None` and
+    /// [`OfflineState::has_outlasted_the_queue`] could never be true outside a
+    /// test that constructed the value by hand. An operator whose agent had been
+    /// offline for two days would have been told that an outage longer than 24
+    /// hours *would* lose queued work, in the future tense, having already lost
+    /// it.
+    ///
+    /// The elapsed time is measured from the first poll of the run rather than
+    /// derived from the interval, because the back-off doubles and the two
+    /// diverge immediately.
+    #[tokio::test]
+    async fn a_day_long_outage_says_that_queued_work_has_already_been_lost() {
+        let clock = Arc::new(FakeClock::default());
+        let launcher = Arc::new(FakeLauncher::new());
+        let demand = Arc::new(FakeDemand::failing(RefreshState::Offline));
+        let mut reconciler = Reconciler::new(
+            host_with(4),
+            ReconcilerPorts {
+                demand: Arc::clone(&demand) as Arc<dyn DemandSource>,
+                launcher: Arc::clone(&launcher) as Arc<dyn RunnerLauncher>,
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                jitter: Arc::new(NoJitter),
+                events: Arc::new(NoEvents),
+            },
+        );
+        let policy = policy(1, "acme/app", 4);
+
+        // The outage begins.
+        let first = reconciler.reconcile(std::slice::from_ref(&policy)).await;
+        let state = first.offline_state().expect("an offline state");
+        assert!(!state.has_outlasted_the_queue());
+        assert!(
+            state
+                .to_string()
+                .contains("an outage longer than that loses"),
+            "{state}"
+        );
+
+        // A day and a minute later, still unreachable.
+        clock.advance_secs(24 * 60 * 60 + 60);
+        let later = reconciler.reconcile(std::slice::from_ref(&policy)).await;
+        let state = later.offline_state().expect("an offline state");
+        assert!(state.has_outlasted_the_queue());
+        assert!(
+            state.to_string().contains("queued work has been lost"),
+            "{state}"
+        );
+        assert_eq!(launcher.launches(), 0, "and still nothing was started");
+
+        // Recovery closes the run, so a *later* outage measures from itself
+        // rather than from the first one.
+        demand.set(PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), 0)));
+        let recovered = reconciler.reconcile(std::slice::from_ref(&policy)).await;
+        assert!(recovered.offline_state().is_none());
+        assert_eq!(reconciler.schedule().offline_for(clock.now()), None);
+
+        demand.set(PollOutcome::Failed(RefreshState::Offline));
+        let again = reconciler.reconcile(std::slice::from_ref(&policy)).await;
+        assert!(
+            !again
+                .offline_state()
+                .expect("an offline state")
+                .has_outlasted_the_queue(),
+            "a new outage must not inherit the age of the one before it"
+        );
+    }
+
+    #[test]
+    fn tee_events_reaches_both_sinks() {
+        // `f3` wires the log sink and `g2`'s buffer at once, and an event that
+        // reached only one of them would be an activity view missing lines the
+        // log file has, or the reverse.
+        let left = Arc::new(EventLog::new());
+        let right = Arc::new(EventLog::new());
+        let tee = TeeEvents(
+            Arc::clone(&left) as Arc<dyn EventSink>,
+            Arc::clone(&right) as Arc<dyn EventSink>,
+        );
+
+        tee.emit(LifecycleEvent::MonitorOnlySkipped {
+            policy: PolicyId::from_u128(1),
+        });
+
+        assert_eq!(left.count_of("monitor_only_skipped"), 1);
+        assert_eq!(right.count_of("monitor_only_skipped"), 1);
     }
 
     // =======================================================================
