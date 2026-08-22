@@ -1706,6 +1706,22 @@ impl RestInventory {
     }
 
     /// One request, with cancellation and the rate-limit gate applied.
+    ///
+    /// # Cancellation is consulted twice, and the two are not redundant
+    ///
+    /// [`CancelToken::check`] decides *before* the rate-limit gate is read, and
+    /// [`CancelToken::run`] covers a token flipped while the socket is already
+    /// open. Removing either one leaves a real hole: without `check`, a caller
+    /// that cancelled a refresh which was also rate-limited is answered
+    /// [`InventoryError::RateLimited`] — told to wait for something it has
+    /// already withdrawn — and without `run`, a cancellation arriving mid-flight
+    /// is not noticed until the response does.
+    ///
+    /// They do overlap for the between-pages case, and deliberately: it is the
+    /// one the shared budget cares about, and a walk that keeps paging after the
+    /// operator navigated away spends real requests. A mutation test that
+    /// disables `check` alone leaves that case still guarded by `run`, which is
+    /// what defence in depth is supposed to look like.
     async fn get(
         &self,
         request: &ApiRequest,
@@ -1724,9 +1740,16 @@ impl RestInventory {
             return Err(InventoryError::RateLimited(limit));
         }
 
-        self.requests_issued.fetch_add(1, Ordering::SeqCst);
         let result = cancel
             .run(async {
+                // Counted *inside* the future, so the count is of requests
+                // actually attempted. Counting before `run` over-reported by one
+                // whenever a token was flipped between the check above and the
+                // first poll: `run`'s biased `select!` then answers
+                // `Cancelled` without ever polling this block, so no socket is
+                // opened — and a budget model measured against an over-count is
+                // a budget model that drifts every time an operator cancels.
+                self.requests_issued.fetch_add(1, Ordering::SeqCst);
                 self.client
                     .send(request)
                     .await
@@ -2918,6 +2941,12 @@ mod tests {
             requests_seen(&server).await,
             1,
             "a cancelled walk spends nothing further"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "and the budget accounting agrees with the wire: a request that was \
+             never polled is not a request that was issued"
         );
     }
 
