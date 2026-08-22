@@ -188,16 +188,19 @@ pub enum StoreError {
     /// all of it turns this error into a disclosure the moment it reaches a log.
     ///
     /// `table` and `column` are carried for the operator's sake and are also
-    /// what decides the echo: a column whose shape the schema fixes gets the
-    /// clipped echo of [`clip`], and one that may hold text a caller chose gets
-    /// position only, with none of the payload. See [`FREE_FORM_COLUMNS`].
+    /// what decides the echo: a column whose shape the schema fixes gets a
+    /// clipped echo of at most [`ECHO_LIMIT`] characters, and one that may hold
+    /// text a caller chose gets position only, with none of the payload. The
+    /// rule and the measurement behind it are on `FREE_FORM_COLUMNS`, beside the
+    /// decoder that applies it. (Named rather than linked: it is private, and a
+    /// link from here would not resolve for a reader of the public docs.)
     #[error("{table}.{column} of row {id} holds {value}, which is not {expected}")]
     CorruptColumn {
         table: &'static str,
         column: &'static str,
         id: String,
         /// At most [`ECHO_LIMIT`] characters of the offending payload for a
-        /// constrained column, and none of it for a [`FREE_FORM_COLUMNS`] one.
+        /// constrained column, and none of it for a free-form one.
         value: String,
         expected: &'static str,
     },
@@ -1397,8 +1400,8 @@ fn u64_to_sql(what: &'static str, value: u64) -> Result<i64, StoreError> {
 /// this, and anything longer is a payload rather than a value.
 ///
 /// It is not a limit that protects a *free-form* column, and it was once applied
-/// to one. See [`FREE_FORM_COLUMNS`] for why a fixed character budget is the
-/// wrong instrument there and what replaced it.
+/// to one. The private `FREE_FORM_COLUMNS` below carries the measurement of why
+/// a fixed character budget is the wrong instrument there, and what replaced it.
 pub const ECHO_LIMIT: usize = 60;
 
 /// The columns whose payload includes text a **caller** chose, and which an
