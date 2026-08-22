@@ -1,0 +1,20 @@
+crates/github/src/rest.rs
+  s_5332f62e0ed5a7::t_30dbb4ecaef479 2865-3128,3424-3483,3556-3587,3590-3645,3667-3668,3685
+  s_5332f62e0ed5a7::t_44fcda5f83bf25 178-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "db6745f77c12b3a8bd046e00753fab8387612ebd",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
