@@ -1,0 +1,25 @@
+crates/github/src/rest.rs
+  s_5332f62e0ed5a7::t_d2382d3e794adb 2887-2891
+  s_5332f62e0ed5a7::t_765f0734219cca 850-856,861
+  s_5332f62e0ed5a7::t_a51fe220fde4ee 2121-2386,2388-2402,2404-2428,2432-2481,2483-2532,2534-2567,2569-2886,2892-3155,3157-3209,3211-3399,3401-3519
+  s_5332f62e0ed5a7::t_503c92c556debc 2387
+  s_5332f62e0ed5a7::t_e64f286b1c4d93 2403,2429-2431,2482,2533,2568,3156,3210,3400
+crates/testkit/src/github.rs
+  s_5332f62e0ed5a7::t_80cc708523d4e3 2-591
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "996229f770761bb3d4337b6f2751b6a0aeedda86",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
