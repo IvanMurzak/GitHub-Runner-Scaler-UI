@@ -1466,6 +1466,66 @@ mod tests {
                 tracing::error!("plist rejected: <string>{secret}</string>");
                 tracing::error!("plist rejected: <key>token</key><string>{secret}</string>");
 
+                // 17. A `;` or an `&` *after a URL in the same word*. This is
+                //     shape 15 and shape 11 with one thing changed: a URL
+                //     earlier in the word. `STRUCTURAL` has nine characters and
+                //     `is_url_terminator` recognised seven of them -- `;` and
+                //     `&` were missing -- and the URL branch runs *ahead* of
+                //     the structural cut. So `split_url` swallowed everything
+                //     to the next terminator, including the separator that
+                //     would have cut the word, and `redact_url`'s terminal arm
+                //     echoed it verbatim.
+                //
+                //     The L3 fix (bounding the URL) and the L1 fix (cutting on
+                //     `;` and `&`) each work alone and did not compose: this
+                //     commit added `;` to `STRUCTURAL` *for connection strings*
+                //     while leaving the path a URL opens straight through it.
+                //     A connection string whose `Server=` is a URL is exactly
+                //     `d2`'s shape, and a systemd `Environment=` line is
+                //     `d3`'s.
+                tracing::error!(
+                    "store rejected: Server=https://vault.local/api;Password={secret};"
+                );
+                tracing::error!("keychain error: url=https://kc.local;secret={secret}");
+                tracing::error!("unit rejected: Environment=API=https://a.com/v1;TOKEN={secret}");
+                tracing::error!("token exchange failed: cb=https://a.com/x&access_token={secret}");
+                tracing::error!(
+                    "dsn rejected: dsn=https://sentry.local/1;password={secret};user=x"
+                );
+                tracing::error!(
+                    "callback failed: redirect=https://a.com/cb&state=1&access_token={secret}"
+                );
+                let routed = StoreError {
+                    body: format!("Server=https://vault.local/api;Password={secret};"),
+                };
+                tracing::error!(reason = ?routed, "the secret store rejected the connection string");
+
+                // 18. A credential key whose value is not in its own fragment.
+                //     The empty-value skip is right, but its justification --
+                //     "the value is in the next fragment, where the structural
+                //     cut reaches it" -- was false: `redact_fragment` carried
+                //     nothing across the cut, so nothing ever reached it. An
+                //     array, a nested object, an empty pair and a plist
+                //     key/value pair are four spellings of the same gap.
+                tracing::error!("store rejected: {{\"password\":[\"{secret}\"]}}");
+                tracing::error!("store rejected: {{\"password\":{{\"v\":\"{secret}\"}}}}");
+                tracing::error!("store rejected: Password=;{secret}");
+                tracing::error!("plist rejected: <key>password</key><string>{secret}</string>");
+
+                // 19. A structural character *inside* a credential value. `,`
+                //     and `&` could already split a secret; this commit added
+                //     `;`, `<` and `>`, so each of those became a new character
+                //     that can cut a punctuated password in half and leave the
+                //     tail standing.
+                tracing::error!("store rejected: {{\"password\":\"a<{secret}>b\"}}");
+                tracing::error!("store rejected: {{\"password\":\"a&{secret},b\"}}");
+
+                // 20. A secret in a URL *path*. `redact_url` applies no shape
+                //     rule to the path at all, so a token that reaches one is
+                //     echoed whole -- and the token-prefix rule is documented
+                //     as a belt that catches a credential anywhere.
+                tracing::error!("download failed: https://github.com/o/r/raw/{secret}/f");
+
                 // 8. Carried on a span rather than on the event.
                 let span = tracing::info_span!("attempt", jit_config = %secret);
                 let _entered = span.enter();
@@ -2428,23 +2488,131 @@ mod tests {
                 body: "{\"password\":\"hunter2\"}".to_string(),
             };
             tracing::error!(reason = ?failure, "store rejected the request");
+
+            // A `;` or an `&` after a URL in the same word. The URL branch runs
+            // ahead of the structural cut and `split_url` did not stop at
+            // either character, so the separator that would have cut the word
+            // was swallowed into the URL and echoed.
+            tracing::error!("store rejected: Server=https://vault.local/api;Password=hunter2;");
+            tracing::error!("keychain error: url=https://kc.local;password=hunter2");
+            tracing::error!("unit rejected: Environment=API=https://a.com/v1;PASSWORD=hunter2");
+            tracing::error!("token exchange failed: cb=https://a.com/x&password=hunter2");
+
+            // A credential key whose value is in a *later* fragment. The
+            // empty-value skip is right; the claim that the structural cut
+            // reaches such a value was not, because nothing carried the key
+            // across the cut.
+            tracing::error!("store rejected: {{\"password\":[\"hunter2\"]}}");
+            tracing::error!("store rejected: {{\"password\":{{\"v\":\"hunter2\"}}}}");
+            tracing::error!("store rejected: Password=;hunter2");
+            tracing::error!("plist rejected: <key>password</key><string>hunter2</string>");
+            tracing::error!(
+                "plist rejected: <dict><key>password</key><string>hunter2</string></dict>"
+            );
+
+            // A structural character inside the value. `,` and `&` could
+            // already split a secret; this commit added `;`, `<` and `>`.
+            tracing::error!("store rejected: {{\"password\":\"aa<bb>cc\"}}");
+            tracing::error!("store rejected: {{\"password\":\"p&ss,w0rd\"}}");
+            tracing::error!("store rejected: {{\"password\":\"a;b<c>d,e\"}}");
         });
 
         assert!(
             !output.contains("hunter2"),
             "a short credential leaked through the sink:\n{output}"
         );
+        // The punctuated passwords: every piece a structural character can cut
+        // one into has to go, not just the piece that kept the key company.
+        for piece in ["bb", "ss", "w0rd", "cc", "a;b", "c>d"] {
+            assert!(
+                !output.contains(piece),
+                "a structural character split a secret and the tail survived \
+                 ({piece}):\n{output}"
+            );
+        }
         assert!(output.contains(REDACTION), "{output}");
-        // Four lines, or the sink was never reached and "no secret found" is
+        // Sixteen lines, or the sink was never reached and "no secret found" is
         // true of an empty string.
         assert_eq!(
             output
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .count(),
-            4,
+            16,
             "{output}"
         );
+    }
+
+    /// The multi-word plist spelling, which is worse than the one-word one:
+    /// the credential key and the value are in the same word, but the value
+    /// itself is two words, so closing it needs the fragment carry to reach the
+    /// word-level follow-on rule.
+    #[test]
+    fn a_credential_value_that_runs_past_its_own_word_is_still_redacted() {
+        let capture = Capture::default();
+        let output = emit(&capture, || {
+            tracing::error!("plist rejected: <key>password</key><string>correct horse</string>");
+            tracing::error!("plist rejected: <key>password</key> <string>correct horse</string>");
+        });
+        for piece in ["correct", "horse"] {
+            assert!(
+                !output.contains(piece),
+                "a multi-word credential value leaked ({piece}):\n{output}"
+            );
+        }
+    }
+
+    /// The other half of the fragment carry: it must not swallow the ordinary,
+    /// *closed* pairs sitting next to a credential.
+    ///
+    /// Every shape here is one the carry has an opportunity to over-redact —
+    /// a closed empty value, a neighbouring key, the pairs of a connection
+    /// string, and the element names of a plist. Redaction that eats the
+    /// diagnostics is redaction nobody keeps, and a carry with no terminator
+    /// is exactly how that happens.
+    #[test]
+    fn the_fragment_carry_stops_where_the_value_does() {
+        for (input, expected) in [
+            (
+                "{\"password\":\"abc\",\"user\":\"bob\"}",
+                format!("{{\"password\":\"{REDACTION}\",\"user\":\"bob\"}}"),
+            ),
+            (
+                "Server=host;Password=hunter2;User=bob",
+                format!("Server=host;Password={REDACTION};User=bob"),
+            ),
+            (
+                "{\"password\":\"\",\"user\":\"bob\"}",
+                "{\"password\":\"\",\"user\":\"bob\"}".to_string(),
+            ),
+            (
+                "<dict><key>password</key><string>hunter2</string></dict>",
+                format!("<dict><key>password</key><string>{REDACTION}</string></dict>"),
+            ),
+            (
+                "{\"password\":\"aa<bb>cc\"}",
+                format!("{{\"password\":\"{REDACTION}<{REDACTION}>{REDACTION}\"}}"),
+            ),
+        ] {
+            assert_eq!(redact(input), expected, "from {input}");
+        }
+
+        // An empty credential value still ends the claim: saying `[redacted]`
+        // where nothing was is a false signal in the one log a reader consults
+        // to find out whether anything leaked.
+        assert_eq!(redact("{\"password\":\"\"} ok"), "{\"password\":\"\"} ok");
+        assert_eq!(
+            redact("{\"password\":\"x\"} ok"),
+            format!("{{\"password\":\"{REDACTION}\"}} ok")
+        );
+
+        // Ordinary prose is untouched: the carry is only ever armed by a
+        // credential key.
+        assert_eq!(
+            redact("started; then reconciled; then idled"),
+            "started; then reconciled; then idled"
+        );
+        assert_eq!(redact("Custom<Io>"), "Custom<Io>");
     }
 
     #[test]
@@ -2483,6 +2651,157 @@ mod tests {
             redact("https://api.github.com/x?page=2#access_token=ghu_secret"),
             format!("https://api.github.com/x?{REDACTION}")
         );
+    }
+
+    /// `;` and `&` end a URL, but only ahead of its query string.
+    ///
+    /// `STRUCTURAL` has nine characters and `is_url_terminator` recognised
+    /// seven of them. Because the URL branch runs *ahead* of the structural
+    /// cut, a URL earlier in a word made `split_url` swallow everything to the
+    /// next terminator — including the `;` or `&` that would have cut the word
+    /// — and `redact_url`'s terminal arm echoes what it is given. So the L3 fix
+    /// (bounding a URL) and the L1 fix (cutting on `;` and `&`) did not
+    /// compose, and this commit added `;` to `STRUCTURAL` for connection
+    /// strings while leaving the path a URL opens straight through it.
+    #[test]
+    fn a_separator_after_a_url_still_cuts_the_word() {
+        for shape in [
+            format!("store rejected: Server=https://vault.local/api;Password={USER_TOKEN};"),
+            format!("keychain error: url=https://kc.local;secret={USER_TOKEN}"),
+            format!("unit rejected: Environment=API=https://a.com/v1;TOKEN={USER_TOKEN}"),
+            format!("token exchange failed: cb=https://a.com/x&access_token={USER_TOKEN}"),
+            format!("dsn rejected: dsn=https://sentry.local/1;password={USER_TOKEN};user=x"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN),
+                "leaked from {shape}:\n{redacted}"
+            );
+        }
+
+        // The URL itself still survives, or nobody keeps this redaction.
+        assert_eq!(
+            redact("store rejected: Server=https://vault.local/api;Password=hunter2;"),
+            format!("store rejected: Server=https://vault.local/api;Password={REDACTION};")
+        );
+
+        // The obvious fix is the wrong one, and this is what it costs. Making
+        // `;` and `&` terminators everywhere ends a URL *inside* its own query
+        // string, and `redact_url` replaces a query wholesale precisely because
+        // a token can be in any parameter and this module does not guess which:
+        // `?[redacted]` would become `?[redacted]&state=hunter2`. So the cut is
+        // restricted to the part of the URL ahead of the first `?` or `#`.
+        assert_eq!(
+            redact("https://a.com/cb?code=1&state=hunter2"),
+            format!("https://a.com/cb?{REDACTION}")
+        );
+        assert_eq!(
+            redact("https://a.com/cb#code=1&state=hunter2"),
+            format!("https://a.com/cb#{REDACTION}")
+        );
+        assert_eq!(
+            redact(&format!(
+                "https://a.com/cb?a=1;b=2&access_token={USER_TOKEN}"
+            )),
+            format!("https://a.com/cb?{REDACTION}")
+        );
+
+        // And leaving `\` out of the terminators is still right: a Windows
+        // path used as a URL password puts the `@` that identifies the
+        // userinfo behind the first backslash, and `redact_url` echoes what it
+        // is given.
+        assert_eq!(
+            redact(r"https://x-access-token:C:\Users\op\p@github.com/o/r.git"),
+            format!("https://{REDACTION}@github.com/o/r.git")
+        );
+    }
+
+    /// A secret in a URL *path* is echoed verbatim.
+    ///
+    /// `redact_url` applied no shape rule to the path at all. The design
+    /// intends a path to be diagnosable — and it still is — but the
+    /// token-prefix rule is documented as a belt that catches a credential
+    /// *anywhere*, and a path was the one place it never ran.
+    #[test]
+    fn a_secret_in_a_url_path_is_redacted_and_the_rest_of_the_path_is_not() {
+        for shape in [
+            format!("https://github.com/o/r/raw/{USER_TOKEN}/f"),
+            format!("https://api.github.com/{JIT_BLOB}"),
+            format!("https://a.com/x/{JWT}?page=2"),
+        ] {
+            let redacted = redact(&shape);
+            assert!(
+                !redacted.contains(USER_TOKEN)
+                    && !redacted.contains(JIT_BLOB)
+                    && !redacted.contains(JWT),
+                "leaked from {shape}:\n{redacted}"
+            );
+        }
+
+        assert_eq!(
+            redact(&format!("https://github.com/o/r/raw/{USER_TOKEN}/f")),
+            format!("https://github.com/o/r/raw/{REDACTION}/f")
+        );
+
+        // The rest of the path is exactly as diagnosable as it was: a segment
+        // is judged on its own, and an ordinary one is not a secret.
+        for url in [
+            "https://api.github.com/repos/owner/repo/actions/runners",
+            "https://github.com/actions/runner/releases/download/v2.330.0/actions-runner-linux-x64-2.330.0.tar.gz",
+            "https://github.com/o/r.git",
+            "https://github.com/@owner/repo",
+            "https://api.github.com/repos/o/r/actions/runners/42",
+        ] {
+            assert_eq!(redact(url), url, "over-redacted a diagnosable path: {url}");
+        }
+    }
+
+    /// A large message must not take the process down.
+    ///
+    /// The URL branch recursed into `redact_core` on both sides of the cut. The
+    /// termination argument was sound — every call is on a strictly shorter
+    /// slice — and it was silent on *depth*, which was linear in the length of
+    /// the input. A message of ~2000 URL-carrying items, about 86 KB, exited
+    /// `0xc00000fd STATUS_STACK_OVERFLOW`.
+    ///
+    /// **A stack overflow is not catchable — it aborts the process.** A large
+    /// HTTP error body is attacker-influenceable content, so this was a way to
+    /// kill the agent from inside its own log sink, which is worse than any
+    /// leak: a sink that is not running redacts nothing.
+    ///
+    /// Note what this test can and cannot do. An overflow aborts the test
+    /// binary rather than failing an assertion, so the value of this test is
+    /// that **the suite completes at all**; the assertions below only confirm
+    /// it did the work rather than skipping it.
+    #[test]
+    fn a_large_message_does_not_overflow_the_stack() {
+        // 20000 items is ~860 KB and an order of magnitude past the ~2000 that
+        // was measured to abort. It is also what the commit *before* the URL
+        // branch survived, because that branch returned without recursing --
+        // so this is a regression guard with the margin the regression had.
+        const ITEMS: usize = 20_000;
+        let body = r#"{"url":"https://api.github.com/repos/o/r"},"#.repeat(ITEMS);
+        assert!(body.len() > 800_000, "the premise is a large body");
+
+        let redacted = redact(&body);
+        assert!(
+            redacted.contains("https://api.github.com/repos/o/r"),
+            "the URLs are the diagnosable part and must survive"
+        );
+
+        // The same depth, reached through the structural cut and through a
+        // credential value rather than through a bare URL.
+        let nested = format!("{{\"error\":{{\"body\":{{\"list\":[{}]}}}}}}", body);
+        assert!(!redact(&nested).is_empty());
+
+        // A long run with no URL in it at all, so the structural loop is
+        // exercised on its own.
+        let flat = "{\"a\":1},".repeat(ITEMS);
+        assert!(!redact(&flat).is_empty());
+
+        // And one long unbroken URL, where the *path* loop is what iterates.
+        let long_path = format!("https://a.com/{}", "seg/".repeat(ITEMS));
+        assert!(!redact(&long_path).is_empty());
     }
 
     #[test]
