@@ -365,11 +365,25 @@ impl FailureReason {
     /// variant, writes its `Display` arm and its `earliest_state_producing` arm,
     /// and then adds it to *neither* this constant nor the test's `cases` table,
     /// gets a green suite with the variant untested. Adding it to exactly one of
-    /// the two fails the length check; adding it to neither does not. Rust has
-    /// no stable way to close that without a derive macro
-    /// (`std::mem::variant_count` is unstable), so it is written down here
-    /// instead: **if you are reading this because the compiler sent you, the
-    /// variant goes in both places.**
+    /// the two fails the length check; adding it to neither does not.
+    ///
+    /// **And the compiler never points at this constant.** A `const` array is
+    /// unaffected by a new variant, so nothing here errors. What stops the
+    /// author is `Display::fmt`'s match (`E0004`) and then
+    /// `tests::earliest_state_producing`'s, and neither of those mentions this
+    /// list — which is why a note pointing back here sits at each of those two
+    /// match sites, where the author is actually standing.
+    ///
+    /// **This is closable in stable Rust, and is hand-written anyway.** A local
+    /// `macro_rules!` that declares the enum and emits `ALL` from the same
+    /// variant list needs no dependency and no unstable feature
+    /// (`std::mem::variant_count` is unstable, but a declarative macro is not
+    /// the same thing). It is not used here because every variant of this enum
+    /// carries several paragraphs of its own documentation explaining what an
+    /// operator should do about it, and variants declared inside a macro
+    /// invocation are markedly worse to read and to `rustdoc`. That is a
+    /// legibility trade, deliberately taken — not an impossibility. If the
+    /// documentation ever thins out, the macro is the better answer.
     pub const ALL: [FailureReason; 8] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
@@ -384,6 +398,11 @@ impl FailureReason {
 
 impl fmt::Display for FailureReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Adding a variant? This `E0004` is where the compiler stops you, and it
+        // is the *only* place it does for `FailureReason::ALL`, which is a const
+        // array and errors nowhere. Add the variant to `ALL` and to the `cases`
+        // table in `tests::all_failure_reasons_are_reachable_from_the_state_that
+        // _produces_them` as well, or it ships untested and unreachable.
         match self {
             FailureReason::JitRequestFailed => f.write_str("the JIT configuration request failed"),
             FailureReason::JitExpired => f.write_str("the JIT configuration expired unclaimed"),
@@ -1050,13 +1069,46 @@ pub enum RecoveryDecision {
     /// [`RunnerAttempt::conclude`], which it does only after the process has
     /// exited.
     ///
-    /// **It is safe to re-derive.** The decision is a pure function of the
-    /// journalled state and the observation, so an agent that dies between
-    /// deciding and terminating is handed the same decision on the next pass. A
-    /// caller that terminates but crashes before writing the outcome observes
-    /// `process_alive: false` next time and reaches the ordinary
-    /// [`Self::Conclude`] arm instead; that arm names the process as gone, which
-    /// by then it is.
+    /// **It is safe to re-derive in one direction, and owes a debt in the
+    /// other.** The decision is a pure function of the journalled state and the
+    /// observation, so an agent that dies *before* terminating sees a live
+    /// process and a larger `elapsed` on the next pass and is handed this same
+    /// decision again. That half costs nothing and needs nothing.
+    ///
+    /// **The other half is a known defect, and it is not harmless.** An agent
+    /// that terminates the process and then dies *before* writing the outcome
+    /// observes `process_alive: false` next time and reaches the ordinary
+    /// [`Self::Conclude`] arm, which records
+    /// [`FailureReason::ProcessExitedUnexpectedly`]. The process did not exit
+    /// unexpectedly; this agent killed it. That is precisely the diagnosis
+    /// [`FailureReason::RegistrationTimedOut`] was split out to prevent — the
+    /// two reasons send an operator to different places, and this window sends
+    /// them to a crash investigation (logs, exit code, a corrupt package) for
+    /// what was a registration failure.
+    ///
+    /// **It cannot be fixed here, and the alternative was weighed rather than
+    /// waved off.** This function's inputs are the journalled state and a
+    /// [`RecoveryObservation`], and neither carries the fact that separates the
+    /// two cases: a process this agent killed and a process that crashed on its
+    /// own present the *same observation*. Using `RegistrationTimedOut` in the
+    /// dead-process arm once `elapsed >= startup` would close this window at the
+    /// price of a wider one — every genuine early crash first observed after a
+    /// restart longer than the startup window would then be reported as a runner
+    /// that "is running but did not register", to an operator who can see that
+    /// it is not running. That trades a rare wrong reason for a common false
+    /// claim about liveness, in the one direction
+    /// [`FailureReason::ProcessExitedUnexpectedly`]'s own documentation says
+    /// spends the credibility of every other message this product prints.
+    /// `tests::no_decision_calls_a_dead_process_live` is what stops that trade
+    /// being made by accident later.
+    ///
+    /// **So the obligation is `e3`'s, and it is a persistence one.** The
+    /// distinguishing fact exists only at the moment terminate-intent is formed,
+    /// and the only way to carry it across a crash is to write it down. `e3`
+    /// journals the intent *before* it signals the process, and on a later pass
+    /// concludes an attempt it finds so marked with `RegistrationTimedOut`
+    /// rather than with whatever this function derived from an observation that
+    /// could not know. Until `e3` does that, the window stands.
     ///
     /// **The one thing this does not bound** is a process that refuses to die.
     /// The slot is held until it does. That is a worse outcome than concluding
@@ -1185,6 +1237,18 @@ pub fn recovery_decision(
             // `ProcessExitedUnexpectedly` to an operator looking at the process
             // in a task manager. `Terminate` says the true thing and keeps the
             // slot until the process is actually gone.
+            //
+            // The dead-process arm below carries a residual this arm cannot
+            // close: an agent that terminated the process and died before
+            // writing the outcome lands there and records
+            // `ProcessExitedUnexpectedly` for a process it killed itself. The
+            // fact that would separate the two is not in this function's
+            // inputs -- a killed process and a crashed one are the same
+            // observation -- so the fix is `e3` journalling terminate-intent
+            // before signalling, not a rearrangement here. See
+            // `RecoveryDecision::Terminate`, which names the trade and the
+            // owner, and `tests::no_decision_calls_a_dead_process_live`, which
+            // reds if somebody closes it here instead.
             G::NotRegistered => {
                 if !observation.process_alive {
                     RecoveryDecision::Conclude(AttemptOutcome::failed(
@@ -1709,6 +1773,10 @@ mod tests {
     /// and `all_failure_reasons_are_reachable_from_the_state_that_produces_them`
     /// then proves the answer.
     fn earliest_state_producing(reason: &FailureReason) -> AttemptState {
+        // The second place a new variant stops the compiler, and the last one.
+        // `FailureReason::ALL` is a const array, so it errors nowhere at all:
+        // add the variant to `ALL` and to the `cases` table below too, or the
+        // suite goes green with it untested.
         match reason {
             // Step 5: the package is verified before the JIT request is made.
             FailureReason::RunnerPackageUnverified => AttemptState::Allocated,
@@ -2760,10 +2828,9 @@ mod tests {
         assert!(!attempt.counts_against_capacity());
         assert_eq!(active_count([&attempt]), 0);
 
-        // And the decision is re-derivable: an agent that died between deciding
-        // and terminating is handed the same answer next pass, while one that
-        // terminated but crashed before writing sees a dead process and reaches
-        // the ordinary conclusion, whose wording is by then true.
+        // Half the re-derivation is free: an agent that died between deciding
+        // and terminating still sees a live process, and is handed the same
+        // answer next pass.
         let pending = attempt_in(AttemptState::Starting, 1_000);
         assert_eq!(
             recovery_decision(&pending, unregistered(true), timeouts, &clock),
@@ -2771,12 +2838,105 @@ mod tests {
                 FailureReason::RegistrationTimedOut
             ))
         );
+
+        // The other half is not, and this is the assertion that says so rather
+        // than blessing it. An agent that terminated the process and died
+        // before writing the outcome is, on the next pass, indistinguishable
+        // from one whose runner crashed on its own: both present exactly the
+        // same `RecoveryObservation`. The decision below is therefore the same
+        // for both, and for the terminate-then-crash case the reason it carries
+        // is wrong -- nothing exited unexpectedly, this agent killed it.
+        let crashed_on_its_own = unregistered(false);
+        let killed_by_us_then_lost = unregistered(false);
         assert_eq!(
-            recovery_decision(&pending, unregistered(false), timeouts, &clock),
+            crashed_on_its_own, killed_by_us_then_lost,
+            "this equality *is* the defect: the fact that separates the two \
+             cases is not an input to `recovery_decision`, which is why it \
+             cannot be repaired inside it"
+        );
+        assert_eq!(
+            recovery_decision(&pending, killed_by_us_then_lost, timeouts, &clock),
             RecoveryDecision::Conclude(AttemptOutcome::failed(
                 FailureReason::ProcessExitedUnexpectedly
-            ))
+            )),
+            "pinned as the current behaviour of a known-wrong window, not as a \
+             correct answer: `e3` closes it by journalling terminate-intent \
+             before signalling, and `RecoveryDecision::Terminate` names the \
+             trade and the owner"
         );
+    }
+
+    #[test]
+    fn no_decision_calls_a_dead_process_live() {
+        // `RegistrationTimedOut` renders as "the runner process is running but
+        // did not register", and `ProcessExitedUnexpectedly` is documented
+        // "only for a process that is actually gone". Both are claims about
+        // liveness, and `RecoveryObservation::process_alive` is the only source
+        // of truth for it, so each reason may only ever appear beside the
+        // observation that supports it.
+        //
+        // This is also the guard on the `Terminate` window's residual. The
+        // rejected fix for that window -- reach for `RegistrationTimedOut` in
+        // the dead-process arm at `starting` once `elapsed >= startup` --
+        // compiles, and passes every other test in this file, because every
+        // other test fixes the observation it asks about. It reds here. That is
+        // why the argument against it is written as a test and not only as a
+        // paragraph.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let entered_at = 1_000i64;
+        // Both sides of each deadline, the deadlines themselves, and one
+        // instant far past all three.
+        let offsets = [0, 59, 60, 61, 119, 120, 121, 299, 300, 301, 100_000];
+        let observations = [
+            GithubRunnerObservation::NotRegistered,
+            GithubRunnerObservation::Registered { busy: false },
+            GithubRunnerObservation::Registered { busy: true },
+            GithubRunnerObservation::Unreachable,
+        ];
+
+        for state in AttemptState::ALL {
+            for github in observations {
+                for process_alive in [true, false] {
+                    for offset in offsets {
+                        let clock = StubClock::at(entered_at + offset);
+                        let observation = RecoveryObservation {
+                            process_alive,
+                            github,
+                        };
+                        let decision = recovery_decision(
+                            &attempt_in(state, entered_at),
+                            observation,
+                            timeouts,
+                            &clock,
+                        );
+                        let reason = match &decision {
+                            RecoveryDecision::Conclude(AttemptOutcome::Failed { reason })
+                            | RecoveryDecision::Terminate(AttemptOutcome::Failed { reason }) => {
+                                Some(reason)
+                            }
+                            _ => None,
+                        };
+                        match reason {
+                            Some(FailureReason::RegistrationTimedOut) => assert!(
+                                process_alive,
+                                "{state} at +{offset}s with {github:?} and a process the \
+                                 observation says is gone was reported as still running"
+                            ),
+                            Some(FailureReason::ProcessExitedUnexpectedly) => assert!(
+                                !process_alive,
+                                "{state} at +{offset}s with {github:?} reported an \
+                                 unexpected exit for a process that is alive"
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

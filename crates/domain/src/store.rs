@@ -182,16 +182,22 @@ pub enum StoreError {
     /// One column holds something that is not the kind of value it is declared
     /// to hold. The row is named so an operator can find and fix it.
     ///
-    /// **`value` is a clipped echo, never the whole payload** — see [`clip`].
-    /// The row id is what an operator needs to find the row; the payload only
-    /// helps them recognise it, and repeating all of it turns this error into a
-    /// disclosure the moment it reaches a log.
+    /// **`value` never repeats the whole payload, and how much it repeats
+    /// depends on which column this is.** The row id is what an operator needs
+    /// to find the row; the payload only helps them recognise it, and repeating
+    /// all of it turns this error into a disclosure the moment it reaches a log.
+    ///
+    /// `table` and `column` are carried for the operator's sake and are also
+    /// what decides the echo: a column whose shape the schema fixes gets the
+    /// clipped echo of [`clip`], and one that may hold text a caller chose gets
+    /// position only, with none of the payload. See [`FREE_FORM_COLUMNS`].
     #[error("{table}.{column} of row {id} holds {value}, which is not {expected}")]
     CorruptColumn {
         table: &'static str,
         column: &'static str,
         id: String,
-        /// At most [`ECHO_LIMIT`] characters of the offending payload.
+        /// At most [`ECHO_LIMIT`] characters of the offending payload for a
+        /// constrained column, and none of it for a [`FREE_FORM_COLUMNS`] one.
         value: String,
         expected: &'static str,
     },
@@ -1383,26 +1389,72 @@ fn u64_to_sql(what: &'static str, value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::UnrepresentableInteger { what, value })
 }
 
-/// The most of a column's payload an error message will ever repeat.
+/// The most of a **constrained** column's payload an error message will ever
+/// repeat.
 ///
 /// Sixty characters identifies a value without reproducing it: a malformed
 /// timestamp, an unrecognised token and a truncated UUID are all shorter than
 /// this, and anything longer is a payload rather than a value.
+///
+/// It is not a limit that protects a *free-form* column, and it was once applied
+/// to one. See [`FREE_FORM_COLUMNS`] for why a fixed character budget is the
+/// wrong instrument there and what replaced it.
 pub const ECHO_LIMIT: usize = 60;
 
-/// One column's payload, trimmed to something safe to put in an error message.
+/// The columns whose payload includes text a **caller** chose, and which an
+/// error message therefore may not echo at all.
 ///
-/// **Why this is not paranoia about a schema that carries no credentials.**
-/// "No column carries a credential" is a claim about the *schema*, and the
-/// `attempts.outcome` column is the counterexample the test suite already
-/// contains: it holds the JSON of [`AttemptOutcome`], whose
-/// `FailureReason::Other(String)` is free-form text a caller chose, and
-/// `the_token_scanner_can_actually_fail` in `tests/store_journal.rs` plants a
-/// `ghu_…` in exactly that field to prove the field is a real carrier. A
-/// [`StoreError::CorruptColumn`] over that column echoed the whole payload into
-/// whatever log caught the error. `d1`'s redacting sink matches on shape, so it
-/// would probably catch a classic token — and an encoded JIT blob, which has no
-/// prefix to match, it would not.
+/// **Why this is a per-column list and not one budget for every column.**
+/// [`ECHO_LIMIT`] is a fixed character budget with no idea which column it is
+/// echoing, and over `attempts.outcome` that is not a small imprecision. The
+/// column holds the JSON of [`AttemptOutcome`], and reaching the free-form
+/// `FailureReason::Other(String)` inside it costs a serde prefix of
+/// `{"outcome":"failed","reason":{"other":"` — thirty-nine characters — which
+/// leaves roughly twenty-one of the caller's own string inside a sixty-character
+/// budget. That is a partial echo of a forty-character `ghu_…` token, and a
+/// **complete** echo of any secret shorter than about twenty-one characters. The
+/// rationale the budget was written with — "anything longer is a payload rather
+/// than a value" — quietly assumes secrets are long, and short ones are the case
+/// it lets straight through.
+///
+/// **The second-order failure is worse than the first.** The argument for
+/// clipping leaned on `d1`'s redacting log sink catching a prefixed token that
+/// slipped out. But that sink matches on *shape*, and a token cut after
+/// twenty-one characters may no longer have the shape it matches — so clipping
+/// can take a token the sink would have redacted and hand it on as a fragment
+/// the sink will not. A partial echo is not a safer echo here; it is an echo
+/// with the downstream control removed.
+///
+/// **What is echoed instead.** For a column on this list,
+/// [`StoreError::CorruptColumn`] reports position only — how many bytes the
+/// column holds and where the parse gave up — and none of the payload. That
+/// costs nothing at every other column: `uuid_column`, `token_column`,
+/// `parse_timestamp` and `current_version` all decode values whose shape the
+/// *schema* fixes, so nothing a caller chose can reach them, and they keep the
+/// full [`clip`] echo the diagnosability argument was made for.
+///
+/// **Why this list has one entry.** `attempts.outcome` is the column
+/// `the_token_scanner_can_actually_fail` in `tests/store_journal.rs` proves is a
+/// carrier, by planting a `ghu_…` in exactly that field. `policies.routing_labels`
+/// is the other column read through `json_column`; its contents are operator
+/// configuration rather than agent-captured failure text, and no test plants a
+/// credential there. It is a list so that a second carrier can be added to it
+/// without touching the decoder.
+const FREE_FORM_COLUMNS: &[(&str, &str)] = &[("attempts", "outcome")];
+
+/// Whether this column may have a caller's own text in it.
+fn carries_free_form_text(table: &str, column: &str) -> bool {
+    FREE_FORM_COLUMNS
+        .iter()
+        .any(|(t, c)| *t == table && *c == column)
+}
+
+/// One constrained column's payload, trimmed to something safe to put in an
+/// error message.
+///
+/// **Only for a column whose shape the schema fixes.** A column that can hold
+/// text a caller chose goes through [`position_only`] instead; see
+/// [`FREE_FORM_COLUMNS`] for the measurement that separates the two.
 ///
 /// Clipping rather than dropping the value entirely: an operator handed only a
 /// row id has to go and read the row, and the first sixty characters are
@@ -1417,6 +1469,27 @@ fn clip(raw: &str) -> String {
             raw.len()
         ),
     }
+}
+
+/// Everything an error may say about a [`FREE_FORM_COLUMNS`] payload: how much
+/// of it there is, and where it stopped being parseable.
+///
+/// Neither figure is derived from the *content* of the value, so no part of it
+/// can travel in the message — which is the point, since a prefix of it is
+/// exactly what would evade `d1`'s shape-matching sink downstream.
+///
+/// It is still enough to work with. A byte count separates "this column is
+/// empty" from "this column holds a megabyte", and a position separates a row
+/// truncated mid-write from one whose first character is already wrong. The row
+/// id, which is what an operator actually needs in order to go and look, is
+/// carried by [`StoreError::CorruptColumn`] itself and is unaffected.
+fn position_only(raw: &str, error: &serde_json::Error) -> String {
+    format!(
+        "a {}-byte payload that is not echoed (it stops parsing at line {}, column {})",
+        raw.len(),
+        error.line(),
+        error.column()
+    )
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -1478,6 +1551,9 @@ fn token_column<T: DeserializeOwned>(
     })
 }
 
+/// The one decoder that reads a column which may carry a caller's own text, and
+/// therefore the one that has to ask which column it is looking at before it
+/// says anything about the payload. See [`FREE_FORM_COLUMNS`].
 fn json_column<T: DeserializeOwned>(
     row: &Row<'_>,
     table: &'static str,
@@ -1487,15 +1563,21 @@ fn json_column<T: DeserializeOwned>(
 ) -> Result<Option<T>, StoreError> {
     match row.get::<_, Option<String>>(column)? {
         None => Ok(None),
-        Some(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|_| StoreError::CorruptColumn {
-                table,
-                column,
-                id: id.to_string(),
-                value: clip(&raw),
-                expected,
-            }),
+        Some(raw) => {
+            serde_json::from_str(&raw)
+                .map(Some)
+                .map_err(|error| StoreError::CorruptColumn {
+                    table,
+                    column,
+                    id: id.to_string(),
+                    value: if carries_free_form_text(table, column) {
+                        position_only(&raw, &error)
+                    } else {
+                        clip(&raw)
+                    },
+                    expected,
+                })
+        }
     }
 }
 
@@ -2294,6 +2376,107 @@ mod tests {
     }
 
     #[test]
+    fn a_short_secret_in_the_free_form_column_is_not_echoed_at_all() {
+        // The case a fixed character budget cannot reach. `ECHO_LIMIT` is sixty
+        // characters and does not know which column it is echoing; the serde
+        // prefix that reaches `FailureReason::Other` is thirty-nine of them, so
+        // a budget-based echo repeats about twenty-one characters of whatever
+        // the caller put there. That is partial for a forty-character `ghu_`
+        // token and complete for anything shorter -- and a *partial* token is
+        // the worse of the two, because `d1`'s sink matches on shape and a
+        // fragment may no longer have the shape it redacts.
+        let planted = "ghs_9tokenish";
+        let raw = format!(r#"{{"outcome":"failed","reason":{{"other":"{planted}"}}"#);
+
+        // The counterfactual, asserted rather than described: this whole row
+        // fits inside the budget, so the echo it authorises is not a clip of
+        // the value but the entire value, secret included.
+        assert!(raw.chars().count() < ECHO_LIMIT);
+        assert_eq!(
+            clip(&raw),
+            raw,
+            "a sixty-character budget repeats this row in full, which is what \
+             makes the budget the wrong instrument at this column"
+        );
+        assert!(carries_free_form_text("attempts", "outcome"));
+
+        // Malformed only in its final brace, so the failure is a real parse
+        // failure and the secret sits where a caller would really have put it.
+        let store = store();
+        RawAttempt {
+            state: "failed".to_string(),
+            outcome: Some(raw.clone()),
+            terminal_at: Some(timestamp_to_text(ts(2_000))),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+
+        let error = store
+            .attempt(attempt_id())
+            .expect_err("an unterminated object is not an attempt outcome");
+        let rendered = error.to_string();
+
+        assert!(
+            !rendered.contains(planted),
+            "the secret must not appear in the message: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ghs_"),
+            "and neither must a prefixed fragment of it, which is what a \
+             clipped echo would have produced and what `d1`'s shape-matching \
+             sink would then have failed to redact: {rendered}"
+        );
+        for len in 4..=planted.len() {
+            assert!(
+                !rendered.contains(&planted[..len]),
+                "no prefix of the secret may survive, and {:?} did: {rendered}",
+                &planted[..len]
+            );
+        }
+
+        // What is left is still diagnosable: the size of the payload, where it
+        // gave up, and above all the row to go and look at.
+        assert!(
+            rendered.contains(&format!("{}-byte", raw.len())),
+            "the message must say how much is there: {rendered}"
+        );
+        assert!(
+            rendered.contains("stops parsing at line"),
+            "and where it stopped: {rendered}"
+        );
+        assert!(
+            rendered.contains(&attempt_id().to_string()),
+            "the error must name the row to fix: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_constrained_column_still_echoes_what_it_holds() {
+        // The other half of the per-column rule: the echo is removed at the one
+        // column that can carry a caller's text, and nowhere else. A malformed
+        // timestamp has the shape the schema fixes -- nothing a caller chose
+        // can reach it -- so an operator still gets to see the value that needs
+        // fixing, which is the diagnosability the clip was argued for.
+        assert!(!carries_free_form_text("attempts", "created_at"));
+        assert!(!carries_free_form_text("policies", "routing_labels"));
+
+        let store = store();
+        RawAttempt {
+            created_at: "the third of never".to_string(),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+
+        let error = store
+            .attempt(attempt_id())
+            .expect_err("`the third of never` is not RFC 3339");
+        assert!(
+            error.to_string().contains("the third of never"),
+            "a constrained column keeps its echo: {error}"
+        );
+    }
+
+    #[test]
     fn the_journal_mode_is_read_back_rather_than_assumed() {
         // The pragma answers with the mode the database *ended up in*. Where WAL
         // is unavailable -- no shared-memory support, as on some network mounts
@@ -2314,16 +2497,44 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("runner-manager.sqlite3");
         let file = SqliteStore::open(&path).expect("opens");
-        assert_eq!(
-            file.journal_mode(),
-            "wal",
-            "an ordinary temporary directory supports WAL; if this ever fails \
-             the message is the finding, which is the whole point of recording \
-             the mode instead of assuming it"
-        );
-        assert!(file.readers_do_not_block_writers());
+        let mode = file.journal_mode();
+
+        // Not `assert_eq!(mode, "wal")`. That is the assumption this test is
+        // named for refusing, and the same commit that named it removed exactly
+        // this assertion from `tests/store_journal.rs` on the stated grounds
+        // that it failed on a healthy build wherever WAL is unavailable. A
+        // container whose `TMPDIR` is a tmpfs or a network mount gives
+        // `tempfile::tempdir()` a directory that cannot host WAL's
+        // shared-memory file, and SQLite then leaves the database in `delete`
+        // and says so -- a correct answer, and a false red here.
+        //
+        // Both are legal; a third value would be a real finding, so the set is
+        // closed rather than dropped.
         assert!(
-            format!("{file:?}").contains("wal"),
+            matches!(mode, "wal" | "delete"),
+            "a file database is in WAL where the directory can host it and \
+             `delete` where it cannot; {mode} is neither and is a finding"
+        );
+
+        // The agreement check is the substance, and it reads a second source to
+        // make it: the presence of the write-ahead log *on disk*. Comparing
+        // `readers_do_not_block_writers()` against `mode == "wal"` would not,
+        // because the method is defined as that comparison -- it could only
+        // ever have failed on a difference in letter case, which is not what a
+        // message about readers and writers claims to be checking.
+        //
+        // `file` is still open here, which is what makes the file check sound:
+        // SQLite creates the `-wal` beside the database on the first write (the
+        // migrations above are one) and removes it only on a clean close of the
+        // last connection.
+        assert_eq!(
+            file.readers_do_not_block_writers(),
+            path.with_extension("sqlite3-wal").exists(),
+            "in {mode} mode the claim about readers and the write-ahead log on \
+             disk must be the same fact told twice"
+        );
+        assert!(
+            format!("{file:?}").contains(mode),
             "an operator reading a support bundle should see the mode"
         );
     }
