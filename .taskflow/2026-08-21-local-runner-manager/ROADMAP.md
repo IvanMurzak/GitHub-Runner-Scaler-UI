@@ -107,10 +107,9 @@ dispatching the task that needs them:
 23 tasks. `/taskflow-execute` is the only writer of the Status, Run / PR, and
 Updated columns.
 
-**Progress: 10 of 23 done** — `a1`, `b1`, `b2`, `c1`, `c2`, `c3`, `d1`, `a2`, `v1`, and
+**Progress: 11 of 23 done** — `a1`, `a2`, `a3`, `b1`, `b2`, `c1`, `c2`, `c3`, `d1`, `v1`, and
 `v2` (an unplanned verification spike, recorded below rather than as a row since
-it has no specification in `tasks/`). `a3` is verified against the tree and in its
-final correction round. Every merge is local: no worker branch has
+it has no specification in `tasks/`). Group A is complete. Every merge is local: no worker branch has
 reached `origin`, and `main` carries 295 passing tests with CI green on Windows,
 macOS and Linux.
 
@@ -143,7 +142,7 @@ macOS and Linux.
 | **Wave 4** | | | | | | |
 | [h1-e2e-security-acceptance](tasks/h1-e2e-security-acceptance.md) | f3, g3, d3, v1 | 9/7 | top | ⬜ pending | | |
 | [a2-release-workflow](tasks/a2-release-workflow.md) | a1 | 8/6 | top | ✅ done | `6bcb34b` | 2026-08-21 |
-| [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | 🔵 in correction | round 10 (local) | 2026-08-21 |
+| [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | ✅ done | `main` (local merge) | 2026-08-21 |
 
 Status vocabulary (`/taskflow-execute`'s, adopted 2026-08-21 so board and
 orchestrator share one set): `⬜ pending`, `🔵 in progress`, `🟣 verified,
