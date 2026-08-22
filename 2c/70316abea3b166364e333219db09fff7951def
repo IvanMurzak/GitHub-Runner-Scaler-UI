@@ -1,0 +1,23 @@
+crates/app/tests/install_scripts.rs
+  s_5332f62e0ed5a7::t_d74265b2be4e2b 630-631,635-645,648-651
+  s_5332f62e0ed5a7::t_e564706bded53c 1938-1943
+  s_5332f62e0ed5a7::t_90b4a61c4606ef 1489-1498,1500-1511,1521
+  s_5332f62e0ed5a7::t_a1d1e0f2e85cfd 1455-1488,1499,1512-1520,1522-1542
+  s_5332f62e0ed5a7::t_f379fcf1915356 1543-1545,1933,1944-1946
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2c70316abea3b166364e333219db09fff7951def",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
