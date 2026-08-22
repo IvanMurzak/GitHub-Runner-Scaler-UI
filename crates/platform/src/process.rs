@@ -1019,13 +1019,23 @@ fn parse_proc_stat(stat: &str) -> Option<ProcStat<'_>> {
 /// `ERROR_ACCESS_DENIED`, and for the same reason: an unexplained failure is
 /// not evidence of absence, and reporting [`Adoption::Gone`] for one is how an
 /// agent decides to start a duplicate runner.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "called from the macOS start-time probe; unit tested on every platform"
-    )
-)]
+///
+/// # Compiled where it is used, rather than allowed where it is not
+///
+/// This carried `#[cfg_attr(not(target_os = "macos"), allow(dead_code, …))]`,
+/// and now carries a `cfg` that names macOS plus `test`. The difference is not
+/// tidiness. An allowance leaves the lint's premise true and silences the
+/// report; the condition it carries is a claim about every platform it does
+/// *not* name, and getting that claim wrong is invisible until the one CI leg
+/// that disagrees runs. That is precisely how N1 reached the Linux leg. A
+/// `cfg` makes the premise false instead: on a platform that does not call
+/// this, the item is not there to be dead, and there is nothing left to allow.
+///
+/// `test` is in the condition because the unit tests below are the reason this
+/// function is a plain function over `Option<i32>` at all -- they are what
+/// exercise it on the Windows and Linux legs, where the macOS caller does not
+/// exist.
+#[cfg(any(target_os = "macos", test))]
 const fn probe_failure_means_gone(errno: Option<i32>, no_such_process: i32) -> bool {
     matches!(errno, Some(code) if code == no_such_process)
 }
@@ -1944,42 +1954,41 @@ mod tests {
         assert!(!probe_failure_means_gone(None, ESRCH));
     }
 
-    /// Every `dead_code` allowance in this file must name a *complement*.
+    /// The attribute this scan walks, and the lint it looks for inside it.
     ///
-    /// A lint on the lint, and it exists because the alternative did not work.
-    /// `probe_failure_means_gone` carried `#[cfg_attr(windows, allow(dead_code,
-    /// …))]` while its only non-test caller was macOS-only. On Linux the
-    /// allowance was inactive *and* the caller absent, so `dead_code` fired on
-    /// the lib target and `cargo clippy --all-targets -- -D warnings` failed --
-    /// on the one CI leg no Windows developer runs, and invisibly to every
-    /// local gate.
+    /// Assembled rather than written out, so that this file contains no
+    /// literal spelling of the attribute outside the attributes themselves.
+    /// A text scan reads its own machinery as readily as it reads code: the
+    /// first version of this test found the attribute quoted in its own
+    /// documentation and failed, which was a fair demonstration that it
+    /// detects the shape and a reminder that the needle must not be in the
+    /// haystack.
+    const CFG_ATTR: &str = concat!("#[cfg_", "attr(");
+
+    /// The lint's own name, which has to appear verbatim in any allowance.
+    const DEAD_CODE: &str = concat!("dead_", "code");
+
+    /// The condition of every `dead_code` allowance in `source` that names a
+    /// platform rather than the complement of one.
     ///
-    /// A `dead_code` allowance is a claim about everywhere the caller is *not*,
-    /// so its condition is naturally a complement: `not(target_os = "…")`. A
-    /// bare positive names a single platform and says nothing whatsoever about
-    /// the rest, which is precisely how the wrong one went unnoticed. Requiring
-    /// the complement form does not prove the condition names the *right*
-    /// platform, but it does refuse the shape that hid the bug.
-    ///
-    /// Scoped to this file because it is the only one in the crate with
-    /// target-conditional compilation; the assertion at the end fails if that
-    /// stops being true by way of these allowances disappearing.
-    #[test]
-    fn every_dead_code_allowance_names_a_complement() {
-        // Comment lines go first. This test's own documentation quotes the
-        // attribute that motivated it, and on the first run the scan duly
-        // found that quotation and failed -- which is a fair demonstration
-        // that it detects the shape, and a reminder that a text scan reads
-        // prose as readily as code.
-        let source: String = include_str!("process.rs")
+    /// Split out from the test below so that it can also be run against a
+    /// fixture. A scan that finds nothing in this file is worth exactly what
+    /// its ability to find something is worth, and the only way to establish
+    /// that is to hand it something it must object to -- the same device
+    /// `logging.rs` uses to prove its secret-injection scan is capable of
+    /// failing.
+    fn positive_dead_code_conditions(source: &str) -> Vec<String> {
+        // Comment lines go first, for the reason `CFG_ATTR` documents.
+        let code: String = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut checked = 0;
 
-        for block in source.split("#[cfg_attr(").skip(1) {
-            // Walk to the `)` closing `cfg_attr(`, and remember the first
+        let mut offenders = Vec::new();
+
+        for block in code.split(CFG_ATTR).skip(1) {
+            // Walk to the `)` closing the attribute, and remember the first
             // comma at depth zero: that is what separates the condition from
             // the attributes it applies.
             let mut depth = 0usize;
@@ -2003,26 +2012,128 @@ mod tests {
             let (Some(body_end), Some(split_at)) = (body_end, split_at) else {
                 continue;
             };
-            if !block[split_at..body_end].contains("dead_code") {
+            if !block[split_at..body_end].contains(DEAD_CODE) {
                 continue;
             }
 
             let condition = block[..split_at].trim();
-            checked += 1;
-            assert!(
-                condition.starts_with("not("),
-                "a dead_code allowance must name the complement of its \
-                 caller's cfg rather than one platform, or it says nothing \
-                 about the legs it does not name: `{condition}`"
-            );
+            if !condition.starts_with("not(") {
+                offenders.push(condition.to_string());
+            }
         }
 
+        offenders
+    }
+
+    /// Every `dead_code` allowance in this file must name a *complement*.
+    ///
+    /// A lint on the lint, and it exists because the alternative did not work.
+    /// `probe_failure_means_gone` carried a `dead_code` allowance conditioned
+    /// on `windows` while its only non-test caller was macOS-only. On Linux the
+    /// allowance was inactive *and* the caller absent, so the lint fired on
+    /// the lib target and `cargo clippy --all-targets -- -D warnings` failed --
+    /// on the one CI leg no Windows developer runs, and invisibly to every
+    /// local gate.
+    ///
+    /// A `dead_code` allowance is a claim about everywhere the caller is *not*,
+    /// so its condition is naturally a complement: `not(target_os = "…")`. A
+    /// bare positive names a single platform and says nothing whatsoever about
+    /// the rest, which is precisely how the wrong one went unnoticed. Requiring
+    /// the complement form does not prove the condition names the *right*
+    /// platform, but it does refuse the shape that hid the bug.
+    ///
+    /// # No lower bound, and why the vacuity check is a fixture instead
+    ///
+    /// This used to end with `checked >= 3`: a lower bound on the number of
+    /// allowances found. A lower bound cannot tell "the parser stopped
+    /// matching" from "somebody removed an allowance properly", so it punished
+    /// the correct remediation. Replacing one of these with a plain
+    /// `cfg(any(…, test))` -- no allowance at all, which is strictly stronger,
+    /// because it makes the lint's premise false rather than silencing the
+    /// report -- left `cargo clippy --all-targets -- -D warnings` clean and
+    /// this test failing. A tripwire that fires on the better fix teaches
+    /// people to make the worse one.
+    ///
+    /// Counting parsed attributes against occurrences in the text does not fix
+    /// it either, and that was tried: both counts come from the same needle, so
+    /// breaking the needle takes both to zero and the check passes. Measured,
+    /// not reasoned -- the probe that was meant to fail did not.
+    ///
+    /// So the vacuity check is
+    /// [`the_allowance_scan_catches_a_positive_condition`], which runs the same
+    /// walk over a fixture that must be objected to. It cannot go vacuous,
+    /// because its input does not depend on what this file happens to contain,
+    /// and it costs nothing when an allowance is properly removed.
+    ///
+    /// # Scope
+    ///
+    /// Scoped to this file because it is the only one in the crate that carries
+    /// a `dead_code` allowance. It is *not* the only one with
+    /// target-conditional compilation, which is what this used to claim and
+    /// which was untrue: `paths.rs` and `logging.rs` both carry `#[cfg(unix)]`,
+    /// and `lock.rs` carries a Windows arm and a Unix arm. Those are a
+    /// different shape and not the one guarded here -- a `cfg` that selects an
+    /// implementation is load-bearing, while an `allow(dead_code)` conditioned
+    /// on one platform is an unexamined claim about all the others. If an
+    /// allowance ever appears in another file this scan will not see it, and
+    /// widening it is then the fix.
+    #[test]
+    fn every_dead_code_allowance_names_a_complement() {
+        let offenders = positive_dead_code_conditions(include_str!("process.rs"));
         assert!(
-            checked >= 3,
-            "this scan found {checked} dead_code allowances; it used to find \
-             three, so either they were removed or the parser has stopped \
-             matching and the check is now vacuous"
+            offenders.is_empty(),
+            "a dead_code allowance must name the complement of its caller's \
+             cfg rather than one platform, or it says nothing about the legs \
+             it does not name: {offenders:?}"
         );
+    }
+
+    /// Proves the scan above is capable of finding something.
+    ///
+    /// Without this, "no offending allowance in the file" and "the walk no
+    /// longer recognises an attribute" are the same passing test. The fixtures
+    /// are assembled with `concat!` for the reason [`CFG_ATTR`] documents: a
+    /// literal here would be found by the file scan itself and reported as a
+    /// defect in the file.
+    #[test]
+    fn the_allowance_scan_catches_a_positive_condition() {
+        let offending = concat!(
+            "#[cfg_",
+            "attr(windows, allow(dead_",
+            "code, reason = \"a reason\"))]\nfn f() {}"
+        );
+        assert_eq!(
+            positive_dead_code_conditions(offending),
+            vec!["windows".to_string()],
+            "the walk no longer recognises an allowance, so the scan over this \
+             file is checking nothing"
+        );
+
+        // The shape this file actually uses is not objected to.
+        let complement = concat!(
+            "#[cfg_",
+            "attr(not(target_os = \"linux\"), allow(dead_",
+            "code, reason = \"a reason\"))]\nfn f() {}"
+        );
+        assert!(positive_dead_code_conditions(complement).is_empty());
+
+        // Nor is a `cfg_attr` that allows something other than this lint, at
+        // any condition: the rule is about claims made on this lint's behalf.
+        let unrelated = concat!(
+            "#[cfg_",
+            "attr(windows, allow(clippy::needless_return))]\nfn f() {}"
+        );
+        assert!(positive_dead_code_conditions(unrelated).is_empty());
+
+        // A comment is not code. The rule this enforces is quoted in prose
+        // above, and reading prose as code is how the first version of this
+        // scan failed.
+        let commented = concat!(
+            "// #[cfg_",
+            "attr(windows, allow(dead_",
+            "code))]\nfn f() {}"
+        );
+        assert!(positive_dead_code_conditions(commented).is_empty());
     }
 
     /// The three-way answer, on synthesised tokens, on every platform.

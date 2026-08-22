@@ -1773,12 +1773,15 @@ mod tests {
         // is not in `WRAPPERS`, so `trim_matches(WRAPPERS)` left it welded on
         // and no list contained the result. `reason` is on ALLOWED_FIELDS, so
         // this reaches the scrubber rather than being dropped.
-        let rendered = format!(
-            "{:?}",
-            StoreError {
-                body: "{\"password\":\"hunter2\"}".to_string(),
-            }
-        );
+        let failure = StoreError {
+            body: "{\"password\":\"hunter2\"}".to_string(),
+        };
+        // The fixture carries the secret before anything has looked at it. A
+        // premise, asserted rather than assumed: a fixture that quietly
+        // stopped carrying one would make every assertion below vacuously
+        // true.
+        assert!(failure.body.contains("hunter2"), "{}", failure.body);
+        let rendered = format!("{failure:?}");
         // The premise, asserted rather than assumed: `Debug` really does
         // produce the escaped spelling. If it ever stops, this test is
         // measuring something else.
