@@ -98,7 +98,7 @@
 //! tripwire `c3` wrote is reused: when there is no `rel="next"`, the whole
 //! filtered set is on this page, so `total_count` **must** equal
 //! `workflow_runs.len()`. A disagreement is always warned about, and past
-//! [`MAX_BENIGN_TOTAL_COUNT_SKEW`] it `debug_assert!`s — see that constant for
+//! `MAX_BENIGN_TOTAL_COUNT_SKEW` it `debug_assert!`s — see that constant for
 //! why the two thresholds differ.
 //!
 //! # There is no job reservation, and nothing here may pretend otherwise
@@ -402,7 +402,7 @@ pub fn target_cost(scope: &ActivityScope) -> TargetCost {
 /// answer. Both hit `/repos/{o}/{r}/actions/runs`, both have no
 /// organization-wide form, and both take the repository list from the same
 /// caller-held set — `c3` documents that the list "has to come from the caller,
-/// [because] `f1` and `e1` already hold it, from
+/// \[because\] `f1` and `e1` already hold it, from
 /// [`crate::AuthenticatedClient::discover_installations`], and re-discovering it
 /// on every refresh would cost more requests than the count itself".
 ///
@@ -1433,6 +1433,25 @@ mod tests {
     /// directly so that the forms are enumerated where `c4` would have needed
     /// them, and so that the seam is loud rather than absent if the job listing
     /// is ever restored by a later owner decision.
+    ///
+    /// # How the second half of that claim is asserted, and how far it reaches
+    ///
+    /// By reading this file's own source, because nothing done to `b1` can
+    /// prove anything about what *this* module contains: every assertion in the
+    /// body below would pass unchanged with a full label matcher sitting beside
+    /// it, which is what the claim used to amount to. The scan takes the
+    /// production half — everything above `#[cfg(test)]`, with comment lines
+    /// dropped so that the module documentation may keep explaining the seam —
+    /// and requires that it names none of `b1`'s label vocabulary.
+    ///
+    /// It forbids the label types and not `runner_manager_domain::policy` as a
+    /// whole, because that module also holds `ScalePolicy` and
+    /// `AutoscaleConfig`, which this file could legitimately come to need. And
+    /// like the needles in
+    /// `nothing_in_this_crate_reserves_or_claims_a_job`, it is a tripwire on the
+    /// obvious shape rather than a proof: a hand-rolled comparison of raw label
+    /// strings that never names a `policy` type would walk past it. Stated
+    /// rather than implied, for the same reason it is stated there.
     #[test]
     fn the_runs_on_forms_b1_matches_are_the_predicate_this_module_does_not_own() {
         let labels = RoutingLabels::derive(
@@ -1488,6 +1507,115 @@ mod tests {
         assert_eq!(tally.not_matched, 1);
         assert_eq!(tally.unresolvable.len(), 1);
         assert_eq!(tally.total_seen(), 3);
+
+        // And the other half of this test's title, which everything above leaves
+        // untouched: that the predicate exercised here has no second
+        // implementation in this file. See the documentation on this test for
+        // what the scan covers and what it does not.
+        let production = this_file_above_its_tests_without_prose();
+        for owned_by_b1 in ["RoutingLabels", "RunsOn", "DemandTally"] {
+            assert!(
+                !production.contains(owned_by_b1),
+                "the demand gateway names `{owned_by_b1}`, which belongs to `b1`: the \
+                 `runs-on` predicate has exactly one implementation and this module is \
+                 not it. If the job listing was restored by a later owner decision, that \
+                 decision belongs in this module's documentation and in this test before \
+                 it belongs in the code"
+            );
+        }
+    }
+
+    /// This file's source above its test module, with comment lines dropped.
+    ///
+    /// Two exclusions, each load-bearing. The **test module** goes because the
+    /// tests above legitimately drive `b1`'s predicate and would accuse the file
+    /// of owning what they are proving it delegates. The **comments** go because
+    /// this module's documentation explains the seam at length and names the
+    /// types to do it — a scan that forbade the explanation would get the
+    /// explanation deleted, which is the trade
+    /// `nothing_in_this_crate_reserves_or_claims_a_job` records making in the
+    /// other direction.
+    fn this_file_above_its_tests_without_prose() -> String {
+        let (production, _) = include_str!("demand.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this file has a test module, and the scan is meaningless without one");
+        production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The one normalisation both halves of the reservation scan use.
+    ///
+    /// Shared rather than written twice, because the defect it closes was two
+    /// spellings of "the same" normalisation drifting apart: the haystack was
+    /// lower-cased and the needle was not, so every needle carrying a capital —
+    /// which is every type-shaped one — could not match a lower-cased haystack,
+    /// and three of the seven assertions were vacuously true from the day they
+    /// were written. One function cannot disagree with itself.
+    fn normalise_for_scan(text: &str) -> String {
+        text.to_ascii_lowercase().replace(['_', ' '], "")
+    }
+
+    // The Actions-service call this design has no equivalent of, plus the shapes
+    // an implementer would invent in its place. Matched case-insensitively with
+    // `_` and spaces removed, so one needle catches the snake, camel and Pascal
+    // spellings of an identifier at once — and so that the singular needle
+    // catches the plural.
+    //
+    // # Why every needle carries `fn` or `struct`
+    //
+    // A bare `acquirejobs` fires on this crate's own prose, and it was written
+    // that way first: three modules explain *why* there is no job reservation,
+    // and each has to name the call that does not exist in order to say so. A
+    // scan that forbids the explanation is a scan that gets the explanation
+    // deleted, which costs more than it protects. Requiring the item keyword
+    // narrows the needle to a *definition*, which is what the rule is actually
+    // about.
+    //
+    // What this therefore does **not** catch is stated rather than implied: a
+    // reservation reached through a trait method, a closure, or a
+    // differently-named helper. It is a tripwire on the obvious shape, and
+    // `c4`'s Definition of Done names review as the primary control.
+    //
+    // # And why every needle is spelled in halves
+    //
+    // `lib.rs`'s confidential-credential scan solves the same problem the same
+    // way: a needle written out whole would appear in this file's own source and
+    // the scan would accuse itself. Normalising
+    // `concat!("fn ", "acquire", "_job")` leaves the quote-comma-quote between
+    // the halves, so no needle ever appears whole in the text being scanned.
+    const FORBIDDEN: &[&str] = &[
+        concat!("fn ", "acquire", "_job"),
+        concat!("fn ", "claim", "_job"),
+        concat!("fn ", "lease", "_job"),
+        concat!("fn ", "reserve", "_job"),
+        // The acknowledgement this test's own title names alongside the other
+        // three, and which the list did not actually carry. Spelled to the verb
+        // rather than to a `_job` suffix, because the shape an implementer
+        // reaches for acknowledges a *message* or an *assignment* as readily as
+        // a job, and a suffixed needle would walk straight past those.
+        concat!("fn ", "ack", "nowledge"),
+        concat!("struct ", "Job", "Lease"),
+        concat!("struct ", "Job", "Claim"),
+        concat!("struct ", "Job", "Reservation"),
+    ];
+
+    /// Which forbidden shape a source text names, if any.
+    ///
+    /// The whole-crate scan and its positive control both go through here, so a
+    /// normalisation that cannot see a shape fails the control loudly instead of
+    /// passing the scan silently. That is the entire point of the indirection:
+    /// the arrangement this replaced had the control re-deriving the needle
+    /// itself, and a copy that agrees with a buggy original proves nothing — it
+    /// re-derived the needle the same wrong way and went green.
+    fn forbidden_shape_in(source: &str) -> Option<&'static str> {
+        let haystack = normalise_for_scan(source);
+        FORBIDDEN
+            .iter()
+            .copied()
+            .find(|forbidden| haystack.contains(&normalise_for_scan(forbidden)))
     }
 
     /// No reservation, claim, lease, or acknowledgement call exists anywhere in
@@ -1507,45 +1635,6 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("rest.rs", include_str!("rest.rs")),
         ];
-        // The Actions-service call this design has no equivalent of, plus the
-        // three shapes an implementer would invent in its place. Matched
-        // case-insensitively with `_` and spaces removed, so one needle catches
-        // the snake, camel and Pascal spellings of an identifier at once — and
-        // so that the singular needle catches the plural.
-        //
-        // # Why every needle carries `fn` or `struct`
-        //
-        // A bare `acquirejobs` fires on this crate's own prose, and it was
-        // written that way first: three modules explain *why* there is no job
-        // reservation, and each has to name the call that does not exist in
-        // order to say so. A scan that forbids the explanation is a scan that
-        // gets the explanation deleted, which costs more than it protects.
-        // Requiring the item keyword narrows the needle to a *definition*,
-        // which is what the rule is actually about.
-        //
-        // What this therefore does **not** catch is stated rather than implied:
-        // a reservation reached through a trait method, a closure, or a
-        // differently-named helper. It is a tripwire on the obvious shape, and
-        // `c4`'s Definition of Done names review as the primary control.
-        //
-        // # And why every needle is spelled in halves
-        //
-        // `lib.rs`'s confidential-credential scan solves the same problem the
-        // same way: a needle written out whole would appear in this file's own
-        // source and the scan would accuse itself. Normalising
-        // `concat!("fn ", "acquire", "_job")` leaves the quote-comma-quote
-        // between the halves, so no needle ever appears whole in the text being
-        // scanned.
-        const FORBIDDEN: &[&str] = &[
-            concat!("fn ", "acquire", "_job"),
-            concat!("fn ", "claim", "_job"),
-            concat!("fn ", "lease", "_job"),
-            concat!("fn ", "reserve", "_job"),
-            concat!("struct ", "Job", "Lease"),
-            concat!("struct ", "Job", "Claim"),
-            concat!("struct ", "Job", "Reservation"),
-        ];
-
         // `SOURCES` is a snapshot, and a snapshot makes "anywhere in the crate"
         // false the moment a file is added. The walk below turns the claim back
         // into a claim.
@@ -1591,48 +1680,75 @@ mod tests {
         );
 
         for (name, source) in SOURCES {
-            let haystack = source.to_ascii_lowercase().replace(['_', ' '], "");
-            for forbidden in FORBIDDEN {
-                let needle = forbidden.replace([' ', '_'], "");
-                assert!(
-                    !haystack.contains(&needle),
-                    "{name} names {forbidden:?}: there is no job reservation on the REST \
-                     path, and a local lease coordinates this host with itself and with \
-                     nothing else"
-                );
-            }
+            assert_eq!(
+                forbidden_shape_in(source),
+                None,
+                "{name} names a forbidden shape: there is no job reservation on the REST \
+                 path, and a local lease coordinates this host with itself and with \
+                 nothing else"
+            );
         }
     }
 
-    /// The scan above can actually see the thing it forbids.
+    /// The scan above can actually see the things it forbids.
     ///
     /// A substring scan that never matches passes for the wrong reason. This
-    /// plants the exact shape and requires the same normalisation to catch it.
+    /// plants the exact shapes and runs them through [`forbidden_shape_in`] —
+    /// the same matcher the scan uses, rather than a second copy of it.
+    ///
+    /// # Why one planted shape was not enough
+    ///
+    /// It planted only the `fn` form, and that form is the one that could not
+    /// fail: a `fn` needle is already lower-case, so it survived a
+    /// normalisation that lower-cased the haystack and not the needle. Every
+    /// type-shaped needle carries capitals and therefore could never match the
+    /// lower-cased haystack — all three of them were un-catchable, and their
+    /// three assertions vacuously true, while this control stayed green. (They
+    /// are not written out here for the reason the list itself is spelled in
+    /// halves: a literal would make this file fail its own gate.) Both kinds
+    /// are planted now, and the case-shape of the plant is the property under
+    /// test rather than an incidental detail of it.
     #[test]
     fn the_reservation_scan_catches_an_injected_reservation() {
         // Assembled from fragments rather than written out, because the scan
         // above reads this very file: a literal here would make the crate fail
         // its own gate, which is the trap that forced the needles to carry an
         // item keyword in the first place.
-        let planted = format!(
+        let call = format!(
             "    async {} {}{}(&self) -> Result<Vec<Job>, InventoryError> {{",
             "fn", "acquire", "_jobs"
         );
-        let haystack = planted.to_ascii_lowercase().replace(['_', ' '], "");
-        // The same needle the scan uses, taken from the same fragments and for
-        // the same reason: written whole it would appear in this file.
-        let needle = concat!("fn ", "acquire", "_job").replace(['_', ' '], "");
-
-        assert!(
-            haystack.contains(&needle),
-            "the normalisation cannot see a snake_case reservation call, so every \
-             negative assertion in the scan above is worthless: {haystack}"
+        let item = format!("{} {}{} {{ id: u64 }}", "struct", "Job", "Lease");
+        let acknowledgement = format!(
+            "    async {} {}{}(&self, id: u64) {{",
+            "fn", "ack", "nowledge_assignment"
         );
+
+        for (planted, expected) in [
+            (&call, concat!("fn ", "acquire", "_job")),
+            (&item, concat!("struct ", "Job", "Lease")),
+            (&acknowledgement, concat!("fn ", "ack", "nowledge")),
+        ] {
+            assert_eq!(
+                forbidden_shape_in(planted),
+                Some(expected),
+                "the scan's own matcher cannot see {planted:?}, so every negative \
+                 assertion it makes about that shape is worthless"
+            );
+        }
+
         // And the plural really is caught by the singular needle, which is the
         // one thing about the list above that is not obvious from reading it.
         assert!(
-            planted.contains("acquire_jobs"),
+            call.contains("acquire_jobs"),
             "the planted shape is the plural the Actions-service protocol used"
+        );
+        // Likewise the acknowledgement needle stops at the verb, so it catches
+        // the shapes that acknowledge something other than a job by name.
+        assert!(
+            acknowledgement.contains("_assignment"),
+            "the planted acknowledgement names no job, which is why the needle \
+             carrying a `_job` suffix would have missed it"
         );
     }
 }
