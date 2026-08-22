@@ -626,6 +626,31 @@ fn install_sh_stays_runnable_by_a_posix_shell() {
             "local -",
             "`local -a`/`local -n` are bash-only; plain `local` is fine",
         ),
+        // --------------------------------------------------------------------
+        // THE ONE MOST LIKELY TO ARRIVE BY COPY-PASTE, AND IT WAS NOT LISTED.
+        // --------------------------------------------------------------------
+        // BOTH sibling scripts open with `set -euo pipefail` (release.sh:36,
+        // channels.sh:36) because both are `#!/usr/bin/env bash`. Anyone
+        // hardening this file will reach for the line they can see two
+        // directories away -- and dash does not merely ignore `pipefail`, it
+        // rejects the whole `set` outright, on line 1, before anything else
+        // runs. `set -eu` is the POSIX subset and is what this file uses.
+        (
+            "set -o pipefail",
+            "`pipefail` is a bash/ksh option; dash rejects `set -o pipefail` \
+             outright. Both sibling scripts here use it, which is exactly why \
+             it is the likeliest thing to be pasted in",
+        ),
+        (
+            "&>",
+            "`&>file` is bash's combined redirect; POSIX is `>file 2>&1`",
+        ),
+        (
+            "echo -e",
+            "`echo -e` is bash; dash's `echo` interprets escapes with no flag \
+             and prints a literal `-e`. `printf` is the portable spelling, and \
+             it is what this script already uses",
+        ),
     ] {
         assert!(
             !source.contains(bashism),
@@ -635,12 +660,20 @@ fn install_sh_stays_runnable_by_a_posix_shell() {
     }
 
     // ------------------------------------------------------------------------
-    // TWO PATTERNS NEED MORE THAN A SUBSTRING, BECAUSE awk IS EMBEDDED HERE.
+    // SOME PATTERNS NEED MORE THAN A SUBSTRING, AND THE REASON IS THE SAME ONE
+    // EVERY TIME: THE LEGAL SPELLING CONTAINS THE ILLEGAL ONE.
     // ------------------------------------------------------------------------
-    // `[[` is a bash keyword AND the opening of a POSIX character class, and
-    // `==` is a bashism in `[ ... ]` AND ordinary awk. install.sh embeds an awk
-    // program to read SHA256SUMS, so a bare substring search reports the awk as
-    // a shell bug -- and the fix somebody reaches for is to weaken the test.
+    // `[[` is a bash keyword AND the opening of a POSIX character class. `==`
+    // is a bashism in `[ ... ]` AND ordinary awk, and install.sh embeds an awk
+    // program to read SHA256SUMS. `((` is a bash arithmetic command AND the
+    // tail of POSIX `$((`. `$'` is bash's ANSI-C quoting AND a `$` anchor
+    // sitting at the end of a single-quoted regex, which line 157 has. And
+    // `source ` is a bashism as a COMMAND but ordinary English inside the two
+    // messages that say "build from source".
+    //
+    // Every one of those, searched as a bare substring, reports correct code as
+    // a bug -- and the fix somebody reaches for at that point is to delete the
+    // check rather than to sharpen it. So each is narrowed here instead.
     for (number, line) in source.lines().enumerate() {
         let number = number + 1;
         assert!(
@@ -654,26 +687,152 @@ fn install_sh_stays_runnable_by_a_posix_shell() {
             "install.sh line {number} compares with `==` inside `[ ]`; POSIX \
              test compares with `=`:\n  {line}"
         );
+        // `((expr))` is bash's arithmetic COMMAND. `$((expr))` is POSIX
+        // arithmetic expansion and perfectly fine, so it is removed first --
+        // the same exception as `[[:` above, for the same reason.
+        assert!(
+            !line.replace("$((", "").contains("(("),
+            "install.sh line {number} uses bash's `((...))` arithmetic command; \
+             POSIX has `$((...))` expansion, or `expr`:\n  {line}"
+        );
+        assert!(
+            !has_substring_expansion(line),
+            "install.sh line {number} uses bash's `${{var:offset:length}}` \
+             substring expansion; POSIX parameter expansion has no offsets. \
+             `${{var:-default}}` and `${{var:+alt}}` are POSIX and are not what \
+             this flags:\n  {line}"
+        );
+        assert!(
+            !has_ansi_c_quoting(line),
+            "install.sh line {number} uses bash's `$'...'` ANSI-C quoting; dash \
+             reads that as a `$` followed by a quoted string:\n  {line}"
+        );
+        assert!(
+            !sources_a_file(line),
+            "install.sh line {number} runs `source`; POSIX spells it `.`:\n  {line}"
+        );
     }
+}
+
+/// `${name:0:8}` -- bash substring expansion.
+///
+/// Told apart from `${name:-default}` and `${name:+alt}`, which are POSIX and
+/// begin identically, by the character after the colon: an offset is a digit.
+fn has_substring_expansion(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while let Some(offset) = line[index..].find("${") {
+        let mut cursor = index + offset + 2;
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        if cursor + 1 < bytes.len() && bytes[cursor] == b':' && bytes[cursor + 1].is_ascii_digit() {
+            return true;
+        }
+        index = index + offset + 2;
+    }
+    false
+}
+
+/// `$'...'` -- bash's ANSI-C quoting -- as opposed to a `$` that happens to end
+/// a single-quoted string.
+///
+/// install.sh line 157 carries `...[0-9]*)$'`: a regex anchor immediately
+/// before the closing quote. ANSI-C quoting OPENS a word, so the character in
+/// front of it decides.
+fn has_ansi_c_quoting(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while let Some(offset) = line[index..].find("$'") {
+        let at = index + offset;
+        let opens_a_word = match at.checked_sub(1).map(|previous| bytes[previous]) {
+            None => true,
+            Some(byte) => byte.is_ascii_whitespace() || matches!(byte, b'=' | b'(' | b'{' | b','),
+        };
+        if opens_a_word {
+            return true;
+        }
+        index = at + 2;
+    }
+    false
+}
+
+/// `source file` as a COMMAND, not the word "source" inside a message.
+///
+/// Both architecture refusals in install.sh say "Build from source with
+/// `cargo install`", and both are executable lines.
+fn sources_a_file(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("source ")
+        || ["; source ", "&& source ", "|| source ", "( source "]
+            .iter()
+            .any(|opener| line.contains(opener))
 }
 
 // ----------------------------------------------------------------------------
 // install.ps1.
 // ----------------------------------------------------------------------------
 
-/// The PowerShell that runs install.ps1.
+/// EVERY PowerShell host on this machine that install.ps1 has to work under.
 ///
-/// `pwsh` first, then Windows PowerShell. Both are supported hosts and the
-/// script is written for 5.1 deliberately -- a clean Windows machine has 5.1
-/// and no PowerShell 7, and the Definition of Done names a clean Windows host
-/// with no Node installed as a case `irm ... | iex` must serve.
-fn powershell_program() -> Option<PathBuf> {
-    for candidate in ["pwsh", "pwsh.exe", "powershell.exe"] {
-        if let Some(found) = find_program(candidate) {
-            return Some(found);
+/// ----------------------------------------------------------------------------
+/// THE FIRST HOST FOUND IS NOT ENOUGH, AND THAT WAS THE BUG.
+/// ----------------------------------------------------------------------------
+/// This used to return the FIRST of `pwsh`, `pwsh.exe`, `powershell.exe`.
+/// GitHub's `windows-latest` image ships PowerShell 7 on PATH and so does a
+/// normal developer machine, so every `install_ps1_*` test ran on pwsh 7 alone
+/// -- and Windows PowerShell 5.1, which the script's own header calls a
+/// supported host rather than a fallback, was never executed by anything.
+///
+/// That matters because 5.1 is not a subset of 7 by accident: it has no `??`,
+/// no ternary, no `-Parallel`, and `Invoke-WebRequest` there needs
+/// `-UseBasicParsing`. The script forbids all of them in prose. Nothing
+/// enforced it, so any of them would have shipped green -- onto exactly the
+/// clean Windows host with no PowerShell 7 and no Node that the Definition of
+/// Done names as the case `irm ... | iex` exists to serve.
+///
+/// Covering it costs a loop, not a dependency: 5.1 is part of the operating
+/// system and always lives at
+/// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`.
+fn powershell_hosts() -> Vec<PathBuf> {
+    let mut hosts: Vec<PathBuf> = Vec::new();
+
+    for name in ["pwsh", "pwsh.exe"] {
+        if let Some(found) = find_program(name)
+            && !hosts.contains(&found)
+        {
+            hosts.push(found);
         }
     }
-    None
+
+    if cfg!(windows) {
+        // Resolved through PATH and by absolute path. Its directory is on PATH
+        // by default, but "by default" is not something the only assertion
+        // covering 5.1 should rest on. First hit wins, so the two spellings of
+        // the same file do not become two runs of the same host.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(found) = find_program("powershell.exe") {
+            candidates.push(found);
+        }
+        let system_root =
+            std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        candidates.push(
+            PathBuf::from(system_root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        );
+        for candidate in candidates {
+            if candidate.is_file() {
+                hosts.push(candidate);
+                break;
+            }
+        }
+    }
+
+    hosts
 }
 
 fn find_program(program: &str) -> Option<PathBuf> {
@@ -683,25 +842,40 @@ fn find_program(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Resolves PowerShell, or explains why the caller may stop.
+/// Resolves every PowerShell host, or explains why the caller may stop.
 ///
 /// PowerShell 7 is preinstalled on all three GitHub-hosted runner images and
-/// Windows always has 5.1, so its absence is a developer-machine condition and
-/// not a CI one. Skipping quietly wherever it is missing would make this an
+/// Windows always has 5.1, so an empty list is a developer-machine condition
+/// and not a CI one. Skipping quietly wherever it is missing would make this an
 /// assertion that could vanish from CI unnoticed, so `CI` being set turns the
 /// skip back into a failure.
-fn powershell_or_skip() -> Option<PathBuf> {
-    if let Some(found) = powershell_program() {
-        return Some(found);
-    }
+fn powershell_hosts_or_skip() -> Vec<PathBuf> {
+    let hosts = powershell_hosts();
+
     // Written as a branch rather than `assert!(!cfg!(windows), ...)`, which
     // clippy reads -- correctly -- as an assertion on a constant.
     if cfg!(windows) {
-        panic!(
+        assert!(
+            !hosts.is_empty(),
             "no PowerShell found on a Windows host. Windows PowerShell 5.1 is \
              part of the operating system, so this is a broken PATH rather than \
              a missing dependency."
         );
+        assert!(
+            hosts.iter().any(|host| host
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))),
+            "Windows PowerShell 5.1 is not among the hosts these tests will \
+             run ({hosts:?}). It is part of the operating system, and it is the \
+             host install.ps1 is deliberately written for -- a clean Windows \
+             machine has 5.1 and no PowerShell 7. Exercising only pwsh 7 is \
+             what previously let a 5.1-only breakage ship green."
+        );
+        return hosts;
+    }
+
+    if !hosts.is_empty() {
+        return hosts;
     }
     assert!(
         std::env::var_os("CI").is_none(),
@@ -713,7 +887,38 @@ fn powershell_or_skip() -> Option<PathBuf> {
         "SKIPPED: no PowerShell on PATH. install.ps1 is exercised on Windows \
          and in CI; install `pwsh` to run it here."
     );
-    None
+    hosts
+}
+
+/// True where `shell` is Windows PowerShell 5.1 rather than PowerShell 7.
+fn is_windows_powershell(shell: &Path) -> bool {
+    shell
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))
+}
+
+/// The `PSModulePath` a CLEAN Windows host gives Windows PowerShell 5.1.
+///
+/// ----------------------------------------------------------------------------
+/// WITHOUT THIS, THE 5.1 LEG MEASURES A MACHINE NOBODY MEANT TO TEST.
+/// ----------------------------------------------------------------------------
+/// `PSModulePath` is inherited, and every parent in the chain that reaches these
+/// tests -- a developer's pwsh 7 prompt, GitHub's `run:` step, which is pwsh by
+/// default on the windows image -- puts PowerShell 7's module directories in
+/// FRONT of 5.1's. 5.1 started that way then resolves
+/// `Microsoft.PowerShell.Utility` to PowerShell 7's copy and loses
+/// `Get-FileHash` outright. Measured; and it is that one cmdlet, not a general
+/// collapse.
+///
+/// That machine is worth testing, but it is a DIFFERENT machine from the one the
+/// Definition of Done names -- "a clean Windows host with no Node installed",
+/// which has 5.1 and no PowerShell 7 at all. So the two are separated: every
+/// test through `run_install_ps1` gets the clean host, and
+/// `install_ps1_verifies_the_digest_where_get_filehash_is_shadowed` constructs
+/// the other one deliberately.
+fn clean_windows_powershell_module_path() -> String {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules")
 }
 
 fn run_install_ps1(
@@ -725,8 +930,18 @@ fn run_install_ps1(
     let script = install_script("install.ps1");
     let mut command = Command::new(shell);
     command.arg("-NoProfile").arg("-NonInteractive");
+    if is_windows_powershell(shell) {
+        command.env("PSModulePath", clean_windows_powershell_module_path());
+    }
     if cfg!(windows) {
         // `-ExecutionPolicy` applies to Windows only; pwsh on Linux rejects it.
+        //
+        // This bypass is a HARNESS convenience -- `-File` is the only way to
+        // pass `-BaseUrl`, `-Dir` and `-PrintPlan` -- and it is precisely what
+        // hid the fact that the README's documented two-step form was refused
+        // on a `Restricted` host. That form is exercised without any bypass by
+        // `the_documented_windows_two_step_form_installs_under_a_restricted_policy`
+        // below; do not let this line stand in for it.
         command.arg("-ExecutionPolicy").arg("Bypass");
     }
     command.arg("-File").arg(&script);
@@ -750,207 +965,1000 @@ fn run_install_ps1(
 
 #[test]
 fn install_ps1_selects_the_windows_artifact_for_both_architectures() {
-    let Some(shell) = powershell_or_skip() else {
-        return;
-    };
-    let temporary = TempDir::new().expect("a temporary directory");
-    let base = temporary.path();
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let temporary = TempDir::new().expect("a temporary directory");
+        let base = temporary.path();
 
-    // Only one Windows target is published, and Windows-on-ARM is served by it
-    // through the x64 emulation layer. npm cannot do that -- it will not
-    // install a `"cpu": ["x64"]` package onto an arm64 host -- so this is the
-    // one platform where the install script reaches a user npm cannot.
-    for architecture in ["AMD64", "ARM64"] {
-        let (ok, output) =
-            run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", architecture]);
-        assert!(ok, "install.ps1 refused {architecture}:\n{output}");
-        assert_eq!(
-            plan_value(&output, "target"),
-            "x86_64-pc-windows-msvc",
-            "install.ps1 maps {architecture} to the wrong artifact:\n{output}"
+        // Only one Windows target is published, and Windows-on-ARM is served by
+        // it through the x64 emulation layer. npm cannot do that -- it will not
+        // install a `"cpu": ["x64"]` package onto an arm64 host -- so this is
+        // the one platform where the install script reaches a user npm cannot.
+        for architecture in ["AMD64", "ARM64"] {
+            let (ok, output) =
+                run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", architecture]);
+            assert!(ok, "install.ps1 refused {architecture} under {host}:\n{output}");
+            assert_eq!(
+                plan_value(&output, "target"),
+                "x86_64-pc-windows-msvc",
+                "install.ps1 maps {architecture} to the wrong artifact under \
+                 {host}:\n{output}"
+            );
+        }
+
+        // 32-bit x86 publishes nothing, so it must be a refusal rather than a
+        // silent x64 install that fails to load.
+        let (ok, output) = run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", "x86"]);
+        assert!(
+            !ok,
+            "install.ps1 accepted a 32-bit x86 host, which publishes no \
+             artifact, under {host}:\n{output}"
+        );
+        assert!(
+            output.contains("cargo install"),
+            "the refusal must point at the way in that still exists ({host}):\n{output}"
         );
     }
-
-    // 32-bit x86 publishes nothing, so it must be a refusal rather than a
-    // silent x64 install that fails to load.
-    let (ok, output) = run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", "x86"]);
-    assert!(
-        !ok,
-        "install.ps1 accepted a 32-bit x86 host, which publishes no artifact:\n{output}"
-    );
-    assert!(
-        output.contains("cargo install"),
-        "the refusal must point at the way in that still exists:\n{output}"
-    );
 }
 
 #[test]
 fn install_ps1_defaults_to_the_documented_directory() {
-    let Some(shell) = powershell_or_skip() else {
-        return;
-    };
-    let temporary = TempDir::new().expect("a temporary directory");
-    let local_app_data = temporary.path().join("LocalAppData");
-    std::fs::create_dir_all(&local_app_data).expect("a fake LOCALAPPDATA");
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let temporary = TempDir::new().expect("a temporary directory");
+        let local_app_data = temporary.path().join("LocalAppData");
+        std::fs::create_dir_all(&local_app_data).expect("a fake LOCALAPPDATA");
 
-    let script = install_script("install.ps1");
-    let mut command = Command::new(&shell);
-    command.arg("-NoProfile").arg("-NonInteractive");
-    if cfg!(windows) {
-        command.arg("-ExecutionPolicy").arg("Bypass");
+        let script = install_script("install.ps1");
+        let mut command = Command::new(&shell);
+        command.arg("-NoProfile").arg("-NonInteractive");
+        if cfg!(windows) {
+            command.arg("-ExecutionPolicy").arg("Bypass");
+        }
+        command.arg("-File").arg(&script);
+        command.arg("-BaseUrl").arg(temporary.path());
+        command.arg("-PrintPlan");
+        command.env("LOCALAPPDATA", &local_app_data);
+        command.env("RUNNER_MANAGER_INSTALL_DIR", "");
+        command.current_dir(repository_root());
+
+        let output = command.output().expect("cannot run install.ps1");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "install.ps1 --print-plan failed under {host}:\n{text}"
+        );
+
+        let directory = plan_value(&text, "install_dir");
+        // Asserted on the shape rather than on an exact string: `Join-Path`
+        // uses the host's separator, and this test also runs on Linux and
+        // macOS.
+        assert!(
+            directory.starts_with(&local_app_data.to_string_lossy().to_string()),
+            "install.ps1 must default under %LOCALAPPDATA%, got {directory} \
+             under {host}"
+        );
+        assert!(
+            directory.contains("Programs") && directory.ends_with("runner-manager"),
+            "install.ps1 must default to %LOCALAPPDATA%\\Programs\\runner-manager. \
+             It is per-user, needs no elevation, and does not move when a \
+             toolchain moves -- which an installed service's recorded absolute \
+             path cannot survive. Got {directory} under {host}"
+        );
     }
-    command.arg("-File").arg(&script);
-    command.arg("-BaseUrl").arg(temporary.path());
-    command.arg("-PrintPlan");
-    command.env("LOCALAPPDATA", &local_app_data);
-    command.env("RUNNER_MANAGER_INSTALL_DIR", "");
-    command.current_dir(repository_root());
-
-    let output = command.output().expect("cannot run install.ps1");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.status.success(),
-        "install.ps1 --print-plan failed:\n{text}"
-    );
-
-    let directory = plan_value(&text, "install_dir");
-    // Asserted on the shape rather than on an exact string: `Join-Path` uses
-    // the host's separator, and this test also runs on Linux and macOS.
-    assert!(
-        directory.starts_with(&local_app_data.to_string_lossy().to_string()),
-        "install.ps1 must default under %LOCALAPPDATA%, got {directory}"
-    );
-    assert!(
-        directory.contains("Programs") && directory.ends_with("runner-manager"),
-        "install.ps1 must default to %LOCALAPPDATA%\\Programs\\runner-manager. \
-         It is per-user, needs no elevation, and does not move when a toolchain \
-         moves -- which an installed service's recorded absolute path cannot \
-         survive. Got {directory}"
-    );
 }
 
 #[test]
 fn install_ps1_verifies_the_published_digest_and_installs() {
-    let Some(shell) = powershell_or_skip() else {
-        return;
-    };
-    let fixture = prepare("1.2.3");
-    let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
-    assert!(ok, "install.ps1 failed on a good release:\n{output}");
-    assert!(
-        output.contains("SHA-256 OK"),
-        "install.ps1 installed without reporting that it verified the \
-         archive:\n{output}"
-    );
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let fixture = prepare("1.2.3");
+        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(ok, "install.ps1 failed on a good release under {host}:\n{output}");
+        assert!(
+            output.contains("SHA-256 OK"),
+            "install.ps1 installed without reporting that it verified the \
+             archive ({host}):\n{output}"
+        );
 
-    let binary = fixture.directory.join("runner-manager.exe");
-    assert!(
-        binary.is_file(),
-        "install.ps1 reported success and installed nothing to {}",
-        fixture.directory.display()
-    );
-    assert_eq!(
-        std::fs::read(&binary).expect("the installed binary"),
-        std::fs::read(
-            fixture
-                .release
-                .staged("x86_64-pc-windows-msvc")
-                .join("runner-manager.exe")
-        )
-        .expect("the staged binary"),
-        "the installed file is not byte-identical to the one in the archive"
-    );
-    assert!(
-        output.contains("Release 1.2.3"),
-        "install.ps1 must report the version it resolved from SHA256SUMS:\n{output}"
-    );
+        let binary = fixture.directory.join("runner-manager.exe");
+        assert!(
+            binary.is_file(),
+            "install.ps1 reported success and installed nothing to {} under {host}",
+            fixture.directory.display()
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("the installed binary"),
+            std::fs::read(
+                fixture
+                    .release
+                    .staged("x86_64-pc-windows-msvc")
+                    .join("runner-manager.exe")
+            )
+            .expect("the staged binary"),
+            "the installed file is not byte-identical to the one in the archive \
+             ({host})"
+        );
+        assert!(
+            output.contains("Release 1.2.3"),
+            "install.ps1 must report the version it resolved from SHA256SUMS \
+             ({host}):\n{output}"
+        );
+    }
 }
 
 #[test]
 fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alone() {
-    let Some(shell) = powershell_or_skip() else {
-        return;
-    };
-    let fixture = prepare("1.2.3");
-    let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
-    assert!(ok, "the first install must succeed:\n{output}");
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let fixture = prepare("1.2.3");
+        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(ok, "the first install must succeed under {host}:\n{output}");
 
-    let binary = fixture.directory.join("runner-manager.exe");
-    let before = std::fs::read(&binary).expect("the installed binary");
+        let binary = fixture.directory.join("runner-manager.exe");
+        let before = std::fs::read(&binary).expect("the installed binary");
 
-    substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
+        substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
 
-    let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
-    assert!(
-        !ok,
-        "install.ps1 installed an archive whose digest does not match the \
-         published one:\n{output}"
-    );
-    assert!(
-        output.contains("CHECKSUM MISMATCH"),
-        "the abort must say plainly what went wrong:\n{output}"
-    );
-    assert_eq!(
-        std::fs::read(&binary).expect("the installed binary"),
-        before,
-        "a failed install replaced or damaged a binary that was already \
-         working. A failed upgrade must be a no-op."
-    );
-    assert_eq!(
-        installed_entries(&fixture.directory),
-        vec!["runner-manager.exe".to_string()],
-        "the aborted install left a staging file behind"
-    );
+        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(
+            !ok,
+            "install.ps1 installed an archive whose digest does not match the \
+             published one, under {host}:\n{output}"
+        );
+        assert!(
+            output.contains("CHECKSUM MISMATCH"),
+            "the abort must say plainly what went wrong ({host}):\n{output}"
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("the installed binary"),
+            before,
+            "a failed install replaced or damaged a binary that was already \
+             working, under {host}. A failed upgrade must be a no-op."
+        );
+        assert_eq!(
+            installed_entries(&fixture.directory),
+            vec!["runner-manager.exe".to_string()],
+            "the aborted install left a staging file behind ({host})"
+        );
+    }
 }
 
 #[test]
 fn install_ps1_is_idempotent_and_pins_the_version_asked_for() {
-    let Some(shell) = powershell_or_skip() else {
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let fixture = prepare("1.2.3");
+
+        for attempt in 1..=2 {
+            let (ok, output) =
+                run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+            assert!(
+                ok,
+                "install.ps1 failed on attempt {attempt} under {host}:\n{output}"
+            );
+        }
+        assert_eq!(
+            installed_entries(&fixture.directory),
+            vec!["runner-manager.exe".to_string()],
+            "running install.ps1 twice must leave exactly one binary and no \
+             staging files ({host})"
+        );
+
+        let (ok, output) = run_install_ps1(
+            &shell,
+            &fixture.release.assets,
+            &fixture.directory,
+            &["-Version", "9.9.9"],
+        );
+        assert!(
+            !ok,
+            "install.ps1 installed 1.2.3 when it was asked for 9.9.9, under \
+             {host}:\n{output}"
+        );
+        assert!(
+            output.contains("9.9.9") && output.contains("1.2.3"),
+            "the refusal must name what was asked for and what is available \
+             ({host}):\n{output}"
+        );
+
+        let (ok, output) = run_install_ps1(
+            &shell,
+            &fixture.release.assets,
+            &fixture.directory,
+            &["-Version", "v1.2.3"],
+        );
+        assert!(
+            !ok,
+            "install.ps1 accepted -Version v1.2.3 under {host}:\n{output}"
+        );
+        assert!(
+            output.contains("belongs to the tag"),
+            "the refusal must explain that the `v` is the tag's, not the \
+             version's ({host}):\n{output}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The README's Windows two-step form, run the way the README writes it.
+// ----------------------------------------------------------------------------
+
+/// The RUN step of the README's Windows two-step block.
+///
+/// Read OUT OF THE README rather than written here, so this test drives the
+/// command the documentation actually hands people. Rewrite that block and this
+/// executes the rewrite -- which is the only way a documented invocation stays
+/// tested rather than merely asserted about.
+fn documented_windows_two_step_run_command() -> String {
+    let source = std::fs::read_to_string(repository_root().join("README.md"))
+        .expect("README.md must be readable")
+        .replace("\r\n", "\n");
+
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in source.lines() {
+        if let Some(rest) = line.trim_end().strip_prefix("```") {
+            match current.take() {
+                Some(body) => blocks.push(body),
+                None => {
+                    if rest.trim() == "powershell" {
+                        current = Some(Vec::new());
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line.trim_end().to_string());
+        }
+    }
+
+    let block = blocks
+        .iter()
+        .find(|body| body.iter().any(|line| line.contains("-OutFile install.ps1")))
+        .unwrap_or_else(|| {
+            panic!(
+                "README.md has no ```powershell block that downloads install.ps1 \
+                 with `-OutFile`. That block is the two-step download-read-run \
+                 form `09-release-distribution.md` requires for operators who \
+                 will not pipe a remote script into a shell, and this test runs \
+                 its last line verbatim."
+            )
+        });
+
+    block
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("the two-step block must end with the step that runs the script")
+        .trim()
+        .to_string()
+}
+
+/// Runs `command` in a PowerShell whose PROCESS-scope execution policy is
+/// `Restricted` -- which is what a clean Windows client has by default.
+///
+/// Process scope is per-process and outranks every scope but a Group Policy, so
+/// the condition is constructed without touching the machine. Where a Group
+/// Policy IS in force the process prints `POLICY-NOT-RESTRICTED` and runs
+/// nothing, because a check that quietly ran under a permissive policy would
+/// assert nothing at all.
+fn run_under_restricted_policy(
+    shell: &Path,
+    working_directory: &Path,
+    command: &str,
+    envs: &[(&str, &str)],
+) -> (bool, String) {
+    let script = format!(
+        "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Restricted -Force; \
+         if ((Get-ExecutionPolicy) -ne 'Restricted') {{ \
+         Write-Output 'POLICY-NOT-RESTRICTED'; exit 0 }}; {command}"
+    );
+
+    let mut process = Command::new(shell);
+    process
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(&script);
+    if is_windows_powershell(shell) {
+        // `Set-ExecutionPolicy` lives in `Microsoft.PowerShell.Security` and is
+        // lost to the same shadowing that takes `Get-FileHash`, so this test
+        // could not even construct its own condition without a clean path.
+        process.env("PSModulePath", clean_windows_powershell_module_path());
+    }
+    process.current_dir(working_directory);
+    for (key, value) in envs {
+        process.env(key, value);
+    }
+
+    let output = process
+        .output()
+        .unwrap_or_else(|err| panic!("cannot run {}: {err}", shell.display()));
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[test]
+fn the_documented_windows_two_step_form_installs_under_a_restricted_policy() {
+    // ------------------------------------------------------------------------
+    // THE POLICY IS THE WHOLE POINT, AND THE HARNESS USED TO BYPASS IT.
+    // ------------------------------------------------------------------------
+    // Two facts collide. `09-release-distribution.md` requires a two-step
+    // download-read-run form for operators who will not pipe a remote script
+    // into a shell. A Windows CLIENT's default `LocalMachine` execution policy
+    // is `Restricted`. So `.\install.ps1` on such a host fails with "cannot be
+    // loaded because running scripts is disabled on this system" -- and it
+    // fails at the LAST step, after the operator has already downloaded and
+    // read the script, which is the worst possible moment to be refused.
+    //
+    // Every other install.ps1 test here passes `-ExecutionPolicy Bypass`,
+    // because `-File` is the only way to hand the script parameters. The suite
+    // therefore could not see this, and did not. This test uses no bypass, and
+    // it runs the command it READS OUT OF THE README rather than one written
+    // here -- so documenting a form that does not work is a red test.
+    //
+    // Execution policy is a Windows-only concept and `Set-ExecutionPolicy` is
+    // not supported by pwsh on Linux or macOS, so there is nothing to build
+    // there.
+    if !cfg!(windows) {
+        eprintln!(
+            "SKIPPED: execution policy is a Windows concept. The documented \
+             two-step form is exercised on the windows leg."
+        );
+        return;
+    }
+
+    let run_step = documented_windows_two_step_run_command();
+
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display().to_string();
+        let fixture = prepare("1.2.3");
+
+        // What the README's first two lines leave behind: the script,
+        // downloaded into the operator's working directory, and read.
+        let download = fixture.release.root.join("download");
+        std::fs::create_dir_all(&download).expect("a download directory");
+        std::fs::copy(install_script("install.ps1"), download.join("install.ps1"))
+            .expect("copying install.ps1 the way the documented download would");
+
+        // ---- the negative control ------------------------------------------
+        // Without it, a machine whose policy could not actually be lowered
+        // would satisfy the positive assertion below for entirely the wrong
+        // reason, and this test would go green on a host it never constrained.
+        let (ran, refusal) =
+            run_under_restricted_policy(&shell, &download, "& '.\\install.ps1' -PrintPlan", &[]);
+        if refusal.contains("POLICY-NOT-RESTRICTED") {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "the execution policy could not be lowered to Restricted in CI \
+                 ({host}). Process scope outranks every scope but a Group \
+                 Policy, so this is a policy-managed image and the condition \
+                 this test exists to construct cannot be constructed on it."
+            );
+            eprintln!(
+                "SKIPPED: a Group Policy pins the execution policy on this \
+                 machine, so `Restricted` cannot be constructed."
+            );
+            return;
+        }
+        assert!(
+            !ran,
+            "running `.\\install.ps1` as a FILE succeeded under a Restricted \
+             execution policy on {host}. That is not what Windows does, so \
+             either the policy was not applied or this test is measuring \
+             nothing:\n{refusal}"
+        );
+        assert!(
+            refusal.contains("running scripts is disabled"),
+            "the file form was refused under {host}, but not by the execution \
+             policy -- so the policy is not what this test is holding \
+             constant:\n{refusal}"
+        );
+
+        // ---- the form the README actually documents ------------------------
+        let assets = posix(&fixture.release.assets);
+        let directory = posix(&fixture.directory);
+        let environment = [
+            ("RUNNER_MANAGER_INSTALL_BASE_URL", assets.as_str()),
+            ("RUNNER_MANAGER_INSTALL_DIR", directory.as_str()),
+        ];
+
+        let (ok, output) = run_under_restricted_policy(&shell, &download, &run_step, &environment);
+        assert!(
+            ok,
+            "the README documents `{run_step}` as the last step of the two-step \
+             install, and it does not work on a Windows host with the default \
+             `Restricted` execution policy ({host}). An operator who declines to \
+             pipe a remote script into a shell is refused at the last step, \
+             after reading the script:\n{output}"
+        );
+        assert!(
+            output.contains("SHA-256 OK"),
+            "the documented form installed without reporting that it verified \
+             the archive ({host}):\n{output}"
+        );
+
+        let binary = fixture.directory.join("runner-manager.exe");
+        assert!(
+            binary.is_file(),
+            "the documented form reported success and installed nothing to {} \
+             under {host}:\n{output}",
+            fixture.directory.display()
+        );
+        let before = std::fs::read(&binary).expect("the installed binary");
+
+        // ---- and the abort path under the same form ------------------------
+        // This is where `exit` would have been fatal. Under `iex` there is no
+        // script of our own to exit FROM, so `exit` terminates the SESSION that
+        // ran it: Windows Terminal closes the tab and takes the CHECKSUM
+        // MISMATCH message with it. Note the asymmetry -- the success path
+        // never calls `exit`, so only a FAILURE killed the session, which is
+        // the one case where the message most needed to survive. install.ps1
+        // throws instead when `$MyInvocation.MyCommand.Path` is empty.
+        substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
+        let (ok, output) = run_under_restricted_policy(&shell, &download, &run_step, &environment);
+        assert!(
+            !ok,
+            "the documented form installed an archive whose digest does not \
+             match the published one, under {host}:\n{output}"
+        );
+        assert!(
+            output.contains("CHECKSUM MISMATCH"),
+            "the abort message did not survive the documented invocation on \
+             {host}. A user who sees only a non-zero exit -- or a closed \
+             terminal -- assumes a network problem and retries forever:\n{output}"
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("the installed binary"),
+            before,
+            "a failed install through the documented form replaced or damaged a \
+             binary that was already working ({host}). A failed upgrade must be \
+             a no-op."
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Windows PowerShell 5.1 on a machine that ALSO has PowerShell 7.
+// ----------------------------------------------------------------------------
+
+/// PowerShell 7's module directory, where this machine has PowerShell 7.
+fn powershell_seven_modules() -> Option<PathBuf> {
+    for shell in powershell_hosts() {
+        if is_windows_powershell(&shell) {
+            continue;
+        }
+        if let Some(modules) = shell.parent().map(|directory| directory.join("Modules"))
+            && modules.is_dir()
+        {
+            return Some(modules);
+        }
+    }
+    None
+}
+
+#[test]
+fn install_ps1_verifies_the_digest_where_get_filehash_is_shadowed() {
+    // ------------------------------------------------------------------------
+    // THE FIRST THING RUNNING 5.1 FOUND WAS A 5.1-ONLY DEFECT.
+    // ------------------------------------------------------------------------
+    // Type `powershell.exe` at a pwsh 7 prompt -- an ordinary thing to do -- and
+    // the 5.1 you get inherits a `PSModulePath` whose first entries are
+    // PowerShell 7's. 5.1 resolves `Microsoft.PowerShell.Utility` to 7's copy,
+    // cannot load it, and `Get-FileHash` becomes "not recognized as the name of
+    // a cmdlet". Measured on 5.1.26100; and it is narrow -- every other cmdlet
+    // install.ps1 uses still resolves, including `Invoke-WebRequest`, which is
+    // in the same module.
+    //
+    // What made it worth fixing rather than noting is WHERE it lands: after the
+    // download, at the digest comparison, so the user is told about a missing
+    // cmdlet instead of about the archive. It fails closed, which is the right
+    // direction and not the same thing as working.
+    //
+    // install.ps1 now falls through to `System.Security.Cryptography.SHA256`,
+    // which is part of the framework rather than of a module. This test is what
+    // keeps that branch honest: it is the only thing that executes it.
+    if !cfg!(windows) {
+        eprintln!("SKIPPED: Windows PowerShell 5.1 exists only on Windows.");
+        return;
+    }
+
+    let Some(shell) = powershell_hosts_or_skip()
+        .into_iter()
+        .find(|host| is_windows_powershell(host))
+    else {
+        return;
+    };
+
+    let Some(seven) = powershell_seven_modules() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "PowerShell 7 is preinstalled on GitHub's windows runner image, so \
+             its module directory not being found in CI means this test cannot \
+             construct the condition it exists for -- and the .NET digest \
+             fallback in install.ps1 would then be executed by nothing."
+        );
+        eprintln!(
+            "SKIPPED: no PowerShell 7 on this machine, so 5.1's module path \
+             cannot be shadowed the way a dual-install shadows it."
+        );
+        return;
+    };
+
+    let shadowed = format!(
+        "{};{}",
+        seven.display(),
+        clean_windows_powershell_module_path()
+    );
+
+    // The positive guard. If PowerShell 7 ever stops shadowing 5.1's
+    // `Get-FileHash`, this test would still install perfectly -- through the
+    // cmdlet, never touching the fallback -- and would report success while
+    // covering nothing.
+    let mut probe = Command::new(&shell);
+    probe
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg("if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) { 'PRESENT' } else { 'ABSENT' }")
+        .env("PSModulePath", &shadowed);
+    let probed = probe.output().expect("cannot run Windows PowerShell");
+    let probed = String::from_utf8_lossy(&probed.stdout).trim().to_string();
+    if probed != "ABSENT" {
+        eprintln!(
+            "SKIPPED: `Get-FileHash` still resolves under a PowerShell 7 module \
+             path on this machine (probe said {probed:?}), so the shadowing this \
+             test reproduces no longer happens here."
+        );
+        return;
+    }
+
+    let fixture = prepare("1.2.3");
+    let script = install_script("install.ps1");
+    let run = |arguments: &[&str]| -> (bool, String) {
+        let mut command = Command::new(&shell);
+        command
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script)
+            .arg("-BaseUrl")
+            .arg(&fixture.release.assets)
+            .arg("-Dir")
+            .arg(&fixture.directory)
+            .args(arguments)
+            .env("PSModulePath", &shadowed)
+            .current_dir(repository_root());
+        let output = command.output().expect("cannot run install.ps1");
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    let (ok, output) = run(&[]);
+    assert!(
+        ok,
+        "install.ps1 could not install under a Windows PowerShell 5.1 whose \
+         `Get-FileHash` is shadowed by a PowerShell 7 install. That is a real \
+         machine, and the failure lands after the download at the verification \
+         step:\n{output}"
+    );
+    assert!(
+        output.contains("SHA-256 OK"),
+        "the fallback digest path installed without reporting that it verified \
+         the archive:\n{output}"
+    );
+
+    let binary = fixture.directory.join("runner-manager.exe");
+    let before = std::fs::read(&binary).expect("the installed binary");
+
+    // The fallback must be a real SHA-256 and not a check that passes. This is
+    // the assertion that would catch a "fallback" that returned an empty string
+    // and compared equal to nothing.
+    substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
+    let (ok, output) = run(&[]);
+    assert!(
+        !ok,
+        "the fallback digest path accepted an archive whose digest does not \
+         match the published one. A fallback that cannot refuse is worse than \
+         no fallback: it turns a loud missing-cmdlet error into a silent \
+         unverified install:\n{output}"
+    );
+    assert!(
+        output.contains("CHECKSUM MISMATCH"),
+        "the fallback path aborted without saying why:\n{output}"
+    );
+    assert_eq!(
+        std::fs::read(&binary).expect("the installed binary"),
+        before,
+        "a failed install through the fallback path damaged a working binary"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SHA256SUMS is a parsed interface, and it has two forms in circulation.
+// ----------------------------------------------------------------------------
+
+/// Rewrites the fixture's `SHA256SUMS` into the binary-mode form.
+///
+/// `<hash> *<name>` -- one space and a marker -- is what `sha256sum -b` writes
+/// everywhere and what GNU sha256sum writes on Windows by default. `sha256sum
+/// -c` verifies it, and the README tells readers to check a release with
+/// exactly that command.
+fn rewrite_sums_as_binary_mode(release: &FixtureRelease) {
+    let text = std::fs::read_to_string(release.sums()).expect("the fixture SHA256SUMS");
+    let rewritten: String = text
+        .lines()
+        .map(|line| match line.split_once("  ") {
+            Some((hash, name)) => format!("{hash} *{name}\n"),
+            None => format!("{line}\n"),
+        })
+        .collect();
+    // A rewrite that changed nothing would leave every assertion below testing
+    // the same format as every other test in this file.
+    assert!(
+        rewritten.contains(" *runner-manager-"),
+        "the fixture rewrite produced no binary-mode line:\n{rewritten}"
+    );
+    std::fs::write(release.sums(), rewritten).expect("rewriting SHA256SUMS");
+}
+
+#[test]
+fn both_installers_read_the_binary_mode_form_of_sha256sums() {
+    // ------------------------------------------------------------------------
+    // A PARSER STRICTER THAN `sha256sum -c` REFUSES FILES THE README ENDORSES.
+    // ------------------------------------------------------------------------
+    // Deriving the asset name from SHA256SUMS is what lets these scripts
+    // survive a version bump untouched -- and it makes the file an INTERFACE
+    // rather than a blob. `sha256sum -c` accepts both `<hash>  <name>` and
+    // `<hash> *<name>`, and "Verifying a release yourself" in the README tells
+    // people to use `sha256sum -c`. A script that accepts only the first form
+    // refuses a file that command verifies -- and, before this, refused it by
+    // announcing "This release does not publish that platform", which sends the
+    // reader looking for a missing build that is sitting right there.
+    let fixture = prepare("1.2.3");
+    rewrite_sums_as_binary_mode(&fixture.release);
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
+    assert!(
+        ok,
+        "install.sh refused a SHA256SUMS in the binary-mode form that \
+         `sha256sum -b` writes and `sha256sum -c` verifies:\n{output}"
+    );
+    assert_eq!(
+        run_installed(&fixture.binary()),
+        fixture.release.expected_output("x86_64-unknown-linux-gnu"),
+        "install.sh parsed the binary-mode form but installed the wrong thing"
+    );
+
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let fixture = prepare("1.2.3");
+        rewrite_sums_as_binary_mode(&fixture.release);
+        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(
+            ok,
+            "install.ps1 refused a SHA256SUMS in the binary-mode form under \
+             {host}:\n{output}"
+        );
+        assert!(
+            fixture.directory.join("runner-manager.exe").is_file(),
+            "install.ps1 reported success and installed nothing ({host}):\n{output}"
+        );
+    }
+}
+
+#[test]
+fn install_sh_tells_an_unreadable_checksum_file_from_a_missing_platform() {
+    // ------------------------------------------------------------------------
+    // TWO FAILURES THAT NEED TWO SENTENCES.
+    // ------------------------------------------------------------------------
+    // "SHA256SUMS parsed to nothing" is a truncated download, a proxy's error
+    // page, or a file that is not a checksum file at all. "SHA256SUMS parsed,
+    // and none of it is for you" is a release that genuinely skipped a
+    // platform. They have different causes and different fixes, and reporting
+    // the first as the second is how an operator comes away believing their
+    // platform was dropped from a release that is perfectly intact.
+    let fixture = prepare("1.2.3");
+    std::fs::write(
+        fixture.release.sums(),
+        "<html><head><title>404 Not Found</title></head></html>\n",
+    )
+    .expect("overwriting SHA256SUMS");
+
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
+    assert!(
+        !ok,
+        "install.sh installed something from a SHA256SUMS it could not \
+         parse:\n{output}"
+    );
+    assert!(
+        output.contains("no line this script can read"),
+        "the refusal must say the file could not be read at all:\n{output}"
+    );
+    assert!(
+        !output.contains("does not publish that platform"),
+        "install.sh reported an unparseable SHA256SUMS as a release that \
+         skipped this platform. The user then goes looking for a missing build \
+         instead of a corrupted download:\n{output}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// The whole-name guard, in the two places it is implemented and was not tested.
+// ----------------------------------------------------------------------------
+
+/// Appends the two decoy classes a release will carry the moment anything is
+/// published beside an archive: a name the archive's is a SUFFIX of, and one it
+/// is a PREFIX of.
+///
+/// Their digests are deliberately not the archive's, so picking one is not only
+/// detectable as a count but fatal to the install.
+fn add_decoy_lines(release: &FixtureRelease) {
+    let mut text = std::fs::read_to_string(release.sums()).expect("the fixture SHA256SUMS");
+    for (target, extension, _) in TARGETS {
+        text.push_str(&format!(
+            "{}  vendored-runner-manager-{}-{target}.{extension}\n",
+            "b".repeat(64),
+            release.version
+        ));
+        text.push_str(&format!(
+            "{}  runner-manager-{}-{target}.{extension}.sig\n",
+            "c".repeat(64),
+            release.version
+        ));
+    }
+    std::fs::write(release.sums(), text).expect("rewriting SHA256SUMS");
+}
+
+#[test]
+fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
+    // ------------------------------------------------------------------------
+    // THE PROPERTY WAS ASSERTED ONCE AND IMPLEMENTED THREE TIMES.
+    // ------------------------------------------------------------------------
+    // `the_checksum_lookup_matches_the_whole_asset_name` in
+    // `release_channels.rs` covers channels.sh with both decoy classes. The
+    // SAME property is implemented separately in install.sh's awk and in
+    // install.ps1's regex, and the fixture those two run against has never
+    // carried a decoy -- so dropping the `^` or the `$` from either anchor
+    // shipped green.
+    //
+    // Today's release publishes one file per target and both anchors are
+    // unobservable. They stop being unobservable the first time anything is
+    // published beside an archive -- a `.sig`, a `.intoto.jsonl`, a vendored
+    // rebuild -- which is precisely the change nobody would connect to an
+    // installer that suddenly refuses to guess, or worse, guesses.
+    let fixture = prepare("1.2.3");
+    add_decoy_lines(&fixture.release);
+
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
+    assert!(
+        ok,
+        "install.sh could not resolve an archive in a release that also \
+         publishes a `.sig` and a vendored rebuild beside it. Anchored at both \
+         ends there is exactly one match; unanchored there are three:\n{output}"
+    );
+    assert!(
+        output.lines().any(|line| line.trim()
+            == "Release 1.2.3, asset runner-manager-1.2.3-x86_64-unknown-linux-gnu.tar.gz"),
+        "install.sh resolved the wrong asset out of a release with decoys \
+         beside the archive:\n{output}"
+    );
+    assert_eq!(
+        run_installed(&fixture.binary()),
+        fixture.release.expected_output("x86_64-unknown-linux-gnu"),
+        "install.sh installed something other than the archive SHA256SUMS names"
+    );
+
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display();
+        let fixture = prepare("1.2.3");
+        add_decoy_lines(&fixture.release);
+
+        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(
+            ok,
+            "install.ps1 could not resolve an archive in a release that also \
+             publishes a `.sig` and a vendored rebuild beside it \
+             ({host}):\n{output}"
+        );
+        assert!(
+            output.lines().any(|line| line.trim()
+                == "Release 1.2.3, asset runner-manager-1.2.3-x86_64-pc-windows-msvc.zip"),
+            "install.ps1 resolved the wrong asset out of a release with decoys \
+             beside the archive ({host}):\n{output}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.join("runner-manager.exe"))
+                .expect("the installed binary"),
+            std::fs::read(
+                fixture
+                    .release
+                    .staged("x86_64-pc-windows-msvc")
+                    .join("runner-manager.exe")
+            )
+            .expect("the staged binary"),
+            "install.ps1 installed something other than the archive SHA256SUMS \
+             names ({host})"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// install.sh under a shell that is not bash.
+// ----------------------------------------------------------------------------
+
+/// A real POSIX `sh` -- dash -- if this machine has one.
+///
+/// ----------------------------------------------------------------------------
+/// THE STATIC SCAN IS A BACKSTOP; THIS IS WHAT ACTUALLY NOTICES.
+/// ----------------------------------------------------------------------------
+/// Every other install.sh test here runs the script under BASH, which accepts
+/// every bashism happily, so `install_sh_stays_runnable_by_a_posix_shell` -- a
+/// list of forbidden substrings -- was the only thing standing between this
+/// file and a script that fails on Debian, Ubuntu and Alpine. A list catches
+/// only what somebody thought to write down, and the omission that prompted
+/// this was `set -o pipefail`, which both sibling scripts use.
+///
+/// Ubuntu's `/bin/sh` IS dash and Git for Windows ships `usr/bin/dash.exe`, so
+/// two of the three CI legs run the real thing for the cost of resolving a
+/// path. macOS ships no dash and is the one leg that skips.
+fn dash_program() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("RUNNER_MANAGER_DASH") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    for name in ["dash", "dash.exe"] {
+        if let Some(found) = find_program(name) {
+            return Some(found);
+        }
+    }
+    if !cfg!(windows) {
+        let standard = PathBuf::from("/bin/dash");
+        if standard.is_file() {
+            return Some(standard);
+        }
+    }
+    // Git for Windows, resolved through `git` the way `common::bash_program`
+    // resolves bash -- anyone who cloned this repository has Git.
+    if let Some(git) = find_program("git.exe")
+        && let Some(root) = git.parent().and_then(Path::parent)
+    {
+        let candidate = root.join("usr").join("bin").join("dash.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let standard = PathBuf::from(r"C:\Program Files\Git\usr\bin\dash.exe");
+    if standard.is_file() {
+        return Some(standard);
+    }
+    None
+}
+
+fn dash_or_skip() -> Option<PathBuf> {
+    if let Some(found) = dash_program() {
+        return Some(found);
+    }
+    assert!(
+        std::env::var_os("CI").is_none() || cfg!(target_os = "macos"),
+        "no `dash` found in CI. Ubuntu's /bin/sh IS dash and Git for Windows \
+         ships usr/bin/dash.exe, so on those two legs this is a broken \
+         environment rather than a missing dependency -- and this is the only \
+         test that runs install.sh under a shell that is not bash. macOS ships \
+         no dash and is the leg allowed to skip."
+    );
+    eprintln!(
+        "SKIPPED: no dash on this machine. install.sh's POSIX compliance is \
+         then covered only by the static scan, which catches only what somebody \
+         thought to list."
+    );
+    None
+}
+
+/// `run_bash`, but with the shell chosen by the caller.
+fn run_with_shell(
+    shell: &Path,
+    script: &Path,
+    arguments: &[&str],
+    envs: &[(&str, &str)],
+) -> (bool, String) {
+    let mut command = Command::new(shell);
+    command.arg(posix(script));
+    command.args(arguments);
+    command.current_dir(repository_root());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().unwrap_or_else(|err| {
+        panic!(
+            "cannot run {} under {}: {err}",
+            posix(script),
+            shell.display()
+        )
+    });
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[test]
+fn install_sh_installs_end_to_end_under_a_real_posix_shell() {
+    let Some(dash) = dash_or_skip() else {
         return;
     };
     let fixture = prepare("1.2.3");
+    let assets = posix(&fixture.release.assets);
+    let directory = posix(&fixture.directory);
+    let environment = [
+        ("RUNNER_MANAGER_INSTALL_UNAME_S", "Linux"),
+        ("RUNNER_MANAGER_INSTALL_UNAME_M", "x86_64"),
+        ("RUNNER_MANAGER_INSTALL_BASE_URL", assets.as_str()),
+        ("RUNNER_MANAGER_INSTALL_DIR", directory.as_str()),
+    ];
 
-    for attempt in 1..=2 {
-        let (ok, output) =
-            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
-        assert!(ok, "install.ps1 failed on attempt {attempt}:\n{output}");
-    }
+    let script = install_script("install.sh");
+    let (ok, output) = run_with_shell(&dash, &script, &[], &environment);
+    assert!(
+        ok,
+        "install.sh failed under dash ({}). The documented command is \
+         `curl ... | sh`, and on Debian and Ubuntu that shell IS this \
+         one:\n{output}",
+        dash.display()
+    );
+    assert!(
+        output.contains("SHA-256 OK"),
+        "install.sh installed under dash without reporting that it verified \
+         the archive:\n{output}"
+    );
     assert_eq!(
-        installed_entries(&fixture.directory),
-        vec!["runner-manager.exe".to_string()],
-        "running install.ps1 twice must leave exactly one binary and no \
-         staging files"
+        run_installed(&fixture.binary()),
+        fixture.release.expected_output("x86_64-unknown-linux-gnu"),
+        "the file install.sh installed under dash is not the binary from the \
+         archive"
     );
 
-    let (ok, output) = run_install_ps1(
-        &shell,
-        &fixture.release.assets,
-        &fixture.directory,
-        &["-Version", "9.9.9"],
-    );
+    // The abort path too. A bashism in an error branch is the one a smoke test
+    // never reaches and a user reaches on their worst day.
+    substitute_payload(&fixture.release, "x86_64-unknown-linux-gnu");
+    let (ok, output) = run_with_shell(&dash, &script, &[], &environment);
     assert!(
         !ok,
-        "install.ps1 installed 1.2.3 when it was asked for 9.9.9:\n{output}"
+        "install.sh under dash installed an archive whose digest does not \
+         match the published one:\n{output}"
     );
     assert!(
-        output.contains("9.9.9") && output.contains("1.2.3"),
-        "the refusal must name what was asked for and what is available:\n{output}"
+        output.contains("CHECKSUM MISMATCH"),
+        "the abort must say plainly what went wrong under dash too:\n{output}"
     );
-
-    let (ok, output) = run_install_ps1(
-        &shell,
-        &fixture.release.assets,
-        &fixture.directory,
-        &["-Version", "v1.2.3"],
-    );
-    assert!(!ok, "install.ps1 accepted -Version v1.2.3:\n{output}");
-    assert!(
-        output.contains("belongs to the tag"),
-        "the refusal must explain that the `v` is the tag's, not the \
-         version's:\n{output}"
+    assert_eq!(
+        installed_entries(&fixture.directory),
+        vec!["runner-manager".to_string()],
+        "the aborted install under dash left a staging file behind"
     );
 }

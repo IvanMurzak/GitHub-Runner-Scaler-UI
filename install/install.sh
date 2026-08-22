@@ -369,7 +369,7 @@ fi
 count="$(printf '%s' "$matches" | grep -c . || true)"
 case "$count" in
 1) ;;
-0) fail "SHA256SUMS at ${assets} lists ${usable} assets but no archive for ${target}. This release does not publish that platform." ;;
+0) fail "SHA256SUMS at ${assets} lists no archive for ${target} (it lists ${usable} assets). This release does not publish that platform." ;;
 *) fail "SHA256SUMS at ${assets} lists ${count} archives for ${target}; refusing to guess which one is meant." ;;
 esac
 

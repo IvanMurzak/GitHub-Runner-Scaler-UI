@@ -124,6 +124,101 @@ function Write-Fail {
 }
 
 # ---------------------------------------------------------------------------
+# WHY THE DIGEST IS NOT SIMPLY `Get-FileHash`.
+# ---------------------------------------------------------------------------
+# `Get-FileHash` is part of `Microsoft.PowerShell.Utility`, which 5.1 resolves
+# by walking `$env:PSModulePath`. Start Windows PowerShell FROM a PowerShell 7
+# session -- typing `powershell.exe` at a pwsh prompt, which is an entirely
+# ordinary thing to do -- and the inherited PSModulePath lists PowerShell 7's
+# module directories first. 5.1 then resolves that module name to 7's copy,
+# which it cannot load, and `Get-FileHash` becomes "not recognized as the name
+# of a cmdlet".
+#
+# Measured on 5.1.26100 with PowerShell 7 installed, and it is narrow: every
+# other cmdlet this script uses still resolves. Only `Get-FileHash` goes, and
+# it goes at exactly the wrong moment -- after the download, at the
+# verification step, with a message about a missing cmdlet and nothing about
+# checksums. It fails CLOSED, which is the right direction, but a user who
+# cannot install is not served by being told about a cmdlet.
+#
+# So: the cmdlet where it resolves, and the .NET class it wraps where it does
+# not. `System.Security.Cryptography.SHA256` is part of the framework rather
+# than of a module, so no autoload has to succeed for it to be there. Both
+# paths compute the same SHA-256 -- there is no weaker fallback here, and no
+# path that skips the check.
+function Get-Sha256 {
+    param([string] $Path)
+
+    if (Get-Command -Name Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $bytes = $algorithm.ComputeHash($stream)
+    } finally {
+        $stream.Close()
+        $algorithm.Dispose()
+    }
+    return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
+# ---------------------------------------------------------------------------
+# WHY UNPACKING IS NOT SIMPLY `Expand-Archive`.
+# ---------------------------------------------------------------------------
+# `Expand-Archive` lives in `Microsoft.PowerShell.Archive`, and that module is
+# a SCRIPT module -- a `.psm1` file. Loading a `.psm1` is itself governed by the
+# execution policy, so on a Windows client left at its default `Restricted`
+# policy the module cannot load AT ALL, in 5.1 and in PowerShell 7 alike:
+#
+#   The 'Expand-Archive' command was found in the module
+#   'Microsoft.PowerShell.Archive', but the module could not be loaded ...
+#   because running scripts is disabled on this system.
+#
+# That is not a corner. It is BOTH documented Windows commands -- `irm ... |
+# iex` and the two-step download-read-run form -- on the default policy of a
+# clean Windows client. And it lands at the worst possible point: the archive
+# has been downloaded and its SHA-256 has been verified and reported, and then
+# nothing is installed. The user sees "SHA-256 OK" followed by an error about
+# a module.
+#
+# `System.IO.Compression.ZipFile` reads the same zip, is part of the framework
+# rather than of a module, and no policy governs a type. The cmdlet stays as
+# the first choice -- it is the matching reader for the `Compress-Archive` the
+# release workflow packs with, and it reports better -- and the type is what
+# catches the policy case.
+function Expand-ReleaseArchive {
+    param([string] $Path, [string] $Destination)
+
+    $reason = ''
+    try {
+        Expand-Archive -LiteralPath $Path -DestinationPath $Destination -Force
+        return
+    } catch {
+        $reason = "$_"
+    }
+
+    # No `Add-Type`: that is a `Microsoft.PowerShell.Utility` cmdlet, and this
+    # fallback exists precisely for the cases where a module cannot be reached.
+    # PowerShell 7 has the type loaded already and this is a no-op there.
+    try {
+        $null = [Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
+    } catch {
+        $null = $_
+    }
+
+    try {
+        [IO.Compression.ZipFile]::ExtractToDirectory($Path, $Destination)
+    } catch {
+        [Console]::Error.WriteLine("${Program}: could not unpack $Path.")
+        [Console]::Error.WriteLine("  Expand-Archive said:      $reason")
+        [Console]::Error.WriteLine("  the .NET reader said:     $_")
+        Stop-Install
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Arguments.
 # ---------------------------------------------------------------------------
 
@@ -306,7 +401,7 @@ try {
     # not publish this platform; more than one means the release is malformed,
     # and picking either would pin a digest to the wrong file.
     if ($found.Count -eq 0) {
-        Write-Fail "SHA256SUMS at $assets lists $usable assets but no archive for $target. This release does not publish that platform."
+        Write-Fail "SHA256SUMS at $assets lists no archive for $target (it lists $usable assets). This release does not publish that platform."
     }
     if ($found.Count -gt 1) {
         Write-Fail "SHA256SUMS at $assets lists $($found.Count) archives for $target; refusing to guess which one is meant."
@@ -340,7 +435,7 @@ try {
         Write-Fail "could not fetch $asset from $assets."
     }
 
-    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = Get-Sha256 -Path $archive
 
     if ($actual -ne $expected) {
         [Console]::Error.WriteLine("${Program}: CHECKSUM MISMATCH -- refusing to install $asset")
@@ -359,12 +454,13 @@ try {
     # -----------------------------------------------------------------------
     # 3. Unpack and install.
     # -----------------------------------------------------------------------
-    # Expand-Archive ships with 5.1, and the archive was produced by
-    # Compress-Archive in the release workflow, so this is the matching reader.
+    # `Expand-Archive` ships with 5.1 and is the matching reader for the
+    # `Compress-Archive` the release workflow packs with -- but it cannot be
+    # reached on a `Restricted` host, so see Expand-ReleaseArchive.
 
     $unpacked = Join-Path $work 'unpacked'
     New-Item -ItemType Directory -Path $unpacked -Force | Out-Null
-    Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -Force
+    Expand-ReleaseArchive -Path $archive -Destination $unpacked
 
     $stem     = "runner-manager-$resolvedVersion-$target"
     $produced = Join-Path (Join-Path $unpacked $stem) $BinaryName
