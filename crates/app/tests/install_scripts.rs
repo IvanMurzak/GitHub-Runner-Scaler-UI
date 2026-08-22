@@ -931,6 +931,28 @@ fn clean_windows_powershell_module_path() -> String {
     format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules")
 }
 
+/// install.ps1 is a Windows installer, and the Linux and macOS legs run it under
+/// PowerShell 7 so its logic is covered on all three. Two of the variables a
+/// real Windows host always sets do not exist there. Tests that need
+/// `%LOCALAPPDATA%` already fake it for themselves; nothing faked
+/// `%PROCESSOR_ARCHITECTURE%`, which is the one the script reads to choose an
+/// artifact -- so every ps1 test that relies on detection failed off Windows
+/// with "could not determine the processor architecture", while
+/// `install_ps1_selects_the_windows_artifact_for_both_architectures` kept
+/// passing precisely because it is the one test that passes `-Arch` explicitly.
+///
+/// Supplying it is fixture setup of the same kind as the faked `%LOCALAPPDATA%`,
+/// not a bypass of the code under test: the script's own
+/// `if (-not $Arch) { $Arch = $env:PROCESSOR_ARCHITECTURE }` is still the line
+/// being exercised, which passing `-Arch` would skip.
+///
+/// On Windows the real variable is left alone, so that leg still tests what the
+/// host actually reports.
+fn supply_windows_host_environment(command: &mut Command) {
+    if !cfg!(windows) {
+        command.env("PROCESSOR_ARCHITECTURE", "AMD64");
+    }
+}
 fn run_install_ps1(
     shell: &Path,
     base: &Path,
@@ -939,6 +961,7 @@ fn run_install_ps1(
 ) -> (bool, String) {
     let script = install_script("install.ps1");
     let mut command = Command::new(shell);
+    supply_windows_host_environment(&mut command);
     command.arg("-NoProfile").arg("-NonInteractive");
     if is_windows_powershell(shell) {
         command.env("PSModulePath", clean_windows_powershell_module_path());
@@ -1024,6 +1047,7 @@ fn install_ps1_defaults_to_the_documented_directory() {
 
         let script = install_script("install.ps1");
         let mut command = Command::new(&shell);
+        supply_windows_host_environment(&mut command);
         command.arg("-NoProfile").arg("-NonInteractive");
         if cfg!(windows) {
             command.arg("-ExecutionPolicy").arg("Bypass");
@@ -1262,6 +1286,20 @@ fn documented_windows_two_step_run_command() -> String {
         .to_string()
 }
 
+/// PowerShell wraps the text of an ERROR RECORD to the host's console width,
+/// breaking on whitespace wherever that width happens to fall -- which moves
+/// with the width itself and with the length of the paths inside the message.
+/// `running scripts is disabled` therefore arrives with a newline somewhere
+/// inside it often enough to matter, so a plain `contains` against the raw text
+/// is a coin flip that lands differently in a developer's terminal, in a CI log,
+/// and between two temporary directories of different name lengths.
+///
+/// Collapsing every whitespace run to a single space matches the phrase the
+/// message actually carries rather than the shape the console gave it.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Runs `command` in a PowerShell whose PROCESS-scope execution policy is
 /// `Restricted` -- which is what a clean Windows client has by default.
 ///
@@ -1269,7 +1307,10 @@ fn documented_windows_two_step_run_command() -> String {
 /// the condition is constructed without touching the machine. Where a Group
 /// Policy IS in force the process prints `POLICY-NOT-RESTRICTED` and runs
 /// nothing, because a check that quietly ran under a permissive policy would
-/// assert nothing at all.
+/// assert nothing at all. The marker carries the `MachinePolicy` and
+/// `UserPolicy` scopes with it, so a caller can tell a host where the condition
+/// is genuinely unconstructable from one where the lowering failed for some
+/// other reason -- which would mean this helper had stopped working.
 fn run_under_restricted_policy(
     shell: &Path,
     working_directory: &Path,
@@ -1279,7 +1320,10 @@ fn run_under_restricted_policy(
     let script = format!(
         "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Restricted -Force; \
          if ((Get-ExecutionPolicy) -ne 'Restricted') {{ \
-         Write-Output 'POLICY-NOT-RESTRICTED'; exit 0 }}; {command}"
+         Write-Output \"POLICY-NOT-RESTRICTED \
+         MachinePolicy=$(Get-ExecutionPolicy -Scope MachinePolicy) \
+         UserPolicy=$(Get-ExecutionPolicy -Scope UserPolicy) \
+         Effective=$(Get-ExecutionPolicy)\"; exit 0 }}; {command}"
     );
 
     let mut process = Command::new(shell);
@@ -1362,18 +1406,34 @@ fn the_documented_windows_two_step_form_installs_under_a_restricted_policy() {
         let (ran, refusal) =
             run_under_restricted_policy(&shell, &download, "& '.\\install.ps1' -PrintPlan", &[]);
         if refusal.contains("POLICY-NOT-RESTRICTED") {
+            // Process scope outranks every scope but a Group Policy, so a host
+            // that refuses the lowering is either policy-managed -- in which
+            // case NOBODY can construct this condition on it, CI included --
+            // or something else is overriding the policy and this negative
+            // control has stopped being sound. Only the second is a defect,
+            // and the marker names the scopes so the two can be told apart.
+            //
+            // Keying that distinction on `CI`, as this did, asserted something
+            // else entirely: that no CI image is ever policy-managed. Where
+            // that is false the assertion fires on every run, and reports the
+            // image as a failure of whatever change is under test.
+            let pinned_by_group_policy = !refusal.contains("MachinePolicy=Undefined")
+                || !refusal.contains("UserPolicy=Undefined");
             assert!(
-                std::env::var_os("CI").is_none(),
-                "the execution policy could not be lowered to Restricted in CI \
-                 ({host}). Process scope outranks every scope but a Group \
-                 Policy, so this is a policy-managed image and the condition \
-                 this test exists to construct cannot be constructed on it."
+                pinned_by_group_policy,
+                "the execution policy could not be lowered to Restricted \
+                 ({host}), and no Group Policy explains it. Process scope \
+                 outranks every other scope, so something else is overriding \
+                 it and this test's negative control is no longer measuring \
+                 what it claims:\n{refusal}"
             );
             eprintln!(
                 "SKIPPED: a Group Policy pins the execution policy on this \
-                 machine, so `Restricted` cannot be constructed."
+                 machine ({host}), so `Restricted` cannot be constructed. \
+                 Reported scopes: {}",
+                refusal.trim()
             );
-            return;
+            continue;
         }
         assert!(
             !ran,
@@ -1383,7 +1443,7 @@ fn the_documented_windows_two_step_form_installs_under_a_restricted_policy() {
              nothing:\n{refusal}"
         );
         assert!(
-            refusal.contains("running scripts is disabled"),
+            collapse_whitespace(&refusal).contains("running scripts is disabled"),
             "the file form was refused under {host}, but not by the execution \
              policy -- so the policy is not what this test is holding \
              constant:\n{refusal}"
