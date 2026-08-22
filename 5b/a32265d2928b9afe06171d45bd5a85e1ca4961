@@ -1,0 +1,41 @@
+crates/app/tests/auth_onboarding.rs
+  s_1b329c8675e8dd::t_2007c41b3bbb30 180-183
+crates/app/src/cli/status.rs
+  s_1b329c8675e8dd::t_c7cee957b8d130 41,49-53,84,86-107,262-263,309,507
+crates/app/tests/host_capacity_and_status.rs
+  s_1b329c8675e8dd::t_2007c41b3bbb30 183-191
+crates/app/src/cli/host.rs
+  s_1b329c8675e8dd::t_c7cee957b8d130 70,429,432,440,468-469,477-479,499-502,508-510,519-521,524-525,535,538,549
+crates/app/src/cli/auth.rs
+  s_1b329c8675e8dd::t_3f634e01fe08d8 1015
+  s_1b329c8675e8dd::t_2007c41b3bbb30 755-765,787,796-798,813-822,825-828,1003-1014,1016-1020,1394-1395,1398-1410,1412-1416,1423-1427
+  s_1b329c8675e8dd::t_e52f2cd4acd74f 54
+  s_1b329c8675e8dd::t_d7b07066adafa6 288-289,295,306-307,324,334,487-489,745,747
+  s_1b329c8675e8dd::t_c7cee957b8d130 788
+crates/app/tests/no_secret_reaches_command_output.rs
+  s_1b329c8675e8dd::t_c46a34571e3e50 76-77
+  s_1b329c8675e8dd::t_7f1f23dc3b4b65 31-69,129-132,240-247
+  s_1b329c8675e8dd::t_e948a580fe9586 73,400
+crates/app/tests/auth_states.rs
+  s_1b329c8675e8dd::t_c7cee957b8d130 23-26,335-338,374-384,389-390,447-448
+crates/app/src/cli/mod.rs
+  s_1b329c8675e8dd::t_c7cee957b8d130 146-174,181-218,220,222,224,226,229,231,233,235,237,239,241,243,245,247,249,251,255,259,263,352-371,670,768-813,1018,1027,1040-1056,1058-1082,1107-1108,1120-1122,1131-1167
+crates/app/tests/support/mod.rs
+  s_1b329c8675e8dd::t_e948a580fe9586 32,557-618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "5ba32265d2928b9afe06171d45bd5a85e1ca4961",
+  "prompts": {},
+  "sessions": {
+    "s_1b329c8675e8dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2689d90-6b58-413b-986a-98948442988b",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
