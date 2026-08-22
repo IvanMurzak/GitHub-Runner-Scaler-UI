@@ -1421,6 +1421,33 @@ fn the_documented_windows_two_step_form_installs_under_a_restricted_policy() {
         );
         let before = std::fs::read(&binary).expect("the installed binary");
 
+        // --------------------------------------------------------------------
+        // BYTE-IDENTICAL, BECAUSE THIS IS THE ONLY TEST THAT REACHES THE
+        // `ZipFile` FALLBACK.
+        // --------------------------------------------------------------------
+        // Under `Restricted` the `Microsoft.PowerShell.Archive` module cannot
+        // load, so this run -- and no other in this file -- unpacks through
+        // `[IO.Compression.ZipFile]::ExtractToDirectory`. `is_file()` alone
+        // asked only whether a file of the right NAME appeared, which every
+        // wrong extraction this fallback could perform would also satisfy. The
+        // `Expand-Archive` path is held to byte-identity a few tests up; the
+        // path that is harder to reach must not be held to less.
+        assert_eq!(
+            before,
+            std::fs::read(
+                fixture
+                    .release
+                    .staged("x86_64-pc-windows-msvc")
+                    .join("runner-manager.exe")
+            )
+            .expect("the staged binary"),
+            "the .NET zip reader installed something that is not byte-for-byte \
+             the archive's payload under {host}. The fixture archive carries a \
+             directory entry, the binary and a LICENSE, so an extractor that \
+             takes the first entry and stops, or that writes a truncated file, \
+             reaches here rather than passing on a name:\n{output}"
+        );
+
         // ---- and the abort path under the same form ------------------------
         // This is where `exit` would have been fatal. Under `iex` there is no
         // script of our own to exit FROM, so `exit` terminates the SESSION that
@@ -1820,12 +1847,44 @@ fn install_sh_tells_an_unreadable_checksum_file_from_a_missing_platform() {
 // The whole-name guard, in the two places it is implemented and was not tested.
 // ----------------------------------------------------------------------------
 
-/// Appends the two decoy classes a release will carry the moment anything is
-/// published beside an archive: a name the archive's is a SUFFIX of, and one it
-/// is a PREFIX of.
+/// Appends the decoy classes a release carries the moment anything is published
+/// beside an archive -- one line of each shape, per target.
 ///
-/// Their digests are deliberately not the archive's, so picking one is not only
-/// detectable as a count but fatal to the install.
+/// ----------------------------------------------------------------------------
+/// FOUR SHAPES, BECAUSE THE FIRST TWO DO NOT CONSTRAIN THE `^` AT ALL.
+/// ----------------------------------------------------------------------------
+/// The first two are NAME decoys: a name the archive's is a SUFFIX of
+/// (`vendored-...`) and one it is a PREFIX of (`...zip.sig`). Those were the
+/// whole set, and measured against install.ps1's regex they pin the `$` and
+/// nothing else -- because in
+///
+///     ^([0-9a-f]{64})\s+\*?(runner-manager-...\.zip)$
+///
+/// the `^` anchors the HASH, not the name. `vendored-` is rejected by `\s+\*?`
+/// abutting `runner-manager-` with the anchor or without it, and `.sig` is
+/// rejected by `$` either way. So deleting the `^` from that regex passed this
+/// test, and the comment in install.ps1 that claimed `vendored-` "needs `^`"
+/// was simply wrong.
+///
+/// The last two are the shapes that DO constrain `^` -- a line carrying
+/// something before the digest, and a line whose hex run is too long:
+///
+///     junk <64 hex>  runner-manager-...           unanchored, this matches
+///     <70 hex>  runner-manager-...                unanchored, this matches
+///
+/// and the over-long one is why this is a line of fixture rather than a note in
+/// a comment. Unanchored the engine starts six characters in and takes the LAST
+/// 64 of the 70, so install.ps1 does not refuse: it pins a SHIFTED digest and
+/// then reports CHECKSUM MISMATCH against an archive that is perfectly good.
+///
+/// install.sh's awk is unaffected by the last two -- it splits on whitespace
+/// and drops any record that is not exactly two fields whose first matches
+/// `^[0-9a-f]{64}$` -- so they are inert there and constrain only the regex.
+/// That asymmetry is the point: the property is implemented twice and each
+/// implementation needs its own decoy.
+///
+/// Every digest here is deliberately not the archive's, so picking any of these
+/// lines is not merely detectable as a count -- it is fatal to the install.
 fn add_decoy_lines(release: &FixtureRelease) {
     let mut text = std::fs::read_to_string(release.sums()).expect("the fixture SHA256SUMS");
     for (target, extension, _) in TARGETS {
@@ -1839,8 +1898,55 @@ fn add_decoy_lines(release: &FixtureRelease) {
             "c".repeat(64),
             release.version
         ));
+        text.push_str(&format!(
+            "junk {}  runner-manager-{}-{target}.{extension}\n",
+            "d".repeat(64),
+            release.version
+        ));
+        text.push_str(&format!(
+            "{}  runner-manager-{}-{target}.{extension}\n",
+            "e".repeat(70),
+            release.version
+        ));
     }
-    std::fs::write(release.sums(), text).expect("rewriting SHA256SUMS");
+    std::fs::write(release.sums(), &text).expect("rewriting SHA256SUMS");
+
+    // A positive control on the fixture itself. Every assertion in the test
+    // below is an ABSENCE of misbehaviour, and a decoy that never reached the
+    // file makes all of them vacuous -- which is precisely how the `^` shipped
+    // unconstrained in the first place.
+    let written = std::fs::read_to_string(release.sums()).expect("the rewritten SHA256SUMS");
+    for (target, extension, _) in TARGETS {
+        for shape in [
+            format!(
+                "{}  vendored-runner-manager-{}-{target}.{extension}",
+                "b".repeat(64),
+                release.version
+            ),
+            format!(
+                "{}  runner-manager-{}-{target}.{extension}.sig",
+                "c".repeat(64),
+                release.version
+            ),
+            format!(
+                "junk {}  runner-manager-{}-{target}.{extension}",
+                "d".repeat(64),
+                release.version
+            ),
+            format!(
+                "{}  runner-manager-{}-{target}.{extension}",
+                "e".repeat(70),
+                release.version
+            ),
+        ] {
+            assert!(
+                written.lines().any(|line| line == shape),
+                "the decoy `{shape}` is not in the SHA256SUMS the scripts will \
+                 read. Without it the anchor it constrains is untested and \
+                 every assertion below passes for the wrong reason."
+            );
+        }
+    }
 }
 
 #[test]
@@ -1860,6 +1966,17 @@ fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
     // published beside an archive -- a `.sig`, a `.intoto.jsonl`, a vendored
     // rebuild -- which is precisely the change nobody would connect to an
     // installer that suddenly refuses to guess, or worse, guesses.
+    //
+    // ------------------------------------------------------------------------
+    // AND THE FIRST VERSION OF THIS TEST STILL DID NOT CONSTRAIN THE `^`.
+    // ------------------------------------------------------------------------
+    // Measured, per anchor, per shape. install.sh's awk is fully covered by the
+    // two NAME decoys: both of its anchors sit on the name, and each decoy
+    // flips its match count. install.ps1's regex is not, because its `^`
+    // anchors the HASH -- so with only the name decoys present, deleting `^`
+    // changed no match count anywhere and shipped green. `add_decoy_lines`
+    // therefore also publishes two malformed digest fields; see its comment for
+    // which anchor each shape pins.
     let fixture = prepare("1.2.3");
     add_decoy_lines(&fixture.release);
 
@@ -1867,8 +1984,9 @@ fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
     assert!(
         ok,
         "install.sh could not resolve an archive in a release that also \
-         publishes a `.sig` and a vendored rebuild beside it. Anchored at both \
-         ends there is exactly one match; unanchored there are three:\n{output}"
+         publishes a `.sig`, a vendored rebuild, and two malformed digest \
+         fields beside it. Anchored at both ends there is exactly one match; \
+         unanchored there are more:\n{output}"
     );
     assert!(
         output.lines().any(|line| line.trim()
@@ -1892,8 +2010,8 @@ fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
         assert!(
             ok,
             "install.ps1 could not resolve an archive in a release that also \
-             publishes a `.sig` and a vendored rebuild beside it \
-             ({host}):\n{output}"
+             publishes a `.sig`, a vendored rebuild, and two malformed digest \
+             fields beside it ({host}):\n{output}"
         );
         assert!(
             output.lines().any(|line| line.trim()

@@ -309,12 +309,8 @@ fn the_readme_advertises_no_download_that_is_not_a_terminal_command() {
             continue;
         }
         for target in link_targets(line) {
-            let is_download = target.ends_with(".zip")
-                || target.ends_with(".tar.gz")
-                || target.contains("/releases/download/")
-                || target.contains("/releases/latest/download/");
             assert!(
-                !is_download,
+                !is_download_target(&target),
                 "README.md embeds an image whose link target is a download \
                  ({target}):\n  {line}\nD14 removed download images and \
                  buttons; every advertised path must be a terminal command, \
@@ -334,24 +330,58 @@ fn the_readme_advertises_no_download_that_is_not_a_terminal_command() {
          terminal commands."
     );
 
-    // A markdown link whose target is an archive is a download link however it
-    // is labelled.
+    // A markdown link whose target is a download is a download link however it
+    // is labelled and whether or not it wears an image.
+    //
+    // ------------------------------------------------------------------------
+    // `line.find(opener)` WAS THE FIRST MATCH PER LINE, AND ONE LINE HOLDS TWO.
+    // ------------------------------------------------------------------------
+    // A download button is `[![label](image)](target)`: two `](` on one line,
+    // and it is the SECOND that downloads. `find` returned the first, so the
+    // shape this whole test exists to forbid was the shape it read past --
+    // while `link_targets` beside it already walked every one of them. Reusing
+    // it is not tidying; it is the difference between checking the image URL
+    // and checking the download.
     for line in source.lines() {
-        for opener in ["](http", "](https"] {
-            if let Some(offset) = line.find(opener) {
-                let target = &line[offset + 2..];
-                let target = target.split(')').next().unwrap_or(target);
-                assert!(
-                    !target.ends_with(".zip") && !target.ends_with(".tar.gz"),
-                    "README.md links directly to a release archive:\n  {line}\n\
-                     Release archives stay published and linkable, but the \
-                     README does not present them as the way in (D14): a \
-                     browser download carries the quarantine flag that every \
-                     terminal path avoids."
-                );
-            }
+        for target in link_targets(line) {
+            assert!(
+                !is_download_target(&target),
+                "README.md links directly to a download ({target}):\n  {line}\n\
+                 Release archives and installers stay published and linkable, \
+                 but the README does not present them as the way in (D14): a \
+                 browser download carries the quarantine flag that every \
+                 terminal path avoids."
+            );
         }
     }
+}
+
+/// Whether a link target is something a BROWSER downloads rather than something
+/// it displays.
+///
+/// ----------------------------------------------------------------------------
+/// THE INSTALLER EXTENSIONS ARE THE POINT, NOT THE ARCHIVES.
+/// ----------------------------------------------------------------------------
+/// This began as `.zip`, `.tar.gz` and the two release-download paths, which
+/// covers the archives this project publishes and misses the shape that would
+/// actually hurt. D12 -- "no paid code signing" -- is safe only while every
+/// advertised path is a terminal path, and the download that trips SmartScreen
+/// hardest is not an archive: it is a `.exe` or an `.msi`, the two things a
+/// "Download for Windows" button would point at, and precisely the two D12
+/// depends on nobody adding. `.pkg` and `.dmg` are the macOS half of the same
+/// statement, where Gatekeeper is the prompt in question.
+///
+/// So the set is the installer extensions plus the archives, and adding one
+/// here is cheaper than the release where somebody discovers the button was
+/// never forbidden.
+fn is_download_target(target: &str) -> bool {
+    const DOWNLOAD_EXTENSIONS: [&str; 7] =
+        [".zip", ".tar.gz", ".7z", ".exe", ".msi", ".pkg", ".dmg"];
+    DOWNLOAD_EXTENSIONS
+        .iter()
+        .any(|extension| target.ends_with(extension))
+        || target.contains("/releases/download/")
+        || target.contains("/releases/latest/download/")
 }
 
 /// Every markdown link target on one line.

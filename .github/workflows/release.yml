@@ -956,6 +956,49 @@ jobs:
           echo "tap ${TAP_REPOSITORY} branch ${TAP_BRANCH} is readable"
 
           # --------------------------------------------------------------
+          # READABLE IS NOT WRITABLE, AND IT IS THE WRITE THAT LANDS LAST.
+          # --------------------------------------------------------------
+          # `ls-remote` speaks git-upload-pack. It proves the repository is
+          # there and that the token can READ it -- and the failure this
+          # pre-flight exists for is narrower than that: a HOMEBREW_TAP_TOKEN
+          # that is present, and readable, and carries no `contents: write` on
+          # the tap. That one still lands on the `git push` at the END of this
+          # job, after `npm publish`, which is the single action here that
+          # nothing can undo.
+          #
+          # `git push --dry-run` closes the gap. It performs the
+          # git-receive-pack ref advertisement -- the request GitHub answers
+          # with 403 for a token that has no write -- and then stops. Measured:
+          # a dry run to a NEW branch prints `* [new branch]`, exits 0, and the
+          # branch is absent from the remote afterwards; it sends no pack and
+          # no ref update. Measured from a depth-1 detached checkout too, which
+          # is exactly what `actions/checkout` with `ref:` leaves behind, so
+          # shallowness does not make this a false rejection.
+          #
+          # The ref is deliberately NOT ${TAP_BRANCH}. Pushing this
+          # repository's HEAD at the tap's branch is a non-fast-forward between
+          # unrelated histories, and git decides that LOCALLY -- so the probe
+          # would fail without the remote ever being asked the question it is
+          # being asked here.
+          if ! push_probe="$(git push --dry-run \
+                "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git" \
+                'HEAD:refs/heads/runner-manager-release-preflight' 2>&1)"; then
+            # git puts the credentialed URL into its own error text, so this is
+            # redacted rather than dropped: the message is the diagnosis.
+            printf '%s\n' "$push_probe" |
+              sed 's#x-access-token:[^@]*@#x-access-token:***@#g' >&2
+            echo "REJECTED: HOMEBREW_TAP_TOKEN cannot WRITE to ${TAP_REPOSITORY}." >&2
+            echo "It can READ it -- the check above passed -- but the" >&2
+            echo "git-receive-pack advertisement was refused, and that is the" >&2
+            echo "access the push at the end of this job needs. Grant the token" >&2
+            echo "'contents: write' on the tap and re-run THIS JOB: nothing has" >&2
+            echo "been published to npm yet." >&2
+            exit 1
+          fi
+          echo "tap ${TAP_REPOSITORY} accepts a write from HOMEBREW_TAP_TOKEN"
+          echo "(dry run only: no ref was created)"
+
+          # --------------------------------------------------------------
           # THE README HARDCODES THE TAP; THIS JOB TAKES IT FROM A VARIABLE.
           # --------------------------------------------------------------
           # `brew install <owner>/<tap>/runner-manager` is the line users copy,
@@ -1033,8 +1076,12 @@ jobs:
           echo "--- assets attached to ${TAG} ---"
           echo "$attached"
 
+          # `-F` as well as `-x`: without it the `.` in `install.sh` is a regex
+          # any-char, so `installXsh` would satisfy a check whose whole purpose
+          # is to match the name exactly. `-x` alone bounds the ends; `-F` is
+          # what makes the middle literal.
           for script in install.sh install.ps1; do
-            if ! printf '%s\n' "$attached" | grep -qx "$script"; then
+            if ! printf '%s\n' "$attached" | grep -qxF "$script"; then
               echo "REJECTED: ${script} is not attached to ${TAG}." >&2
               echo "The upload above exited non-zero and that was read as 'already" >&2
               echo "attached', but the release does not carry it. Until it does," >&2

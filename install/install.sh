@@ -432,6 +432,26 @@ staged="${install_dir}/.${BINARY}.install-tmp"
 rm -f "$staged"
 cp "$unpacked" "$staged" || fail "could not write to ${install_dir}."
 chmod 755 "$staged"
+
+# ----------------------------------------------------------------------------
+# `mv -f` ONTO A DIRECTORY SUCCEEDS, AT THE WRONG THING.
+# ----------------------------------------------------------------------------
+# If `${install_dir}/${BINARY}` is a DIRECTORY -- an interrupted extraction, a
+# stray `mkdir`, a packaging tool that made one -- `mv -f src dst` does not
+# replace it and does not fail. It moves the staged file INSIDE it and exits 0,
+# so the `|| fail` below never runs, the next line announces "Installed
+# runner-manager <v> to ${install_dir}/${BINARY}", and the `runner-manager
+# --version` this script then tells the user to run is still not found. The
+# staging cleanup in the EXIT trap no-ops as well, because the staged path has
+# moved.
+#
+# A FALSE SUCCESS, which is the same class as a checksum that is not checked: a
+# failure sends the user looking and this does not. Checked rather than worked
+# around -- deleting a directory somebody else created is not an installer's
+# call to make. install.ps1 carries the same guard over the same move.
+[ ! -d "${install_dir}/${BINARY}" ] ||
+    fail "${install_dir}/${BINARY} is a directory, not a file, so it cannot be replaced with a binary. Remove it and re-run."
+
 mv -f "$staged" "${install_dir}/${BINARY}" || fail "could not install into ${install_dir}."
 
 say ""

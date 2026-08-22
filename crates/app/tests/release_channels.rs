@@ -1413,9 +1413,13 @@ fn step_eight_proves_both_install_scripts_reached_the_release() {
              answers the question",
         ),
         (
-            "grep -qx",
-            "matched whole, not as a substring: `install.sh` is a substring of \
-             `install.sh.sig` and of anything else that gets attached later",
+            "grep -qxF",
+            "matched whole AND literal. `-x` is what stops `install.sh` \
+             matching as a substring of `install.sh.sig`; `-F` is what stops \
+             its `.` being read as a regex any-char, which would let \
+             `installXsh` satisfy a check whose entire job is exactness. The \
+             comment beside it claims a literal whole-line match, so `-F` is \
+             the spelling that makes the claim true",
         ),
         (
             "exit 1",
@@ -1497,6 +1501,30 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     );
 
     // ------------------------------------------------------------------------
+    // AND `ls-remote` PROVES A READ, WHILE WHAT LANDS LAST IS A WRITE.
+    // ------------------------------------------------------------------------
+    // `git ls-remote` speaks git-upload-pack, so it passes for a token that can
+    // read the tap and not write it -- which is the exact shape a
+    // `HOMEBREW_TAP_TOKEN` takes when somebody grants it `contents: read`. That
+    // token then fails on the `git push` at the END of this job, after
+    // `npm publish`, and `npm unpublish` is restricted and time-limited.
+    //
+    // `git push --dry-run` performs the git-receive-pack advertisement, which
+    // is the request GitHub refuses with 403 for a read-only token, and it
+    // creates nothing: measured, a dry run to a new branch prints
+    // `* [new branch]`, exits 0, and leaves the remote without that ref.
+    assert!(
+        bodies[guard].contains("git push --dry-run"),
+        "the pre-flight proves the tap is READABLE and stops there. \
+         `git ls-remote` is git-upload-pack; the action this job actually ends \
+         with is a PUSH, and a token with read but no write passes the check \
+         above and fails after `npm publish`. `git push --dry-run` does the \
+         receive-pack advertisement -- the request that 403s for a read-only \
+         token -- and writes nothing:\n{}",
+        bodies[guard]
+    );
+
+    // ------------------------------------------------------------------------
     // THE README HARDCODES THE TAP AND THIS JOB TAKES IT FROM A VARIABLE.
     // ------------------------------------------------------------------------
     // Setting `vars.RUNNER_MANAGER_TAP_REPOSITORY` without editing the README
@@ -1514,6 +1542,22 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
 }
 
 /// The tap `release.yml` falls back to when no repository variable is set.
+///
+/// ----------------------------------------------------------------------------
+/// EVERY OCCURRENCE, NOT THE FIRST ONE.
+/// ----------------------------------------------------------------------------
+/// The default is spelled once per step that needs it -- the pre-flight, the
+/// tap update, and the summary -- because a `run:` step only sees the `env:`
+/// declared on it. Reading `source.find(MARKER)` took the FIRST of those and
+/// compared only that one against the README, so a tap update pointed at a
+/// different repository than the pre-flight validated would have gone green:
+/// the README agreement would still hold against a spelling no longer used by
+/// the step that does the writing.
+///
+/// So all of them are collected and they must agree. That is what makes the
+/// single value this returns meaningful enough to compare with anything --
+/// and it fails naming both spellings, because "they disagree" without saying
+/// how is a finding somebody has to redo.
 fn workflow_default_tap() -> String {
     let source = read(
         &repository_root()
@@ -1522,18 +1566,45 @@ fn workflow_default_tap() -> String {
             .join("release.yml"),
     );
     const MARKER: &str = "vars.RUNNER_MANAGER_TAP_REPOSITORY || '";
-    let offset = source.find(MARKER).unwrap_or_else(|| {
+
+    let mut spellings: Vec<String> = Vec::new();
+    let mut rest = source.as_str();
+    while let Some(offset) = rest.find(MARKER) {
+        let after = &rest[offset + MARKER.len()..];
+        spellings.push(
+            after
+                .split('\'')
+                .next()
+                .expect("a quoted default")
+                .to_string(),
+        );
+        rest = after;
+    }
+
+    let first = spellings.first().cloned().unwrap_or_else(|| {
         panic!(
             "release.yml no longer names a default for \
              `vars.RUNNER_MANAGER_TAP_REPOSITORY`. The assertion below compares \
              that default with the README and would be checking nothing."
         )
     });
-    source[offset + MARKER.len()..]
-        .split('\'')
-        .next()
-        .expect("a quoted default")
-        .to_string()
+
+    for (index, spelling) in spellings.iter().enumerate() {
+        assert_eq!(
+            spelling,
+            &first,
+            "release.yml spells the default tap {} times and occurrence {} is \
+             `{spelling}` while the first is `{first}`. Each `run:` step carries \
+             its own `env:`, so a job whose pre-flight validates one repository \
+             and whose push targets another is a release that checks the wrong \
+             thing and then writes to the wrong place. All spellings: \
+             {spellings:?}",
+            spellings.len(),
+            index + 1,
+        );
+    }
+
+    first
 }
 
 #[test]

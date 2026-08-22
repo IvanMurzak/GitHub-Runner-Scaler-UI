@@ -217,8 +217,13 @@ system already has — `awk`, `sed`, `grep`, `cut`, `tr`, `mktemp` — and **a
 SHA-256 tool: `sha256sum`, `shasum` or `openssl`.** That last one is not
 optional and there is no flag to skip it: on a host with none of the three the
 script refuses to install rather than installing something it could not verify.
-`install.ps1` needs only what ships with Windows PowerShell 5.1
-(`Invoke-WebRequest`, `Get-FileHash`, `Expand-Archive`).
+`install.ps1` needs only what ships with Windows PowerShell 5.1, and in
+practice only `Invoke-WebRequest`. It does **not** require `Get-FileHash` or
+`Expand-Archive`: both live in modules that a rearranged `PSModulePath` or the
+default `Restricted` execution policy can put out of reach, so the digest and
+unpack steps fall back to the .NET framework types behind those cmdlets when
+the modules cannot be loaded. The SHA-256 check is computed on both paths and
+there is no path that skips it.
 
 ### Confirm it worked
 

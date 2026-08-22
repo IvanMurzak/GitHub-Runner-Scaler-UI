@@ -153,7 +153,27 @@ function Get-Sha256 {
         return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 
-    $algorithm = [Security.Cryptography.SHA256]::Create()
+    # `SHA256::Create()` hands back `SHA256Managed` on .NET Framework, and a
+    # machine with `FIPSAlgorithmPolicy` enforced refuses to construct a managed
+    # implementation at all:
+    #
+    #   Exception calling "Create" with "0" argument(s): "This implementation
+    #   is not part of the Windows Platform FIPS validated cryptographic
+    #   algorithms."
+    #
+    # It fails CLOSED, which is the right direction, and it fails with a raw
+    # .NET exception -- which is the SAME complaint the header above raises
+    # about being told a cmdlet is missing: accurate, and not a sentence anyone
+    # can act on. Worse, the two hosts overlap. A FIPS-enforcing machine is a
+    # locked-down enterprise image, which is exactly the kind whose
+    # PSModulePath is rearranged, so a FIPS host is over-represented on THIS
+    # branch rather than on the `Get-FileHash` one above.
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+    } catch {
+        Write-Fail "no SHA-256 implementation is available on this host. Get-FileHash could not be resolved, and constructing the .NET one failed: $_ -- a FIPS-enforcing machine policy blocks the managed implementation. Refusing to install a binary nothing verified."
+    }
+
     $stream = [IO.File]::OpenRead($Path)
     try {
         $bytes = $algorithm.ComputeHash($stream)
@@ -368,11 +388,29 @@ try {
     # files, and refuses them by announcing that the release skipped their
     # platform.
     #
-    # Anchored at BOTH ends, which is what keeps the match whole:
-    # `runner-manager-1.2.3-x86_64-pc-windows-msvc.zip` is matched, while
-    # `vendored-runner-manager-...zip` (needs `^`) and
-    # `runner-manager-...zip.sig` (needs `$`) are not. A digest taken off
-    # either of those installs nothing and explains nothing.
+    # Anchored at BOTH ends -- and it is worth being exact about WHICH anchor
+    # rejects WHICH shape, because the obvious reading of this regex is wrong.
+    #
+    # `^` anchors the HASH, not the name. So `^` is NOT what rejects
+    # `vendored-runner-manager-...zip`: that line is rejected by `\s+\*?`
+    # abutting `runner-manager-`, with the anchor or without it. What `^`
+    # actually guards is a line whose digest field is not where it claims to
+    # be, and there are two such shapes:
+    #
+    #   junk <64 hex>  runner-manager-...zip   -- something before the digest
+    #   <70 hex>  runner-manager-...zip        -- an over-long hex run
+    #
+    # The second is the dangerous one. Unanchored, the engine simply starts six
+    # characters in and matches the LAST 64 of the 70, so the script does not
+    # refuse -- it pins a SHIFTED digest and then reports CHECKSUM MISMATCH on
+    # an archive that is perfectly good, which sends the reader hunting a
+    # tampered release that does not exist.
+    #
+    # `$` anchors the name, and `$` is what rejects `runner-manager-...zip.sig`.
+    #
+    # `add_decoy_lines` in `install_scripts.rs` publishes one line of each of
+    # these shapes beside the archive, so dropping either anchor is a red test
+    # rather than a release that guesses.
     $readable = '^[0-9a-f]{64}\s+\*?\S+$'
     $pattern  = '^([0-9a-f]{64})\s+\*?(runner-manager-[0-9]+\.[0-9]+\.[0-9]+-' +
                 [Regex]::Escape($target) + '\.zip)$'
@@ -481,6 +519,33 @@ try {
     $staged      = Join-Path $Dir '.runner-manager.install-tmp'
     if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force }
     Copy-Item -LiteralPath $produced -Destination $staged -Force
+
+    # -----------------------------------------------------------------------
+    # `Move-Item -Force` ONTO A DIRECTORY SUCCEEDS, AT THE WRONG THING.
+    # -----------------------------------------------------------------------
+    # If `$destination` is a DIRECTORY -- an interrupted extraction, a stray
+    # `mkdir`, a packaging tool that made one -- `Move-Item -Force` does not
+    # replace it and does not throw. It moves the staged file INSIDE it.
+    # Measured:
+    #
+    #   Move-Item SUCCEEDED
+    #   C:\tmp\mvprobe2\bin\runner-manager.exe\.staged
+    #
+    # The `catch` below therefore never fires, the line after it announces
+    # "Installed runner-manager <v> to <destination>", and the next thing the
+    # user types is `runner-manager --version`, which is still not found. The
+    # staging cleanup no-ops too, because the staged path no longer exists.
+    #
+    # A FALSE SUCCESS, which is the same class as a checksum that is not
+    # checked: a failure sends the user looking, and this does not. Checked
+    # rather than worked around -- deleting a directory somebody else created
+    # is not an installer's call to make. install.sh carries the same guard
+    # over the same `mv`.
+    if (Test-Path -LiteralPath $destination -PathType Container) {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Write-Fail "$destination is a directory, not a file, so it cannot be replaced with a binary. Remove it and re-run."
+    }
+
     try {
         Move-Item -LiteralPath $staged -Destination $destination -Force
     } catch {

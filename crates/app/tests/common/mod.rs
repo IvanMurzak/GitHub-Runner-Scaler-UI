@@ -386,9 +386,18 @@ pub fn write_stored_zip(path: &Path, entries: &[(String, &[u8])]) {
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
         central.extend_from_slice(&0u16.to_le_bytes()); // disk number
         central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
-        // External attributes: unix mode 0755 in the high 16 bits, so an
-        // extractor that honours them produces an executable file.
-        central.extend_from_slice(&0x81ED_0000u32.to_le_bytes());
+        // External attributes: unix mode in the high 16 bits, so an extractor
+        // that honours them produces an executable file. A trailing `/` is how
+        // zip spells a DIRECTORY entry, and it needs both halves of the field
+        // -- `0o40755` for the unix reader and the MS-DOS directory bit
+        // (`0x10`) for the Windows one. `Compress-Archive` emits these entries
+        // and a fixture without them is not the archive release.yml publishes.
+        let external = if name.ends_with('/') {
+            0x41ED_0010u32
+        } else {
+            0x81ED_0000u32
+        };
+        central.extend_from_slice(&external.to_le_bytes());
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name_bytes);
     }
@@ -424,7 +433,42 @@ fn pack(stage: &Path, stem: &str, binary: &str, extension: &str, archive: &Path,
             let (ok, output) = run_tar(stage, stem, archive);
             assert!(ok, "packing {stem}.{extension} failed:\n{output}");
         }
-        "zip" => write_stored_zip(archive, &[(format!("{stem}/{binary}"), body)]),
+        "zip" => {
+            // ----------------------------------------------------------------
+            // THREE ENTRIES, NOT ONE, AND THE DIFFERENCE IS WHAT THE FALLBACK
+            // IS TESTED ON.
+            // ----------------------------------------------------------------
+            // `release.yml`'s `Compress-Archive` packs the whole staged
+            // directory: the binary, `LICENSE`, `README.md`, and the directory
+            // entries the cmdlet emits for the tree it walked. This fixture
+            // carried ONE stored entry and no directory entry -- so
+            // `install.ps1`'s `[IO.Compression.ZipFile]` fallback, which is the
+            // only reader on a `Restricted`-policy host, had never been handed
+            // an archive with more than one member. An extractor that pulled
+            // out the FIRST entry and stopped would have been indistinguishable
+            // from a correct one.
+            //
+            // The tar.gz side never had this gap: it shells out to `tar` over
+            // the staged directory, so it has always carried `LICENSE`. It was
+            // the hand-written zip that dropped it, which is exactly the way a
+            // fixture drifts from the thing it stands in for.
+            //
+            // Still STORED rather than deflated -- there is no compressor here
+            // and writing one would be fixture code with its own bugs -- so the
+            // compression method remains the one respect in which this is not
+            // what `Compress-Archive` produces. Both readers handle stored and
+            // deflated entries through the same API.
+            let licence = std::fs::read(stage.join(stem).join("LICENSE"))
+                .expect("the staged LICENSE that the tar path already packs");
+            write_stored_zip(
+                archive,
+                &[
+                    (format!("{stem}/"), &[][..]),
+                    (format!("{stem}/{binary}"), body),
+                    (format!("{stem}/LICENSE"), licence.as_slice()),
+                ],
+            );
+        }
         other => panic!("unknown archive extension {other}"),
     }
 }
