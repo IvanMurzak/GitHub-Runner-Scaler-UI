@@ -1261,16 +1261,30 @@ mod tests {
     /// redacted, so this was a hole in the coverage rather than a leak, but a
     /// needle that cannot match is a check that cannot fail.
     fn needles(secret: &str) -> Vec<String> {
-        let json = serde_json::to_string(secret).expect("a string is serialisable");
-        // Strip the quotes `to_string` added; what is left is the secret
-        // exactly as it appears inside a JSON string literal.
-        let escaped = json[1..json.len() - 1].to_string();
+        // Strip the quotes `to_string` adds; what is left is the text exactly
+        // as it appears inside a JSON string literal.
+        let escape = |text: &str| {
+            let json = serde_json::to_string(text).expect("a string is serialisable");
+            json[1..json.len() - 1].to_string()
+        };
 
-        if escaped == secret {
-            vec![secret.to_string()]
-        } else {
-            vec![secret.to_string(), escaped]
-        }
+        let once = escape(secret);
+        // Twice, because a secret can be escaped twice on the way out, and
+        // shape 12 is where that happens: `Debug` on a `String` escapes the
+        // quotes *and* the backslashes inside it, and the sink then
+        // JSON-encodes what `Debug` produced. A Windows path arrives in that
+        // line with four backslashes where the secret has one, so the
+        // once-escaped needle cannot match it there -- not even against
+        // `PassthroughLayer`, which redacts nothing at all. That cell of the
+        // matrix was a check incapable of failing, which is the same defect
+        // this helper was written to fix one level down.
+        let twice = escape(&once);
+
+        let mut spellings = vec![secret.to_string(), once, twice];
+        // Consecutive-only is enough: each level of escaping is a superset of
+        // the last, so equal spellings are always adjacent.
+        spellings.dedup();
+        spellings
     }
 
     #[test]
@@ -1281,12 +1295,37 @@ mod tests {
         let windows = needles(WINDOWS_WORKSPACE);
         assert_eq!(
             windows.len(),
-            2,
-            "a backslash path has two spellings: {windows:?}"
+            3,
+            "a backslash path has three spellings, one per level of escaping it \
+             can pass through on the way out: {windows:?}"
         );
         assert!(
             windows[1].contains(r"\\Users\\operator"),
-            "the escaped spelling is what a JSON line actually contains: {windows:?}"
+            "the once-escaped spelling is what an ordinary JSON line contains: {windows:?}"
+        );
+        assert!(
+            windows[2].contains(r"\\\\Users\\\\operator"),
+            "the twice-escaped spelling is what a Debug rendering inside a JSON \
+             line contains: {windows:?}"
+        );
+
+        // The third spelling is not hypothetical: it is exactly what the sink
+        // writes for shape 12, and without it that cell of the scan was a
+        // check that could not fail.
+        let shape_twelve = serde_json::to_string(&Value::String(format!(
+            "{:?}",
+            StoreError {
+                body: format!("{{\"runner_token\":\"{WINDOWS_WORKSPACE}\"}}"),
+            }
+        )))
+        .expect("serialisable");
+        assert!(
+            shape_twelve.contains(&windows[2]),
+            "the twice-escaped needle must be findable in what shape 12 emits: {shape_twelve}"
+        );
+        assert!(
+            !shape_twelve.contains(&windows[1]),
+            "and the once-escaped one must not be, or the gap was never there: {shape_twelve}"
         );
 
         // Confirms the premise: the raw spelling genuinely cannot occur in the
