@@ -3014,22 +3014,32 @@ mod tests {
     mod windows {
         use super::*;
 
-        /// Denies DELETE on `path` to Everyone, so a replacing rename over it
-        /// is refused.
+        /// Reproduces what a second non-administrative operator meets, without
+        /// needing a second account.
         ///
-        /// This is what a second non-administrative operator meets on a shared
-        /// host, reproduced without a second account: the effective right that
-        /// is missing for them is DELETE on the target, and denying it to
-        /// Everyone denies it here too. Measured before it was relied on — a
-        /// deny ACE on the file alone is enough, even though the test's own
-        /// temporary directory grants its owner `FILE_DELETE_CHILD`, which is
-        /// the other way Windows grants delete.
-        fn deny_delete(path: &std::path::Path) {
-            icacls(&[&path.display().to_string(), "/deny", "*S-1-1-0:(D)"]);
+        /// **Both denies are required, and finding that out was the point of
+        /// running this against the un-fixed code.** Windows grants delete two
+        /// ways — `DELETE` on the object, or `FILE_DELETE_CHILD` on its parent
+        /// — and `MOVEFILE_REPLACE_EXISTING`, which is what `std::fs::rename`
+        /// is on Windows, takes either. Operator B has neither: the file's DACL
+        /// names `SY`, `BA` and `OW`, and a stock `%ProgramData%` grants
+        /// `BUILTIN\Users` no `DC`. The test process, by contrast, *owns* its
+        /// temporary directory and so does hold `FILE_DELETE_CHILD` — with only
+        /// the file denied, the rename went through and the simulation
+        /// reproduced nothing while looking exactly right.
+        ///
+        /// Creating a file is `FILE_ADD_FILE`, which neither deny touches, so
+        /// the temporary is still written here exactly as it is for B. That is
+        /// what makes the "nothing was left behind" half of this test mean
+        /// something.
+        fn deny_delete(file: &std::path::Path, directory: &std::path::Path) {
+            icacls(&[&file.display().to_string(), "/deny", "*S-1-1-0:(D)"]);
+            icacls(&[&directory.display().to_string(), "/deny", "*S-1-1-0:(DC)"]);
         }
 
-        fn allow_delete_again(path: &std::path::Path) {
-            icacls(&[&path.display().to_string(), "/remove:d", "*S-1-1-0"]);
+        fn allow_delete_again(file: &std::path::Path, directory: &std::path::Path) {
+            icacls(&[&file.display().to_string(), "/remove:d", "*S-1-1-0"]);
+            icacls(&[&directory.display().to_string(), "/remove:d", "*S-1-1-0"]);
         }
 
         fn icacls(arguments: &[&str]) {
@@ -3066,7 +3076,7 @@ mod tests {
                 .parent()
                 .expect("the guard has a directory")
                 .to_path_buf();
-            deny_delete(&guard);
+            deny_delete(&guard, &directory);
 
             let error = store
                 .store(&other_token())
@@ -3108,7 +3118,7 @@ mod tests {
             assert!(strays.is_empty(), "a refused store left {strays:?}");
 
             // And the first operator's value is untouched.
-            allow_delete_again(&guard);
+            allow_delete_again(&guard, &directory);
             assert_eq!(stored(&store), exposed(&fixture_token()));
 
             // With the denial lifted, the same call succeeds -- which is what
