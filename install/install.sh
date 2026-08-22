@@ -283,8 +283,18 @@ digest_of() {
 }
 
 work=""
+staged=""
 cleanup() {
     [ -z "$work" ] || rm -rf "$work"
+    # The staging file is the one temporary thing that does NOT live under
+    # $work, and it cannot: a rename is only atomic within a filesystem, so it
+    # has to be written beside the destination. That means a failure between
+    # `cp` and `mv` -- a full disk, a `chmod` refused by a mount option, a
+    # destination that is a running executable -- leaves
+    # `.runner-manager.install-tmp` sitting in the user's install directory
+    # with nothing to remove it. install.ps1 already deletes its own in the
+    # `catch` that wraps the same two steps; this is the missing half.
+    [ -z "$staged" ] || rm -f "$staged"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -304,25 +314,62 @@ if ! fetch "SHA256SUMS" "${work}/SHA256SUMS"; then
     fail "could not fetch SHA256SUMS from ${assets}."
 fi
 
-# Exactly one archive per target per release. Zero means this release does not
-# publish this platform; more than one means the release is malformed, and
-# picking either would pin a digest to the wrong file.
-matches="$(
+# ----------------------------------------------------------------------------
+# READING SHA256SUMS IS PARSING AN INTERFACE, NOT GREPPING A FILE.
+# ----------------------------------------------------------------------------
+# Deriving the asset name from this document is what lets the script survive a
+# version bump untouched -- and it makes SHA256SUMS a format this script has to
+# accept as widely as the tools that produce it. TWO FORMS ARE IN CIRCULATION,
+# and `sha256sum -c` verifies both:
+#
+#     <hash>  <name>     text mode: two spaces, no marker
+#     <hash> *<name>     binary mode: one space and a `*` -- what `sha256sum -b`
+#                        writes everywhere, and what GNU sha256sum writes on
+#                        Windows BY DEFAULT
+#
+# The README tells a reader to check a release by hand with
+# `sha256sum -c SHA256SUMS`. A parser here that is STRICTER than the tool the
+# documentation recommends refuses files that command accepts -- and refuses
+# them by announcing "this release does not publish that platform", which sends
+# the reader to entirely the wrong conclusion about an intact release. So the
+# `*` is stripped, and the two failures are then told apart below.
+parsed="$(
     awk -v target="$target" '
         { line = $0; sub(/\r$/, "", line) }
-        { n = split(line, field, /[ \t]+/) }
-        n == 2 && field[1] ~ /^[0-9a-f]{64}$/ {
-            if (field[2] ~ ("^runner-manager-[0-9]+\\.[0-9]+\\.[0-9]+-" target "\\.tar\\.gz$")) {
-                print field[1] " " field[2]
+        {
+            n = split(line, field, /[ \t]+/)
+            if (n != 2 || field[1] !~ /^[0-9a-f]{64}$/) { next }
+            name = field[2]
+            sub(/^\*/, "", name)
+            usable = usable + 1
+            if (name ~ ("^runner-manager-[0-9]+\\.[0-9]+\\.[0-9]+-" target "\\.tar\\.gz$")) {
+                print "match " field[1] " " name
             }
         }
+        END { print "usable " usable + 0 }
     ' "${work}/SHA256SUMS"
 )"
 
+usable="$(printf '%s\n' "$parsed" | sed -n 's/^usable //p')"
+matches="$(printf '%s\n' "$parsed" | sed -n 's/^match //p')"
+
+# A checksum file NOTHING could be read out of is a different failure from one
+# that simply carries no line for this host, and it needs a different sentence.
+# The first is a truncated download, a proxy's error page, or a file that is
+# not SHA256SUMS at all; the second is a release that genuinely skipped a
+# platform. Reporting the first as the second is how an operator comes away
+# believing their platform was dropped from a release that is perfectly fine.
+if [ "${usable:-0}" -eq 0 ]; then
+    fail "SHA256SUMS at ${assets} has no line this script can read. Expected '<64 hex digits><spaces><asset name>' on each line; this file is empty, truncated, or not a checksum file at all."
+fi
+
+# Exactly one archive per target per release. Zero means this release does not
+# publish this platform; more than one means the release is malformed, and
+# picking either would pin a digest to the wrong file.
 count="$(printf '%s' "$matches" | grep -c . || true)"
 case "$count" in
 1) ;;
-0) fail "SHA256SUMS at ${assets} lists no archive for ${target}. This release does not publish that platform." ;;
+0) fail "SHA256SUMS at ${assets} lists ${usable} assets but no archive for ${target}. This release does not publish that platform." ;;
 *) fail "SHA256SUMS at ${assets} lists ${count} archives for ${target}; refusing to guess which one is meant." ;;
 esac
 

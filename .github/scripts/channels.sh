@@ -92,6 +92,21 @@ aarch64-unknown-linux-gnu|linux|arm64|tar.gz|runner-manager'
 readonly PRODUCT="runner-manager"
 readonly PRODUCT_DESCRIPTION="Local-first autoscaling manager for ephemeral GitHub Actions self-hosted runners, with a CLI and a Ratatui TUI."
 
+# ----------------------------------------------------------------------------
+# HOMEBREW CAPS `desc` AT 80 CHARACTERS, AND npm DOES NOT.
+# ----------------------------------------------------------------------------
+# `brew audit` fails a formula whose `desc` is 80 characters or longer, so the
+# description above -- which is the right length for an npm package page, where
+# it is the whole of what a reader sees before deciding -- cannot be reused
+# verbatim as the formula's. Two strings rather than one truncated at render
+# time: a truncation would cut mid-word at whatever length the description
+# happens to be, and nobody would notice until `brew audit` ran, which is after
+# the tap commit.
+#
+# `release_channels.rs` asserts the rendered formula's `desc` against the same
+# 80-character limit, so this staying short is not a matter of remembering.
+readonly PRODUCT_DESCRIPTION_BREW="Local-first autoscaler for ephemeral GitHub Actions self-hosted runners"
+
 readonly SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 
 require_semver() {
@@ -118,20 +133,47 @@ field_of() {
 # release, but it would be a substring of `...-x86_64-apple-darwin.tar.gz.sig`
 # the moment anything else is published beside it -- and a formula pinned to a
 # signature file's digest installs nothing and explains nothing.
+#
+# THE `*` MARKER IS STRIPPED, AND THAT IS NOT COSMETIC. Two forms of this file
+# are in circulation and `sha256sum -c` verifies both: `<hash>  <name>` (text
+# mode) and `<hash> *<name>` (binary mode -- what `sha256sum -b` writes
+# everywhere and what GNU sha256sum writes on Windows by default). `release.sh
+# sha256` normalises to the first, so a release published by this repository
+# only ever carries that one; but this subcommand is also pointed at checksum
+# files this repository did not write -- a re-run against a hand-assembled
+# directory, a mirror -- and refusing those is refusing something `sha256sum -c`
+# accepts.
 cmd_checksum() {
     local sums="${1-}" asset="${2-}"
     [[ -n "$sums" ]] || die "checksum: no SHA256SUMS given"
     [[ -f "$sums" ]] || die "checksum: no such file: $sums"
     [[ -n "$asset" ]] || die "checksum: no asset name given"
 
+    # Counted first and separately, because "this file records nothing at all"
+    # and "this file does not record THAT asset" are different failures with
+    # different fixes: a truncated download versus a release that never
+    # published the target. Reporting the first as the second sends whoever
+    # reads it looking for a missing build.
+    local usable
+    usable="$(awk '
+        { line = $0; sub(/\r$/, "", line) }
+        { n = split(line, field, /[ \t]+/) }
+        n == 2 && field[1] ~ /^[0-9a-f]{64}$/ { readable = readable + 1 }
+        END { print readable + 0 }
+    ' "$sums")"
+
+    [[ "$usable" -gt 0 ]] ||
+        die "checksum: ${sums} has no line in the form '<64 hex digits><spaces><asset name>'. That is an empty, truncated or non-checksum file, not a release missing '${asset}'."
+
     local hits
     hits="$(awk -v want="$asset" '
         { line = $0; sub(/\r$/, "", line) }
         {
             n = split(line, field, /[ \t]+/)
-            if (n == 2 && field[1] ~ /^[0-9a-f]{64}$/ && field[2] == want) {
-                print field[1]
-            }
+            if (n != 2 || field[1] !~ /^[0-9a-f]{64}$/) { next }
+            name = field[2]
+            sub(/^\*/, "", name)
+            if (name == want) { print field[1] }
         }
     ' "$sums")"
 
@@ -139,7 +181,7 @@ cmd_checksum() {
     count="$(printf '%s' "$hits" | grep -c . || true)"
     case "$count" in
     1) ;;
-    0) die "checksum: ${sums} records no digest for '${asset}'. Refusing to render a manifest with an unpinned artifact." ;;
+    0) die "checksum: ${sums} records no digest for '${asset}' (it records ${usable}). Refusing to render a manifest with an unpinned artifact." ;;
     *) die "checksum: ${sums} records ${count} digests for '${asset}'; refusing to guess which one is meant." ;;
     esac
 
@@ -199,7 +241,7 @@ cmd_brew_formula() {
 # hand: the next release overwrites this file, and every digest below is the
 # one release ${version} actually published.
 class RunnerManager < Formula
-  desc "${PRODUCT_DESCRIPTION}"
+  desc "${PRODUCT_DESCRIPTION_BREW}"
   homepage "https://github.com/${repository}"
   version "${version}"
   license "MIT"
@@ -262,11 +304,23 @@ FORMULA
 # so on a normal `dependencies` line every user on four of the five platforms
 # would fail to install at all.
 #
-# UNSCOPED NAMES, DELIBERATELY. `@runner-manager/linux-x64` would read better
-# and matches esbuild, but a scoped name requires the npm organisation to exist
-# before anything can be published, and this repository cannot create one. An
-# unscoped name that publishes is worth more than a scoped one that blocks the
-# first release.
+# UNSCOPED NAMES, AND THE REASON IS AN OWNER'S CHOICE RATHER THAN A LIMIT.
+#
+# An earlier version of this comment said a scoped name needs an npm
+# ORGANISATION to exist first, and that this repository cannot create one.
+# THAT PREMISE IS FALSE and it is corrected here rather than deleted, because a
+# wrong reason left standing is what gets quoted the next time somebody asks:
+# every npm account already owns the scope matching its username, and
+# publishing into it needs nothing but `--access public`, which release.yml
+# already passes. `@ivanmurzak/runner-manager-linux-x64` was always available.
+#
+# The names stay unscoped anyway. It is esbuild's actual shape -- an unscoped
+# root so that `npm i -g runner-manager` reads well, which is the command the
+# README documents -- and changing it is the owner's call, not this script's.
+# The argument on the other side, recorded so it is not rediscovered as a
+# surprise: five unscoped names are five separate namespace claims that anyone
+# can register before the first release, where one scope claims them all at
+# once.
 #
 # Each platform manifest records the archive its binary was taken from and that
 # archive's published digest. npm does not check it -- nothing in npm can --

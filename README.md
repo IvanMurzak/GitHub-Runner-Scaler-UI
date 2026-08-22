@@ -196,13 +196,29 @@ sh ./install.sh
 ```powershell
 irm https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content .\install.ps1 | more
-.\install.ps1
+Get-Content .\install.ps1 -Raw | iex
 ```
 
-The scripts are short, have no dependencies beyond `curl`/`tar` (or
-`Invoke-WebRequest`/`Expand-Archive`), and are the same files as
+**Why the last line is not `.\install.ps1`.** On a Windows *client* the default
+`LocalMachine` execution policy is `Restricted`, so running a downloaded `.ps1`
+file fails with *"cannot be loaded because running scripts is disabled on this
+system"* — after you have already read it, which is the worst possible moment.
+`Get-Content ... | iex` runs the same text without involving the policy at all,
+and it keeps the read-first property that is the whole point of this section.
+If you would rather run the file, `powershell -ExecutionPolicy Bypass -File
+.\install.ps1` also works.
+
+The scripts are short and are the same files as
 [`install/install.sh`](install/install.sh) and
 [`install/install.ps1`](install/install.ps1) in this repository.
+
+`install.sh` needs `curl` (or `wget`), `tar`, the POSIX text tools every
+system already has — `awk`, `sed`, `grep`, `cut`, `tr`, `mktemp` — and **a
+SHA-256 tool: `sha256sum`, `shasum` or `openssl`.** That last one is not
+optional and there is no flag to skip it: on a host with none of the three the
+script refuses to install rather than installing something it could not verify.
+`install.ps1` needs only what ships with Windows PowerShell 5.1
+(`Invoke-WebRequest`, `Get-FileHash`, `Expand-Archive`).
 
 ### Confirm it worked
 

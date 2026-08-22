@@ -3,6 +3,14 @@
 Local-first autoscaling manager for ephemeral GitHub Actions self-hosted
 runners, with a CLI and a Ratatui TUI.
 
+> **Read this before you install.** Using this tool means installing the
+> project's published GitHub App, which declares **Repository → Administration:
+> Read and write** — a permission that also allows deleting, renaming and
+> transferring the repository, and adding or removing collaborators. It applies
+> even if you only ever use `runner-manager` as a read-only dashboard. The full
+> permission set and the narrower organization-scoped alternative are in
+> [What you are granting](#what-you-are-granting) below.
+
 ```sh
 npm i -g runner-manager
 runner-manager --version

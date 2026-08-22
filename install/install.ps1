@@ -82,10 +82,45 @@ $Program    = 'install.ps1'
 $Repository = 'IvanMurzak/GitHub-Runner-Scaler-UI'
 $BinaryName = 'runner-manager.exe'
 
+# ---------------------------------------------------------------------------
+# HOW THIS SCRIPT ABORTS, AND WHY IT IS NOT ALWAYS `exit`.
+# ---------------------------------------------------------------------------
+# The documented Windows command is `irm ... | iex`, which runs this text in
+# the CALLER'S session -- there is no script of our own to exit from. `exit`
+# there terminates that session: Windows Terminal closes the tab and the abort
+# message goes with it. Measured, not assumed -- a marker printed after the
+# `iex` never runs, and the tab is gone before anyone can read the reason.
+#
+# The asymmetry is what makes it easy to miss. The SUCCESS path never calls
+# `exit`, so a working install leaves the session alone; only a FAILURE kills
+# it, which is the one case where the user most needs to read what was printed.
+#
+# `$MyInvocation.MyCommand.Path` is the file this script was loaded FROM, and
+# it is empty exactly when there is no file: `iex`, a script block, a paste.
+# Loaded from a real file this still `exit 1`s, so a caller waiting on the
+# process's exit status gets one. Loaded from `iex` it throws instead, which
+# unwinds to the caller's prompt with the message intact, leaves the session
+# standing -- and is still a non-zero exit for `powershell -Command`, so a
+# harness or a CI step can still tell that it failed.
+$ScriptPath = ''
+try {
+    if ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
+        $ScriptPath = $MyInvocation.MyCommand.Path
+    }
+} catch {
+    $null = $_
+    $ScriptPath = ''
+}
+
+function Stop-Install {
+    if ($ScriptPath) { exit 1 }
+    throw "${Program}: aborted; nothing was installed."
+}
+
 function Write-Fail {
     param([string] $Message)
     [Console]::Error.WriteLine("${Program}: $Message")
-    exit 1
+    Stop-Install
 }
 
 # ---------------------------------------------------------------------------
@@ -157,7 +192,10 @@ if ($PrintPlan) {
     Write-Output "assets=$assets"
     Write-Output "install_dir=$Dir"
     Write-Output "binary=$(Join-Path $Dir $BinaryName)"
-    exit 0
+    # `return`, not `exit 0`, for the reason Stop-Install exists: run from a
+    # file this leaves the script with status 0, and run from `iex` it ends
+    # this script block instead of the session that invoked it.
+    return
 }
 
 # ---------------------------------------------------------------------------
@@ -223,23 +261,52 @@ try {
         Write-Fail "could not fetch SHA256SUMS from $assets."
     }
 
-    # Anchored at both ends, so `runner-manager-1.2.3-x86_64-pc-windows-msvc.zip`
-    # is matched and `something-runner-manager-...zip.bak` is not.
-    $pattern = '^([0-9a-f]{64})\s+(runner-manager-[0-9]+\.[0-9]+\.[0-9]+-' +
-               [Regex]::Escape($target) + '\.zip)$'
+    # -----------------------------------------------------------------------
+    # READING SHA256SUMS IS PARSING AN INTERFACE, NOT MATCHING A LINE.
+    # -----------------------------------------------------------------------
+    # `\s+\*?`, not `\s+`. TWO FORMS ARE IN CIRCULATION and `sha256sum -c`
+    # verifies both: `<hash>  <name>` (text mode, two spaces) and
+    # `<hash> *<name>` (binary mode -- what `sha256sum -b` writes everywhere,
+    # and what GNU sha256sum writes on Windows by default). The README tells a
+    # reader to check a release by hand with `sha256sum -c SHA256SUMS`, so a
+    # parser stricter than the tool the documentation recommends refuses good
+    # files, and refuses them by announcing that the release skipped their
+    # platform.
+    #
+    # Anchored at BOTH ends, which is what keeps the match whole:
+    # `runner-manager-1.2.3-x86_64-pc-windows-msvc.zip` is matched, while
+    # `vendored-runner-manager-...zip` (needs `^`) and
+    # `runner-manager-...zip.sig` (needs `$`) are not. A digest taken off
+    # either of those installs nothing and explains nothing.
+    $readable = '^[0-9a-f]{64}\s+\*?\S+$'
+    $pattern  = '^([0-9a-f]{64})\s+\*?(runner-manager-[0-9]+\.[0-9]+\.[0-9]+-' +
+                [Regex]::Escape($target) + '\.zip)$'
+    $usable = 0
     $found = New-Object System.Collections.ArrayList
     foreach ($line in (Get-Content -LiteralPath $sums)) {
-        $hit = [Regex]::Match($line.Trim(), $pattern)
+        $trimmed = $line.Trim()
+        if ([Regex]::IsMatch($trimmed, $readable)) { $usable = $usable + 1 }
+        $hit = [Regex]::Match($trimmed, $pattern)
         if ($hit.Success) {
             $null = $found.Add(@($hit.Groups[1].Value, $hit.Groups[2].Value))
         }
+    }
+
+    # A file NOTHING could be read out of is a different failure from one that
+    # simply carries no line for this host. The first is a truncated download,
+    # a proxy's error page, or a file that is not SHA256SUMS at all; the second
+    # is a release that genuinely skipped a platform. Reporting the first as
+    # the second is how an operator comes away believing their platform was
+    # dropped from a release that is perfectly fine.
+    if ($usable -eq 0) {
+        Write-Fail "SHA256SUMS at $assets has no line this script can read. Expected '<64 hex digits><spaces><asset name>' on each line; this file is empty, truncated, or not a checksum file at all."
     }
 
     # Exactly one archive per target per release. Zero means this release does
     # not publish this platform; more than one means the release is malformed,
     # and picking either would pin a digest to the wrong file.
     if ($found.Count -eq 0) {
-        Write-Fail "SHA256SUMS at $assets lists no archive for $target. This release does not publish that platform."
+        Write-Fail "SHA256SUMS at $assets lists $usable assets but no archive for $target. This release does not publish that platform."
     }
     if ($found.Count -gt 1) {
         Write-Fail "SHA256SUMS at $assets lists $($found.Count) archives for $target; refusing to guess which one is meant."
@@ -284,7 +351,7 @@ try {
         [Console]::Error.WriteLine('either a corrupted download or a tampered artifact; nothing has been')
         [Console]::Error.WriteLine('installed either way. Retry, and if it happens again report it at')
         [Console]::Error.WriteLine("https://github.com/$Repository/issues rather than installing by hand.")
-        exit 1
+        Stop-Install
     }
 
     Write-Output "SHA-256 OK: $expected"
