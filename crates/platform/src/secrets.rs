@@ -2141,8 +2141,23 @@ mod tests {
         );
     }
 
+    /// "Delete leaves no recoverable remnant" — stated as the same property on
+    /// all three platforms, and checked through whatever *carries* the value on
+    /// each.
+    ///
+    /// The distinction is one CI caught rather than one this test was written
+    /// with. A file-backed store keeps the value *in* the guard, so the remnant
+    /// question is "is the file gone". A keychain-backed store keeps it in an
+    /// item *inside* the guard, and the guard is a database that legitimately
+    /// outlives every item it ever held — asserting the keychain disappears
+    /// would be asserting that `auth logout` deletes the operator's login
+    /// keychain, which would be a bug rather than a purge.
+    ///
+    /// So the two things asserted everywhere are the two that mean the same
+    /// thing everywhere: nothing readable is left, and no byte of the value is
+    /// lying in whatever does remain.
     #[test]
-    fn deleting_leaves_no_file_behind() {
+    fn deleting_leaves_no_recoverable_remnant() {
         let root = TempDir::new().expect("a temporary directory");
         let store = rooted(SecretScope::Machine, &root);
         store.store(&fixture_token()).expect("stored");
@@ -2152,29 +2167,74 @@ mod tests {
         store.delete().expect("purged");
 
         assert!(
-            !guard.exists(),
-            "the stored value is still at {}",
-            guard.display()
+            store
+                .load()
+                .expect("a purged store reads cleanly")
+                .is_none(),
+            "the value is still readable through the store's own API"
         );
-
-        // And nothing beside it either. An interrupted write leaves a
-        // `user-access-token.<uuid>.tmp`, and a purge that swept the named file
-        // and left the temporary would leave the token on disk under a name
-        // nobody looks at.
-        if let Some(directory) = guard.parent()
-            && let Ok(entries) = std::fs::read_dir(directory)
-        {
-            let remnants: Vec<_> = entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("user-access-token"))
-                .collect();
+        if let Ok(bytes) = std::fs::read(&guard) {
+            let token = exposed(&fixture_token());
             assert!(
-                remnants.is_empty(),
-                "a purge left {remnants:?} in {}",
-                directory.display()
+                !bytes
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes()),
+                "the value is still lying in {} after a purge",
+                guard.display()
             );
         }
+
+        // A file-backed store additionally leaves nothing at all: neither the
+        // named file, nor a `user-access-token.<uuid>.tmp` from a write that was
+        // interrupted, which is the token on disk under a name nobody looks at.
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                !guard.exists(),
+                "the stored value is still at {}",
+                guard.display()
+            );
+            if let Some(directory) = guard.parent()
+                && let Ok(entries) = std::fs::read_dir(directory)
+            {
+                let remnants: Vec<_> = entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("user-access-token"))
+                    .collect();
+                assert!(
+                    remnants.is_empty(),
+                    "a purge left {remnants:?} in {}",
+                    directory.display()
+                );
+            }
+        }
+    }
+
+    /// The negative control for the sweep above: a temporary file from an
+    /// interrupted write is a token on disk, and a purge that only removed the
+    /// file it was told about would leave it there.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_purge_sweeps_a_temporary_left_by_an_interrupted_write() {
+        let root = TempDir::new().expect("a temporary directory");
+        let store = rooted(SecretScope::Machine, &root);
+        store.store(&fixture_token()).expect("stored");
+
+        let directory = store
+            .guard()
+            .parent()
+            .expect("the guard has a directory")
+            .to_path_buf();
+        let abandoned = directory.join(format!("{TEMP_PREFIX}00000000-dead-beef.tmp"));
+        std::fs::write(&abandoned, exposed(&fixture_token())).expect("planted");
+
+        store.delete().expect("purged");
+        assert!(
+            !abandoned.exists(),
+            "a purge left {} behind, which is the token on disk under a name nobody looks at",
+            abandoned.display()
+        );
     }
 
     // -----------------------------------------------------------------------
