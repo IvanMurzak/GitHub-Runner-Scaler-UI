@@ -1058,9 +1058,23 @@ fn install_wrapper(node: &Path, root: &Path, with_platform_package: bool) -> Pat
         // test. Copying node makes one executable serve every platform:
         // invoked as `runner-manager -e "<script>"` it is a programmable
         // child.
+        // `node_or_skip` returns the PATH entry verbatim, and on two of the
+        // three runner images that entry is a SYMLINK whose target is written
+        // relative to the directory holding it. `hard_link` resolves to
+        // `linkat` without `AT_SYMLINK_FOLLOW`, so hard-linking it reproduces
+        // the link rather than the binary -- and the reproduction resolves its
+        // relative target against this temporary directory, where nothing of
+        // that name exists. `spawnSync` then reports ENOENT for a path that is
+        // plainly there, which is a confusing way to be told the stand-in is a
+        // dangling link.
+        //
+        // Canonicalising first links the real executable. The fallback `copy`
+        // never had the problem -- it follows symlinks and reads contents --
+        // which is why this only ever bit where the hard link SUCCEEDED.
+        let source = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
         let destination = bin.join(binary_name);
-        if std::fs::hard_link(node, &destination).is_err() {
-            std::fs::copy(node, &destination).expect("copying node as the stand-in binary");
+        if std::fs::hard_link(&source, &destination).is_err() {
+            std::fs::copy(&source, &destination).expect("copying node as the stand-in binary");
         }
     }
 
