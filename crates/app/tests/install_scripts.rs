@@ -1571,6 +1571,121 @@ fn install_sh_removes_its_staging_file_when_the_install_step_fails() {
 }
 
 // ----------------------------------------------------------------------------
+// The destination that is a DIRECTORY, in both installers.
+// ----------------------------------------------------------------------------
+// A FALSE SUCCESS, and the same class as a checksum that is never compared:
+// both scripts finish, both print "Installed runner-manager 1.2.3 to <path>",
+// and nothing is installed. `07-security.md`'s reasoning about a mismatch
+// applies unchanged -- a failure sends the user looking and a false success does
+// not -- which is why this is a guard with a test rather than a one-line fix.
+//
+// Measured on both platforms before either guard was written:
+//
+//     Move-Item SUCCEEDED
+//     C:\tmp\mvprobe2\bin\runner-manager.exe\.staged
+//
+// `mv -f src dst` and `Move-Item -Force` do not replace a directory and do not
+// fail: they move the source INSIDE it. So the `|| fail` on one side and the
+// `catch` on the other never run, and the staging cleanup no-ops as well,
+// because the staged path is no longer where the cleanup looks for it.
+//
+// How the directory gets there is not exotic: an interrupted extraction, a
+// `mkdir -p` of the wrong path, a packaging tool that made a folder. What makes
+// it worth a test is that the user's next action is `runner-manager --version`
+// -- which the script itself tells them to run -- and it is still not found.
+
+#[test]
+fn install_sh_refuses_a_destination_that_is_a_directory() {
+    let fixture = prepare("1.2.3");
+    let destination = fixture.directory.join("runner-manager");
+    std::fs::create_dir_all(&destination).expect("a directory where the binary belongs");
+
+    let (ok, output) = run_install_sh(&LINUX_X64, &fixture.release.assets, &fixture.directory, &[]);
+
+    assert!(
+        !ok,
+        "install.sh reported SUCCESS with a directory where the binary belongs. \
+         `mv -f` moved the staged file inside it and exited 0, so the `|| fail` \
+         never ran:\n{output}"
+    );
+    assert!(
+        output.contains("is a directory, not a file"),
+        "the refusal must name the cause. `could not install into ...` sends \
+         the reader to permissions, which is not what is wrong:\n{output}"
+    );
+    assert!(
+        !output.contains("Installed runner-manager"),
+        "install.sh announced an install it did not perform:\n{output}"
+    );
+
+    // The move must not have happened AT ALL -- not into the directory, and not
+    // beside it. This is the assertion that separates a real guard from a
+    // message printed after the damage.
+    assert_eq!(
+        installed_entries(&destination),
+        Vec::<String>::new(),
+        "install.sh moved the staged binary INSIDE the directory that was \
+         standing where the binary belongs. That is the false success this \
+         guard exists to prevent, now with a non-zero exit in front of it."
+    );
+
+    // And the staging file is gone. It lives beside the destination rather than
+    // under `$work`, so only the EXIT trap removes it -- and the trap could only
+    // no-op before, because the staged path had been moved away.
+    assert_eq!(
+        installed_entries(&fixture.directory),
+        vec!["runner-manager".to_string()],
+        "install.sh left its staging file in the install directory after \
+         refusing. The EXIT trap removes the staged path, and this is the case \
+         where it must still be there to remove."
+    );
+}
+
+#[test]
+fn install_ps1_refuses_a_destination_that_is_a_directory() {
+    for shell in powershell_hosts_or_skip() {
+        let host = shell.display().to_string();
+        let fixture = prepare("1.2.3");
+        let destination = fixture.directory.join("runner-manager.exe");
+        std::fs::create_dir_all(&destination).expect("a directory where the binary belongs");
+
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+
+        assert!(
+            !ok,
+            "install.ps1 reported SUCCESS with a directory where the binary \
+             belongs ({host}). `Move-Item -Force` moved the staged file inside \
+             it and did not throw, so the `catch` never ran:\n{output}"
+        );
+        assert!(
+            output.contains("is a directory, not a file"),
+            "the refusal must name the cause ({host}). `could not replace ...` \
+             sends the reader to the running-agent advice, which is not what is \
+             wrong here:\n{output}"
+        );
+        assert!(
+            !output.contains("Installed runner-manager"),
+            "install.ps1 announced an install it did not perform \
+             ({host}):\n{output}"
+        );
+        assert_eq!(
+            installed_entries(&destination),
+            Vec::<String>::new(),
+            "install.ps1 moved the staged binary INSIDE the directory standing \
+             where the binary belongs ({host})"
+        );
+        assert_eq!(
+            installed_entries(&fixture.directory),
+            vec!["runner-manager.exe".to_string()],
+            "install.ps1 left its staging file in the install directory after \
+             refusing ({host}). The guard removes the staged copy before it \
+             fails, the way the `catch` beside it already did."
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Windows PowerShell 5.1 on a machine that ALSO has PowerShell 7.
 // ----------------------------------------------------------------------------
 

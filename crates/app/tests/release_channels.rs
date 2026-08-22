@@ -1207,6 +1207,32 @@ fn job_block(job: &str) -> String {
 }
 
 /// Every `run:` body inside a job block -- executable text only.
+/// A `run:` body with its shell COMMENTS removed.
+///
+/// ----------------------------------------------------------------------------
+/// A COMMENT MENTIONING A COMMAND IS NOT THE COMMAND.
+/// ----------------------------------------------------------------------------
+/// Every assertion in this file that says "the step must execute X" is a
+/// substring search over the raw body, and the bodies in release.yml are
+/// heavily commented -- deliberately, because the reasoning is the valuable
+/// part. The two are in tension: a comment that NAMES a command satisfies the
+/// search for it.
+///
+/// Measured rather than supposed. Deleting the `git push --dry-run` pre-flight
+/// from release.yml while leaving the paragraph above it that explains why it
+/// is there left the assertion GREEN, because the explanation contains the
+/// string. The guard was gone and the test could not tell.
+///
+/// So the assertions about what a step EXECUTES scan this instead. It is
+/// deliberately not applied to everything: a few checks are about the step's
+/// prose, and those want the comments.
+fn executable_lines(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn run_bodies(block: &str) -> Vec<String> {
     let lines: Vec<&str> = block.lines().collect();
     let mut bodies = Vec::new();
@@ -1491,13 +1517,18 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     // created, therefore fails AFTER the one action here nothing can undo --
     // `npm unpublish` is restricted and time-limited. A pre-flight that checks
     // a secret is non-empty and stops there has moved no failure at all.
+    // Scanned over EXECUTABLE lines, not the raw body: the paragraph above each
+    // of these commands explains what it is for and therefore names it, so a
+    // raw-body search goes green on the explanation alone. Measured -- deleting
+    // the dry-run push below while keeping its comment left this test passing.
+    let guard_commands = executable_lines(&bodies[guard]);
+
     assert!(
-        bodies[guard].contains("git ls-remote"),
+        guard_commands.contains("git ls-remote"),
         "the pre-flight validates the SECRETS but not the TAP. One read-only \
          `git ls-remote` moves a bad token or a missing repository from after \
          `npm publish` to before it, and it needs exactly the access the clone \
-         at the end of the job needs:\n{}",
-        bodies[guard]
+         at the end of the job needs:\n{guard_commands}"
     );
 
     // ------------------------------------------------------------------------
@@ -1514,14 +1545,26 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     // creates nothing: measured, a dry run to a new branch prints
     // `* [new branch]`, exits 0, and leaves the remote without that ref.
     assert!(
-        bodies[guard].contains("git push --dry-run"),
+        guard_commands.contains("git push --dry-run"),
         "the pre-flight proves the tap is READABLE and stops there. \
          `git ls-remote` is git-upload-pack; the action this job actually ends \
          with is a PUSH, and a token with read but no write passes the check \
          above and fails after `npm publish`. `git push --dry-run` does the \
          receive-pack advertisement -- the request that 403s for a read-only \
-         token -- and writes nothing:\n{}",
-        bodies[guard]
+         token -- and writes nothing:\n{guard_commands}"
+    );
+
+    // `--dry-run` is only safe because of WHICH ref it names. Pushing this
+    // repository's HEAD at the tap's own branch is a non-fast-forward between
+    // unrelated histories, and git decides that LOCALLY -- so the probe would
+    // fail on every release, on a perfectly good token, and the fix somebody
+    // reached for would be to delete the probe.
+    assert!(
+        guard_commands.contains("refs/heads/runner-manager-release-preflight"),
+        "the dry-run push must target a ref that cannot conflict. Pointed at \
+         the tap's real branch it is a non-fast-forward decided locally, which \
+         fails before the remote is ever asked the question the probe exists to \
+         ask:\n{guard_commands}"
     );
 
     // ------------------------------------------------------------------------
