@@ -97,6 +97,49 @@ pub enum PathsError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A directory could not be created because its parent refused.
+    ///
+    /// Split out from [`PathsError::Create`] because the message a bare
+    /// `EACCES` produces is a dead end. It names the leaf, and the leaf is not
+    /// the obstacle: it does not exist yet, so it cannot be what refused.
+    /// `mkdir(2)` reports `EACCES` about the **parent**, and the parent here
+    /// is one of the shared directories this program deliberately does not
+    /// tighten -- `~/.local`, `~/.config`, or whatever the account's
+    /// application-data root resolves under. An operator handed the leaf path
+    /// goes and looks at a directory that is not there.
+    ///
+    /// Nothing about the permission policy changes on the strength of this.
+    /// Parents are still not this program's to tighten, and this still fails
+    /// rather than widening anything. The diagnosis is the whole of the
+    /// remedy: say which directory refused and what state it is in, so the
+    /// operator can decide.
+    #[error(
+        "cannot create the {purpose} directory {}: permission denied. The directory named is \
+         not the obstacle -- it does not exist yet, so it cannot be what refused; the refusal \
+         comes from its parent. {} is {parent_state}. This program will not change it: an \
+         intermediate directory is shared with every other application and is not the agent's \
+         to tighten. Grant this account write access to that directory, or run the agent \
+         against an explicit root under a directory it owns.",
+        path.display(),
+        path.parent().unwrap_or(path.as_path()).display()
+    )]
+    ParentDenies {
+        /// Which of the four directories failed.
+        purpose: &'static str,
+        /// The leaf that could not be created. The directory that actually
+        /// refused is its parent, which is derived rather than stored: keeping
+        /// both is redundant, and it pushed `Result<_, LoggingError>` past
+        /// clippy's `result_large_err` threshold, which is a fair complaint
+        /// about an error type carrying a path twice.
+        path: PathBuf,
+        /// What the platform can say about that parent: its mode on Unix,
+        /// whatever `std::fs` can report on Windows.
+        parent_state: String,
+        /// The underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// The four directories the daemon owns.
@@ -260,6 +303,20 @@ impl AppPaths {
                     }
                     restrict_directory(purpose, path)?;
                 }
+                Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // `mkdir(2)` reports `EACCES` about the parent: the leaf
+                    // does not exist yet, so it cannot be what refused. The
+                    // parent is known exactly here -- `create_dir_all` above
+                    // just returned `Ok` for it -- which is why this is the
+                    // one place the diagnosis can be made without guessing.
+                    let parent = path.parent().unwrap_or(path);
+                    return Err(PathsError::ParentDenies {
+                        purpose,
+                        path: path.to_path_buf(),
+                        parent_state: describe_parent(parent),
+                        source,
+                    });
+                }
                 Err(source) => return Err(failed(source)),
             }
         }
@@ -284,6 +341,42 @@ fn create_restricted_leaf(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn create_restricted_leaf(path: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().create(path)
+}
+
+/// How the parent of a leaf that could not be created presents to this account.
+///
+/// Reported rather than acted on. This is the directory the operator has to
+/// look at, and the whole point of naming it is that the message about the
+/// leaf sends them somewhere that does not exist yet.
+fn describe_parent(parent: &Path) -> String {
+    match std::fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => permission_summary(&metadata),
+        // Both of these contradict the caller's premise -- `create_dir_all`
+        // returned `Ok` for this path a moment ago -- so say so plainly rather
+        // than inventing a mode for something that is not a directory.
+        Ok(_) => "not a directory".to_string(),
+        Err(error) => format!("not inspectable ({error})"),
+    }
+}
+
+/// What the platform can say about a directory's permissions.
+#[cfg(unix)]
+fn permission_summary(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    format!("mode {:04o}", metadata.permissions().mode() & 0o7777)
+}
+
+/// Windows has no mode bits. The read-only attribute is the only thing
+/// `std::fs` exposes, and it is almost never the reason -- so say which of the
+/// two answers this is, rather than implying the attribute is the whole story.
+#[cfg(not(unix))]
+fn permission_summary(metadata: &std::fs::Metadata) -> String {
+    if metadata.permissions().readonly() {
+        "marked read-only".to_string()
+    } else {
+        "not marked read-only, so an access-control entry is what refused".to_string()
+    }
 }
 
 impl fmt::Display for AppPaths {
@@ -470,6 +563,99 @@ mod tests {
             paths.all().map(|(name, _)| name),
             ["config", "state", "runtime", "logs"],
             "the order and the names are what `host show` prints"
+        );
+    }
+
+    /// A denied creation must name the directory that actually refused.
+    ///
+    /// The diagnosis, not the policy. `create_all` still fails, and still
+    /// leaves the parent alone -- an intermediate directory is shared with
+    /// every other application and is not the agent's to tighten. What
+    /// changes is that the message stops sending the operator to a path that
+    /// does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_creation_names_the_parent_rather_than_the_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).expect("the parent is created writable");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+            .expect("the parent is made unwritable");
+
+        // Root ignores the mode bits, and containers routinely run as root.
+        // Probe rather than ask: if a child can still be created here, this
+        // account is not the one the test needs, and skipping is honest where
+        // failing would be a lie about the code.
+        let probe = locked.join("probe");
+        let skip = std::fs::create_dir(&probe).is_ok();
+        if skip {
+            std::fs::remove_dir(&probe).expect("the probe is removed");
+        }
+        // Restored before any assertion can unwind past it, or the temporary
+        // directory cannot be cleaned up.
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        };
+        if skip {
+            restore();
+            return;
+        }
+
+        // Rooted *at* the unwritable directory, so that the leaf's parent
+        // already exists and the refusal comes from `create_restricted_leaf`
+        // rather than from the `create_dir_all` above it.
+        let paths = AppPaths::rooted_at(&locked);
+        let outcome = paths.create_all();
+        restore();
+
+        let error = outcome.expect_err("an unwritable parent must not succeed");
+        let PathsError::ParentDenies {
+            purpose,
+            path,
+            parent_state,
+            ..
+        } = &error
+        else {
+            panic!("a denied creation must be reported as such, not as a bare Create: {error}");
+        };
+
+        assert_eq!(*purpose, "config", "the first of the four is what failed");
+        assert_eq!(path, &locked.join("config"));
+        assert_eq!(
+            path.parent(),
+            Some(locked.as_path()),
+            "the parent is the directory that refused"
+        );
+        assert_eq!(parent_state, "mode 0555", "{parent_state}");
+
+        // The message is the whole point of the variant, so assert on it.
+        let message = error.to_string();
+        assert!(
+            message.contains(&locked.display().to_string()),
+            "the parent must be named: {message}"
+        );
+        assert!(
+            message.contains("mode 0555"),
+            "the parent's state must be given, or the operator has to go and \
+             look it up before they can act: {message}"
+        );
+        assert!(
+            message.contains("not the obstacle"),
+            "the message must say why the leaf is not the thing to look at, \
+             or naming the parent reads as an aside: {message}"
+        );
+
+        // The policy is unchanged: nothing was widened on the way out.
+        let mode = std::fs::metadata(&locked)
+            .expect("the parent still exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "only this test's own restore may have touched the parent"
         );
     }
 
