@@ -12,9 +12,15 @@
 //!   every effect it has reaches the world through a port, which is what makes
 //!   the whole decision path testable with no process, no filesystem and no
 //!   network.
-//! * [`package`] — the cached, checksum-verified GitHub runner package.
+//! * [`package`] — the cached, checksum-verified GitHub runner package. `e2`
+//!   owns it, and it is an ownership stub today.
 //! * [`lifecycle`] — the JIT registration, the child process, and restart
-//!   recovery. It implements [`reconcile::RunnerLauncher`].
+//!   recovery. `e3` owns it and **will** implement
+//!   [`reconcile::RunnerLauncher`]; it is an ownership stub today, so the port
+//!   has no production implementation yet. Written in the future tense on
+//!   purpose: a crate root that describes a stub as if it were finished is how
+//!   a reader concludes the wiring exists and goes looking for the bug
+//!   somewhere else.
 //!
 //! # Every ceiling in this product is enforced in this crate
 //!

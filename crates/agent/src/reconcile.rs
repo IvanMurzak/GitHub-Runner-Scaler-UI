@@ -162,6 +162,21 @@ pub const GITHUB_CANCELS_QUEUED_JOBS_AFTER: Duration = Duration::from_secs(24 * 
 /// host's own policies creating runtimes at the same moment — and each hold
 /// lasts only as long as one runtime creation. Waiting a few seconds turns the
 /// common case into a short pause instead of a skipped runner.
+///
+/// # How many of these a poll actually costs
+///
+/// Exactly one per runtime created, and none for a policy that is granted
+/// nothing. That is worth stating because it did not used to be true and the
+/// difference only shows up here: the budget was checked *after* the lock had
+/// been taken and the attempt set re-read, so a policy granted N runners took
+/// N+1 holds, and `start_runners` ran for every readable autoscale policy
+/// including the zero-demand ones — so an idle host with P policies took P
+/// host-wide locks per poll for nothing. Free under
+/// [`InProcessAllocationLock`]; under [`FileAllocationLock`] each one is a
+/// `spawn_blocking` plus a filesystem lock, with this wait behind it.
+///
+/// [`Reconciler::start_runners`] now pre-checks lock-free and stops as soon as
+/// the budget is spent. The under-lock re-read still decides.
 pub const ALLOCATION_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -821,6 +836,23 @@ impl LaunchFailure {
 ///
 /// So the launcher is asked, under the allocation lock, immediately before each
 /// runtime is created. There is no second supply point and no cached copy.
+///
+/// # The two ways an implementer can say "I hold no attempts"
+///
+/// The argument above closes the hole for a *caller*. It stayed open one level
+/// down for the **implementer**, in two shapes that both oversubscribe the
+/// machine and neither of which reports anything:
+///
+/// * **By failing.** `attempts()` used to be infallible, which left `e3` — which
+///   reads a journal off a disk — a choice between panicking and answering
+///   `vec![]` on an I/O error. An empty set is indistinguishable from an idle
+///   host, so a transient read failure reads as "nothing is running" and the
+///   next pass allocates the whole machine for jobs already being served. It is
+///   fallible now, and [`Reconciler`] treats a failure the way it treats a lock
+///   it could not take: start nothing, say so, try again next pass.
+/// * **By lagging.** [`Self::launch`] returns the attempt it created rather than
+///   its identifier, so the caller can carry it. See that method for the
+///   measurement that made this necessary.
 #[async_trait::async_trait]
 pub trait RunnerLauncher: fmt::Debug + Send + Sync {
     /// Every attempt this host holds, across every policy, terminal ones
@@ -830,15 +862,43 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
     /// caller needs both answers from one set:
     /// [`AttemptState::counts_against_capacity`] decides the ceiling, and the
     /// terminal ones are what [`RunnerLauncher::clean`] is for.
-    async fn attempts(&self) -> Vec<RunnerAttempt>;
+    ///
+    /// # Errors
+    /// [`LaunchFailure`] when the set could not be read. **Never answer `Ok`
+    /// with an empty vector to signal a failure** — the caller cannot tell that
+    /// from an idle host, and the two lead to opposite actions.
+    async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure>;
 
-    /// Create exactly one runtime and start one runner.
+    /// Create exactly one runtime and start one runner, and return the attempt
+    /// that now exists.
     ///
     /// Called once per grant, with the host-wide allocation lock held.
     ///
+    /// # The attempt is returned, not just its identifier
+    ///
+    /// The host ceiling is enforced against a host-wide total, and that total is
+    /// recomputed from [`Self::attempts`] on every hold. If a launch is not yet
+    /// visible there when the *next* policy is allocated for — a journal write
+    /// that has not landed, an asynchronous store, a cache — then that policy's
+    /// grant is computed from a set missing the previous policy's runners, and
+    /// it is too large.
+    ///
+    /// That is measured, not hypothetical. With a launcher whose attempts never
+    /// became visible, two policies on a host of **three** started **six**
+    /// runners, with the allocation lock held correctly throughout:
+    /// `host_capacity=3, started=6, launches=6`. Serialisation was never the
+    /// problem; the arithmetic under it was reading a stale set.
+    ///
+    /// So an implementer *should* make the new attempt visible to
+    /// [`Self::attempts`] before returning — and the caller does not depend on
+    /// it. [`Reconciler`] carries what this pass created and merges it, by
+    /// [`RunnerAttempt::id`], with whatever the launcher reports. A launcher
+    /// that honours the contract is not double-counted, and one that lags cannot
+    /// oversubscribe the host.
+    ///
     /// # Errors
     /// [`LaunchFailure`], carrying the [`FailureReason`] `e3` recorded.
-    async fn launch(&self, request: LaunchRequest<'_>) -> Result<AttemptId, LaunchFailure>;
+    async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure>;
 
     /// Remove a terminal attempt's runtime and mark it `cleaned`.
     ///
@@ -1114,13 +1174,27 @@ pub enum LifecycleEvent {
         policy: PolicyId,
         reason: &'static str,
     },
-    /// The allocation lock was not free; no runtime was created.
-    AllocationDeferred { policy: PolicyId },
+    /// The allocation lock was not free, so `count` runners this policy was
+    /// granted were not created this pass.
+    AllocationDeferred { policy: PolicyId, count: u16 },
+    /// The host's attempt set could not be read at all.
+    ///
+    /// Distinct from an empty set on purpose, and the whole reason
+    /// [`RunnerLauncher::attempts`] is fallible: the two produce the same
+    /// *number* and demand opposite actions.
+    AttemptsUnreadable { reason: &'static str },
     /// A terminal attempt's runtime was removed.
     AttemptCleaned {
         policy: PolicyId,
         attempt: AttemptId,
         outcome: OutcomeKind,
+    },
+    /// A terminal attempt's runtime could not be removed. It will be retried on
+    /// the next pass, and this is what keeps that retry from being silent.
+    AttemptCleanFailed {
+        policy: PolicyId,
+        attempt: AttemptId,
+        reason: &'static str,
     },
     /// Scale-down declined to remove a runner that is executing a job.
     ScaleDownRefused {
@@ -1143,7 +1217,9 @@ impl LifecycleEvent {
             Self::RunnerStarted { .. } => "runner_started",
             Self::RunnerStartFailed { .. } => "runner_start_failed",
             Self::AllocationDeferred { .. } => "allocation_deferred",
+            Self::AttemptsUnreadable { .. } => "attempts_unreadable",
             Self::AttemptCleaned { .. } => "attempt_cleaned",
+            Self::AttemptCleanFailed { .. } => "attempt_clean_failed",
             Self::ScaleDownRefused { .. } => "scale_down_refused",
             Self::PollScheduled { .. } => "poll_scheduled",
         }
@@ -1159,10 +1235,11 @@ impl LifecycleEvent {
             | Self::MonitorOnlySkipped { policy }
             | Self::RunnerStarted { policy, .. }
             | Self::RunnerStartFailed { policy, .. }
-            | Self::AllocationDeferred { policy }
+            | Self::AllocationDeferred { policy, .. }
             | Self::AttemptCleaned { policy, .. }
+            | Self::AttemptCleanFailed { policy, .. }
             | Self::ScaleDownRefused { policy, .. } => Some(*policy),
-            Self::PollScheduled { .. } => None,
+            Self::PollScheduled { .. } | Self::AttemptsUnreadable { .. } => None,
         }
     }
 }
@@ -1208,15 +1285,30 @@ impl fmt::Display for LifecycleEvent {
             Self::RunnerStartFailed { policy, reason } => {
                 write!(f, "policy {policy}: could not start a runner ({reason})")
             }
-            Self::AllocationDeferred { policy } => write!(
+            Self::AllocationDeferred { policy, count } => write!(
                 f,
-                "policy {policy}: the allocation lock was held; no runtime was created"
+                "policy {policy}: the allocation lock was held; {count} granted runners \
+                 were not created"
+            ),
+            Self::AttemptsUnreadable { reason } => write!(
+                f,
+                "the host's attempt set could not be read ({reason}); nothing was started, \
+                 and this is not the same as the host being idle"
             ),
             Self::AttemptCleaned {
                 policy,
                 attempt,
                 outcome,
             } => write!(f, "policy {policy}: cleaned attempt {attempt} ({outcome})"),
+            Self::AttemptCleanFailed {
+                policy,
+                attempt,
+                reason,
+            } => write!(
+                f,
+                "policy {policy}: attempt {attempt} could not be cleaned ({reason}); it \
+                 will be retried"
+            ),
             Self::ScaleDownRefused { policy, attempt } => write!(
                 f,
                 "policy {policy}: attempt {attempt} is executing a job and was not removed"
@@ -1292,8 +1384,11 @@ impl EventSink for TracingEvents {
             LifecycleEvent::RunnerStartFailed { policy, reason } => {
                 tracing::warn!(event = name, policy_id = %policy, reason);
             }
-            LifecycleEvent::AllocationDeferred { policy } => {
-                tracing::debug!(event = name, policy_id = %policy, lock = "allocation");
+            LifecycleEvent::AllocationDeferred { policy, count } => {
+                tracing::debug!(event = name, policy_id = %policy, lock = "allocation", count);
+            }
+            LifecycleEvent::AttemptsUnreadable { reason } => {
+                tracing::warn!(event = name, reason);
             }
             LifecycleEvent::AttemptCleaned {
                 policy,
@@ -1304,6 +1399,16 @@ impl EventSink for TracingEvents {
                 policy_id = %policy,
                 attempt_id = %attempt,
                 outcome = outcome.as_str(),
+            ),
+            LifecycleEvent::AttemptCleanFailed {
+                policy,
+                attempt,
+                reason,
+            } => tracing::warn!(
+                event = name,
+                policy_id = %policy,
+                attempt_id = %attempt,
+                reason,
             ),
             LifecycleEvent::ScaleDownRefused { policy, attempt } => tracing::info!(
                 event = name,
@@ -1415,8 +1520,25 @@ pub struct ReconcileReport {
     pub idle_exits: u16,
     /// Of those, the ones an operator should look at.
     pub failures: u16,
-    /// Grants abandoned because the allocation lock was held.
+    /// Runners this pass was granted but did not start because the allocation
+    /// lock was held.
+    ///
+    /// **Grants, not policies.** It used to be incremented once per
+    /// `start_runners` call that met a held lock, so a policy that launched two
+    /// of five and then lost the lock reported `1` while three runners went
+    /// unstarted -- a number that agreed with neither its own name nor its
+    /// documentation.
     pub deferred: u16,
+    /// Times the host's attempt set could not be read this pass.
+    ///
+    /// Non-zero means the pass decided less than it looks like it decided: a
+    /// policy whose attempt set was unreadable started nothing and is *not* in
+    /// [`Self::allocations`], because there was no set to compute an allocation
+    /// from. It is not the same as the host being idle, which is the whole
+    /// reason [`RunnerLauncher::attempts`] is fallible.
+    pub attempts_unreadable: u16,
+    /// Terminal attempts whose runtime could not be removed. Retried next pass.
+    pub clean_failures: u16,
     /// The most severe failure across the targets polled, when there was one.
     pub failure: Option<RefreshState>,
     /// What to display while GitHub is unreachable, including how long the
@@ -1464,6 +1586,8 @@ pub struct ScaleDownReport {
     pub removed: u16,
     /// Attempts executing a job. **Removed nothing, left `busy`.**
     pub refused_busy: u16,
+    /// Terminal attempts whose runtime could not be removed.
+    pub clean_failures: u16,
     /// Live attempts that are not yet busy. Also removed nothing: capacity is
     /// reclaimed only when an attempt reaches a terminal state.
     pub retained: u16,
@@ -1541,6 +1665,10 @@ impl Reconciler {
     ///   [`RunnerLauncher`] for why it comes from there and nowhere else.
     pub async fn reconcile(&mut self, policies: &[ScalePolicy]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
+        // Everything this pass has created, carried across policies so that the
+        // host-wide total cannot be computed from a set that is missing it. See
+        // `RunnerLauncher::launch`.
+        let mut launched: Vec<RunnerAttempt> = Vec::new();
 
         // --- Flow 2.1-2.2: who is even asking, and what did GitHub say -------
         let mut pollable: Vec<&ScalePolicy> = Vec::new();
@@ -1600,7 +1728,13 @@ impl Reconciler {
                 // Ownership rule 2 and precedence rule 4. Allocated for with no
                 // demand, so the refusal is reported by name rather than by
                 // absence.
-                report.allocations.push(self.allocate_only(policy, 0).await);
+                match self.allocate_only(policy, 0, &launched).await {
+                    Some(allocation) => {
+                        self.emit_allocation(&allocation);
+                        report.allocations.push(allocation);
+                    }
+                    None => self.report_unreadable_attempts(&mut report),
+                }
                 continue;
             }
             let Some(reading) = readings.get(&policy.target) else {
@@ -1624,7 +1758,8 @@ impl Reconciler {
                         demand: count,
                         complete: demand.is_complete(),
                     });
-                    self.start_runners(policy, count, &mut report).await;
+                    self.start_runners(policy, count, &mut report, &mut launched)
+                        .await;
                 }
             }
         }
@@ -1699,12 +1834,17 @@ impl Reconciler {
     /// reaches here is refused by [`HostAllocator::allocate`] before any
     /// headroom is spent, so there is no read-decide-create sequence to make
     /// atomic.
-    async fn allocate_only(&self, policy: &ScalePolicy, demand: u32) -> Allocation {
-        let attempts = self.launcher.attempts().await;
+    /// `None` when the attempt set could not be read, which is never the same
+    /// answer as an empty one.
+    async fn allocate_only(
+        &self,
+        policy: &ScalePolicy,
+        demand: u32,
+        launched: &[RunnerAttempt],
+    ) -> Option<Allocation> {
+        let attempts = self.host_attempts(launched).await.ok()?;
         let mut allocator = HostAllocator::from_attempts(&self.host, &attempts);
-        let allocation = allocator.allocate(policy, demand);
-        self.emit_allocation(&allocation);
-        allocation
+        Some(allocator.allocate(policy, demand))
     }
 
     /// Flow 2.4-2.6: start runners for one policy, one lock hold per runtime.
@@ -1728,16 +1868,49 @@ impl Reconciler {
     /// reconciliation loop is the one place in this product that must not be
     /// able to wedge, so the bound is structural rather than a consequence of
     /// every input being well behaved.
-    async fn start_runners(&self, policy: &ScalePolicy, demand: u32, report: &mut ReconcileReport) {
-        let mut reported = false;
-        let mut budget = 0_u16;
-        loop {
+    async fn start_runners(
+        &self,
+        policy: &ScalePolicy,
+        demand: u32,
+        report: &mut ReconcileReport,
+        launched: &mut Vec<RunnerAttempt>,
+    ) {
+        // A lock-free pre-check, for one reason only: the host-wide lock should
+        // not be taken by a policy that is going to be granted nothing. On an
+        // idle host with P policies that was P lock acquisitions per poll --
+        // free under `InProcessAllocationLock`, a `spawn_blocking` and a
+        // filesystem lock apiece under `FileAllocationLock`.
+        //
+        // It is safe because it can only be optimistic. Anything it grants is
+        // re-decided under the lock below and may be lowered there; the only
+        // thing it can get wrong in the other direction is refusing a grant that
+        // headroom freed a moment later would have allowed, which the next poll
+        // picks up.
+        let Some(intent) = self.allocate_only(policy, demand, launched).await else {
+            self.report_unreadable_attempts(report);
+            self.events.emit(LifecycleEvent::AttemptsUnreadable {
+                reason: "attempts_unreadable",
+            });
+            return;
+        };
+
+        // The allocation that is *reported* is the one taken under the lock when
+        // a lock was taken, because that is the one that decided anything. The
+        // pre-check stands in only when no hold was ever obtained.
+        let mut decided: Option<Allocation> = None;
+        let mut budget = intent.to_start;
+
+        while budget > 0 {
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
                 Err(_) => {
-                    report.deferred = report.deferred.saturating_add(1);
-                    self.events
-                        .emit(LifecycleEvent::AllocationDeferred { policy: policy.id });
+                    // Grants, not policies: this is what the policy was owed and
+                    // did not get.
+                    report.deferred = report.deferred.saturating_add(budget);
+                    self.events.emit(LifecycleEvent::AllocationDeferred {
+                        policy: policy.id,
+                        count: budget,
+                    });
                     break;
                 }
             };
@@ -1747,26 +1920,36 @@ impl Reconciler {
             // whole sequence rather than on the decision alone -- reading the
             // headroom outside the lock is the shape in which two policies both
             // find room for the last slot.
-            let attempts = self.launcher.attempts().await;
+            let attempts = match self.host_attempts(launched).await {
+                Ok(attempts) => attempts,
+                Err(failure) => {
+                    drop(guard);
+                    self.report_unreadable_attempts(report);
+                    self.events.emit(LifecycleEvent::AttemptsUnreadable {
+                        reason: failure_reason_kind(&failure.reason),
+                    });
+                    break;
+                }
+            };
             let mut allocator = HostAllocator::from_attempts(&self.host, &attempts);
             let allocation = allocator.allocate(policy, demand);
 
-            if !reported {
-                self.emit_allocation(&allocation);
-                budget = allocation.to_start;
-                report.allocations.push(allocation.clone());
-                reported = true;
+            if decided.is_none() {
+                // The under-lock decision may be smaller than the pre-check, and
+                // never larger: `min` rather than assignment, so a later hold
+                // cannot raise the bound either.
+                budget = budget.min(allocation.to_start);
+                decided = Some(allocation.clone());
             }
 
             // Either stop is sufficient on its own in the well-behaved case;
-            // neither is sufficient in the case above. See the doc comment.
+            // neither is sufficient when the launcher lags. See the doc comment.
             if allocation.starts_nothing() || budget == 0 {
                 drop(guard);
                 break;
             }
-            budget -= 1;
 
-            let launched = self
+            let created = self
                 .launcher
                 .launch(LaunchRequest {
                     host: &self.host,
@@ -1775,12 +1958,18 @@ impl Reconciler {
                 .await;
             drop(guard);
 
-            match launched {
+            match created {
                 Ok(attempt) => {
+                    let id = attempt.id;
+                    // Carried across policies for the rest of this pass, so the
+                    // host-wide total cannot be computed from a set that is
+                    // missing it. See `RunnerLauncher::launch`.
+                    launched.push(attempt);
                     report.started = report.started.saturating_add(1);
+                    budget -= 1;
                     self.events.emit(LifecycleEvent::RunnerStarted {
                         policy: policy.id,
-                        attempt,
+                        attempt: id,
                     });
                 }
                 Err(failure) => {
@@ -1793,13 +1982,46 @@ impl Reconciler {
             }
         }
 
-        if !reported {
-            // The lock was held on the very first attempt, so nothing was ever
-            // decided. Report the intent anyway, without the lock, so an
-            // operator staring at a queue sees why nothing started.
-            let allocation = self.allocate_only(policy, demand).await;
-            report.allocations.push(allocation);
-        }
+        let allocation = decided.unwrap_or(intent);
+        self.emit_allocation(&allocation);
+        report.allocations.push(allocation);
+    }
+
+    /// The attempt set the host holds, plus everything this pass has already
+    /// created.
+    ///
+    /// The merge is by [`RunnerAttempt::id`], so a launcher that makes its
+    /// launches visible before returning -- which
+    /// [`RunnerLauncher::launch`] asks for -- contributes each attempt once, and
+    /// one that lags still cannot hide a runner from the host-wide total. The
+    /// ceiling therefore holds on the strength of this function rather than on
+    /// the strength of an implementer honouring a comment.
+    ///
+    /// # Errors
+    /// Whatever [`RunnerLauncher::attempts`] reported.
+    async fn host_attempts(
+        &self,
+        launched: &[RunnerAttempt],
+    ) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
+        let mut attempts = self.launcher.attempts().await?;
+        let known: BTreeSet<AttemptId> = attempts.iter().map(|attempt| attempt.id).collect();
+        attempts.extend(
+            launched
+                .iter()
+                .filter(|attempt| !known.contains(&attempt.id))
+                .cloned(),
+        );
+        Ok(attempts)
+    }
+
+    /// The attempt set could not be read, so nothing may be decided from it.
+    ///
+    /// Counted rather than swallowed for the reason the module documentation
+    /// gives: an unreadable set and an idle host produce the same *number* and
+    /// demand opposite actions, so the difference has to survive into the
+    /// report.
+    fn report_unreadable_attempts(&self, report: &mut ReconcileReport) {
+        report.attempts_unreadable = report.attempts_unreadable.saturating_add(1);
     }
 
     /// Remove the runtimes of attempts that have already concluded.
@@ -1808,7 +2030,17 @@ impl Reconciler {
     /// done, and `busy` is not terminal at all. That is what makes it impossible
     /// for this path to reach a runner executing a job.
     async fn clean_terminal_attempts(&self, report: &mut ReconcileReport) {
-        for attempt in self.launcher.attempts().await {
+        let attempts = match self.launcher.attempts().await {
+            Ok(attempts) => attempts,
+            Err(failure) => {
+                self.report_unreadable_attempts(report);
+                self.events.emit(LifecycleEvent::AttemptsUnreadable {
+                    reason: failure_reason_kind(&failure.reason),
+                });
+                return;
+            }
+        };
+        for attempt in attempts {
             if !attempt.state().is_concluded() {
                 continue;
             }
@@ -1816,22 +2048,40 @@ impl Reconciler {
                 continue;
             };
             let kind = OutcomeKind::of(outcome);
-            if self.launcher.clean(attempt.id).await.is_ok() {
-                report.cleaned = report.cleaned.saturating_add(1);
-                if kind.is_failure() {
-                    report.failures = report.failures.saturating_add(1);
-                } else if kind == OutcomeKind::IdleExit {
-                    // The surplus case. Counted apart from a failure because
-                    // `g2` renders it apart, and because an operator told that a
-                    // normal surplus exit is an error goes hunting a fault that
-                    // does not exist.
-                    report.idle_exits = report.idle_exits.saturating_add(1);
+            match self.launcher.clean(attempt.id).await {
+                Ok(()) => {
+                    report.cleaned = report.cleaned.saturating_add(1);
+                    if kind.is_failure() {
+                        report.failures = report.failures.saturating_add(1);
+                    } else if kind == OutcomeKind::IdleExit {
+                        // The surplus case. Counted apart from a failure because
+                        // `g2` renders it apart, and because an operator told
+                        // that a normal surplus exit is an error goes hunting a
+                        // fault that does not exist.
+                        report.idle_exits = report.idle_exits.saturating_add(1);
+                    }
+                    self.events.emit(LifecycleEvent::AttemptCleaned {
+                        policy: attempt.policy_id,
+                        attempt: attempt.id,
+                        outcome: kind,
+                    });
                 }
-                self.events.emit(LifecycleEvent::AttemptCleaned {
-                    policy: attempt.policy_id,
-                    attempt: attempt.id,
-                    outcome: kind,
-                });
+                // A runtime directory that cannot be removed is retried on every
+                // poll. Silently, before this arm existed: no event, no counter,
+                // no report field, so a cleanup that can never succeed was an
+                // invisible permanent loop. It wedges no capacity -- a terminal
+                // attempt already stopped counting -- but this module's
+                // organising principle is the things that go wrong silently, and
+                // `clean` returns a `Result` precisely so the caller can say
+                // something.
+                Err(failure) => {
+                    report.clean_failures = report.clean_failures.saturating_add(1);
+                    self.events.emit(LifecycleEvent::AttemptCleanFailed {
+                        policy: attempt.policy_id,
+                        attempt: attempt.id,
+                        reason: failure_reason_kind(&failure.reason),
+                    });
+                }
             }
         }
     }
@@ -1845,7 +2095,15 @@ impl Reconciler {
     /// nothing, changes nothing, and says so.
     pub async fn scale_down(&self, policy: &ScalePolicy) -> ScaleDownReport {
         let mut report = ScaleDownReport::default();
-        for attempt in self.launcher.attempts().await {
+        let Ok(attempts) = self.launcher.attempts().await else {
+            // The same rule as everywhere else: an unreadable set is not an
+            // empty one, and scale-down removes nothing it cannot see.
+            self.events.emit(LifecycleEvent::AttemptsUnreadable {
+                reason: "attempts_unreadable",
+            });
+            return report;
+        };
+        for attempt in attempts {
             if attempt.policy_id != policy.id {
                 continue;
             }
@@ -1861,13 +2119,23 @@ impl Reconciler {
                     let kind = attempt
                         .outcome()
                         .map_or(OutcomeKind::Failed, OutcomeKind::of);
-                    if self.launcher.clean(attempt.id).await.is_ok() {
-                        report.removed = report.removed.saturating_add(1);
-                        self.events.emit(LifecycleEvent::AttemptCleaned {
-                            policy: policy.id,
-                            attempt: attempt.id,
-                            outcome: kind,
-                        });
+                    match self.launcher.clean(attempt.id).await {
+                        Ok(()) => {
+                            report.removed = report.removed.saturating_add(1);
+                            self.events.emit(LifecycleEvent::AttemptCleaned {
+                                policy: policy.id,
+                                attempt: attempt.id,
+                                outcome: kind,
+                            });
+                        }
+                        Err(failure) => {
+                            report.clean_failures = report.clean_failures.saturating_add(1);
+                            self.events.emit(LifecycleEvent::AttemptCleanFailed {
+                                policy: policy.id,
+                                attempt: attempt.id,
+                                reason: failure_reason_kind(&failure.reason),
+                            });
+                        }
                     }
                 }
                 AttemptState::Cleaned => {}
@@ -1950,8 +2218,11 @@ mod tests {
 
     use std::sync::atomic::AtomicUsize;
 
+    use std::num::NonZeroU16;
+
     use runner_manager_domain::attempt::PersistedAttempt;
-    use runner_manager_domain::model::HostId;
+    use runner_manager_domain::model::{CachePolicy, HostId};
+    use runner_manager_domain::policy::PolicyMode;
     use runner_manager_github::rest::RateLimited;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
@@ -1994,6 +2265,12 @@ mod tests {
         /// first.
         forgetful: bool,
         fail_next: Mutex<Option<FailureReason>>,
+        /// Reports that the attempt set cannot be read at all, which is the one
+        /// answer a caller must never confuse with an idle host.
+        attempts_fail: Mutex<bool>,
+        /// Refuses every cleanup, so the silent-retry path has something to be
+        /// loud about.
+        clean_fails: bool,
     }
 
     impl FakeLauncher {
@@ -2037,6 +2314,18 @@ mod tests {
             *self.fail_next.lock().unwrap() = Some(reason);
         }
 
+        fn fail_attempts(&self, failing: bool) {
+            *self.attempts_fail.lock().unwrap() = failing;
+        }
+
+        fn refusing_cleanup(attempts: Vec<RunnerAttempt>) -> Self {
+            Self {
+                clean_fails: true,
+                ..Self::default()
+            }
+            .seeded(attempts)
+        }
+
         fn cleaned(&self) -> Vec<AttemptId> {
             self.cleaned.lock().unwrap().clone()
         }
@@ -2044,11 +2333,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunnerLauncher for FakeLauncher {
-        async fn attempts(&self) -> Vec<RunnerAttempt> {
-            self.snapshot()
+        async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
+            if *self.attempts_fail.lock().unwrap() {
+                return Err(LaunchFailure::new(FailureReason::Other(
+                    "the journal could not be read".into(),
+                )));
+            }
+            Ok(self.snapshot())
         }
 
-        async fn launch(&self, request: LaunchRequest<'_>) -> Result<AttemptId, LaunchFailure> {
+        async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
             if let Some(reason) = self.fail_next.lock().unwrap().take() {
                 return Err(LaunchFailure::new(reason));
             }
@@ -2058,19 +2352,25 @@ mod tests {
             }
             let id =
                 AttemptId::from_u128(u128::from(self.next_id.fetch_add(1, Ordering::SeqCst) + 1));
+            let created = RunnerAttempt::allocate(
+                id,
+                request.policy.id,
+                "runtime/p/a",
+                request.host.created_at,
+            );
             self.launches.fetch_add(1, Ordering::SeqCst);
             if !self.forgetful {
-                self.attempts.lock().unwrap().push(RunnerAttempt::allocate(
-                    id,
-                    request.policy.id,
-                    "runtime/p/a",
-                    request.host.created_at,
-                ));
+                self.attempts.lock().unwrap().push(created.clone());
             }
-            Ok(id)
+            Ok(created)
         }
 
         async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure> {
+            if self.clean_fails {
+                return Err(LaunchFailure::new(FailureReason::Other(
+                    "the runtime directory is locked".into(),
+                )));
+            }
             self.cleaned.lock().unwrap().push(attempt);
             let mut attempts = self.attempts.lock().unwrap();
             attempts.retain(|a| a.id != attempt);
@@ -2428,6 +2728,202 @@ mod tests {
         );
     }
 
+    /// The host-wide ceiling must hold across policies even when the launcher
+    /// lags, and the per-policy budget alone does not reach that case.
+    ///
+    /// Review found this, with this file's own `forgetful` fixture and one more
+    /// policy: the budget bounds *each policy's* loop to its own first grant,
+    /// but policy B's first grant is computed from a set that does not yet
+    /// contain policy A's launches, so B's bound is itself too large. Two
+    /// policies on a host of three started **six** runners --
+    /// `host_capacity=3, started=6, launches=6` -- with the lock held correctly
+    /// throughout. Serialisation was never the problem; the arithmetic under it
+    /// was reading a stale set.
+    #[tokio::test]
+    async fn two_policies_cannot_exceed_host_capacity_even_when_the_launcher_lags() {
+        let launcher = Arc::new(FakeLauncher::forgetful());
+        let demand = Arc::new(FakeDemand::default());
+        demand.set_for(
+            &ScaleTarget::repository("acme/left").unwrap(),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/left"), 3)),
+        );
+        demand.set_for(
+            &ScaleTarget::repository("acme/right").unwrap(),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/right"), 3)),
+        );
+        let mut harness = Harness::build(
+            host_with(3),
+            Arc::clone(&launcher),
+            demand,
+            Arc::new(InProcessAllocationLock::new()),
+        );
+
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/left", 3), policy(2, "acme/right", 3)])
+            .await;
+
+        assert_eq!(
+            report.started, 3,
+            "host_capacity is 3 and two policies each allowed 3 started {} runners between              them; the second policy's grant was computed from a set that did not yet              contain the first policy's launches",
+            report.started
+        );
+        assert_eq!(launcher.launches(), 3);
+    }
+
+    /// Finding 1: an attempt set that cannot be read is not an empty one.
+    ///
+    /// `attempts()` used to be infallible, which left `e3` — reading a journal
+    /// off a disk — a choice between panicking and answering `vec![]`. The
+    /// second is silent and catastrophic: an empty set is indistinguishable from
+    /// an idle host, so a transient read failure reads as "nothing is running"
+    /// and the pass allocates the whole machine for jobs already being served.
+    ///
+    /// The contrast is the assertion. Identical host, identical demand,
+    /// identical policy; the only difference is whether the launcher can answer.
+    #[tokio::test]
+    async fn an_unreadable_attempt_set_starts_nothing_and_is_not_read_as_an_idle_host() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut harness = Harness::build(
+            host_with(8),
+            Arc::clone(&launcher),
+            Arc::new(FakeDemand::ready(4, &repo("acme/app"))),
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        let policy = policy(1, "acme/app", 8);
+
+        launcher.fail_attempts(true);
+        let unreadable = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(
+            unreadable.started, 0,
+            "nothing may be decided from a set that was not read"
+        );
+        assert_eq!(launcher.launches(), 0);
+        assert!(unreadable.attempts_unreadable > 0, "and the pass says so");
+        assert!(
+            unreadable.allocations.is_empty(),
+            "no allocation is reported either: there was no set to compute one from, and \
+             an allocation of zero would claim a decision nobody made"
+        );
+        assert!(harness.events.count_of("attempts_unreadable") > 0);
+
+        // The same everything, with a launcher that can answer.
+        launcher.fail_attempts(false);
+        let readable = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+        assert_eq!(
+            readable.started, 4,
+            "the difference between the two passes is only whether the set could be read"
+        );
+        assert_eq!(readable.attempts_unreadable, 0);
+    }
+
+    /// Finding 3: a cleanup that can never succeed was an invisible permanent
+    /// loop.
+    ///
+    /// `if …clean(…).await.is_ok()` had no `else`, so a runtime directory that
+    /// could not be removed was retried on every poll with no event, no counter
+    /// and no report field. It wedges no capacity — a terminal attempt already
+    /// stopped counting — but `clean` returns a `Result` precisely so the caller
+    /// can say something, and this module's organising principle is the things
+    /// that go wrong silently.
+    #[tokio::test]
+    async fn a_cleanup_that_cannot_succeed_is_reported_rather_than_retried_in_silence() {
+        let launcher = Arc::new(FakeLauncher::refusing_cleanup(vec![concluded(
+            1,
+            1,
+            AttemptOutcome::ExitedIdleWithoutWork,
+        )]));
+        let mut harness = Harness::build(
+            host_with(4),
+            Arc::clone(&launcher),
+            Arc::new(FakeDemand::ready(0, &repo("acme/app"))),
+            Arc::new(InProcessAllocationLock::new()),
+        );
+
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "acme/app", 4)])
+            .await;
+
+        assert_eq!(report.cleaned, 0);
+        assert_eq!(report.clean_failures, 1);
+        assert_eq!(harness.events.count_of("attempt_clean_failed"), 1);
+        assert_eq!(
+            harness.events.count_of("attempt_cleaned"),
+            0,
+            "and it is not reported as cleaned"
+        );
+        assert_eq!(
+            launcher.snapshot().len(),
+            1,
+            "the attempt is still there, so the retry is real -- what changed is that it \
+             is no longer silent"
+        );
+
+        // The reason is the variant, never the detail: the fixture's failure
+        // carries free text and none of it reaches the event.
+        let reasons: Vec<&'static str> = harness
+            .events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::AttemptCleanFailed { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, vec!["other"]);
+    }
+
+    /// Finding 7: the lower arm of the clamp, driven through the reconciler.
+    ///
+    /// `demand_below_min_capacity_starts_nothing_in_v1` runs `demand = 0`
+    /// against `min_capacity = 0`, which is *at* the floor and never raises
+    /// `desired` — the assertion held for a reason unrelated to the boundary it
+    /// named. D7 fixes `min` at 0 for v1, but `AutoscaleConfig::new` accepts
+    /// `min > 0` today, so the path is representable and was undriven.
+    #[tokio::test]
+    async fn demand_below_min_capacity_is_raised_to_min_capacity() {
+        let mut warm = ScalePolicy::new(
+            PolicyId::from_u128(1),
+            ScaleTarget::repository("acme/app").unwrap(),
+            1,
+            fixtures::HOST_ID,
+            PolicyMode::autoscale(
+                fixtures::routing_labels("home"),
+                2,
+                NonZeroU16::new(5).expect("non-zero"),
+            )
+            .expect("min <= max"),
+            CachePolicy::default(),
+        );
+        warm.activate().expect("pending -> active");
+
+        let mut harness = Harness::simple(8, 0, "acme/app");
+        let report = harness.reconciler.reconcile(&[warm]).await;
+
+        assert_eq!(
+            report.allocations[0].demand, 0,
+            "GitHub reported no queued runs"
+        );
+        assert_eq!(
+            report.allocations[0].desired, 2,
+            "min_capacity raised the target above demand"
+        );
+        assert_eq!(
+            report.allocations[0].limiting_factor,
+            LimitingFactor::MinCapacity
+        );
+        assert_eq!(report.started, 2, "and two runners were actually started");
+        assert_eq!(harness.launcher.live_count(), 2);
+    }
+
     // =======================================================================
     // Capacity, at the boundaries
     // =======================================================================
@@ -2589,9 +3085,10 @@ mod tests {
              headroom and the creation of the runtime are not atomic"
         );
         assert!(
-            lock.acquisitions() >= 3,
-            "the lock is taken before *each* runtime, not once per pass; it was taken {} \
-             times",
+            (3..=5).contains(&lock.acquisitions()),
+            "the lock is taken before *each* runtime, not once per pass: three runtimes \
+             means at least three holds, and at most one further hold per policy to \
+             discover the host filled up underneath it. It was taken {} times",
             lock.acquisitions()
         );
     }
@@ -2771,9 +3268,11 @@ mod tests {
         );
         assert_eq!(
             lock.acquisitions(),
-            3,
-            "two grants plus the hold that found nothing left to grant, all for the one \
-             policy that owns runners"
+            2,
+            "one hold per runtime created, and none on behalf of the monitor-only policy. \
+             It was three before the budget was checked at the top of the loop rather than \
+             after the re-read, which cost every policy a surplus hold to discover there \
+             was nothing left to grant"
         );
     }
 
@@ -3278,6 +3777,46 @@ mod tests {
         );
     }
 
+    /// Finding 5: the adapter, not the lock underneath it.
+    ///
+    /// `d1` covers `LockKind::Allocation` including a contended `acquire_at`
+    /// with a wait. What that does not reach is this adapter: the
+    /// `spawn_blocking` wrapper, the collapse of both a refused lock and a
+    /// panicked blocking task into `AllocationLockBusy`, and — the one that
+    /// would be silent — whether [`AllocationGuard`] really holds the
+    /// `HostLock`, since dropping it is the only release there is. A guard that
+    /// dropped the lock on the way out would make every acquisition succeed and
+    /// the ceiling would hold by luck.
+    ///
+    /// The original disclosure said this needed a real filesystem and was
+    /// therefore expensive. `AppPaths::rooted_at` plus `tempfile` — already a
+    /// non-dev dependency of this crate — makes it about fifteen lines, so the
+    /// reason was weaker than stated.
+    #[tokio::test]
+    async fn the_file_allocation_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let paths = Arc::new(runner_manager_platform::paths::AppPaths::rooted_at(
+            root.path(),
+        ));
+        let lock = FileAllocationLock::new(paths).with_wait(Duration::from_millis(50));
+
+        let held = lock.acquire().await.expect("an uncontended lock is free");
+        assert!(
+            matches!(lock.acquire().await, Err(AllocationLockBusy)),
+            "a second holder was admitted; on Unix the lock is per open file description \
+             and on Windows the share mode denies write, so this must be refused even \
+             from inside the same process"
+        );
+
+        drop(held);
+        let regained = lock.acquire().await;
+        assert!(
+            regained.is_ok(),
+            "dropping the guard is the only release there is, so a guard that does not \
+             hold the `HostLock` leaves it held forever"
+        );
+    }
+
     #[test]
     fn tee_events_reaches_both_sinks() {
         // `f3` wires the log sink and `g2`'s buffer at once, and an event that
@@ -3421,9 +3960,22 @@ mod tests {
             .reconcile(&[policy(1, "acme/app", 4)])
             .await;
         assert_eq!(report.started, 0);
-        assert_eq!(report.deferred, 1);
+        assert_eq!(
+            report.deferred, 3,
+            "three runners were granted and none was created; `deferred` counts grants, \
+             not policies -- it reported `1` when a policy that launched two of five and \
+             then lost the lock had left three unstarted"
+        );
         assert_eq!(launcher.launches(), 0);
         assert_eq!(harness.events.count_of("allocation_deferred"), 1);
+        assert!(
+            harness
+                .events
+                .events()
+                .iter()
+                .any(|event| matches!(event, LifecycleEvent::AllocationDeferred { count: 3, .. })),
+            "the event carries the same number the report does"
+        );
         assert_eq!(
             report.allocations.len(),
             1,
@@ -3550,7 +4102,17 @@ mod tests {
                     "Authorization: Bearer ghp_0123456789abcdefghijklmnopqrstuvwxyz".into(),
                 )),
             },
-            LifecycleEvent::AllocationDeferred { policy },
+            LifecycleEvent::AllocationDeferred { policy, count: 4 },
+            LifecycleEvent::AttemptsUnreadable {
+                reason: failure_reason_kind(&FailureReason::Other(
+                    "x-api-key: ghp_0123456789abcdefghijklmnopqrstuvwxyz".into(),
+                )),
+            },
+            LifecycleEvent::AttemptCleanFailed {
+                policy,
+                attempt,
+                reason: failure_reason_kind(&FailureReason::ProcessExitedUnexpectedly),
+            },
             LifecycleEvent::AttemptCleaned {
                 policy,
                 attempt,
@@ -3659,18 +4221,20 @@ mod tests {
     // The two tripwires
     // =======================================================================
 
-    /// This file's source above its test module, with comment lines dropped.
+    /// One source file's production half, with comment lines dropped.
     ///
     /// Both exclusions are `c4`'s, and load-bearing for the same reasons. The
-    /// **test module** goes because the tests above legitimately name the
-    /// shapes they forbid; the **comments** go because this module's
+    /// **test module** goes because the tests in it legitimately name the shapes
+    /// they forbid — this module's own positive control is a literal
+    /// `async fn acquire_jobs`, which would accuse the file of the thing it is
+    /// proving it does not do. The **comments** go because this module's
     /// documentation explains the seam at length and has to name what does not
-    /// exist in order to say why. A scan that forbade the explanation is a scan
+    /// exist in order to say why; a scan that forbade the explanation is a scan
     /// that gets the explanation deleted.
-    fn this_file_above_its_tests_without_prose() -> String {
-        let (production, _) = include_str!("reconcile.rs")
+    fn production_half_of(source: &str) -> String {
+        let production = source
             .split_once("\n#[cfg(test)]")
-            .expect("this file has a test module, and the scan is meaningless without one");
+            .map_or(source, |(production, _)| production);
         production
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -3678,6 +4242,29 @@ mod tests {
             .join("\n")
     }
 
+    /// This file's own production half.
+    fn this_file_above_its_tests_without_prose() -> String {
+        production_half_of(include_str!("reconcile.rs"))
+    }
+
+    /// The one normalisation both halves of the scan use.
+    ///
+    /// # This is a second copy of `crates/github/src/demand.rs`, deliberately
+    ///
+    /// `production_half_of`, this function, [`FORBIDDEN`] and
+    /// `forbidden_shape_in` together duplicate `demand.rs:1530-1619`. Sharing
+    /// them would mean putting them in `crates/testkit`, which `e1` does not
+    /// own, so the copy was the only option available to this task.
+    ///
+    /// **It is worth consolidating later, and here is the specific hazard.**
+    /// The last defect in `c4`'s copy was two spellings of "the same"
+    /// normalisation drifting apart — the haystack lower-cased and the needle
+    /// not — which made three of its seven assertions vacuously true from the
+    /// day they were written. Two copies is the same hazard one level up. The
+    /// mitigation inside *this* copy is that one function serves both the scan
+    /// and its positive control, so a normaliser that stops matching fails the
+    /// control loudly rather than passing the scan silently; what that cannot
+    /// catch is this copy and `c4`'s diverging from each other.
     fn normalise_for_scan(text: &str) -> String {
         text.to_ascii_lowercase().replace(['_', ' '], "")
     }
@@ -3728,17 +4315,77 @@ mod tests {
     /// reservation reached through a trait method or a differently-named helper
     /// would walk past it. Review is the primary control, exactly as `c4` states
     /// for its own copy.
+    ///
+    /// # It scans the crate, because the bullet says "in the crate"
+    ///
+    /// It used to scan this file alone while quoting a crate-wide claim, which
+    /// left `lifecycle.rs` — `e3`, the launcher, and by far the likeliest place
+    /// for someone to "fix" the surplus-runner case with a local lease — covered
+    /// by nothing. Reading another owner's file is not editing it, so ownership
+    /// was never the obstacle.
+    ///
+    /// The walk below is `c4`'s, and it **recurses** for the reason `c4`
+    /// records: a module directory (`src/reconcile/mod.rs`) arrives as an entry
+    /// that does not end in `.rs`, so a flat filter drops it and takes every
+    /// file underneath with it, leaving the scan passing over files it covers
+    /// by nothing at all. The listed-versus-on-disk assertion is what stops
+    /// `SOURCES` going stale the moment `e2` or `e3` adds a module.
     #[test]
-    fn nothing_in_this_module_reserves_or_claims_a_job() {
+    fn nothing_in_this_crate_reserves_or_claims_a_job() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("lib.rs", include_str!("lib.rs")),
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("package.rs", include_str!("package.rs")),
+            ("reconcile.rs", include_str!("reconcile.rs")),
+        ];
+
+        fn walk(directory: &std::path::Path, prefix: &str, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(directory).expect("the crate's own src/ is readable") {
+                let entry = entry.expect("a readable directory entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // `/`-joined, which is what `include_str!` takes on every
+                // platform, so the two sides compare directly.
+                let joined = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &joined, found);
+                } else if name.ends_with(".rs") {
+                    found.push(joined);
+                }
+            }
+        }
+
+        let mut listed: Vec<&str> = SOURCES.iter().map(|(name, _)| *name).collect();
+        listed.sort_unstable();
+        let mut on_disk = Vec::new();
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            "",
+            &mut on_disk,
+        );
+        on_disk.sort_unstable();
         assert_eq!(
-            forbidden_shape_in(&this_file_above_its_tests_without_prose()),
-            None,
-            "this module defines a job reservation. There is no `AcquireJobs` equivalent \
-             over REST; if an owner decision restored one, that decision belongs in this \
-             module's documentation and in this test before it belongs in the code"
+            listed, on_disk,
+            "a source file was added or removed; this scan claims to cover the whole crate \
+             and a stale list makes that claim false"
         );
 
-        // The control: the scan can see a shape when there is one.
+        for (name, source) in SOURCES {
+            assert_eq!(
+                forbidden_shape_in(&production_half_of(source)),
+                None,
+                "{name} names a forbidden shape: there is no `AcquireJobs` equivalent over \
+                 REST, and a local lease coordinates this host with itself and with nothing \
+                 else. If an owner decision restored one, that decision belongs in this \
+                 module's documentation and in this test before it belongs in the code"
+            );
+        }
+
+        // The control: the scan can see a shape when there is one, through the
+        // same matcher the loop above uses.
         assert!(
             forbidden_shape_in("async fn acquire_jobs(&self) -> Vec<Job> { todo!() }").is_some(),
             "the scan above proves nothing if the needles no longer match"
