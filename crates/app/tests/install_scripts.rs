@@ -723,7 +723,8 @@ fn has_substring_expansion(line: &str) -> bool {
     let mut index = 0;
     while let Some(offset) = line[index..].find("${") {
         let mut cursor = index + offset + 2;
-        while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
         {
             cursor += 1;
         }
@@ -815,8 +816,8 @@ fn powershell_hosts() -> Vec<PathBuf> {
         if let Some(found) = find_program("powershell.exe") {
             candidates.push(found);
         }
-        let system_root =
-            std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        let system_root = std::env::var_os("SystemRoot")
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
         candidates.push(
             PathBuf::from(system_root)
                 .join("System32")
@@ -977,7 +978,10 @@ fn install_ps1_selects_the_windows_artifact_for_both_architectures() {
         for architecture in ["AMD64", "ARM64"] {
             let (ok, output) =
                 run_install_ps1(&shell, base, base, &["-PrintPlan", "-Arch", architecture]);
-            assert!(ok, "install.ps1 refused {architecture} under {host}:\n{output}");
+            assert!(
+                ok,
+                "install.ps1 refused {architecture} under {host}:\n{output}"
+            );
             assert_eq!(
                 plan_value(&output, "target"),
                 "x86_64-pc-windows-msvc",
@@ -1057,8 +1061,12 @@ fn install_ps1_verifies_the_published_digest_and_installs() {
     for shell in powershell_hosts_or_skip() {
         let host = shell.display();
         let fixture = prepare("1.2.3");
-        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
-        assert!(ok, "install.ps1 failed on a good release under {host}:\n{output}");
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        assert!(
+            ok,
+            "install.ps1 failed on a good release under {host}:\n{output}"
+        );
         assert!(
             output.contains("SHA-256 OK"),
             "install.ps1 installed without reporting that it verified the \
@@ -1096,7 +1104,8 @@ fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alo
     for shell in powershell_hosts_or_skip() {
         let host = shell.display();
         let fixture = prepare("1.2.3");
-        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
         assert!(ok, "the first install must succeed under {host}:\n{output}");
 
         let binary = fixture.directory.join("runner-manager.exe");
@@ -1104,7 +1113,8 @@ fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alo
 
         substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
 
-        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
         assert!(
             !ok,
             "install.ps1 installed an archive whose digest does not match the \
@@ -1220,7 +1230,10 @@ fn documented_windows_two_step_run_command() -> String {
 
     let block = blocks
         .iter()
-        .find(|body| body.iter().any(|line| line.contains("-OutFile install.ps1")))
+        .find(|body| {
+            body.iter()
+                .any(|line| line.contains("-OutFile install.ps1"))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "README.md has no ```powershell block that downloads install.ps1 \
@@ -1653,7 +1666,8 @@ fn both_installers_read_the_binary_mode_form_of_sha256sums() {
         let host = shell.display();
         let fixture = prepare("1.2.3");
         rewrite_sums_as_binary_mode(&fixture.release);
-        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
         assert!(
             ok,
             "install.ps1 refused a SHA256SUMS in the binary-mode form under \
@@ -1773,7 +1787,8 @@ fn both_installers_match_the_whole_asset_name_when_neighbours_are_published() {
         let fixture = prepare("1.2.3");
         add_decoy_lines(&fixture.release);
 
-        let (ok, output) = run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
+        let (ok, output) =
+            run_install_ps1(&shell, &fixture.release.assets, &fixture.directory, &[]);
         assert!(
             ok,
             "install.ps1 could not resolve an archive in a release that also \

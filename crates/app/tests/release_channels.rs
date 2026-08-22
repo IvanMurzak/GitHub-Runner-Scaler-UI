@@ -380,9 +380,7 @@ fn the_brew_formula_desc_fits_what_brew_audit_accepts() {
         .lines()
         .find_map(|line| line.trim().strip_prefix("desc \""))
         .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or_else(|| {
-            panic!("the rendered formula declares no `desc`:\n{formula}")
-        });
+        .unwrap_or_else(|| panic!("the rendered formula declares no `desc`:\n{formula}"));
 
     assert!(
         !description.trim().is_empty(),
@@ -986,9 +984,9 @@ fn the_npm_readme_warns_that_a_global_npm_prefix_moves() {
     let install = readme.find("npm i -g runner-manager").unwrap_or_else(|| {
         panic!("npm/README.md must carry the install command it exists to serve")
     });
-    let disclosure = readme.find("Administration").unwrap_or_else(|| {
-        panic!("checked above: the permission is named somewhere in this file")
-    });
+    let disclosure = readme
+        .find("Administration")
+        .unwrap_or_else(|| panic!("checked above: the permission is named somewhere in this file"));
     assert!(
         disclosure < install,
         "npm/README.md puts `npm i -g runner-manager` at byte {install} and the \
@@ -1545,9 +1543,9 @@ fn the_readme_and_the_workflow_name_the_same_homebrew_tap() {
     // one thing, in two files, is exactly the shape that drifts -- and the
     // symptom lands on a user, not on this repository.
     let tap = workflow_default_tap();
-    let (owner, repository) = tap.split_once('/').unwrap_or_else(|| {
-        panic!("release.yml's default tap `{tap}` is not `owner/repository`")
-    });
+    let (owner, repository) = tap
+        .split_once('/')
+        .unwrap_or_else(|| panic!("release.yml's default tap `{tap}` is not `owner/repository`"));
     let shorthand = repository.strip_prefix("homebrew-").unwrap_or(repository);
     let documented = format!("brew install {owner}/{shorthand}/runner-manager");
 
