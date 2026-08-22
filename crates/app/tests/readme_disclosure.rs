@@ -291,12 +291,38 @@ fn the_readme_advertises_no_download_that_is_not_a_terminal_command() {
     // "Download for Windows" button reintroduces the prompt this project buys
     // no certificate to avoid -- and it would be added by someone trying to be
     // helpful, in a commit that mentions none of this.
-    assert!(
-        !source.contains("!["),
-        "README.md embeds an image. D14 removed download images and buttons; \
-         every advertised path must be a terminal command, which is the whole \
-         reason no code-signing certificate is needed (D12)."
-    );
+    // ------------------------------------------------------------------------
+    // NARROWED TO IMAGES THAT ARE DOWNLOADS, NOT TO EVERY IMAGE.
+    // ------------------------------------------------------------------------
+    // This used to forbid `![` outright. That also forbids a CI badge, a
+    // screenshot of the TUI, and a diagram -- none of which sets a quarantine
+    // flag on anything -- and the message a contributor would have got for
+    // adding one talks about code-signing certificates, which is not a sentence
+    // anybody can act on.
+    //
+    // What D14 removed is the download IMAGE: a "Download for Windows" button,
+    // which is an image whose LINK TARGET is an archive or a release download.
+    // That is the shape to forbid, and forbidding it precisely is what keeps
+    // the rule from being deleted the first time somebody wants a badge.
+    for line in source.lines() {
+        if !line.contains("![") {
+            continue;
+        }
+        for target in link_targets(line) {
+            let is_download = target.ends_with(".zip")
+                || target.ends_with(".tar.gz")
+                || target.contains("/releases/download/")
+                || target.contains("/releases/latest/download/");
+            assert!(
+                !is_download,
+                "README.md embeds an image whose link target is a download \
+                 ({target}):\n  {line}\nD14 removed download images and \
+                 buttons; every advertised path must be a terminal command, \
+                 which is the whole reason no code-signing certificate is \
+                 needed (D12)."
+            );
+        }
+    }
     assert!(
         !source.contains("<img"),
         "README.md embeds a raw <img> tag; see above"
@@ -326,6 +352,23 @@ fn the_readme_advertises_no_download_that_is_not_a_terminal_command() {
             }
         }
     }
+}
+
+/// Every markdown link target on one line.
+///
+/// A download button is written `[![label](image)](target)`, so both targets on
+/// the line matter and taking only the first would miss the one that does the
+/// downloading.
+fn link_targets(line: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut rest = line;
+    while let Some(offset) = rest.find("](") {
+        let after = &rest[offset + 2..];
+        let target = after.split(')').next().unwrap_or(after);
+        targets.push(target.trim().to_string());
+        rest = after;
+    }
+    targets
 }
 
 #[test]

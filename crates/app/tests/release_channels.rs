@@ -173,6 +173,72 @@ fn the_checksum_lookup_matches_the_whole_asset_name() {
     );
 }
 
+#[test]
+fn the_checksum_lookup_reads_both_forms_sha256sum_writes() {
+    // ------------------------------------------------------------------------
+    // SHA256SUMS IS A PARSED INTERFACE, AND IT HAS TWO SPELLINGS.
+    // ------------------------------------------------------------------------
+    // `sha256sum -c` verifies both `<hash>  <name>` (text mode) and
+    // `<hash> *<name>` (binary mode -- what `-b` writes everywhere and what GNU
+    // sha256sum writes on Windows by DEFAULT). `release.sh sha256` normalises
+    // to the first, so a release this repository published only ever carries
+    // that one; but this subcommand is also pointed at files this repository
+    // did not write -- a re-run over a hand-assembled directory, a mirror --
+    // and refusing those is refusing what the README's own manual check
+    // accepts.
+    let temporary = TempDir::new().expect("a temporary directory");
+    let wanted = "a".repeat(64);
+
+    let binary_mode = temporary.path().join("SHA256SUMS.binary");
+    std::fs::write(
+        &binary_mode,
+        format!("{wanted} *runner-manager-1.2.3-x86_64-apple-darwin.tar.gz\n"),
+    )
+    .expect("a binary-mode fixture");
+
+    let found = channels_stdout(&[
+        "checksum",
+        &posix(&binary_mode),
+        "runner-manager-1.2.3-x86_64-apple-darwin.tar.gz",
+    ]);
+    assert_eq!(
+        found, wanted,
+        "channels.sh refused the binary-mode form that `sha256sum -b` writes \
+         and `sha256sum -c` verifies"
+    );
+
+    // And a file nothing could be read out of gets its OWN sentence. A
+    // truncated download and a release that never published an asset are
+    // different failures with different fixes, and reporting the first as the
+    // second sends whoever reads it hunting for a missing build.
+    let unreadable = temporary.path().join("NOT-A-CHECKSUM-FILE");
+    std::fs::write(
+        &unreadable,
+        "<html><head><title>404 Not Found</title></head></html>\n",
+    )
+    .expect("an unreadable fixture");
+
+    let (ok, output) = run_channels(&[
+        "checksum",
+        &posix(&unreadable),
+        "runner-manager-1.2.3-x86_64-apple-darwin.tar.gz",
+    ]);
+    assert!(
+        !ok,
+        "the lookup returned something from a file it could not parse:\n{output}"
+    );
+    assert!(
+        output.contains("no line in the form"),
+        "an unparseable checksum file must be reported as one:\n{output}"
+    );
+    assert!(
+        !output.contains("records no digest"),
+        "channels.sh reported a file it could not parse at all as a release \
+         missing one asset. Those have different causes and different \
+         fixes:\n{output}"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // The Homebrew formula.
 // ----------------------------------------------------------------------------
@@ -281,6 +347,62 @@ fn the_brew_formula_pins_every_platform_to_the_published_digest() {
          README, and `07-security.md` requires the statement wherever the App \
          is offered.\n{formula}"
     );
+}
+
+#[test]
+fn the_brew_formula_desc_fits_what_brew_audit_accepts() {
+    // ------------------------------------------------------------------------
+    // `brew audit` FAILS A `desc` OF 80 CHARACTERS OR MORE.
+    // ------------------------------------------------------------------------
+    // The npm description is the right length for an npm package page, where it
+    // is most of what a reader sees before deciding. Reused verbatim as the
+    // formula's `desc` it is about 110 characters, and `brew audit` rejects
+    // that -- which nobody discovers until the audit runs, which is after the
+    // tap commit, which is after `npm publish`, which is the one action in step
+    // 8 that cannot be undone.
+    //
+    // So there are two strings rather than one truncated at render time: a
+    // truncation cuts mid-word at whatever length the description happens to
+    // be, and silently.
+    let temporary = TempDir::new().expect("a temporary directory");
+    let release = build_release(temporary.path(), "1.2.3");
+    let output_path = temporary.path().join("Formula").join("runner-manager.rb");
+    channels_stdout(&[
+        "brew-formula",
+        "1.2.3",
+        &posix(&release.sums()),
+        "IvanMurzak/GitHub-Runner-Scaler-UI",
+        &posix(&output_path),
+    ]);
+
+    let formula = read(&output_path);
+    let description = formula
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("desc \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| {
+            panic!("the rendered formula declares no `desc`:\n{formula}")
+        });
+
+    assert!(
+        !description.trim().is_empty(),
+        "the formula's `desc` is empty; `brew audit` requires one:\n{formula}"
+    );
+    assert!(
+        description.chars().count() < 80,
+        "the formula's `desc` is {} characters. `brew audit` accepts fewer \
+         than 80, and it is run by anyone who taps this formula as well as by \
+         Homebrew itself:\n  {description}",
+        description.chars().count()
+    );
+    // Homebrew also rejects a description that opens with an article or with
+    // the formula's own name.
+    for opener in ["A ", "An ", "The ", "runner-manager"] {
+        assert!(
+            !description.starts_with(opener),
+            "`brew audit` rejects a `desc` starting with `{opener}`:\n  {description}"
+        );
+    }
 }
 
 #[test]
@@ -849,6 +971,31 @@ fn the_npm_readme_warns_that_a_global_npm_prefix_moves() {
         "npm/README.md names `Administration: Read and write` without saying \
          what it permits. The string is not the disclosure."
     );
+
+    // ------------------------------------------------------------------------
+    // AND IT COMES BEFORE THE INSTALL COMMAND, FOR THE SAME REASON IT DOES IN
+    // THE REPOSITORY README.
+    // ------------------------------------------------------------------------
+    // The task's Definition of Done binds only the repository README, so this
+    // is not a contract violation -- it is the same requirement arriving by its
+    // own logic. `07-security.md` asks for the disclosure "stated prominently
+    // wherever the App is offered", the npmjs.com package page IS where the App
+    // is offered to npm users, and the comment above this test already argues
+    // that those users "may never see the repository at all". A disclosure
+    // seventy lines below the command they came to copy is not prominent.
+    let install = readme.find("npm i -g runner-manager").unwrap_or_else(|| {
+        panic!("npm/README.md must carry the install command it exists to serve")
+    });
+    let disclosure = readme.find("Administration").unwrap_or_else(|| {
+        panic!("checked above: the permission is named somewhere in this file")
+    });
+    assert!(
+        disclosure < install,
+        "npm/README.md puts `npm i -g runner-manager` at byte {install} and the \
+         first mention of `Administration` at byte {disclosure}. A reader who \
+         stops at the first thing they can copy must already have passed the \
+         sentence about deleting their repositories."
+    );
 }
 
 /// The `node` that runs the shim, or `None` with a reason printed.
@@ -1226,6 +1373,80 @@ fn step_eight_pins_the_channels_to_what_was_actually_published() {
 }
 
 #[test]
+fn step_eight_proves_both_install_scripts_reached_the_release() {
+    // ------------------------------------------------------------------------
+    // A REFUSAL AND A FAILURE EXIT THE SAME WAY.
+    // ------------------------------------------------------------------------
+    // `gh release upload` returns non-zero when an asset is already attached --
+    // which on a re-run is expected and fine -- and ALSO for a 5xx, an expired
+    // or under-scoped token, a rate limit, a file that is not there, and a
+    // PARTIAL upload where install.sh conflicted and install.ps1 never went up
+    // at all. An `if/else` on that exit status cannot tell them apart, so
+    // reading every one of them as "already attached" and then announcing the
+    // address is live produces a GREEN release whose
+    // `releases/latest/download/install.sh` is a 404.
+    //
+    // That address is the FIRST install command in the README, so the failure
+    // reaches every new user and nobody else. The only thing that settles it is
+    // the release itself: `gh release view` is read-only, uploads nothing, and
+    // replaces nothing -- which is why this can be asserted without reaching
+    // for the `--clobber` the job forbids.
+    let block = job_block("channels");
+    let bodies = run_bodies(&block);
+    assert!(!bodies.is_empty(), "no run bodies parsed:\n{block}");
+
+    let upload = bodies
+        .iter()
+        .find(|body| body.contains("gh release upload"))
+        .expect(
+            "the channels job must attach install.sh and install.ps1 to the \
+             release; without them the README's documented address is a 404",
+        );
+
+    for (required, why) in [
+        (
+            "gh release view",
+            "the step must ask the RELEASE what it carries rather than infer it \
+             from an exit status that means five different things",
+        ),
+        (
+            "--json assets",
+            "and it must read the asset list, which is the only thing that \
+             answers the question",
+        ),
+        (
+            "grep -qx",
+            "matched whole, not as a substring: `install.sh` is a substring of \
+             `install.sh.sig` and of anything else that gets attached later",
+        ),
+        (
+            "exit 1",
+            "a missing asset must FAIL the job. Reporting it and continuing is \
+             what the branch above already did",
+        ),
+    ] {
+        assert!(
+            upload.contains(required),
+            "the install-script upload step does not execute `{required}`. \
+             {why}\nParsed step:\n{upload}"
+        );
+    }
+
+    // Both scripts, not one. The partial upload -- install.sh conflicts,
+    // install.ps1 never goes up -- is the case the old branch handled worst,
+    // and it is the case a single check would still miss.
+    for script in ["install.sh", "install.ps1"] {
+        assert!(
+            upload.matches(script).count() >= 2,
+            "`{script}` appears only once in the upload step, so it is uploaded \
+             and never checked. A partial upload attaches one of the two and \
+             exits non-zero, which is indistinguishable from a \
+             refusal:\n{upload}"
+        );
+    }
+}
+
+#[test]
 fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     // ------------------------------------------------------------------------
     // A SKIPPED CHANNEL LOOKS EXACTLY LIKE AN UPDATED ONE.
@@ -1257,5 +1478,85 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
         "the credential check must FAIL the run when a secret is missing, not \
          warn and continue:\n{}",
         bodies[guard]
+    );
+
+    // ------------------------------------------------------------------------
+    // PRESENT IS NOT THE SAME AS WORKING, AND THE TAP IS TOUCHED LAST.
+    // ------------------------------------------------------------------------
+    // The order of this job is download, upload scripts, stage npm, render the
+    // formula, `npm publish`, THEN clone the tap. A HOMEBREW_TAP_TOKEN that is
+    // set but carries no access, or a TAP_REPOSITORY that was renamed or never
+    // created, therefore fails AFTER the one action here nothing can undo --
+    // `npm unpublish` is restricted and time-limited. A pre-flight that checks
+    // a secret is non-empty and stops there has moved no failure at all.
+    assert!(
+        bodies[guard].contains("git ls-remote"),
+        "the pre-flight validates the SECRETS but not the TAP. One read-only \
+         `git ls-remote` moves a bad token or a missing repository from after \
+         `npm publish` to before it, and it needs exactly the access the clone \
+         at the end of the job needs:\n{}",
+        bodies[guard]
+    );
+
+    // ------------------------------------------------------------------------
+    // THE README HARDCODES THE TAP AND THIS JOB TAKES IT FROM A VARIABLE.
+    // ------------------------------------------------------------------------
+    // Setting `vars.RUNNER_MANAGER_TAP_REPOSITORY` without editing the README
+    // leaves every reader copying `brew install <owner>/<tap>/runner-manager`
+    // for a tap this release no longer writes to. It surfaces as
+    // `No available formula`, which reads like a broken release rather than a
+    // stale document -- and nothing else in this repository would notice.
+    assert!(
+        bodies[guard].contains("README.md"),
+        "the pre-flight must check that README.md documents the tap this job \
+         actually publishes to. The tap is a workflow variable and the README's \
+         `brew install` line is not:\n{}",
+        bodies[guard]
+    );
+}
+
+/// The tap `release.yml` falls back to when no repository variable is set.
+fn workflow_default_tap() -> String {
+    let source = read(
+        &repository_root()
+            .join(".github")
+            .join("workflows")
+            .join("release.yml"),
+    );
+    const MARKER: &str = "vars.RUNNER_MANAGER_TAP_REPOSITORY || '";
+    let offset = source.find(MARKER).unwrap_or_else(|| {
+        panic!(
+            "release.yml no longer names a default for \
+             `vars.RUNNER_MANAGER_TAP_REPOSITORY`. The assertion below compares \
+             that default with the README and would be checking nothing."
+        )
+    });
+    source[offset + MARKER.len()..]
+        .split('\'')
+        .next()
+        .expect("a quoted default")
+        .to_string()
+}
+
+#[test]
+fn the_readme_and_the_workflow_name_the_same_homebrew_tap() {
+    // Homebrew's shorthand drops the `homebrew-` prefix, so the repository
+    // `IvanMurzak/homebrew-tap` is tapped as `IvanMurzak/tap`. Two spellings of
+    // one thing, in two files, is exactly the shape that drifts -- and the
+    // symptom lands on a user, not on this repository.
+    let tap = workflow_default_tap();
+    let (owner, repository) = tap.split_once('/').unwrap_or_else(|| {
+        panic!("release.yml's default tap `{tap}` is not `owner/repository`")
+    });
+    let shorthand = repository.strip_prefix("homebrew-").unwrap_or(repository);
+    let documented = format!("brew install {owner}/{shorthand}/runner-manager");
+
+    let readme = read(&repository_root().join("README.md"));
+    assert!(
+        readme.contains(&documented),
+        "release.yml publishes the formula to `{tap}`, which is tapped as \
+         `{owner}/{shorthand}`, and README.md does not document \
+         `{documented}`. Every reader who copies the README's line would get \
+         `No available formula`."
     );
 }
