@@ -2869,28 +2869,28 @@ mod tests {
         assert!(activity.truncated().is_empty());
     }
 
-    /// A page sequence for the no-`total_count` fallback: `pages` full pages,
-    /// each offering the next, and each mounted so an unspent request is visible
-    /// as a mock that was never called.
-    async fn mount_runs_fallback_chain(server: &MockServer, pages: usize) {
-        for page in 1..=pages {
-            let body = runs_body(None, usize::try_from(PER_PAGE).expect("PER_PAGE fits"));
-            let response = ResponseTemplate::new(200).set_body_json(body);
-            // Every page offers a successor, including the last: a walk that
-            // stops has to stop because it chose to, not because the fixture
-            // ran out of `Link` headers.
-            let response = response.insert_header(
-                "link",
-                link_next(&format!("{}/runs/{}", server.uri(), page + 1)).as_str(),
-            );
-            let matcher = if page == 1 {
-                path(REPO_RUNS)
-            } else {
-                path(format!("/runs/{page}"))
-            };
+    /// An **endless** no-`total_count` page sequence at `first_path`: every page
+    /// is full and every page offers another, forever.
+    ///
+    /// Deliberately endless rather than a chain of `n` pages. A finite fixture
+    /// makes an unbounded walk fail by running off the end into a `404`, which
+    /// is a fixture artefact — the test would then be red for the wrong reason
+    /// and would stay red if the bound were changed to any other finite number.
+    /// Against this one, the number of requests the walk spends *is* the
+    /// measurement, and an unbounded walk answers with `MAX_PAGES` instead of
+    /// the budget. It is also the shape `MAX_PAGES` exists for: a `rel="next"`
+    /// that never ends.
+    async fn mount_endless_runs_pages(server: &MockServer, first_path: &str, loop_path: &str) {
+        let body = || runs_body(None, usize::try_from(PER_PAGE).expect("PER_PAGE fits"));
+        let onward = link_next(&format!("{}{loop_path}", server.uri()));
+        for at in [first_path, loop_path] {
             Mock::given(method("GET"))
-                .and(matcher)
-                .respond_with(response)
+                .and(path(at.to_owned()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", onward.as_str())
+                        .set_body_json(body()),
+                )
                 .mount(server)
                 .await;
         }
@@ -2907,7 +2907,7 @@ mod tests {
     #[tokio::test]
     async fn the_activity_fallback_stops_at_the_budget_not_at_the_runaway_ceiling() {
         let server = MockServer::start().await;
-        mount_runs_fallback_chain(&server, MAX_ACTIVITY_FALLBACK_PAGES + 2).await;
+        mount_endless_runs_pages(&server, REPO_RUNS, "/runs/onward").await;
 
         let gateway = gateway(&server, Arc::new(TestClock::default()));
         let activity = gateway
@@ -2938,7 +2938,7 @@ mod tests {
     #[tokio::test]
     async fn a_count_the_page_budget_cut_short_is_reported_as_a_floor_not_as_a_total() {
         let server = MockServer::start().await;
-        mount_runs_fallback_chain(&server, MAX_ACTIVITY_FALLBACK_PAGES + 2).await;
+        mount_endless_runs_pages(&server, REPO_RUNS, "/runs/onward").await;
 
         let gateway = gateway(&server, Arc::new(TestClock::default()));
         let activity = gateway
@@ -2968,30 +2968,10 @@ mod tests {
     #[tokio::test]
     async fn one_truncated_repository_makes_the_whole_aggregate_a_floor() {
         let server = MockServer::start().await;
+        // `octo/dashboard` answers exactly, in one request. `octo/api` sends no
+        // `total_count` and never stops offering pages.
         mount_runs(&repo(), 4).mount(&server).await;
-        // `octo/api` answers without a `total_count` and keeps offering pages.
-        for page in 1..=(MAX_ACTIVITY_FALLBACK_PAGES + 1) {
-            let matcher = if page == 1 {
-                path("/repos/octo/api/actions/runs")
-            } else {
-                path(format!("/api-runs/{page}"))
-            };
-            Mock::given(method("GET"))
-                .and(matcher)
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header(
-                            "link",
-                            link_next(&format!("{}/api-runs/{}", server.uri(), page + 1)).as_str(),
-                        )
-                        .set_body_json(runs_body(
-                            None,
-                            usize::try_from(PER_PAGE).expect("PER_PAGE fits"),
-                        )),
-                )
-                .mount(&server)
-                .await;
-        }
+        mount_endless_runs_pages(&server, "/repos/octo/api/actions/runs", "/api-runs/onward").await;
 
         let gateway = gateway(&server, Arc::new(TestClock::default()));
         let scope = ActivityScope::organization(
