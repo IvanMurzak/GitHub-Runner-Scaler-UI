@@ -70,8 +70,10 @@
 //!
 //! A key is also trimmed of backslashes, which a value never is: `Debug` on a
 //! `String` escapes the quotes inside it, so a body reached through
-//! `error!(reason = ?err)` spells its keys `\"password\"`. See [`trim_key`]
-//! for why the same trim must not be applied to a value.
+//! `error!(reason = ?err)` spells its keys `\"password\"`. The `trim_key`
+//! function documents why the same trim must not be applied to a value; it is
+//! named rather than linked because it is private and this module's
+//! documentation is not.
 //!
 //! Every one of those is a case where being wrong costs a slightly less
 //! readable log line, against a case where being wrong the other way costs a
