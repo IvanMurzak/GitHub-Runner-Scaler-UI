@@ -279,6 +279,13 @@ fn a_failure_reason_round_trips_including_the_open_ended_one() {
         FailureReason::RunnerVersionRejected,
         FailureReason::ProcessStartFailed,
         FailureReason::ProcessExitedUnexpectedly,
+        // `e3` writes this one to the journal after reading its own
+        // terminate-intent back, so its snake_case serde name is on a real
+        // persistence path and belongs here. This list is hand-maintained and
+        // nothing binds it to `FailureReason::ALL`, which is why
+        // `RegistrationTimedOut` is absent from it -- an omission that predates
+        // this variant and is left alone rather than tidied in passing.
+        FailureReason::TerminatedAfterRegistrationTimeout,
         FailureReason::Other("the runner package cache was pruned mid-start".to_string()),
     ];
 
