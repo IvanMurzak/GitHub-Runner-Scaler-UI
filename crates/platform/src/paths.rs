@@ -60,12 +60,20 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
+// The three segments below are `pub(crate)` rather than private because
+// `crate::secrets` resolves its own locations -- `%ProgramData%\<org>\<app>`,
+// `$XDG_DATA_HOME/<app>`, and the macOS keychain service name -- and it must
+// resolve them to the *same* product identity this module does. Spelled twice,
+// a drift between the two files would move the secret store out from under an
+// upgraded binary, and the token would read as simply absent. Visibility is the
+// whole of the change: no value, no doc comment, and no behaviour here differs.
+
 /// Reverse-domain qualifier; used on macOS only.
-const QUALIFIER: &str = "io.github";
+pub(crate) const QUALIFIER: &str = "io.github";
 /// Organization segment; used on macOS and Windows only.
-const ORGANIZATION: &str = "IvanMurzak";
+pub(crate) const ORGANIZATION: &str = "IvanMurzak";
 /// Application segment; used on all three platforms.
-const APPLICATION: &str = "runner-manager";
+pub(crate) const APPLICATION: &str = "runner-manager";
 
 /// The four directory names, as `05-infrastructure.md` writes them. Also the
 /// layout [`AppPaths::rooted_at`] produces verbatim.

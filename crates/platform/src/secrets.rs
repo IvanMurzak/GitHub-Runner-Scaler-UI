@@ -97,11 +97,30 @@ use std::path::{Path, PathBuf};
 use runner_manager_domain::model::StartMode;
 use secrecy::{ExposeSecret, SecretString};
 
-/// Reverse-domain service name for the macOS keychain item. Matches the
-/// qualifier and application segments [`crate::paths`] uses, because it names
-/// the same product.
+/// The product identity, resolved from the one place that defines it.
+///
+/// `crate::paths` owns these three segments and builds the four
+/// application-data directories out of them. This module builds *different*
+/// locations — `%ProgramData%\<org>\<app>`, `$XDG_DATA_HOME/<app>`, the macOS
+/// keychain service — but out of the same identity, and it must stay the same
+/// identity. Spelled a second time here, a drift would move the secret store
+/// out from under an upgraded binary and the token would read as simply
+/// absent, which is the one failure mode this store must never produce
+/// silently.
+use crate::paths::{APPLICATION, ORGANIZATION, QUALIFIER};
+
+/// Reverse-domain service name for the macOS keychain item.
+///
+/// Composed rather than written out, for the reason above. It is a `LazyLock`
+/// because the three segments are `const`s and neither `concat!` nor a `const
+/// fn` can join them — `concat!` takes literals, not constant items. The
+/// composition is asserted against the documented literal by
+/// `the_standard_locations_are_the_documented_ones`, which keeps its own
+/// hard-coded strings precisely so that it is an *independent* oracle rather
+/// than a second copy of this expression.
 #[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "io.github.IvanMurzak.runner-manager";
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{QUALIFIER}.{ORGANIZATION}.{APPLICATION}"));
 
 /// The keychain account, and the stem of the file name on the two platforms
 /// that use a file. One value, one name, everywhere.
@@ -827,6 +846,86 @@ fn sweep_temporaries(directory: &Path) {
     }
 }
 
+/// Overwrites every byte of a file with zeroes, in place.
+///
+/// Returns `Ok(false)` when there is nothing there, which is the ordinary state
+/// of a store that was never written.
+///
+/// # What this is and is not
+///
+/// It is **not** secure erasure and nothing here claims it is. The reasoning is
+/// [`crate::process::RestrictiveHandoff`]'s, unchanged: a journal, a
+/// copy-on-write snapshot, or an SSD's wear levelling can each keep a copy that
+/// an overwrite never reaches. It is here because it costs one `write` and
+/// because on Linux the stored value is at rest in **plaintext** — the mode is
+/// the whole access control there — so leaving the bytes in the block after the
+/// inode is unlinked is worse than not.
+///
+/// # Why it is a separate function, and not `cfg`-gated to Linux
+///
+/// Both are the same reason, and it is a testing reason rather than a
+/// portability one. Folded into the delete path, the zero fill was asserted by
+/// nothing: a test could only observe the file's *absence* afterwards, which is
+/// what removing it proves too, so the fill could have been deleted outright
+/// and the suite would have stayed green. Split out, the fill is observable —
+/// [`tests::overwrite_zeroes_every_byte_and_leaves_the_file_there`] reads the
+/// bytes back before anything unlinks them. Compiled on Windows as well as
+/// Linux, that test runs on every leg of the matrix rather than on one, and the
+/// Windows delete path calls it too: the value there is ciphertext, so the fill
+/// buys less, but it costs the same and it keeps the mechanism on a path a
+/// developer can execute.
+#[cfg(not(target_os = "macos"))]
+fn overwrite(path: &Path) -> std::io::Result<bool> {
+    use std::io::Write as _;
+
+    let mut file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    let length = usize::try_from(file.metadata()?.len()).unwrap_or(0);
+    file.write_all(&vec![0u8; length])?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(true)
+}
+
+/// Drops trailing ASCII whitespace from a value that came from outside this
+/// module.
+///
+/// There is exactly one such value: the systemd credential. `store` writes no
+/// newline and its own file is read back verbatim, deliberately — trimming
+/// there would quietly repair a corruption this store would rather report. A
+/// credential, though, is produced by the operator through `systemd-creds
+/// encrypt`, and `echo`, `printf '%s\n'`, and every text editor put a newline
+/// on the end. Used byte for byte, that newline becomes part of the token and
+/// surfaces much later inside an `Authorization` header, where it looks like a
+/// bad credential rather than a bad read.
+///
+/// Trailing only. A token has no interior whitespace, but if one ever did,
+/// silently rewriting its middle would be a worse bug than the one this fixes.
+#[cfg(not(target_os = "macos"))]
+// `allow` rather than `expect`: on Windows this is dead in a normal build and
+// live in a test build, because the test below is the whole reason it is
+// compiled there, and an `expect` that is fulfilled in only one of the two
+// configurations warns in the other.
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the systemd credential path is Linux-only; this is compiled on Windows so \
+                  that its unit test runs on every leg of the matrix rather than on the one \
+                  platform a developer usually cannot execute"
+    )
+)]
+fn trim_trailing_ascii_whitespace(mut bytes: Vec<u8>) -> Vec<u8> {
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes.pop();
+    }
+    bytes
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -872,14 +971,42 @@ mod sys {
     //! without opening a process token, without a `TOKEN_USER` buffer, and
     //! without a second copy of the SID lookup `process.rs` already carries.
     //!
-    //! One consequence is worth stating rather than discovering. Ownership
-    //! moves with the write: `store` creates a new file and renames it over the
-    //! old one, so the account that ran `auth login` most recently is the owner
-    //! and is the account `OW` names. Two *non-administrative* operators sharing
-    //! one host therefore cannot both read the machine store — the second
-    //! `auth login` takes it. That is not a gap this module should close by
-    //! widening the DACL, because the reader that actually matters is the
-    //! service account, which `SY` covers by default and which `d3` grants
+    //! # One store per host, and what a second operator actually gets
+    //!
+    //! An earlier version of this paragraph said that ownership moves with the
+    //! write, so a second non-administrative operator's `auth login` "takes"
+    //! the store. **That was wrong, and it was wrong in the optimistic
+    //! direction.** Ownership does not move, because the write never lands:
+    //! `store` finishes with a replacing rename, a replacing rename deletes the
+    //! target, and delete is granted by `DELETE` on the file or
+    //! `FILE_DELETE_CHILD` on its parent. `sddl(Machine)` names `SY`, `BA` and
+    //! `OW`, none of which is operator B; and a stock `%ProgramData%` grants
+    //! `BUILTIN\Users` only `(OI)(CI)(RX)` plus `(CI)(WD,AD,WEA,WA)` — `WD`
+    //! lets B create the temporary, and the absence of `DC` and `DE` is what
+    //! denies the rename. So B's `auth login` **fails**.
+    //!
+    //! That is the correct behaviour, and it is the behaviour this store now
+    //! states rather than stumbles into. **The machine-scoped value is the
+    //! host's one credential, not an operator's.** `07-security.md` counts the
+    //! persisted credential surface and gets to one; `service install`
+    //! registers one service reading one store; the domain has one `Host` and
+    //! `d1`'s lock permits one agent. A second operator does not get a second
+    //! store, and whether B may overwrite A's token is a policy question whose
+    //! answer is "only if B is trusted with this host" — which on Windows is
+    //! spelled *administrator*, and `BA` already grants it.
+    //!
+    //! What changed is the *failure*, not the policy. [`cannot_replace`] asks
+    //! before anything is encrypted or written, so B gets a message naming the
+    //! three ways forward instead of a bare "Access is denied" raised at the
+    //! last step of the write, after a valid machine-decryptable blob of a live
+    //! token has already been placed on disk.
+    //!
+    //! Widening the DACL was considered and rejected. The DACL is the **entire**
+    //! access control here — a machine-scope DPAPI blob is unprotectable by any
+    //! process on the host, by definition — so an ACE that let B replace the
+    //! file would also let every interactive account on the machine read the
+    //! one credential the product holds. The reader that actually matters is
+    //! the service account, which `SY` covers by default and which `d3` grants
     //! explicitly when `service install` registers a least-privilege account
     //! instead (`05-infrastructure.md`, service behaviour, item 2).
     //!
@@ -919,7 +1046,10 @@ mod sys {
     };
     use windows::core::PCWSTR;
 
-    use super::{DIRECTORY, ITEM, SecretScope, TEMP_PREFIX, sweep_temporaries};
+    use super::{
+        APPLICATION, DIRECTORY, ITEM, ORGANIZATION, QUALIFIER, SecretScope, TEMP_PREFIX, overwrite,
+        sweep_temporaries,
+    };
 
     /// Optional entropy mixed into every blob.
     ///
@@ -951,10 +1081,10 @@ mod sys {
                      install the service with --start-at login to use the user-scoped store."
                         .to_string()
                 })?
-                .join("IvanMurzak")
-                .join("runner-manager"),
+                .join(ORGANIZATION)
+                .join(APPLICATION),
             SecretScope::User => {
-                directories::ProjectDirs::from("io.github", "IvanMurzak", "runner-manager")
+                directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
                     .ok_or_else(|| {
                         "the operating system reports no home directory for this account, so \
                          the user-scoped store cannot be resolved. A service account \
@@ -1006,12 +1136,95 @@ mod sys {
         }
     }
 
+    /// The access right a replacing rename needs on the file it replaces.
+    ///
+    /// `MOVEFILE_REPLACE_EXISTING` deletes the target, and delete is granted by
+    /// `DELETE` on the object or by `FILE_DELETE_CHILD` on its parent. Probing
+    /// for it is `CreateFileW` with `dwDesiredAccess = DELETE`, which
+    /// [`std::os::windows::fs::OpenOptionsExt::access_mode`] reaches without
+    /// another FFI declaration.
+    const DELETE: u32 = 0x0001_0000;
+
+    /// Whether this account may replace the value already in the store, and if
+    /// not, why an operator is seeing it.
+    ///
+    /// Returns `None` when there is nothing there, or when the existing value
+    /// can be replaced — the ordinary cases.
+    ///
+    /// # What this catches
+    ///
+    /// A second non-administrative operator on a shared host. Their `auth
+    /// login` inherits `WD` (create file) from `%ProgramData%` so the temporary
+    /// file is written happily, and then the rename over the first operator's
+    /// file is denied, because `sddl(Machine)` names `SY`, `BA` and `OW` and
+    /// this account is none of the three. Left to the rename, that surfaces as
+    /// a bare "Access is denied" at the last step of the write, after a valid
+    /// machine-decryptable blob of a real token has already been put on disk.
+    ///
+    /// # Why it refuses rather than widening the DACL
+    ///
+    /// **This product keeps one machine-scoped credential per host, and that is
+    /// the intended model rather than an accident of the ACL.**
+    /// `07-security.md` counts the persisted credential surface and gets to
+    /// one; `05-infrastructure.md` has `service install` register one service
+    /// reading one store; the domain has one `Host`, and `d1`'s single-instance
+    /// lock allows one agent. The value is *the host's* credential, not an
+    /// operator's — so a second operator does not get a second store, and the
+    /// question "may B overwrite A's token" is a policy question with a policy
+    /// answer: only if B is trusted with the host, which on Windows means
+    /// administrator.
+    ///
+    /// Widening the DACL to make the rename succeed would give every
+    /// interactive account on the machine write access to the one credential
+    /// the product holds, and read access with it, since the DACL is the
+    /// **entire** access control here — a machine-scope DPAPI blob is
+    /// unprotectable by any process on the host by definition. That trade is
+    /// not worth a smoother second login.
+    fn cannot_replace(site: &Site) -> Option<io::Error> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        match std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .open(&site.file)
+        {
+            // Replaceable, or nothing there to replace.
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the machine-scoped store at {} already holds a token that belongs to \
+                     another account on this host, and this account may not replace it. This \
+                     product keeps one machine-scoped credential per host -- it is the host's \
+                     credential, not an operator's -- so a second operator does not get a \
+                     second store. Either run `auth logout` as the account that stored it, or \
+                     run `auth login` from an elevated prompt, since the local Administrators \
+                     group is granted access, or install the service with `--start-at login`, \
+                     which uses the per-user store instead. Nothing was written.",
+                    site.file.display()
+                ),
+            )),
+            // Anything else is not this condition. Say nothing and let the
+            // write report whatever it actually runs into, rather than
+            // inventing a diagnosis from an unrelated errno.
+            Err(_) => None,
+        }
+    }
+
     pub(super) fn store(site: &Site, scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
         let directory = site
             .file
             .parent()
             .ok_or_else(|| io::Error::other("the store path has no parent directory"))?;
         std::fs::create_dir_all(directory)?;
+
+        // Before anything is encrypted or written. The point of asking here is
+        // that the alternative -- finding out at the rename -- means a valid,
+        // machine-decryptable blob of a live token has already been placed on
+        // disk before the refusal.
+        if let Some(refusal) = cannot_replace(site) {
+            return Err(refusal);
+        }
 
         let blob = protect(plaintext, scope)?;
 
@@ -1023,8 +1236,7 @@ mod sys {
             file.sync_all()
         })();
         if let Err(error) = written {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
+            return Err(discard(&temporary, error));
         }
 
         // `std::fs::rename` is `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)` on
@@ -1032,10 +1244,47 @@ mod sys {
         // file keeps its own security descriptor across the move, so the DACL
         // applied at creation is the one the store ends up with.
         if let Err(error) = std::fs::rename(&temporary, &site.file) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
+            // The probe above should have caught the second-operator case, but
+            // it is a probe and this is a race: another account can take the
+            // file between the two calls. Report the same diagnosis rather than
+            // the bare denial, then discard the blob either way.
+            let error = if error.kind() == io::ErrorKind::PermissionDenied {
+                cannot_replace(site).unwrap_or(error)
+            } else {
+                error
+            };
+            return Err(discard(&temporary, error));
         }
         Ok(())
+    }
+
+    /// Scrubs and removes a temporary that will not become the store, and folds
+    /// a failure to do so into the error the caller is already returning.
+    ///
+    /// A temporary that survives a failed `store` is a valid machine-scope
+    /// DPAPI blob of a real token, sitting under a name nobody looks at.
+    /// Removing it was already the behaviour; what was missing is that the
+    /// removal was `let _ =`, so a temporary that could *not* be removed left
+    /// the token on disk with nothing said about it.
+    ///
+    /// A blanket [`sweep_temporaries`] is deliberately not used here. Its own
+    /// documentation says why: two `store` calls can be in flight at once, and
+    /// sweeping the directory would remove the other one's live temporary. This
+    /// removes exactly the file this call created.
+    fn discard(temporary: &Path, error: io::Error) -> io::Error {
+        let _ = overwrite(temporary);
+        match std::fs::remove_file(temporary) {
+            Ok(()) => error,
+            Err(removal) if removal.kind() == io::ErrorKind::NotFound => error,
+            Err(removal) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}. A temporary file holding the encrypted token was also left at \
+                     {} and could not be removed ({removal}); delete it by hand.",
+                    temporary.display()
+                ),
+            ),
+        }
     }
 
     pub(super) fn load(site: &Site, _scope: SecretScope) -> io::Result<Option<Vec<u8>>> {
@@ -1057,6 +1306,13 @@ mod sys {
     }
 
     pub(super) fn delete(site: &Site) -> io::Result<bool> {
+        // Zeroed before it is unlinked, the same as the Linux backend. The
+        // value here is a DPAPI blob rather than plaintext, so the fill buys
+        // less; it costs one `write`, and it keeps one mechanism instead of two
+        // on the path the Definition of Done calls "leaves no recoverable
+        // remnant". `overwrite`'s documentation carries the disclaimer.
+        let _ = overwrite(&site.file);
+
         let removed = match std::fs::remove_file(&site.file) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -1070,8 +1326,27 @@ mod sys {
 
     // -- DPAPI ---------------------------------------------------------------
 
-    fn io_error(error: &windows::core::Error) -> io::Error {
-        io::Error::from_raw_os_error(error.code().0)
+    /// Turns a windows-rs error into one whose [`io::Error::kind`] means
+    /// something.
+    ///
+    /// `Error::code()` is an **HRESULT**, and handing that straight to
+    /// `from_raw_os_error` is what an earlier version did. It produces an
+    /// `io::Error` whose `raw_os_error` is `0x8007_0005` rather than `5`, so
+    /// `kind()` is `Uncategorized` and a caller cannot tell "access denied"
+    /// from anything else — which matters here, because the second operator
+    /// case below is precisely an access denial a caller has to recognise.
+    ///
+    /// The `0x8007_xxxx` range is `HRESULT_FROM_WIN32`, so its low sixteen bits
+    /// are the Win32 code and unwrapping them restores the classification.
+    /// Anything outside that range is not a Win32 error and is passed through
+    /// as it is.
+    pub(super) fn io_error(error: &windows::core::Error) -> io::Error {
+        let code = error.code().0;
+        if (code as u32) & 0xffff_0000 == 0x8007_0000 {
+            io::Error::from_raw_os_error(code & 0xffff)
+        } else {
+            io::Error::from_raw_os_error(code)
+        }
     }
 
     /// A blob descriptor over a buffer the caller keeps alive.
@@ -1082,8 +1357,44 @@ mod sys {
         }
     }
 
-    /// Copies a DPAPI-allocated output blob into a `Vec` and frees the
-    /// original.
+    /// Copies `len` bytes out of `ptr` and zeroes the source.
+    ///
+    /// Split out from [`take_blob`] for one reason: a scrub that happens inside
+    /// an `unsafe` block around a DPAPI buffer can be asserted by nothing —
+    /// once `LocalFree` has run there is nothing left to look at. Given a
+    /// pointer, the scrub is a property a test can check against a buffer Rust
+    /// owns, which is what
+    /// [`tests::windows::the_dpapi_buffer_is_scrubbed_before_it_is_freed`]
+    /// does.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads *and writes* of `len` bytes, and must not
+    /// be aliased for the duration of the call.
+    pub(super) unsafe fn copy_and_scrub(ptr: *mut u8, len: usize) -> Vec<u8> {
+        use secrecy::zeroize::Zeroize as _;
+
+        // SAFETY: the caller guarantees `ptr` is valid for `len` bytes and
+        // unaliased, so one exclusive slice over it is sound.
+        let source = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let copy = source.to_vec();
+        source.zeroize();
+        copy
+    }
+
+    /// Copies a DPAPI-allocated output blob into a `Vec`, scrubs the original,
+    /// and frees it.
+    ///
+    /// The scrub is not optional and is not only for tidiness. On the
+    /// [`unprotect`] path this buffer holds **the user access token in
+    /// plaintext**, and `LocalFree` returns it to the process heap exactly as
+    /// it is — where a later allocation, a crash dump, or a core file can pick
+    /// it up. Every other copy this module makes is scrubbed (`protect`'s
+    /// input, `decode`'s rejected bytes); this one was the exception.
+    ///
+    /// It runs on the [`protect`] path too, where the buffer is ciphertext and
+    /// the scrub buys nothing. Making it conditional would buy a branch and an
+    /// opportunity to get the condition wrong.
     ///
     /// # Safety
     ///
@@ -1093,7 +1404,10 @@ mod sys {
         if out.pbData.is_null() {
             return Vec::new();
         }
-        let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+        // SAFETY: DPAPI filled this blob in, so the pointer is valid for
+        // `cbData` bytes and nothing else holds a reference to it.
+        let bytes = unsafe { copy_and_scrub(out.pbData, out.cbData as usize) };
+        // SAFETY: the buffer was `LocalAlloc`ed by DPAPI and is freed once.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(out.pbData.cast())));
         }
@@ -1300,6 +1614,16 @@ mod sys {
 
     use super::{DIRECTORY, ITEM, KEYCHAIN_SERVICE, ROOTED_KEYCHAIN_PASSWORD, SecretScope};
 
+    /// The composed product identity, as a plain `&str`.
+    ///
+    /// [`KEYCHAIN_SERVICE`] is a `LazyLock<String>` so that it is built from
+    /// `crate::paths`'s three segments rather than written out a second time.
+    /// This is the one place that unwraps it, so the call sites below read as
+    /// they did when it was a constant.
+    pub(super) fn service() -> &'static str {
+        &KEYCHAIN_SERVICE
+    }
+
     /// `errSecItemNotFound`. Hard-coded rather than imported because
     /// `security-framework-sys` is not a dependency of this workspace and
     /// adding one would be an A-group change for a single integer.
@@ -1393,8 +1717,9 @@ mod sys {
             Kind::Rooted => "rooted",
         };
         format!(
-            "{kind} keychain {}, item {KEYCHAIN_SERVICE}/{ITEM}",
-            site.path.display()
+            "{kind} keychain {}, item {}/{ITEM}",
+            site.path.display(),
+            service()
         )
     }
 
@@ -1552,7 +1877,7 @@ mod sys {
         })?;
 
         keychain
-            .set_generic_password(KEYCHAIN_SERVICE, ITEM, plaintext)
+            .set_generic_password(service(), ITEM, plaintext)
             .map_err(|error| sec_error(&error))?;
 
         restrict(site)
@@ -1564,7 +1889,7 @@ mod sys {
             return Ok(None);
         };
 
-        match keychain.find_generic_password(KEYCHAIN_SERVICE, ITEM) {
+        match keychain.find_generic_password(service(), ITEM) {
             Ok((password, _item)) => Ok(Some(password.as_ref().to_vec())),
             Err(error) if is_absence(&error) => Ok(None),
             Err(error) => Err(sec_error(&error)),
@@ -1577,7 +1902,7 @@ mod sys {
             return Ok(false);
         };
 
-        match keychain.find_generic_password(KEYCHAIN_SERVICE, ITEM) {
+        match keychain.find_generic_password(service(), ITEM) {
             Ok((password, item)) => {
                 // The password buffer holds the value. Drop it before anything
                 // else happens, so it exists for as few instructions as it can.
@@ -1587,7 +1912,7 @@ mod sys {
                 // `auth logout` that reported success without removing anything
                 // would be a lie told during a credential-disclosure response.
                 item.delete();
-                match keychain.find_generic_password(KEYCHAIN_SERVICE, ITEM) {
+                match keychain.find_generic_password(service(), ITEM) {
                     Err(error) if is_absence(&error) => Ok(true),
                     Ok(_) => Err(io::Error::other(
                         "the keychain item is still present after being deleted",
@@ -1646,13 +1971,16 @@ mod sys {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CREDENTIALS_DIRECTORY, DIRECTORY, ITEM, SYSTEMD_CREDENTIAL, SecretScope, TEMP_PREFIX,
-        sweep_temporaries,
+        APPLICATION, CREDENTIALS_DIRECTORY, DIRECTORY, ITEM, ORGANIZATION, QUALIFIER,
+        SYSTEMD_CREDENTIAL, SecretScope, TEMP_PREFIX, overwrite, sweep_temporaries,
+        trim_trailing_ascii_whitespace,
     };
 
     /// Where a machine-scoped store lives. Not under any home directory and
     /// not under any runtime directory; see the module documentation.
-    const MACHINE_ROOT: &str = "/var/lib/runner-manager";
+    /// The FHS directory for state a program owns; the product's own segment
+    /// is [`APPLICATION`], not a second spelling of it.
+    const MACHINE_PREFIX: &str = "/var/lib";
 
     /// The file, and the systemd credential that outranks it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1684,21 +2012,23 @@ mod sys {
     pub(super) fn standard_site(scope: SecretScope) -> Result<Site, String> {
         match scope {
             SecretScope::Machine => Ok(Site {
-                file: Path::new(MACHINE_ROOT).join(DIRECTORY).join(ITEM),
+                file: Path::new(MACHINE_PREFIX)
+                    .join(APPLICATION)
+                    .join(DIRECTORY)
+                    .join(ITEM),
                 credential: credential_from_environment(),
             }),
             SecretScope::User => {
-                let root =
-                    directories::ProjectDirs::from("io.github", "IvanMurzak", "runner-manager")
-                        .ok_or_else(|| {
-                            "the operating system reports no home directory for this account, \
+                let root = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+                    .ok_or_else(|| {
+                        "the operating system reports no home directory for this account, \
                              so the user-scoped store cannot be resolved. A service account \
                              configured with no profile normally hits this; use the \
                              machine-scoped store, which is what --start-at boot installs."
-                                .to_string()
-                        })?
-                        .data_local_dir()
-                        .to_path_buf();
+                            .to_string()
+                    })?
+                    .data_local_dir()
+                    .to_path_buf();
                 Ok(Site {
                     file: root.join(DIRECTORY).join(ITEM),
                     // A user-scoped store is deliberately not for a service, so
@@ -1817,7 +2147,13 @@ mod sys {
     pub(super) fn load(site: &Site, _scope: SecretScope) -> io::Result<Option<Vec<u8>>> {
         if let Some(credential) = &site.credential {
             match std::fs::read(credential) {
-                Ok(bytes) => return Ok(Some(bytes)),
+                // Trimmed, and *only* here. The operator produced this file
+                // with `systemd-creds encrypt`, and `echo`, `printf '%s\n'` and
+                // every text editor leave a newline on the end. Byte for byte
+                // that newline becomes part of the token and fails much later
+                // inside an `Authorization` header, where it reads as a bad
+                // credential rather than as a bad read.
+                Ok(bytes) => return Ok(Some(trim_trailing_ascii_whitespace(bytes))),
                 // No credential of that name: fall through to the file. A unit
                 // can be given credentials without being given this one.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1825,6 +2161,10 @@ mod sys {
             }
         }
 
+        // Not trimmed. `store` writes the value verbatim and with no newline,
+        // so anything trailing here is corruption rather than formatting, and
+        // silently repairing it would hide the one thing `Corrupt` exists to
+        // report.
         match std::fs::read(&site.file) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1850,29 +2190,19 @@ mod sys {
         }
     }
 
-    /// Overwrites the file's bytes before unlinking it.
+    /// Zeroes the file's bytes, then unlinks it.
     ///
-    /// A best effort and **not a claim**, for the reason
-    /// [`crate::process::RestrictiveHandoff`] sets out at length: a journal, a
-    /// copy-on-write snapshot, or an SSD's wear levelling can each keep a copy
-    /// an overwrite never reaches. It is here because the value is at rest in
-    /// plaintext on this platform and the overwrite costs one `write` — not
-    /// because it makes the bytes unrecoverable.
+    /// The zero fill is [`overwrite`], which lives in the parent module so that
+    /// it is a function a test can watch rather than a side effect inside a
+    /// delete; its documentation carries the "best effort, not a claim"
+    /// reasoning in full.
+    ///
+    /// Not being able to overwrite is not a reason to skip the unlink. The
+    /// unlink is the part that matters, it may still succeed, and a store that
+    /// refused to purge because it could not scrub first would fail `auth
+    /// logout` in exactly the situation where finishing it matters most.
     fn overwrite_then_remove(path: &Path) -> io::Result<bool> {
-        match std::fs::OpenOptions::new().write(true).open(path) {
-            Ok(mut file) => {
-                if let Ok(metadata) = file.metadata() {
-                    let length = usize::try_from(metadata.len()).unwrap_or(0);
-                    let _ = file.write_all(&vec![0u8; length]);
-                    let _ = file.flush();
-                    let _ = file.sync_all();
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            // Not being able to overwrite is not a reason to skip the unlink;
-            // the unlink is the part that matters and it may still succeed.
-            Err(_) => {}
-        }
+        let _ = overwrite(path);
 
         match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
@@ -2569,6 +2899,113 @@ mod tests {
         }
     }
 
+    /// The independent oracle for the identity `secrets.rs` now *borrows* from
+    /// [`crate::paths`] rather than spelling out.
+    ///
+    /// Borrowing removes the drift the reviewer named — two files can no longer
+    /// disagree — but it moves the risk rather than removing it: a change in
+    /// `paths.rs` now silently moves the secret store as well as the four
+    /// application-data directories, and a token that has moved reads as simply
+    /// absent. The literals below are the only place in this module that is
+    /// *not* derived from those constants, which is exactly what makes them
+    /// able to catch such a change.
+    #[test]
+    fn the_product_identity_is_the_one_paths_defines() {
+        assert_eq!(QUALIFIER, "io.github");
+        assert_eq!(ORGANIZATION, "IvanMurzak");
+        assert_eq!(APPLICATION, "runner-manager");
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            sys::service(),
+            "io.github.IvanMurzak.runner-manager",
+            "the keychain service names the product; a change here moves every \
+             stored item and the token reads as absent"
+        );
+    }
+
+    /// Finding 2's replacement, and the whole of what the zero fill claims.
+    ///
+    /// The test it replaces stored, deleted, and asserted the file was gone —
+    /// which is what *removing* it proves too, so
+    /// `overwrite`'s `write_all` could have been deleted outright and the suite
+    /// would have stayed green. This one observes the fill itself: it reads the
+    /// bytes back **before** anything unlinks them, so the subject of the test
+    /// cannot be removed without it failing.
+    ///
+    /// Not `cfg`-gated to Linux, although Linux is the platform whose stored
+    /// value is plaintext, because the mechanism is shared and a test that only
+    /// a CI leg can run is a test its author never watched fail.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn overwrite_zeroes_every_byte_and_leaves_the_file_there() {
+        let root = TempDir::new().expect("a temporary directory");
+        let path = root.path().join("value");
+        let token = exposed(&fixture_token());
+        std::fs::write(&path, &token).expect("written");
+
+        assert!(overwrite(&path).expect("overwritten"), "the file was there");
+
+        let after = std::fs::read(&path).expect("still there, so the fill is observable");
+        assert_eq!(
+            after.len(),
+            token.len(),
+            "the overwrite must not truncate; a shorter file leaves the tail of the old \
+             value in the block"
+        );
+        assert!(
+            after.iter().all(|byte| *byte == 0),
+            "the file still holds non-zero bytes after an overwrite: {after:?}"
+        );
+        assert!(
+            !after
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "the value survived the overwrite"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn overwriting_what_is_not_there_is_not_a_failure() {
+        let root = TempDir::new().expect("a temporary directory");
+        assert!(
+            !overwrite(&root.path().join("absent")).expect("absence is not an error"),
+            "a store that was never written has nothing to scrub"
+        );
+    }
+
+    /// Finding 6's pure half, run on every leg.
+    ///
+    /// The systemd credential path that uses this is Linux-only, so its
+    /// end-to-end test is too; the decision the trim makes is not
+    /// platform-specific, and testing it here is what let this be watched
+    /// failing on the machine it was written on.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_trailing_newline_is_not_part_of_the_token() {
+        let token = exposed(&fixture_token());
+
+        for suffix in ["\n", "\r\n", "\n\n", " ", "\t\n", ""] {
+            let raw = format!("{token}{suffix}").into_bytes();
+            assert_eq!(
+                trim_trailing_ascii_whitespace(raw),
+                token.clone().into_bytes(),
+                "a credential written with {suffix:?} on the end yielded a different token"
+            );
+        }
+
+        // Interior whitespace is left alone. A token has none, and silently
+        // rewriting the middle of a value would be a worse bug than the one
+        // this fixes.
+        let interior = b"gh u_x\n".to_vec();
+        assert_eq!(trim_trailing_ascii_whitespace(interior), b"gh u_x".to_vec());
+
+        // A value that is nothing but whitespace becomes empty, which `decode`
+        // reports as `Corrupt` rather than as absence.
+        assert!(trim_trailing_ascii_whitespace(b"\n\n".to_vec()).is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Windows
     // -----------------------------------------------------------------------
@@ -2576,6 +3013,161 @@ mod tests {
     #[cfg(windows)]
     mod windows {
         use super::*;
+
+        /// Denies DELETE on `path` to Everyone, so a replacing rename over it
+        /// is refused.
+        ///
+        /// This is what a second non-administrative operator meets on a shared
+        /// host, reproduced without a second account: the effective right that
+        /// is missing for them is DELETE on the target, and denying it to
+        /// Everyone denies it here too. Measured before it was relied on — a
+        /// deny ACE on the file alone is enough, even though the test's own
+        /// temporary directory grants its owner `FILE_DELETE_CHILD`, which is
+        /// the other way Windows grants delete.
+        fn deny_delete(path: &std::path::Path) {
+            icacls(&[&path.display().to_string(), "/deny", "*S-1-1-0:(D)"]);
+        }
+
+        fn allow_delete_again(path: &std::path::Path) {
+            icacls(&[&path.display().to_string(), "/remove:d", "*S-1-1-0"]);
+        }
+
+        fn icacls(arguments: &[&str]) {
+            let output = std::process::Command::new("icacls.exe")
+                .args(arguments)
+                .output()
+                .expect("icacls is present on every Windows");
+            assert!(
+                output.status.success(),
+                "icacls {arguments:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Finding 1: a second operator is refused with a remedy, before
+        /// anything is written.
+        ///
+        /// The behaviour is right — one machine-scoped credential per host, and
+        /// replacing it is an administrator's call; see the backend's module
+        /// documentation for why widening the DACL is the wrong answer. What
+        /// this pins is that the refusal *says so*, that it is classifiable as
+        /// a permission problem, and that it leaves nothing on disk.
+        #[test]
+        fn a_second_operator_is_refused_with_a_remedy_and_writes_nothing() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+            store
+                .store(&fixture_token())
+                .expect("the first operator stores");
+
+            let guard = store.guard();
+            let directory = guard
+                .parent()
+                .expect("the guard has a directory")
+                .to_path_buf();
+            deny_delete(&guard);
+
+            let error = store
+                .store(&other_token())
+                .expect_err("a value this account may not replace is not a value it may store");
+
+            let rendered = error.to_string();
+            for expected in [
+                "one machine-scoped credential per host",
+                "auth logout",
+                "elevated",
+                "--start-at login",
+                "Nothing was written",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "the refusal does not name {expected:?}, so an operator cannot act on \
+                     it: {rendered}"
+                );
+            }
+            assert!(
+                matches!(
+                    &error,
+                    SecretStoreError::Store { source, .. }
+                        if source.kind() == std::io::ErrorKind::PermissionDenied
+                ),
+                "a caller cannot classify this as a permission problem: {error:?}"
+            );
+
+            // Nothing was written, so the refusal did not also leave a valid
+            // machine-decryptable blob of a live token under a name nobody
+            // looks at. This is the half the old code got wrong: it found out
+            // at the rename, after the blob was already on disk.
+            let strays: Vec<_> = std::fs::read_dir(&directory)
+                .expect("readable")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(strays.is_empty(), "a refused store left {strays:?}");
+
+            // And the first operator's value is untouched.
+            allow_delete_again(&guard);
+            assert_eq!(stored(&store), exposed(&fixture_token()));
+
+            // With the denial lifted, the same call succeeds -- which is what
+            // makes the assertions above a statement about the denial rather
+            // than about the store being broken.
+            store
+                .store(&other_token())
+                .expect("stored once allowed again");
+            assert_eq!(stored(&store), exposed(&other_token()));
+        }
+
+        /// Finding 3: the DPAPI output buffer is zeroed before it is freed.
+        ///
+        /// Asserted against a buffer Rust owns, because once `LocalFree` has
+        /// run there is nothing left to look at. `copy_and_scrub` is the whole
+        /// of what `take_blob` does to that buffer before freeing it, so this
+        /// is the property and not a rehearsal of it.
+        #[test]
+        fn the_dpapi_buffer_is_scrubbed_before_it_is_freed() {
+            let token = exposed(&fixture_token());
+            let mut buffer = token.clone().into_bytes();
+            let length = buffer.len();
+
+            // SAFETY: `buffer` is a live allocation of exactly `length` bytes
+            // and nothing else refers to it for the duration of the call.
+            let copy = unsafe { sys::copy_and_scrub(buffer.as_mut_ptr(), length) };
+
+            assert_eq!(
+                copy,
+                token.clone().into_bytes(),
+                "the caller must still receive the value"
+            );
+            assert!(
+                buffer.iter().all(|byte| *byte == 0),
+                "the source buffer still holds the token after the copy, and on the \
+                 unprotect path that buffer is handed back to the heap by LocalFree: \
+                 {buffer:?}"
+            );
+        }
+
+        #[test]
+        fn a_win32_error_keeps_its_kind_through_the_hresult_wrapper() {
+            // ERROR_ACCESS_DENIED as windows-rs reports it: HRESULT 0x80070005.
+            // Handed straight to `from_raw_os_error` this is `Uncategorized`,
+            // and finding 1's refusal could not be classified by a caller.
+            let denied = ::windows::core::Error::from_hresult(::windows::core::HRESULT(
+                0x8007_0005_u32 as i32,
+            ));
+            assert_eq!(
+                sys::io_error(&denied).kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+
+            // ERROR_FILE_NOT_FOUND, 0x80070002.
+            let missing = ::windows::core::Error::from_hresult(::windows::core::HRESULT(
+                0x8007_0002_u32 as i32,
+            ));
+            assert_eq!(sys::io_error(&missing).kind(), std::io::ErrorKind::NotFound);
+        }
 
         #[test]
         fn both_dacls_are_protected_and_name_no_broad_trustee() {
@@ -2773,6 +3365,47 @@ mod tests {
             );
         }
 
+        /// Finding 6, end to end: what an operator's `systemd-creds encrypt`
+        /// actually produces.
+        ///
+        /// `echo`, `printf '%s\n'` and every text editor leave a newline. Used
+        /// byte for byte it becomes part of the token and fails much later
+        /// inside an `Authorization` header, where it reads as a bad credential
+        /// rather than as a bad read — which is the failure this pins.
+        #[test]
+        fn a_credential_written_with_a_trailing_newline_yields_the_token_without_it() {
+            let root = TempDir::new().expect("a temporary directory");
+            let credentials = TempDir::new().expect("a credentials directory");
+            let token = exposed(&fixture_token());
+
+            plant_credential(credentials.path(), format!("{token}\n").as_bytes());
+            let store =
+                rooted(SecretScope::Machine, &root).with_credentials_directory(credentials.path());
+
+            assert_eq!(stored(&store), token);
+        }
+
+        /// The file half of the same decision, which must *not* be trimmed.
+        ///
+        /// `store` writes no newline, so anything trailing in its own file is
+        /// corruption rather than formatting, and repairing it silently would
+        /// hide the one thing `Corrupt` exists to report.
+        #[test]
+        fn the_stores_own_file_is_read_back_verbatim() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+            store.store(&fixture_token()).expect("stored");
+
+            let token = exposed(&fixture_token());
+            std::fs::write(store.guard(), format!("{token}\n")).expect("planted");
+
+            assert_eq!(
+                stored(&store),
+                format!("{token}\n"),
+                "the store's own file is used verbatim; only a systemd credential is trimmed"
+            );
+        }
+
         #[test]
         fn a_credentials_directory_without_this_credential_falls_back_to_the_file() {
             let root = TempDir::new().expect("a temporary directory");
@@ -2848,22 +3481,6 @@ mod tests {
                 error.to_string().contains(SYSTEMD_CREDENTIAL),
                 "the operator has to be told what is still supplying a token: {error}"
             );
-        }
-
-        #[test]
-        fn the_file_is_overwritten_before_it_is_unlinked() {
-            // Best effort and documented as such -- see `overwrite_then_remove`.
-            // Asserted because the alternative is a comment claiming something
-            // no test ever ran.
-            let root = TempDir::new().expect("a temporary directory");
-            let store = rooted(SecretScope::Machine, &root);
-            store.store(&fixture_token()).expect("stored");
-
-            let guard = store.guard();
-            let length = std::fs::metadata(&guard).expect("there").len();
-            assert!(length > 0);
-            store.delete().expect("purged");
-            assert!(!guard.exists());
         }
 
         #[test]

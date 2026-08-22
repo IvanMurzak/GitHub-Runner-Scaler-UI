@@ -27,9 +27,14 @@
 //! the token is deliberately planted in the state directory and the scan is
 //! required to find it. If that fails, the test fails there — with a message
 //! saying the scan is blind — instead of passing quietly for the rest of this
-//! product's life. The second defence is a floor on the number of files
-//! examined, for the case where the walk reaches the repository but not the
-//! application-data tree.
+//! product's life.
+//!
+//! The second defence is a floor on the number of files examined, **per root**.
+//! It was one number over both roots together, and in that form it could not
+//! catch the case it named — a walk that reached the repository and nothing
+//! else cleared a floor the repository already satisfied four times over. Per
+//! root it bites: a walk that missed a tree fails on the tree it missed, and
+//! says which one.
 //!
 //! # Why this is its own test binary
 //!
@@ -71,12 +76,30 @@ fn fixture_token() -> SecretString {
 /// Directory names the repository walk does not descend into.
 const NOT_SCANNED: &[&str] = &[".git", "target"];
 
-/// A floor on how much the scan must have looked at.
+/// A floor on how much of the **repository** the scan must have looked at.
 ///
-/// The repository carries well over a hundred files and the cycle below adds
-/// four directories and a log. A walk that examined fewer than this reached
-/// neither, and its clean result is meaningless.
-const MINIMUM_FILES_SCANNED: usize = 60;
+/// An earlier version of this constant was one number over both roots
+/// together, documented as catching "the walk reaches the repository but not
+/// the application-data tree". It could not: the repository alone holds well
+/// over a hundred files and the floor was 60, so that exact case cleared it
+/// comfortably. The floor is now per root, which is what makes the claim true —
+/// a walk that reached one tree and not the other now fails on the tree it
+/// missed, and says which one.
+///
+/// The number is a floor and not a count. It is deliberately well under the
+/// current total so that adding or removing a file is not a test change, and
+/// deliberately well over the handful a collapsed walk would return.
+const MINIMUM_REPOSITORY_FILES: usize = 90;
+
+/// The same floor for the application-data tree, which is far smaller.
+///
+/// After the positive control is removed, the only file the cycle leaves under
+/// it is the rotating log — `config/`, `state/` and `runtime/` are empty
+/// directories. So one is the honest floor here, and it still catches the case
+/// the constant above cannot: a walk that never descended into the workspace at
+/// all. The stronger statement about that tree is made separately, by requiring
+/// the log to contain what the cycle pushed at the sink.
+const MINIMUM_WORKSPACE_FILES: usize = 1;
 
 #[test]
 fn a_full_cycle_leaves_no_token_shaped_value_outside_the_store() {
@@ -128,7 +151,18 @@ fn a_full_cycle_leaves_no_token_shaped_value_outside_the_store() {
     );
 
     let repository = repository_root();
-    let roots = [repository.as_path(), workspace.path()];
+    let roots: [(&str, &Path, usize); 2] = [
+        (
+            "the repository",
+            repository.as_path(),
+            MINIMUM_REPOSITORY_FILES,
+        ),
+        (
+            "the application-data tree",
+            workspace.path(),
+            MINIMUM_WORKSPACE_FILES,
+        ),
+    ];
 
     // ---- the positive control ---------------------------------------------
     //
@@ -138,22 +172,32 @@ fn a_full_cycle_leaves_no_token_shaped_value_outside_the_store() {
     let planted = paths.state_dir().join("planted-by-the-positive-control.db");
     std::fs::write(&planted, format!("attempt_journal|{needle}|end")).expect("planted");
 
-    let (hits, scanned) = scan(&roots, needle.as_bytes());
+    let (hits, _) = scan(workspace.path(), needle.as_bytes());
     assert!(
         hits.contains(&planted),
-        "the scan did not find a value planted at {} -- it is blind, and the assertion \
-         below proves nothing. It examined {scanned} files.",
+        "the scan did not find a value planted at {} -- it is blind, and the assertions \
+         below prove nothing",
         planted.display()
     );
     std::fs::remove_file(&planted).expect("the control is removed");
 
     // ---- the real assertion -----------------------------------------------
-    let (hits, scanned) = scan(&roots, needle.as_bytes());
-    assert!(
-        scanned >= MINIMUM_FILES_SCANNED,
-        "the scan examined only {scanned} files, which is fewer than the repository alone \
-         holds; it did not reach what it was meant to inspect"
-    );
+    //
+    // Per root, so that a walk which reached one tree and not the other fails
+    // on the tree it missed and says which one. Over both roots at once, that
+    // case cleared any floor the larger tree already satisfied on its own.
+    let mut hits = Vec::new();
+    for (name, root, floor) in roots {
+        let (found, scanned) = scan(root, needle.as_bytes());
+        assert!(
+            scanned >= floor,
+            "the scan examined only {scanned} files under {name} ({}), fewer than the {floor} \
+             it must reach; it did not inspect what it was meant to",
+            root.display()
+        );
+        hits.extend(found);
+    }
+
     assert!(
         hits.is_empty(),
         "a token-shaped value survives outside the store, in:\n{}",
@@ -277,10 +321,10 @@ fn repository_root() -> PathBuf {
 
 /// Every file under `roots` whose bytes contain `needle`, and how many were
 /// examined.
-fn scan(roots: &[&Path], needle: &[u8]) -> (Vec<PathBuf>, usize) {
+fn scan(root: &Path, needle: &[u8]) -> (Vec<PathBuf>, usize) {
     let mut hits = Vec::new();
     let mut scanned = 0usize;
-    let mut pending: Vec<PathBuf> = roots.iter().map(|root| (*root).to_path_buf()).collect();
+    let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
 
     while let Some(directory) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -326,7 +370,7 @@ fn scan(roots: &[&Path], needle: &[u8]) -> (Vec<PathBuf>, usize) {
 fn the_fixture_token_is_in_no_source_file() {
     let needle = fixture_token().expose_secret().to_string();
     let crates = repository_root().join("crates");
-    let (hits, scanned) = scan(&[crates.as_path()], needle.as_bytes());
+    let (hits, scanned) = scan(crates.as_path(), needle.as_bytes());
 
     assert!(
         scanned > 10,
