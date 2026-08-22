@@ -165,8 +165,15 @@ pub const GITHUB_CANCELS_QUEUED_JOBS_AFTER: Duration = Duration::from_secs(24 * 
 ///
 /// # How many of these a poll actually costs
 ///
-/// Exactly one per runtime created, and none for a policy that is granted
-/// nothing. That is worth stating because it did not used to be true and the
+/// One per runtime created, none for a policy that is granted nothing, and at
+/// most one further hold per policy — the case where the pre-check proposed a
+/// grant and the under-lock re-read found the host had filled up underneath it,
+/// so that hold creates nothing and ends the loop. `(3..=5)` in
+/// `two_policies_reconciling_concurrently_never_exceed_host_capacity` is that
+/// bound with two policies and three runtimes; the deterministic single-policy
+/// case is pinned at exactly one per runtime.
+///
+/// That is worth stating because it did not used to be true and the
 /// difference only shows up here: the budget was checked *after* the lock had
 /// been taken and the attempt set re-read, so a policy granted N runners took
 /// N+1 holds, and `start_runners` ran for every readable autoscale policy
@@ -896,6 +903,23 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
     /// that honours the contract is not double-counted, and one that lags cannot
     /// oversubscribe the host.
     ///
+    /// # Every call must return a **fresh** [`RunnerAttempt::id`]
+    ///
+    /// This is a requirement, not a convention, because the merge above is what
+    /// carries the host ceiling and the merge is keyed on the identifier. Two
+    /// calls that answer with the same id are two runtimes that the host-wide
+    /// total counts once, and the machine is then allocated past
+    /// `host_capacity`: probed at `host_capacity = 3` with one slot already
+    /// busy and a launcher answering with a duplicate id, the pass started
+    /// **four** runners for five occupied slots.
+    ///
+    /// That is a narrower defect than the lagging launcher above — that one
+    /// needed no bug at all, this one needs a broken id generator — but `e3` is
+    /// the implementor and cannot honour a requirement nobody states.
+    /// [`Reconciler::host_attempts`] carries a `debug_assert` that fires on a
+    /// collision, so a development build finds it at the first duplicate rather
+    /// than through an oversubscribed host.
+    ///
     /// # Errors
     /// [`LaunchFailure`], carrying the [`FailureReason`] `e3` recorded.
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure>;
@@ -1536,6 +1560,17 @@ pub struct ReconcileReport {
     /// [`Self::allocations`], because there was no set to compute an allocation
     /// from. It is not the same as the host being idle, which is the whole
     /// reason [`RunnerLauncher::attempts`] is fallible.
+    ///
+    /// **A count, where [`Self::unreadable`] is a `Vec<PolicyId>`, and that
+    /// asymmetry is deliberate.** An unreadable *target* is a fact about one
+    /// policy's GitHub target; an unreadable *attempt set* is a fact about this
+    /// host's journal, which no policy owns — two of the three paths that reach
+    /// it (`clean_terminal_attempts` and `scale_down`) have no policy in hand at
+    /// all. Naming policies here would mean either inventing an owner for a
+    /// host-wide failure or reporting a partial list, and both read as more
+    /// precision than there is. The pass is distinguishable from an idle one,
+    /// which is what the field exists for; the per-policy attribution is not
+    /// available, and is recorded as missing rather than faked.
     pub attempts_unreadable: u16,
     /// Terminal attempts whose runtime could not be removed. Retried next pass.
     pub clean_failures: u16,
@@ -1591,6 +1626,27 @@ pub struct ScaleDownReport {
     /// Live attempts that are not yet busy. Also removed nothing: capacity is
     /// reclaimed only when an attempt reaches a terminal state.
     pub retained: u16,
+    /// The host's attempt set could not be read, so **every other field here is
+    /// meaningless** rather than zero.
+    ///
+    /// This is the same distinction [`ReconcileReport::attempts_unreadable`]
+    /// draws, and it is here for the same reason: a default
+    /// [`ScaleDownReport`] and a scale-down that could not see the machine are
+    /// both all-zeros, and they mean opposite things — "there was nothing to
+    /// reclaim" against "we do not know what there was". Check
+    /// [`Self::is_conclusive`] before reading a zero as an answer.
+    pub attempts_unreadable: bool,
+}
+
+impl ScaleDownReport {
+    /// Whether the counts here describe the machine at all.
+    ///
+    /// `false` means the attempt set could not be read, so every zero is
+    /// "unknown" rather than "none".
+    #[must_use]
+    pub const fn is_conclusive(&self) -> bool {
+        !self.attempts_unreadable
+    }
 }
 
 /// The reconciliation loop.
@@ -1729,11 +1785,11 @@ impl Reconciler {
                 // demand, so the refusal is reported by name rather than by
                 // absence.
                 match self.allocate_only(policy, 0, &launched).await {
-                    Some(allocation) => {
+                    Ok(allocation) => {
                         self.emit_allocation(&allocation);
                         report.allocations.push(allocation);
                     }
-                    None => self.report_unreadable_attempts(&mut report),
+                    Err(failure) => self.report_unreadable_attempts(&mut report, &failure),
                 }
                 continue;
             }
@@ -1830,21 +1886,30 @@ impl Reconciler {
 
     /// Compute one policy's allocation without creating anything.
     ///
-    /// Safe without the lock precisely because it cannot grant: every path that
-    /// reaches here is refused by [`HostAllocator::allocate`] before any
-    /// headroom is spent, so there is no read-decide-create sequence to make
-    /// atomic.
-    /// `None` when the attempt set could not be read, which is never the same
-    /// answer as an empty one.
+    /// # Why this is safe without the lock
+    ///
+    /// **Not** because it cannot grant — it can, and
+    /// [`Reconciler::start_runners`] uses it as a pre-check precisely for the
+    /// number it returns. That was the original reason and this function
+    /// outgrew it; the reason now is that it *decides* nothing. Nothing is
+    /// created here, the headroom it read is re-read under the lock before any
+    /// runtime exists, and the under-lock allocation may only lower what this
+    /// one proposed. So there is no read-decide-create sequence here to make
+    /// atomic, and the worst this can be is optimistic — which the lock then
+    /// corrects.
+    ///
+    /// # Errors
+    /// Whatever [`RunnerLauncher::attempts`] reported. A failure is never the
+    /// same answer as an empty set.
     async fn allocate_only(
         &self,
         policy: &ScalePolicy,
         demand: u32,
         launched: &[RunnerAttempt],
-    ) -> Option<Allocation> {
-        let attempts = self.host_attempts(launched).await.ok()?;
+    ) -> Result<Allocation, LaunchFailure> {
+        let attempts = self.host_attempts(launched).await?;
         let mut allocator = HostAllocator::from_attempts(&self.host, &attempts);
-        Some(allocator.allocate(policy, demand))
+        Ok(allocator.allocate(policy, demand))
     }
 
     /// Flow 2.4-2.6: start runners for one policy, one lock hold per runtime.
@@ -1886,12 +1951,12 @@ impl Reconciler {
         // thing it can get wrong in the other direction is refusing a grant that
         // headroom freed a moment later would have allowed, which the next poll
         // picks up.
-        let Some(intent) = self.allocate_only(policy, demand, launched).await else {
-            self.report_unreadable_attempts(report);
-            self.events.emit(LifecycleEvent::AttemptsUnreadable {
-                reason: "attempts_unreadable",
-            });
-            return;
+        let intent = match self.allocate_only(policy, demand, launched).await {
+            Ok(intent) => intent,
+            Err(failure) => {
+                self.report_unreadable_attempts(report, &failure);
+                return;
+            }
         };
 
         // The allocation that is *reported* is the one taken under the lock when
@@ -1924,10 +1989,7 @@ impl Reconciler {
                 Ok(attempts) => attempts,
                 Err(failure) => {
                     drop(guard);
-                    self.report_unreadable_attempts(report);
-                    self.events.emit(LifecycleEvent::AttemptsUnreadable {
-                        reason: failure_reason_kind(&failure.reason),
-                    });
+                    self.report_unreadable_attempts(report, &failure);
                     break;
                 }
             };
@@ -2004,6 +2066,25 @@ impl Reconciler {
         launched: &[RunnerAttempt],
     ) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
         let mut attempts = self.launcher.attempts().await?;
+
+        // Each `launch` creates one runtime, so each must answer with an
+        // identifier no other attempt has. Two entries sharing one here are two
+        // runtimes the host-wide total below counts once, which is the ceiling
+        // failing silently -- so a development build stops at the first
+        // duplicate instead. `RunnerLauncher::launch` states the requirement;
+        // this is what makes it findable.
+        debug_assert!(
+            launched
+                .iter()
+                .map(|attempt| attempt.id)
+                .collect::<BTreeSet<AttemptId>>()
+                .len()
+                == launched.len(),
+            "`RunnerLauncher::launch` returned an AttemptId this pass had already seen; \
+             the host ceiling is enforced against a set keyed on that identifier, so a \
+             duplicate is two runtimes counted as one"
+        );
+
         let known: BTreeSet<AttemptId> = attempts.iter().map(|attempt| attempt.id).collect();
         attempts.extend(
             launched
@@ -2020,8 +2101,17 @@ impl Reconciler {
     /// gives: an unreadable set and an idle host produce the same *number* and
     /// demand opposite actions, so the difference has to survive into the
     /// report.
-    fn report_unreadable_attempts(&self, report: &mut ReconcileReport) {
+    fn report_unreadable_attempts(&self, report: &mut ReconcileReport, failure: &LaunchFailure) {
         report.attempts_unreadable = report.attempts_unreadable.saturating_add(1);
+        // The variant, never a literal and never the detail. A hand-written
+        // `"attempts_unreadable"` said only what the event's own name already
+        // said, and threw away the one thing the field is for -- *which* failure
+        // it was. `FailureReason::Other` carries free text that must not reach
+        // an event, which is what `failure_reason_kind` is for and what
+        // `a_cleanup_that_cannot_succeed_...` pins for the sibling path.
+        self.events.emit(LifecycleEvent::AttemptsUnreadable {
+            reason: failure_reason_kind(&failure.reason),
+        });
     }
 
     /// Remove the runtimes of attempts that have already concluded.
@@ -2033,10 +2123,7 @@ impl Reconciler {
         let attempts = match self.launcher.attempts().await {
             Ok(attempts) => attempts,
             Err(failure) => {
-                self.report_unreadable_attempts(report);
-                self.events.emit(LifecycleEvent::AttemptsUnreadable {
-                    reason: failure_reason_kind(&failure.reason),
-                });
+                self.report_unreadable_attempts(report, &failure);
                 return;
             }
         };
@@ -2095,13 +2182,19 @@ impl Reconciler {
     /// nothing, changes nothing, and says so.
     pub async fn scale_down(&self, policy: &ScalePolicy) -> ScaleDownReport {
         let mut report = ScaleDownReport::default();
-        let Ok(attempts) = self.launcher.attempts().await else {
-            // The same rule as everywhere else: an unreadable set is not an
-            // empty one, and scale-down removes nothing it cannot see.
-            self.events.emit(LifecycleEvent::AttemptsUnreadable {
-                reason: "attempts_unreadable",
-            });
-            return report;
+        let attempts = match self.launcher.attempts().await {
+            Ok(attempts) => attempts,
+            Err(failure) => {
+                // The same rule as everywhere else, and this was the one place
+                // it was still broken: an unreadable set is not an empty one,
+                // and a bare `default()` here reported all zeros -- byte for
+                // byte an idle host with nothing to reclaim.
+                self.events.emit(LifecycleEvent::AttemptsUnreadable {
+                    reason: failure_reason_kind(&failure.reason),
+                });
+                report.attempts_unreadable = true;
+                return report;
+            }
         };
         for attempt in attempts {
             if attempt.policy_id != policy.id {
@@ -2765,7 +2858,9 @@ mod tests {
 
         assert_eq!(
             report.started, 3,
-            "host_capacity is 3 and two policies each allowed 3 started {} runners between              them; the second policy's grant was computed from a set that did not yet              contain the first policy's launches",
+            "host_capacity is 3 and two policies each allowed 3 started {} runners \
+             between them; the second policy's grant was computed from a set that did \
+             not yet contain the first policy's launches",
             report.started
         );
         assert_eq!(launcher.launches(), 3);
@@ -2879,6 +2974,62 @@ mod tests {
             })
             .collect();
         assert_eq!(reasons, vec!["other"]);
+    }
+
+    /// N2: an unreadable attempt set makes a scale-down inconclusive, not empty.
+    ///
+    /// Making `attempts()` fallible closed this everywhere the allocation path
+    /// touches, and left it open in the one place that returns a different type:
+    /// `scale_down` answered `ScaleDownReport::default()`, which is all zeros
+    /// and byte-for-byte identical to an idle host with nothing to reclaim. The
+    /// two mean opposite things — "there was nothing to remove" against "we
+    /// cannot see what there was".
+    ///
+    /// Measured as the sibling test measures it: identical host, identical
+    /// attempts, identical policy, and the only difference is whether the
+    /// launcher can answer.
+    #[tokio::test]
+    async fn an_unreadable_attempt_set_makes_scale_down_inconclusive_rather_than_empty() {
+        let launcher = Arc::new(FakeLauncher::new().seeded(vec![
+            attempt_in(AttemptState::Busy, 1, 1),
+            concluded(2, 1, AttemptOutcome::CompletedJob),
+        ]));
+        let harness = Harness::build(
+            host_with(4),
+            Arc::clone(&launcher),
+            Arc::new(FakeDemand::ready(0, &repo("acme/app"))),
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        let policy = policy(1, "acme/app", 4);
+
+        launcher.fail_attempts(true);
+        let blind = harness.reconciler.scale_down(&policy).await;
+
+        assert!(!blind.is_conclusive(), "the machine was never read");
+        assert_ne!(
+            blind,
+            ScaleDownReport::default(),
+            "a scale-down that could not see the host must not be equal to one that saw \
+             an idle host; that equality is the whole finding"
+        );
+        assert_eq!(blind.removed, 0);
+        assert_eq!(
+            blind.refused_busy, 0,
+            "and this zero means `unknown`, not `none`"
+        );
+        assert_eq!(harness.events.count_of("attempts_unreadable"), 1);
+
+        // The same everything, with a launcher that can answer.
+        launcher.fail_attempts(false);
+        let seeing = harness.reconciler.scale_down(&policy).await;
+
+        assert!(seeing.is_conclusive());
+        assert_eq!(seeing.removed, 1, "the concluded attempt was reclaimed");
+        assert_eq!(seeing.refused_busy, 1, "and the busy one was left alone");
+        assert_ne!(
+            seeing, blind,
+            "the difference between the two is only whether the set could be read"
+        );
     }
 
     /// Finding 7: the lower arm of the clamp, driven through the reconciler.
