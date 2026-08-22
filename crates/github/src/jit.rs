@@ -18,7 +18,7 @@
 //!
 //! # What the live spikes settled, and what each one costs to get wrong
 //!
-//! `v1` ([`docs/spikes/d18-org-jit-verification.md`]) drove both scopes against
+//! `v1` (`docs/spikes/d18-org-jit-verification.md`) drove both scopes against
 //! live GitHub. Four of its findings are load-bearing here rather than
 //! interesting:
 //!
@@ -266,7 +266,7 @@ struct JitRequestBody<'a> {
 ///   cannot be written into a config file, a SQLite row, a `status --json`
 ///   payload or a structured log field by any code that compiles. The doctest
 ///   below is the executable form of that claim.
-/// * **It zeroises on drop.** [`Drop`] calls [`Self::scrub`], which zeroes the
+/// * **It zeroises on drop.** [`Drop`] calls `Self::scrub`, which zeroes the
 ///   buffer through `zeroize`. `secrecy`'s [`SecretString`] also zeroises on its
 ///   own drop; the explicit scrub is what makes the property *testable* rather
 ///   than a statement about a dependency.
@@ -525,14 +525,51 @@ impl JitError {
     /// `403` on this family of endpoints means. A rejected credential is
     /// terminal too — it resolves by an interactive `auth login`, not by
     /// retrying.
+    ///
+    /// # Why an undecodable answer is terminal, and why it is the expensive one
+    ///
+    /// A body this client cannot parse will not parse on the next attempt, so
+    /// the answer to the question in the first line is plainly no. What makes
+    /// it worth spelling out is the cost of getting it wrong here rather than
+    /// anywhere else: `generate-jitconfig` answers `201` by **completing a
+    /// registration**, and the decode happens after that. A caller that read
+    /// this as retryable would issue a second registration, and a third, each
+    /// one a real runner created at GitHub whose one-shot configuration this
+    /// process then discards — a target silently accumulating registered
+    /// runners that never come online. So [`GithubError::Decode`] and
+    /// [`GithubError::Malformed`] are terminal, and
+    /// [`JitError::operator_action`] answers for both rather than leaving the
+    /// failure silent.
+    ///
+    /// # Why [`GithubError::Forbidden`] and a `404` under `Github` are not
+    ///
+    /// Both are reachable through the transparent `#[from]` without passing
+    /// `RestJit::classify`, and both would be terminal if they had. They stay
+    /// as they are because answering them here means keeping a second
+    /// status-code table beside `classify`'s, and the two would drift. For the
+    /// `403` it is worse than untidy: GitHub answers a secondary rate limit
+    /// with a `403`, `classify` runs [`RateLimited::detect`] *first* for
+    /// exactly that reason, and a predicate that called the raw variant
+    /// terminal without repeating that detection would turn the one 403 that
+    /// resolves by waiting into a permanent failure. An unclassified failure
+    /// reported as retryable costs a wasted request; an unclassified rate limit
+    /// reported as terminal costs the registration. The fix for those two is to
+    /// route them through `classify`, which every path inside this crate
+    /// already does.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Forbidden { .. } | Self::NotFound { .. } | Self::Rejected { .. } => true,
-            // Only the rejected credential. An authentication *lockout* is not
-            // terminal — it is the one 403 that resolves by waiting — and a
-            // transport failure resolves when the network does.
-            Self::Github(error) => matches!(error, GithubError::AuthenticationFailed),
+            // The rejected credential, and an answer this client cannot read.
+            // An authentication *lockout* is not terminal — it is the one 403
+            // that resolves by waiting — and a transport failure resolves when
+            // the network does.
+            Self::Github(error) => matches!(
+                error,
+                GithubError::AuthenticationFailed
+                    | GithubError::Decode { .. }
+                    | GithubError::Malformed { .. }
+            ),
             Self::RateLimited(_) | Self::Cancelled => false,
         }
     }
@@ -586,6 +623,20 @@ impl JitError {
             Self::Github(GithubError::AuthenticationFailed) => {
                 Some("Run `runner-manager auth login` to sign in again.".to_string())
             }
+            // Deliberately says nothing about the body it could not read. The
+            // undecodable answer is a `201`, so the body it is holding is a real
+            // encoded configuration, and this string is rendered wherever the
+            // error is; the module's redaction rule binds the remedy as tightly
+            // as the failure.
+            Self::Github(GithubError::Decode { .. } | GithubError::Malformed { .. }) => Some(
+                "Do not retry this registration: GitHub's answer could not be read, and \
+                 `generate-jitconfig` answers 201 by creating the runner — so each further \
+                 attempt can leave another registered runner that never comes online. \
+                 Check the target's self-hosted runner list for offline runners matching \
+                 this name and remove them, then report the response shape: this means \
+                 GitHub's payload changed or the request body could not be built."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -1475,6 +1526,98 @@ mod tests {
                 rendered.contains("Resource not accessible by integration"),
                 "GitHub's message is what makes a {status} operator-actionable and must \
                  survive: {rendered}"
+            );
+        }
+    }
+
+    /// A `201` this client cannot decode is terminal, and tells an operator what
+    /// to do about it.
+    ///
+    /// This is the one failure on this path where retrying is not merely
+    /// useless but actively destructive, and the two facts compound. A `201`
+    /// **is a completed registration**: GitHub has already created the runner
+    /// and spent the one-shot configuration on it. So a caller that reads
+    /// [`JitError::is_terminal`] as "safe to try again" issues a second
+    /// registration, and a third, each one a fresh runner that this process
+    /// then throws away undecoded — a target quietly accumulating registered
+    /// runners that never come online, none of which is visible from the
+    /// failure itself.
+    ///
+    /// It was reported non-terminal, and with no
+    /// [`JitError::operator_action`], so the loop was silent as well as
+    /// unbounded. Both halves are pinned here: the answer to "could retrying
+    /// this exact request ever produce a different answer" is no — a body this
+    /// client cannot parse will not parse on the next attempt — and a terminal
+    /// outcome without an operator action is the dead end that
+    /// `operator_action`'s own documentation forbids.
+    #[tokio::test]
+    async fn an_undecodable_registration_is_terminal_and_operator_actionable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(RestJit::path(&repo_target())))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "encoded_jit_config": FIXTURE_JIT_CONFIG,
+                "runner": { "name": "no id field, so this cannot decode" }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = gateway(&server)
+            .generate_jit_config(&repo_target(), &request(), &CancelToken::new())
+            .await
+            .expect_err("a 201 missing `runner.id` cannot decode");
+
+        assert!(
+            matches!(error, JitError::Github(GithubError::Decode { .. })),
+            "the undecodable 201 arrives through the transparent `#[from]`, which is \
+             what makes its terminality a question about `GithubError` rather than \
+             about a `JitError` variant: {error:?}"
+        );
+        assert!(
+            error.is_terminal(),
+            "a response body this client cannot parse will not parse on a retry, and \
+             every retry registers another runner that is then discarded"
+        );
+        let action = error
+            .operator_action()
+            .expect("a terminal outcome with no operator action is a dead end");
+        assert!(
+            action.contains("Do not retry"),
+            "the action has to say the one thing a caller must not do: {action}"
+        );
+        assert!(
+            !action.contains(FIXTURE_JIT_CONFIG) && !action.contains("eyJ"),
+            "the operator action is rendered wherever the error is, so it is bound by \
+             the same redaction rule as the error itself: {action}"
+        );
+
+        // The sibling variant, which reaches the same conclusion by the same
+        // route: `Malformed` is a value this client cannot use, and it will be
+        // the same value next time. Constructed directly because there is no
+        // response shape that produces it on the registration path today --
+        // which is exactly why it needs pinning rather than leaving to chance.
+        let malformed = JitError::Github(GithubError::Malformed {
+            what: "runner.id",
+            value: "not a number".to_string(),
+        });
+        assert!(malformed.is_terminal());
+        assert!(malformed.operator_action().is_some());
+
+        // And the two failures that stay non-terminal, so the widening above is
+        // read as deliberate rather than as "everything under `Github` is
+        // terminal now". A lockout resolves by waiting and a transport failure
+        // resolves when the network does; retrying either is the correct
+        // behaviour, and neither has registered anything.
+        for still_retryable in [
+            JitError::Github(GithubError::AuthenticationLockout {
+                retry_after: std::time::Duration::from_secs(60),
+            }),
+            JitError::Cancelled,
+        ] {
+            assert!(
+                !still_retryable.is_terminal(),
+                "{still_retryable:?} resolves on its own and must not be reported as \
+                 terminal"
             );
         }
     }
