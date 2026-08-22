@@ -1152,6 +1152,7 @@ pub struct InventorySnapshot {
 pub struct TargetCost {
     scope: TargetScope,
     installed_repositories: u32,
+    demand_requests_per_repository: u32,
 }
 
 impl TargetCost {
@@ -1161,6 +1162,7 @@ impl TargetCost {
         Self {
             scope: TargetScope::Repository,
             installed_repositories: 1,
+            demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
         }
     }
 
@@ -1170,7 +1172,27 @@ impl TargetCost {
         Self {
             scope: TargetScope::Organization,
             installed_repositories,
+            demand_requests_per_repository: DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
         }
+    }
+
+    /// Replace the demand cost with the one `c4` measured.
+    ///
+    /// `c4`'s specification says to "report the per-poll request count to `c3`'s
+    /// budget model rather than estimating it there", and this is where it
+    /// reports it. Without a seam, honouring that sentence would mean editing
+    /// [`DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`] — in this file, which `c4`
+    /// does not own — so the sentence would have been unfollowable and the
+    /// estimate would have quietly stayed the truth.
+    ///
+    /// The default is [`DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which is
+    /// what `04-subsystem-contracts.md` tabulates. This overrides that number
+    /// and nothing else: the inventory and activity costs are this task's own
+    /// and are measured against the requests it really issues.
+    #[must_use]
+    pub fn with_demand_requests_per_repository(mut self, requests: u32) -> Self {
+        self.demand_requests_per_repository = requests;
+        self
     }
 
     /// The cost of the scope an activity refresh will actually walk.
@@ -1208,8 +1230,7 @@ impl TargetCost {
         };
         RUNNER_INVENTORY_REQUESTS_PER_REFRESH
             + repositories.saturating_mul(
-                ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH
-                    + DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH,
+                ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH + self.demand_requests_per_repository,
             )
     }
 
@@ -1912,6 +1933,20 @@ impl RestInventory {
 /// lockout, an unreachable host, an undecodable body — is the second, because
 /// stepping over those would report a total that is short by an unknown amount
 /// while looking complete.
+///
+/// # It applies to an aggregate only, never to a repository target
+///
+/// Stepping over the *only* repository in scope turns a permissions failure into
+/// `ActivityCount { total: 0 }`, and a dashboard that reads `total()` — which is
+/// the obvious thing to read — then renders "0 in progress" for a target it
+/// cannot see at all. [`ActivityCount::is_complete`] says otherwise, but a
+/// safety property that depends on every caller remembering to ask a second
+/// question is not a safety property.
+///
+/// So the caller checks [`TargetScope`] first: an organization aggregate steps
+/// over a bad repository, and a repository target propagates. The step-over
+/// exists because one archived repository must not take down an organization's
+/// whole activity refresh — a scope of one has no such problem to solve.
 fn is_repository_local_failure(error: &InventoryError) -> bool {
     match error {
         InventoryError::Github(GithubError::Forbidden { .. }) => true,
@@ -1959,13 +1994,16 @@ impl InventoryGateway for RestInventory {
     ) -> Result<ActivityCount, InventoryError> {
         let mut per_repository = BTreeMap::new();
         let mut unavailable = Vec::new();
+        // Only an aggregate steps over a bad repository; see
+        // `is_repository_local_failure`.
+        let aggregating = scope.target().scope() == TargetScope::Organization;
 
         for repository in scope.repositories() {
             match self.repository_in_progress(repository, cancel).await {
                 Ok(count) => {
                     per_repository.insert(repository.clone(), count);
                 }
-                Err(error) if is_repository_local_failure(&error) => {
+                Err(error) if aggregating && is_repository_local_failure(&error) => {
                     tracing::warn!(
                         repository = %repository,
                         error = %error,
@@ -2592,6 +2630,34 @@ mod tests {
         );
         assert_eq!(activity.unavailable().len(), 1);
         assert_eq!(activity.unavailable()[0].repository, other_repo());
+    }
+
+    /// The step-over is for an aggregate. A **repository** target's failure
+    /// propagates, because turning the only repository in scope into a zero
+    /// renders a permissions failure as "0 in progress" for anything that reads
+    /// `total()` — which is the obvious thing to read.
+    #[tokio::test]
+    async fn a_repository_targets_activity_failure_propagates_rather_than_becoming_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({ "message": "Resource not accessible by integration" })),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let error = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect_err("a scope of one has no partial answer to give");
+
+        assert!(matches!(
+            RefreshState::from_error(&error),
+            RefreshState::Forbidden { .. }
+        ));
     }
 
     /// A rate limit hit part-way through an aggregate aborts it, because
@@ -3500,6 +3566,37 @@ mod tests {
             cost.requests_per_refresh(),
             RUNNER_INVENTORY_REQUESTS_PER_REFRESH,
             "the runners endpoint is still polled; nothing else is"
+        );
+    }
+
+    /// `c4` reports its measured demand cost rather than this file estimating
+    /// it, which is what its specification asks for and what it could not do if
+    /// the constant were the only way in.
+    #[test]
+    fn the_demand_cost_can_be_reported_by_the_task_that_measures_it() {
+        let default = interval(RefreshInterval::DEFAULT_SECS);
+
+        assert_eq!(
+            TargetCost::repository().requests_per_hour(default),
+            240,
+            "the documented estimate is the default"
+        );
+
+        // A demand poll that turned out to need three requests per repository,
+        // not two.
+        let measured = TargetCost::repository().with_demand_requests_per_repository(3);
+        assert_eq!(measured.requests_per_refresh(), 5);
+        assert_eq!(measured.requests_per_hour(default), 300);
+
+        // And it scales with an organization's repository count like everything
+        // else per-repository does.
+        let org = TargetCost::organization(4).with_demand_requests_per_repository(3);
+        assert_eq!(org.requests_per_refresh(), 1 + 4 * (1 + 3));
+        assert_eq!(
+            org.requests_per_hour(default),
+            1_020,
+            "a worse demand cost lands hardest on an organization, which is \
+             exactly the effect a flat per-target model would hide"
         );
     }
 
