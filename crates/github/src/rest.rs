@@ -410,7 +410,11 @@ impl fmt::Display for RateLimited {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "GitHub's {} rate limit is exhausted", self.kind)?;
         if let Some(retry_after) = self.retry_after {
-            write!(f, "; it asked to be left alone for {}s", retry_after.as_secs())?;
+            write!(
+                f,
+                "; it asked to be left alone for {}s",
+                retry_after.as_secs()
+            )?;
         }
         if let Some(remaining) = self.remaining {
             write!(f, "; {remaining} requests remain in the hourly quota")?;
@@ -1623,7 +1627,10 @@ impl fmt::Debug for RestInventory {
             Err(_) => "unknown (the rate-limit state is being updated)".to_string(),
         };
         f.debug_struct("RestInventory")
-            .field("requests_issued", &self.requests_issued.load(Ordering::Relaxed))
+            .field(
+                "requests_issued",
+                &self.requests_issued.load(Ordering::Relaxed),
+            )
             .field("rate_limited", &backing_off)
             .finish_non_exhaustive()
     }
@@ -1719,7 +1726,12 @@ impl RestInventory {
 
         self.requests_issued.fetch_add(1, Ordering::SeqCst);
         let result = cancel
-            .run(async { self.client.send(request).await.map_err(InventoryError::from) })
+            .run(async {
+                self.client
+                    .send(request)
+                    .await
+                    .map_err(InventoryError::from)
+            })
             .await;
 
         match result {
@@ -2571,7 +2583,9 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("retry-after", "30")
-                    .set_body_json(json!({ "message": "You have exceeded a secondary rate limit" })),
+                    .set_body_json(
+                        json!({ "message": "You have exceeded a secondary rate limit" }),
+                    ),
             )
             .mount(&server)
             .await;
@@ -2601,7 +2615,9 @@ mod tests {
             .respond_with(Script::new(vec![
                 ResponseTemplate::new(429)
                     .insert_header("retry-after", "120")
-                    .set_body_json(json!({ "message": "You have exceeded a secondary rate limit" })),
+                    .set_body_json(
+                        json!({ "message": "You have exceeded a secondary rate limit" }),
+                    ),
                 ResponseTemplate::new(200).set_body_json(runner_page(1..2, 1)),
             ]))
             .mount(&server)
@@ -2757,9 +2773,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(REPO_RUNNERS))
-            .respond_with(ResponseTemplate::new(403).set_body_json(
-                json!({ "message": "Resource not accessible by integration" }),
-            ))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({ "message": "Resource not accessible by integration" })),
+            )
             .mount(&server)
             .await;
 
@@ -3011,7 +3028,11 @@ mod tests {
         );
 
         let null = downloads.select(Os::Linux, Arch::X64).expect("selected");
-        assert_eq!(null.sha256_checksum(), None, "an explicit null is absent too");
+        assert_eq!(
+            null.sha256_checksum(),
+            None,
+            "an explicit null is absent too"
+        );
 
         let empty = downloads.select(Os::Linux, Arch::Arm64).expect("selected");
         assert_eq!(
@@ -3105,7 +3126,10 @@ mod tests {
 
         let spike = &inventory.runners()[0];
         assert_eq!(spike.labels, ["rm-home-win-x64", "windows"]);
-        assert!(spike.has_label("Windows"), "GitHub lower-cases what it stores");
+        assert!(
+            spike.has_label("Windows"),
+            "GitHub lower-cases what it stores"
+        );
         assert!(spike.has_label("  windows  "));
         assert!(
             !spike.has_label("self-hosted"),
@@ -3358,7 +3382,10 @@ mod tests {
 
         let message = full.admit(TargetCost::repository()).to_string();
         for expected in ["2640", "2500", "5000", "60-second", "about 10 repository"] {
-            assert!(message.contains(expected), "{expected:?} missing from: {message}");
+            assert!(
+                message.contains(expected),
+                "{expected:?} missing from: {message}"
+            );
         }
         assert!(
             !message.contains("because the App is installed on"),
@@ -3468,9 +3495,7 @@ mod tests {
     #[test]
     fn the_authentication_taxonomy_survives_the_summary() {
         assert_eq!(
-            RefreshState::from_error(&InventoryError::Github(
-                GithubError::AuthenticationFailed
-            )),
+            RefreshState::from_error(&InventoryError::Github(GithubError::AuthenticationFailed)),
             RefreshState::Unauthorized
         );
         assert_eq!(

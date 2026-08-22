@@ -589,3 +589,215 @@ impl InventoryGateway for FakeGithub {
         self.clock.now()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runner_manager_github::rest::CancelToken;
+
+    fn repo() -> OwnerRepo {
+        OwnerRepo::parse("octo/dashboard").expect("a valid owner/repo")
+    }
+
+    fn target() -> ScaleTarget {
+        ScaleTarget::Repository(repo())
+    }
+
+    /// The page accounting a consumer's budget assertions rest on.
+    #[tokio::test]
+    async fn the_page_count_follows_the_programmed_page_size() {
+        let gateway = FakeGithub::new()
+            .with_page_size(10)
+            .with_runners(target(), runners(25));
+
+        assert_eq!(
+            gateway.pages_for(&target()),
+            3,
+            "25 at 10 a page is 3 pages"
+        );
+
+        let inventory = gateway
+            .list_runners(&target(), &CancelToken::new())
+            .await
+            .expect("readable");
+        assert_eq!(inventory.len(), 25);
+        assert_eq!(inventory.pages(), 3);
+        assert_eq!(inventory.reported_total(), Some(25));
+        assert_eq!(gateway.requests_issued(), 3);
+    }
+
+    /// An empty target still costs the request that discovered it was empty.
+    /// Charging zero would let a consumer poll an idle host for free, which is
+    /// not how the shared budget works.
+    #[tokio::test]
+    async fn an_empty_target_still_costs_one_request() {
+        let gateway = FakeGithub::new();
+        assert_eq!(gateway.pages_for(&target()), 1);
+
+        let inventory = gateway
+            .list_runners(&target(), &CancelToken::new())
+            .await
+            .expect("readable");
+        assert!(inventory.is_empty());
+        assert_eq!(inventory.pages(), 1);
+        assert_eq!(gateway.requests_issued(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a page must hold at least one runner")]
+    fn a_zero_page_size_is_refused_rather_than_paginating_forever() {
+        let _ = FakeGithub::new().with_page_size(0);
+    }
+
+    /// A latched failure wins over a queued one: an exhausted quota does not
+    /// take turns with a `404`.
+    #[tokio::test]
+    async fn a_latched_failure_takes_precedence_over_the_queue() {
+        let gateway = FakeGithub::new();
+        gateway.fail_next(FakeFailure::not_found());
+        gateway.fail_always(FakeFailure::RevokedToken);
+
+        for _ in 0..2 {
+            let error = gateway
+                .list_runners(&target(), &CancelToken::new())
+                .await
+                .expect_err("latched");
+            assert!(
+                matches!(
+                    &error,
+                    InventoryError::Github(GithubError::AuthenticationFailed)
+                ),
+                "{error}"
+            );
+        }
+
+        gateway.recover();
+        assert!(
+            gateway
+                .list_runners(&target(), &CancelToken::new())
+                .await
+                .is_ok(),
+            "`recover` clears the queue as well as the latch"
+        );
+    }
+
+    /// Queued failures are consumed in order, one per call.
+    #[tokio::test]
+    async fn queued_failures_are_consumed_in_order() {
+        let gateway = FakeGithub::new();
+        gateway.fail_next(FakeFailure::not_found());
+        gateway.fail_next(FakeFailure::secondary_rate_limit(30));
+
+        let first = gateway
+            .list_runners(&target(), &CancelToken::new())
+            .await
+            .expect_err("the first queued failure");
+        assert!(!first.is_rate_limited(), "{first}");
+
+        let second = gateway
+            .list_runners(&target(), &CancelToken::new())
+            .await
+            .expect_err("the second queued failure");
+        assert!(second.is_rate_limited(), "{second}");
+
+        assert!(
+            gateway
+                .list_runners(&target(), &CancelToken::new())
+                .await
+                .is_ok(),
+            "the queue is empty again"
+        );
+        assert_eq!(
+            gateway.calls().len(),
+            3,
+            "a failed call is still a call, and a consumer asserting on call \
+             counts needs to see it"
+        );
+    }
+
+    /// A failed call spends no request, because no request reached the wire.
+    #[tokio::test]
+    async fn a_failed_call_costs_no_request() {
+        let gateway = FakeGithub::new().with_runners(target(), runners(5));
+        gateway.fail_next(FakeFailure::RevokedToken);
+        let _ = gateway.list_runners(&target(), &CancelToken::new()).await;
+        assert_eq!(gateway.requests_issued(), 0);
+    }
+
+    /// The builder's defaults and the two facts D18 established about labels.
+    #[test]
+    fn the_runner_builder_stores_labels_the_way_github_does() {
+        let built = runner(73, "rm-d18-spike-ivanpc-1753")
+            .labels(["RM-Home-Win-X64", " Windows "])
+            .build();
+
+        assert_eq!(
+            built.labels,
+            ["rm-home-win-x64", "windows"],
+            "GitHub lower-cases what it stores (D18, point 3), and a fixture that \
+             kept the casing would let a consumer assert one GitHub does not keep"
+        );
+        assert!(built.has_label("WINDOWS"));
+        assert!(
+            !built.has_label("self-hosted"),
+            "no label is added implicitly (D18, point 1)"
+        );
+        assert_eq!(built.status, RunnerStatus::Online);
+        assert!(!built.busy);
+        assert_eq!(built.ephemeral, Some(true));
+
+        let unknown = runner(1, "legacy").ephemeral(None).offline().build();
+        assert_eq!(
+            unknown.ephemeral, None,
+            "absent is a fact a fixture must be able to express, because absent \
+             is not `false`"
+        );
+        assert_eq!(unknown.status, RunnerStatus::Offline);
+    }
+
+    /// Fixtures are reproducible, so a `g2` snapshot of them is too.
+    #[test]
+    fn generated_runners_are_deterministic() {
+        let first = runners(3);
+        assert_eq!(first, runners(3));
+        assert_eq!(
+            first.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [1, 2, 3],
+            "ids start at one; a zero id would collide with `Default`"
+        );
+        assert_eq!(first[0].name, "runner-0001");
+        assert!(runners(0).is_empty());
+    }
+
+    /// The download fixtures differ in exactly the field `e2` fails closed on.
+    #[test]
+    fn the_download_fixtures_differ_only_in_the_published_digest() {
+        let with = download("win", "x64");
+        let without = download_without_checksum("win", "x64");
+
+        assert_eq!(with.sha256_checksum().map(str::len), Some(64));
+        assert_eq!(without.sha256_checksum(), None);
+        assert_eq!(with.os, without.os);
+        assert_eq!(with.architecture, without.architecture);
+        assert_eq!(with.download_url, without.download_url);
+        assert_eq!(with.filename, without.filename);
+    }
+
+    /// `headroom` is programmable, so `f1` and `g3` can render a quota display
+    /// without a network.
+    #[test]
+    fn the_reported_headroom_is_what_the_test_programmed() {
+        let headroom = RateLimitHeadroom {
+            limit: Some(5_000),
+            remaining: Some(120),
+            reset_unix_secs: Some(1_787_274_000),
+        };
+        let gateway = FakeGithub::new().with_headroom(headroom);
+        assert_eq!(gateway.headroom(), Some(headroom));
+        assert_eq!(
+            FakeGithub::new().headroom(),
+            None,
+            "nothing observed is not the same as a full quota"
+        );
+    }
+}
