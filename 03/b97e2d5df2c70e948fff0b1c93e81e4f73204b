@@ -1,0 +1,19 @@
+crates/platform/src/secrets.rs
+  s_1b329c8675e8dd::t_b5acb85e007894 3017-3030,3032-3033,3046-3117,3120-3123,3126-3127,3130-3133,3163,3205,3217-3275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "03b97e2d5df2c70e948fff0b1c93e81e4f73204b",
+  "prompts": {},
+  "sessions": {
+    "s_1b329c8675e8dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2689d90-6b58-413b-986a-98948442988b",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
