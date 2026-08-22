@@ -627,23 +627,24 @@ fn redact_fragment(
     };
 
     if claimed {
-        let next = if closes_a_value(suffix) {
-            // Punctuation that closes a string or a structure settles it.
-            Carry::None
-        } else if carry == Carry::Unclosed {
-            // Still inside an open quote, so the value runs into the next
-            // fragment as well.
-            Carry::Unclosed
-        } else if trailing {
-            // A claim spent on the *last* fragment of a core is a claim whose
-            // value reached the end of the word with nothing closing it, so it
-            // may continue into the next word — as `Unclosed`, not as the
-            // `Expecting` it arrived as, because the value has now started.
-            // `<key>password</key><string>` + `correct horse</string>` is that
-            // shape.
+        // Two different reasons to think the value has more to come, and one
+        // answer: it is `Unclosed` from here, never the `Expecting` it may have
+        // arrived as, because the value has now started.
+        //
+        // - `carry == Unclosed` — still inside an open quote, so the value runs
+        //   into the next fragment as well.
+        // - `trailing` — a claim spent on the *last* fragment of a core is one
+        //   whose value reached the end of the word with nothing closing it, so
+        //   it may continue into the next word.
+        //   `<key>password</key><string>` + `correct horse</string>` is that
+        //   shape.
+        //
+        // Anything else was spent in the middle of a core, where the value was
+        // and is done — and punctuation that closes a string or a structure
+        // settles it either way.
+        let next = if !closes_a_value(suffix) && (carry == Carry::Unclosed || trailing) {
             Carry::Unclosed
         } else {
-            // Spent in the middle of a core: the value was here and is done.
             Carry::None
         };
         return (format!("{prefix}{REDACTION}{suffix}"), next);
