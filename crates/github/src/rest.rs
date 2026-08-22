@@ -235,6 +235,16 @@ const _: () = assert!(
 /// direction and never the unfiltered-total defect, so it stays a `warn!` alone.
 const MAX_BENIGN_TOTAL_COUNT_SKEW: u64 = 16;
 
+// A zero skew is `total == listed` again, which is the check that panicked on
+// the documented race. Enforced at compile time rather than by a test because a
+// test cannot do it: any test that derives its fixture from this constant moves
+// with it and stays green at zero, which is exactly the false comfort this
+// assertion exists to refuse.
+const _: () = assert!(
+    MAX_BENIGN_TOTAL_COUNT_SKEW > 0,
+    "a zero skew re-creates the assert that trips on a run finishing mid-serialisation"
+);
+
 /// Requests one demand poll costs, **per repository**: the queued runs, then
 /// their jobs.
 ///
@@ -3218,14 +3228,18 @@ mod tests {
     /// development would have been a false positive, which is how a real check
     /// gets deleted by the next reader.
     ///
-    /// Pinned at the boundary rather than one over, so that shrinking
-    /// [`MAX_BENIGN_TOTAL_COUNT_SKEW`] reds this test instead of silently
-    /// narrowing the race window.
+    /// The gap is a **literal**, deliberately. A fixture derived from
+    /// [`MAX_BENIGN_TOTAL_COUNT_SKEW`] moves with the constant and stays green
+    /// even at zero — where the check is `total == listed` again and the race
+    /// panics — so it would assert nothing about the threshold at all. That end
+    /// is held by a compile-time assertion next to the constant; this test holds
+    /// the case an operator actually meets: one run finished between the total
+    /// being computed and the page being serialised.
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn a_total_count_within_the_benign_skew_does_not_panic_a_debug_build() {
+    async fn a_total_count_one_over_its_only_page_is_the_documented_race_not_a_panic() {
         let listed = 3_usize;
-        let total = listed as u64 + MAX_BENIGN_TOTAL_COUNT_SKEW;
+        let total = 4_u64;
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
