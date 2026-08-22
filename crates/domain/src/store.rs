@@ -2640,6 +2640,95 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_outcome_tag_keeps_the_position_serde_did_record() {
+        // The one row of `position_only`'s table that separates its
+        // discriminator from the obvious alternative -- and, until this test,
+        // the only row nothing planted.
+        //
+        // `position_only` branches on `error.line() == 0`, and its documentation
+        // says so in bold, because `classify()` is the reading a later editor
+        // reaches for: five of the seven measured rows are `Data` *and*
+        // positionless, so "positionless means `Data`" fits almost every row.
+        // It is wrong at exactly one -- an unknown *outcome* tag. `AttemptOutcome`
+        // is internally tagged, so serde reads the tag straight out of the input
+        // stream to decide what to deserialise into and only *then* buffers the
+        // rest of the object; a tag it does not recognise fails before the
+        // buffering that loses the position. That error is `Data` and carries a
+        // real 1-based position, so a `classify()`-based branch would throw the
+        // position away and tell an operator none was recorded when one was.
+        //
+        // The suite did not notice. Swapping the discriminator to
+        // `error.classify() == serde_json::error::Category::Data` left every
+        // test green -- 129 lib, 9 integration -- because the positionless half
+        // of `a_short_secret_in_the_free_form_column_is_not_echoed_at_all`
+        // plants an unknown *reason* variant, which is positionless under both
+        // readings and so cannot tell them apart. By this crate's own standard a
+        // measurement recorded once and never re-run is a gap; this closes the
+        // one under that table.
+        let raw = r#"{"outcome":"vanished"}"#;
+
+        // The premise, asserted rather than described. Both halves carry weight:
+        // the first is what makes `classify()` look correct, the second is what
+        // makes it wrong.
+        let inner = serde_json::from_str::<AttemptOutcome>(raw)
+            .expect_err("`vanished` is not an attempt outcome");
+        assert_eq!(
+            inner.classify(),
+            serde_json::error::Category::Data,
+            "a `classify()`-based discriminator would send this down the \
+             positionless branch: {inner}"
+        );
+        assert_ne!(
+            inner.line(),
+            0,
+            "and it has a real position to lose, which is the whole finding: \
+             {inner}"
+        );
+
+        let store = store();
+        RawAttempt {
+            state: "failed".to_string(),
+            outcome: Some(raw.to_string()),
+            terminal_at: Some(timestamp_to_text(ts(2_000))),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+
+        let rendered = store
+            .attempt(attempt_id())
+            .expect_err("an unknown outcome tag is not an attempt outcome")
+            .to_string();
+
+        // Read off the error rather than written as a literal: the column figure
+        // is a property of this probe string, not a constant of the format.
+        assert!(
+            rendered.contains(&format!(
+                "stops parsing at line {}, column {}",
+                inner.line(),
+                inner.column()
+            )),
+            "the position serde did record must survive into the message: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains("no position"),
+            "and must not be reported as absent: {rendered}"
+        );
+
+        // Same branch, same payload-free rule: the position travels and the tag
+        // that produced it does not. `position_only` reads `line()` and
+        // `column()`, never `to_string()`, on this path as much as on the other.
+        assert!(
+            rendered.contains(&format!("{}-byte", raw.len())),
+            "the message must still say how much is there: {rendered}"
+        );
+        assert!(
+            !rendered.contains("vanished"),
+            "serde names the offending tag; this message must not: {rendered}"
+        );
+    }
+
+    #[test]
     fn a_constrained_column_still_echoes_what_it_holds() {
         // The other half of the per-column rule: the echo is removed at the one
         // column that carries text the agent captured from a failure, and
