@@ -3014,8 +3014,23 @@ mod tests {
     mod windows {
         use super::*;
 
+        /// How much a [`DeniedReplace`] takes away.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum AlsoDeny {
+            /// Only what denies a *replacing rename*. Creating a file in the
+            /// directory still works, exactly as it does for operator B, so the
+            /// temporary is still written if the store gets that far.
+            Nothing,
+            /// Additionally `FILE_ADD_FILE`, so nothing can be created in the
+            /// directory at all. What makes
+            /// [`the_refusal_is_made_before_anything_is_written`] able to tell
+            /// a pre-write refusal from a post-write one.
+            Creation,
+        }
+
         /// Reproduces what a second non-administrative operator meets, without
-        /// needing a second account.
+        /// needing a second account, and puts the rights back on **every** path
+        /// out — including an unwind.
         ///
         /// **Both denies are required, and finding that out was the point of
         /// running this against the un-fixed code.** Windows grants delete two
@@ -3028,25 +3043,94 @@ mod tests {
         /// the file denied, the rename went through and the simulation
         /// reproduced nothing while looking exactly right.
         ///
-        /// Creating a file is `FILE_ADD_FILE`, which neither deny touches, so
-        /// the temporary is still written here exactly as it is for B. That is
-        /// what makes the "nothing was left behind" half of this test mean
-        /// something.
-        fn deny_delete(file: &std::path::Path, directory: &std::path::Path) {
-            icacls(&[&file.display().to_string(), "/deny", "*S-1-1-0:(D)"]);
-            icacls(&[&directory.display().to_string(), "/deny", "*S-1-1-0:(DC)"]);
+        /// # Why the restore is a `Drop` and not a line at the end of the body
+        ///
+        /// Because a failing assertion unwinds past that line, and what it
+        /// leaves behind is not tidy: `Everyone:(D)` denies deleting the guard
+        /// and `Everyone:(DC)` denies deleting the directory's children, so
+        /// `TempDir::drop` — which ignores removal errors — cannot clean up. A
+        /// DPAPI blob of the fixture token would sit in `%TEMP%` under an ACL
+        /// ordinary cleanup cannot remove, on exactly the run where somebody is
+        /// already debugging a failure.
+        struct DeniedReplace {
+            file: std::path::PathBuf,
+            directory: std::path::PathBuf,
+            restored: bool,
         }
 
-        fn allow_delete_again(file: &std::path::Path, directory: &std::path::Path) {
-            icacls(&[&file.display().to_string(), "/remove:d", "*S-1-1-0"]);
-            icacls(&[&directory.display().to_string(), "/remove:d", "*S-1-1-0"]);
+        impl DeniedReplace {
+            fn new(file: &std::path::Path, directory: &std::path::Path, also: AlsoDeny) -> Self {
+                let denied = Self {
+                    file: file.to_path_buf(),
+                    directory: directory.to_path_buf(),
+                    restored: false,
+                };
+                // Constructed first, so that a failure in any `icacls` below
+                // unwinds through this guard's `Drop` and undoes the ones that
+                // did take effect.
+                icacls(&[&denied.file.display().to_string(), "/deny", "*S-1-1-0:(D)"]);
+                icacls(&[
+                    &denied.directory.display().to_string(),
+                    "/deny",
+                    "*S-1-1-0:(DC)",
+                ]);
+                if also == AlsoDeny::Creation {
+                    icacls(&[
+                        &denied.directory.display().to_string(),
+                        "/deny",
+                        "*S-1-1-0:(WD)",
+                    ]);
+                }
+                denied
+            }
+
+            /// Puts the rights back now, for a test that needs to go on and
+            /// observe the store working again. Idempotent, so [`Drop`] running
+            /// afterwards is a no-op.
+            fn restore(&mut self) {
+                if self.restored {
+                    return;
+                }
+                self.restored = true;
+                // `/remove:d` drops every deny ACE this SID has on the object,
+                // so one call per object undoes all of the above.
+                //
+                // Deliberately not asserting: this runs on the unwind path,
+                // where a panic would abort the process and replace a readable
+                // test failure with one nobody can diagnose.
+                for path in [&self.file, &self.directory] {
+                    let arguments = [
+                        path.display().to_string(),
+                        "/remove:d".into(),
+                        "*S-1-1-0".into(),
+                    ];
+                    match run_icacls(&arguments.each_ref().map(String::as_str)) {
+                        Ok(output) if output.status.success() => {}
+                        other => eprintln!(
+                            "could not restore the ACL on {}: {other:?}; {} may survive in \
+                             the temporary directory",
+                            path.display(),
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+
+        impl Drop for DeniedReplace {
+            fn drop(&mut self) {
+                self.restore();
+            }
+        }
+
+        fn run_icacls(arguments: &[&str]) -> std::io::Result<std::process::Output> {
+            std::process::Command::new("icacls.exe")
+                .args(arguments)
+                .output()
         }
 
         fn icacls(arguments: &[&str]) {
-            let output = std::process::Command::new("icacls.exe")
-                .args(arguments)
-                .output()
-                .expect("icacls is present on every Windows");
+            let output = run_icacls(arguments).expect("icacls is present on every Windows");
             assert!(
                 output.status.success(),
                 "icacls {arguments:?} failed: {}{}",
@@ -3076,7 +3160,7 @@ mod tests {
                 .parent()
                 .expect("the guard has a directory")
                 .to_path_buf();
-            deny_delete(&guard, &directory);
+            let mut denied = DeniedReplace::new(&guard, &directory, AlsoDeny::Nothing);
 
             let error = store
                 .store(&other_token())
@@ -3118,7 +3202,7 @@ mod tests {
             assert!(strays.is_empty(), "a refused store left {strays:?}");
 
             // And the first operator's value is untouched.
-            allow_delete_again(&guard, &directory);
+            denied.restore();
             assert_eq!(stored(&store), exposed(&fixture_token()));
 
             // With the denial lifted, the same call succeeds -- which is what
@@ -3128,6 +3212,65 @@ mod tests {
                 .store(&other_token())
                 .expect("stored once allowed again");
             assert_eq!(stored(&store), exposed(&other_token()));
+        }
+
+        /// The ordering the fix is built around: the refusal is made **before**
+        /// anything is encrypted or written.
+        ///
+        /// The test above cannot tell. The rename path re-derives the identical
+        /// diagnosis — on `PermissionDenied` it calls `cannot_replace` itself —
+        /// so moving the probe back behind the write leaves all five message
+        /// assertions and the `kind()` assertion passing, and `discard` removes
+        /// the temporary either way, so the `strays` assertion does not catch it
+        /// either. The property stated at `store`'s call site and twice in the
+        /// module documentation was asserted by nothing: the same shape as the
+        /// zero fill that could be deleted with the suite staying green.
+        ///
+        /// [`AlsoDeny::Creation`] closes that. With `FILE_ADD_FILE` denied on
+        /// the directory:
+        ///
+        /// - a probe that runs **first** still produces the remedy, because it
+        ///   only reads the target's ACL, and nothing has been written;
+        /// - a probe that runs **after** the write never runs at all, because
+        ///   `create_protected_file` dies first with a bare denial that carries
+        ///   no remedy in it.
+        ///
+        /// So this pins the ordering rather than the wording.
+        #[test]
+        fn the_refusal_is_made_before_anything_is_written() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+            store
+                .store(&fixture_token())
+                .expect("the first operator stores");
+
+            let guard = store.guard();
+            let directory = guard
+                .parent()
+                .expect("the guard has a directory")
+                .to_path_buf();
+            let _denied = DeniedReplace::new(&guard, &directory, AlsoDeny::Creation);
+
+            let error = store
+                .store(&other_token())
+                .expect_err("nothing can be created here, so nothing can be stored");
+
+            let rendered = error.to_string();
+            for expected in [
+                "one machine-scoped credential per host",
+                "auth logout",
+                "elevated",
+                "--start-at login",
+                "Nothing was written",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "the refusal does not name {expected:?}. With creation denied, the only \
+                     way to produce that text is a check that ran BEFORE the write -- so this \
+                     message came from `create_protected_file` instead, and the store reached \
+                     the write before it refused: {rendered}"
+                );
+            }
         }
 
         /// Finding 3: the DPAPI output buffer is zeroed before it is freed.
