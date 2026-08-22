@@ -158,14 +158,16 @@ pub enum OwnershipError {
 ///   for the restart case, where a pre-registration attempt is found after the
 ///   agent restarts.
 ///
-/// Those edges are also what make six of the eight [`FailureReason`] variants
+/// Those edges are also what make seven of the nine [`FailureReason`] variants
 /// reachable at all — `JitRequestFailed`, `JitExpired`,
-/// `RunnerPackageUnverified`, `RunnerVersionRejected`, `ProcessStartFailed` and
-/// `RegistrationTimedOut` each occur at a pre-registration state.
-/// `03-control-flows.md` flow 2 names the first five as conditions the agent
-/// must record; `RegistrationTimedOut` is named by no document and is this
-/// crate's own, added because [`recovery_decision`] needs to say "alive, past
-/// its deadline, still unregistered" without calling it a crash.
+/// `RunnerPackageUnverified`, `RunnerVersionRejected`, `ProcessStartFailed`,
+/// `RegistrationTimedOut` and `TerminatedAfterRegistrationTimeout` each occur at
+/// a pre-registration state. `03-control-flows.md` flow 2 names the first five
+/// as conditions the agent must record; the last two are named by no document
+/// and are this crate's own, added because [`recovery_decision`] needs to say
+/// "alive, past its deadline, still unregistered" without calling it a crash,
+/// and because `e3` then needs to say what became of that runner without
+/// calling a process it stopped itself either a crash or still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -344,6 +346,32 @@ pub enum FailureReason {
     /// fixes, and an operator sent to the wrong one of the two loses the time
     /// this distinction exists to save.
     RegistrationTimedOut,
+    /// The agent stopped a runner process that had not registered inside its
+    /// startup window.
+    ///
+    /// **The dead-process counterpart of [`Self::RegistrationTimedOut`], and it
+    /// exists because that one cannot be reused here.** By the time this reason
+    /// is recorded the process is gone — the agent signalled it — so rendering
+    /// "the runner process is running but did not register" would tell an
+    /// operator a process is up that they can see is not. That is the same false
+    /// liveness claim [`Self::ProcessExitedUnexpectedly`]'s documentation says
+    /// spends the credibility of every other message this product prints, and
+    /// `tests::no_decision_calls_a_dead_process_live` is what holds the line.
+    ///
+    /// **It points where [`Self::RegistrationTimedOut`] points, not where
+    /// [`Self::ProcessExitedUnexpectedly`] points.** The runner never reached
+    /// GitHub — a proxy, a firewall, a DNS answer, an expired or wrong-scoped
+    /// configuration — and the exit is the agent's own doing rather than
+    /// evidence of a crash. An operator sent to logs and exit codes for this is
+    /// investigating the wrong machine.
+    ///
+    /// **Who records it.** `e3`, and only `e3`. [`recovery_decision`] cannot
+    /// derive it: a process this agent killed and a process that crashed on its
+    /// own present the *same* [`RecoveryObservation`], so the distinguishing
+    /// fact has to be journalled as terminate-intent before the signal is sent
+    /// and read back afterwards. See [`RecoveryDecision::Terminate`] for the
+    /// window that obligation closes.
+    TerminatedAfterRegistrationTimeout,
     /// Anything else. Must carry no credential.
     Other(String),
 }
@@ -355,7 +383,7 @@ impl FailureReason {
     /// *variant*; no consumer should read the string out of this constant.
     ///
     /// **This list is hand-written, and what keeps it honest is not its own
-    /// length.** A length written as `8` next to eight elements asserts
+    /// length.** A length written as `9` next to nine elements asserts
     /// nothing — that was the defect in the assertion this constant replaced.
     /// What catches a new variant is the exhaustive, wildcard-free `match` in
     /// `tests::earliest_state_producing`, which stops the test target compiling
@@ -366,6 +394,14 @@ impl FailureReason {
     /// and then adds it to *neither* this constant nor the test's `cases` table,
     /// gets a green suite with the variant untested. Adding it to exactly one of
     /// the two fails the length check; adding it to neither does not.
+    ///
+    /// Re-measured when `TerminatedAfterRegistrationTimeout` was added, because
+    /// a gap described once and never re-run is a gap nobody knows still exists.
+    /// With the variant declared and both match arms written but neither list
+    /// touched, `cargo test -p runner-manager-domain` was green — its lib target
+    /// reported `128 passed; 0 failed` — with the ninth variant unreachable and
+    /// untested. Adding it to this constant alone then failed the length check
+    /// with `left: 8 / right: 9`.
     ///
     /// **And the compiler never points at this constant.** A `const` array is
     /// unaffected by a new variant, so nothing here errors. What stops the
@@ -384,7 +420,7 @@ impl FailureReason {
     /// invocation are markedly worse to read and to `rustdoc`. That is a
     /// legibility trade, deliberately taken — not an impossibility. If the
     /// documentation ever thins out, the macro is the better answer.
-    pub const ALL: [FailureReason; 8] = [
+    pub const ALL: [FailureReason; 9] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
         FailureReason::RunnerPackageUnverified,
@@ -392,6 +428,7 @@ impl FailureReason {
         FailureReason::ProcessStartFailed,
         FailureReason::ProcessExitedUnexpectedly,
         FailureReason::RegistrationTimedOut,
+        FailureReason::TerminatedAfterRegistrationTimeout,
         FailureReason::Other(String::new()),
     ];
 }
@@ -419,6 +456,14 @@ impl fmt::Display for FailureReason {
             FailureReason::RegistrationTimedOut => f.write_str(
                 "the runner process is running but did not register with GitHub \
                  before its startup deadline",
+            ),
+            // Past tense, and no claim that anything is still running: by the
+            // time this is recorded the agent has signalled the process and the
+            // operator can see it is gone. `tests::a_terminated_runner_is_never
+            // _described_as_running` pins that.
+            FailureReason::TerminatedAfterRegistrationTimeout => f.write_str(
+                "the agent stopped the runner process after it failed to \
+                 register with GitHub before its startup deadline",
             ),
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
@@ -1106,9 +1151,34 @@ pub enum RecoveryDecision {
     /// distinguishing fact exists only at the moment terminate-intent is formed,
     /// and the only way to carry it across a crash is to write it down. `e3`
     /// journals the intent *before* it signals the process, and on a later pass
-    /// concludes an attempt it finds so marked with `RegistrationTimedOut`
-    /// rather than with whatever this function derived from an observation that
-    /// could not know. Until `e3` does that, the window stands.
+    /// concludes an attempt it finds so marked with
+    /// [`FailureReason::TerminatedAfterRegistrationTimeout`] rather than with
+    /// whatever this function derived from an observation that could not know.
+    /// Until `e3` does that, the window stands.
+    ///
+    /// **Why that closure needs a reason of its own, and not
+    /// `RegistrationTimedOut`.** On the pass where `e3` reads the mark back, the
+    /// process is dead — `e3` killed it, which is the whole reason the mark is
+    /// there. `RegistrationTimedOut` renders as "the runner process is running
+    /// but did not register", so concluding with it would print exactly the
+    /// false liveness claim the paragraph above rejects option A for: the same
+    /// sentence, about a process an operator can see is gone, moved one pass
+    /// later. Rewording that string instead is not open either —
+    /// `tests::the_two_starting_failures_read_differently_to_an_operator` pins
+    /// it on "running", which is correct for the live case it names.
+    ///
+    /// [`FailureReason::TerminatedAfterRegistrationTimeout`] is that reason.
+    /// It is true of a dead process, it says who stopped it and why, and it
+    /// sends an operator to the networking and configuration fix rather than to
+    /// a crash investigation — which is the whole distinction
+    /// [`FailureReason::RegistrationTimedOut`] was split out to draw. Nothing in
+    /// this function derives it, and nothing should: it is a claim about an
+    /// action this agent took, not about anything a [`RecoveryObservation`]
+    /// reports. `tests::no_decision_calls_a_dead_process_live` covers it
+    /// alongside the other two liveness-claiming reasons, so the day something
+    /// here does start deriving it — which it legitimately might, once the mark
+    /// is journalled where this function can read it — it may only do so beside
+    /// a process the observation says is gone.
     ///
     /// **The one thing this does not bound** is a process that refuses to die.
     /// The slot is held until it does. That is a worse outcome than concluding
@@ -1245,10 +1315,15 @@ pub fn recovery_decision(
             // fact that would separate the two is not in this function's
             // inputs -- a killed process and a crashed one are the same
             // observation -- so the fix is `e3` journalling terminate-intent
-            // before signalling, not a rearrangement here. See
-            // `RecoveryDecision::Terminate`, which names the trade and the
-            // owner, and `tests::no_decision_calls_a_dead_process_live`, which
-            // reds if somebody closes it here instead.
+            // before signalling and concluding the marked attempt with
+            // `FailureReason::TerminatedAfterRegistrationTimeout`, not a
+            // rearrangement here. That reason exists precisely because the
+            // process is gone by then, so the closure cannot reuse
+            // `RegistrationTimedOut` without printing the same false liveness
+            // claim one pass later. See `RecoveryDecision::Terminate`, which
+            // names the trade and the owner, and
+            // `tests::no_decision_calls_a_dead_process_live`, which reds if
+            // somebody closes it here instead.
             G::NotRegistered => {
                 if !observation.process_alive {
                     RecoveryDecision::Conclude(AttemptOutcome::failed(
@@ -1768,10 +1843,17 @@ mod tests {
     /// assertion was `7 == 7` and could not fail. Measured on the code as it
     /// stood, adding an eighth variant produced exactly one error — `E0004` from
     /// `Display`'s match — and once that arm was written the suite was green
-    /// with the new variant unreachable and untested. Here, a ninth variant
+    /// with the new variant unreachable and untested. Here, a tenth variant
     /// stops this file compiling until somebody says which state produces it,
     /// and `all_failure_reasons_are_reachable_from_the_state_that_produces_them`
     /// then proves the answer.
+    ///
+    /// Re-measured on the ninth. Declaring
+    /// `TerminatedAfterRegistrationTimeout` and changing nothing else produced
+    /// exactly one error, `E0004` at `Display`'s match; writing that arm
+    /// produced exactly one more, `E0004` here; writing this one left
+    /// `cargo check --all-targets --workspace` clean. Two stops, in that order,
+    /// and no third — which is what the note above each of them promises.
     fn earliest_state_producing(reason: &FailureReason) -> AttemptState {
         // The second place a new variant stops the compiler, and the last one.
         // `FailureReason::ALL` is a const array, so it errors nowhere at all:
@@ -1793,6 +1875,11 @@ mod tests {
             // The live-but-unregistered process past its startup deadline; see
             // the `S::Starting` / `G::NotRegistered` arm of `recovery_decision`.
             FailureReason::RegistrationTimedOut => AttemptState::Starting,
+            // The same attempt one step later: still `starting`, because the
+            // agent acts on the `Terminate` payload without moving the state
+            // first, and the process it signalled is the one that never
+            // registered.
+            FailureReason::TerminatedAfterRegistrationTimeout => AttemptState::Starting,
             FailureReason::Other(_) => AttemptState::Busy,
         }
     }
@@ -1810,7 +1897,7 @@ mod tests {
         // The table is written out rather than derived so each pairing carries
         // its reason; `earliest_state_producing` above is what makes a new
         // variant a compile error, and the two are cross-checked below.
-        let cases: [(FailureReason, AttemptState); 8] = [
+        let cases: [(FailureReason, AttemptState); 9] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -1831,6 +1918,12 @@ mod tests {
             ),
             // A live runner that never reached GitHub inside its startup window.
             (FailureReason::RegistrationTimedOut, AttemptState::Starting),
+            // The same runner after `e3` acted on the `Terminate` payload: the
+            // attempt never left `starting`, so this is where it concludes from.
+            (
+                FailureReason::TerminatedAfterRegistrationTimeout,
+                AttemptState::Starting,
+            ),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
                 AttemptState::Busy,
@@ -2861,27 +2954,50 @@ mod tests {
             )),
             "pinned as the current behaviour of a known-wrong window, not as a \
              correct answer: `e3` closes it by journalling terminate-intent \
-             before signalling, and `RecoveryDecision::Terminate` names the \
-             trade and the owner"
+             before signalling and concluding the marked attempt with \
+             `TerminatedAfterRegistrationTimeout`, which is true of the dead \
+             process this pass is looking at. `RecoveryDecision::Terminate` \
+             names the trade and the owner"
         );
     }
 
     #[test]
     fn no_decision_calls_a_dead_process_live() {
         // `RegistrationTimedOut` renders as "the runner process is running but
-        // did not register", and `ProcessExitedUnexpectedly` is documented
-        // "only for a process that is actually gone". Both are claims about
-        // liveness, and `RecoveryObservation::process_alive` is the only source
-        // of truth for it, so each reason may only ever appear beside the
-        // observation that supports it.
+        // did not register", `ProcessExitedUnexpectedly` is documented "only for
+        // a process that is actually gone", and
+        // `TerminatedAfterRegistrationTimeout` says the agent stopped the
+        // process. All three are claims about liveness, and
+        // `RecoveryObservation::process_alive` is the only source of truth for
+        // it, so each reason may only ever appear beside the observation that
+        // supports it.
         //
         // This is also the guard on the `Terminate` window's residual. The
         // rejected fix for that window -- reach for `RegistrationTimedOut` in
         // the dead-process arm at `starting` once `elapsed >= startup` --
-        // compiles, and passes every other test in this file, because every
-        // other test fixes the observation it asks about. It reds here. That is
-        // why the argument against it is written as a test and not only as a
-        // paragraph.
+        // compiles, and reds three tests. Measured by applying it:
+        //
+        //  * here, at `starting at +120s with NotRegistered and a process the
+        //    observation says is gone was reported as still running`;
+        //  * `a_live_unregistered_runner_past_its_deadline_is_stopped_before_
+        //    its_slot_returns`, at the assertion that pins the known-wrong
+        //    window as current behaviour;
+        //  * `a_pre_registration_attempt_waits_until_its_deadline_then_
+        //    concludes`, with `left: Conclude(Failed { reason:
+        //    RegistrationTimedOut })` against `right: Conclude(Failed { reason:
+        //    ProcessExitedUnexpectedly })`.
+        //
+        // The third is the strongest of the three and is worth naming ahead of
+        // this one. It is not a guard written to catch this mistake: it is a
+        // real scenario already in the suite -- flow 2's "runner exit before job
+        // acceptance", process dead, elapsed 121s against a 120s startup window
+        // -- which the rejected fix relabels `RegistrationTimedOut`. So the
+        // objection is not only that a synthetic sweep dislikes the change; an
+        // ordinary early crash, observed after a restart longer than the startup
+        // window, gets reported as a runner that is still running. This test
+        // remains the argument's *general* form, because it holds the claim at
+        // every state, every observation and both sides of every deadline rather
+        // than at one scenario.
         let timeouts = RecoveryTimeouts::new(
             Elapsed::seconds(60),
             Elapsed::seconds(120),
@@ -2897,6 +3013,12 @@ mod tests {
             GithubRunnerObservation::Registered { busy: true },
             GithubRunnerObservation::Unreachable,
         ];
+
+        // Set by the third arm below, and asserted `false` after the sweep. It
+        // is what keeps that arm from being a vacuous assertion nobody notices
+        // has stopped meaning anything: today the arm is unreached, and this
+        // says so out loud rather than leaving it to be assumed.
+        let mut agent_termination_derived_here = false;
 
         for state in AttemptState::ALL {
             for github in observations {
@@ -2931,12 +3053,91 @@ mod tests {
                                 "{state} at +{offset}s with {github:?} reported an \
                                  unexpected exit for a process that is alive"
                             ),
+                            // Nothing here derives this one today -- it is
+                            // `e3`'s, recorded after reading its own journalled
+                            // terminate-intent back, which is why the flag above
+                            // records that the arm was reached at all. It is not
+                            // idle cover: once the mark is journalled somewhere
+                            // `recovery_decision` can read it, deriving the
+                            // reason here becomes legitimate, and this is what
+                            // stops that derivation landing beside a process the
+                            // observation reports as still running.
+                            Some(FailureReason::TerminatedAfterRegistrationTimeout) => {
+                                agent_termination_derived_here = true;
+                                assert!(
+                                    !process_alive,
+                                    "{state} at +{offset}s with {github:?} said the agent had \
+                                     stopped a process the observation reports as alive"
+                                );
+                            }
                             _ => {}
                         }
                     }
                 }
             }
         }
+
+        // The division of labour, asserted rather than described. The reason
+        // that names an agent-initiated stop is not derivable from an
+        // observation -- a process this agent killed and one that crashed on its
+        // own look identical to `recovery_decision` -- so it must not appear
+        // anywhere in the sweep above. If it ever does, the fact that separates
+        // the two cases has become an input, and `RecoveryDecision::Terminate`'s
+        // deferred obligation is either discharged or wrong; either way somebody
+        // should be reading that doc rather than passing this test by accident.
+        assert!(
+            !agent_termination_derived_here,
+            "`recovery_decision` derived `TerminatedAfterRegistrationTimeout`, \
+             which is `e3`'s to record from journalled terminate-intent and not \
+             this function's to infer from an observation that cannot know"
+        );
+    }
+
+    #[test]
+    fn a_terminated_runner_is_never_described_as_running() {
+        // The `Display` half of the same argument. `e3` concludes the window in
+        // `RecoveryDecision::Terminate`'s doc with this reason, on a pass where
+        // the process is already dead, so its rendering may not claim otherwise.
+        // Reusing `RegistrationTimedOut` there -- the closure this file used to
+        // promise -- would have printed "the runner process is running but did
+        // not register" about a process the operator can see is gone: the same
+        // false liveness claim option A is rejected for, one pass later.
+        let terminated = FailureReason::TerminatedAfterRegistrationTimeout.to_string();
+        assert!(
+            !terminated.contains("running"),
+            "this reason is only ever recorded about a process the agent has \
+             already stopped: {terminated}"
+        );
+        assert!(
+            !terminated.contains("exited unexpectedly"),
+            "and nothing exited unexpectedly either -- the agent stopped it on \
+             purpose: {terminated}"
+        );
+        assert!(
+            terminated.contains("stopped") && terminated.contains("register"),
+            "it has to say both what happened to the process and why, or it \
+             sends an operator to a crash investigation: {terminated}"
+        );
+
+        // Distinct from both neighbours, in the variant and in the string. A
+        // reason that renders identically to another is a reason `g2` cannot
+        // use to send an operator anywhere different.
+        assert_ne!(
+            terminated,
+            FailureReason::RegistrationTimedOut.to_string(),
+            "the live and the stopped case must read differently"
+        );
+        assert_ne!(
+            terminated,
+            FailureReason::ProcessExitedUnexpectedly.to_string()
+        );
+        assert!(
+            !matches!(
+                FailureReason::TerminatedAfterRegistrationTimeout,
+                FailureReason::Other(_)
+            ),
+            "a known, named condition must not travel through the escape hatch"
+        );
     }
 
     #[test]
