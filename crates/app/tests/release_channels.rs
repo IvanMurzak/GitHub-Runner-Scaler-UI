@@ -1048,16 +1048,32 @@ fn install_wrapper(node: &Path, root: &Path, with_platform_package: bool) -> Pat
         .expect("the platform manifest");
 
         // ----------------------------------------------------------------
-        // THE STAND-IN BINARY IS `node` ITSELF.
+        // THE STAND-IN BINARY IS `node`, REACHED TWO DIFFERENT WAYS.
         // ----------------------------------------------------------------
         // The shim's job is to pass argv through and hand back the child's
         // exit code, and proving that needs a child that can be TOLD what to
-        // print and what to exit with. A shell script cannot be that on
-        // Windows -- `spawnSync` will not start a `.exe` that is really a
-        // batch file -- and a real runner-manager binary is not built by this
-        // test. Copying node makes one executable serve every platform:
-        // invoked as `runner-manager -e "<script>"` it is a programmable
-        // child.
+        // print and what to exit with. Invoked as `runner-manager -e
+        // "<script>"`, node is exactly that programmable child. Reaching it
+        // differs by platform, because node itself is not relocatable
+        // everywhere.
+        //
+        // On Windows the stand-in must be a real executable -- `spawnSync`
+        // will not start a `.exe` that is really a batch file -- and node.exe
+        // relocates cleanly, so it is linked or copied into place.
+        //
+        // Everywhere else it must NOT be relocated. GitHub's macOS node is a
+        // dynamically linked build whose `@rpath/libnode.*.dylib` resolves
+        // beside the executable, so a copy in a temporary directory dies at
+        // `dyld: Library not loaded` before it runs a single line. A shebang
+        // wrapper leaves the binary where its libraries are, and is just as
+        // programmable. It also sidesteps the symlink trap that preceded this:
+        // `node_or_skip` returns the PATH entry verbatim, and on those images
+        // it is a symlink whose target is written RELATIVE to the directory
+        // holding it -- `hard_link` resolves to `linkat` without
+        // `AT_SYMLINK_FOLLOW`, so linking it reproduced the link, whose
+        // relative target then resolved against the temporary directory and
+        // dangled. `spawnSync` reported ENOENT for a path that was plainly
+        // there. Canonicalising first is what makes the exec'd path real.
         // `node_or_skip` returns the PATH entry verbatim, and on two of the
         // three runner images that entry is a SYMLINK whose target is written
         // relative to the directory holding it. `hard_link` resolves to
@@ -1073,8 +1089,27 @@ fn install_wrapper(node: &Path, root: &Path, with_platform_package: bool) -> Pat
         // which is why this only ever bit where the hard link SUCCEEDED.
         let source = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
         let destination = bin.join(binary_name);
-        if std::fs::hard_link(&source, &destination).is_err() {
-            std::fs::copy(&source, &destination).expect("copying node as the stand-in binary");
+        if cfg!(windows) {
+            if std::fs::hard_link(&source, &destination).is_err() {
+                std::fs::copy(&source, &destination).expect("copying node as the stand-in binary");
+            }
+        } else {
+            std::fs::write(
+                &destination,
+                format!(
+                    "#!/bin/sh
+exec '{}' \"$@\"
+",
+                    source.display()
+                ),
+            )
+            .expect("writing the stand-in wrapper");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))
+                    .expect("the stand-in must be executable");
+            }
         }
     }
 
