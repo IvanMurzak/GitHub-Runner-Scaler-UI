@@ -1,0 +1,19 @@
+crates/app/tests/release_channels.rs
+  s_1b329c8675e8dd::t_c1968b6343c334 1051,1055-1076,1092-1112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "98798497fa5a3157c19476ee1b9ca49032b18fc1",
+  "prompts": {},
+  "sessions": {
+    "s_1b329c8675e8dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2689d90-6b58-413b-986a-98948442988b",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
