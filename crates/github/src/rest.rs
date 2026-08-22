@@ -147,6 +147,30 @@ pub const RUNNER_INVENTORY_REQUESTS_PER_REFRESH: u32 = 1;
 /// Workflow runs are a per-repository resource. There is no organization-wide
 /// workflow-runs endpoint, so an organization pays this once per repository the
 /// App is installed on.
+///
+/// # This is the best case, not the worst one
+///
+/// One request is what a repository costs **when GitHub sends `total_count`**,
+/// which is the ordinary answer from the workflow-runs endpoint and the reason
+/// the figure is `1`. When it is absent the count falls back to walking pages,
+/// and that walk may spend up to [`MAX_ACTIVITY_FALLBACK_PAGES`] — so the true
+/// worst case per repository per refresh is **four**, not one.
+///
+/// The gap is stated rather than modelled, deliberately, and the same way
+/// [`RUNNER_INVENTORY_REQUESTS_PER_REFRESH`] states that a paginated inventory
+/// costs more than the one request it claims. But it is worth naming here
+/// because things are built on top of it: `f1`'s `host show` headroom and `f2`'s
+/// `add` refusals both read *this* constant, so both are projecting the
+/// best case. A target sitting at the edge of what `f2` will allow could
+/// overrun by up to 4x on repositories whose counts take the fallback.
+///
+/// [`BUDGET_SHARE_DIVISOR`] is what absorbs this: the projection is compared
+/// against half the ceiling precisely so that the half this model does not
+/// attempt to count has somewhere to go. The fallback is also bounded and
+/// **says when it was reached** — a repository that walked to the ceiling lands
+/// in [`ActivityCount::truncated`] — so an overrun is visible rather than
+/// silent. That visibility, not the number `1`, is what makes the projection
+/// honest.
 pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = 1;
 
 /// The most pages one repository's in-progress count may walk when GitHub sends
@@ -182,6 +206,34 @@ const _: () = assert!(
     MAX_ACTIVITY_FALLBACK_PAGES < MAX_PAGES,
     "the activity page budget must stay below the runaway `Link`-cycle ceiling"
 );
+
+/// How far GitHub's `total_count` may exceed the single page it arrived with
+/// before the disagreement stops being a race and starts being evidence.
+///
+/// The tripwire in `RestInventory::repository_in_progress` has two very
+/// different customers, and they are separated by *size* rather than by
+/// existence:
+///
+/// * The **benign race** — a run finishing between GitHub computing
+///   `total_count` and serialising the page — makes `total` exceed `listed` by a
+///   handful. It is documented, it is real, and a debug build pointed at live
+///   GitHub during `c4`'s development is the build most likely to meet it.
+/// * The **defect being hunted** — `total_count` carrying the *unfiltered*
+///   lifetime total instead of the filtered one — is gross: thousands over a
+///   page of three, which is exactly the shape
+///   `a_total_count_that_disagrees_with_its_only_page_is_caught` pins at 5,000
+///   over 3.
+///
+/// So the always-on `warn!` fires on any disagreement at all, and the
+/// `debug_assert!` fires only past this threshold. An assert that fired on both
+/// would panic a development build over a race its own documentation calls
+/// legitimate — and a tripwire that cries wolf is a tripwire the next reader
+/// deletes, which costs the real check.
+///
+/// Only the *upward* gap is gated. `total` coming in **below** `listed` means a
+/// run started after the total was computed, which is the same race in the other
+/// direction and never the unfiltered-total defect, so it stays a `warn!` alone.
+const MAX_BENIGN_TOTAL_COUNT_SKEW: u64 = 16;
 
 /// Requests one demand poll costs, **per repository**: the queued runs, then
 /// their jobs.
@@ -422,6 +474,26 @@ impl RateLimited {
         // that direction, because a false "not a lockout" costs nothing. Here
         // the same test would positively assert a rate limit, which it cannot
         // support.
+        //
+        // # The residual this trade leaves, recorded rather than fixed
+        //
+        // Making the message the *sole* discriminator within `403` has a cost,
+        // and it is one-directional: a genuine exhausted-quota `403` whose body
+        // did not parse into a `message` — an empty body, an intermediary's own
+        // error page, a shape GitHub has not sent before — is reported as
+        // `Forbidden`. No window is latched, and the client goes on spending
+        // against a quota that is already dead until the hour rolls over.
+        //
+        // There is no header-only discriminator to fall back on:
+        // `x-ratelimit-remaining: 0` rides on the permissions refusal too, which
+        // is exactly what
+        // `a_permissions_403_that_lands_on_an_exhausted_quota_is_still_forbidden`
+        // demonstrates. So the trade is forced — the only choice is which way to
+        // be wrong when the message is missing. Being wrong toward "permissions"
+        // costs this one target its requests for the rest of the hour. Being
+        // wrong toward "rate limit" latches a window that silences *every*
+        // target, waiting out a grant that will never arrive. The narrower harm
+        // is chosen deliberately.
         if status != 429 && !says_rate_limit {
             return None;
         }
@@ -1075,12 +1147,45 @@ impl ActivityCount {
         Self::new(BTreeMap::from([(repository, count)]))
     }
 
+    /// Mark `repository`'s count a **floor** rather than a total.
+    ///
+    /// The programmable counterpart to what the fallback walk does when it stops
+    /// at [`MAX_ACTIVITY_FALLBACK_PAGES`], and it exists so that the incomplete
+    /// case is reachable from outside this module at all. [`Self::new`] and
+    /// [`Self::of`] were the only public constructors; both yield an empty
+    /// `truncated` **and** an empty `unavailable`, and the fields are private —
+    /// so [`Self::is_complete`] could only ever be `true` for a caller holding a
+    /// hand-built count, and every downstream consumer that renders the `false`
+    /// path had no way to write a test for it.
+    #[must_use]
+    pub fn with_truncated(mut self, repository: OwnerRepo) -> Self {
+        self.truncated.insert(repository);
+        self
+    }
+
+    /// Record a repository the count could not read, and why.
+    ///
+    /// The counterpart to [`Self::with_truncated`] for the *other* cause of an
+    /// incomplete count — see [`Self::is_complete`] for why the two are not
+    /// interchangeable. Deliberately does **not** insert a zero into
+    /// [`Self::per_repository`]: a repository that could not be counted is
+    /// unknown, not idle, and flattening it to zero is the exact defect
+    /// [`UnavailableRepository`] exists to prevent.
+    #[must_use]
+    pub fn with_unavailable(mut self, repository: OwnerRepo, reason: impl Into<String>) -> Self {
+        self.unavailable.push(UnavailableRepository {
+            repository,
+            reason: reason.into(),
+        });
+        self
+    }
+
     /// In-progress workflow runs across every repository in scope.
     ///
     /// A **floor** rather than a total when [`Self::truncated`] is non-empty,
-    /// and short by an unknown amount when [`Self::unavailable`] is. Both are
-    /// [`Self::is_complete`], which is the one question a caller rendering this
-    /// number has to ask.
+    /// and short by an unknown amount when [`Self::unavailable`] is. Both make
+    /// [`Self::is_complete`] `false`, which is the one question a caller
+    /// rendering this number has to ask.
     #[must_use]
     pub fn total(&self) -> u32 {
         self.per_repository.values().copied().sum()
@@ -1126,6 +1231,25 @@ impl ActivityCount {
     /// to ask about truncation separately is a caller that will forget, which is
     /// the same argument `is_repository_local_failure` makes about stepping over
     /// the only repository in scope.
+    ///
+    /// # `false` has two causes, and they have opposite remedies
+    ///
+    /// One question is right for *rendering* the number. It is not enough for
+    /// *acting* on it, because the two ways a count can be incomplete point in
+    /// opposite directions:
+    ///
+    /// * [`Self::truncated`] — the count is a **lower bound**. The repository
+    ///   answered and there is at least this much work in progress, so scaling
+    ///   **up** from it is sound; the real figure is only ever larger.
+    /// * [`Self::unavailable`] — the count is **unknown**. Nothing was learned
+    ///   about that repository, and a missing count is not a zero. Scaling on it
+    ///   is guessing.
+    ///
+    /// So a caller that reads `false` as a uniform "do nothing" stalls scale-up
+    /// on a repository that is demonstrably busy — the truncated case is
+    /// *evidence of load*, not absence of it. Ask this question to decide
+    /// whether to caveat the number; ask [`Self::truncated`] versus
+    /// [`Self::unavailable`] to decide what to do about it.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.unavailable.is_empty() && self.truncated.is_empty()
@@ -1275,6 +1399,12 @@ pub struct InventorySnapshot {
 /// runner deletion. That is what [`BUDGET_SHARE_DIVISOR`] is for: the
 /// projection is compared against half the ceiling, and the other half absorbs
 /// everything this model deliberately does not attempt to count.
+///
+/// It also prices each repository's activity count at its **best case** of one
+/// request. A count that has to take the no-`total_count` fallback costs up to
+/// [`MAX_ACTIVITY_FALLBACK_PAGES`] — see
+/// [`ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which `f1` and `f2` read
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetCost {
     scope: TargetScope,
@@ -2053,12 +2183,18 @@ impl RestInventory {
                      filtered query; this layer reads `total_count` as the count of the \
                      filtered set, and that reading looks wrong"
                 );
+                // The `warn!` above fires on any disagreement; this does not, and
+                // the asymmetry is the whole point — see
+                // `MAX_BENIGN_TOTAL_COUNT_SKEW`. A handful over is the race this
+                // check's own doc calls legitimate; thousands over is the
+                // unfiltered total it was written to catch.
                 debug_assert!(
-                    total == listed,
-                    "`total_count` ({total}) must equal the {listed} run(s) on the only \
-                     page of a filtered query; if it does not, `total_count` is not the \
-                     filtered count and every in-progress figure — and `c4`'s demand — \
-                     is being read off the wrong field"
+                    total <= listed.saturating_add(MAX_BENIGN_TOTAL_COUNT_SKEW),
+                    "`total_count` ({total}) exceeds the {listed} run(s) on the only page \
+                     of a filtered query by more than {MAX_BENIGN_TOTAL_COUNT_SKEW}, which \
+                     is far past the run-finishing-mid-serialisation race; `total_count` \
+                     is not the filtered count, and every in-progress figure — and `c4`'s \
+                     demand — is being read off the wrong field"
                 );
             }
             return Ok(RepositoryActivity::from_reported_total(total, repository));
@@ -3071,6 +3207,51 @@ mod tests {
         );
     }
 
+    /// The narrowing: the race this check's **own documentation** calls
+    /// legitimate must not panic the build most likely to meet it.
+    ///
+    /// A run finishing between GitHub computing `total_count` and serialising
+    /// the page leaves `total` a handful over `listed`. That is benign, it is
+    /// real, and a debug build pointed at live GitHub during `c4`'s development
+    /// is precisely where it shows up. While the assert read `total == listed`
+    /// it fired on this too — so the tripwire's *only* observable behaviour in
+    /// development would have been a false positive, which is how a real check
+    /// gets deleted by the next reader.
+    ///
+    /// Pinned at the boundary rather than one over, so that shrinking
+    /// [`MAX_BENIGN_TOTAL_COUNT_SKEW`] reds this test instead of silently
+    /// narrowing the race window.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_total_count_within_the_benign_skew_does_not_panic_a_debug_build() {
+        let listed = 3_usize;
+        let total = listed as u64 + MAX_BENIGN_TOTAL_COUNT_SKEW;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(total), listed)))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("the documented race is an answer, not a panic");
+
+        assert_eq!(
+            activity.total(),
+            u32::try_from(total).expect("the fixture total fits"),
+            "the reported total is still what the layer reads"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "and noticing the skew must stay free"
+        );
+    }
+
     /// The check is scoped to the page that *is* the whole set. A total larger
     /// than one page is the ordinary case and must stay silent.
     #[tokio::test]
@@ -3272,6 +3453,85 @@ mod tests {
             .expect("the back-off elapsed");
         assert_eq!(inventory.len(), 1);
         assert_eq!(requests_seen(&server).await, 2);
+    }
+
+    /// `get`'s `cancel.check()` runs **before** the rate-limit gate, and that
+    /// ordering is the one effect the check does not share with `run`.
+    ///
+    /// Everywhere else the two overlap: a token flipped before or during a
+    /// request is caught by `run`'s biased `select!` whether or not `check` ran
+    /// first. Inside a **latched back-off window** it cannot be, because `get`
+    /// returns at the suppression branch without ever reaching `run`. Delete the
+    /// `check` and this call is answered [`InventoryError::RateLimited`] — a
+    /// caller that has already navigated away is told to wait out a back-off it
+    /// is never coming back for, and `f1`'s countdown would render for a refresh
+    /// nobody asked for any more.
+    ///
+    /// That is the real content of "removing `check` alone reds nothing": before
+    /// this test, the guard's only non-redundant behaviour was the one behaviour
+    /// nothing exercised.
+    #[tokio::test]
+    async fn a_cancelled_call_inside_a_latched_window_is_cancelled_not_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(
+                        json!({ "message": "You have exceeded a secondary rate limit" }),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway(&server, clock.clone());
+
+        // Latch the window with a live token, exactly as an ordinary refresh
+        // would.
+        let live = CancelToken::new();
+        let first = gateway
+            .list_runners(&repo_target(), &live)
+            .await
+            .expect_err("GitHub is rate limiting");
+        assert!(first.is_rate_limited(), "{first}");
+        assert_eq!(
+            gateway.rate_limit_backoff(),
+            Some(Duration::from_secs(120)),
+            "the window has to actually be open, or this test proves nothing"
+        );
+
+        // Same gateway, same open window — but this caller has withdrawn.
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let error = gateway
+            .list_runners(&repo_target(), &cancelled)
+            .await
+            .expect_err("a cancelled call is still an error");
+
+        assert!(
+            error.is_cancelled(),
+            "the answer a withdrawn caller gets is `Cancelled`: {error}"
+        );
+        assert!(
+            !error.is_rate_limited(),
+            "answering `RateLimited` tells a caller that navigated away to wait out a \
+             back-off it will never return for; the suppression branch must not \
+             outrank the cancellation: {error}"
+        );
+        assert_eq!(
+            requests_seen(&server).await,
+            1,
+            "and neither answer reached the wire: the window suppressed nothing extra \
+             and the cancellation opened no socket"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "the budget accounting agrees: only the call that latched the window spent \
+             anything"
+        );
     }
 
     /// The primary limit: a `403` carrying `x-ratelimit-remaining: 0`. The wait
@@ -3533,15 +3793,29 @@ mod tests {
 
     // -- cancellation -------------------------------------------------------
 
-    /// Cancels a token as it serves a page, which is what makes the
-    /// between-pages case deterministic instead of timed.
+    /// Cancels a token **while a request is in flight**, deterministically.
     ///
-    /// The flip happens inside the mock server while page one is being
-    /// answered, so the walk is guaranteed to have *started* with a live token
-    /// — page one being fetched at all is the proof — and page two is the first
-    /// request the cancellation can possibly stop. A `set_delay` and a spawned
-    /// canceller would test the same thing on a good day and something else on a
-    /// loaded machine.
+    /// wiremock calls `respond` to *build* the template, which is strictly
+    /// before any response byte is written. So the flip lands while the request
+    /// that provoked it is still open, and [`CancelToken::run`]'s biased
+    /// `select!` — whose watch channel wakes the task to force exactly that poll
+    /// — answers `Cancelled` for **that request itself**. Its response is
+    /// dropped unparsed.
+    ///
+    /// # This is the in-flight case, not the between-pages one
+    ///
+    /// It reads like the between-pages case and it is not, which is worth
+    /// stating because this fixture spent a round claiming to be it. A walk cut
+    /// short here never obtains the `Link` header, so it is not *declining* to
+    /// follow page two — it never saw page two offered. All the outward
+    /// assertions (`is_cancelled`, one request seen, one request issued) hold
+    /// identically under both mechanisms, which is precisely why they cannot
+    /// tell them apart.
+    ///
+    /// [`RestInventory::headroom`] is what separates them: it is written only in
+    /// `get`'s `Ok(response)` arm, so it stays `None` here and is `Some` in
+    /// `cancelling_between_pages_stops_the_walk`. The two tests assert opposite
+    /// sides of that one observable, and neither can pass as the other.
     struct CancelWhileServingPage {
         token: CancelToken,
         next_page: String,
@@ -3552,21 +3826,41 @@ mod tests {
         fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
             self.token.cancel();
             ResponseTemplate::new(200)
+                // Carried so that the discriminator is *available* to be
+                // observed and is still absent. `headroom` staying `None` when
+                // the response plainly offered it is what proves this response
+                // was never parsed at all.
+                .insert_header("x-ratelimit-limit", "5000")
+                .insert_header("x-ratelimit-remaining", "4999")
+                .insert_header("x-ratelimit-reset", "1787274000")
                 .insert_header("link", link_next(&self.next_page).as_str())
                 .set_body_json(self.body.clone())
         }
     }
 
-    /// A token flipped **between pages** stops the walk there, rather than
-    /// spending the shared budget on pages nobody will read.
+    /// A token flipped **while a page is in flight** abandons that page, and
+    /// spends nothing after it.
     ///
-    /// The walk begins un-cancelled, fetches page one from inside
-    /// `collect_pages`, and the token flips while that page is in flight. Page
-    /// two is offered by a `Link` header and must never be asked for. This is
-    /// the case `RestInventory::get`'s own doc calls "the one the shared budget
-    /// cares about", and the case a long organization walk actually hits.
+    /// The walk begins un-cancelled and fetches page one; the token flips inside
+    /// the mock server, so `CancelToken::run` abandons page one's own request
+    /// and its response is dropped unparsed. Page two is offered by a `Link`
+    /// header that the walk consequently never reads, and must never be asked
+    /// for either way.
+    ///
+    /// This is [`CancelToken::run`]'s half of the guard — "a cancellation
+    /// arriving mid-flight is not noticed until the response does", as
+    /// `RestInventory::get`'s doc puts it. The between-pages half is
+    /// `cancelling_between_pages_stops_the_walk`, which needs a seam this
+    /// fixture cannot provide; the `headroom` assertion below is what keeps the
+    /// two from being mistaken for each other.
+    ///
+    /// Distinct from `cancelling_an_in_flight_request_abandons_it`, which
+    /// asserts *promptness* — that the walk does not sit out a 20-second
+    /// response — and pays a spawned canceller and a wall-clock bound to do it.
+    /// This one asserts the *observable consequence* of abandoning, that the
+    /// response is never parsed, and is deterministic.
     #[tokio::test]
-    async fn cancelling_between_pages_stops_the_walk() {
+    async fn a_cancellation_landing_mid_request_drops_the_response_unparsed() {
         let server = MockServer::start().await;
         let cancel = CancelToken::new();
         Mock::given(method("GET"))
@@ -3612,9 +3906,157 @@ mod tests {
             1,
             "and the budget accounting agrees with the wire"
         );
+        assert!(
+            gateway.headroom().is_none(),
+            "the response carried `x-ratelimit-*` and they were never read, which is what \
+             `abandoned in flight` means: `get` returned `Cancelled` from `run` without \
+             reaching its `Ok` arm. `Some` here would mean page one was actually parsed \
+             and this test had silently become the between-pages case"
+        );
     }
 
-    /// The neighbouring case, and the one the test above used to be.
+    /// The seam the between-pages property needs: a token flipped **while no
+    /// request is in flight**.
+    ///
+    /// Cancelling from the mock server cannot express it. wiremock builds the
+    /// template before writing a byte, so that flip always lands mid-request and
+    /// `run` abandons the very page that triggered it — see
+    /// [`CancelWhileServingPage`]. A `set_delay` plus a spawned canceller would
+    /// hit the right window on an idle machine and the wrong one on a loaded
+    /// one, which is a coin-flip dressed as a test.
+    ///
+    /// Parsing is the seam. `collect_pages` calls `into_items` after `get` has
+    /// returned `Ok` for the page in hand — `headroom` already recorded — and
+    /// before it reads the `Link` header or issues anything further. There is no
+    /// socket open at that instant, so a token flipped here is flipped *exactly*
+    /// between pages, by construction rather than by timing.
+    ///
+    /// The token travels in a static because `serde` builds this type and cannot
+    /// be handed one. Only `cancelling_between_pages_stops_the_walk` arms it, and
+    /// it is `take`n on first use so a second page could not re-trigger it.
+    static CANCEL_WHILE_PARSING: std::sync::Mutex<Option<CancelToken>> =
+        std::sync::Mutex::new(None);
+
+    /// A [`WirePage`] that is byte-identical to [`RunnersPage`] on the wire and
+    /// flips [`CANCEL_WHILE_PARSING`] as `collect_pages` unwraps it.
+    #[derive(Debug, Deserialize)]
+    struct CancelOnParsePage {
+        total_count: Option<u64>,
+        #[serde(default)]
+        runners: Vec<RawRunner>,
+    }
+
+    impl WirePage for CancelOnParsePage {
+        type Item = RawRunner;
+        const WHAT: &'static str = "runners";
+
+        fn reported_total(&self) -> Option<u64> {
+            self.total_count
+        }
+
+        fn into_items(self) -> Vec<Self::Item> {
+            if let Some(token) = CANCEL_WHILE_PARSING
+                .lock()
+                .expect("the parse-time cancel seam is not poisoned")
+                .take()
+            {
+                token.cancel();
+            }
+            self.runners
+        }
+    }
+
+    /// A token flipped **between pages** stops the walk there, rather than
+    /// spending the shared budget on pages nobody will read.
+    ///
+    /// The walk begins un-cancelled and fetches page one. Page one is served
+    /// completely, parsed, and its `Link: rel="next"` really is in hand — the
+    /// `headroom` assertion below is the proof, since `get` writes it only on
+    /// the `Ok` path. *Then* the token flips, with nothing in flight. Page two
+    /// is therefore a request the walk is in a position to make and **declines**
+    /// to, which is the actual property: this is the case `RestInventory::get`'s
+    /// doc calls "the one the shared budget cares about", and the case a long
+    /// organization walk hits.
+    ///
+    /// Driven through `collect_pages` rather than `list_runners` because the
+    /// seam is the page type, and `list_runners` fixes that to [`RunnersPage`].
+    /// The walk under test is the same one either way — `list_runners` is a thin
+    /// wrapper over this call — and the between-pages decision lives entirely in
+    /// `collect_pages` and `get`.
+    #[tokio::test]
+    async fn cancelling_between_pages_stops_the_walk() {
+        let server = MockServer::start().await;
+        let page_two = format!("{}/page/2", server.uri());
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // Read on the `Ok` path, and the discriminator that
+                    // separates this test from the in-flight one.
+                    .insert_header("x-ratelimit-limit", "5000")
+                    .insert_header("x-ratelimit-remaining", "4999")
+                    .insert_header("x-ratelimit-reset", "1787274000")
+                    .insert_header("link", link_next(&page_two).as_str())
+                    .set_body_json(runner_page(1..101, 200)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(101..201, 200)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let cancel = CancelToken::new();
+        *CANCEL_WHILE_PARSING
+            .lock()
+            .expect("the parse-time cancel seam is not poisoned") = Some(cancel.clone());
+
+        assert!(
+            !cancel.is_cancelled(),
+            "the walk has to start live, or this is a test of page zero"
+        );
+
+        let first = ApiRequest::get(REPO_RUNNERS).query("per_page", PER_PAGE);
+        // Matched rather than `expect_err`: `Collected` is a private walk result
+        // that does not derive `Debug`, and a test is not a reason to widen it.
+        let error = match gateway
+            .collect_pages::<CancelOnParsePage>(first, &cancel)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the token was flipped between page one and page two"),
+        };
+
+        assert!(error.is_cancelled(), "{error}");
+        assert!(
+            cancel.is_cancelled(),
+            "page one was parsed, which is what flipped the token"
+        );
+        assert!(
+            gateway.headroom().is_some(),
+            "page one's response must have been parsed for this to be the between-pages \
+             case at all; `headroom` is written only in `get`'s `Ok` arm, so `None` here \
+             would mean page one was cancelled in flight and the walk never saw the \
+             `Link` header it is supposed to decline to follow"
+        );
+        assert_eq!(
+            requests_seen(&server).await,
+            1,
+            "page one, and nothing after it: the `Link` header offered page two and the \
+             walk declined to spend the request"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "and the budget accounting agrees with the wire"
+        );
+    }
+
+    /// The neighbouring case, and the one the between-pages test used to be.
     ///
     /// A walk handed a token that is *already* cancelled stops before page one
     /// rather than between pages. Worth keeping — it is what a caller that

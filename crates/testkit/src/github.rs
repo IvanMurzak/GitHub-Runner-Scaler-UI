@@ -44,7 +44,7 @@
 //! consumer that started polling per repository when it used to poll per target.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -191,6 +191,11 @@ pub enum FakeCall {
 struct FakeState {
     runners: BTreeMap<ScaleTarget, Vec<Runner>>,
     activity: BTreeMap<OwnerRepo, u32>,
+    /// Repositories whose count is a **floor**, as the bounded fallback walk
+    /// leaves them.
+    truncated_activity: BTreeSet<OwnerRepo>,
+    /// Repositories that cannot be counted at all, and the reason each gives.
+    unavailable_activity: BTreeMap<OwnerRepo, String>,
     downloads: Vec<RunnerDownload>,
     queued_failures: VecDeque<FakeFailure>,
     latched_failure: Option<FakeFailure>,
@@ -270,6 +275,64 @@ impl FakeGithub {
     #[must_use]
     pub fn with_in_progress(self, repository: OwnerRepo, count: u32) -> Self {
         self.lock().activity.insert(repository, count);
+        self
+    }
+
+    /// This repository's in-progress count as a **floor** rather than a total.
+    ///
+    /// What the real gateway produces when GitHub sends no `total_count` and the
+    /// fallback walk stops at its page bound: the repository answered, `floor`
+    /// runs were counted, and there may be more.
+    ///
+    /// # Why this exists
+    ///
+    /// [`ActivityCount::is_complete`] has two causes for `false` and, until this
+    /// builder, the fake could produce **neither**. `ActivityCount::new` and
+    /// `::of` were the only public constructors, both yield an empty `truncated`
+    /// *and* an empty `unavailable`, and the fields are private — so every count
+    /// this fake returned was unconditionally complete, and a consumer rendering
+    /// the incomplete path could not write a test for it at all.
+    ///
+    /// Pair with [`Self::with_unavailable_repository`], and keep the two
+    /// distinct: a floor is a lower bound that is safe to scale **up** from, an
+    /// unavailable repository is unknown and is not.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_truncated_in_progress(self, repository: OwnerRepo, floor: u32) -> Self {
+        let mut state = self.lock();
+        state.activity.insert(repository.clone(), floor);
+        state.truncated_activity.insert(repository);
+        drop(state);
+        self
+    }
+
+    /// A repository the activity count cannot read at all, and why.
+    ///
+    /// Reported through [`ActivityCount::unavailable`] rather than as a zero,
+    /// which is the distinction the real aggregate makes and the one a consumer
+    /// most needs a fixture for: a repository that could not be counted is
+    /// unknown, not idle. It is therefore left **out** of
+    /// [`ActivityCount::per_repository`] entirely, exactly as the real gateway
+    /// leaves it, so a consumer that reads the map directly sees the same
+    /// absence in the fake as in production.
+    ///
+    /// The request is still charged. The real gateway spends one before learning
+    /// the repository is unreadable, and a fixture that charged nothing would
+    /// under-report the budget a consumer is asserting against.
+    ///
+    /// # Panics
+    /// If a previous holder panicked while the state lock was held.
+    #[must_use]
+    pub fn with_unavailable_repository(
+        self,
+        repository: OwnerRepo,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.lock()
+            .unavailable_activity
+            .insert(repository, reason.into());
         self
     }
 
@@ -557,15 +620,29 @@ impl InventoryGateway for FakeGithub {
         // An organization reaching ten repositories costs ten, and a consumer
         // asserting otherwise should fail here rather than in production.
         state.requests_issued += u64::try_from(scope.repositories().len()).unwrap_or(u64::MAX);
+
+        // An unavailable repository is left out of the counts rather than
+        // folded in as zero, which is what the real aggregate does: nothing was
+        // learned about it, and a missing count is not an idle one.
         let counts = scope
             .repositories()
             .iter()
+            .filter(|repository| !state.unavailable_activity.contains_key(*repository))
             .map(|repository| {
                 let count = state.activity.get(repository).copied().unwrap_or(0);
                 (repository.clone(), count)
             })
             .collect();
-        Ok(ActivityCount::new(counts))
+
+        let mut activity = ActivityCount::new(counts);
+        for repository in scope.repositories() {
+            if let Some(reason) = state.unavailable_activity.get(repository) {
+                activity = activity.with_unavailable(repository.clone(), reason.clone());
+            } else if state.truncated_activity.contains(repository) {
+                activity = activity.with_truncated(repository.clone());
+            }
+        }
+        Ok(activity)
     }
 
     async fn runner_downloads(
@@ -599,8 +676,101 @@ mod tests {
         OwnerRepo::parse("octo/dashboard").expect("a valid owner/repo")
     }
 
+    fn other_repo() -> OwnerRepo {
+        OwnerRepo::parse("octo/api").expect("a valid owner/repo")
+    }
+
     fn target() -> ScaleTarget {
         ScaleTarget::Repository(repo())
+    }
+
+    fn org_scope(repositories: impl IntoIterator<Item = OwnerRepo>) -> ActivityScope {
+        ActivityScope::organization(
+            runner_manager_domain::model::Org::new("octo-org").expect("a valid organization login"),
+            repositories,
+        )
+    }
+
+    /// The fake can produce an **incomplete** count, which until now it could
+    /// not do at all.
+    ///
+    /// `ActivityCount`'s only public constructors both yield empty `truncated`
+    /// and empty `unavailable` over private fields, so every count this fake
+    /// returned was unconditionally complete and `is_complete() == false` was
+    /// unreachable from any consumer's test. A fixture that cannot produce a
+    /// state is a fixture that hides every bug in rendering it.
+    #[tokio::test]
+    async fn a_truncated_count_is_a_floor_that_says_so() {
+        let gateway = FakeGithub::new().with_truncated_in_progress(repo(), 400);
+
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a truncated count is an answer, not a failure");
+
+        assert_eq!(activity.total(), 400, "the floor is still a number");
+        assert!(
+            !activity.is_complete(),
+            "a count clipped by the page bound must not read as exact"
+        );
+        assert!(activity.is_truncated(&repo()));
+        assert!(
+            activity.unavailable().is_empty(),
+            "truncated is not unavailable: this repository answered, and its answer is a \
+             floor that is safe to scale up from"
+        );
+        assert_eq!(gateway.requests_issued(), 1);
+    }
+
+    /// The other cause of `is_complete() == false`, and the one with the
+    /// opposite remedy: unknown rather than a lower bound.
+    #[tokio::test]
+    async fn an_unavailable_repository_is_reported_as_unknown_not_as_zero() {
+        let gateway = FakeGithub::new()
+            .with_in_progress(repo(), 3)
+            .with_unavailable_repository(other_repo(), "repository archived");
+
+        let activity = gateway
+            .in_progress_activity(&org_scope([repo(), other_repo()]), &CancelToken::new())
+            .await
+            .expect("an aggregate steps over a repository it cannot read");
+
+        assert!(!activity.is_complete());
+        assert!(
+            activity.truncated().is_empty(),
+            "unavailable is not truncated: nothing at all was learned here"
+        );
+        assert_eq!(activity.unavailable().len(), 1);
+        assert_eq!(activity.unavailable()[0].repository, other_repo());
+        assert_eq!(activity.unavailable()[0].reason, "repository archived");
+        assert_eq!(
+            activity.for_repository(&other_repo()),
+            None,
+            "a repository that could not be counted is absent from the map, not present \
+             as a zero -- a zero would render a possibly-busy repository as idle"
+        );
+        assert_eq!(activity.total(), 3, "and the total is only what was read");
+        assert_eq!(
+            gateway.requests_issued(),
+            2,
+            "the request that discovered the repository was unreadable was still spent"
+        );
+    }
+
+    /// The default stays complete, so the incomplete path is something a test
+    /// opts into rather than something it trips over.
+    #[tokio::test]
+    async fn an_unprogrammed_count_is_complete() {
+        let gateway = FakeGithub::new().with_in_progress(repo(), 2);
+
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("readable");
+
+        assert!(activity.is_complete());
+        assert!(activity.truncated().is_empty());
+        assert!(activity.unavailable().is_empty());
     }
 
     /// The page accounting a consumer's budget assertions rest on.
