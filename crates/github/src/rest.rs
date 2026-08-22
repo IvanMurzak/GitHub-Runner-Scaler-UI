@@ -63,8 +63,10 @@
 //! 2. **It is surfaced, never hidden** (`04-subsystem-contracts.md`, "Rate
 //!    limiting increases the refresh delay and is displayed, never hidden").
 //!    [`RateLimited`] is a displayable state carrying what GitHub said, and
-//!    [`RefreshState::retry_delay`] is the number `e1` adds to its refresh
-//!    interval.
+//!    [`RefreshState::retry_delay`] is the **absolute floor** on when `e1` may
+//!    try again — `next_attempt_at = now + retry_delay`, not the ordinary
+//!    interval plus that. Adding it would only wait longer than necessary: this
+//!    gateway already enforces the window itself, at no request cost.
 //! 3. **A rate limit is never confused with a permissions answer.** See
 //!    [`RateLimited::detect`]: GitHub sends `x-ratelimit-*` on *every* response,
 //!    so "remaining is zero" alone would turn an ordinary `404` into a rate
@@ -86,7 +88,7 @@
 //! exactly that factor, which is the one error this model exists to prevent.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     sync::{
@@ -146,6 +148,32 @@ pub const RUNNER_INVENTORY_REQUESTS_PER_REFRESH: u32 = 1;
 /// workflow-runs endpoint, so an organization pays this once per repository the
 /// App is installed on.
 pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = 1;
+
+/// The most pages one repository's in-progress count may walk when GitHub sends
+/// no `total_count`.
+///
+/// [`crate::MAX_PAGES`] is the wrong ceiling for this walk, and the distinction
+/// is a budget one rather than a stylistic one. `MAX_PAGES` exists to stop a
+/// `Link: rel="next"` cycle looping *forever*; it is not a number anything
+/// budgeted for. This walk is charged against
+/// [`ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which is **one**, and that
+/// constant is what [`TargetCost`] projects and what `f2` computes its `add`
+/// refusals from.
+///
+/// The arithmetic is why the two cannot share a ceiling. At the 60-second
+/// default a target refreshes 60 times an hour, so the projection budgets 60
+/// requests for one repository's activity count. A fallback allowed to reach
+/// `MAX_PAGES` could spend 6,000 — more than the whole
+/// [`HOURLY_REQUEST_CEILING`], for a single repository's count — which would
+/// make every refusal `f2` computes from the projection a fiction.
+///
+/// Four pages counts 400 in-progress runs exactly, at a worst case of 240
+/// requests/hour against the ~2,500 [`BUDGET_SHARE_DIVISOR`] leaves as slack.
+/// Past that the answer stops being exact and **says so**: the repository lands
+/// in [`ActivityCount::truncated`]. That is what makes a bounded walk honest
+/// rather than merely cheap — an unbounded walk and a silently-clipped one are
+/// both wrong, in opposite directions.
+pub const MAX_ACTIVITY_FALLBACK_PAGES: usize = 4;
 
 /// Requests one demand poll costs, **per repository**: the queued runs, then
 /// their jobs.
@@ -333,17 +361,23 @@ impl RateLimited {
     /// never resolve.
     ///
     /// So the status has to be one GitHub actually rate-limits with — `403` or
-    /// `429` — before the headers are read at all. Within those two:
+    /// `429` — before the headers are read at all. And a `403` is not enough on
+    /// its own, because `403` is *also* how GitHub refuses a missing permission.
+    /// The two questions are therefore answered in order:
     ///
-    /// * `x-ratelimit-remaining: 0` is the primary limit, and takes precedence,
-    ///   because a `429` sent while the hourly quota is exhausted resets on the
-    ///   hourly schedule rather than on a short back-off.
-    /// * a `429` is otherwise the secondary limit.
-    /// * a `403` whose message says "rate limit" is the secondary limit. This is
-    ///   the same evidence [`crate::AuthenticatedClient`] already uses to keep a
-    ///   rate limit from being misreported as an authentication lockout, and
-    ///   reading it the same way here is what keeps the two layers agreeing.
-    /// * anything else is a permissions answer and is **not** a rate limit.
+    /// **Is this a rate limit at all?** Only a `429`, or a `403` whose message
+    /// says "rate limit", qualifies. The message is the same evidence
+    /// [`crate::AuthenticatedClient`] already uses to keep a rate limit from
+    /// being misreported as an authentication lockout, and reading it the same
+    /// way here is what keeps the two layers agreeing. Everything else is a
+    /// permissions answer, **whatever the headers say** — see
+    /// `a_permissions_403_that_lands_on_an_exhausted_quota_is_still_forbidden`.
+    ///
+    /// **Which limit is it?** Now the headers matter.
+    /// `x-ratelimit-remaining: 0` is the primary limit and takes precedence,
+    /// because a `429` sent while the hourly quota is exhausted resets on the
+    /// hourly schedule rather than on a short back-off. Anything else is the
+    /// secondary limit.
     #[must_use]
     pub fn detect(error: &GithubError) -> Option<Self> {
         let (status, message) = match error {
@@ -362,12 +396,33 @@ impl RateLimited {
         let says_rate_limit =
             message.is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"));
 
-        let kind = if remaining == Some(0) {
-            RateLimitKind::Primary
-        } else if status == 429 || says_rate_limit {
-            RateLimitKind::Secondary
-        } else {
+        // *Whether* this is a rate limit is decided before *which* one, and the
+        // headers get no say in the first question. A `403` is GitHub's answer
+        // to a missing grant as well as to an abuse limit, so within `403` the
+        // message is the only evidence that separates them — and
+        // `x-ratelimit-remaining: 0` rides on the permissions refusal too, when
+        // the denial happens to land on the request that exhausted the quota.
+        //
+        // Reading `remaining == 0` first classified that denial as a primary
+        // limit: an operator told to wait out a grant that will never arrive,
+        // and a latched window silencing every other target meanwhile. That is
+        // the same harm the `404` case above avoids, one status code over.
+        //
+        // This is not the inverse of `AuthenticatedClient::is_rate_limited`,
+        // which checks `remaining` first as well. It uses the answer only to
+        // *avoid* misreporting a limit as an authentication lockout — safe in
+        // that direction, because a false "not a lockout" costs nothing. Here
+        // the same test would positively assert a rate limit, which it cannot
+        // support.
+        if status != 429 && !says_rate_limit {
             return None;
+        }
+        let kind = if remaining == Some(0) {
+            // Takes precedence over a `429`: a secondary limit hit while the
+            // hourly quota is also gone resets on the hourly schedule.
+            RateLimitKind::Primary
+        } else {
+            RateLimitKind::Secondary
         };
 
         Some(Self {
@@ -602,13 +657,35 @@ impl RefreshState {
         }
     }
 
-    /// How long `e1` should add to its refresh delay before trying again, or
-    /// `None` when waiting is not what this state needs.
+    /// How long to wait before trying again, or `None` when waiting is not what
+    /// this state needs.
     ///
     /// `04-subsystem-contracts.md`: "Rate limiting increases the refresh delay
     /// and is displayed, never hidden." This is the increase. It is deliberately
     /// `None` for [`RefreshState::Unauthorized`] and
     /// [`RefreshState::Forbidden`], which no amount of waiting fixes.
+    ///
+    /// # An absolute floor, not an addend
+    ///
+    /// The scheduling rule is `next_attempt_at = now + retry_delay`. It is *not*
+    /// the ordinary refresh interval **plus** this — adding the two would double
+    /// the wait for no benefit, because the gateway enforces the same window
+    /// itself: a request issued inside it is answered
+    /// [`InventoryError::RateLimited`] without a socket being opened
+    /// ([`RestInventory::rate_limit_backoff`]).
+    ///
+    /// Trying too early is therefore cheap and self-correcting rather than
+    /// harmful. A suppressed request returns before [`RateLimited::detect`] is
+    /// ever reached, so an early attempt cannot ratchet the window outward by
+    /// this gateway's own silence, and repeated attempts converge on the instant
+    /// GitHub named. What an addend buys is one wasted interval per limit; what
+    /// it costs is a dashboard that stays dark longer than GitHub asked for.
+    ///
+    /// Note also that a [`RefreshState::RateLimited`] read back from
+    /// [`RestInventory::rate_limit_state`] carries the time *remaining*, not the
+    /// delay GitHub originally asked for — so this value shrinks as the window
+    /// elapses, which is another reason it reads as a deadline rather than as an
+    /// increment.
     #[must_use]
     pub fn retry_delay(&self, now: Timestamp) -> Option<Duration> {
         match self {
@@ -941,10 +1018,23 @@ impl ActivityScope {
 /// poll at all. `04-subsystem-contracts.md` and `g2` both require them rendered
 /// as distinct aggregates, and they are distinct types here so that they cannot
 /// be added together by accident.
+/// # A count can be short in two different ways, and both have to say so
+///
+/// A repository can fail to answer at all ([`ActivityCount::unavailable`]), and
+/// a repository can answer with a number that is only a **floor**
+/// ([`ActivityCount::truncated`]) — the fallback walk stopped at
+/// [`MAX_ACTIVITY_FALLBACK_PAGES`], or GitHub's own total was wider than the
+/// `u32` this product renders. [`ActivityCount::is_complete`] is `false` for
+/// either, because `04-subsystem-contracts.md` forbids exactly this shape of
+/// mistake on the other read model — "must never treat a first page as a
+/// complete inventory" — and a count truncated at page four is the same defect
+/// wearing a different endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ActivityCount {
     per_repository: BTreeMap<OwnerRepo, u32>,
     unavailable: Vec<UnavailableRepository>,
+    /// Repositories whose count is a floor rather than a total.
+    truncated: BTreeSet<OwnerRepo>,
 }
 
 /// A repository the aggregate could not read, and why.
@@ -967,6 +1057,7 @@ impl ActivityCount {
         Self {
             per_repository,
             unavailable: Vec::new(),
+            truncated: BTreeSet::new(),
         }
     }
 
@@ -977,6 +1068,11 @@ impl ActivityCount {
     }
 
     /// In-progress workflow runs across every repository in scope.
+    ///
+    /// A **floor** rather than a total when [`Self::truncated`] is non-empty,
+    /// and short by an unknown amount when [`Self::unavailable`] is. Both are
+    /// [`Self::is_complete`], which is the one question a caller rendering this
+    /// number has to ask.
     #[must_use]
     pub fn total(&self) -> u32 {
         self.per_repository.values().copied().sum()
@@ -998,10 +1094,33 @@ impl ActivityCount {
         &self.unavailable
     }
 
-    /// `true` when every repository in scope answered.
+    /// Repositories whose count is a **floor**, not a total.
+    ///
+    /// The counterpart to [`RunnerInventory::truncated`], and here for the same
+    /// reason: a number clipped by a page ceiling that does not say it was
+    /// clipped is indistinguishable from a real one, and `g2` renders this
+    /// number with no other way to find out.
+    #[must_use]
+    pub fn truncated(&self) -> &BTreeSet<OwnerRepo> {
+        &self.truncated
+    }
+
+    /// Whether this repository's count is a floor rather than a total.
+    #[must_use]
+    pub fn is_truncated(&self, repository: &OwnerRepo) -> bool {
+        self.truncated.contains(repository)
+    }
+
+    /// `true` when every repository in scope answered **and** every answer was
+    /// exact.
+    ///
+    /// Deliberately one question rather than two. A caller that has to remember
+    /// to ask about truncation separately is a caller that will forget, which is
+    /// the same argument `is_repository_local_failure` makes about stepping over
+    /// the only repository in scope.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.unavailable.is_empty()
+        self.unavailable.is_empty() && self.truncated.is_empty()
     }
 }
 
@@ -1461,6 +1580,20 @@ impl fmt::Display for Admission {
 /// this one returns that result without calling `work` at all. `work` being
 /// `FnOnce` is what makes "no second request" structural rather than
 /// remembered: the joining path never has a future to poll.
+///
+/// # One instance per target. This is a requirement, not a convention
+///
+/// `last` is a single slot and `generation` is a single counter, so an instance
+/// can only ever be a cache of *one* thing. Sharing one coalescer across two
+/// targets does not merely lose cache hits — it hands target A's caller target
+/// B's snapshot, silently and with no error, because joining a generation that
+/// moved is precisely how this type reports "somebody else already refreshed
+/// what you asked for". Nothing here can detect that the somebody else was
+/// refreshing something different.
+///
+/// `e1` and `g2` therefore hold one instance per [`ScaleTarget`] — keyed by
+/// target in whatever map they already keep — and never one per host. The type
+/// cannot enforce it, which is exactly why it is written down.
 #[derive(Debug)]
 pub struct RefreshCoalescer<T> {
     generation: AtomicU64,
@@ -1866,12 +1999,31 @@ impl RestInventory {
     ///
     /// The fallback matters anyway: a response with no `total_count` is counted
     /// by walking the pages, because guessing zero from a missing field would
-    /// render a busy repository as idle.
+    /// render a busy repository as idle. That walk is bounded by
+    /// [`MAX_ACTIVITY_FALLBACK_PAGES`] rather than [`crate::MAX_PAGES`], and
+    /// stopping at the bound makes the answer inexact rather than merely
+    /// smaller.
+    ///
+    /// # The `total_count` assumption is checked, because checking it is free
+    ///
+    /// Reading the reported total for a *filtered* query assumes that total is
+    /// the count of the filtered set rather than of every run the repository has
+    /// ever had. GitHub documents it that way and this product depends on it —
+    /// but the same envelope reaches `c4`'s `clamp()` on `status=queued`, so the
+    /// assumption is worth more than a dashboard number.
+    ///
+    /// It is checkable with no extra request. When there is no `rel="next"`, the
+    /// whole filtered set is on this page, so `total_count` **must** equal
+    /// `workflow_runs.len()`. A repository with 3 in-progress runs out of 5,000
+    /// lifetime runs would answer `len() == 3`, no `Link`, and
+    /// `total_count == 5000` — a contradiction visible on the first response.
+    /// Discarding that disagreement is what would leave the assumption
+    /// falsifiable only by an operator noticing a wrong number.
     async fn repository_in_progress(
         &self,
         repository: &OwnerRepo,
         cancel: &CancelToken,
-    ) -> Result<u32, InventoryError> {
+    ) -> Result<RepositoryActivity, InventoryError> {
         let request = ApiRequest::get(format!(
             "/repos/{}/{}/actions/runs",
             repository.owner(),
@@ -1883,7 +2035,25 @@ impl RestInventory {
         let response = self.get(&request, cancel).await?;
         let page: RunsPage = response.json()?;
         if let Some(total) = page.total_count {
-            return Ok(u32::try_from(total).unwrap_or(u32::MAX));
+            let listed = page.workflow_runs.len() as u64;
+            if response.next_page().is_none() && total != listed {
+                tracing::warn!(
+                    repository = %repository,
+                    total_count = total,
+                    listed,
+                    "GitHub's `total_count` disagrees with the single page it sent for a \
+                     filtered query; this layer reads `total_count` as the count of the \
+                     filtered set, and that reading looks wrong"
+                );
+                debug_assert!(
+                    total == listed,
+                    "`total_count` ({total}) must equal the {listed} run(s) on the only \
+                     page of a filtered query; if it does not, `total_count` is not the \
+                     filtered count and every in-progress figure — and `c4`'s demand — \
+                     is being read off the wrong field"
+                );
+            }
+            return Ok(RepositoryActivity::from_reported_total(total, repository));
         }
 
         // No `total_count`: count what is there, following pages.
@@ -1893,23 +2063,28 @@ impl RestInventory {
             .next_page()
             .map(|url| ApiRequest::get(url.as_str()));
         while let Some(request) = next.take() {
+            if pages >= MAX_ACTIVITY_FALLBACK_PAGES {
+                tracing::warn!(
+                    repository = %repository,
+                    pages,
+                    counted,
+                    "stopped counting in-progress runs at the activity page budget; the \
+                     count reported for this repository is a floor, not a total"
+                );
+                // A floor, and it says so. Returning it as an exact count is the
+                // defect `04-subsystem-contracts.md` forbids for inventory, on
+                // the other read model.
+                return Ok(RepositoryActivity::floor(counted));
+            }
             let response = self.get(&request, cancel).await?;
             let page: RunsPage = response.json()?;
             counted += page.workflow_runs.len();
             pages += 1;
-            if pages >= MAX_PAGES {
-                tracing::warn!(
-                    repository = %repository,
-                    pages,
-                    "stopped counting in-progress runs at the page ceiling"
-                );
-                break;
-            }
             next = response
                 .next_page()
                 .map(|url| ApiRequest::get(url.as_str()));
         }
-        Ok(u32::try_from(counted).unwrap_or(u32::MAX))
+        Ok(RepositoryActivity::exact(counted))
     }
 
     /// The runners path for either scope.
@@ -1994,14 +2169,21 @@ impl InventoryGateway for RestInventory {
     ) -> Result<ActivityCount, InventoryError> {
         let mut per_repository = BTreeMap::new();
         let mut unavailable = Vec::new();
+        let mut truncated = BTreeSet::new();
         // Only an aggregate steps over a bad repository; see
         // `is_repository_local_failure`.
         let aggregating = scope.target().scope() == TargetScope::Organization;
 
         for repository in scope.repositories() {
             match self.repository_in_progress(repository, cancel).await {
-                Ok(count) => {
-                    per_repository.insert(repository.clone(), count);
+                Ok(activity) => {
+                    per_repository.insert(repository.clone(), activity.count);
+                    if !activity.exact {
+                        // A floor travels with the aggregate rather than being
+                        // flattened into it: one truncated repository makes the
+                        // *total* a floor too, and `g2` has no other way to know.
+                        truncated.insert(repository.clone());
+                    }
                 }
                 Err(error) if aggregating && is_repository_local_failure(&error) => {
                     tracing::warn!(
@@ -2022,6 +2204,7 @@ impl InventoryGateway for RestInventory {
         Ok(ActivityCount {
             per_repository,
             unavailable,
+            truncated,
         })
     }
 
@@ -2067,6 +2250,65 @@ struct Collected<T> {
     reported_total: Option<u64>,
     pages: usize,
     truncated: bool,
+}
+
+/// One repository's in-progress count, and whether that number is the whole
+/// truth.
+///
+/// [`Collected::truncated`]'s counterpart for the activity read model. It exists
+/// so that "the walk stopped early" cannot be dropped on the floor between
+/// [`RestInventory::repository_in_progress`] and the aggregate that renders it:
+/// a `u32` alone has nowhere to carry the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepositoryActivity {
+    count: u32,
+    /// `false` when `count` is a **floor**: the page budget stopped the walk, or
+    /// GitHub's own total was wider than the `u32` this product renders.
+    exact: bool,
+}
+
+impl RepositoryActivity {
+    fn exact(count: usize) -> Self {
+        Self {
+            // A count this layer assembled itself, one page at a time, cannot
+            // exceed `MAX_ACTIVITY_FALLBACK_PAGES * PER_PAGE`. The saturation is
+            // unreachable rather than lossy.
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+            exact: true,
+        }
+    }
+
+    fn floor(count: usize) -> Self {
+        Self {
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+            exact: false,
+        }
+    }
+
+    /// GitHub's own `total_count`, narrowed to the width this product renders.
+    ///
+    /// A total that does not fit a `u32` is not a number to saturate silently:
+    /// `unwrap_or(u32::MAX)` alone would put `4294967295` on a dashboard as
+    /// though it were a measurement. It is still a *floor* — the real count is
+    /// larger, not smaller — so it is reported as one, through the same signal
+    /// the page budget uses.
+    fn from_reported_total(total: u64, repository: &OwnerRepo) -> Self {
+        match u32::try_from(total) {
+            Ok(count) => Self { count, exact: true },
+            Err(_) => {
+                tracing::warn!(
+                    repository = %repository,
+                    total_count = total,
+                    "GitHub reported an in-progress total wider than this product renders; \
+                     it is clamped and reported as a floor rather than as a count"
+                );
+                Self {
+                    count: u32::MAX,
+                    exact: false,
+                }
+            }
+        }
+    }
 }
 
 /// One page of a paginated GitHub collection.
@@ -2457,7 +2699,23 @@ mod tests {
         }
     }
 
+    /// One repository's whole in-progress set, on a single page.
+    ///
+    /// `total_count` and the listed runs **agree**, because that is what GitHub
+    /// sends when there is no `rel="next"` — and it is now the invariant
+    /// `repository_in_progress` checks. These fixtures previously declared a
+    /// `total_count` over an empty `workflow_runs`, which was not a smaller
+    /// fixture but a fixture of a response GitHub does not send; every one of
+    /// them tripped the new check the moment it existed, which is the check
+    /// earning its place before it ever reaches the live API.
     fn mount_runs(repository: &OwnerRepo, total: u64) -> Mock {
+        assert!(
+            total <= u64::from(PER_PAGE),
+            "a single-page fixture cannot hold {total} runs; a larger one needs a \
+             `Link: rel=next` and a second page, or it is claiming a total the page \
+             does not support"
+        );
+        let listed = usize::try_from(total).expect("a fixture total fits a usize");
         Mock::given(method("GET"))
             .and(path(format!(
                 "/repos/{}/{}/actions/runs",
@@ -2465,7 +2723,7 @@ mod tests {
                 repository.repo()
             )))
             .and(query_param("status", "in_progress"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(total), 0)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(total), listed)))
     }
 
     /// A repository target counts its own runs, in one request, from GitHub's
