@@ -272,22 +272,35 @@ fn every_attempt_state_round_trips_byte_identically() {
 #[test]
 fn a_failure_reason_round_trips_including_the_open_ended_one() {
     let store = SqliteStore::open_in_memory().expect("in-memory");
-    let reasons = [
-        FailureReason::JitRequestFailed,
-        FailureReason::JitExpired,
-        FailureReason::RunnerPackageUnverified,
-        FailureReason::RunnerVersionRejected,
-        FailureReason::ProcessStartFailed,
-        FailureReason::ProcessExitedUnexpectedly,
-        // `e3` writes this one to the journal after reading its own
-        // terminate-intent back, so its snake_case serde name is on a real
-        // persistence path and belongs here. This list is hand-maintained and
-        // nothing binds it to `FailureReason::ALL`, which is why
-        // `RegistrationTimedOut` is absent from it -- an omission that predates
-        // this variant and is left alone rather than tidied in passing.
-        FailureReason::TerminatedAfterRegistrationTimeout,
-        FailureReason::Other("the runner package cache was pruned mid-start".to_string()),
-    ];
+    // Derived from `FailureReason::ALL`, not hand-written. The list this
+    // replaces was maintained by hand with nothing binding it to `ALL`, and it
+    // had been missing `RegistrationTimedOut` since the day that variant was
+    // added; `TerminatedAfterRegistrationTimeout` reached it only because
+    // somebody happened to notice. The hole was latent rather than live -- every
+    // variant does round-trip, the absent one included -- but "covered because a
+    // reader was paying attention" is not a property, and deriving makes the
+    // drift impossible: a variant reaches this test the moment it reaches `ALL`.
+    //
+    // What keeps `ALL` itself honest is documented on the constant, and this
+    // test now inherits exactly that guarantee and no more. That is the trade,
+    // stated plainly: coverage here is no longer hand-maintained, and is instead
+    // as complete as `ALL` is.
+    //
+    // **With one substitution, and it is what keeps this test's name true.**
+    // `ALL` carries `Other(String::new())` -- deliberately, since what a caller
+    // enumerates is the variant -- which serialises to `{"other":""}`. Iterating
+    // `ALL` naively would therefore swap the suite's only non-empty free-form
+    // payload for an empty one and quietly weaken the open-ended case this test
+    // is named for, while still passing. So `Other`'s detail is put back and
+    // every other variant is taken as `ALL` gives it. The catch-all arm is the
+    // point rather than a shortcut: an arm per variant would be the same
+    // hand-maintained list in a new costume.
+    let reasons = FailureReason::ALL.map(|reason| match reason {
+        FailureReason::Other(_) => {
+            FailureReason::Other("the runner package cache was pruned mid-start".to_string())
+        }
+        other => other,
+    });
 
     for (index, reason) in reasons.into_iter().enumerate() {
         let attempt = fixtures::attempt()
