@@ -847,11 +847,18 @@ impl RunnerInventory {
     /// The whole reason pagination is mandatory, made checkable: a caller that
     /// wants to refuse to render an incomplete inventory can, and one that
     /// renders it anyway can say so.
+    /// `checked_sub` rather than a `>` test and a subtraction, because
+    /// collecting *more* than GitHub reported is reachable: a `rel="next"` that
+    /// points back at the page it arrived on is answered by the [`MAX_PAGES`]
+    /// ceiling, and by then the same page has been collected a hundred times
+    /// against a `total_count` of one. The eager `then_some` this replaced
+    /// panicked with a subtraction overflow on exactly that path — in a debug
+    /// build, from inside the agent's reconciliation loop.
     #[must_use]
     pub fn missing(&self) -> Option<u64> {
         let total = self.reported_total?;
         let collected = u64::try_from(self.runners.len()).unwrap_or(u64::MAX);
-        (total > collected).then_some(total - collected)
+        total.checked_sub(collected).filter(|missing| *missing > 0)
     }
 }
 
@@ -2111,4 +2118,1403 @@ impl From<RawDownload> for RunnerDownload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{FIXTURE_TOKEN, Script, TestClock};
+    use crate::{Endpoints, UserAccessToken};
+    use secrecy::SecretString;
+    use serde_json::{Value, json};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+
+    // -- fixtures -----------------------------------------------------------
+
+    fn repo() -> OwnerRepo {
+        OwnerRepo::parse("octo/dashboard").expect("a valid owner/repo")
+    }
+
+    fn other_repo() -> OwnerRepo {
+        OwnerRepo::parse("octo/api").expect("a valid owner/repo")
+    }
+
+    fn third_repo() -> OwnerRepo {
+        OwnerRepo::parse("octo/docs").expect("a valid owner/repo")
+    }
+
+    fn repo_target() -> ScaleTarget {
+        ScaleTarget::Repository(repo())
+    }
+
+    fn org_target() -> ScaleTarget {
+        ScaleTarget::organization("octo-org").expect("a valid organization login")
+    }
+
+    const REPO_RUNNERS: &str = "/repos/octo/dashboard/actions/runners";
+    const ORG_RUNNERS: &str = "/orgs/octo-org/actions/runners";
+    const REPO_RUNS: &str = "/repos/octo/dashboard/actions/runs";
+
+    fn runners_path(target: &ScaleTarget) -> &'static str {
+        match target {
+            ScaleTarget::Repository(_) => REPO_RUNNERS,
+            ScaleTarget::Organization(_) => ORG_RUNNERS,
+        }
+    }
+
+    fn gateway(server: &MockServer, clock: Arc<TestClock>) -> RestInventory {
+        let client = AuthenticatedClient::new(
+            Endpoints::for_test_server(&server.uri()).expect("a valid test base"),
+            UserAccessToken::new(SecretString::from(FIXTURE_TOKEN)),
+            clock.clone(),
+        )
+        .expect("the HTTP client builds");
+        RestInventory::new(Arc::new(client), clock)
+    }
+
+    /// A page of runners with ids in `ids`, all online and idle.
+    fn runner_page(ids: std::ops::Range<u64>, total: u64) -> Value {
+        let runners: Vec<Value> = ids
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "name": format!("runner-{id:04}"),
+                    "os": "win",
+                    "status": "online",
+                    "busy": false,
+                    "ephemeral": true,
+                    "labels": [{ "id": 1, "name": "rm-home-win-x64", "type": "read-only" }]
+                })
+            })
+            .collect();
+        json!({ "total_count": total, "runners": runners })
+    }
+
+    fn link_next(url: &str) -> String {
+        format!("<{url}>; rel=\"next\"")
+    }
+
+    async fn requests_seen(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("the mock server records requests")
+            .len()
+    }
+
+    // -- pagination ---------------------------------------------------------
+
+    /// The Definition of Done's first item, at both scopes under one body.
+    ///
+    /// `04-subsystem-contracts.md` forbids treating a first page as a complete
+    /// inventory, and the reason it forbids it rather than merely discouraging
+    /// it is that the failure is silent: 250 runners reported as 100 renders as
+    /// a smaller fleet, not as an error. So the assertion is on the *whole*
+    /// collection, and on the page count that proves three requests were spent
+    /// getting it.
+    ///
+    /// One body over both targets, the way the domain's own
+    /// `repository_and_organization_targets_are_equivalent` runs one body over
+    /// both variants: the scopes differ in the endpoint and in nothing else, and
+    /// a second copy of this test is where that stops being true.
+    #[tokio::test]
+    async fn a_multi_page_runner_inventory_returns_every_runner_at_both_scopes() {
+        for target in [repo_target(), org_target()] {
+            let server = MockServer::start().await;
+            let first = runners_path(&target);
+            let page_two = format!("{}/page/2", server.uri());
+            let page_three = format!("{}/page/3", server.uri());
+
+            Mock::given(method("GET"))
+                .and(path(first))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", link_next(&page_two).as_str())
+                        .set_body_json(runner_page(1..101, 250)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/page/2"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", link_next(&page_three).as_str())
+                        .set_body_json(runner_page(101..201, 250)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/page/3"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(201..251, 250)))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let gateway = gateway(&server, Arc::new(TestClock::default()));
+            let inventory = gateway
+                .list_runners(&target, &CancelToken::new())
+                .await
+                .expect("three pages are readable");
+
+            assert_eq!(
+                inventory.len(),
+                250,
+                "{target}: a first page is not a complete inventory"
+            );
+            assert_eq!(inventory.pages(), 3, "{target}");
+            assert_eq!(inventory.reported_total(), Some(250), "{target}");
+            assert_eq!(
+                inventory.missing(),
+                None,
+                "{target}: pagination collected everything GitHub said existed"
+            );
+            assert!(!inventory.truncated(), "{target}");
+            assert_eq!(inventory.runners()[0].id, 1, "{target}");
+            assert_eq!(inventory.runners()[249].id, 250, "{target}");
+            assert_eq!(gateway.requests_issued(), 3, "{target}");
+        }
+    }
+
+    /// The `Link` header case that silently stopped pagination at page one until
+    /// a review caught it, exercised through *this* module's loop rather than
+    /// only through `c2`'s parser.
+    ///
+    /// A runner query carries `labels=self-hosted,windows` routinely, so the
+    /// next-page URL contains a comma — and a parser that splits the header on
+    /// `,` first tears that URL in half and loses the relation. That this
+    /// module reuses [`crate::ApiResponse::next_page`] rather than writing a
+    /// second reader is what makes it immune; this test is what says so, because
+    /// "we reuse it" is a claim about code that a later edit can quietly falsify.
+    #[tokio::test]
+    async fn a_next_page_url_containing_a_comma_does_not_truncate_the_inventory() {
+        let server = MockServer::start().await;
+        let page_two = format!("{}/page/2?labels=self-hosted,windows", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", link_next(&page_two).as_str())
+                    .set_body_json(runner_page(1..101, 150)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page/2"))
+            .and(query_param("labels", "self-hosted,windows"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(101..151, 150)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let inventory = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect("both pages are readable");
+
+        assert_eq!(inventory.len(), 150, "the comma ended pagination at page 1");
+        assert_eq!(inventory.pages(), 2);
+    }
+
+    /// A collection shorter than GitHub's own `total_count` is reported as
+    /// short, rather than as the inventory.
+    #[tokio::test]
+    async fn an_inventory_shorter_than_the_reported_total_says_how_short() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(1..11, 40)))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let inventory = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect("one page is readable");
+
+        assert_eq!(inventory.len(), 10);
+        assert_eq!(
+            inventory.missing(),
+            Some(30),
+            "GitHub said 40 and pagination found 10; a caller has to be able to see that"
+        );
+    }
+
+    /// A `rel="next"` that never ends is stopped at the ceiling instead of
+    /// wedging the agent's reconciliation loop.
+    #[tokio::test]
+    async fn a_self_referential_next_link_stops_at_the_page_ceiling() {
+        let server = MockServer::start().await;
+        let itself = format!("{}{}", server.uri(), REPO_RUNNERS);
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", link_next(&itself).as_str())
+                    .set_body_json(runner_page(1..2, 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let inventory = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect("the walk terminates");
+
+        assert_eq!(inventory.pages(), MAX_PAGES);
+        assert!(
+            inventory.truncated(),
+            "a truncated walk must say so, or it reads as a complete inventory"
+        );
+        assert_eq!(gateway.requests_issued() as usize, MAX_PAGES);
+    }
+
+    // -- in-progress workflow counts ----------------------------------------
+
+    fn runs_body(total: Option<u64>, listed: usize) -> Value {
+        let runs: Vec<Value> = (0..listed)
+            .map(|i| json!({ "id": i + 1, "status": "in_progress" }))
+            .collect();
+        match total {
+            Some(total) => json!({ "total_count": total, "workflow_runs": runs }),
+            None => json!({ "workflow_runs": runs }),
+        }
+    }
+
+    fn mount_runs(repository: &OwnerRepo, total: u64) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/{}/{}/actions/runs",
+                repository.owner(),
+                repository.repo()
+            )))
+            .and(query_param("status", "in_progress"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(total), 0)))
+    }
+
+    /// A repository target counts its own runs, in one request, from GitHub's
+    /// own `total_count`.
+    #[tokio::test]
+    async fn a_repository_activity_count_is_one_request_and_reads_the_reported_total() {
+        let server = MockServer::start().await;
+        mount_runs(&repo(), 7).expect(1).mount(&server).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::repository(repo());
+        let activity = gateway
+            .in_progress_activity(&scope, &CancelToken::new())
+            .await
+            .expect("the count is readable");
+
+        assert_eq!(activity.total(), 7);
+        assert_eq!(activity.for_repository(&repo()), Some(7));
+        assert!(activity.is_complete());
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "reading `total_count` is what keeps this at the one request the budget \
+             table projects"
+        );
+    }
+
+    /// An organization target aggregates across the repositories the App is
+    /// installed on — because workflow runs are a per-repository resource and
+    /// GitHub publishes no organization-wide runs endpoint.
+    #[tokio::test]
+    async fn an_organization_activity_count_aggregates_across_installed_repositories() {
+        let server = MockServer::start().await;
+        mount_runs(&repo(), 4).mount(&server).await;
+        mount_runs(&other_repo(), 9).mount(&server).await;
+        mount_runs(&third_repo(), 0).mount(&server).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [repo(), other_repo(), third_repo()],
+        );
+        let activity = gateway
+            .in_progress_activity(&scope, &CancelToken::new())
+            .await
+            .expect("every repository answers");
+
+        assert_eq!(activity.total(), 13);
+        assert_eq!(activity.for_repository(&repo()), Some(4));
+        assert_eq!(activity.for_repository(&other_repo()), Some(9));
+        assert_eq!(
+            activity.for_repository(&third_repo()),
+            Some(0),
+            "a repository with no in-progress runs is a zero, not an absence"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            3,
+            "one request per installed repository: this is the cost the budget model \
+             projects and the reason an organization is not a flat per-target constant"
+        );
+    }
+
+    /// The Definition of Done's "they are different numbers with different
+    /// meanings", asserted on one snapshot where they genuinely differ.
+    #[tokio::test]
+    async fn the_in_progress_count_and_the_busy_runner_count_are_distinct() {
+        let server = MockServer::start().await;
+        let runners = json!({
+            "total_count": 5,
+            "runners": (1..=5).map(|id| json!({
+                "id": id,
+                "name": format!("runner-{id}"),
+                "os": "win",
+                "status": "online",
+                // Three of five are executing something.
+                "busy": id <= 3,
+                "ephemeral": true,
+                "labels": []
+            })).collect::<Vec<_>>()
+        });
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runners))
+            .mount(&server)
+            .await;
+        mount_runs(&repo(), 7).mount(&server).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::repository(repo());
+        let snapshot = gateway
+            .snapshot(&scope, &CancelToken::new())
+            .await
+            .expect("both read models are readable");
+
+        assert_eq!(snapshot.runners.len(), 5);
+        assert_eq!(snapshot.runners.busy_count(), 3);
+        assert_eq!(snapshot.runners.online_count(), 5);
+        assert_eq!(snapshot.activity.total(), 7);
+        assert_ne!(
+            u32::try_from(snapshot.runners.busy_count()).unwrap(),
+            snapshot.activity.total(),
+            "a workflow run is not a busy runner; `g2` renders them as separate \
+             aggregates and cannot do that if this layer conflates them"
+        );
+        assert_eq!(snapshot.target, repo_target());
+        assert_eq!(snapshot.observed_at, TestClock::default().now());
+    }
+
+    /// A response with no `total_count` is counted rather than guessed at.
+    #[tokio::test]
+    async fn an_activity_count_without_a_reported_total_counts_the_runs_instead() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(None, 4)))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("the runs are countable");
+
+        assert_eq!(
+            activity.total(),
+            4,
+            "a missing `total_count` must not read as an idle repository"
+        );
+    }
+
+    /// One unreadable repository does not take down an organization's whole
+    /// aggregate, and does not silently vanish from it either.
+    #[tokio::test]
+    async fn a_repository_that_cannot_be_counted_is_reported_as_unavailable_not_as_zero() {
+        let server = MockServer::start().await;
+        mount_runs(&repo(), 6).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/api/actions/runs"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [repo(), other_repo()],
+        );
+        let activity = gateway
+            .in_progress_activity(&scope, &CancelToken::new())
+            .await
+            .expect("one unreadable repository is not fatal to the aggregate");
+
+        assert_eq!(activity.total(), 6);
+        assert_eq!(activity.for_repository(&other_repo()), None);
+        assert!(
+            !activity.is_complete(),
+            "a partial total is usable only when it says it is partial"
+        );
+        assert_eq!(activity.unavailable().len(), 1);
+        assert_eq!(activity.unavailable()[0].repository, other_repo());
+    }
+
+    /// A rate limit hit part-way through an aggregate aborts it, because
+    /// stepping over it would report a total that is short by an unknown amount
+    /// while looking complete.
+    #[tokio::test]
+    async fn a_rate_limit_during_an_aggregate_aborts_it_rather_than_under_reporting() {
+        let server = MockServer::start().await;
+        mount_runs(&repo(), 6).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/api/actions/runs"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(json!({ "message": "You have exceeded a secondary rate limit" })),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [repo(), other_repo(), third_repo()],
+        );
+        let error = gateway
+            .in_progress_activity(&scope, &CancelToken::new())
+            .await
+            .expect_err("a rate limit is systemic, not a fact about one repository");
+
+        assert!(error.is_rate_limited(), "{error}");
+    }
+
+    // -- rate limiting ------------------------------------------------------
+
+    /// The Definition of Done's `retry-after`, obeyed in the only way that costs
+    /// the shared budget nothing: by issuing no request at all.
+    #[tokio::test]
+    async fn retry_after_is_obeyed_by_issuing_no_request_until_it_elapses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(Script::new(vec![
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(json!({ "message": "You have exceeded a secondary rate limit" })),
+                ResponseTemplate::new(200).set_body_json(runner_page(1..2, 1)),
+            ]))
+            .mount(&server)
+            .await;
+
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway(&server, clock.clone());
+        let cancel = CancelToken::new();
+
+        let first = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect_err("GitHub is rate limiting");
+        let limit = first.rate_limited().expect("a distinct rate-limited state");
+        assert_eq!(limit.kind, RateLimitKind::Secondary);
+        assert_eq!(limit.retry_after, Some(Duration::from_secs(120)));
+        assert_eq!(requests_seen(&server).await, 1);
+
+        // The window is open. A second call must not reach the wire.
+        let second = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect_err("the back-off is still running");
+        assert!(second.is_rate_limited(), "{second}");
+        assert_eq!(
+            requests_seen(&server).await,
+            1,
+            "obeying `retry-after` means sending nothing, not sending and waiting"
+        );
+        assert_eq!(
+            gateway.rate_limit_backoff(),
+            Some(Duration::from_secs(120)),
+            "the reported wait is what is left of it"
+        );
+
+        // Part-way through, still suppressed, and the countdown has moved.
+        clock.advance_secs(90);
+        assert!(
+            gateway
+                .list_runners(&repo_target(), &cancel)
+                .await
+                .is_err_and(|error| error.is_rate_limited())
+        );
+        assert_eq!(gateway.rate_limit_backoff(), Some(Duration::from_secs(30)));
+        assert_eq!(requests_seen(&server).await, 1);
+
+        // Elapsed. Traffic resumes.
+        clock.advance_secs(30);
+        assert_eq!(gateway.rate_limit_backoff(), None);
+        let inventory = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect("the back-off elapsed");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(requests_seen(&server).await, 2);
+    }
+
+    /// The primary limit: a `403` carrying `x-ratelimit-remaining: 0`. The wait
+    /// comes from `x-ratelimit-reset`, because a primary limit says *when*
+    /// rather than *how long*.
+    #[tokio::test]
+    async fn an_exhausted_hourly_quota_is_a_distinct_displayable_state() {
+        let server = MockServer::start().await;
+        let now = TestClock::default().now().timestamp();
+        let reset = now + 300;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-limit", "5000")
+                    .insert_header("x-ratelimit-reset", reset.to_string().as_str())
+                    .set_body_json(json!({ "message": "API rate limit exceeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway(&server, clock);
+        let error = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect_err("the quota is gone");
+
+        let limit = *error.rate_limited().expect("a rate-limited state");
+        assert_eq!(limit.kind, RateLimitKind::Primary);
+        assert_eq!(limit.remaining, Some(0));
+        assert_eq!(
+            limit.reset_unix_secs,
+            Some(u64::try_from(reset).unwrap()),
+            "the reset instant is what tells an operator how long this lasts"
+        );
+        assert_eq!(gateway.rate_limit_backoff(), Some(Duration::from_secs(300)));
+
+        // Displayable rather than opaque: a state, a sentence, and a delay `e1`
+        // can add to its refresh interval.
+        let state = RefreshState::from_error(&error);
+        assert_eq!(state, RefreshState::RateLimited(limit));
+        assert!(!state.is_ready());
+        let rendered = state.to_string();
+        assert!(rendered.contains("primary"), "{rendered}");
+        assert!(rendered.contains("Refreshes are delayed"), "{rendered}");
+        assert_eq!(
+            state.retry_delay(TestClock::default().now()),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    /// The false positive this detection is narrowed to avoid.
+    ///
+    /// GitHub attaches `x-ratelimit-*` to **every** response. A `404` that
+    /// happens to arrive on the request that exhausted the quota therefore
+    /// carries `remaining: 0` while having nothing to do with rate limiting —
+    /// and reporting it as one would tell an operator to wait for a repository
+    /// name that will never resolve, while silently latching a back-off that
+    /// suppresses every other target's refresh too.
+    #[tokio::test]
+    async fn a_404_carrying_an_exhausted_remaining_header_is_not_a_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({ "message": "Not Found" })),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let error = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect_err("the repository is not there");
+
+        assert!(!error.is_rate_limited(), "{error}");
+        assert!(
+            gateway.rate_limit_backoff().is_none(),
+            "a 404 must not silence this gateway"
+        );
+        assert!(matches!(
+            RefreshState::from_error(&error),
+            RefreshState::Failed {
+                status: Some(404),
+                ..
+            }
+        ));
+    }
+
+    /// The other false positive: an ordinary permissions refusal.
+    #[tokio::test]
+    async fn a_permissions_403_is_forbidden_and_not_a_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                json!({ "message": "Resource not accessible by integration" }),
+            ))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let error = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect_err("the installation does not grant it");
+
+        assert!(!error.is_rate_limited(), "{error}");
+        assert!(gateway.rate_limit_backoff().is_none());
+        let state = RefreshState::from_error(&error);
+        assert!(
+            matches!(&state, RefreshState::Forbidden { message } if message.as_deref()
+                == Some("Resource not accessible by integration")),
+            "{state:?}: waiting does not fix a missing grant, so it must not be \
+             rendered as something to wait for"
+        );
+        assert_eq!(
+            state.retry_delay(TestClock::default().now()),
+            None,
+            "there is nothing to wait for"
+        );
+    }
+
+    /// A rate limit that names no wait still waits: answering "retry in zero
+    /// seconds" would turn a rate limit into a busy loop against the endpoint
+    /// that asked for quiet.
+    #[test]
+    fn a_rate_limit_with_no_usable_delay_still_backs_off() {
+        let now = TestClock::default().now();
+        let bare = RateLimited {
+            kind: RateLimitKind::Secondary,
+            retry_after: None,
+            remaining: None,
+            reset_unix_secs: None,
+        };
+        assert_eq!(bare.delay_from(now), DEFAULT_RATE_LIMIT_BACKOFF);
+
+        let stale_reset = RateLimited {
+            reset_unix_secs: Some(u64::try_from(now.timestamp() - 60).unwrap()),
+            ..bare
+        };
+        assert_eq!(
+            stale_reset.delay_from(now),
+            DEFAULT_RATE_LIMIT_BACKOFF,
+            "a reset already in the past means the clocks disagree, not that the \
+             limit has lifted"
+        );
+
+        let absurd = RateLimited {
+            retry_after: Some(Duration::from_secs(86_400)),
+            ..bare
+        };
+        assert_eq!(
+            absurd.delay_from(now),
+            MAX_RATE_LIMIT_BACKOFF,
+            "a remote header does not get to decide how long this product stays dark"
+        );
+    }
+
+    /// Rate limiting is "displayed, never hidden" — including before it bites.
+    #[tokio::test]
+    async fn the_hourly_quota_is_read_from_successful_responses_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-limit", "5000")
+                    .insert_header("x-ratelimit-remaining", "4873")
+                    .insert_header("x-ratelimit-reset", "1787274000")
+                    .set_body_json(runner_page(1..3, 2)),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        assert_eq!(gateway.headroom(), None, "nothing observed yet");
+        gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect("readable");
+
+        assert_eq!(
+            gateway.headroom(),
+            Some(RateLimitHeadroom {
+                limit: Some(5_000),
+                remaining: Some(4_873),
+                reset_unix_secs: Some(1_787_274_000),
+            }),
+            "a quota display that only appears once the quota is gone is not a display"
+        );
+    }
+
+    // -- cancellation -------------------------------------------------------
+
+    /// A token flipped between pages stops the walk there, rather than spending
+    /// the shared budget on pages nobody will read.
+    #[tokio::test]
+    async fn cancelling_between_pages_stops_the_walk() {
+        let server = MockServer::start().await;
+        let page_two = format!("{}/page/2", server.uri());
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", link_next(&page_two).as_str())
+                    .set_body_json(runner_page(1..101, 200)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(101..201, 200)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let cancel = CancelToken::new();
+
+        // Cancelled while page one is being read: the walk must not fetch page
+        // two, even though the `Link` header offers it.
+        let first = ApiRequest::get(REPO_RUNNERS).query("per_page", PER_PAGE);
+        let response = gateway
+            .get(&first, &cancel)
+            .await
+            .expect("page one is readable");
+        assert!(response.next_page().is_some(), "page two is on offer");
+        cancel.cancel();
+
+        let error = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect_err("the token is cancelled");
+        assert!(error.is_cancelled(), "{error}");
+        assert_eq!(
+            requests_seen(&server).await,
+            1,
+            "a cancelled walk spends nothing further"
+        );
+    }
+
+    /// Cancellation of a request already on the wire, which is the case a
+    /// between-pages check alone does not cover.
+    #[tokio::test]
+    async fn cancelling_an_in_flight_request_abandons_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(20))
+                    .set_body_json(runner_page(1..2, 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let cancel = CancelToken::new();
+        let token = cancel.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect_err("the caller withdrew");
+        let elapsed = started.elapsed();
+        canceller.await.expect("the canceller completes");
+
+        assert!(error.is_cancelled(), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the request was awaited to completion rather than abandoned: {elapsed:?}"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(
+            CancelToken::new().check().is_ok(),
+            "a fresh token is not cancelled"
+        );
+    }
+
+    // -- runner package downloads -------------------------------------------
+
+    /// The Definition of Done's optional checksum: absent stays absent, and is
+    /// distinguishable from empty.
+    #[tokio::test]
+    async fn an_absent_sha256_checksum_is_absent_and_an_empty_one_is_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/dashboard/actions/runners/downloads"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "os": "win",
+                    "architecture": "x64",
+                    "download_url": "https://example.invalid/win-x64.zip",
+                    "filename": "actions-runner-win-x64.zip",
+                    "sha256_checksum": "abc123"
+                },
+                {
+                    // The field is simply not there.
+                    "os": "osx",
+                    "architecture": "arm64",
+                    "download_url": "https://example.invalid/osx-arm64.tar.gz",
+                    "filename": "actions-runner-osx-arm64.tar.gz"
+                },
+                {
+                    // The field is there and null.
+                    "os": "linux",
+                    "architecture": "x64",
+                    "download_url": "https://example.invalid/linux-x64.tar.gz",
+                    "filename": "actions-runner-linux-x64.tar.gz",
+                    "sha256_checksum": null
+                },
+                {
+                    // The field is there and empty, which is a different fact.
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "download_url": "https://example.invalid/linux-arm64.tar.gz",
+                    "filename": "actions-runner-linux-arm64.tar.gz",
+                    "sha256_checksum": ""
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let downloads = gateway
+            .runner_downloads(&repo_target(), &CancelToken::new())
+            .await
+            .expect("the metadata is readable");
+
+        let windows = downloads
+            .select(Os::Windows, Arch::X64)
+            .expect("selected by OS and architecture");
+        assert_eq!(windows.sha256_checksum(), Some("abc123"));
+
+        let missing = downloads.select(Os::MacOs, Arch::Arm64).expect("selected");
+        assert_eq!(
+            missing.sha256_checksum(),
+            None,
+            "`e2` fails closed on an absent digest, and can only do that if this \
+             layer does not paper the absence over"
+        );
+
+        let null = downloads.select(Os::Linux, Arch::X64).expect("selected");
+        assert_eq!(null.sha256_checksum(), None, "an explicit null is absent too");
+
+        let empty = downloads.select(Os::Linux, Arch::Arm64).expect("selected");
+        assert_eq!(
+            empty.sha256_checksum(),
+            Some(""),
+            "an empty digest is a different fact from a missing one, and \
+             collapsing them would leave `e2` unable to report which it saw"
+        );
+        assert_ne!(
+            empty.sha256_checksum(),
+            missing.sha256_checksum(),
+            "absent and empty must be distinguishable"
+        );
+
+        assert_eq!(
+            downloads.select(Os::Windows, Arch::Arm32),
+            None,
+            "an unpublished pair is refused rather than substituted"
+        );
+        assert_eq!(gateway.requests_issued(), 1, "downloads are not paginated");
+    }
+
+    /// The organization form of the same endpoint.
+    #[tokio::test]
+    async fn runner_downloads_are_read_at_organization_scope_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/octo-org/actions/runners/downloads"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "os": "linux",
+                "architecture": "arm",
+                "download_url": "https://example.invalid/linux-arm.tar.gz",
+                "filename": "actions-runner-linux-arm.tar.gz",
+                "sha256_checksum": "deadbeef"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let downloads = gateway
+            .runner_downloads(&org_target(), &CancelToken::new())
+            .await
+            .expect("readable");
+        assert!(downloads.select(Os::Linux, Arch::Arm32).is_some());
+    }
+
+    // -- runner shape -------------------------------------------------------
+
+    /// The D18 spike's label facts, kept true in the type.
+    #[tokio::test]
+    async fn labels_are_read_as_github_stores_them_and_matched_case_insensitively() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total_count": 2,
+                "runners": [
+                    {
+                        "id": 73,
+                        "name": "rm-d18-spike-ivanpc-1753",
+                        "os": "win",
+                        "status": "offline",
+                        "busy": false,
+                        "ephemeral": true,
+                        // Lower-cased by GitHub, and carrying exactly what was
+                        // requested — no `self-hosted`, no OS, no architecture.
+                        "labels": [
+                            { "id": 1, "name": "rm-home-win-x64", "type": "read-only" },
+                            { "id": 2, "name": "windows", "type": "read-only" }
+                        ]
+                    },
+                    {
+                        "id": 74,
+                        "name": "legacy-persistent",
+                        "os": "Linux",
+                        "status": "provisioning",
+                        "busy": true,
+                        "labels": []
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let inventory = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect("readable");
+
+        let spike = &inventory.runners()[0];
+        assert_eq!(spike.labels, ["rm-home-win-x64", "windows"]);
+        assert!(spike.has_label("Windows"), "GitHub lower-cases what it stores");
+        assert!(spike.has_label("  windows  "));
+        assert!(
+            !spike.has_label("self-hosted"),
+            "no label is added implicitly (D18, point 1)"
+        );
+        assert_eq!(spike.status, RunnerStatus::Offline);
+        assert_eq!(spike.ephemeral, Some(true));
+        assert_eq!(spike.parsed_os(), Some(Os::Windows));
+
+        let legacy = &inventory.runners()[1];
+        assert_eq!(
+            legacy.status,
+            RunnerStatus::Other("provisioning".to_string()),
+            "an unrecognised status is something to display, not something to guess at"
+        );
+        assert_eq!(
+            legacy.ephemeral, None,
+            "absent is not `false`: a runner whose ephemerality is unknown is \
+             exactly the one an operator wants flagged"
+        );
+        assert_eq!(legacy.parsed_os(), Some(Os::Linux));
+        assert!(legacy.busy);
+        assert_eq!(inventory.busy_count(), 1);
+        assert_eq!(inventory.online_count(), 0);
+    }
+
+    // -- coalescing ---------------------------------------------------------
+
+    /// The Definition of Done's coalescing item, measured where it matters: at
+    /// the mock server's request log.
+    ///
+    /// The requirement is a budget one before it is a latency one. `F5` held
+    /// down on the dashboard would otherwise be an operator-driven denial of
+    /// service against a 5,000/hour ceiling shared with the polling that keeps
+    /// runners starting.
+    #[tokio::test]
+    async fn a_manual_refresh_during_an_in_flight_one_coalesces_into_a_single_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(runner_page(1..4, 3)),
+            )
+            .mount(&server)
+            .await;
+        mount_runs(&repo(), 2).mount(&server).await;
+
+        let gateway = Arc::new(gateway(&server, Arc::new(TestClock::default())));
+        let coalescer: Arc<RefreshCoalescer<RefreshState>> = Arc::new(RefreshCoalescer::new());
+        let scope = ActivityScope::repository(repo());
+
+        let refresh = || {
+            let gateway = gateway.clone();
+            let coalescer = coalescer.clone();
+            let scope = scope.clone();
+            async move {
+                coalescer
+                    .refresh(|| async {
+                        RefreshState::from_result(
+                            gateway.snapshot(&scope, &CancelToken::new()).await,
+                        )
+                    })
+                    .await
+            }
+        };
+
+        // The scheduled poll and an operator's manual refresh, together.
+        let (scheduled, manual) = tokio::join!(refresh(), refresh());
+
+        assert_eq!(coalescer.performed(), 1, "one refresh actually ran");
+        assert_eq!(coalescer.joined(), 1, "the other joined it");
+        assert_eq!(scheduled, manual, "and both callers got the same answer");
+        assert!(scheduled.is_ready(), "{scheduled}");
+        assert_eq!(
+            scheduled.snapshot().expect("ready").runners.len(),
+            3,
+            "joining must return the answer, not an empty placeholder"
+        );
+        assert_eq!(
+            requests_seen(&server).await,
+            2,
+            "one refresh is one runners request plus one runs request; a second \
+             refresh would have made it four"
+        );
+        assert_eq!(gateway.requests_issued(), 2);
+        assert_eq!(coalescer.last(), Some(scheduled));
+    }
+
+    /// A refresh that arrives *after* the previous one finished is not a
+    /// coalescing candidate — it is a new refresh, and must issue its own
+    /// requests.
+    #[tokio::test]
+    async fn a_refresh_after_the_previous_one_completed_is_not_coalesced() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(1..2, 1)))
+            .mount(&server)
+            .await;
+        mount_runs(&repo(), 0).mount(&server).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let coalescer: RefreshCoalescer<RefreshState> = RefreshCoalescer::new();
+        let scope = ActivityScope::repository(repo());
+
+        for _ in 0..3 {
+            let state = coalescer
+                .refresh(|| async {
+                    RefreshState::from_result(gateway.snapshot(&scope, &CancelToken::new()).await)
+                })
+                .await;
+            assert!(state.is_ready(), "{state}");
+        }
+
+        assert_eq!(coalescer.performed(), 3);
+        assert_eq!(
+            coalescer.joined(),
+            0,
+            "coalescing an in-flight refresh must not become caching a finished one"
+        );
+        assert_eq!(gateway.requests_issued(), 6);
+    }
+
+    // -- the shared request budget ------------------------------------------
+
+    fn interval(secs: u16) -> RefreshInterval {
+        RefreshInterval::from_secs(secs).expect("at or above the documented floor")
+    }
+
+    /// `04-subsystem-contracts.md`'s per-target table, reproduced exactly.
+    ///
+    /// | Per target, per hour | 60 s default | 30 s floor |
+    /// |---|---|---|
+    /// | demand | ~120 | ~240 |
+    /// | runner inventory | ~60 | ~120 |
+    /// | in-progress workflow count | ~60 | ~120 |
+    /// | **total** | **~240** | **~480** |
+    #[test]
+    fn a_repository_target_costs_the_documented_number_of_requests() {
+        let default = interval(RefreshInterval::DEFAULT_SECS);
+        let floor = interval(RefreshInterval::MIN_SECS);
+
+        assert_eq!(refreshes_per_hour(default), 60);
+        assert_eq!(refreshes_per_hour(floor), 120);
+
+        let target = TargetCost::repository();
+        assert_eq!(target.requests_per_refresh(), 4);
+        assert_eq!(
+            target.requests_per_hour(default),
+            240,
+            "the documented per-target total at the 60-second default"
+        );
+        assert_eq!(
+            target.requests_per_hour(floor),
+            480,
+            "and at the 30-second floor"
+        );
+    }
+
+    /// The Definition of Done's "roughly 10 targets per host at the 60-second
+    /// default and 5 at the 30-second floor".
+    #[test]
+    fn the_projection_reproduces_the_documented_target_ceilings() {
+        assert_eq!(HOURLY_REQUEST_CEILING, 5_000);
+        assert_eq!(budget_allowance(), 2_500, "half the ceiling");
+
+        assert_eq!(
+            BudgetProjection::max_repository_targets(interval(RefreshInterval::DEFAULT_SECS)),
+            10
+        );
+        assert_eq!(
+            BudgetProjection::max_repository_targets(interval(RefreshInterval::MIN_SECS)),
+            5
+        );
+
+        // And the boundary is where the documented ceilings say it is.
+        let default = interval(RefreshInterval::DEFAULT_SECS);
+        let ten = BudgetProjection::new(default, vec![TargetCost::repository(); 10]);
+        assert_eq!(ten.requests_per_hour(), 2_400);
+        assert!(!ten.exceeds_allowance());
+        assert_eq!(ten.headroom(), 100);
+
+        let eleven = BudgetProjection::new(default, vec![TargetCost::repository(); 11]);
+        assert_eq!(eleven.requests_per_hour(), 2_640);
+        assert!(
+            eleven.exceeds_allowance(),
+            "the eleventh repository is the one an operator needs told about"
+        );
+        assert_eq!(eleven.headroom(), 0);
+    }
+
+    /// The correction this task owns: an organization is not a flat per-target
+    /// constant.
+    #[test]
+    fn an_organization_target_costs_materially_more_than_a_repository_target() {
+        let default = interval(RefreshInterval::DEFAULT_SECS);
+        let repository = TargetCost::repository().requests_per_hour(default);
+
+        assert_eq!(
+            TargetCost::organization(1).requests_per_hour(default),
+            repository,
+            "at one installed repository the two models agree exactly, which is \
+             what makes this a refinement of the documented table rather than a \
+             contradiction of it"
+        );
+
+        let ten = TargetCost::organization(10);
+        assert_eq!(ten.requests_per_refresh(), 31);
+        assert_eq!(ten.requests_per_hour(default), 1_860);
+        assert!(
+            ten.requests_per_hour(default) > repository * 7,
+            "an organization on ten repositories costs nearly eight times a \
+             repository target; projecting it flat understates the real spend by \
+             exactly that factor"
+        );
+
+        // Which is why the refusal arrives far earlier for an organization.
+        let empty = BudgetProjection::new(default, Vec::new());
+        assert!(empty.admit(TargetCost::repository()).is_admitted());
+        assert!(empty.admit(TargetCost::organization(13)).is_admitted());
+        let refusal = empty.admit(TargetCost::organization(14));
+        assert!(
+            !refusal.is_admitted(),
+            "a single organization on fourteen repositories already exceeds a \
+             host's whole share of the budget"
+        );
+    }
+
+    /// `f2`'s refusal has to explain itself with the computed numbers, not with
+    /// the rule.
+    #[test]
+    fn a_refused_configuration_states_the_numbers_and_the_maximum_target_count() {
+        let default = interval(RefreshInterval::DEFAULT_SECS);
+        let full = BudgetProjection::new(default, vec![TargetCost::repository(); 10]);
+
+        let Admission::Refused {
+            projected_requests_per_hour,
+            allowance,
+            max_repository_targets,
+            ..
+        } = full.admit(TargetCost::repository())
+        else {
+            panic!("the eleventh repository must be refused");
+        };
+        assert_eq!(projected_requests_per_hour, 2_640);
+        assert_eq!(allowance, 2_500);
+        assert_eq!(max_repository_targets, 10);
+
+        let message = full.admit(TargetCost::repository()).to_string();
+        for expected in ["2640", "2500", "5000", "60-second", "about 10 repository"] {
+            assert!(message.contains(expected), "{expected:?} missing from: {message}");
+        }
+        assert!(
+            !message.contains("because the App is installed on"),
+            "the organization clause belongs only on an organization refusal: {message}"
+        );
+
+        // An organization refusal says which repository count drove it, because
+        // that is the part a flat per-target reading would not have predicted.
+        let org_message = full.admit(TargetCost::organization(4)).to_string();
+        assert!(
+            org_message.contains("installed on 4 of its repositories"),
+            "{org_message}"
+        );
+
+        let admitted = BudgetProjection::new(default, vec![TargetCost::repository(); 2])
+            .admit(TargetCost::repository())
+            .to_string();
+        assert!(admitted.contains("720"), "{admitted}");
+        assert!(admitted.contains("1780"), "{admitted}");
+    }
+
+    /// The projection's per-refresh constants, pinned against the requests the
+    /// gateway actually issues.
+    ///
+    /// Without this the budget model is a table in a document that happens to be
+    /// written in Rust. Demand is `c4`'s and is not issued here, so the two
+    /// classes this task owns are compared on their own: an organization
+    /// refresh is one runners request plus one runs request per installed
+    /// repository, and the model has to say the same.
+    #[tokio::test]
+    async fn the_budget_model_matches_the_requests_the_gateway_really_issues() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ORG_RUNNERS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(1..4, 3)))
+            .mount(&server)
+            .await;
+        for repository in [repo(), other_repo(), third_repo()] {
+            mount_runs(&repository, 1).mount(&server).await;
+        }
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [repo(), other_repo(), third_repo()],
+        );
+        gateway
+            .snapshot(&scope, &CancelToken::new())
+            .await
+            .expect("readable");
+
+        let cost = TargetCost::from_activity_scope(&scope);
+        assert_eq!(cost.installed_repositories(), 3);
+        assert_eq!(cost.scope(), TargetScope::Organization);
+
+        let modelled_without_demand = cost.requests_per_refresh()
+            - DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH * cost.installed_repositories();
+        assert_eq!(
+            gateway.requests_issued(),
+            u64::from(modelled_without_demand),
+            "the model projects {modelled_without_demand} inventory-and-activity \
+             requests per refresh for this scope, and the gateway issued {}",
+            gateway.requests_issued()
+        );
+        assert_eq!(
+            modelled_without_demand,
+            RUNNER_INVENTORY_REQUESTS_PER_REFRESH + scope.requests_per_refresh()
+        );
+    }
+
+    /// An organization the App reaches no repository in is projected as zero
+    /// repositories, not silently as one.
+    #[test]
+    fn an_organization_with_no_installed_repositories_is_projected_as_such() {
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [],
+        );
+        assert_eq!(scope.requests_per_refresh(), 0);
+        let cost = TargetCost::from_activity_scope(&scope);
+        assert_eq!(cost.installed_repositories(), 0);
+        assert_eq!(
+            cost.requests_per_refresh(),
+            RUNNER_INVENTORY_REQUESTS_PER_REFRESH,
+            "the runners endpoint is still polled; nothing else is"
+        );
+    }
+
+    /// A repository target's activity scope is its own repository, whatever a
+    /// caller passes.
+    #[test]
+    fn a_repository_activity_scope_covers_exactly_one_repository() {
+        let scope = ActivityScope::repository(repo());
+        assert_eq!(scope.repositories(), [repo()]);
+        assert_eq!(scope.requests_per_refresh(), 1);
+        assert_eq!(scope.target(), &repo_target());
+        assert_eq!(
+            TargetCost::from_activity_scope(&scope),
+            TargetCost::repository()
+        );
+    }
+
+    // -- error summarising --------------------------------------------------
+
+    /// Every authentication outcome `c2` separates stays separate here. `f1`
+    /// reports four states and must not collapse them.
+    #[test]
+    fn the_authentication_taxonomy_survives_the_summary() {
+        assert_eq!(
+            RefreshState::from_error(&InventoryError::Github(
+                GithubError::AuthenticationFailed
+            )),
+            RefreshState::Unauthorized
+        );
+        assert_eq!(
+            RefreshState::from_error(&InventoryError::Github(
+                GithubError::AuthenticationLockout {
+                    retry_after: Duration::from_secs(60)
+                }
+            )),
+            RefreshState::LockedOut {
+                retry_after: Duration::from_secs(60)
+            }
+        );
+        assert_eq!(
+            RefreshState::from_error(&InventoryError::Cancelled),
+            RefreshState::Cancelled
+        );
+
+        // A lockout is waited out; a rejected credential is not.
+        let now = TestClock::default().now();
+        assert_eq!(
+            RefreshState::LockedOut {
+                retry_after: Duration::from_secs(60)
+            }
+            .retry_delay(now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(RefreshState::Unauthorized.retry_delay(now), None);
+        assert_eq!(RefreshState::Offline.retry_delay(now), None);
+    }
+
+    /// An empty inventory is an answer, not a failure. An idle host that
+    /// rendered as broken would be a support ticket a week.
+    #[test]
+    fn an_empty_snapshot_is_ready_rather_than_a_failure() {
+        let snapshot = InventorySnapshot {
+            target: repo_target(),
+            runners: RunnerInventory::new(repo_target(), Vec::new()),
+            activity: ActivityCount::of(repo(), 0),
+            observed_at: TestClock::default().now(),
+            headroom: None,
+        };
+        let state = RefreshState::from_result(Ok(snapshot));
+        assert!(state.is_ready());
+        assert!(state.snapshot().expect("ready").runners.is_empty());
+        assert_eq!(state.to_string(), "0 runners, 0 in progress");
+    }
 }
