@@ -1,0 +1,24 @@
+crates/domain/src/attempt.rs
+  s_5332f62e0ed5a7::t_07f7e45c435815 368-386,401-405,1072-1111,1240-1251,1776-1779,2831-2833,2841-2856,2858,2861-2865,2869-2941
+crates/domain/tests/store_journal.rs
+  s_5332f62e0ed5a7::t_1c4a08517f3683 422-426,428-431,438,446,448-457
+  s_5332f62e0ed5a7::t_5eec1a620c2720 352-359,361-364
+crates/domain/src/store.rs
+  s_5332f62e0ed5a7::t_07f7e45c435815 185-193,199-200,1392-1393,1398-1401,1404-1453,1455-1457,1474-1494,1554-1556,1566-1580,2378-2478,2500-2529,2531-2534,2537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "743f4612ce94d7c4a88b7eec9e4c395b8a1e8caa",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
