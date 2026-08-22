@@ -107,18 +107,25 @@ dispatching the task that needs them:
 23 tasks. `/taskflow-execute` is the only writer of the Status, Run / PR, and
 Updated columns.
 
+**Progress: 9 of 23 done** — `a1`, `b1`, `b2`, `c1`, `c2`, `d1`, `a2`, `v1`, and
+`v2` (an unplanned verification spike, recorded below rather than as a row since
+it has no specification in `tasks/`). `c3` and `a3` are verified against the tree
+and in their final correction rounds. Every merge is local: no worker branch has
+reached `origin`, and `main` carries 295 passing tests with CI green on Windows,
+macOS and Linux.
+
 | Task (spec) | needs | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|
 | **Wave 0** | | | | | | |
 | [a1-workspace-ci-foundation](tasks/a1-workspace-ci-foundation.md) | — | 10/5 | mid | ✅ done | `b67ca43` (local merge) | 2026-08-21 |
 | [b1-domain-core](tasks/b1-domain-core.md) | a1 | 10/8 | top | ✅ done | `e1dcbdb` (local merge) | 2026-08-21 |
-| [b2-sqlite-persistence](tasks/b2-sqlite-persistence.md) | b1 | 9/6 | mid | ✅ done | `main` (local merge) | 2026-08-21 |
+| [b2-sqlite-persistence](tasks/b2-sqlite-persistence.md) | b1 | 9/6 | mid | ✅ done | `7a2f60b` | 2026-08-21 |
 | **Wave 1** | | | | | | |
 | [v1-org-jit-verification](tasks/v1-org-jit-verification.md) | c1 | 9/3 | mid | ✅ done | `e5d7d1c` (local merge) | 2026-08-21 |
-| [c1-d17-scale-set-spike](tasks/c1-d17-scale-set-spike.md) | a1 | 10/8 | top | ✅ complete | `docs/spikes/d17-user-to-server-scale-set-chain.md` | 2026-08-21 |
-| [c2-device-flow-auth](tasks/c2-device-flow-auth.md) | c1, b1 | 10/7 | top | ✅ done | `main` (local merge) | 2026-08-21 |
-| [c3-rest-inventory-gateway](tasks/c3-rest-inventory-gateway.md) | c2 | 8/6 | mid | 🟣 verified, in review | round 9 (local) | 2026-08-21 |
-| [d1-platform-core](tasks/d1-platform-core.md) | a1 | 9/6 | top | ✅ done | `main` (local merge) | 2026-08-21 |
+| [c1-d17-scale-set-spike](tasks/c1-d17-scale-set-spike.md) | a1 | 10/8 | top | ✅ done | `docs/spikes/d17-user-to-server-scale-set-chain.md` | 2026-08-21 |
+| [c2-device-flow-auth](tasks/c2-device-flow-auth.md) | c1, b1 | 10/7 | top | ✅ done | `0378872` | 2026-08-21 |
+| [c3-rest-inventory-gateway](tasks/c3-rest-inventory-gateway.md) | c2 | 8/6 | mid | 🔵 in correction | round 10 (local) | 2026-08-21 |
+| [d1-platform-core](tasks/d1-platform-core.md) | a1 | 9/6 | top | ✅ done | `4c1e08f` | 2026-08-21 |
 | [d2-machine-secret-store](tasks/d2-machine-secret-store.md) | d1 | 10/7 | top | ⬜ pending | | |
 | [f1-cli-auth-host-status](tasks/f1-cli-auth-host-status.md) | b2, c3, d2 | 9/6 | top | ⬜ pending | | |
 | [f2-cli-policy-commands](tasks/f2-cli-policy-commands.md) | f1 | 9/6 | mid | ⬜ pending | | |
@@ -135,8 +142,8 @@ Updated columns.
 | [g3-tui-settings-parity](tasks/g3-tui-settings-parity.md) | g2, f2 | 8/6 | mid | ⬜ pending | | |
 | **Wave 4** | | | | | | |
 | [h1-e2e-security-acceptance](tasks/h1-e2e-security-acceptance.md) | f3, g3, d3, v1 | 9/7 | top | ⬜ pending | | |
-| [a2-release-workflow](tasks/a2-release-workflow.md) | a1 | 8/6 | top | ✅ done | `main` (local merge) | 2026-08-21 |
-| [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | 🟣 verified, in review | round 8 (local) | 2026-08-21 |
+| [a2-release-workflow](tasks/a2-release-workflow.md) | a1 | 8/6 | top | ✅ done | `6bcb34b` | 2026-08-21 |
+| [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | 🔵 in correction | round 10 (local) | 2026-08-21 |
 
 Status vocabulary (`/taskflow-execute`'s, adopted 2026-08-21 so board and
 orchestrator share one set): `⬜ pending`, `🔵 in progress`, `🟣 verified,
