@@ -74,7 +74,7 @@ use std::{
     time::Duration,
 };
 
-use runner_manager_domain::model::{Clock, OwnerRepo, ScaleTarget, Timestamp};
+use runner_manager_domain::model::{Clock, OwnerRepo, ScaleTarget, TargetScope, Timestamp};
 use runner_manager_github::{
     GithubError, HeaderMap,
     demand::{DemandGateway, QueuedDemand},
@@ -542,14 +542,26 @@ impl FakeGithub {
 
     /// A repository whose demand cannot be polled at all, and why.
     ///
-    /// Reported through [`QueuedDemand::unavailable`] rather than as a zero,
+    /// **What this produces depends on the scope of the target being polled,
+    /// because it does in the real gateway.**
+    ///
+    /// At **organization** scope the poll succeeds and the repository is
+    /// reported through [`QueuedDemand::unavailable`] rather than as a zero,
     /// which is the distinction that matters most on this read model: a zero
     /// tells `e1` there is nothing to serve, and `e1` acts on that by starting
     /// no runners. It is left **out** of [`QueuedDemand::per_repository`]
     /// entirely, exactly as the real gateway leaves it.
     ///
-    /// The request is still charged — the real gateway spends one before
-    /// learning the repository is unreadable.
+    /// At **repository** scope the poll **fails**. Stepping over the only
+    /// repository in scope would flatten the whole reading to `0`, which is the
+    /// confusion the paragraph above exists to prevent — so `RestDemand` gates
+    /// the step-over on the target's scope, and this fake reads the same gate.
+    /// A fixture that answered `Ok(total 0)` where production answers `Err`
+    /// would leave a consumer's test green over exactly the bug it was written
+    /// to catch.
+    ///
+    /// The request is still charged either way — the real gateway spends one
+    /// before learning the repository is unreadable.
     ///
     /// # Panics
     /// If a previous holder panicked while the state lock was held.
@@ -957,6 +969,41 @@ impl DemandGateway for FakeGithub {
         // quietly started costing more should fail here rather than in
         // production.
         state.requests_issued += u64::try_from(scope.repositories().len()).unwrap_or(u64::MAX);
+
+        // Only an *aggregate* steps over a repository it cannot poll, and
+        // `RestDemand` gates that on exactly this comparison. A repository
+        // target has one repository in scope, so stepping over it would turn a
+        // permissions or existence failure into demand `0` — and `e1` reads a
+        // zero as "start no runners for a target we can see", when the truth is
+        // "we cannot see this target at all". Production returns `Err` there;
+        // so does this.
+        //
+        // The status is `404` rather than a programmed one because
+        // `with_unavailable_demand` programs the *outcome* — unreadable — and
+        // not which of the two answers produced it. `RestDemand` steps over a
+        // `403` and a `404` alike, so a fake that made the caller choose would
+        // be offering a distinction the read model does not have. Same reason
+        // the headers are empty above.
+        if scope.target().scope() != TargetScope::Organization
+            && let Some((repository, reason)) = scope.repositories().iter().find_map(|repository| {
+                state
+                    .unavailable_queued
+                    .get(repository)
+                    .map(|reason| (repository.clone(), reason.clone()))
+            })
+        {
+            return Err(InventoryError::Github(GithubError::Status {
+                status: 404,
+                method: "GET".to_string(),
+                path: format!(
+                    "/repos/{}/{}/actions/runs",
+                    repository.owner(),
+                    repository.repo()
+                ),
+                message: Some(reason),
+                headers: Box::new(HeaderMap::new()),
+            }));
+        }
 
         let counts = scope
             .repositories()
@@ -1464,6 +1511,10 @@ mod tests {
     }
 
     /// A demand count can be short in two ways, and the fake can produce both.
+    ///
+    /// And an unreadable repository is short in a third way that is not a count
+    /// at all — see the repository-scope half below, which is the case where
+    /// this fake and `RestDemand` used to disagree outright.
     #[tokio::test]
     async fn a_demand_reading_can_be_a_floor_or_can_be_missing_a_repository() {
         let gateway = FakeGithub::new()
@@ -1489,6 +1540,36 @@ mod tests {
             gateway.requests_issued(),
             2,
             "the request that discovered the repository was unreadable was still spent"
+        );
+
+        // The same programming at *repository* scope, which is a failure and not
+        // a reading. `RestDemand` gates the step-over on the target's scope, and
+        // a fixture that ignored the gate would answer `Ok(total 0)` where
+        // production answers `Err` -- handing a consumer's test a green over the
+        // one confusion the aggregate path exists to prevent.
+        let scoped = FakeGithub::new().with_unavailable_demand(repo(), "repository archived");
+        let error = scoped
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect_err(
+                "a repository target whose only repository cannot be polled knows nothing \
+                 about that target, which is not the same as knowing it has no demand",
+            );
+        assert!(
+            !error.is_cancelled() && !error.is_rate_limited(),
+            "the failure is the repository-local one production propagates, not a \
+             cancellation or a rate limit: {error}"
+        );
+        assert!(
+            error.to_string().contains("repository archived"),
+            "the programmed reason survives into the failure, so a consumer can see why: \
+             {error}"
+        );
+        assert_eq!(
+            scoped.requests_issued(),
+            1,
+            "the request that discovered the repository was unreadable was still spent, \
+             exactly as on the aggregate path"
         );
     }
 
