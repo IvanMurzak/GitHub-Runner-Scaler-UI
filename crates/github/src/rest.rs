@@ -175,6 +175,14 @@ pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = 1;
 /// both wrong, in opposite directions.
 pub const MAX_ACTIVITY_FALLBACK_PAGES: usize = 4;
 
+// Enforced at compile time rather than by a test, because the two ceilings
+// collapsing back into one is the defect, not a symptom of it: a budget that is
+// not tighter than the runaway ceiling is not a budget.
+const _: () = assert!(
+    MAX_ACTIVITY_FALLBACK_PAGES < MAX_PAGES,
+    "the activity page budget must stay below the runaway `Link`-cycle ceiling"
+);
+
 /// Requests one demand poll costs, **per repository**: the queued runs, then
 /// their jobs.
 ///
@@ -2854,6 +2862,270 @@ mod tests {
             4,
             "a missing `total_count` must not read as an idle repository"
         );
+        assert!(
+            activity.is_complete(),
+            "a fallback that reached the end of the pages counted everything"
+        );
+        assert!(activity.truncated().is_empty());
+    }
+
+    /// A page sequence for the no-`total_count` fallback: `pages` full pages,
+    /// each offering the next, and each mounted so an unspent request is visible
+    /// as a mock that was never called.
+    async fn mount_runs_fallback_chain(server: &MockServer, pages: usize) {
+        for page in 1..=pages {
+            let body = runs_body(None, usize::try_from(PER_PAGE).expect("PER_PAGE fits"));
+            let response = ResponseTemplate::new(200).set_body_json(body);
+            // Every page offers a successor, including the last: a walk that
+            // stops has to stop because it chose to, not because the fixture
+            // ran out of `Link` headers.
+            let response = response.insert_header(
+                "link",
+                link_next(&format!("{}/runs/{}", server.uri(), page + 1)).as_str(),
+            );
+            let matcher = if page == 1 {
+                path(REPO_RUNS)
+            } else {
+                path(format!("/runs/{page}"))
+            };
+            Mock::given(method("GET"))
+                .and(matcher)
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// The fallback walk is bounded by the **budget**, not by the runaway
+    /// ceiling.
+    ///
+    /// `MAX_PAGES` is the number that keeps a `Link` cycle from looping forever;
+    /// it is not a number anything budgeted for. Charging 100 requests to a line
+    /// item the projection prices at one — 6,000/hour against a 5,000 ceiling,
+    /// for a single repository's count — is what would make `f2`'s `add`
+    /// refusals a fiction, since it computes them from that projection.
+    #[tokio::test]
+    async fn the_activity_fallback_stops_at_the_budget_not_at_the_runaway_ceiling() {
+        let server = MockServer::start().await;
+        mount_runs_fallback_chain(&server, MAX_ACTIVITY_FALLBACK_PAGES + 2).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("the walk ends at the budget rather than erroring");
+
+        assert_eq!(
+            gateway.requests_issued() as usize,
+            MAX_ACTIVITY_FALLBACK_PAGES,
+            "the walk spends its page budget and not one request more; `MAX_PAGES` \
+             here would be {MAX_PAGES} requests for one repository's count, per refresh"
+        );
+        assert_eq!(
+            activity.total(),
+            PER_PAGE * u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap(),
+            "what it did count, it counted"
+        );
+    }
+
+    /// A count the page budget cut short is a **floor**, and says so.
+    ///
+    /// `04-subsystem-contracts.md` forbids treating a first page as a complete
+    /// inventory; a count clipped at page four is the same defect on the other
+    /// read model. `RunnerInventory` already honours this with `truncated()` and
+    /// `missing()` — returning the partial activity count as though it were the
+    /// answer left `g2` rendering a number with no way to know.
+    #[tokio::test]
+    async fn a_count_the_page_budget_cut_short_is_reported_as_a_floor_not_as_a_total() {
+        let server = MockServer::start().await;
+        mount_runs_fallback_chain(&server, MAX_ACTIVITY_FALLBACK_PAGES + 2).await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a truncated count is an answer, not a failure");
+
+        assert!(
+            activity.is_truncated(&repo()),
+            "the repository whose walk was cut short has to be named"
+        );
+        assert_eq!(activity.truncated().len(), 1);
+        assert!(
+            !activity.is_complete(),
+            "a partial answer is usable only when it says it is partial -- and a caller \
+             asking the one obvious question must hear about truncation, not only about \
+             repositories that failed outright"
+        );
+        assert!(
+            activity.unavailable().is_empty(),
+            "truncated is not unavailable: this repository answered, the answer is a floor"
+        );
+    }
+
+    /// Truncation of one repository makes an **organization's** total a floor
+    /// too, and the aggregate carries which repository did it.
+    #[tokio::test]
+    async fn one_truncated_repository_makes_the_whole_aggregate_a_floor() {
+        let server = MockServer::start().await;
+        mount_runs(&repo(), 4).mount(&server).await;
+        // `octo/api` answers without a `total_count` and keeps offering pages.
+        for page in 1..=(MAX_ACTIVITY_FALLBACK_PAGES + 1) {
+            let matcher = if page == 1 {
+                path("/repos/octo/api/actions/runs")
+            } else {
+                path(format!("/api-runs/{page}"))
+            };
+            Mock::given(method("GET"))
+                .and(matcher)
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "link",
+                            link_next(&format!("{}/api-runs/{}", server.uri(), page + 1)).as_str(),
+                        )
+                        .set_body_json(runs_body(
+                            None,
+                            usize::try_from(PER_PAGE).expect("PER_PAGE fits"),
+                        )),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let scope = ActivityScope::organization(
+            Org::new("octo-org").expect("a valid organization login"),
+            [repo(), other_repo()],
+        );
+        let activity = gateway
+            .in_progress_activity(&scope, &CancelToken::new())
+            .await
+            .expect("the aggregate completes");
+
+        assert!(activity.is_truncated(&other_repo()));
+        assert!(
+            !activity.is_truncated(&repo()),
+            "the repository that answered exactly is not tarred with it"
+        );
+        assert!(
+            !activity.is_complete(),
+            "one floor in the sum makes the sum a floor"
+        );
+        assert_eq!(
+            activity.total(),
+            4 + PER_PAGE * u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap()
+        );
+    }
+
+    /// The assumption this layer's one-request activity count rests on, checked
+    /// against the wire at no extra request cost.
+    ///
+    /// Reading `total_count` off a *filtered* query assumes it counts the
+    /// filtered set. When GitHub sends no `rel="next"`, the whole filtered set
+    /// is on the page in hand, so `total_count` must equal
+    /// `workflow_runs.len()`. An unfiltered total would show up here as exactly
+    /// the contradiction below — 5,000 lifetime runs reported over the 3 that
+    /// are in progress — and it is caught on the first response rather than by
+    /// an operator noticing a wrong dashboard number weeks later.
+    ///
+    /// The same envelope reaches `c4`'s `clamp()` on `status=queued`, which is
+    /// why this is worth a check rather than a comment.
+    ///
+    /// # Debug-only, because the tripwire is
+    ///
+    /// A contradiction here means a wire contract is not what this layer read it
+    /// to be, which is a thing to find in development and not a reason to panic
+    /// a shipped dashboard — and there is a legitimate way to see it in the
+    /// wild: a run finishing between GitHub computing `total_count` and
+    /// serialising the page. So the loud half is a `debug_assert!` and the
+    /// always-on half is the `warn!`, which
+    /// `a_total_count_that_disagrees_with_its_only_page_still_answers_in_release`
+    /// covers.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "is not the filtered count")]
+    async fn a_total_count_that_disagrees_with_its_only_page_is_caught() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            // No `Link`, so this page is the whole filtered set -- and yet the
+            // total claims 5,000. One of the two is not what it says it is.
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(5_000), 3)))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let _ = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await;
+    }
+
+    /// The release half of the same case: the `debug_assert!` is compiled out,
+    /// so the contradiction is a `warn!` and the refresh keeps working.
+    ///
+    /// Asserted so that "it panics in debug" is never quietly also "it panics in
+    /// production", and so that the check cannot start costing a second request
+    /// to resolve the disagreement it noticed.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn a_total_count_that_disagrees_with_its_only_page_still_answers_in_release() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(Some(5_000), 3)))
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a suspect total is still an answer in release");
+
+        assert_eq!(activity.total(), 5_000);
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "noticing the disagreement must stay free"
+        );
+    }
+
+    /// The check is scoped to the page that *is* the whole set. A total larger
+    /// than one page is the ordinary case and must stay silent.
+    #[tokio::test]
+    async fn a_total_count_larger_than_a_page_is_not_a_contradiction() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "link",
+                        link_next(&format!("{}/page/2", server.uri())).as_str(),
+                    )
+                    .set_body_json(runs_body(
+                        Some(250),
+                        usize::try_from(PER_PAGE).expect("PER_PAGE fits"),
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let activity = gateway
+            .in_progress_activity(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a paginated total is exactly what `total_count` is for");
+
+        assert_eq!(activity.total(), 250);
+        assert!(activity.is_complete());
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "reading the reported total is what keeps a 250-run repository at one \
+             request; the check must not have provoked a second"
+        );
     }
 
     /// One unreadable repository does not take down an organization's whole
@@ -3149,6 +3421,66 @@ mod tests {
         );
     }
 
+    /// The `403` twin of the `404` case above, and the one the status gate alone
+    /// did not close.
+    ///
+    /// GitHub attaches `x-ratelimit-*` to every response, so a permissions
+    /// refusal that happens to land on the request which exhausted the hourly
+    /// quota arrives as a `403` carrying `remaining: 0`. Classifying it on the
+    /// header alone made it a `Primary` limit — an operator told to wait out a
+    /// grant that will never arrive, and a latched window suppressing every
+    /// other target's refresh meanwhile, which is exactly the harm the `404`
+    /// test names.
+    ///
+    /// The message is what separates them, and a genuine primary limit always
+    /// carries "API rate limit exceeded"
+    /// (`an_exhausted_hourly_quota_is_a_distinct_displayable_state` sends it).
+    #[tokio::test]
+    async fn a_permissions_403_that_lands_on_an_exhausted_quota_is_still_forbidden() {
+        let server = MockServer::start().await;
+        let reset = TestClock::default().now().timestamp() + 900;
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    // The headers of a genuine exhausted quota...
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-limit", "5000")
+                    .insert_header("x-ratelimit-reset", reset.to_string().as_str())
+                    // ...on a body that is plainly a permissions refusal.
+                    .set_body_json(json!({ "message": "Resource not accessible by integration" })),
+            )
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        let error = gateway
+            .list_runners(&repo_target(), &CancelToken::new())
+            .await
+            .expect_err("the installation does not grant it");
+
+        assert!(
+            !error.is_rate_limited(),
+            "a missing grant does not become a rate limit because the quota also ran \
+             out on the same request: {error}"
+        );
+        assert!(
+            gateway.rate_limit_backoff().is_none(),
+            "and it must not latch a window that silences every other target too"
+        );
+        let state = RefreshState::from_error(&error);
+        assert!(
+            matches!(&state, RefreshState::Forbidden { message } if message.as_deref()
+                == Some("Resource not accessible by integration")),
+            "{state:?}"
+        );
+        assert_eq!(
+            state.retry_delay(TestClock::default().now()),
+            None,
+            "waiting for the quota to reset will not grant the permission"
+        );
+    }
+
     /// A rate limit that names no wait still waits: answering "retry in zero
     /// seconds" would turn a rate limit into a busy loop against the endpoint
     /// that asked for quiet.
@@ -3221,10 +3553,96 @@ mod tests {
 
     // -- cancellation -------------------------------------------------------
 
-    /// A token flipped between pages stops the walk there, rather than spending
-    /// the shared budget on pages nobody will read.
+    /// Cancels a token as it serves a page, which is what makes the
+    /// between-pages case deterministic instead of timed.
+    ///
+    /// The flip happens inside the mock server while page one is being
+    /// answered, so the walk is guaranteed to have *started* with a live token
+    /// — page one being fetched at all is the proof — and page two is the first
+    /// request the cancellation can possibly stop. A `set_delay` and a spawned
+    /// canceller would test the same thing on a good day and something else on a
+    /// loaded machine.
+    struct CancelWhileServingPage {
+        token: CancelToken,
+        next_page: String,
+        body: Value,
+    }
+
+    impl wiremock::Respond for CancelWhileServingPage {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            self.token.cancel();
+            ResponseTemplate::new(200)
+                .insert_header("link", link_next(&self.next_page).as_str())
+                .set_body_json(self.body.clone())
+        }
+    }
+
+    /// A token flipped **between pages** stops the walk there, rather than
+    /// spending the shared budget on pages nobody will read.
+    ///
+    /// The walk begins un-cancelled, fetches page one from inside
+    /// `collect_pages`, and the token flips while that page is in flight. Page
+    /// two is offered by a `Link` header and must never be asked for. This is
+    /// the case `RestInventory::get`'s own doc calls "the one the shared budget
+    /// cares about", and the case a long organization walk actually hits.
     #[tokio::test]
     async fn cancelling_between_pages_stops_the_walk() {
+        let server = MockServer::start().await;
+        let cancel = CancelToken::new();
+        Mock::given(method("GET"))
+            .and(path(REPO_RUNNERS))
+            .respond_with(CancelWhileServingPage {
+                token: cancel.clone(),
+                next_page: format!("{}/page/2", server.uri()),
+                body: runner_page(1..101, 200),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runner_page(101..201, 200)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        assert!(
+            !cancel.is_cancelled(),
+            "the walk has to start live, or this is a test of page zero"
+        );
+
+        let error = gateway
+            .list_runners(&repo_target(), &cancel)
+            .await
+            .expect_err("the token was flipped between page one and page two");
+        assert!(error.is_cancelled(), "{error}");
+        assert!(
+            cancel.is_cancelled(),
+            "page one was served, which is what flipped the token"
+        );
+        assert_eq!(
+            requests_seen(&server).await,
+            1,
+            "page one, and nothing after it: the `Link` header offered page two and the \
+             walk declined to spend the request"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            1,
+            "and the budget accounting agrees with the wire"
+        );
+    }
+
+    /// The neighbouring case, and the one the test above used to be.
+    ///
+    /// A walk handed a token that is *already* cancelled stops before page one
+    /// rather than between pages. Worth keeping — it is what a caller that
+    /// navigated away before the refresh started actually does — but it is a
+    /// different property, and naming it after the between-pages case left that
+    /// case uncovered.
+    #[tokio::test]
+    async fn an_already_cancelled_token_stops_a_walk_before_its_first_page() {
         let server = MockServer::start().await;
         let page_two = format!("{}/page/2", server.uri());
         Mock::given(method("GET"))
@@ -3246,8 +3664,8 @@ mod tests {
         let gateway = gateway(&server, Arc::new(TestClock::default()));
         let cancel = CancelToken::new();
 
-        // Cancelled while page one is being read: the walk must not fetch page
-        // two, even though the `Link` header offers it.
+        // One request, issued by hand and outside any walk, purely to establish
+        // that the server would serve a page and offer a second.
         let first = ApiRequest::get(REPO_RUNNERS).query("per_page", PER_PAGE);
         let response = gateway
             .get(&first, &cancel)
@@ -3264,7 +3682,7 @@ mod tests {
         assert_eq!(
             requests_seen(&server).await,
             1,
-            "a cancelled walk spends nothing further"
+            "the manual request only; the walk spent nothing at all"
         );
         assert_eq!(
             gateway.requests_issued(),
