@@ -1230,7 +1230,7 @@ mod tests {
         use runner_manager_domain::model::RefreshInterval;
 
         let interval = RefreshInterval::default();
-        let printed = BudgetProjection::max_repository_targets(interval, TargetCost::repository());
+        let printed = BudgetProjection::max_repository_targets(interval);
         let per_hour_estimated = TargetCost::repository().requests_per_hour(interval);
         let per_hour_measured = TargetCost::repository()
             .with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)

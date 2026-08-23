@@ -296,7 +296,7 @@ fn a_consumer_projects_the_budget_from_the_scope_it_will_actually_poll() {
     assert_eq!(projection.headroom(), 2_080);
     assert!(!projection.exceeds_allowance());
     assert_eq!(
-        BudgetProjection::max_repository_targets(default, TargetCost::repository()),
+        BudgetProjection::max_repository_targets(default),
         10,
         "the figure `host show` prints"
     );

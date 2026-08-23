@@ -111,7 +111,17 @@ fn scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label
             assert!(outcome.stdout.contains("Routing label: rm-office-"));
         } else {
             assert!(outcome.stdout.contains("Monitor-only"));
-            assert!(outcome.stdout.contains("Administration: Read and write"));
+            assert!(outcome.stdout.contains(
+                "`Administration: Read and write` is NOT a narrow self-hosted-runner permission."
+            ));
+            assert!(outcome.stdout.contains(
+                "The same grant also permits DELETING, RENAMING and TRANSFERRING the repository, and"
+            ));
+            assert!(
+                outcome
+                    .stdout
+                    .contains("adding and removing collaborators.")
+            );
         }
     }
     assert_eq!(

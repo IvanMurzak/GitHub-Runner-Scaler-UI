@@ -17,8 +17,6 @@ use runner_manager_github::rest::{Admission, BudgetProjection, TargetCost};
 use super::auth::CredentialState;
 use super::{CliError, Context, Failure, OrgCommand, RepoCommand, write_failed};
 
-const PERMISSION_DISCLOSURE: &str =
-    "The GitHub App grant includes Administration: Read and write for self-hosted runners.";
 const TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
 
 pub fn dispatch_repo(
@@ -325,7 +323,10 @@ fn write_add_result(
         }
         None => {
             writeln!(out, "Monitor-only: no routing label is reserved and no runner will ever be started for this policy.").map_err(failed)?;
-            writeln!(out, "{PERMISSION_DISCLOSURE}").map_err(failed)?;
+            // D21 requires the monitor-only path to repeat the complete grant
+            // consequences, not merely its consent-screen label. Keep one
+            // rendering in auth.rs so sign-in and policy creation cannot drift.
+            super::auth::write_disclosure(out).map_err(failed)?;
             writeln!(
                 out,
                 "Promote it with: runner-manager {} set-capacity {} --max-capacity N",
@@ -861,7 +862,20 @@ mod tests {
         assert!(policy.routing_labels().is_none());
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("no runner will ever be started"), "{text}");
-        assert!(text.contains("Administration: Read and write"), "{text}");
+        assert!(
+            text.contains(
+                "`Administration: Read and write` is NOT a narrow self-hosted-runner permission."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("The same grant also permits DELETING, RENAMING and TRANSFERRING the repository, and"),
+            "{text}"
+        );
+        assert!(
+            text.contains("adding and removing collaborators."),
+            "{text}"
+        );
 
         let persisted_host = store.host(policy.host_id).unwrap().unwrap();
         policy
@@ -968,7 +982,7 @@ mod tests {
     fn refusal_prints_the_ceiling_admission_actually_used() {
         let interval = RefreshInterval::default();
         let candidate = TargetCost::repository();
-        let maximum = BudgetProjection::max_repository_targets(interval, candidate);
+        let maximum = BudgetProjection::max_repository_targets(interval);
         let projection = BudgetProjection::new(interval, vec![candidate; maximum as usize]);
         let refusal = projection.admit(candidate);
         let Admission::Refused {

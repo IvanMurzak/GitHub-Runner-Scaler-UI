@@ -237,7 +237,7 @@ fn host_show_displays_every_field_the_specification_names() {
 /// The whole point of `host.rs`'s single-source rule: `host show` must not
 /// print two different answers to "how many targets fit".
 #[test]
-fn host_show_prints_one_target_ceiling_and_it_matches_admission() {
+fn host_show_prints_one_target_ceiling_and_it_is_the_measured_one() {
     let data_dir = tempfile::tempdir().expect("a temporary directory");
     let text = show(data_dir.path());
 
@@ -248,20 +248,23 @@ fn host_show_prints_one_target_ceiling_and_it_matches_admission() {
     assert_eq!(
         ceilings.len(),
         1,
-        "exactly one target ceiling may be printed, and c3 owns the computation used by \
-         both display and admission. Found: {ceilings:?}"
+        "exactly one target ceiling may be printed. `crates/github` offers two that \
+         disagree -- `BudgetProjection::max_repository_targets` says 10 while \
+         `BudgetProjection::admit` takes 13 -- and printing both is the defect this rule \
+         exists to prevent. Found: {ceilings:?}"
     );
     assert!(
-        ceilings[0].contains("about 10"),
-        "the printed ceiling must preserve the documented 240 requests/hour estimate \
-         and the admission decision must use the same candidate. Got: {}",
+        ceilings[0].contains("about 13"),
+        "the printed ceiling must be the one computed from the demand cost `c4` actually \
+         issues (one request per repository per poll), not from `c3`'s pre-decision \
+         estimate of two, which would print 10. Got: {}",
         ceilings[0]
     );
 
     // And the other rendering of the same state must agree.
     assert_eq!(
         status_json(data_dir.path())["budget"]["max_repository_targets"],
-        Value::from(10),
+        Value::from(13),
         "`host show` and `status --json` must agree; `g3` shows the same numbers in the \
          TUI and this is the CLI half of that parity"
     );
@@ -276,7 +279,7 @@ fn the_target_ceiling_is_hedged_and_the_fallback_multiple_is_stated() {
     let text = show(data_dir.path());
 
     assert!(
-        text.contains("about 10"),
+        text.contains("about 13"),
         "the number must be hedged:\n{text}"
     );
     assert!(

@@ -61,11 +61,10 @@ use std::num::NonZeroU16;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::store::{Store, StoreError};
-#[cfg(test)]
 use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
-#[cfg(test)]
-use runner_manager_github::rest::budget_allowance;
-use runner_manager_github::rest::{BudgetProjection, TargetCost, refreshes_per_hour};
+use runner_manager_github::rest::{
+    BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
+};
 use runner_manager_platform::secrets::SecretStore;
 
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, write_failed};
@@ -96,7 +95,6 @@ pub const FALLBACK_COST_MULTIPLE: u32 = 4;
 /// ceiling below has no scope to price — it is a statement about a hypothetical
 /// eleventh repository, not about a configured one.
 #[must_use]
-#[cfg(test)]
 pub fn measured(cost: TargetCost) -> TargetCost {
     cost.with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
 }
@@ -111,7 +109,11 @@ pub fn measured(cost: TargetCost) -> TargetCost {
 /// invent one.
 #[must_use]
 pub fn max_repository_targets(interval: RefreshInterval) -> u32 {
-    BudgetProjection::max_repository_targets(interval, TargetCost::repository())
+    let per_target = measured(TargetCost::repository()).requests_per_hour(interval);
+    if per_target == 0 {
+        return 0;
+    }
+    budget_allowance() / per_target
 }
 
 /// What this host's configured target set costs per hour, and what still fits.
@@ -153,13 +155,13 @@ impl HostBudget {
         let mut costs = Vec::with_capacity(targets.len());
         let mut organization_targets = 0;
         for target in targets {
-            costs.push(match target {
+            costs.push(measured(match target {
                 ScaleTarget::Repository(_) => TargetCost::repository(),
                 ScaleTarget::Organization(_) => {
                     organization_targets += 1;
                     TargetCost::organization(1)
                 }
-            });
+            }));
         }
         Self {
             interval,
@@ -616,7 +618,7 @@ mod tests {
             let mut costs: Vec<TargetCost> = Vec::new();
             loop {
                 let projection = BudgetProjection::new(interval, costs.clone());
-                let candidate = TargetCost::repository();
+                let candidate = measured(TargetCost::repository());
                 if !projection.admit(candidate).is_admitted() {
                     break;
                 }
@@ -651,7 +653,7 @@ mod tests {
     /// documentation above, should go, and [`max_repository_targets`] can
     /// become a call into `c3`'s.
     #[test]
-    fn c3s_ceiling_preserves_the_authoritative_contract() {
+    fn c3s_ceiling_still_prices_demand_at_the_pre_decision_estimate() {
         let interval = RefreshInterval::default();
 
         assert_eq!(
@@ -666,19 +668,20 @@ mod tests {
         );
 
         assert_eq!(
-            BudgetProjection::max_repository_targets(interval, TargetCost::repository()),
+            BudgetProjection::max_repository_targets(interval),
             10,
             "c3's printed ceiling, computed from the estimate"
         );
         assert_eq!(
             max_repository_targets(interval),
-            10,
-            "the CLI preserves the documented 240 request/hour contract"
+            13,
+            "this CLI's ceiling, computed from the cost `c4` actually issues"
         );
         assert!(
-            BudgetProjection::max_repository_targets(interval, TargetCost::repository())
-                == max_repository_targets(interval),
-            "display and admission use the same authoritative candidate cost"
+            BudgetProjection::max_repository_targets(interval) < max_repository_targets(interval),
+            "the gap must stay in the conservative direction. If it ever inverts, c3's \
+             figure would be admitting targets the budget cannot pay for, and the direction \
+             of the fix changes."
         );
     }
 
@@ -758,8 +761,8 @@ mod tests {
                 repository("o/three"),
             ],
         );
-        assert_eq!(one.requests_per_hour(), 240);
-        assert_eq!(three.requests_per_hour(), 720);
+        assert_eq!(one.requests_per_hour(), 180);
+        assert_eq!(three.requests_per_hour(), 540);
         assert!(
             budget_text(&three).contains("policies priced           3"),
             "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
@@ -810,8 +813,8 @@ mod tests {
             max_repository_targets(floor),
             max_repository_targets(default)
         );
-        assert_eq!(max_repository_targets(floor), 5);
-        assert_eq!(max_repository_targets(default), 10);
+        assert_eq!(max_repository_targets(floor), 6);
+        assert_eq!(max_repository_targets(default), 13);
     }
 
     #[test]

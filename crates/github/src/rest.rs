@@ -1488,16 +1488,6 @@ impl TargetCost {
         self.installed_repositories
     }
 
-    /// A one-repository cost preserving the caller's demand measurement.
-    #[must_use]
-    pub const fn repository_equivalent(self) -> Self {
-        Self {
-            scope: TargetScope::Repository,
-            installed_repositories: 1,
-            demand_requests_per_repository: self.demand_requests_per_repository,
-        }
-    }
-
     /// Requests one refresh of this target costs.
     #[must_use]
     pub const fn requests_per_refresh(&self) -> u32 {
@@ -1610,9 +1600,8 @@ impl BudgetProjection {
     /// installed repository count, so "how many organizations fit" has no single
     /// answer and this deliberately does not invent one.
     #[must_use]
-    pub fn max_repository_targets(interval: RefreshInterval, repository_cost: TargetCost) -> u32 {
-        debug_assert_eq!(repository_cost.scope(), TargetScope::Repository);
-        let per_target = repository_cost.requests_per_hour(interval);
+    pub fn max_repository_targets(interval: RefreshInterval) -> u32 {
+        let per_target = TargetCost::repository().requests_per_hour(interval);
         if per_target == 0 {
             return 0;
         }
@@ -1633,10 +1622,7 @@ impl BudgetProjection {
                 allowance,
                 ceiling: self.ceiling(),
                 interval: self.interval,
-                max_repository_targets: Self::max_repository_targets(
-                    self.interval,
-                    candidate.repository_equivalent(),
-                ),
+                max_repository_targets: Self::max_repository_targets(self.interval),
             };
         }
         Admission::Admitted {
@@ -4520,17 +4506,11 @@ mod tests {
         assert_eq!(budget_allowance(), 2_500, "half the ceiling");
 
         assert_eq!(
-            BudgetProjection::max_repository_targets(
-                interval(RefreshInterval::DEFAULT_SECS),
-                TargetCost::repository()
-            ),
+            BudgetProjection::max_repository_targets(interval(RefreshInterval::DEFAULT_SECS)),
             10
         );
         assert_eq!(
-            BudgetProjection::max_repository_targets(
-                interval(RefreshInterval::MIN_SECS),
-                TargetCost::repository()
-            ),
+            BudgetProjection::max_repository_targets(interval(RefreshInterval::MIN_SECS)),
             5
         );
 
