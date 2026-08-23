@@ -71,6 +71,25 @@ fn ci_runs_the_privileged_installer_smoke_tests_by_name() {
 }
 
 #[test]
+fn ci_builds_the_fixture_service_host_before_running_the_smoke_tests() {
+    // This one is here because its absence already cost a CI run.
+    // `cargo test --test <name>` selects one target and builds no examples, so
+    // the fixture service host the restart measurement starts is simply not
+    // there unless something builds it by name. The tests fail loudly when it
+    // is missing rather than skipping — but a red job that has to be diagnosed
+    // from a stack trace is worth less than a test that names the missing step.
+    let (path, source) = ci_workflow();
+    assert!(
+        source.contains("--example service_host_fixture"),
+        "{}'s installer job must build the fixture service host by name before running the \
+         smoke tests. `cargo test --test privileged_service_installer` does not build \
+         examples, and `--examples` builds a libtest harness under a different name rather \
+         than the service host.",
+        path.display()
+    );
+}
+
+#[test]
 fn ci_checks_that_no_self_test_fixture_survives_the_installer_job() {
     let (path, source) = ci_workflow();
     assert!(

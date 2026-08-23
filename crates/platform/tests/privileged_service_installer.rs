@@ -208,12 +208,21 @@ fn sweep(name: &str) {
         .output();
 }
 
-/// The example built alongside this test.
+/// The fixture service host, beside this test binary's own directory.
 ///
-/// `cargo test` builds `examples/`, so the binary is beside the test binary's
-/// own directory. A missing one is a hard failure rather than a skip: a smoke
-/// test that quietly does nothing is the failure mode this whole run has been
-/// finding.
+/// **It has to be built separately, and that is easy to get wrong.** A plain
+/// `cargo test` builds every example, so running the whole suite produces it as
+/// a side effect — but `cargo test --test privileged_service_installer`, which
+/// is how these tests are actually selected, builds exactly one target and no
+/// examples. `--examples` does not close the gap either: it builds the example
+/// as a libtest harness under a hashed name, and that binary runs libtest and
+/// exits rather than reporting itself to the Service Control Manager.
+///
+/// A missing one is a hard failure rather than a skip. A smoke test that
+/// quietly did nothing would be the exact failure mode this whole run keeps
+/// finding — and this assertion has already earned its place once, by turning
+/// a CI job that would otherwise have passed while verifying nothing into a
+/// red one that named the cause.
 fn fixture_service_host() -> PathBuf {
     let test_binary = std::env::current_exe().expect("this test binary has a path");
     let candidate = test_binary
@@ -224,8 +233,10 @@ fn fixture_service_host() -> PathBuf {
         .join("service_host_fixture.exe");
     assert!(
         candidate.is_file(),
-        "{} is missing. Build it with `cargo build -p runner-manager-platform --example \
-         service_host_fixture`; an ordinary `cargo test` builds it too.",
+        "{} is missing, so there is nothing for the service manager to start. Build it first:\n\
+         \n    cargo build -p runner-manager-platform --example service_host_fixture\n\n\
+         `cargo test --test privileged_service_installer` does NOT build it; only a whole-crate \
+         `cargo test` or the explicit command above does.",
         candidate.display()
     );
     candidate
