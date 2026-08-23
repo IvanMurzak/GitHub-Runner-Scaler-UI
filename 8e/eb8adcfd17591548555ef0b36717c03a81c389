@@ -1,0 +1,23 @@
+crates/app/tests/policy_commands.rs
+  s_d14c0886a58be6::t_3565e87e001395 32-83
+crates/app/src/cli/policy.rs
+  s_d14c0886a58be6::t_eff94d5c30cce4 906,910-911,915-916,918-922,932-933,935-945
+  s_d14c0886a58be6::t_163b2d6ede14d9 243-266
+  s_d14c0886a58be6::t_eafca3afce84c5 652-655,658-742,907
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "8eeb8adcfd17591548555ef0b36717c03a81c389",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
