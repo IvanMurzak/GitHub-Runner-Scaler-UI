@@ -1,0 +1,21 @@
+crates/app/src/cli/daemon.rs
+  s_e3f2ebf0732f36::t_12c5e141e57bd2 5,135-138,147,159,170,242-369
+  s_e3f2ebf0732f36::t_97f95cb479056c 11,657-662,664,667-746,898-988
+  s_e3f2ebf0732f36::t_f3eb28d296a0ba 370
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "abe7b4950c62f63586a7116c4fc0c70aed331845",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
