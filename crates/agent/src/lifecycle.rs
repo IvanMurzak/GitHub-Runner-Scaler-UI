@@ -42,8 +42,11 @@ use crate::reconcile::{
 };
 
 const IDENTITY_FILE: &str = ".runner-process.json";
+const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
+const UNRESOLVED_PROCESS_FILE: &str = ".runner-process.unresolved";
 const RUNNER_ID_FILE: &str = ".github-runner-id";
 const TERMINATE_INTENT_FILE: &str = ".terminate-registration-timeout";
+const MAX_POST_SPAWN_STOP_ATTEMPTS: usize = 3;
 
 /// Retry bounds for failures that can resolve without operator action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,8 +442,12 @@ impl ProcessStartFailure {
     }
 
     fn after_spawn_live(pid: u32) -> Self {
+        Self::after_spawn_live_with_reason(pid, FailureReason::ProcessStartFailed)
+    }
+
+    fn after_spawn_live_with_reason(pid: u32, reason: FailureReason) -> Self {
         Self {
-            reason: FailureReason::ProcessStartFailed,
+            reason,
             retryable: false,
             live_pid: Some(pid),
         }
@@ -511,9 +518,33 @@ impl NativeProcesses {
     }
 
     #[cfg(test)]
-    fn fail_next_post_spawn_stop(&self) {
+    fn fail_post_spawn_stops(&self, count: usize) {
         self.post_spawn_stop_failures
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_post_spawn_stop(&self) {
+        self.fail_post_spawn_stops(1);
+    }
+
+    fn stop_spawned_child(&self, child: &mut ChildProcess) -> Result<(), FailureReason> {
+        #[cfg(test)]
+        if self
+            .post_spawn_stop_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| if left > 0 { Some(left - 1) } else { None },
+            )
+            .is_ok()
+        {
+            return Err(FailureReason::Other("injected runner stop failure".into()));
+        }
+        child
+            .stop(Duration::from_secs(1))
+            .map(|_| ())
+            .map_err(|_| FailureReason::Other("spawned runner process could not be stopped".into()))
     }
 
     fn abort_spawned_child(
@@ -522,39 +553,58 @@ impl NativeProcesses {
         attempt: &RunnerAttempt,
         remove_identity: bool,
     ) -> ProcessStartFailure {
-        #[cfg(test)]
-        let injected_stop_failure = self
-            .post_spawn_stop_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |left| if left > 0 { Some(left - 1) } else { None },
-            )
-            .is_ok();
-        #[cfg(not(test))]
-        let injected_stop_failure = false;
-        let mut reaped = !injected_stop_failure && child.stop(Duration::from_secs(1)).is_ok();
+        let mut reaped = self.stop_spawned_child(&mut child).is_ok();
         if reaped {
             if remove_identity {
-                let _ = fs::remove_file(Self::identity_path(attempt));
+                Self::remove_identity_files(attempt);
             }
         } else {
             // A failed stop is not a failed attempt yet.  Persist enough truth
             // for crash recovery, and retain the owned child when possible.
-            let identity_durable = serde_json::to_vec(child.identity())
-                .ok()
-                .is_some_and(|identity| self.persist_identity(attempt, &identity).is_ok());
+            let identity_durable =
+                serde_json::to_vec(child.identity())
+                    .ok()
+                    .is_some_and(|identity| {
+                        self.persist_identity(attempt, &identity).is_ok()
+                            || self.persist_fallback_identity(attempt, &identity).is_ok()
+                    });
             if !identity_durable {
-                // Returning a live PID without its start token would make the
-                // next boot trust a recyclable PID. Once both durable identity
-                // and the first stop fail, fail closed by continuing to reap;
-                // there is no safe live-child result left to return.
-                while child.stop(Duration::from_secs(1)).is_err() {
-                    std::thread::sleep(Duration::from_millis(10));
+                // Returning a live PID as though recovery were complete would
+                // make the next boot trust a recyclable PID. Reaping is bounded;
+                // if it cannot finish, the durable `starting` journal entry is
+                // deliberately unresolved on restart and blocks new launches.
+                for _ in 1..MAX_POST_SPAWN_STOP_ATTEMPTS {
+                    if self.stop_spawned_child(&mut child).is_ok() {
+                        reaped = true;
+                        break;
+                    }
                 }
-                reaped = true;
-                if remove_identity {
-                    let _ = fs::remove_file(Self::identity_path(attempt));
+                if !reaped {
+                    // The attempt journal will durably record `starting` and
+                    // its PID. Recovery treats a missing full identity as
+                    // unresolved and starts nothing, so bounded stop failure
+                    // cannot turn into either a hang or a duplicate runner.
+                    let pid = child.pid();
+                    let marker = write_durable_file(
+                        &Self::unresolved_process_path(attempt),
+                        pid.to_string().as_bytes(),
+                    );
+                    self.children
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(attempt.id, child);
+                    let reason = if marker.is_ok() {
+                        FailureReason::Other(
+                            "spawn cleanup exhausted its bounded stop attempts; the live process remains under durable unresolved supervision"
+                                .into(),
+                        )
+                    } else {
+                        FailureReason::Other(
+                            "spawn cleanup exhausted its bounded stop attempts and the unresolved-process marker could not be journalled"
+                                .into(),
+                        )
+                    };
+                    return ProcessStartFailure::after_spawn_live_with_reason(pid, reason);
                 }
             } else {
                 let pid = child.pid();
@@ -579,12 +629,38 @@ impl NativeProcesses {
         attempt.runtime_path().join(IDENTITY_FILE)
     }
 
+    fn fallback_identity_path(attempt: &RunnerAttempt) -> PathBuf {
+        attempt.runtime_path().join(FALLBACK_IDENTITY_FILE)
+    }
+
+    fn unresolved_process_path(attempt: &RunnerAttempt) -> PathBuf {
+        attempt.runtime_path().join(UNRESOLVED_PROCESS_FILE)
+    }
+
+    fn remove_identity_files(attempt: &RunnerAttempt) {
+        let _ = fs::remove_file(Self::identity_path(attempt));
+        let _ = fs::remove_file(Self::fallback_identity_path(attempt));
+        let _ = fs::remove_file(Self::unresolved_process_path(attempt));
+    }
+
     fn persist_identity(&self, attempt: &RunnerAttempt, bytes: &[u8]) -> std::io::Result<()> {
+        self.persist_identity_at(&Self::identity_path(attempt), bytes)
+    }
+
+    fn persist_fallback_identity(
+        &self,
+        attempt: &RunnerAttempt,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        self.persist_identity_at(&Self::fallback_identity_path(attempt), bytes)
+    }
+
+    fn persist_identity_at(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(test)]
         if self.faults_at(PostSpawnBoundary::IdentityWrite) {
             return Err(std::io::Error::other("injected identity write failure"));
         }
-        write_durable_file(&Self::identity_path(attempt), bytes)
+        write_durable_file(path, bytes)
     }
 
     fn intent_path(attempt: &RunnerAttempt) -> PathBuf {
@@ -592,7 +668,14 @@ impl NativeProcesses {
     }
 
     fn read_identity(attempt: &RunnerAttempt) -> Result<Option<ProcessIdentity>, FailureReason> {
-        match fs::read(Self::identity_path(attempt)) {
+        match Self::read_identity_at(&Self::identity_path(attempt))? {
+            Some(identity) => Ok(Some(identity)),
+            None => Self::read_identity_at(&Self::fallback_identity_path(attempt)),
+        }
+    }
+
+    fn read_identity_at(path: &Path) -> Result<Option<ProcessIdentity>, FailureReason> {
+        match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|_| FailureReason::Other("process identity journal is unreadable".into())),
@@ -693,6 +776,12 @@ impl ProcessSupervisor for NativeProcesses {
             };
         }
         let Some(identity) = Self::read_identity(attempt)? else {
+            if attempt.process_id().is_some() || Self::unresolved_process_path(attempt).is_file() {
+                return Err(FailureReason::Other(
+                    "runner process identity is missing; refusing recovery until the process is resolved"
+                        .into(),
+                ));
+            }
             return Ok(false);
         };
         match identity.recheck() {
@@ -2914,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn every_post_spawn_boundary_reaps_child_removes_identity_and_forbids_retry() {
+    fn post_spawn_boundaries_are_bounded_durable_and_never_retry_jit() {
         let root = tempfile::tempdir().unwrap();
         let policy = fixtures::policy()
             .repository("octo/repo")
@@ -2974,18 +3063,66 @@ mod tests {
             FakeClock::default().now(),
         );
         // The first fault rejects the normal identity write; the second rejects
-        // the recovery write after the first stop also fails. The only safe
-        // outcome is a reaped child, never a live PID with no durable token.
+        // its retry after the first stop fails. The fallback sidecar must make
+        // the live-child result durable without an unbounded reap loop.
         processes.fail_post_spawn_at(PostSpawnBoundary::IdentityWrite);
         processes.fail_post_spawn_at(PostSpawnBoundary::IdentityWrite);
         processes.fail_next_post_spawn_stop();
         let failure = processes
             .spawn(&attempt, &EncodedJitConfig::new(JIT))
             .expect_err("the identity boundary must fail closed");
-        assert!(failure.live_pid.is_none());
-        assert!(!processes.is_alive(&attempt).unwrap());
+        assert!(failure.live_pid.is_some());
+        assert!(processes.is_alive(&attempt).unwrap());
         assert!(!NativeProcesses::identity_path(&attempt).exists());
-        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 5);
+        assert!(NativeProcesses::fallback_identity_path(&attempt).is_file());
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
+        processes.terminate(&attempt).unwrap();
+
+        let runtime = root.path().join("persistent-stop-and-identity-failures");
+        let bin = runtime.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        #[cfg(windows)]
+        let listener = bin.join("Runner.Listener.exe");
+        #[cfg(not(windows))]
+        let listener = bin.join("Runner.Listener");
+        fs::copy(std::env::current_exe().unwrap(), &listener).unwrap();
+        let mut unresolved = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runtime,
+            FakeClock::default().now(),
+        );
+        for _ in 0..3 {
+            processes.fail_post_spawn_at(PostSpawnBoundary::IdentityWrite);
+        }
+        processes.fail_post_spawn_stops(MAX_POST_SPAWN_STOP_ATTEMPTS);
+        let failure = processes
+            .spawn(&unresolved, &EncodedJitConfig::new(JIT))
+            .expect_err("bounded cleanup must return even when every stop errors");
+        let pid = failure
+            .live_pid
+            .expect("the owned child remains supervised in this invocation");
+        assert!(matches!(failure.reason, FailureReason::Other(_)));
+        unresolved.jit_received(FakeClock::default().now()).unwrap();
+        unresolved.started(pid, FakeClock::default().now()).unwrap();
+        let journal = SqliteStore::open_in_memory().unwrap();
+        journal.record_attempt(&unresolved).unwrap();
+        let recovered = journal.attempt(unresolved.id).unwrap().unwrap();
+        assert_eq!(recovered.process_id(), Some(pid));
+        assert_eq!(recovered.state(), AttemptState::Starting);
+        assert!(processes.is_alive(&unresolved).unwrap());
+        assert!(!NativeProcesses::identity_path(&unresolved).exists());
+        assert!(!NativeProcesses::fallback_identity_path(&unresolved).exists());
+        assert_eq!(
+            fs::read_to_string(NativeProcesses::unresolved_process_path(&unresolved)).unwrap(),
+            pid.to_string(),
+            "bounded cleanup must leave durable unresolved-process evidence before returning"
+        );
+        assert!(
+            NativeProcesses::new().is_alive(&recovered).is_err(),
+            "restart must fail closed on the durable starting/PID journal rather than trust a bare PID"
+        );
+        processes.terminate(&unresolved).unwrap();
 
         let runtime = root.path().join("post-spawn-stop-failed");
         let bin = runtime.join("bin");
@@ -3018,7 +3155,7 @@ mod tests {
                 .pid(),
             live_pid
         );
-        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 5);
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
         processes.terminate(&attempt).unwrap();
     }
 
