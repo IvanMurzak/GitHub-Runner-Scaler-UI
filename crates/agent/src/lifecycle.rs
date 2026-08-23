@@ -47,6 +47,8 @@ const UNRESOLVED_PROCESS_FILE: &str = ".runner-process.unresolved";
 const RUNNER_ID_FILE: &str = ".github-runner-id";
 const TERMINATE_INTENT_FILE: &str = ".terminate-registration-timeout";
 const MAX_POST_SPAWN_STOP_ATTEMPTS: usize = 3;
+#[cfg(test)]
+const TEST_LISTENER_READY: &str = ".test-listener-ready";
 
 /// Retry bounds for failures that can resolve without operator action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +486,8 @@ pub struct NativeProcesses {
     post_spawn_reaps: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    use_long_lived_test_listener: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -526,6 +530,12 @@ impl NativeProcesses {
     #[cfg(test)]
     fn fail_next_post_spawn_stop(&self) {
         self.fail_post_spawn_stops(1);
+    }
+
+    #[cfg(test)]
+    fn use_long_lived_test_listener(&self) {
+        self.use_long_lived_test_listener
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn stop_spawned_child(&self, child: &mut ChildProcess) -> Result<(), FailureReason> {
@@ -713,6 +723,31 @@ impl ProcessSupervisor for NativeProcesses {
                 FailureReason::ProcessStartFailed,
             ));
         }
+        #[cfg(test)]
+        let spec = if self
+            .use_long_lived_test_listener
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            SpawnSpec::new(program)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "lifecycle::tests::long_lived_native_listener_helper",
+                    "--nocapture",
+                ])
+                .env(
+                    "RUNNER_MANAGER_TEST_LISTENER_READY",
+                    attempt.runtime_path().join(TEST_LISTENER_READY),
+                )
+                .working_dir(attempt.runtime_path())
+        } else {
+            SpawnSpec::new(program)
+                .arg("run")
+                .arg("--jit-config-file")
+                .arg(&handoff_path)
+                .working_dir(attempt.runtime_path())
+        };
+        #[cfg(not(test))]
         let spec = SpawnSpec::new(program)
             .arg("run")
             .arg("--jit-config-file")
@@ -3011,6 +3046,7 @@ mod tests {
             .active()
             .build();
         let processes = NativeProcesses::new();
+        processes.use_long_lived_test_listener();
         for (index, boundary) in [
             PostSpawnBoundary::HandoffDelete,
             PostSpawnBoundary::IdentitySerialize,
@@ -3072,6 +3108,7 @@ mod tests {
             .spawn(&attempt, &EncodedJitConfig::new(JIT))
             .expect_err("the identity boundary must fail closed");
         assert!(failure.live_pid.is_some());
+        assert_long_lived_listener_ready(&processes, &attempt);
         assert!(processes.is_alive(&attempt).unwrap());
         assert!(!NativeProcesses::identity_path(&attempt).exists());
         assert!(NativeProcesses::fallback_identity_path(&attempt).is_file());
@@ -3103,6 +3140,7 @@ mod tests {
             .live_pid
             .expect("the owned child remains supervised in this invocation");
         assert!(matches!(failure.reason, FailureReason::Other(_)));
+        assert_long_lived_listener_ready(&processes, &unresolved);
         unresolved.jit_received(FakeClock::default().now()).unwrap();
         unresolved.started(pid, FakeClock::default().now()).unwrap();
         let journal = SqliteStore::open_in_memory().unwrap();
@@ -3147,6 +3185,7 @@ mod tests {
             .live_pid
             .expect("live PID is returned to the journal");
         assert!(!failure.retryable);
+        assert_long_lived_listener_ready(&processes, &attempt);
         assert!(NativeProcesses::identity_path(&attempt).is_file());
         assert_eq!(
             NativeProcesses::read_identity(&attempt)
@@ -3157,6 +3196,36 @@ mod tests {
         );
         assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
         processes.terminate(&attempt).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawned only as the platform-stable native listener fixture"]
+    fn long_lived_native_listener_helper() {
+        let ready = std::env::var_os("RUNNER_MANAGER_TEST_LISTENER_READY")
+            .map(PathBuf::from)
+            .expect("the parent supplies the readiness path");
+        fs::write(ready, b"ready\n").expect("the listener publishes readiness");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    fn assert_long_lived_listener_ready(processes: &NativeProcesses, attempt: &RunnerAttempt) {
+        let ready = attempt.runtime_path().join(TEST_LISTENER_READY);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready.is_file() {
+                assert_eq!(fs::read(&ready).unwrap(), b"ready\n");
+                return;
+            }
+            assert!(
+                processes.is_alive(attempt).unwrap(),
+                "the native listener exited before publishing readiness"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the native listener stayed alive but never published readiness"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
