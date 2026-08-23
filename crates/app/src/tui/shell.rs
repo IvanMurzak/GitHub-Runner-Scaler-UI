@@ -4,7 +4,7 @@
 //! Rendering accepts only immutable [`PresentationState`], so a frame has no
 //! filesystem, store, or network capability.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -950,6 +950,19 @@ where
     }
 }
 
+fn require_interactive_terminal(
+    input_is_terminal: bool,
+    output_is_terminal: bool,
+) -> io::Result<()> {
+    if input_is_terminal && output_is_terminal {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "the terminal UI requires interactive stdin and stdout",
+        ))
+    }
+}
+
 /// Runs the production terminal against an injected agent-event receiver.
 ///
 /// This is the composition seam for an in-process agent. The standalone
@@ -958,6 +971,7 @@ where
 pub fn run_terminal_with_agent_events(
     agent_events: mpsc::UnboundedReceiver<AgentEvent>,
 ) -> io::Result<()> {
+    require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     let mut session = TerminalSession::start(CrosstermActions::new(io::stdout(), SystemRawMode))?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -1317,6 +1331,18 @@ mod tests {
             .0;
         assert!(production_actions.contains("self.emit(EnableFocusChange)"));
         assert!(production_actions.contains("self.emit(DisableFocusChange)"));
+    }
+
+    #[test]
+    fn tui_refuses_captured_or_redirected_stdio_instead_of_waiting_for_events() {
+        assert!(require_interactive_terminal(true, true).is_ok());
+        for (input, output) in [(false, true), (true, false), (false, false)] {
+            let error = require_interactive_terminal(input, output).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the terminal UI requires interactive stdin and stdout"
+            );
+        }
     }
 
     #[derive(Clone)]
