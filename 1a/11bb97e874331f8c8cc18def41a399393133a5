@@ -1,0 +1,20 @@
+crates/app/tests/install_scripts.rs
+  s_e3f2ebf0732f36::t_556c81ae9cb452 2326-2348,2356,2385-2407
+  s_e3f2ebf0732f36::t_1ef01471e16c1e 51,788-810,1010,1087,1372,1859,1861,1890
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "1a11bb97e874331f8c8cc18def41a399393133a5",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
