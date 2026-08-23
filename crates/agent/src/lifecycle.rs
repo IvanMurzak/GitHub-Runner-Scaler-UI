@@ -9,6 +9,8 @@
 //! startup merely supplies the first observation.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -84,6 +86,10 @@ pub enum AttemptEvent {
     },
     Adopted {
         attempt: AttemptId,
+    },
+    RemoteIdentityRecovered {
+        attempt: AttemptId,
+        runner_id: u64,
     },
     TerminateIntent {
         attempt: AttemptId,
@@ -171,6 +177,41 @@ pub struct JitRequestFailure {
     pub retry_after: Option<Duration>,
 }
 
+/// GitHub's authoritative runner state plus the identity returned by inventory.
+/// The id is carried independently of the local sidecar so recovery can close
+/// the crash boundary immediately after a successful remote registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleGithubObservation {
+    pub status: GithubRunnerObservation,
+    pub runner_id: Option<u64>,
+}
+
+impl LifecycleGithubObservation {
+    #[must_use]
+    pub const fn unreachable() -> Self {
+        Self {
+            status: GithubRunnerObservation::Unreachable,
+            runner_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn not_registered() -> Self {
+        Self {
+            status: GithubRunnerObservation::NotRegistered,
+            runner_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn registered(runner_id: u64, busy: bool) -> Self {
+        Self {
+            status: GithubRunnerObservation::Registered { busy },
+            runner_id: Some(runner_id),
+        }
+    }
+}
+
 /// The two GitHub views the lifecycle needs, combined so one fake can drive
 /// registration and authoritative runner telemetry.
 #[async_trait]
@@ -187,7 +228,7 @@ pub trait LifecycleGithub: fmt::Debug + Send + Sync {
         target: &ScaleTarget,
         attempt: AttemptId,
         cancel: &CancelToken,
-    ) -> GithubRunnerObservation;
+    ) -> LifecycleGithubObservation;
 }
 
 #[async_trait]
@@ -227,17 +268,17 @@ where
         target: &ScaleTarget,
         attempt: AttemptId,
         cancel: &CancelToken,
-    ) -> GithubRunnerObservation {
+    ) -> LifecycleGithubObservation {
         let expected_name = runner_name(attempt);
         match self.list_runners(target, cancel).await {
             Ok(inventory) => inventory
                 .runners()
                 .iter()
                 .find(|runner| runner.name == expected_name)
-                .map_or(GithubRunnerObservation::NotRegistered, |runner| {
-                    GithubRunnerObservation::Registered { busy: runner.busy }
+                .map_or(LifecycleGithubObservation::not_registered(), |runner| {
+                    LifecycleGithubObservation::registered(runner.id, runner.busy)
                 }),
-            Err(_) => GithubRunnerObservation::Unreachable,
+            Err(_) => LifecycleGithubObservation::unreachable(),
         }
     }
 }
@@ -247,8 +288,9 @@ where
 pub trait RuntimePackages: fmt::Debug + Send + Sync {
     async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason>;
     fn release(&self, attempt: AttemptId) -> Result<(), FailureReason>;
-    fn prune(
+    fn prune_guarded(
         &self,
+        guard: &AllocationGuard,
         version: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason>;
@@ -289,8 +331,9 @@ impl RuntimePackages for CachedRuntimePackages {
         self.cache.release(attempt).map_err(package_failure)
     }
 
-    fn prune(
+    fn prune_guarded(
         &self,
+        _guard: &AllocationGuard,
         version: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason> {
@@ -302,6 +345,25 @@ fn package_failure(error: PackageError) -> FailureReason {
     error.failure_reason().unwrap_or(FailureReason::Other(
         "runner package cache operation failed".into(),
     ))
+}
+
+fn package_failure_is_terminal(reason: &FailureReason) -> bool {
+    matches!(
+        reason,
+        FailureReason::RunnerPackageUnverified | FailureReason::RunnerVersionRejected
+    )
+}
+
+fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
+    match outcome {
+        AttemptOutcome::Failed {
+            reason: FailureReason::JitExpired,
+        } => Some("jit_expired_replacement"),
+        AttemptOutcome::Failed {
+            reason: FailureReason::ProcessExitedUnexpectedly,
+        } => Some("exit_before_acceptance_replacement"),
+        _ => None,
+    }
 }
 
 fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -320,12 +382,36 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 /// Process operations are attempt-addressed so a recovered process and a child
 /// started in this invocation are supervised through one port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessStartFailure {
+    pub reason: FailureReason,
+    /// False once a child existed: the one-shot JIT value may have been
+    /// consumed, so retrying it could start a duplicate.
+    pub retryable: bool,
+}
+
+impl ProcessStartFailure {
+    fn before_spawn(reason: FailureReason) -> Self {
+        Self {
+            reason,
+            retryable: true,
+        }
+    }
+
+    fn after_spawn() -> Self {
+        Self {
+            reason: FailureReason::ProcessStartFailed,
+            retryable: false,
+        }
+    }
+}
+
 pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
     fn spawn(
         &self,
         attempt: &RunnerAttempt,
         config: &EncodedJitConfig,
-    ) -> Result<u32, FailureReason>;
+    ) -> Result<u32, ProcessStartFailure>;
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason>;
     /// True only for a child this invocation owned and reaped with a successful
     /// exit status.  A recovered process that is merely gone answers false.
@@ -341,12 +427,61 @@ pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
 pub struct NativeProcesses {
     children: Mutex<BTreeMap<AttemptId, ChildProcess>>,
     successful_exits: Mutex<BTreeMap<AttemptId, bool>>,
+    #[cfg(test)]
+    post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
+    #[cfg(test)]
+    post_spawn_reaps: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostSpawnBoundary {
+    HandoffDelete,
+    IdentitySerialize,
+    IdentityWrite,
+    ChildMapInsert,
 }
 
 impl NativeProcesses {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn fail_post_spawn_at(&self, boundary: PostSpawnBoundary) {
+        self.post_spawn_faults.lock().unwrap().push_back(boundary);
+    }
+
+    #[cfg(test)]
+    fn faults_at(&self, boundary: PostSpawnBoundary) -> bool {
+        let mut faults = self.post_spawn_faults.lock().unwrap();
+        if faults.front() == Some(&boundary) {
+            faults.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abort_spawned_child(
+        &self,
+        child: &mut ChildProcess,
+        attempt: &RunnerAttempt,
+        remove_identity: bool,
+    ) -> ProcessStartFailure {
+        let reaped = child.stop(Duration::from_secs(1)).is_ok();
+        if remove_identity {
+            let _ = fs::remove_file(Self::identity_path(attempt));
+        }
+        #[cfg(test)]
+        if reaped {
+            self.post_spawn_reaps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        #[cfg(not(test))]
+        let _ = reaped;
+        ProcessStartFailure::after_spawn()
     }
 
     fn identity_path(attempt: &RunnerAttempt) -> PathBuf {
@@ -375,12 +510,12 @@ impl ProcessSupervisor for NativeProcesses {
         &self,
         attempt: &RunnerAttempt,
         config: &EncodedJitConfig,
-    ) -> Result<u32, FailureReason> {
+    ) -> Result<u32, ProcessStartFailure> {
         let handoff = RestrictiveHandoff::create(
             attempt.runtime_path(),
             SecretString::from(config.expose().to_owned()),
         )
-        .map_err(|_| FailureReason::ProcessStartFailed)?;
+        .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
         let handoff_path = handoff.path().to_path_buf();
         #[cfg(windows)]
         let program = attempt
@@ -392,7 +527,9 @@ impl ProcessSupervisor for NativeProcesses {
         // Checked after the handoff exists on purpose: the error path below is
         // a real post-handoff launch failure, and unwinding must delete it.
         if !program.is_file() {
-            return Err(FailureReason::ProcessStartFailed);
+            return Err(ProcessStartFailure::before_spawn(
+                FailureReason::ProcessStartFailed,
+            ));
         }
         let spec = SpawnSpec::new(program)
             .arg("run")
@@ -401,22 +538,42 @@ impl ProcessSupervisor for NativeProcesses {
             .working_dir(attempt.runtime_path());
         let mut child = spec
             .spawn_with_handoff(&handoff)
-            .map_err(|_| FailureReason::ProcessStartFailed)?;
+            .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
         // The payload is gone before any state saying "starting" is persisted.
-        handoff
-            .delete()
-            .map_err(|_| FailureReason::ProcessStartFailed)?;
-        let identity =
-            serde_json::to_vec(child.identity()).map_err(|_| FailureReason::ProcessStartFailed)?;
-        if fs::write(Self::identity_path(attempt), identity).is_err() {
-            let _ = child.stop(Duration::from_secs(1));
-            return Err(FailureReason::ProcessStartFailed);
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::HandoffDelete) {
+            drop(handoff);
+            return Err(self.abort_spawned_child(&mut child, attempt, false));
+        }
+        if handoff.delete().is_err() {
+            return Err(self.abort_spawned_child(&mut child, attempt, false));
+        }
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
+            return Err(self.abort_spawned_child(&mut child, attempt, false));
+        }
+        let identity = match serde_json::to_vec(child.identity()) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Err(self.abort_spawned_child(&mut child, attempt, false));
+            }
+        };
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::IdentityWrite) {
+            return Err(self.abort_spawned_child(&mut child, attempt, true));
+        }
+        if write_durable_file(&Self::identity_path(attempt), &identity).is_err() {
+            return Err(self.abort_spawned_child(&mut child, attempt, true));
         }
         let pid = child.pid();
-        self.children
-            .lock()
-            .map_err(|_| FailureReason::ProcessStartFailed)?
-            .insert(attempt.id, child);
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
+            return Err(self.abort_spawned_child(&mut child, attempt, true));
+        }
+        let Ok(mut children) = self.children.lock() else {
+            return Err(self.abort_spawned_child(&mut child, attempt, true));
+        };
+        children.insert(attempt.id, child);
         Ok(pid)
     }
 
@@ -457,14 +614,7 @@ impl ProcessSupervisor for NativeProcesses {
 
     fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
         let path = Self::intent_path(attempt);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-            .map_err(|_| FailureReason::Other("terminate intent could not be journalled".into()))?;
-        file.write_all(b"registration-timeout\n")
-            .and_then(|()| file.sync_all())
+        write_durable_file(&path, b"registration-timeout\n")
             .map_err(|_| FailureReason::Other("terminate intent could not be journalled".into()))
     }
 
@@ -558,6 +708,17 @@ pub struct LifecycleLauncher {
     ports: LifecyclePorts,
     recovery_complete: Mutex<bool>,
     versions: Mutex<BTreeMap<AttemptId, RunnerVersion>>,
+    pending_replacements: Mutex<BTreeMap<PolicyId, (AttemptId, &'static str)>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileProgress {
+    Reconciled,
+    Deferred,
+    Replacement {
+        attempt: AttemptId,
+        operation: &'static str,
+    },
 }
 
 impl LifecycleLauncher {
@@ -582,6 +743,7 @@ impl LifecycleLauncher {
             ports,
             recovery_complete: Mutex::new(false),
             versions: Mutex::new(BTreeMap::new()),
+            pending_replacements: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -595,17 +757,45 @@ impl LifecycleLauncher {
             .store
             .attempts()
             .map_err(|_| LifecycleError::Journal)?;
+        let mut unresolved = false;
         for attempt in attempts {
             let Some(policy) = by_id.get(&attempt.policy_id) else {
+                if !attempt.is_terminal() && attempt.state() != AttemptState::Cleaned {
+                    unresolved = true;
+                }
                 continue;
             };
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
-            self.reconcile_one(policy, attempt).await?;
+            match self.reconcile_one(policy, attempt).await? {
+                ReconcileProgress::Deferred => unresolved = true,
+                ReconcileProgress::Replacement { attempt, operation } => {
+                    self.pending_replacements
+                        .lock()
+                        .map_err(|_| LifecycleError::Journal)?
+                        .insert(policy.id, (attempt, operation));
+                }
+                ReconcileProgress::Reconciled => {}
+            }
+        }
+        if unresolved {
+            return Err(LifecycleError::RecoveryIncomplete);
         }
         *self
             .recovery_complete
             .lock()
             .map_err(|_| LifecycleError::Journal)? = true;
+        let pending = std::mem::take(
+            &mut *self
+                .pending_replacements
+                .lock()
+                .map_err(|_| LifecycleError::Journal)?,
+        );
+        for (policy_id, (attempt, operation)) in pending {
+            if let Some(policy) = by_id.get(&policy_id) {
+                self.replace_with_backoff(policy, attempt, operation)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -616,9 +806,18 @@ impl LifecycleLauncher {
             .store
             .attempts_for_policy(policy.id)
             .map_err(|_| LifecycleError::Journal)?;
+        let mut replacements = Vec::new();
         for attempt in attempts {
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
-            self.reconcile_one(policy, attempt).await?;
+            if let ReconcileProgress::Replacement { attempt, operation } =
+                self.reconcile_one(policy, attempt).await?
+            {
+                replacements.push((attempt, operation));
+            }
+        }
+        for (attempt, operation) in replacements {
+            self.replace_with_backoff(policy, attempt, operation)
+                .await?;
         }
         Ok(())
     }
@@ -627,12 +826,13 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         mut attempt: RunnerAttempt,
-    ) -> Result<(), LifecycleError> {
+    ) -> Result<ReconcileProgress, LifecycleError> {
         if attempt.state() == AttemptState::Cleaned {
-            return Ok(());
+            return Ok(ReconcileProgress::Reconciled);
         }
         if attempt.is_terminal() {
-            return self.clean_attempt(&mut attempt);
+            self.clean_attempt(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
         }
         let process_alive = self
             .ports
@@ -645,17 +845,34 @@ impl LifecycleLauncher {
             .observe(&policy.target, attempt.id, &self.cancel)
             .await;
 
+        // If the agent died after GitHub accepted the registration but before
+        // the non-secret runner-id sidecar landed, inventory closes the gap.
+        // Persist it before making any state decision so a second crash moves
+        // the boundary forward rather than repeating it.
+        if let Some(runner_id) = github.runner_id
+            && read_runner_id(attempt.runtime_path()).is_none()
+        {
+            write_runner_id(attempt.runtime_path(), runner_id)?;
+            self.ports
+                .events
+                .emit(AttemptEvent::RemoteIdentityRecovered {
+                    attempt: attempt.id,
+                    runner_id,
+                });
+        }
+
         // A one-shot child owned by this invocation exited successfully after
         // GitHub had already reported it busy, and its ephemeral registration
         // is now gone.  This concludes the *runner attempt*, never the workflow
         // outcome; GitHub remains authoritative for that outcome.
         if attempt.state() == AttemptState::Busy
             && !process_alive
-            && github == GithubRunnerObservation::NotRegistered
+            && github.status == GithubRunnerObservation::NotRegistered
             && self.ports.processes.completed_successfully(&attempt)
         {
             self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
-            return self.clean_attempt(&mut attempt);
+            self.clean_attempt(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
         }
 
         // This durable mark is more authoritative than a later observation
@@ -665,29 +882,66 @@ impl LifecycleLauncher {
                 &mut attempt,
                 AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
             )?;
-            return self.clean_attempt(&mut attempt);
+            self.clean_attempt(&mut attempt)?;
+            return Ok(ReconcileProgress::Replacement {
+                attempt: attempt.id,
+                operation: "jit_expired_replacement",
+            });
+        }
+
+        // A remote registration with no surviving process has lost its
+        // one-shot JIT secret.  Walking it to `starting` would require inventing
+        // a PID; retrying the same registration would require inventing the
+        // secret.  Record the configuration as expired and let the bounded
+        // replacement path request a fresh one only if demand remains.
+        if matches!(
+            attempt.state(),
+            AttemptState::Allocated | AttemptState::JitReceived
+        ) && !process_alive
+            && matches!(github.status, GithubRunnerObservation::Registered { .. })
+        {
+            if attempt.state() == AttemptState::Allocated {
+                attempt
+                    .jit_received(self.ports.clock.now())
+                    .map_err(|_| LifecycleError::Transition)?;
+                self.record(&attempt)?;
+            }
+            self.conclude(
+                &mut attempt,
+                AttemptOutcome::failed(FailureReason::JitExpired),
+            )?;
+            self.clean_attempt(&mut attempt)?;
+            return Ok(ReconcileProgress::Replacement {
+                attempt: attempt.id,
+                operation: "jit_expired_replacement",
+            });
         }
 
         match recovery_decision(
             &attempt,
             RecoveryObservation {
                 process_alive,
-                github,
+                github: github.status,
             },
             self.timeouts,
             self.ports.clock.as_ref(),
         ) {
-            RecoveryDecision::Nothing | RecoveryDecision::Wait | RecoveryDecision::Defer => Ok(()),
+            RecoveryDecision::Nothing | RecoveryDecision::Wait => Ok(ReconcileProgress::Reconciled),
+            RecoveryDecision::Defer => Ok(ReconcileProgress::Deferred),
             RecoveryDecision::Adopt => {
                 self.ports.events.emit(AttemptEvent::Adopted {
                     attempt: attempt.id,
                 });
-                Ok(())
+                Ok(ReconcileProgress::Reconciled)
             }
-            RecoveryDecision::Clean => self.clean_attempt(&mut attempt),
+            RecoveryDecision::Clean => {
+                self.clean_attempt(&mut attempt)?;
+                Ok(ReconcileProgress::Reconciled)
+            }
             RecoveryDecision::Observe(state) => {
                 let runner_id = attempt
                     .github_runner_id()
+                    .or(github.runner_id)
                     .or_else(|| read_runner_id(attempt.runtime_path()))
                     .ok_or(LifecycleError::Transition)?;
                 match state {
@@ -708,11 +962,21 @@ impl LifecycleLauncher {
                         .map_err(|_| LifecycleError::Transition)?,
                     _ => return Err(LifecycleError::Transition),
                 }
-                self.record(&attempt)
+                self.record(&attempt)?;
+                Ok(ReconcileProgress::Reconciled)
             }
             RecoveryDecision::Conclude(outcome) => {
+                let replacement = replacement_operation(&outcome);
                 self.conclude(&mut attempt, outcome)?;
-                self.clean_attempt(&mut attempt)
+                self.clean_attempt(&mut attempt)?;
+                Ok(
+                    replacement.map_or(ReconcileProgress::Reconciled, |operation| {
+                        ReconcileProgress::Replacement {
+                            attempt: attempt.id,
+                            operation,
+                        }
+                    }),
+                )
             }
             RecoveryDecision::Terminate(_payload) => {
                 // The mark is synced first.  Do not use `_payload` to conclude:
@@ -735,7 +999,7 @@ impl LifecycleLauncher {
                     .is_alive(&attempt)
                     .map_err(LifecycleError::Failed)?
                 {
-                    return Ok(());
+                    return Ok(ReconcileProgress::Deferred);
                 }
                 self.ports.events.emit(AttemptEvent::Terminated {
                     attempt: attempt.id,
@@ -744,7 +1008,8 @@ impl LifecycleLauncher {
                     &mut attempt,
                     AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
                 )?;
-                self.clean_attempt(&mut attempt)
+                self.clean_attempt(&mut attempt)?;
+                Ok(ReconcileProgress::Reconciled)
             }
         }
     }
@@ -844,6 +1109,72 @@ impl LifecycleLauncher {
         })
     }
 
+    async fn materialize_with_retry(
+        &self,
+        policy: &ScalePolicy,
+        attempt: &RunnerAttempt,
+    ) -> Result<RunnerVersion, FailureReason> {
+        let mut issued = 0_u32;
+        loop {
+            issued = issued.saturating_add(1);
+            match self.ports.packages.materialize(attempt).await {
+                Ok(version) => return Ok(version),
+                Err(reason)
+                    if package_failure_is_terminal(&reason)
+                        || issued >= self.retry.max_attempts.max(1) =>
+                {
+                    return Err(reason);
+                }
+                Err(reason) => {
+                    if !self.ports.demand.persists(policy.id).await {
+                        return Err(reason);
+                    }
+                    let delay = self.retry.delay(issued);
+                    self.ports.events.emit(AttemptEvent::Retry {
+                        attempt: attempt.id,
+                        operation: "package_materialization",
+                        delay,
+                    });
+                    self.ports.delay.wait(delay).await;
+                    if !self.ports.demand.persists(policy.id).await {
+                        return Err(reason);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn replace_with_backoff(
+        &self,
+        policy: &ScalePolicy,
+        previous: AttemptId,
+        operation: &'static str,
+    ) -> Result<(), LifecycleError> {
+        let mut last_error = None;
+        for retry_index in 1..=self.retry.max_attempts.max(1) {
+            if !self.ports.demand.persists(policy.id).await {
+                return Ok(());
+            }
+            let delay = self.retry.delay(retry_index);
+            self.ports.events.emit(AttemptEvent::Retry {
+                attempt: previous,
+                operation,
+                delay,
+            });
+            self.ports.delay.wait(delay).await;
+            // Adjacent to the effect: no directory, package request or JIT
+            // registration occurs after demand disappears during the delay.
+            if !self.ports.demand.persists(policy.id).await {
+                return Ok(());
+            }
+            match self.launch_attempt(policy).await {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(LifecycleError::RecoveryIncomplete))
+    }
+
     async fn register_with_retry(
         &self,
         policy: &ScalePolicy,
@@ -863,13 +1194,12 @@ impl LifecycleLauncher {
                 Err(error) if error.terminal => {
                     return Err(LifecycleError::Failed(error.reason));
                 }
-                Err(error) if issued >= self.retry.max_attempts.max(1) => {
-                    return Err(LifecycleError::Failed(error.reason));
-                }
-                Err(error) if !self.ports.demand.persists(policy.id).await => {
-                    return Err(LifecycleError::Failed(error.reason));
-                }
                 Err(error) => {
+                    if issued >= self.retry.max_attempts.max(1)
+                        || !self.ports.demand.persists(policy.id).await
+                    {
+                        return Err(LifecycleError::Failed(error.reason));
+                    }
                     let delay = error
                         .retry_after
                         .unwrap_or_else(|| self.retry.delay(issued));
@@ -879,15 +1209,15 @@ impl LifecycleLauncher {
                         delay,
                     });
                     self.ports.delay.wait(delay).await;
+                    if !self.ports.demand.persists(policy.id).await {
+                        return Err(LifecycleError::Failed(error.reason));
+                    }
                 }
             }
         }
     }
 
-    async fn launch_attempt(
-        &self,
-        request: LaunchRequest<'_>,
-    ) -> Result<RunnerAttempt, LifecycleError> {
+    async fn launch_attempt(&self, policy: &ScalePolicy) -> Result<RunnerAttempt, LifecycleError> {
         if !*self
             .recovery_complete
             .lock()
@@ -895,23 +1225,21 @@ impl LifecycleLauncher {
         {
             return Err(LifecycleError::RecoveryIncomplete);
         }
-        let labels = request
-            .policy
+        let labels = policy
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
         let runtime = self
             .runtime_root
-            .join(request.policy.id.to_string())
+            .join(policy.id.to_string())
             .join(id.to_string());
         fs::create_dir_all(&runtime)
             .map_err(|_| LifecycleError::Failed(FailureReason::ProcessStartFailed))?;
-        let mut attempt =
-            RunnerAttempt::allocate(id, request.policy.id, runtime, self.ports.clock.now());
+        let mut attempt = RunnerAttempt::allocate(id, policy.id, runtime, self.ports.clock.now());
         // This is deliberately the first effect after directory allocation.
         self.record(&attempt)?;
 
-        let version = match self.ports.packages.materialize(&attempt).await {
+        let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
         };
@@ -922,36 +1250,29 @@ impl LifecycleLauncher {
 
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
-        let registration = match self
-            .register_with_retry(request.policy, id, &jit_request)
-            .await
-        {
+        let registration = match self.register_with_retry(policy, id, &jit_request).await {
             Ok(registration) => registration,
             Err(error) => return self.fail_launch(&mut attempt, error.reason()),
         };
+        let runner_id = registration.runner().id;
+        write_runner_id(attempt.runtime_path(), runner_id)?;
         attempt
             .jit_received(self.ports.clock.now())
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
-        let runner_id = registration.runner().id;
-        fs::write(
-            attempt.runtime_path().join(RUNNER_ID_FILE),
-            runner_id.to_string(),
-        )
-        .map_err(|_| LifecycleError::Failed(FailureReason::ProcessStartFailed))?;
         let config = registration.into_config();
         let mut issued = 0_u32;
         let pid = loop {
             issued = issued.saturating_add(1);
             match self.ports.processes.spawn(&attempt, &config) {
                 Ok(pid) => break pid,
-                Err(reason)
-                    if issued >= self.retry.max_attempts.max(1)
-                        || !self.ports.demand.persists(request.policy.id).await =>
-                {
-                    return self.fail_launch(&mut attempt, reason);
-                }
-                Err(_) => {
+                Err(error) => {
+                    if !error.retryable
+                        || issued >= self.retry.max_attempts.max(1)
+                        || !self.ports.demand.persists(policy.id).await
+                    {
+                        return self.fail_launch(&mut attempt, error.reason);
+                    }
                     let delay = self.retry.delay(issued);
                     self.ports.events.emit(AttemptEvent::Retry {
                         attempt: attempt.id,
@@ -959,6 +1280,9 @@ impl LifecycleLauncher {
                         delay,
                     });
                     self.ports.delay.wait(delay).await;
+                    if !self.ports.demand.persists(policy.id).await {
+                        return self.fail_launch(&mut attempt, error.reason);
+                    }
                 }
             }
         };
@@ -992,7 +1316,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?;
         self.ports
             .packages
-            .prune(version, &attempts)
+            .prune_guarded(_guard, version, &attempts)
             .map_err(LifecycleError::Failed)
     }
 }
@@ -1008,7 +1332,7 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
-        self.launch_attempt(request)
+        self.launch_attempt(request.policy)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -1045,10 +1369,72 @@ fn read_runner_id(runtime: &Path) -> Option<u64> {
         .ok()
 }
 
+fn write_runner_id(runtime: &Path, runner_id: u64) -> Result<(), LifecycleError> {
+    let target = runtime.join(RUNNER_ID_FILE);
+    if let Some(existing) = read_runner_id(runtime) {
+        return (existing == runner_id)
+            .then_some(())
+            .ok_or(LifecycleError::Journal);
+    }
+    let temporary = runtime.join(format!("{RUNNER_ID_FILE}.{}.tmp", uuid::Uuid::new_v4()));
+    write_durable_file(&temporary, runner_id.to_string().as_bytes())
+        .map_err(|_| LifecycleError::Journal)?;
+    match fs::rename(&temporary, &target) {
+        Ok(()) => sync_directory(runtime).map_err(|_| LifecycleError::Journal),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            (read_runner_id(runtime) == Some(runner_id))
+                .then_some(())
+                .ok_or(LifecycleError::Journal)
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&temporary);
+            Err(LifecycleError::Journal)
+        }
+    }
+}
+
+fn write_durable_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file has no parent directory",
+        )
+    })?;
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0007;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use runner_manager_domain::model::Elapsed;
@@ -1062,7 +1448,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeGithubLifecycle {
         registration_failures: Mutex<VecDeque<bool>>,
-        observations: Mutex<VecDeque<GithubRunnerObservation>>,
+        observations: Mutex<VecDeque<LifecycleGithubObservation>>,
         registrations: AtomicUsize,
         remaining_runners: AtomicUsize,
     }
@@ -1077,6 +1463,15 @@ mod tests {
         }
 
         fn observe(&self, observation: GithubRunnerObservation) {
+            let observation = match observation {
+                GithubRunnerObservation::Unreachable => LifecycleGithubObservation::unreachable(),
+                GithubRunnerObservation::NotRegistered => {
+                    LifecycleGithubObservation::not_registered()
+                }
+                GithubRunnerObservation::Registered { busy } => {
+                    LifecycleGithubObservation::registered(73, busy)
+                }
+            };
             self.observations.lock().unwrap().push_back(observation);
         }
     }
@@ -1121,14 +1516,14 @@ mod tests {
             _target: &ScaleTarget,
             _attempt: AttemptId,
             _cancel: &CancelToken,
-        ) -> GithubRunnerObservation {
+        ) -> LifecycleGithubObservation {
             let observation = self
                 .observations
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(GithubRunnerObservation::NotRegistered);
-            if observation == GithubRunnerObservation::NotRegistered {
+                .unwrap_or(LifecycleGithubObservation::not_registered());
+            if observation.status == GithubRunnerObservation::NotRegistered {
                 self.remaining_runners.store(0, Ordering::SeqCst);
             }
             observation
@@ -1139,6 +1534,8 @@ mod tests {
     struct FakePackages {
         version: RunnerVersion,
         leases: Mutex<BTreeSet<AttemptId>>,
+        materializations: AtomicUsize,
+        materialization_failures: AtomicUsize,
         releases: AtomicUsize,
         prunes: AtomicUsize,
     }
@@ -1148,9 +1545,17 @@ mod tests {
             Self {
                 version: RunnerVersion::parse("2.330.0").unwrap(),
                 leases: Mutex::new(BTreeSet::new()),
+                materializations: AtomicUsize::new(0),
+                materialization_failures: AtomicUsize::new(0),
                 releases: AtomicUsize::new(0),
                 prunes: AtomicUsize::new(0),
             }
+        }
+    }
+
+    impl FakePackages {
+        fn fail_materializations(&self, count: usize) {
+            self.materialization_failures.store(count, Ordering::SeqCst);
         }
     }
 
@@ -1160,6 +1565,18 @@ mod tests {
             &self,
             attempt: &RunnerAttempt,
         ) -> Result<RunnerVersion, FailureReason> {
+            self.materializations.fetch_add(1, Ordering::SeqCst);
+            if self
+                .materialization_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    if left > 0 { Some(left - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err(FailureReason::Other(
+                    "runner package materialization failed transiently".into(),
+                ));
+            }
             fs::create_dir_all(attempt.runtime_path()).unwrap();
             fs::write(attempt.runtime_path().join("runner-package"), b"verified").unwrap();
             self.leases.lock().unwrap().insert(attempt.id);
@@ -1172,8 +1589,9 @@ mod tests {
             Ok(())
         }
 
-        fn prune(
+        fn prune_guarded(
             &self,
+            _guard: &AllocationGuard,
             _version: &RunnerVersion,
             _attempts: &[RunnerAttempt],
         ) -> Result<(), FailureReason> {
@@ -1190,6 +1608,7 @@ mod tests {
         spawn_failures: AtomicUsize,
         terminations: AtomicUsize,
         intent: AtomicBool,
+        intent_failure: AtomicBool,
         actions: Mutex<Vec<&'static str>>,
         saw_secret: AtomicBool,
     }
@@ -1207,6 +1626,10 @@ mod tests {
             self.completed_successfully.store(true, Ordering::SeqCst);
             self.alive.store(false, Ordering::SeqCst);
         }
+
+        fn fail_intent(&self) {
+            self.intent_failure.store(true, Ordering::SeqCst);
+        }
     }
 
     impl ProcessSupervisor for FakeProcesses {
@@ -1214,7 +1637,7 @@ mod tests {
             &self,
             attempt: &RunnerAttempt,
             config: &EncodedJitConfig,
-        ) -> Result<u32, FailureReason> {
+        ) -> Result<u32, ProcessStartFailure> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             // Model the production handoff on both paths: the sensitive file is
             // scoped to this call and absent when it returns.
@@ -1235,7 +1658,9 @@ mod tests {
             drop(handoff);
             assert!(!handoff_path.exists(), "handoff must be absent on return");
             if failing {
-                return Err(FailureReason::ProcessStartFailed);
+                return Err(ProcessStartFailure::before_spawn(
+                    FailureReason::ProcessStartFailed,
+                ));
             }
             self.alive.store(true, Ordering::SeqCst);
             Ok(4242)
@@ -1252,6 +1677,11 @@ mod tests {
 
         fn record_terminate_intent(&self, _attempt: &RunnerAttempt) -> Result<(), FailureReason> {
             self.actions.lock().unwrap().push("terminate_intent");
+            if self.intent_failure.load(Ordering::SeqCst) {
+                return Err(FailureReason::Other(
+                    "terminate intent directory sync failed".into(),
+                ));
+            }
             self.intent.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1632,11 +2062,20 @@ mod tests {
         ));
         assert!(!first.runtime_path().exists());
 
-        // This is the next e1 grant after demand was recomputed and remained.
-        let replacement = harness.launch().await;
+        let replacement = harness
+            .store
+            .attempts()
+            .unwrap()
+            .into_iter()
+            .find(|attempt| attempt.id != first.id)
+            .expect("persistent demand produced a bounded replacement");
         assert_ne!(replacement.id, first.id);
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 2);
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *harness.delay.0.lock().unwrap(),
+            vec![Duration::from_millis(10)]
+        );
     }
 
     #[tokio::test]
@@ -1673,6 +2112,143 @@ mod tests {
         ));
         assert!(!runtime.exists());
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert!(harness.delay.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_jit_gets_one_delayed_fresh_registration_when_demand_persists() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let id = AttemptId::new_random();
+        let runtime = harness.launcher.runtime_root.join("expired-with-demand");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+        attempt.jit_received(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        harness.clock.advance_secs(11);
+        harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+
+        let attempts = harness.store.attempts().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts
+                .iter()
+                .find(|attempt| attempt.id == id)
+                .unwrap()
+                .state(),
+            AttemptState::Cleaned
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| { attempt.id != id && attempt.state() == AttemptState::Starting })
+        );
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *harness.delay.0.lock().unwrap(),
+            vec![Duration::from_millis(10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn package_materialization_retries_are_bounded_and_demand_adjacent() {
+        let persistent = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        persistent.packages.fail_materializations(2);
+        persistent.ready().await;
+        persistent.launch().await;
+        assert_eq!(
+            persistent.packages.materializations.load(Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            *persistent.delay.0.lock().unwrap(),
+            vec![Duration::from_millis(10), Duration::from_millis(20)]
+        );
+
+        let gone_before_wait = Harness::new(
+            FakeGithubLifecycle::default(),
+            Arc::new(FakeDemand::answering([false])),
+        );
+        gone_before_wait.packages.fail_materializations(3);
+        gone_before_wait.ready().await;
+        assert!(
+            gone_before_wait
+                .launcher
+                .launch(LaunchRequest {
+                    host: &gone_before_wait.host,
+                    policy: &gone_before_wait.policy,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            gone_before_wait
+                .packages
+                .materializations
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert!(gone_before_wait.delay.0.lock().unwrap().is_empty());
+
+        let gone_during_wait = Harness::new(
+            FakeGithubLifecycle::default(),
+            Arc::new(FakeDemand::answering([true, false])),
+        );
+        gone_during_wait.packages.fail_materializations(3);
+        gone_during_wait.ready().await;
+        assert!(
+            gone_during_wait
+                .launcher
+                .launch(LaunchRequest {
+                    host: &gone_during_wait.host,
+                    policy: &gone_during_wait.policy,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            gone_during_wait
+                .packages
+                .materializations
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            *gone_during_wait.delay.0.lock().unwrap(),
+            vec![Duration::from_millis(10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rechecks_demand_immediately_before_launch() {
+        let harness = Harness::new(
+            FakeGithubLifecycle::default(),
+            Arc::new(FakeDemand::answering([true, false])),
+        );
+        harness.ready().await;
+        let first = harness.launch().await;
+        harness.processes.set_alive(false);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert_eq!(harness.store.attempts().unwrap().len(), 1);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *harness.delay.0.lock().unwrap(),
+            vec![Duration::from_millis(10)]
+        );
+        assert_eq!(
+            harness.store.attempt(first.id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
     }
 
     #[tokio::test]
@@ -1712,6 +2288,140 @@ mod tests {
                 .events()
                 .contains(&AttemptEvent::Adopted { attempt: id })
         );
+    }
+
+    #[tokio::test]
+    async fn remote_runner_identity_closes_both_sides_of_the_registration_crash_boundary() {
+        for sidecar_already_present in [false, true] {
+            let harness = Harness::new(
+                FakeGithubLifecycle::default(),
+                Arc::new(FakeDemand::answering([false])),
+            );
+            let id = AttemptId::new_random();
+            let runtime = harness
+                .launcher
+                .runtime_root
+                .join(if sidecar_already_present {
+                    "after-id-sidecar"
+                } else {
+                    "before-id-sidecar"
+                });
+            fs::create_dir_all(&runtime).unwrap();
+            let mut attempt =
+                RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+            if sidecar_already_present {
+                write_runner_id(&runtime, 73).unwrap();
+                attempt.jit_received(harness.clock.now()).unwrap();
+            }
+            harness.store.record_attempt(&attempt).unwrap();
+            harness.processes.set_alive(true);
+            harness
+                .github
+                .observe(GithubRunnerObservation::Registered { busy: false });
+            harness
+                .launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .unwrap();
+
+            assert_eq!(read_runner_id(&runtime), Some(73));
+            assert!(
+                harness
+                    .store
+                    .attempt(id)
+                    .unwrap()
+                    .unwrap()
+                    .outcome()
+                    .is_none()
+            );
+            let events = harness.events.events();
+            let recovered = events.iter().position(|event| {
+                matches!(
+                    event,
+                    AttemptEvent::RemoteIdentityRecovered {
+                        attempt,
+                        runner_id: 73
+                    } if *attempt == id
+                )
+            });
+            assert_eq!(recovered.is_some(), !sidecar_already_present);
+            if let Some(recovered) = recovered {
+                let adopted = events
+                    .iter()
+                    .position(|event| matches!(event, AttemptEvent::Adopted { attempt } if *attempt == id))
+                    .unwrap();
+                assert!(
+                    recovered < adopted,
+                    "identity was not durable before adoption: {events:?}"
+                );
+            }
+            assert!(runtime.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_stays_closed_for_unknown_policy_and_unreachable_attempts() {
+        let unknown = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let unknown_attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            PolicyId::from_u128(0xfeed),
+            unknown.launcher.runtime_root.join("unknown-policy"),
+            unknown.clock.now(),
+        );
+        unknown.store.record_attempt(&unknown_attempt).unwrap();
+        assert!(matches!(
+            unknown
+                .launcher
+                .recover_startup(std::slice::from_ref(&unknown.policy))
+                .await,
+            Err(LifecycleError::RecoveryIncomplete)
+        ));
+        assert!(
+            unknown
+                .launcher
+                .launch(LaunchRequest {
+                    host: &unknown.host,
+                    policy: &unknown.policy,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(unknown.processes.spawns.load(Ordering::SeqCst), 0);
+
+        let unreachable = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let id = AttemptId::new_random();
+        let runtime = unreachable.launcher.runtime_root.join("unreachable");
+        fs::create_dir_all(&runtime).unwrap();
+        unreachable
+            .store
+            .record_attempt(&RunnerAttempt::allocate(
+                id,
+                unreachable.policy.id,
+                runtime,
+                unreachable.clock.now(),
+            ))
+            .unwrap();
+        unreachable
+            .github
+            .observe(GithubRunnerObservation::Unreachable);
+        assert!(matches!(
+            unreachable
+                .launcher
+                .recover_startup(std::slice::from_ref(&unreachable.policy))
+                .await,
+            Err(LifecycleError::RecoveryIncomplete)
+        ));
+        assert!(
+            unreachable
+                .launcher
+                .launch(LaunchRequest {
+                    host: &unreachable.host,
+                    policy: &unreachable.policy,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(unreachable.processes.spawns.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1803,6 +2513,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminate_intent_sync_failure_prevents_signal_and_conclusion() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let id = AttemptId::new_random();
+        let runtime = harness.launcher.runtime_root.join("timeout-sync-failure");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+        attempt.jit_received(harness.clock.now()).unwrap();
+        attempt.started(4242, harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        harness.clock.advance_secs(11);
+        harness.processes.set_alive(true);
+        harness.processes.fail_intent();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+
+        assert!(
+            harness
+                .launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .is_err()
+        );
+        assert_eq!(harness.processes.terminations.load(Ordering::SeqCst), 0);
+        assert!(harness.processes.alive.load(Ordering::SeqCst));
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().state(),
+            AttemptState::Starting
+        );
+        assert!(!harness.events.events().iter().any(|event| matches!(
+            event,
+            AttemptEvent::Terminated { attempt } | AttemptEvent::Concluded { attempt, .. }
+                if *attempt == id
+        )));
+    }
+
+    #[tokio::test]
     async fn diagnostics_survive_cleanup_without_the_jit_or_a_token() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         harness.ready().await;
@@ -1875,6 +2623,60 @@ mod tests {
             "a runtime with no runner executable must fail"
         );
         assert_no_jit_file(&failed_runtime);
+        processes
+            .record_terminate_intent(&failed)
+            .expect("the intent file and its directory entry are durably synced");
+        assert_eq!(
+            fs::read(NativeProcesses::intent_path(&failed)).unwrap(),
+            b"registration-timeout\n"
+        );
+    }
+
+    #[test]
+    fn every_post_spawn_boundary_reaps_child_removes_identity_and_forbids_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = fixtures::policy()
+            .repository("octo/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let processes = NativeProcesses::new();
+        for (index, boundary) in [
+            PostSpawnBoundary::HandoffDelete,
+            PostSpawnBoundary::IdentitySerialize,
+            PostSpawnBoundary::IdentityWrite,
+            PostSpawnBoundary::ChildMapInsert,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let runtime = root.path().join(format!("post-spawn-{index}"));
+            let bin = runtime.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            #[cfg(windows)]
+            let listener = bin.join("Runner.Listener.exe");
+            #[cfg(not(windows))]
+            let listener = bin.join("Runner.Listener");
+            fs::copy(std::env::current_exe().unwrap(), &listener).unwrap();
+            let attempt = RunnerAttempt::allocate(
+                AttemptId::new_random(),
+                policy.id,
+                &runtime,
+                FakeClock::default().now(),
+            );
+            processes.fail_post_spawn_at(boundary);
+            let failure = processes
+                .spawn(&attempt, &EncodedJitConfig::new(JIT))
+                .expect_err("fault must cross the post-spawn cleanup path");
+            assert!(!failure.retryable, "{boundary:?} allowed duplicate retry");
+            assert!(
+                !processes.is_alive(&attempt).unwrap(),
+                "{boundary:?} left a child"
+            );
+            assert!(!NativeProcesses::identity_path(&attempt).exists());
+            assert_no_jit_file(&runtime);
+        }
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
