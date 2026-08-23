@@ -673,20 +673,11 @@ trait TerminalActions {
     fn disable_raw(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
-    fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit>;
+    fn enable_mouse_capture(&mut self) -> io::Result<()>;
     fn disable_mouse_capture(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> io::Result<()>;
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureTransport {
-    NativeExecute,
-    AnsiBytes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CapturePermit(CaptureTransport);
 
 trait RawModeActions {
     fn enable(&mut self) -> io::Result<()>;
@@ -706,51 +697,29 @@ impl RawModeActions for SystemRawMode {
 struct CrosstermActions<W: Write, R: RawModeActions> {
     writer: W,
     raw_mode: R,
-    force_ansi: bool,
 }
 
 impl<W: Write, R: RawModeActions> CrosstermActions<W, R> {
     fn new(writer: W, raw_mode: R) -> Self {
-        Self {
-            writer,
-            raw_mode,
-            force_ansi: false,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_ansi_transport(writer: W, raw_mode: R) -> Self {
-        Self {
-            writer,
-            raw_mode,
-            force_ansi: true,
-        }
+        Self { writer, raw_mode }
     }
 
     fn emit(&mut self, command: impl Command) -> io::Result<()> {
-        if self.force_ansi {
-            let mut ansi = String::new();
-            command
-                .write_ansi(&mut ansi)
-                .map_err(|_| io::Error::other("Crossterm command could not be encoded"))?;
-            self.writer.write_all(ansi.as_bytes())?;
-            self.writer.flush()
-        } else {
-            execute!(self.writer, command).map(|_| ())
-        }
+        execute!(self.writer, command).map(|_| ())
     }
 
-    fn enable_capture(&mut self) -> io::Result<CapturePermit> {
-        if self.force_ansi {
-            self.emit(EnableMouseCapture)?;
-            Ok(CapturePermit(CaptureTransport::AnsiBytes))
-        } else {
-            // Keep the permit construction in this production branch: the
-            // reducer may accept mouse input only after Crossterm's real
-            // execute transport has returned successfully.
-            execute!(self.writer, EnableMouseCapture)?;
-            Ok(CapturePermit(CaptureTransport::NativeExecute))
-        }
+    fn enable_capture(&mut self) -> io::Result<()> {
+        // Mouse tracking is a terminal protocol command, so write its encoded
+        // bytes through the owned terminal writer on every platform. This
+        // makes the setup side effect part of the same observable output path
+        // as the terminal session instead of an unobservable process-global
+        // Windows console mutation.
+        let mut ansi = String::new();
+        EnableMouseCapture
+            .write_ansi(&mut ansi)
+            .map_err(|_| io::Error::other("mouse capture command could not be encoded"))?;
+        self.writer.write_all(ansi.as_bytes())?;
+        self.writer.flush()
     }
 }
 
@@ -767,7 +736,7 @@ impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
     fn leave_alternate_screen(&mut self) -> io::Result<()> {
         self.emit(LeaveAlternateScreen)
     }
-    fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
         self.enable_capture()
     }
     fn disable_mouse_capture(&mut self) -> io::Result<()> {
@@ -787,7 +756,6 @@ struct TerminalSession<A: TerminalActions> {
     raw: bool,
     alternate: bool,
     mouse: bool,
-    capture_transport: Option<CaptureTransport>,
     paste: bool,
 }
 
@@ -798,16 +766,14 @@ impl<A: TerminalActions> TerminalSession<A> {
             raw: false,
             alternate: false,
             mouse: false,
-            capture_transport: None,
             paste: false,
         };
         session.actions.enable_raw()?;
         session.raw = true;
         session.actions.enter_alternate_screen()?;
         session.alternate = true;
-        let permit = session.actions.enable_mouse_capture()?;
+        session.actions.enable_mouse_capture()?;
         session.mouse = true;
-        session.capture_transport = Some(permit.0);
         session.actions.enable_bracketed_paste()?;
         session.paste = true;
         Ok(session)
@@ -818,8 +784,7 @@ impl<A: TerminalActions> TerminalSession<A> {
             return Ok(());
         }
         if enabled {
-            let permit = self.actions.enable_mouse_capture()?;
-            self.capture_transport = Some(permit.0);
+            self.actions.enable_mouse_capture()?;
         } else {
             self.actions.disable_mouse_capture()?;
         }
@@ -835,7 +800,6 @@ impl<A: TerminalActions> TerminalSession<A> {
         if self.mouse {
             let _ = self.actions.disable_mouse_capture();
             self.mouse = false;
-            self.capture_transport = None;
         }
         if self.alternate {
             let _ = self.actions.leave_alternate_screen();
@@ -891,7 +855,7 @@ impl<A: TerminalActions> SessionControl for TerminalSession<A> {
         TerminalSession::set_mouse_capture(self, enabled)
     }
     fn mouse_capture_enabled(&self) -> bool {
-        self.mouse && self.capture_transport.is_some()
+        self.mouse
     }
 }
 
@@ -1204,28 +1168,18 @@ mod tests {
         const ENABLE_MOUSE_CAPTURE_ANSI: &[u8] =
             b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
 
-        let mut session =
-            TerminalSession::start(CrosstermActions::new(SharedWriter::default(), NoopRawMode))
-                .expect("production execute transport must enable capture");
-        assert_eq!(
-            session.capture_transport,
-            Some(CaptureTransport::NativeExecute),
-            "the production branch grants input only after execute! succeeds"
-        );
         let output = SharedWriter::default();
         let observed_output = Arc::clone(&output.0);
-        let ansi_session =
-            TerminalSession::start(CrosstermActions::with_ansi_transport(output, NoopRawMode))
-                .expect("test terminal setup");
+        let mut session = TerminalSession::start(CrosstermActions::new(output, NoopRawMode))
+            .expect("production terminal setup");
         assert!(
             observed_output
                 .lock()
                 .unwrap()
                 .windows(ENABLE_MOUSE_CAPTURE_ANSI.len())
                 .any(|window| window == ENABLE_MOUSE_CAPTURE_ANSI),
-            "the real Crossterm action must emit every mouse tracking mode"
+            "the production Crossterm capture path must emit every mouse tracking mode"
         );
-        drop(ansi_session);
 
         let width = 80;
         let height = 24;
@@ -1305,9 +1259,9 @@ mod tests {
             self.record("alternate:off");
             Ok(())
         }
-        fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
+        fn enable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:on");
-            Ok(CapturePermit(CaptureTransport::AnsiBytes))
+            Ok(())
         }
         fn disable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:off");
@@ -1390,9 +1344,9 @@ mod tests {
             self.record("alternate:off");
             Ok(())
         }
-        fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
+        fn enable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:on");
-            Ok(CapturePermit(CaptureTransport::AnsiBytes))
+            Ok(())
         }
         fn disable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:off");
