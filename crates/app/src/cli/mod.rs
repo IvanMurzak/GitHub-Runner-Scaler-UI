@@ -880,10 +880,11 @@ pub fn dispatch() -> ExitCode {
     // The terminal UI owns the terminal and owns its own exit code, so it is
     // routed here rather than through `run`: `ExitCode` cannot be inspected, so
     // a TUI that exited non-zero for its own reasons would otherwise be
-    // re-reported as whichever class this file guessed. It also means `tui`
-    // creates no data directories and installs no log sink on the way in.
+    // re-reported as whichever class this file guessed. The data root still
+    // crosses this seam: the TUI's production event source reads the same local
+    // lifecycle journal as `status`, never a second database.
     if matches!(cli.command, Command::Tui) {
-        return crate::tui::run();
+        return crate::tui::run(cli.data_dir.as_deref());
     }
 
     let stdout = io::stdout();
