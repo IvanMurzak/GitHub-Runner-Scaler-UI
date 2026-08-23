@@ -5,6 +5,8 @@
 //! filesystem, store, or network capability.
 
 use std::io::{self, Write};
+use std::sync::{Arc, mpsc as std_mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -28,6 +30,7 @@ use tokio::sync::mpsc;
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const TICK_RATE: Duration = Duration::from_millis(250);
+const LOCAL_AGENT_POLL_RATE: Duration = Duration::from_secs(1);
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +159,75 @@ impl PresentationState {
 pub struct AgentEvent {
     pub summary: String,
     pub health: Health,
+}
+
+/// Polls the durable lifecycle/status view written by the already-running
+/// daemon. This is deliberately a local journal reader, not an IPC listener:
+/// the product exposes no inbound control surface and `q` owns only this
+/// reader thread.
+struct LocalAgentEventSource {
+    stop: std_mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalAgentEventSource {
+    fn start(
+        context: Arc<crate::cli::Context>,
+        poll_rate: Duration,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
+        let (events, receiver) = mpsc::unbounded_channel();
+        let (stop, stopped) = std_mpsc::channel();
+        // Seed the first frame from real journal state before the terminal is
+        // acquired. Subsequent refreshes happen on the reader thread.
+        let _ = events.send(local_agent_event(&context));
+        let worker = thread::Builder::new()
+            .name("runner-manager-tui-events".to_owned())
+            .spawn(move || {
+                while let Err(std_mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(poll_rate)
+                {
+                    if events.send(local_agent_event(&context)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok((
+            Self {
+                stop,
+                worker: Some(worker),
+            },
+            receiver,
+        ))
+    }
+}
+
+impl Drop for LocalAgentEventSource {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn local_agent_event(context: &crate::cli::Context) -> AgentEvent {
+    match crate::cli::status::snapshot(context) {
+        Ok(snapshot) => AgentEvent {
+            summary: format!(
+                "Local agent journal: {} active runner attempt(s), {} configured policy/policies.",
+                snapshot.host.in_use,
+                snapshot.policies.len()
+            ),
+            health: if snapshot.host.in_use > 0 {
+                Health::Busy
+            } else {
+                Health::Ready
+            },
+        },
+        Err(error) => AgentEvent {
+            summary: format!("Local agent journal could not be read: {error}"),
+            health: Health::Error,
+        },
+    }
 }
 
 /// All terminal, timer, and agent events feed the same reducer through here.
@@ -601,11 +673,20 @@ trait TerminalActions {
     fn disable_raw(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
-    fn enable_mouse_capture(&mut self) -> io::Result<()>;
+    fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit>;
     fn disable_mouse_capture(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> io::Result<()>;
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTransport {
+    NativeExecute,
+    AnsiBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapturePermit(CaptureTransport);
 
 trait RawModeActions {
     fn enable(&mut self) -> io::Result<()>;
@@ -658,6 +739,19 @@ impl<W: Write, R: RawModeActions> CrosstermActions<W, R> {
             execute!(self.writer, command).map(|_| ())
         }
     }
+
+    fn enable_capture(&mut self) -> io::Result<CapturePermit> {
+        if self.force_ansi {
+            self.emit(EnableMouseCapture)?;
+            Ok(CapturePermit(CaptureTransport::AnsiBytes))
+        } else {
+            // Keep the permit construction in this production branch: the
+            // reducer may accept mouse input only after Crossterm's real
+            // execute transport has returned successfully.
+            execute!(self.writer, EnableMouseCapture)?;
+            Ok(CapturePermit(CaptureTransport::NativeExecute))
+        }
+    }
 }
 
 impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
@@ -673,8 +767,8 @@ impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
     fn leave_alternate_screen(&mut self) -> io::Result<()> {
         self.emit(LeaveAlternateScreen)
     }
-    fn enable_mouse_capture(&mut self) -> io::Result<()> {
-        self.emit(EnableMouseCapture)
+    fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
+        self.enable_capture()
     }
     fn disable_mouse_capture(&mut self) -> io::Result<()> {
         self.emit(DisableMouseCapture)
@@ -693,6 +787,7 @@ struct TerminalSession<A: TerminalActions> {
     raw: bool,
     alternate: bool,
     mouse: bool,
+    capture_transport: Option<CaptureTransport>,
     paste: bool,
 }
 
@@ -703,14 +798,16 @@ impl<A: TerminalActions> TerminalSession<A> {
             raw: false,
             alternate: false,
             mouse: false,
+            capture_transport: None,
             paste: false,
         };
         session.actions.enable_raw()?;
         session.raw = true;
         session.actions.enter_alternate_screen()?;
         session.alternate = true;
-        session.actions.enable_mouse_capture()?;
+        let permit = session.actions.enable_mouse_capture()?;
         session.mouse = true;
+        session.capture_transport = Some(permit.0);
         session.actions.enable_bracketed_paste()?;
         session.paste = true;
         Ok(session)
@@ -721,7 +818,8 @@ impl<A: TerminalActions> TerminalSession<A> {
             return Ok(());
         }
         if enabled {
-            self.actions.enable_mouse_capture()?;
+            let permit = self.actions.enable_mouse_capture()?;
+            self.capture_transport = Some(permit.0);
         } else {
             self.actions.disable_mouse_capture()?;
         }
@@ -737,6 +835,7 @@ impl<A: TerminalActions> TerminalSession<A> {
         if self.mouse {
             let _ = self.actions.disable_mouse_capture();
             self.mouse = false;
+            self.capture_transport = None;
         }
         if self.alternate {
             let _ = self.actions.leave_alternate_screen();
@@ -785,10 +884,14 @@ fn base64(bytes: &[u8]) -> String {
 
 pub trait SessionControl {
     fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()>;
+    fn mouse_capture_enabled(&self) -> bool;
 }
 impl<A: TerminalActions> SessionControl for TerminalSession<A> {
     fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
         TerminalSession::set_mouse_capture(self, enabled)
+    }
+    fn mouse_capture_enabled(&self) -> bool {
+        self.mouse && self.capture_transport.is_some()
     }
 }
 
@@ -831,6 +934,9 @@ where
                 }
             },
         };
+        if matches!(event, AppEvent::Mouse(_)) && !session.mouse_capture_enabled() {
+            continue;
+        }
         for effect in reduce(&mut state, event) {
             match effect {
                 Effect::SetMouseCapture(enabled) => session.set_mouse_capture(enabled)?,
@@ -870,11 +976,8 @@ pub fn run_terminal_with_agent_events(
     result
 }
 
-pub fn run_terminal() -> io::Result<()> {
-    // A standalone TUI does not own the already-running daemon (and `q` must
-    // not stop it). It therefore starts with a disconnected in-process stream;
-    // embedders that do own an agent use `run_terminal_with_agent_events`.
-    let agent_events = mpsc::unbounded_channel::<AgentEvent>().1;
+pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
+    let (_source, agent_events) = LocalAgentEventSource::start(context, LOCAL_AGENT_POLL_RATE)?;
     run_terminal_with_agent_events(agent_events)
 }
 
@@ -1050,6 +1153,26 @@ mod tests {
         let effects = reduce(&mut state, key(KeyCode::Char('q')));
         assert!(state.should_exit);
         assert!(effects.is_empty());
+
+        let shell_source = include_str!("shell.rs");
+        let key_reducer = shell_source
+            .split_once("fn reduce_key")
+            .unwrap()
+            .1
+            .split_once("fn reduce_mouse")
+            .unwrap()
+            .0;
+        assert!(!key_reducer.contains("daemon"));
+        assert!(!key_reducer.contains("stop("));
+
+        let cli_source = include_str!("../cli/mod.rs");
+        assert!(
+            cli_source.contains("crate::tui::run(cli.data_dir.as_deref())"),
+            "the real `runner-manager tui` route must pass its selected data root"
+        );
+        let tui_source = include_str!("mod.rs");
+        assert!(tui_source.contains("Context::resolve(data_dir"));
+        assert!(tui_source.contains("shell::run_terminal(context)"));
     }
 
     #[derive(Clone, Default)]
@@ -1081,9 +1204,17 @@ mod tests {
         const ENABLE_MOUSE_CAPTURE_ANSI: &[u8] =
             b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
 
+        let mut session =
+            TerminalSession::start(CrosstermActions::new(SharedWriter::default(), NoopRawMode))
+                .expect("production execute transport must enable capture");
+        assert_eq!(
+            session.capture_transport,
+            Some(CaptureTransport::NativeExecute),
+            "the production branch grants input only after execute! succeeds"
+        );
         let output = SharedWriter::default();
         let observed_output = Arc::clone(&output.0);
-        let mut session =
+        let ansi_session =
             TerminalSession::start(CrosstermActions::with_ansi_transport(output, NoopRawMode))
                 .expect("test terminal setup");
         assert!(
@@ -1094,6 +1225,7 @@ mod tests {
                 .any(|window| window == ENABLE_MOUSE_CAPTURE_ANSI),
             "the real Crossterm action must emit every mouse tracking mode"
         );
+        drop(ansi_session);
 
         let width = 80;
         let height = 24;
@@ -1108,14 +1240,16 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let (input_sender, input) = futures::channel::mpsc::unbounded::<io::Result<Event>>();
-        let (agent_sender, agent_events) = mpsc::unbounded_channel();
+        let data_root = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        let context = Arc::new(
+            crate::cli::Context::resolve(Some(data_root.path()), &mut warnings)
+                .expect("production TUI context"),
+        );
+        let (_source, agent_events) =
+            LocalAgentEventSource::start(context, Duration::from_secs(60))
+                .expect("production local-agent source");
         let producer = async move {
-            agent_sender
-                .send(AgentEvent {
-                    summary: "AGENT_EVENT_REACHED_REDUCER".to_owned(),
-                    health: Health::Busy,
-                })
-                .unwrap();
             input_sender
                 .unbounded_send(Ok(Event::Mouse(crossterm_mouse(
                     MouseEventKind::Down(MouseButton::Left),
@@ -1135,13 +1269,14 @@ mod tests {
         );
         let final_state = result.expect("merged loop");
         assert_eq!(final_state.screen, Screen::Activity);
-        assert_eq!(final_state.presentation.health, Health::Busy);
+        assert_eq!(final_state.presentation.health, Health::Ready);
         assert!(
             final_state
                 .presentation
                 .diagnostics
                 .iter()
-                .any(|line| line == "AGENT_EVENT_REACHED_REDUCER")
+                .any(|line| line.starts_with("Local agent journal:")),
+            "the actual `tui` composition source must reach the reducer"
         );
         assert!(final_state.should_exit);
     }
@@ -1170,9 +1305,9 @@ mod tests {
             self.record("alternate:off");
             Ok(())
         }
-        fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
             self.record("mouse:on");
-            Ok(())
+            Ok(CapturePermit(CaptureTransport::AnsiBytes))
         }
         fn disable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:off");
@@ -1255,9 +1390,9 @@ mod tests {
             self.record("alternate:off");
             Ok(())
         }
-        fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        fn enable_mouse_capture(&mut self) -> io::Result<CapturePermit> {
             self.record("mouse:on");
-            Ok(())
+            Ok(CapturePermit(CaptureTransport::AnsiBytes))
         }
         fn disable_mouse_capture(&mut self) -> io::Result<()> {
             self.record("mouse:off");
