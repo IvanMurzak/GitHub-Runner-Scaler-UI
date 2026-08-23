@@ -803,6 +803,9 @@ impl fmt::Display for OfflineState {
 pub struct LaunchRequest<'a> {
     pub host: &'a Host,
     pub policy: &'a ScalePolicy,
+    /// Proof that e1 still owns the host allocation lock for every package,
+    /// prune, and process-start effect performed by e3.
+    pub allocation_guard: &'a AllocationGuard,
 }
 
 /// Why one runner could not be started.
@@ -944,13 +947,13 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
 /// file-backed implementation, and a caller that could see which one it has
 /// would eventually branch on it.
 pub struct AllocationGuard {
-    _held: Box<dyn std::any::Any + Send>,
+    _held: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl AllocationGuard {
     /// Wrap whatever the implementation holds. Dropping the guard drops it.
     #[must_use]
-    pub fn new<T: Send + 'static>(held: T) -> Self {
+    fn new<T: Send + Sync + 'static>(held: T) -> Self {
         Self {
             _held: Box::new(held),
         }
@@ -2016,6 +2019,7 @@ impl Reconciler {
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy,
+                    allocation_guard: &guard,
                 })
                 .await;
             drop(guard);

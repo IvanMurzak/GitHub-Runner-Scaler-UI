@@ -107,6 +107,16 @@ pub enum AttemptEvent {
     },
 }
 
+/// A request for e1 to run another ordinary allocation pass.  It is an intent,
+/// never permission to launch: e1 must poll demand again, acquire its opaque
+/// allocation guard, and recompute host and policy capacity before acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplacementIntent {
+    pub policy: PolicyId,
+    pub previous_attempt: AttemptId,
+    pub operation: &'static str,
+}
+
 pub trait AttemptEventSink: fmt::Debug + Send + Sync {
     fn emit(&self, event: AttemptEvent);
 }
@@ -388,6 +398,9 @@ pub struct ProcessStartFailure {
     /// False once a child existed: the one-shot JIT value may have been
     /// consumed, so retrying it could start a duplicate.
     pub retryable: bool,
+    /// Set only when cleanup could not prove the spawned process dead.  The
+    /// caller must journal `starting` and retain capacity/supervision.
+    pub live_pid: Option<u32>,
 }
 
 impl ProcessStartFailure {
@@ -395,13 +408,23 @@ impl ProcessStartFailure {
         Self {
             reason,
             retryable: true,
+            live_pid: None,
         }
     }
 
-    fn after_spawn() -> Self {
+    fn after_spawn_stopped() -> Self {
         Self {
             reason: FailureReason::ProcessStartFailed,
             retryable: false,
+            live_pid: None,
+        }
+    }
+
+    fn after_spawn_live(pid: u32) -> Self {
+        Self {
+            reason: FailureReason::ProcessStartFailed,
+            retryable: false,
+            live_pid: Some(pid),
         }
     }
 }
@@ -413,6 +436,9 @@ pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
         config: &EncodedJitConfig,
     ) -> Result<u32, ProcessStartFailure>;
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason>;
+    /// Durable identity observed for a process that spawned before the
+    /// `starting` journal write survived.
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason>;
     /// True only for a child this invocation owned and reaped with a successful
     /// exit status.  A recovered process that is merely gone answers false.
     fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool;
@@ -431,6 +457,8 @@ pub struct NativeProcesses {
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
     post_spawn_reaps: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -464,15 +492,46 @@ impl NativeProcesses {
         }
     }
 
+    #[cfg(test)]
+    fn fail_next_post_spawn_stop(&self) {
+        self.post_spawn_stop_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn abort_spawned_child(
         &self,
-        child: &mut ChildProcess,
+        mut child: ChildProcess,
         attempt: &RunnerAttempt,
         remove_identity: bool,
     ) -> ProcessStartFailure {
-        let reaped = child.stop(Duration::from_secs(1)).is_ok();
-        if remove_identity {
-            let _ = fs::remove_file(Self::identity_path(attempt));
+        #[cfg(test)]
+        let injected_stop_failure = self
+            .post_spawn_stop_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| if left > 0 { Some(left - 1) } else { None },
+            )
+            .is_ok();
+        #[cfg(not(test))]
+        let injected_stop_failure = false;
+        let reaped = !injected_stop_failure && child.stop(Duration::from_secs(1)).is_ok();
+        if reaped {
+            if remove_identity {
+                let _ = fs::remove_file(Self::identity_path(attempt));
+            }
+        } else {
+            // A failed stop is not a failed attempt yet.  Persist enough truth
+            // for crash recovery, and retain the owned child when possible.
+            if let Ok(identity) = serde_json::to_vec(child.identity()) {
+                let _ = write_durable_file(&Self::identity_path(attempt), &identity);
+            }
+            let pid = child.pid();
+            self.children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(attempt.id, child);
+            return ProcessStartFailure::after_spawn_live(pid);
         }
         #[cfg(test)]
         if reaped {
@@ -481,7 +540,7 @@ impl NativeProcesses {
         }
         #[cfg(not(test))]
         let _ = reaped;
-        ProcessStartFailure::after_spawn()
+        ProcessStartFailure::after_spawn_stopped()
     }
 
     fn identity_path(attempt: &RunnerAttempt) -> PathBuf {
@@ -536,51 +595,54 @@ impl ProcessSupervisor for NativeProcesses {
             .arg("--jit-config-file")
             .arg(&handoff_path)
             .working_dir(attempt.runtime_path());
-        let mut child = spec
+        let child = spec
             .spawn_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
         // The payload is gone before any state saying "starting" is persisted.
         #[cfg(test)]
         if self.faults_at(PostSpawnBoundary::HandoffDelete) {
             drop(handoff);
-            return Err(self.abort_spawned_child(&mut child, attempt, false));
+            return Err(self.abort_spawned_child(child, attempt, false));
         }
         if handoff.delete().is_err() {
-            return Err(self.abort_spawned_child(&mut child, attempt, false));
+            return Err(self.abort_spawned_child(child, attempt, false));
         }
         #[cfg(test)]
         if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
-            return Err(self.abort_spawned_child(&mut child, attempt, false));
+            return Err(self.abort_spawned_child(child, attempt, false));
         }
         let identity = match serde_json::to_vec(child.identity()) {
             Ok(identity) => identity,
             Err(_) => {
-                return Err(self.abort_spawned_child(&mut child, attempt, false));
+                return Err(self.abort_spawned_child(child, attempt, false));
             }
         };
         #[cfg(test)]
         if self.faults_at(PostSpawnBoundary::IdentityWrite) {
-            return Err(self.abort_spawned_child(&mut child, attempt, true));
+            return Err(self.abort_spawned_child(child, attempt, true));
         }
         if write_durable_file(&Self::identity_path(attempt), &identity).is_err() {
-            return Err(self.abort_spawned_child(&mut child, attempt, true));
+            return Err(self.abort_spawned_child(child, attempt, true));
         }
         let pid = child.pid();
         #[cfg(test)]
         if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
-            return Err(self.abort_spawned_child(&mut child, attempt, true));
+            return Err(self.abort_spawned_child(child, attempt, true));
         }
-        let Ok(mut children) = self.children.lock() else {
-            return Err(self.abort_spawned_child(&mut child, attempt, true));
-        };
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.insert(attempt.id, child);
         Ok(pid)
     }
 
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
-        if let Ok(mut children) = self.children.lock()
-            && let Some(child) = children.get_mut(&attempt.id)
-        {
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = children.get_mut(&attempt.id) {
             return match child
                 .try_exit_status()
                 .map_err(|_| FailureReason::Other("runner process could not be observed".into()))?
@@ -604,6 +666,10 @@ impl ProcessSupervisor for NativeProcesses {
         }
     }
 
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        Ok(Self::read_identity(attempt)?.map(|identity| identity.pid()))
+    }
+
     fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
         self.successful_exits
             .lock()
@@ -623,9 +689,11 @@ impl ProcessSupervisor for NativeProcesses {
     }
 
     fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
-        if let Ok(mut children) = self.children.lock()
-            && let Some(child) = children.get_mut(&attempt.id)
-        {
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = children.get_mut(&attempt.id) {
             child
                 .stop(Duration::from_secs(10))
                 .map_err(|_| FailureReason::Other("runner process could not be stopped".into()))?;
@@ -708,7 +776,7 @@ pub struct LifecycleLauncher {
     ports: LifecyclePorts,
     recovery_complete: Mutex<bool>,
     versions: Mutex<BTreeMap<AttemptId, RunnerVersion>>,
-    pending_replacements: Mutex<BTreeMap<PolicyId, (AttemptId, &'static str)>>,
+    pending_replacements: Mutex<BTreeMap<AttemptId, ReplacementIntent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -750,7 +818,10 @@ impl LifecycleLauncher {
     /// Reconcile the entire journal before allowing a launch.  Unknown-policy
     /// attempts are left untouched rather than being acted on without an
     /// ownership proof.
-    pub async fn recover_startup(&self, policies: &[ScalePolicy]) -> Result<(), LifecycleError> {
+    pub async fn recover_startup(
+        &self,
+        policies: &[ScalePolicy],
+    ) -> Result<Vec<ReplacementIntent>, LifecycleError> {
         let by_id: BTreeMap<_, _> = policies.iter().map(|policy| (policy.id, policy)).collect();
         let attempts = self
             .ports
@@ -772,7 +843,14 @@ impl LifecycleLauncher {
                     self.pending_replacements
                         .lock()
                         .map_err(|_| LifecycleError::Journal)?
-                        .insert(policy.id, (attempt, operation));
+                        .insert(
+                            attempt,
+                            ReplacementIntent {
+                                policy: policy.id,
+                                previous_attempt: attempt,
+                                operation,
+                            },
+                        );
                 }
                 ReconcileProgress::Reconciled => {}
             }
@@ -784,23 +862,21 @@ impl LifecycleLauncher {
             .recovery_complete
             .lock()
             .map_err(|_| LifecycleError::Journal)? = true;
-        let pending = std::mem::take(
+        Ok(std::mem::take(
             &mut *self
                 .pending_replacements
                 .lock()
                 .map_err(|_| LifecycleError::Journal)?,
-        );
-        for (policy_id, (attempt, operation)) in pending {
-            if let Some(policy) = by_id.get(&policy_id) {
-                self.replace_with_backoff(policy, attempt, operation)
-                    .await?;
-            }
-        }
-        Ok(())
+        )
+        .into_values()
+        .collect())
     }
 
     /// Supervise all attempts of one policy during an ordinary poll.
-    pub async fn supervise(&self, policy: &ScalePolicy) -> Result<(), LifecycleError> {
+    pub async fn supervise(
+        &self,
+        policy: &ScalePolicy,
+    ) -> Result<Vec<ReplacementIntent>, LifecycleError> {
         let attempts = self
             .ports
             .store
@@ -812,14 +888,14 @@ impl LifecycleLauncher {
             if let ReconcileProgress::Replacement { attempt, operation } =
                 self.reconcile_one(policy, attempt).await?
             {
-                replacements.push((attempt, operation));
+                replacements.push(ReplacementIntent {
+                    policy: policy.id,
+                    previous_attempt: attempt,
+                    operation,
+                });
             }
         }
-        for (attempt, operation) in replacements {
-            self.replace_with_backoff(policy, attempt, operation)
-                .await?;
-        }
-        Ok(())
+        Ok(replacements)
     }
 
     async fn reconcile_one(
@@ -861,6 +937,24 @@ impl LifecycleLauncher {
                 });
         }
 
+        // The child identity is synced before `spawn` returns.  If the agent
+        // crashed before the following `starting` journal write, recover that
+        // exact PID and take the legal `jit_received -> starting` edge before
+        // applying GitHub's authoritative idle/busy observation below.
+        if attempt.state() == AttemptState::JitReceived
+            && process_alive
+            && let Some(pid) = self
+                .ports
+                .processes
+                .recovered_pid(&attempt)
+                .map_err(LifecycleError::Failed)?
+        {
+            attempt
+                .started(pid, self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
+        }
+
         // A one-shot child owned by this invocation exited successfully after
         // GitHub had already reported it busy, and its ephemeral registration
         // is now gone.  This concludes the *runner attempt*, never the workflow
@@ -885,7 +979,7 @@ impl LifecycleLauncher {
             self.clean_attempt(&mut attempt)?;
             return Ok(ReconcileProgress::Replacement {
                 attempt: attempt.id,
-                operation: "jit_expired_replacement",
+                operation: "registration_timeout_replacement",
             });
         }
 
@@ -1009,7 +1103,10 @@ impl LifecycleLauncher {
                     AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
                 )?;
                 self.clean_attempt(&mut attempt)?;
-                Ok(ReconcileProgress::Reconciled)
+                Ok(ReconcileProgress::Replacement {
+                    attempt: attempt.id,
+                    operation: "registration_timeout_replacement",
+                })
             }
         }
     }
@@ -1144,37 +1241,6 @@ impl LifecycleLauncher {
         }
     }
 
-    async fn replace_with_backoff(
-        &self,
-        policy: &ScalePolicy,
-        previous: AttemptId,
-        operation: &'static str,
-    ) -> Result<(), LifecycleError> {
-        let mut last_error = None;
-        for retry_index in 1..=self.retry.max_attempts.max(1) {
-            if !self.ports.demand.persists(policy.id).await {
-                return Ok(());
-            }
-            let delay = self.retry.delay(retry_index);
-            self.ports.events.emit(AttemptEvent::Retry {
-                attempt: previous,
-                operation,
-                delay,
-            });
-            self.ports.delay.wait(delay).await;
-            // Adjacent to the effect: no directory, package request or JIT
-            // registration occurs after demand disappears during the delay.
-            if !self.ports.demand.persists(policy.id).await {
-                return Ok(());
-            }
-            match self.launch_attempt(policy).await {
-                Ok(_) => return Ok(()),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(last_error.unwrap_or(LifecycleError::RecoveryIncomplete))
-    }
-
     async fn register_with_retry(
         &self,
         policy: &ScalePolicy,
@@ -1217,7 +1283,11 @@ impl LifecycleLauncher {
         }
     }
 
-    async fn launch_attempt(&self, policy: &ScalePolicy) -> Result<RunnerAttempt, LifecycleError> {
+    async fn launch_attempt(
+        &self,
+        policy: &ScalePolicy,
+        allocation_guard: &AllocationGuard,
+    ) -> Result<RunnerAttempt, LifecycleError> {
         if !*self
             .recovery_complete
             .lock()
@@ -1243,6 +1313,7 @@ impl LifecycleLauncher {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
         };
+        self.prune_under_allocation_lock(allocation_guard, &version)?;
         self.versions
             .lock()
             .map_err(|_| LifecycleError::Journal)?
@@ -1267,6 +1338,13 @@ impl LifecycleLauncher {
             match self.ports.processes.spawn(&attempt, &config) {
                 Ok(pid) => break pid,
                 Err(error) => {
+                    if let Some(pid) = error.live_pid {
+                        attempt
+                            .started(pid, self.ports.clock.now())
+                            .map_err(|_| LifecycleError::Transition)?;
+                        self.record(&attempt)?;
+                        return Err(LifecycleError::Failed(error.reason));
+                    }
                     if !error.retryable
                         || issued >= self.retry.max_attempts.max(1)
                         || !self.ports.demand.persists(policy.id).await
@@ -1304,7 +1382,7 @@ impl LifecycleLauncher {
 
     /// e2's prune guard is invoked only with e1's allocation guard borrowed.
     /// The otherwise-unused argument is a compile-time witness of the ordering.
-    pub fn prune_under_allocation_lock(
+    fn prune_under_allocation_lock(
         &self,
         _guard: &AllocationGuard,
         version: &RunnerVersion,
@@ -1332,7 +1410,7 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
-        self.launch_attempt(request.policy)
+        self.launch_attempt(request.policy, request.allocation_guard)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -1437,6 +1515,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use crate::reconcile::{AllocationLock, InProcessAllocationLock};
     use runner_manager_domain::model::Elapsed;
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_github::jit::JitRunner;
@@ -1606,6 +1685,7 @@ mod tests {
         completed_successfully: AtomicBool,
         spawns: AtomicUsize,
         spawn_failures: AtomicUsize,
+        live_spawn_failure: AtomicBool,
         terminations: AtomicUsize,
         intent: AtomicBool,
         intent_failure: AtomicBool,
@@ -1616,6 +1696,10 @@ mod tests {
     impl FakeProcesses {
         fn fail_spawns(&self, count: usize) {
             self.spawn_failures.store(count, Ordering::SeqCst);
+        }
+
+        fn fail_spawn_with_live_child(&self) {
+            self.live_spawn_failure.store(true, Ordering::SeqCst);
         }
 
         fn set_alive(&self, alive: bool) {
@@ -1657,6 +1741,10 @@ mod tests {
                 .is_ok();
             drop(handoff);
             assert!(!handoff_path.exists(), "handoff must be absent on return");
+            if self.live_spawn_failure.swap(false, Ordering::SeqCst) {
+                self.alive.store(true, Ordering::SeqCst);
+                return Err(ProcessStartFailure::after_spawn_live(4242));
+            }
             if failing {
                 return Err(ProcessStartFailure::before_spawn(
                     FailureReason::ProcessStartFailed,
@@ -1669,6 +1757,10 @@ mod tests {
         fn is_alive(&self, _attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
             self.actions.lock().unwrap().push("observe_process");
             Ok(self.alive.load(Ordering::SeqCst))
+        }
+
+        fn recovered_pid(&self, _attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+            Ok(self.alive.load(Ordering::SeqCst).then_some(4242))
         }
 
         fn completed_successfully(&self, _attempt: &RunnerAttempt) -> bool {
@@ -1745,6 +1837,7 @@ mod tests {
         delay: Arc<FakeDelay>,
         host: runner_manager_domain::model::Host,
         policy: ScalePolicy,
+        allocation_lock: InProcessAllocationLock,
     }
 
     impl Harness {
@@ -1803,6 +1896,7 @@ mod tests {
                 delay,
                 host,
                 policy,
+                allocation_lock: InProcessAllocationLock::new(),
             }
         }
 
@@ -1814,13 +1908,18 @@ mod tests {
         }
 
         async fn launch(&self) -> RunnerAttempt {
+            self.launch_result().await.unwrap()
+        }
+
+        async fn launch_result(&self) -> Result<RunnerAttempt, LaunchFailure> {
+            let guard = self.allocation_lock.acquire().await.unwrap();
             self.launcher
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy: &self.policy,
+                    allocation_guard: &guard,
                 })
                 .await
-                .unwrap()
         }
 
         fn only_attempt(&self) -> RunnerAttempt {
@@ -1956,15 +2055,7 @@ mod tests {
             Arc::new(FakeDemand::answering([false])),
         );
         gone.ready().await;
-        assert!(
-            gone.launcher
-                .launch(LaunchRequest {
-                    host: &gone.host,
-                    policy: &gone.policy
-                })
-                .await
-                .is_err()
-        );
+        assert!(gone.launch_result().await.is_err());
         assert_eq!(gone.github.registrations.load(Ordering::SeqCst), 1);
         assert!(gone.delay.0.lock().unwrap().is_empty());
 
@@ -1973,16 +2064,7 @@ mod tests {
             Arc::new(PersistentDemand),
         );
         forbidden.ready().await;
-        assert!(
-            forbidden
-                .launcher
-                .launch(LaunchRequest {
-                    host: &forbidden.host,
-                    policy: &forbidden.policy,
-                })
-                .await
-                .is_err()
-        );
+        assert!(forbidden.launch_result().await.is_err());
         assert_eq!(forbidden.github.registrations.load(Ordering::SeqCst), 1);
         assert!(forbidden.delay.0.lock().unwrap().is_empty());
         assert!(matches!(
@@ -2044,7 +2126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_before_acceptance_concludes_and_persistent_demand_gets_a_fresh_attempt() {
+    async fn exit_before_acceptance_returns_replacement_intent_without_launching() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         harness.ready().await;
         let first = harness.launch().await;
@@ -2052,7 +2134,7 @@ mod tests {
         harness
             .github
             .observe(GithubRunnerObservation::NotRegistered);
-        harness.launcher.supervise(&harness.policy).await.unwrap();
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
         let failed = harness.store.attempt(first.id).unwrap().unwrap();
         assert!(matches!(
             failed.outcome(),
@@ -2062,20 +2144,18 @@ mod tests {
         ));
         assert!(!first.runtime_path().exists());
 
-        let replacement = harness
-            .store
-            .attempts()
-            .unwrap()
-            .into_iter()
-            .find(|attempt| attempt.id != first.id)
-            .expect("persistent demand produced a bounded replacement");
-        assert_ne!(replacement.id, first.id);
-        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 2);
-        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 2);
         assert_eq!(
-            *harness.delay.0.lock().unwrap(),
-            vec![Duration::from_millis(10)]
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: first.id,
+                operation: "exit_before_acceptance_replacement",
+            }]
         );
+        assert_eq!(harness.store.attempts().unwrap().len(), 1);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
+        assert!(harness.delay.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2096,11 +2176,19 @@ mod tests {
         attempt.jit_received(harness.clock.now()).unwrap();
         harness.store.record_attempt(&attempt).unwrap();
         harness.clock.advance_secs(11);
-        harness
+        let replacements = harness
             .launcher
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .unwrap();
+        assert_eq!(
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "jit_expired_replacement",
+            }]
+        );
 
         let cleaned = harness.store.attempt(id).unwrap().unwrap();
         assert_eq!(cleaned.state(), AttemptState::Cleaned);
@@ -2116,7 +2204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_jit_gets_one_delayed_fresh_registration_when_demand_persists() {
+    async fn expired_jit_returns_intent_but_never_launches_inside_lifecycle() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
         let runtime = harness.launcher.runtime_root.join("expired-with-demand");
@@ -2126,14 +2214,14 @@ mod tests {
         attempt.jit_received(harness.clock.now()).unwrap();
         harness.store.record_attempt(&attempt).unwrap();
         harness.clock.advance_secs(11);
-        harness
+        let replacements = harness
             .launcher
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .unwrap();
 
         let attempts = harness.store.attempts().unwrap();
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 1);
         assert_eq!(
             attempts
                 .iter()
@@ -2142,17 +2230,17 @@ mod tests {
                 .state(),
             AttemptState::Cleaned
         );
-        assert!(
-            attempts
-                .iter()
-                .any(|attempt| { attempt.id != id && attempt.state() == AttemptState::Starting })
-        );
-        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
-        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(
-            *harness.delay.0.lock().unwrap(),
-            vec![Duration::from_millis(10)]
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "jit_expired_replacement",
+            }]
         );
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
+        assert!(harness.delay.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2176,16 +2264,7 @@ mod tests {
         );
         gone_before_wait.packages.fail_materializations(3);
         gone_before_wait.ready().await;
-        assert!(
-            gone_before_wait
-                .launcher
-                .launch(LaunchRequest {
-                    host: &gone_before_wait.host,
-                    policy: &gone_before_wait.policy,
-                })
-                .await
-                .is_err()
-        );
+        assert!(gone_before_wait.launch_result().await.is_err());
         assert_eq!(
             gone_before_wait
                 .packages
@@ -2201,16 +2280,7 @@ mod tests {
         );
         gone_during_wait.packages.fail_materializations(3);
         gone_during_wait.ready().await;
-        assert!(
-            gone_during_wait
-                .launcher
-                .launch(LaunchRequest {
-                    host: &gone_during_wait.host,
-                    policy: &gone_during_wait.policy,
-                })
-                .await
-                .is_err()
-        );
+        assert!(gone_during_wait.launch_result().await.is_err());
         assert_eq!(
             gone_during_wait
                 .packages
@@ -2225,7 +2295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_rechecks_demand_immediately_before_launch() {
+    async fn replacement_is_intent_only_and_never_launches_inside_lifecycle() {
         let harness = Harness::new(
             FakeGithubLifecycle::default(),
             Arc::new(FakeDemand::answering([true, false])),
@@ -2236,14 +2306,19 @@ mod tests {
         harness
             .github
             .observe(GithubRunnerObservation::NotRegistered);
-        harness.launcher.supervise(&harness.policy).await.unwrap();
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
 
         assert_eq!(harness.store.attempts().unwrap().len(), 1);
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
+        assert!(harness.delay.0.lock().unwrap().is_empty());
         assert_eq!(
-            *harness.delay.0.lock().unwrap(),
-            vec![Duration::from_millis(10)]
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: first.id,
+                operation: "exit_before_acceptance_replacement",
+            }]
         );
         assert_eq!(
             harness.store.attempt(first.id).unwrap().unwrap().state(),
@@ -2254,13 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn startup_adopts_a_live_process_and_refuses_launch_before_recovery() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
-        let before = harness
-            .launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-            })
-            .await;
+        let before = harness.launch_result().await;
         assert!(before.is_err());
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
 
@@ -2276,17 +2345,99 @@ mod tests {
         harness
             .github
             .observe(GithubRunnerObservation::NotRegistered);
-        harness
+        let replacements = harness
             .launcher
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
             .unwrap();
+        assert!(replacements.is_empty());
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
         assert!(
             harness
                 .events
                 .events()
                 .contains(&AttemptEvent::Adopted { attempt: id })
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_before_starting_crash_recovers_pid_then_completes_and_cleans() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let id = AttemptId::new_random();
+        let runtime = harness.launcher.runtime_root.join("spawn-before-starting");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+        attempt.jit_received(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        harness.processes.set_alive(true);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+
+        let replacements = harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        assert!(replacements.is_empty());
+        let recovered = harness.store.attempt(id).unwrap().unwrap();
+        assert_eq!(recovered.state(), AttemptState::Busy);
+        assert_eq!(recovered.process_id(), Some(4242));
+        assert_eq!(recovered.github_runner_id(), Some(73));
+        let events = harness.events.events();
+        let starting = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::State { attempt, state: AttemptState::Starting } if *attempt == id))
+            .unwrap();
+        let busy = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::State { attempt, state: AttemptState::Busy } if *attempt == id))
+            .unwrap();
+        assert!(starting < busy, "recovery skipped a legal edge: {events:?}");
+
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        assert!(
+            harness
+                .launcher
+                .supervise(&harness.policy)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let cleaned = harness.store.attempt(id).unwrap().unwrap();
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+        assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
+        assert!(!runtime.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_post_spawn_stop_keeps_capacity_until_supervision_proves_death() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.processes.fail_spawn_with_live_child();
+        harness.ready().await;
+        assert!(harness.launch_result().await.is_err());
+
+        let attempt = harness.only_attempt();
+        assert_eq!(attempt.state(), AttemptState::Starting);
+        assert_eq!(attempt.process_id(), Some(4242));
+        assert!(attempt.outcome().is_none());
+        assert!(attempt.state().counts_against_capacity());
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
+        assert!(harness.delay.0.lock().unwrap().is_empty());
+
+        harness.processes.set_alive(false);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
         );
     }
 
@@ -2369,6 +2520,18 @@ mod tests {
             unknown.clock.now(),
         );
         unknown.store.record_attempt(&unknown_attempt).unwrap();
+        let expired_id = AttemptId::new_random();
+        let expired_runtime = unknown.launcher.runtime_root.join("expired-beside-unknown");
+        fs::create_dir_all(&expired_runtime).unwrap();
+        let mut expired = RunnerAttempt::allocate(
+            expired_id,
+            unknown.policy.id,
+            expired_runtime,
+            unknown.clock.now(),
+        );
+        expired.jit_received(unknown.clock.now()).unwrap();
+        unknown.store.record_attempt(&expired).unwrap();
+        unknown.clock.advance_secs(11);
         assert!(matches!(
             unknown
                 .launcher
@@ -2376,15 +2539,26 @@ mod tests {
                 .await,
             Err(LifecycleError::RecoveryIncomplete)
         ));
-        assert!(
-            unknown
-                .launcher
-                .launch(LaunchRequest {
-                    host: &unknown.host,
-                    policy: &unknown.policy,
-                })
-                .await
-                .is_err()
+        assert!(unknown.launch_result().await.is_err());
+        assert_eq!(unknown.processes.spawns.load(Ordering::SeqCst), 0);
+        let recovered_policy = fixtures::policy()
+            .id(PolicyId::from_u128(0xfeed))
+            .repository("octo/repo")
+            .autoscale("home", 2)
+            .active()
+            .build();
+        let pending = unknown
+            .launcher
+            .recover_startup(&[unknown.policy.clone(), recovered_policy])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending,
+            vec![ReplacementIntent {
+                policy: unknown.policy.id,
+                previous_attempt: expired_id,
+                operation: "jit_expired_replacement",
+            }]
         );
         assert_eq!(unknown.processes.spawns.load(Ordering::SeqCst), 0);
 
@@ -2411,16 +2585,7 @@ mod tests {
                 .await,
             Err(LifecycleError::RecoveryIncomplete)
         ));
-        assert!(
-            unreachable
-                .launcher
-                .launch(LaunchRequest {
-                    host: &unreachable.host,
-                    policy: &unreachable.policy,
-                })
-                .await
-                .is_err()
-        );
+        assert!(unreachable.launch_result().await.is_err());
         assert_eq!(unreachable.processes.spawns.load(Ordering::SeqCst), 0);
     }
 
@@ -2454,6 +2619,7 @@ mod tests {
     #[tokio::test]
     async fn registration_timeout_journals_intent_stops_then_concludes_with_dead_reason() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
         let id = AttemptId::new_random();
         let runtime = harness.launcher.runtime_root.join("timeout");
         fs::create_dir_all(&runtime).unwrap();
@@ -2467,11 +2633,15 @@ mod tests {
         harness
             .github
             .observe(GithubRunnerObservation::NotRegistered);
-        harness
-            .launcher
-            .recover_startup(std::slice::from_ref(&harness.policy))
-            .await
-            .unwrap();
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "registration_timeout_replacement",
+            }]
+        );
 
         assert_eq!(harness.processes.terminations.load(Ordering::SeqCst), 1);
         assert!(!harness.processes.alive.load(Ordering::SeqCst));
@@ -2510,6 +2680,44 @@ mod tests {
             .position(|event| matches!(event, AttemptEvent::Concluded { .. }))
             .unwrap();
         assert!(intent < stopped && stopped < concluded, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn timeout_crash_recovery_returns_the_same_replacement_intent() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        let id = AttemptId::new_random();
+        let runtime = harness.launcher.runtime_root.join("timeout-after-crash");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
+        attempt.jit_received(harness.clock.now()).unwrap();
+        attempt.started(4242, harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        harness.processes.intent.store(true, Ordering::SeqCst);
+        harness.processes.set_alive(false);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+
+        let replacements = harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        assert_eq!(
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "registration_timeout_replacement",
+            }]
+        );
+        assert!(matches!(
+            harness.store.attempt(id).unwrap().unwrap().outcome(),
+            Some(AttemptOutcome::Failed {
+                reason: FailureReason::TerminatedAfterRegistrationTimeout
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2677,19 +2885,48 @@ mod tests {
             assert_no_jit_file(&runtime);
         }
         assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
+
+        let runtime = root.path().join("post-spawn-stop-failed");
+        let bin = runtime.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        #[cfg(windows)]
+        let listener = bin.join("Runner.Listener.exe");
+        #[cfg(not(windows))]
+        let listener = bin.join("Runner.Listener");
+        fs::copy(std::env::current_exe().unwrap(), &listener).unwrap();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runtime,
+            FakeClock::default().now(),
+        );
+        processes.fail_post_spawn_at(PostSpawnBoundary::ChildMapInsert);
+        processes.fail_next_post_spawn_stop();
+        let failure = processes
+            .spawn(&attempt, &EncodedJitConfig::new(JIT))
+            .expect_err("the injected stop failure must preserve supervision");
+        let live_pid = failure
+            .live_pid
+            .expect("live PID is returned to the journal");
+        assert!(!failure.retryable);
+        assert!(NativeProcesses::identity_path(&attempt).is_file());
+        assert_eq!(
+            NativeProcesses::read_identity(&attempt)
+                .unwrap()
+                .unwrap()
+                .pid(),
+            live_pid
+        );
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
+        processes.terminate(&attempt).unwrap();
     }
 
     #[tokio::test]
-    async fn package_prune_is_reached_only_with_the_host_allocation_guard() {
-        use crate::reconcile::{AllocationLock, InProcessAllocationLock};
-
+    async fn every_production_launch_prunes_under_the_same_allocation_guard() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
-        let lock = InProcessAllocationLock::new();
-        let guard = lock.acquire().await.expect("host allocation lock");
-        harness
-            .launcher
-            .prune_under_allocation_lock(&guard, &harness.packages.version)
-            .unwrap();
+        harness.ready().await;
+        assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 0);
+        harness.launch().await;
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 1);
     }
 
