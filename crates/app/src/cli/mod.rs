@@ -523,7 +523,7 @@ pub struct RepoSetCapacityArgs {
 pub struct RepoSetScaleArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
-    #[arg(long, value_name = "BOOL")]
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub enabled: bool,
 }
 
@@ -572,7 +572,7 @@ pub struct OrgSetCapacityArgs {
 pub struct OrgSetScaleArgs {
     #[arg(value_name = "ORG")]
     pub organization: String,
-    #[arg(long, value_name = "BOOL")]
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub enabled: bool,
 }
 
@@ -934,7 +934,8 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Cl
         Command::Auth(command) => auth::dispatch(&context, command, out),
         Command::Host(command) => host::dispatch(&context, command, out),
         Command::Status(args) => status::dispatch(&context, args, out),
-        Command::Repo(_) | Command::Org(_) => Err(not_implemented("f2")),
+        Command::Repo(command) => policy::dispatch_repo(&context, command, out),
+        Command::Org(command) => policy::dispatch_org(&context, command, out),
         Command::Daemon(_) | Command::Service(_) => Err(not_implemented("f3")),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
@@ -1204,6 +1205,29 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn repository_and_organization_set_scale_parse_explicit_true_and_false() {
+        for (scope, target) in [("repo", "octo/repo"), ("org", "octo")] {
+            for expected in [true, false] {
+                let cli = Cli::try_parse_from([
+                    "runner-manager",
+                    scope,
+                    "set-scale",
+                    target,
+                    "--enabled",
+                    if expected { "true" } else { "false" },
+                ])
+                .unwrap();
+                let actual = match cli.command {
+                    Command::Repo(RepoCommand::SetScale(args)) => args.enabled,
+                    Command::Org(OrgCommand::SetScale(args)) => args.enabled,
+                    _ => panic!("wrong command parsed for {scope}"),
+                };
+                assert_eq!(actual, expected, "{scope} must retain explicit {expected}");
+            }
+        }
     }
 
     /// The override is the one environment variable that can send a credential
