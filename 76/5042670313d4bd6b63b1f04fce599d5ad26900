@@ -1,0 +1,29 @@
+crates/agent/src/lifecycle.rs
+  s_e3f2ebf0732f36::t_840d5b599534fe 50-51,489-490,535-540,726-750
+  s_e3f2ebf0732f36::t_76270101300b9f 3049,3111,3143,3188,3201-3229
+  s_d14c0886a58be6::t_6a9acacc6ffa77 3230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "765042670313d4bd6b63b1f04fce599d5ad26900",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
