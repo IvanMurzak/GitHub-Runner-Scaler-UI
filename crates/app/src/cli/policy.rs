@@ -240,7 +240,30 @@ fn record_policy_with_id(
         mode,
         CachePolicy::default(),
     );
-    store.insert_policy(&policy).map_err(store_failure)?;
+    if let Err(initial_failure) = store.insert_policy(&policy) {
+        let mut repair = policy.clone();
+        if repair.repair_required().is_ok() && store.insert_policy(&repair).is_ok() {
+            let command = format!(
+                "runner-manager {} remove {} --purge",
+                scope_word(repair.target.scope()),
+                repair.target
+            );
+            let failed = write_failed("this repair result");
+            writeln!(
+                out,
+                "Policy storage failed after local preparation; {} was persisted in repair_required.",
+                repair.target
+            )
+            .map_err(failed)?;
+            writeln!(out, "repair: {command}").map_err(failed)?;
+            return Err(CliError::with_remedy(
+                Failure::LocalState,
+                format!("the initial policy insert failed: {initial_failure}"),
+                command,
+            ));
+        }
+        return Err(store_failure(initial_failure));
+    }
     write_add_result(out, &policy, host)
 }
 
@@ -626,8 +649,96 @@ fn store_failure(source: StoreError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runner_manager_domain::model::{Arch, HostId, Org, Os, OwnerRepo};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use runner_manager_domain::attempt::RunnerAttempt;
+    use runner_manager_domain::model::{Arch, AttemptId, HostId, Org, Os, OwnerRepo};
     use runner_manager_domain::store::SqliteStore;
+
+    #[derive(Debug)]
+    struct FailFirstPolicyInsert {
+        inner: SqliteStore,
+        fail_next_insert: AtomicBool,
+        remove_policy_calls: AtomicUsize,
+    }
+
+    impl FailFirstPolicyInsert {
+        fn new() -> Self {
+            Self {
+                inner: SqliteStore::open_in_memory().unwrap(),
+                fail_next_insert: AtomicBool::new(true),
+                remove_policy_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Store for FailFirstPolicyInsert {
+        fn put_host(&self, host: &Host) -> Result<(), StoreError> {
+            self.inner.put_host(host)
+        }
+
+        fn host(&self, id: HostId) -> Result<Option<Host>, StoreError> {
+            self.inner.host(id)
+        }
+
+        fn hosts(&self) -> Result<Vec<Host>, StoreError> {
+            self.inner.hosts()
+        }
+
+        fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
+            if self.fail_next_insert.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::AlreadyExists {
+                    what: "fault-injected policy insert",
+                    id: policy.id.to_string(),
+                });
+            }
+            self.inner.insert_policy(policy)
+        }
+
+        fn update_policy(
+            &self,
+            policy: &ScalePolicy,
+            expected_revision: u64,
+        ) -> Result<(), StoreError> {
+            self.inner.update_policy(policy, expected_revision)
+        }
+
+        fn remove_policy(&self, id: PolicyId, expected_revision: u64) -> Result<(), StoreError> {
+            self.remove_policy_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.remove_policy(id, expected_revision)
+        }
+
+        fn policy(&self, id: PolicyId) -> Result<Option<ScalePolicy>, StoreError> {
+            self.inner.policy(id)
+        }
+
+        fn policies(&self) -> Result<Vec<ScalePolicy>, StoreError> {
+            self.inner.policies()
+        }
+
+        fn record_attempt(&self, attempt: &RunnerAttempt) -> Result<(), StoreError> {
+            self.inner.record_attempt(attempt)
+        }
+
+        fn attempt(&self, id: AttemptId) -> Result<Option<RunnerAttempt>, StoreError> {
+            self.inner.attempt(id)
+        }
+
+        fn attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.attempts()
+        }
+
+        fn attempts_for_policy(
+            &self,
+            policy_id: PolicyId,
+        ) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.attempts_for_policy(policy_id)
+        }
+
+        fn remove_attempt(&self, id: AttemptId) -> Result<bool, StoreError> {
+            self.inner.remove_attempt(id)
+        }
+    }
 
     fn nz(value: u16) -> NonZeroU16 {
         NonZeroU16::new(value).unwrap()
@@ -792,33 +903,23 @@ mod tests {
     }
 
     #[test]
-    fn failed_policy_insert_cannot_mutate_the_committed_host() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    fn faulted_initial_insert_persists_repair_state_and_prints_the_repair_command() {
+        let store = FailFirstPolicyInsert::new();
         let local = host("machine");
         store.put_host(&local).unwrap();
-        let duplicate_id = PolicyId::new_random();
-        let existing = ScalePolicy::new_for_host_label(
-            duplicate_id,
-            targets()[0].clone(),
-            77,
-            local.id,
-            HostLabel::new("home").unwrap(),
-            PolicyMode::monitor_only(),
-            CachePolicy::default(),
-        );
-        store.insert_policy(&existing).unwrap();
-
+        let policy_id = PolicyId::new_random();
+        let mut output = Vec::new();
         let error = record_policy_with_id(
             &store,
             &local,
-            targets()[1].clone(),
-            HostLabel::new("office").unwrap(),
+            targets()[0].clone(),
+            HostLabel::new("home").unwrap(),
             None,
-            78,
-            TargetCost::organization(1),
-            vec![TargetCost::repository()],
-            duplicate_id,
-            &mut Vec::new(),
+            77,
+            TargetCost::repository(),
+            Vec::new(),
+            policy_id,
+            &mut output,
         )
         .unwrap_err();
         assert_eq!(error.class(), Failure::LocalState);
@@ -828,7 +929,20 @@ mod tests {
         );
         let policies = store.policies().unwrap();
         assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].id, policy_id);
+        assert_eq!(policies[0].state(), PolicyState::RepairRequired);
         assert_eq!(policies[0].requested_host_label.as_str(), "home");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("persisted in repair_required"), "{output}");
+        assert!(
+            output.contains("repair: runner-manager repo remove octo/repo --purge"),
+            "{output}"
+        );
+        assert_eq!(
+            store.remove_policy_calls.load(Ordering::SeqCst),
+            0,
+            "the failure path persists repair state but never deletes local or remote state"
+        );
     }
 
     #[test]

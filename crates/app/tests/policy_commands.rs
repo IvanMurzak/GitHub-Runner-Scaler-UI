@@ -29,6 +29,58 @@ fn database(data_dir: &std::path::Path) -> SqliteStore {
     SqliteStore::open(data_dir.join("config").join("runner-manager.sqlite3")).unwrap()
 }
 
+fn add_with_label(scope: &str, target: &str, label: &str) -> (String, Vec<String>) {
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+    let outcome = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args([
+            scope,
+            "add",
+            target,
+            "--host-label",
+            label,
+            "--max-capacity",
+            "2",
+        ]);
+        command
+    });
+    assert_eq!(outcome.code, 0, "{scope} add: {}", outcome.both());
+    let policy = database(data_dir.path()).policies().unwrap().remove(0);
+    assert_eq!(policy.requested_host_label.as_str(), label);
+    (outcome.stdout, github.seen())
+}
+
+#[test]
+fn repository_and_organization_add_share_the_gateway_path_and_emit_label_specific_routing() {
+    for (scope, target) in [("repo", "octo/one"), ("org", "octo")] {
+        let mut emitted = Vec::new();
+        for label in ["home", "office"] {
+            let (output, requests) = add_with_label(scope, target, label);
+            let routing = output
+                .lines()
+                .find(|line| line.starts_with("Routing label: "))
+                .unwrap_or_else(|| panic!("{scope} add omitted routing output:\n{output}"));
+            assert!(routing.contains(&format!("rm-{label}-")), "{routing}");
+            emitted.push(routing.to_string());
+            assert_eq!(
+                requests,
+                [
+                    "GET /user/installations",
+                    "GET /user/installations/77/repositories"
+                ],
+                "{scope} add must make exactly the two discovery reads and no GitHub write"
+            );
+        }
+        assert_ne!(
+            emitted[0], emitted[1],
+            "the same {scope} target added in isolated stores under distinct host labels"
+        );
+    }
+}
+
 #[test]
 fn scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label() {
     let data_dir = tempfile::tempdir().unwrap();
