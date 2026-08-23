@@ -635,6 +635,22 @@ pub enum ServiceError {
         detail: String,
     },
 
+    /// An operation failed and its compensating action failed too.
+    #[error(
+        "cannot {operation} {name}: {cause}. The attempted rollback also failed: {rollback}. \
+         Inspect `service status` before retrying."
+    )]
+    Rollback {
+        /// The transaction that could not be completed.
+        operation: &'static str,
+        /// Which registration was involved.
+        name: String,
+        /// The original failure.
+        cause: String,
+        /// The failure while restoring the previous state.
+        rollback: String,
+    },
+
     /// The operation needs administrative rights it does not have.
     #[error("{operation} {name} needs administrative rights: {detail}. {remedy}")]
     NeedsElevation {
@@ -2654,6 +2670,8 @@ impl InstallRecord {
     ///
     /// [`ServiceError::Record`].
     pub fn write(&self, paths: &AppPaths) -> Result<(), ServiceError> {
+        use std::io::Write as _;
+
         let path = Self::path(paths);
         let text = toml::to_string_pretty(self).map_err(|error| ServiceError::Record {
             operation: "encode",
@@ -2667,11 +2685,33 @@ impl InstallRecord {
                 detail: error.to_string(),
             })?;
         }
-        std::fs::write(&path, text).map_err(|error| ServiceError::Record {
+        let parent = path.parent().ok_or_else(|| ServiceError::Record {
             operation: "write",
-            path,
-            detail: error.to_string(),
-        })
+            path: path.clone(),
+            detail: "the record path has no parent directory".to_string(),
+        })?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(parent).map_err(|error| ServiceError::Record {
+                operation: "write",
+                path: path.clone(),
+                detail: error.to_string(),
+            })?;
+        temporary
+            .write_all(text.as_bytes())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| ServiceError::Record {
+                operation: "write",
+                path: path.clone(),
+                detail: error.to_string(),
+            })?;
+        temporary
+            .persist(&path)
+            .map(|_| ())
+            .map_err(|error| ServiceError::Record {
+                operation: "write",
+                path,
+                detail: error.error.to_string(),
+            })
     }
 
     /// Removes the record. Returns whether there was one.
@@ -3220,7 +3260,17 @@ impl ServiceOperations {
         let definition = control.install(&plan)?;
         let review = review_least_privilege(&definition, &plan);
         let record = InstallRecord::of(&plan, &definition, Utc::now());
-        record.write(&self.paths)?;
+        if let Err(cause) = record.write(&self.paths) {
+            if let Err(rollback) = control.uninstall(&self.identity) {
+                return Err(ServiceError::Rollback {
+                    operation: "install",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback: rollback.to_string(),
+                });
+            }
+            return Err(cause);
+        }
         Ok(Installed {
             plan,
             definition,
@@ -3323,10 +3373,41 @@ impl ServiceOperations {
             Err(_) => plan,
         };
 
-        self.controls.control(from)?.uninstall(&self.identity)?;
-        let control = self.controls.control(to)?;
-        let definition = control.install(&plan)?;
-        InstallRecord::of(&plan, &definition, record.installed_at).write(&self.paths)?;
+        // Install the target domain before touching the live one. This makes a
+        // failed target install a no-op from the operator's point of view and,
+        // unlike uninstall-first ordering, never trades a working service for
+        // an error message.
+        let target = self.controls.control(to)?;
+        let definition = target.install(&plan)?;
+        let next_record = InstallRecord::of(&plan, &definition, record.installed_at);
+        if let Err(cause) = next_record.write(&self.paths) {
+            if let Err(rollback) = target.uninstall(&self.identity) {
+                return Err(ServiceError::Rollback {
+                    operation: "switch start mode",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback: rollback.to_string(),
+                });
+            }
+            return Err(cause);
+        }
+
+        // Only after the target registration and its durable record exist is
+        // it safe to remove the old domain. If that last step fails, remove the
+        // target and put the old record back so status and reality agree.
+        if let Err(cause) = self.controls.control(from)?.uninstall(&self.identity) {
+            let target_rollback = target.uninstall(&self.identity);
+            let record_rollback = record.write(&self.paths);
+            if let Err(rollback) = target_rollback.and(record_rollback) {
+                return Err(ServiceError::Rollback {
+                    operation: "switch start mode",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback: rollback.to_string(),
+                });
+            }
+            return Err(cause);
+        }
         Ok(StartModeChange {
             from,
             to,
@@ -3789,6 +3870,16 @@ struct RecordingState {
     registrations: BTreeMap<(StartMode, String), Registration>,
     definitions: BTreeMap<String, ServiceDefinition>,
     calls: Vec<String>,
+    #[cfg(test)]
+    install_failures: BTreeMap<StartMode, String>,
+    #[cfg(test)]
+    after_install: BTreeMap<StartMode, TestInstallSideEffect>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum TestInstallSideEffect {
+    HideDirectory { directory: PathBuf, hidden: PathBuf },
 }
 
 impl RecordingControls {
@@ -3847,6 +3938,27 @@ impl RecordingControls {
             edit(registration);
         }
     }
+
+    #[cfg(test)]
+    fn fail_next_install(&self, mode: StartMode, detail: &str) {
+        self.state
+            .lock()
+            .expect("not poisoned")
+            .install_failures
+            .insert(mode, detail.to_string());
+    }
+
+    #[cfg(test)]
+    fn hide_directory_after_install(&self, mode: StartMode, directory: PathBuf, hidden: PathBuf) {
+        self.state
+            .lock()
+            .expect("not poisoned")
+            .after_install
+            .insert(
+                mode,
+                TestInstallSideEffect::HideDirectory { directory, hidden },
+            );
+    }
 }
 
 impl ControlFactory for RecordingControls {
@@ -3884,6 +3996,21 @@ impl ServiceControl for RecordingControl {
 
     fn install(&self, plan: &InstallPlan) -> Result<ServiceDefinition, ServiceError> {
         self.note("install", plan.identity().name());
+        #[cfg(test)]
+        if let Some(detail) = self
+            .state
+            .lock()
+            .expect("not poisoned")
+            .install_failures
+            .remove(&self.mode)
+        {
+            return Err(ServiceError::Control {
+                operation: "install",
+                name: plan.identity().name().to_string(),
+                manager: "recording control",
+                detail,
+            });
+        }
         // The real definition, not a stub. Rendering is pure, so the double can
         // afford it -- and a stub would make `Installed::review` report that the
         // definition confirms nothing, which is exactly the shape of false
@@ -3905,6 +4032,15 @@ impl ServiceControl for RecordingControl {
         state
             .definitions
             .insert(plan.identity().name().to_string(), definition.clone());
+        #[cfg(test)]
+        let side_effect = state.after_install.remove(&self.mode);
+        drop(state);
+        #[cfg(test)]
+        if let Some(TestInstallSideEffect::HideDirectory { directory, hidden }) = side_effect {
+            std::fs::rename(&directory, &hidden).expect("test fault can hide the record directory");
+            std::fs::write(&directory, b"blocks recreation")
+                .expect("test fault can block record directory recreation");
+        }
         Ok(definition)
     }
 
@@ -4017,6 +4153,71 @@ pub const fn host_definition_kind(mode: StartMode) -> DefinitionKind {
         DefinitionKind::LaunchdPlist
     } else {
         DefinitionKind::SystemdUnit
+    }
+}
+
+/// Enables a launchd label after it has been bootstrapped.
+///
+/// `launchctl bootstrap` deliberately preserves a label's disabled bit. An
+/// `enable` failure therefore means the new registration cannot satisfy its
+/// start policy. Compensate by booting it out and removing the plist so a
+/// failed install cannot look installed to `service status`.
+#[cfg(any(target_os = "macos", test))]
+fn enable_launchd_registration(
+    mut launchctl: impl FnMut(&[&std::ffi::OsStr]) -> (bool, String),
+    domain: &str,
+    service_target: &str,
+    plist: &Path,
+    name: &str,
+    elevation_remedy: &'static str,
+) -> Result<(), ServiceError> {
+    let (enabled, cause) = launchctl(&[
+        std::ffi::OsStr::new("enable"),
+        std::ffi::OsStr::new(service_target),
+    ]);
+    if enabled {
+        return Ok(());
+    }
+
+    let (booted_out, bootout_detail) = launchctl(&[
+        std::ffi::OsStr::new("bootout"),
+        std::ffi::OsStr::new(service_target),
+    ]);
+    let removed = std::fs::remove_file(plist);
+    if !booted_out || removed.is_err() {
+        return Err(ServiceError::Rollback {
+            operation: "enable launchd registration",
+            name: name.to_string(),
+            cause,
+            rollback: format!(
+                "launchctl bootout {domain}: {}; remove {}: {}",
+                if booted_out {
+                    "succeeded".to_string()
+                } else {
+                    bootout_detail
+                },
+                plist.display(),
+                removed
+                    .err()
+                    .map_or_else(|| "succeeded".to_string(), |error| error.to_string())
+            ),
+        });
+    }
+
+    if cause.to_ascii_lowercase().contains("permission denied") {
+        Err(ServiceError::NeedsElevation {
+            operation: "enable",
+            name: name.to_string(),
+            detail: cause,
+            remedy: elevation_remedy,
+        })
+    } else {
+        Err(ServiceError::Control {
+            operation: "enable",
+            name: name.to_string(),
+            manager: "launchd",
+            detail: cause,
+        })
     }
 }
 
@@ -4603,7 +4804,8 @@ mod sys {
     use super::{
         DefinitionKind, InstallPlan, LAUNCH_AGENTS_SUBDIR, LAUNCH_DAEMONS_DIR, Registration,
         SUDO_REMEDY, ServiceControl, ServiceDefinition, ServiceError, ServiceIdentity,
-        home_directory, plist_string_value, quote_argument, run, write_definition, xml_value,
+        enable_launchd_registration, home_directory, plist_string_value, quote_argument, run,
+        write_definition, xml_value,
     };
 
     pub(super) fn control(mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError> {
@@ -4702,7 +4904,14 @@ mod sys {
             // A previously disabled label stays disabled through a bootstrap,
             // which is a service that is installed and will never start.
             let service_target = self.service_target(plan.identity());
-            let _ = self.launchctl(&[OsStr::new("enable"), OsStr::new(&service_target)]);
+            enable_launchd_registration(
+                |arguments| self.launchctl(arguments),
+                &target,
+                &service_target,
+                &path,
+                &name,
+                SUDO_REMEDY,
+            )?;
             Ok(definition)
         }
 
@@ -5138,6 +5347,51 @@ mod tests {
         fn request(&self, mode: StartMode) -> InstallRequest {
             InstallRequest::new(mode).for_binary(&self.binary)
         }
+    }
+
+    #[test]
+    fn launchd_enable_failure_is_returned_and_removes_the_bootstrapped_registration() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let plist = root.path().join("fixture.plist");
+        std::fs::write(&plist, b"fixture").expect("a plist fixture");
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let error = enable_launchd_registration(
+            |arguments| {
+                let call = arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let operation = call[0].clone();
+                calls.borrow_mut().push(call);
+                if operation == "enable" {
+                    (false, "label remains disabled".to_string())
+                } else {
+                    (true, String::new())
+                }
+            },
+            "system",
+            "system/com.openai.runner-manager-selftest",
+            &plist,
+            "runner-manager-selftest",
+            "rerun with administrative rights",
+        )
+        .expect_err("enable failure must fail the install");
+
+        assert!(
+            matches!(
+                error,
+                ServiceError::Control {
+                    operation: "enable",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(calls.borrow().len(), 2);
+        assert_eq!(calls.borrow()[0][0], "enable");
+        assert_eq!(calls.borrow()[1][0], "bootout");
+        assert!(!plist.exists(), "rollback must remove the plist");
     }
 
     // -----------------------------------------------------------------------
@@ -6160,6 +6414,32 @@ mod tests {
     }
 
     #[test]
+    fn install_rolls_back_the_registration_when_record_persistence_fails() {
+        let host = Host::new();
+        let record_path = InstallRecord::path(&host.paths);
+        std::fs::create_dir(&record_path).expect("a directory blocks the record file");
+
+        let error = host
+            .operations()
+            .install(&host.request(StartMode::Boot))
+            .expect_err("record persistence must fail");
+
+        assert!(matches!(error, ServiceError::Record { .. }), "{error}");
+        assert!(
+            host.controls.registrations().is_empty(),
+            "a failed install must not leave a live unrecorded registration"
+        );
+        assert!(
+            host.controls
+                .calls()
+                .iter()
+                .any(|call| call == "uninstall runner-manager (boot)"),
+            "the registration must be explicitly rolled back: {:?}",
+            host.controls.calls()
+        );
+    }
+
+    #[test]
     fn install_reviews_what_it_registered() {
         let host = Host::new();
         let installed = host
@@ -6341,6 +6621,71 @@ mod tests {
                 .contains(&host.binary.to_string_lossy().into_owned()),
             "{:?}",
             registrations[0].2
+        );
+    }
+
+    #[test]
+    fn switching_start_mode_keeps_the_live_registration_when_target_install_fails() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install at boot");
+        let record_before = std::fs::read(InstallRecord::path(&host.paths)).expect("the record");
+        host.controls
+            .fail_next_install(StartMode::Login, "injected target failure");
+
+        let error = operations
+            .set_start_mode(StartMode::Login)
+            .expect_err("the target manager refuses the install");
+
+        assert!(matches!(error, ServiceError::Control { .. }), "{error}");
+        assert_eq!(
+            std::fs::read(InstallRecord::path(&host.paths)).expect("the old record survives"),
+            record_before
+        );
+        let registrations = host.controls.registrations();
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].0, StartMode::Boot);
+    }
+
+    #[test]
+    fn switching_start_mode_rolls_back_target_when_record_persistence_fails() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install at boot");
+        let record_before = std::fs::read(InstallRecord::path(&host.paths)).expect("the record");
+        let config = host.paths.config_dir().to_path_buf();
+        let hidden = config.with_file_name("config-hidden-by-fault");
+        host.controls.hide_directory_after_install(
+            StartMode::Login,
+            config.clone(),
+            hidden.clone(),
+        );
+
+        let error = operations
+            .set_start_mode(StartMode::Login)
+            .expect_err("the injected filesystem fault prevents persistence");
+
+        std::fs::remove_file(&config).expect("remove the injected blocker");
+        std::fs::rename(&hidden, &config).expect("restore the record directory");
+        assert!(matches!(error, ServiceError::Record { .. }), "{error}");
+        assert_eq!(
+            std::fs::read(InstallRecord::path(&host.paths)).expect("the old record survives"),
+            record_before
+        );
+        let registrations = host.controls.registrations();
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].0, StartMode::Boot);
+        assert!(
+            host.controls
+                .calls()
+                .iter()
+                .any(|call| call == "uninstall runner-manager (login)"),
+            "the target must be rolled back: {:?}",
+            host.controls.calls()
         );
     }
 
