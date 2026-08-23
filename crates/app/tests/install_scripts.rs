@@ -48,6 +48,7 @@ use common::{
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 use tempfile::TempDir;
 
@@ -784,6 +785,29 @@ fn sources_a_file(line: &str) -> bool {
 // install.ps1.
 // ----------------------------------------------------------------------------
 
+/// One PowerShell runtime at a time inside this integration-test process.
+///
+/// Rust runs tests concurrently by default. That made this file start six or
+/// more `pwsh` processes at once on the two Unix CI hosts. The hosted macOS
+/// runtime has then failed while parsing a truncated
+/// `System.Collections.Concurrent` assembly name, and the hosted Linux runtime
+/// has exited with a stack overflow. Both are failures before install.ps1 gets
+/// control, and reruns on the same commit have passed.
+///
+/// Serialising the child runtimes fixes the actual contention without weakening
+/// the suite: the Rust tests still run concurrently, every installer scenario
+/// still executes, and each scenario still makes its checksum, corruption,
+/// rollback, idempotency, architecture and destination assertions. Holding the
+/// lock only through `Command::output` also keeps unrelated fixture construction
+/// and install.sh coverage parallel.
+static POWERSHELL_PROCESS: Mutex<()> = Mutex::new(());
+
+fn powershell_process() -> MutexGuard<'static, ()> {
+    POWERSHELL_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// EVERY PowerShell host on this machine that install.ps1 has to work under.
 ///
 /// ----------------------------------------------------------------------------
@@ -983,6 +1007,7 @@ fn run_install_ps1(
     command.args(arguments);
     command.current_dir(repository_root());
 
+    let _runtime = powershell_process();
     let output = command
         .output()
         .unwrap_or_else(|err| panic!("cannot run install.ps1: {err}"));
@@ -1059,6 +1084,7 @@ fn install_ps1_defaults_to_the_documented_directory() {
         command.env("RUNNER_MANAGER_INSTALL_DIR", "");
         command.current_dir(repository_root());
 
+        let _runtime = powershell_process();
         let output = command.output().expect("cannot run install.ps1");
         let text = format!(
             "{}{}",
@@ -1343,6 +1369,7 @@ fn run_under_restricted_policy(
         process.env(key, value);
     }
 
+    let _runtime = powershell_process();
     let output = process
         .output()
         .unwrap_or_else(|err| panic!("cannot run {}: {err}", shell.display()));
@@ -1829,7 +1856,9 @@ fn install_ps1_verifies_the_digest_where_get_filehash_is_shadowed() {
         .arg("-Command")
         .arg("if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) { 'PRESENT' } else { 'ABSENT' }")
         .env("PSModulePath", &shadowed);
+    let _runtime = powershell_process();
     let probed = probe.output().expect("cannot run Windows PowerShell");
+    drop(_runtime);
     let probed = String::from_utf8_lossy(&probed.stdout).trim().to_string();
     if probed != "ABSENT" {
         eprintln!(
@@ -1858,6 +1887,7 @@ fn install_ps1_verifies_the_digest_where_get_filehash_is_shadowed() {
             .args(arguments)
             .env("PSModulePath", &shadowed)
             .current_dir(repository_root());
+        let _runtime = powershell_process();
         let output = command.output().expect("cannot run install.ps1");
         (
             output.status.success(),
@@ -2293,6 +2323,29 @@ fn dash_or_skip() -> Option<PathBuf> {
 }
 
 /// `run_bash`, but with the shell chosen by the caller.
+///
+/// Git Bash normally prepends its own `usr/bin` before starting a script. A
+/// direct `dash.exe script` invocation does not: on a stock Git-for-Windows
+/// install it inherits the runner's Windows PATH and cannot find the adjacent
+/// `mktemp.exe` (or the other POSIX tools install.sh deliberately uses). Put the
+/// selected shell's tool directory first so this measures install.sh under dash
+/// rather than an environment no Git shell creates.
+fn supply_shell_tool_path(command: &mut Command, shell: &Path) {
+    let Some(directory) = shell.parent() else {
+        return;
+    };
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited));
+    let joined = std::env::join_paths(paths).unwrap_or_else(|err| {
+        panic!(
+            "cannot put {} on PATH for {}: {err}",
+            directory.display(),
+            shell.display()
+        )
+    });
+    command.env("PATH", joined);
+}
+
 fn run_with_shell(
     shell: &Path,
     script: &Path,
@@ -2300,6 +2353,7 @@ fn run_with_shell(
     envs: &[(&str, &str)],
 ) -> (bool, String) {
     let mut command = Command::new(shell);
+    supply_shell_tool_path(&mut command, shell);
     command.arg(posix(script));
     command.args(arguments);
     command.current_dir(repository_root());
@@ -2328,6 +2382,29 @@ fn install_sh_installs_end_to_end_under_a_real_posix_shell() {
     let Some(dash) = dash_or_skip() else {
         return;
     };
+
+    // Anti-vacuity for the process environment above. The installer would also
+    // fail when one of these is absent, but only after fixture construction and
+    // with a symptom such as `mktemp: not found`. This proves up front that the
+    // direct dash process has the same baseline tools as the documented `sh`
+    // invocation and names the harness fault if that ever changes.
+    let mut probe = Command::new(&dash);
+    supply_shell_tool_path(&mut probe, &dash);
+    let probe = probe
+        .arg("-c")
+        .arg("for tool in awk sed grep cut tr mktemp tar; do command -v \"$tool\" || exit 1; done")
+        .output()
+        .unwrap_or_else(|err| panic!("cannot probe dash at {}: {err}", dash.display()));
+    assert!(
+        probe.status.success(),
+        "dash at {} cannot see every POSIX tool install.sh requires. The test \
+         would then measure a broken direct-shell PATH instead of the \
+         installer:\n{}{}",
+        dash.display(),
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+
     let fixture = prepare("1.2.3");
     let assets = posix(&fixture.release.assets);
     let directory = posix(&fixture.directory);
