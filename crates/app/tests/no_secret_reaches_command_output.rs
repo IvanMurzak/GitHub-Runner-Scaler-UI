@@ -116,10 +116,15 @@ const COMMANDS: &[&[&str]] = &[
     &["org", "set-capacity", "acme", "--max-capacity", "2"],
     &["org", "set-scale", "acme", "--enabled", "false"],
     &["org", "remove", "acme", "--purge"],
-    &["daemon", "run"],
-    &["service", "install", "--start-at", "boot"],
-    &["service", "uninstall"],
+    // Long-running and host-mutating commands are covered at their parser
+    // boundary here. Their implemented handlers have focused f3 tests; running
+    // them in a secret-output corpus would either hang forever or alter the
+    // developer's real service manager.
+    &["daemon", "run", "--help"],
+    &["service", "install", "--help"],
+    &["service", "uninstall", "--help"],
     &["service", "status"],
+    &["service", "set-start-mode", "--help"],
     &["tui"],
     &["status"],
     &["status", "--json"],
@@ -199,11 +204,7 @@ fn corpus_from_the_full_command_set(verbose: bool) -> (tempfile::TempDir, Vec<Fr
 
     record("auth login".to_string(), &["auth", "login"], 0);
     for arguments in COMMANDS {
-        let expected_code = match arguments[0] {
-            "daemon" | "service" => 17,
-            "tui" => 1,
-            _ => 0,
-        };
+        let expected_code = if arguments[0] == "tui" { 1 } else { 0 };
         record(arguments.join(" "), arguments, expected_code);
     }
     record("auth logout".to_string(), &["auth", "logout"], 0);

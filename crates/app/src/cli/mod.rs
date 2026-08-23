@@ -589,7 +589,37 @@ pub struct OrgRemoveArgs {
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     /// Run the reconciliation loop in the foreground.
-    Run,
+    Run(DaemonRunArgs),
+}
+
+/// Arguments normally supplied by `service install`.
+///
+/// The four hidden leaves preserve the application-data layout selected by
+/// the installing operator when the service manager later starts the daemon
+/// under LocalSystem/root. They do not affect secret-store selection: the
+/// secret remains in the platform-standard machine/user store for the recorded
+/// start mode.
+#[derive(Debug, Args, Default)]
+pub struct DaemonRunArgs {
+    #[arg(long, hide = true, requires_all = ["service_state_dir", "service_runtime_dir", "service_logs_dir"])]
+    pub service_config_dir: Option<PathBuf>,
+    #[arg(long, hide = true, requires_all = ["service_config_dir", "service_runtime_dir", "service_logs_dir"])]
+    pub service_state_dir: Option<PathBuf>,
+    #[arg(long, hide = true, requires_all = ["service_config_dir", "service_state_dir", "service_logs_dir"])]
+    pub service_runtime_dir: Option<PathBuf>,
+    #[arg(long, hide = true, requires_all = ["service_config_dir", "service_state_dir", "service_runtime_dir"])]
+    pub service_logs_dir: Option<PathBuf>,
+}
+
+impl DaemonRunArgs {
+    fn service_paths(&self) -> Option<AppPaths> {
+        Some(AppPaths::from_directories(
+            self.service_config_dir.as_ref()?,
+            self.service_state_dir.as_ref()?,
+            self.service_runtime_dir.as_ref()?,
+            self.service_logs_dir.as_ref()?,
+        ))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -600,12 +630,21 @@ pub enum ServiceCommand {
     Uninstall,
     /// Report the start mode, resolved binary path, and last GitHub contact.
     Status,
+    /// Switch between boot and login start without reinstalling the product.
+    SetStartMode(ServiceSetStartModeArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceInstallArgs {
     /// `boot` starts the agent with the machine; `login` waits for a session.
     #[arg(long, value_name = "WHEN", default_value = "boot")]
+    pub start_at: StartAt,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceSetStartModeArgs {
+    /// `boot` starts the agent with the machine; `login` waits for a session.
+    #[arg(value_name = "WHEN")]
     pub start_at: StartAt,
 }
 
@@ -668,6 +707,26 @@ impl Context {
         Ok(Self {
             paths,
             data_root: data_dir.map(Path::to_path_buf),
+            endpoints: Self::resolve_endpoints(err)?,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    /// Resolves a daemon against the exact non-secret directories captured by
+    /// `service install`, while leaving the secret store platform-standard.
+    fn resolve_service(paths: AppPaths, err: &mut dyn Write) -> Result<Self, CliError> {
+        paths.create_all().map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot create this service's application-data directories: {source}"),
+            )
+        })?;
+        Ok(Self {
+            paths,
+            // This is the load-bearing difference from `--data-dir`: a service
+            // path handoff must not re-root the machine secret into another
+            // file underneath the data tree.
+            data_root: None,
             endpoints: Self::resolve_endpoints(err)?,
             clock: Arc::new(SystemClock),
         })
@@ -916,7 +975,20 @@ pub fn dispatch() -> ExitCode {
 /// # Errors
 /// Whatever the routed command returns.
 pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), CliError> {
-    let context = Context::resolve(cli.data_dir.as_deref(), err)?;
+    let service_paths = match &cli.command {
+        Command::Daemon(DaemonCommand::Run(args)) => args.service_paths(),
+        _ => None,
+    };
+    if service_paths.is_some() && cli.data_dir.is_some() {
+        return Err(CliError::new(
+            Failure::InvalidArgument,
+            "the service supplied its recorded application-data directories, so --data-dir cannot also select a different database",
+        ));
+    }
+    let context = match service_paths {
+        Some(paths) => Context::resolve_service(paths, err)?,
+        None => Context::resolve(cli.data_dir.as_deref(), err)?,
+    };
 
     // Diagnostics go to `logs/`, redacted by `d1`'s allowlist sink. A CLI that
     // could not install them is still a CLI that must run, so this is a warning
@@ -936,7 +1008,8 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Cl
         Command::Status(args) => status::dispatch(&context, args, out),
         Command::Repo(command) => policy::dispatch_repo(&context, command, out),
         Command::Org(command) => policy::dispatch_org(&context, command, out),
-        Command::Daemon(_) | Command::Service(_) => Err(not_implemented("f3")),
+        Command::Daemon(command) => daemon::dispatch(&context, command, out),
+        Command::Service(command) => service::dispatch(&context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),
