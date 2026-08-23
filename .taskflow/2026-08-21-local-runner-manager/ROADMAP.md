@@ -136,16 +136,16 @@ worker branch to reach `origin`.
 | [d1-platform-core](tasks/d1-platform-core.md) | a1 | 9/6 | top | ✅ done | `4c1e08f` | 2026-08-21 |
 | [d2-machine-secret-store](tasks/d2-machine-secret-store.md) | d1 | 10/7 | top | ✅ done | `7e0855c` (PR [#4](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/4)) | 2026-08-22 |
 | [f1-cli-auth-host-status](tasks/f1-cli-auth-host-status.md) | b2, c3, d2 | 9/6 | top | ✅ done | `5072a71` (PR [#6](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/6)) | 2026-08-22 |
-| [f2-cli-policy-commands](tasks/f2-cli-policy-commands.md) | f1 | 9/6 | mid | ⬜ pending | | |
+| [f2-cli-policy-commands](tasks/f2-cli-policy-commands.md) | f1 | 9/6 | mid | 🔵 in progress | `worktree-f2-cli-policy-commands` | 2026-08-22 |
 | **Wave 2** | | | | | | |
 | [c4-demand-and-jit-gateway](tasks/c4-demand-and-jit-gateway.md) | c3, b1, v1 | 10/7 | top | ✅ done | `a671a70` (PR [#3](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/3)) | 2026-08-22 |
 | [e1-reconciliation-capacity](tasks/e1-reconciliation-capacity.md) | b1, c4, d1 | 10/8 | top | ✅ done | `caa447b` (PR [#5](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/5)) | 2026-08-22 |
 | [e2-runner-package-cache](tasks/e2-runner-package-cache.md) | c3, d1, b1 | 8/6 | top | ✅ done | `fff4299` (PR [#7](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/7)) | 2026-08-22 |
-| [e3-jit-lifecycle-recovery](tasks/e3-jit-lifecycle-recovery.md) | e1, e2, b2, d1 | 10/8 | top | ⬜ pending | | |
+| [e3-jit-lifecycle-recovery](tasks/e3-jit-lifecycle-recovery.md) | e1, e2, b2, d1 | 10/8 | top | 🔵 in progress | `worktree-e3-jit-lifecycle-recovery` | 2026-08-22 |
 | [d3-service-installers](tasks/d3-service-installers.md) | d1, b2 | 8/7 | top | ✅ done | `38b178a` (PR [#8](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/8)) | 2026-08-22 |
 | [f3-cli-daemon-service](tasks/f3-cli-daemon-service.md) | f2, e3, d3 | 7/4 | mid | ⬜ pending | | |
 | **Wave 3** | | | | | | |
-| [g1-tui-shell-input](tasks/g1-tui-shell-input.md) | f1 | 8/8 | top | ⬜ pending | | |
+| [g1-tui-shell-input](tasks/g1-tui-shell-input.md) | f1 | 8/8 | top | 🔵 in progress | `worktree-g1-tui-shell-input` | 2026-08-22 |
 | [g2-tui-screens](tasks/g2-tui-screens.md) | g1, c3 | 8/6 | mid | ⬜ pending | | |
 | [g3-tui-settings-parity](tasks/g3-tui-settings-parity.md) | g2, f2 | 8/6 | mid | ⬜ pending | | |
 | **Wave 4** | | | | | | |
