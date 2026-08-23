@@ -1,0 +1,19 @@
+.taskflow/2026-08-21-local-runner-manager/ROADMAP.md
+  s_e3f2ebf0732f36::t_0ae60f8f76cef0 146,316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "523c9d7834e5f1aeb2878c60fde2e6a66250fdbe",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
