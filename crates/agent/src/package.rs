@@ -1737,7 +1737,7 @@ impl PackageCache {
     /// [`PackageError::VersionInUse`],
     /// [`PackageError::VersionHeldByUnknownAttempt`],
     /// [`PackageError::NotInstalled`], or [`PackageError::Io`].
-    pub fn prune(
+    pub(crate) fn prune(
         &self,
         version: &RunnerVersion,
         attempts: &[RunnerAttempt],

@@ -805,7 +805,10 @@ pub struct LaunchRequest<'a> {
     pub policy: &'a ScalePolicy,
     /// Proof that e1 still owns the host allocation lock for every package,
     /// prune, and process-start effect performed by e3.
-    pub allocation_guard: &'a AllocationGuard,
+    // Crate-visible so only this allocator can mint the request that reaches
+    // package pruning. A caller holding an unrelated public AllocationLock can
+    // no longer assemble a LaunchRequest and present that guard as authority.
+    pub(crate) allocation_guard: &'a AllocationGuard,
 }
 
 /// Why one runner could not be started.
@@ -818,6 +821,15 @@ pub struct LaunchRequest<'a> {
 #[error("the runner could not be started: {reason}")]
 pub struct LaunchFailure {
     pub reason: FailureReason,
+}
+
+/// A lifecycle conclusion that must return through ordinary demand and
+/// capacity allocation before another runner may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplacementIntent {
+    pub policy: PolicyId,
+    pub previous_attempt: AttemptId,
+    pub operation: &'static str,
 }
 
 impl LaunchFailure {
@@ -865,6 +877,17 @@ impl LaunchFailure {
 ///   measurement that made this necessary.
 #[async_trait::async_trait]
 pub trait RunnerLauncher: fmt::Debug + Send + Sync {
+    /// Reconcile this policy's existing processes before demand is read and
+    /// capacity is recomputed. A concluded pre-acceptance attempt thereby
+    /// becomes an ordinary allocation candidate in this same pass; replacement
+    /// never bypasses the allocator.
+    async fn supervise(
+        &self,
+        _policy: &ScalePolicy,
+    ) -> Result<Vec<ReplacementIntent>, LaunchFailure> {
+        Ok(Vec::new())
+    }
+
     /// Every attempt this host holds, across every policy, terminal ones
     /// included.
     ///
@@ -1540,6 +1563,9 @@ pub struct ReconcileReport {
     pub unreadable: Vec<PolicyId>,
     /// Runners actually started.
     pub started: u16,
+    /// Pre-acceptance attempts routed back through this pass's ordinary
+    /// demand/capacity decision.
+    pub replacement_intents: u16,
     /// Terminal attempts whose runtime was removed.
     pub cleaned: u16,
     /// Of those, the surplus case: registered, got no job, exited on its idle
@@ -1731,6 +1757,7 @@ impl Reconciler {
 
         // --- Flow 2.1-2.2: who is even asking, and what did GitHub say -------
         let mut pollable: Vec<&ScalePolicy> = Vec::new();
+        let mut supervision_failed = BTreeSet::new();
         for policy in policies {
             if !policy.owns_runners() {
                 report.monitor_only.push(policy.id);
@@ -1738,10 +1765,25 @@ impl Reconciler {
                     .emit(LifecycleEvent::MonitorOnlySkipped { policy: policy.id });
                 continue;
             }
-            if !policy.is_owned_by(self.host.id) || !policy.may_start_runners() {
+            if !policy.is_owned_by(self.host.id) {
                 // Ownership rule 2 and precedence rule 4. The allocator reports
                 // both by name below; polling on their behalf would spend
                 // requests for an answer that cannot be acted on.
+                continue;
+            }
+            match self.launcher.supervise(policy).await {
+                Ok(intents) => {
+                    report.replacement_intents = report
+                        .replacement_intents
+                        .saturating_add(u16::try_from(intents.len()).unwrap_or(u16::MAX));
+                }
+                Err(failure) => {
+                    supervision_failed.insert(policy.id);
+                    self.report_unreadable_attempts(&mut report, &failure);
+                    continue;
+                }
+            }
+            if !policy.may_start_runners() {
                 continue;
             }
             pollable.push(policy);
@@ -1794,6 +1836,9 @@ impl Reconciler {
                     }
                     Err(failure) => self.report_unreadable_attempts(&mut report, &failure),
                 }
+                continue;
+            }
+            if supervision_failed.contains(&policy.id) {
                 continue;
             }
             let Some(reading) = readings.get(&policy.target) else {
@@ -2368,6 +2413,7 @@ mod tests {
         /// Refuses every cleanup, so the silent-retry path has something to be
         /// loud about.
         clean_fails: bool,
+        replacements: Mutex<Vec<ReplacementIntent>>,
     }
 
     impl FakeLauncher {
@@ -2426,10 +2472,36 @@ mod tests {
         fn cleaned(&self) -> Vec<AttemptId> {
             self.cleaned.lock().unwrap().clone()
         }
+
+        fn replacing(self, intent: ReplacementIntent) -> Self {
+            self.replacements.lock().unwrap().push(intent);
+            self
+        }
     }
 
     #[async_trait::async_trait]
     impl RunnerLauncher for FakeLauncher {
+        async fn supervise(
+            &self,
+            policy: &ScalePolicy,
+        ) -> Result<Vec<ReplacementIntent>, LaunchFailure> {
+            let mut replacements = self.replacements.lock().unwrap();
+            let selected: Vec<_> = replacements
+                .extract_if(.., |intent| intent.policy == policy.id)
+                .collect();
+            if !selected.is_empty() {
+                let retired: BTreeSet<_> = selected
+                    .iter()
+                    .map(|intent| intent.previous_attempt)
+                    .collect();
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .retain(|attempt| !retired.contains(&attempt.id));
+            }
+            Ok(selected)
+        }
+
         async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
             if *self.attempts_fail.lock().unwrap() {
                 return Err(LaunchFailure::new(FailureReason::Other(
@@ -3116,6 +3188,32 @@ mod tests {
         assert_eq!(report.allocations[0].desired, 0);
         assert_eq!(report.started, 0);
         assert!(report.starts_nothing());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_replacement_intent_is_consumed_by_the_ordinary_allocator() {
+        let policy = policy(1, "octo/repo", 1);
+        let previous = attempt_in(AttemptState::Starting, 41, 1);
+        let intent = ReplacementIntent {
+            policy: policy.id,
+            previous_attempt: previous.id,
+            operation: "exit_before_acceptance_replacement",
+        };
+        let launcher = Arc::new(FakeLauncher::new().seeded(vec![previous]).replacing(intent));
+        let demand = Arc::new(FakeDemand::ready(1, &repo("octo/repo")));
+        let mut harness = Harness::build(
+            host_with(1),
+            Arc::clone(&launcher),
+            demand,
+            Arc::new(InProcessAllocationLock::new()),
+        );
+
+        let report = harness.reconciler.reconcile(&[policy]).await;
+
+        assert_eq!(report.replacement_intents, 1);
+        assert_eq!(report.started, 1);
+        assert_eq!(launcher.launches(), 1);
+        assert_eq!(launcher.live_count(), 1);
     }
 
     #[tokio::test]

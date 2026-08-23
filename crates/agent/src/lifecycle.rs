@@ -38,7 +38,7 @@ use secrecy::SecretString;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    RunnerLauncher,
+    ReplacementIntent, RunnerLauncher,
 };
 
 const IDENTITY_FILE: &str = ".runner-process.json";
@@ -105,16 +105,6 @@ pub enum AttemptEvent {
         attempt: AttemptId,
         outcome: OutcomeKind,
     },
-}
-
-/// A request for e1 to run another ordinary allocation pass.  It is an intent,
-/// never permission to launch: e1 must poll demand again, acquire its opaque
-/// allocation guard, and recompute host and policy capacity before acting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReplacementIntent {
-    pub policy: PolicyId,
-    pub previous_attempt: AttemptId,
-    pub operation: &'static str,
 }
 
 pub trait AttemptEventSink: fmt::Debug + Send + Sync {
@@ -298,12 +288,32 @@ where
 pub trait RuntimePackages: fmt::Debug + Send + Sync {
     async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason>;
     fn release(&self, attempt: AttemptId) -> Result<(), FailureReason>;
-    fn prune_guarded(
+    fn prune_obsolete_guarded(
         &self,
-        guard: &AllocationGuard,
-        version: &RunnerVersion,
+        authority: PruneAuthority<'_>,
+        current: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason>;
+}
+
+/// Unforgeable evidence that pruning was reached through e1's launch request.
+/// The type is public only because it appears in the public adapter trait; its
+/// private field and constructor prevent callers from substituting a guard
+/// acquired from an unrelated lock.
+pub struct PruneAuthority<'a> {
+    _guard: &'a AllocationGuard,
+}
+
+impl fmt::Debug for PruneAuthority<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PruneAuthority")
+    }
+}
+
+impl<'a> PruneAuthority<'a> {
+    fn from_launch_request(guard: &'a AllocationGuard) -> Self {
+        Self { _guard: guard }
+    }
 }
 
 /// Production package adapter.  It takes an e2 lease before returning, so a
@@ -341,13 +351,21 @@ impl RuntimePackages for CachedRuntimePackages {
         self.cache.release(attempt).map_err(package_failure)
     }
 
-    fn prune_guarded(
+    fn prune_obsolete_guarded(
         &self,
-        _guard: &AllocationGuard,
-        version: &RunnerVersion,
+        _authority: PruneAuthority<'_>,
+        current: &RunnerVersion,
         attempts: &[RunnerAttempt],
     ) -> Result<(), FailureReason> {
-        self.cache.prune(version, attempts).map_err(package_failure)
+        for installed in self.cache.installed().map_err(package_failure)? {
+            if installed.version() != current {
+                match self.cache.prune(installed.version(), attempts) {
+                    Ok(()) | Err(PackageError::VersionInUse { .. }) => {}
+                    Err(error) => return Err(package_failure(error)),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -515,7 +533,7 @@ impl NativeProcesses {
             .is_ok();
         #[cfg(not(test))]
         let injected_stop_failure = false;
-        let reaped = !injected_stop_failure && child.stop(Duration::from_secs(1)).is_ok();
+        let mut reaped = !injected_stop_failure && child.stop(Duration::from_secs(1)).is_ok();
         if reaped {
             if remove_identity {
                 let _ = fs::remove_file(Self::identity_path(attempt));
@@ -523,15 +541,29 @@ impl NativeProcesses {
         } else {
             // A failed stop is not a failed attempt yet.  Persist enough truth
             // for crash recovery, and retain the owned child when possible.
-            if let Ok(identity) = serde_json::to_vec(child.identity()) {
-                let _ = write_durable_file(&Self::identity_path(attempt), &identity);
+            let identity_durable = serde_json::to_vec(child.identity())
+                .ok()
+                .is_some_and(|identity| self.persist_identity(attempt, &identity).is_ok());
+            if !identity_durable {
+                // Returning a live PID without its start token would make the
+                // next boot trust a recyclable PID. Once both durable identity
+                // and the first stop fail, fail closed by continuing to reap;
+                // there is no safe live-child result left to return.
+                while child.stop(Duration::from_secs(1)).is_err() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                reaped = true;
+                if remove_identity {
+                    let _ = fs::remove_file(Self::identity_path(attempt));
+                }
+            } else {
+                let pid = child.pid();
+                self.children
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(attempt.id, child);
+                return ProcessStartFailure::after_spawn_live(pid);
             }
-            let pid = child.pid();
-            self.children
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(attempt.id, child);
-            return ProcessStartFailure::after_spawn_live(pid);
         }
         #[cfg(test)]
         if reaped {
@@ -545,6 +577,14 @@ impl NativeProcesses {
 
     fn identity_path(attempt: &RunnerAttempt) -> PathBuf {
         attempt.runtime_path().join(IDENTITY_FILE)
+    }
+
+    fn persist_identity(&self, attempt: &RunnerAttempt, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::IdentityWrite) {
+            return Err(std::io::Error::other("injected identity write failure"));
+        }
+        write_durable_file(&Self::identity_path(attempt), bytes)
     }
 
     fn intent_path(attempt: &RunnerAttempt) -> PathBuf {
@@ -617,11 +657,7 @@ impl ProcessSupervisor for NativeProcesses {
                 return Err(self.abort_spawned_child(child, attempt, false));
             }
         };
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::IdentityWrite) {
-            return Err(self.abort_spawned_child(child, attempt, true));
-        }
-        if write_durable_file(&Self::identity_path(attempt), &identity).is_err() {
+        if self.persist_identity(attempt, &identity).is_err() {
             return Err(self.abort_spawned_child(child, attempt, true));
         }
         let pid = child.pid();
@@ -862,14 +898,13 @@ impl LifecycleLauncher {
             .recovery_complete
             .lock()
             .map_err(|_| LifecycleError::Journal)? = true;
-        Ok(std::mem::take(
-            &mut *self
-                .pending_replacements
-                .lock()
-                .map_err(|_| LifecycleError::Journal)?,
-        )
-        .into_values()
-        .collect())
+        Ok(self
+            .pending_replacements
+            .lock()
+            .map_err(|_| LifecycleError::Journal)?
+            .values()
+            .copied()
+            .collect())
     }
 
     /// Supervise all attempts of one policy during an ordinary poll.
@@ -877,12 +912,23 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
     ) -> Result<Vec<ReplacementIntent>, LifecycleError> {
+        let mut replacements = Vec::new();
+        self.pending_replacements
+            .lock()
+            .map_err(|_| LifecycleError::Journal)?
+            .retain(|_, intent| {
+                if intent.policy == policy.id {
+                    replacements.push(*intent);
+                    false
+                } else {
+                    true
+                }
+            });
         let attempts = self
             .ports
             .store
             .attempts_for_policy(policy.id)
             .map_err(|_| LifecycleError::Journal)?;
-        let mut replacements = Vec::new();
         for attempt in attempts {
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
             if let ReconcileProgress::Replacement { attempt, operation } =
@@ -1384,7 +1430,7 @@ impl LifecycleLauncher {
     /// The otherwise-unused argument is a compile-time witness of the ordering.
     fn prune_under_allocation_lock(
         &self,
-        _guard: &AllocationGuard,
+        guard: &AllocationGuard,
         version: &RunnerVersion,
     ) -> Result<(), LifecycleError> {
         let attempts = self
@@ -1394,13 +1440,26 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?;
         self.ports
             .packages
-            .prune_guarded(_guard, version, &attempts)
+            .prune_obsolete_guarded(
+                PruneAuthority::from_launch_request(guard),
+                version,
+                &attempts,
+            )
             .map_err(LifecycleError::Failed)
     }
 }
 
 #[async_trait]
 impl RunnerLauncher for LifecycleLauncher {
+    async fn supervise(
+        &self,
+        policy: &ScalePolicy,
+    ) -> Result<Vec<ReplacementIntent>, LaunchFailure> {
+        LifecycleLauncher::supervise(self, policy)
+            .await
+            .map_err(|error| LaunchFailure::new(error.reason()))
+    }
+
     async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
         self.ports.store.attempts().map_err(|_| {
             LaunchFailure::new(FailureReason::Other(
@@ -1617,6 +1676,7 @@ mod tests {
         materialization_failures: AtomicUsize,
         releases: AtomicUsize,
         prunes: AtomicUsize,
+        prune_currents: Mutex<Vec<RunnerVersion>>,
     }
 
     impl Default for FakePackages {
@@ -1628,6 +1688,7 @@ mod tests {
                 materialization_failures: AtomicUsize::new(0),
                 releases: AtomicUsize::new(0),
                 prunes: AtomicUsize::new(0),
+                prune_currents: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1668,13 +1729,14 @@ mod tests {
             Ok(())
         }
 
-        fn prune_guarded(
+        fn prune_obsolete_guarded(
             &self,
-            _guard: &AllocationGuard,
-            _version: &RunnerVersion,
+            _authority: PruneAuthority<'_>,
+            current: &RunnerVersion,
             _attempts: &[RunnerAttempt],
         ) -> Result<(), FailureReason> {
             self.prunes.fetch_add(1, Ordering::SeqCst);
+            self.prune_currents.lock().unwrap().push(current.clone());
             Ok(())
         }
     }
@@ -2712,6 +2774,17 @@ mod tests {
                 operation: "registration_timeout_replacement",
             }]
         );
+        let consumed = RunnerLauncher::supervise(&harness.launcher, &harness.policy)
+            .await
+            .unwrap();
+        assert_eq!(consumed, replacements);
+        assert!(
+            RunnerLauncher::supervise(&harness.launcher, &harness.policy)
+                .await
+                .unwrap()
+                .is_empty(),
+            "startup replacement evidence must be consumed exactly once by e1"
+        );
         assert!(matches!(
             harness.store.attempt(id).unwrap().unwrap().outcome(),
             Some(AttemptOutcome::Failed {
@@ -2886,6 +2959,34 @@ mod tests {
         }
         assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
 
+        let runtime = root.path().join("identity-and-stop-fail");
+        let bin = runtime.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        #[cfg(windows)]
+        let listener = bin.join("Runner.Listener.exe");
+        #[cfg(not(windows))]
+        let listener = bin.join("Runner.Listener");
+        fs::copy(std::env::current_exe().unwrap(), &listener).unwrap();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runtime,
+            FakeClock::default().now(),
+        );
+        // The first fault rejects the normal identity write; the second rejects
+        // the recovery write after the first stop also fails. The only safe
+        // outcome is a reaped child, never a live PID with no durable token.
+        processes.fail_post_spawn_at(PostSpawnBoundary::IdentityWrite);
+        processes.fail_post_spawn_at(PostSpawnBoundary::IdentityWrite);
+        processes.fail_next_post_spawn_stop();
+        let failure = processes
+            .spawn(&attempt, &EncodedJitConfig::new(JIT))
+            .expect_err("the identity boundary must fail closed");
+        assert!(failure.live_pid.is_none());
+        assert!(!processes.is_alive(&attempt).unwrap());
+        assert!(!NativeProcesses::identity_path(&attempt).exists());
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 5);
+
         let runtime = root.path().join("post-spawn-stop-failed");
         let bin = runtime.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -2917,7 +3018,7 @@ mod tests {
                 .pid(),
             live_pid
         );
-        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 4);
+        assert_eq!(processes.post_spawn_reaps.load(Ordering::SeqCst), 5);
         processes.terminate(&attempt).unwrap();
     }
 
@@ -2928,6 +3029,11 @@ mod tests {
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 0);
         harness.launch().await;
         assert_eq!(harness.packages.prunes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *harness.packages.prune_currents.lock().unwrap(),
+            vec![harness.packages.version.clone()],
+            "the leased current version is an exclusion, never the prune target"
+        );
     }
 
     fn assert_no_jit_file(runtime: &Path) {
