@@ -130,3 +130,79 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+  # ---------------------------------------------------------------------------
+  # The privileged installer smoke tests (d3).
+  # ---------------------------------------------------------------------------
+  # Separate from `check` because these register a REAL Windows service, start
+  # it, kill it, and remove it. They are `#[ignore]`d so that an ordinary
+  # `cargo test --workspace` — the step above, and every developer's laptop —
+  # never does any of that; this job is the one place that asks for them by
+  # name. `crates/platform/tests/privileged_tests_are_wired_into_ci.rs` asserts
+  # that this job still exists and still passes `--ignored`, because a gate that
+  # can be deleted without anything going red is not a gate.
+  #
+  # WINDOWS ONLY, AND THAT IS `d3`'s OWN SCOPE NOTE RATHER THAN AN OVERSIGHT:
+  # "All three installers are written here, in Wave 2, because gate 3 requires
+  # verified boot-start recovery on Windows. macOS and Linux installation and
+  # reboot recovery are validated in Wave 3 against this same implementation."
+  # The launchd and systemd backends are compiled and their definitions are
+  # asserted line by line on all three legs by the unit tests in `service.rs`;
+  # what no leg has yet done is run `launchctl bootstrap` or `systemctl enable`
+  # for real. Wave 3 adds those two legs here, against the same library API.
+  #
+  # There is no `continue-on-error` here on purpose. If the runner cannot create
+  # a service, the tests fail with the remedy rather than passing quietly: a
+  # privileged smoke test that skipped when it could not get privileges would
+  # report success for having verified nothing.
+  service-install:
+    name: privileged installer smoke tests (windows-x86_64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      - name: Cache the cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      # `--test-threads=1` because these contend for one machine's service
+      # database, and because the restart measurement times an interval that a
+      # loaded machine would stretch.
+      - name: cargo test --test privileged_service_installer -- --ignored
+        run: |
+          cargo test -p runner-manager-platform \
+            --test privileged_service_installer -- --ignored --test-threads=1 --nocapture
+
+      # A leaked privileged service is the worst outcome available to this job,
+      # so the claim that nothing leaks is checked rather than trusted — and it
+      # is checked even when the step above failed, which is exactly when a
+      # fixture would have been left behind.
+      - name: Assert no self-test fixture was left on the runner
+        if: always()
+        shell: pwsh
+        run: |
+          $services = Get-Service -Name '*selftest*' -ErrorAction SilentlyContinue
+          $tasks = & schtasks.exe /Query /FO CSV /NH 2>$null |
+            Select-String 'runner-manager-selftest'
+          if ($services -or $tasks) {
+            Write-Error "a self-test fixture survived: $($services.Name) $tasks"
+            exit 1
+          }
+          Write-Output 'no self-test fixture remains'
+

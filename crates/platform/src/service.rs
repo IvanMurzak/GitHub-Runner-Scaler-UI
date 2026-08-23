@@ -6523,4 +6523,62 @@ mod tests {
             "{error}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // The seam with `d2`
+    // -----------------------------------------------------------------------
+
+    /// Requirement 2 is *"an account that can **read the secret store**"*, and
+    /// on Windows what an account may read is decided by a DACL in a file this
+    /// task does not own. Asserting the account name alone would be asserting
+    /// this module against itself; this reads `d2`'s protection back off a real
+    /// store and checks that it admits the account this installer registers.
+    ///
+    /// No privileges are needed. `d2` documents that a rooted machine-scoped
+    /// store *"is protected and encrypted exactly as the standard one is"* —
+    /// the Windows backend picks its DACL from the scope, not from the site —
+    /// so a store in a temporary directory carries the access control the real
+    /// one does.
+    #[cfg(windows)]
+    #[test]
+    fn the_account_this_installer_registers_is_one_the_stores_own_dacl_admits() {
+        use crate::secrets::{PlatformSecretStore, SecretScope, SecretStore as _};
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted machine-scoped store");
+        store
+            .store(&secrecy::SecretString::from("a stand-in for the token"))
+            .expect("the store accepts a value");
+        let protection = store.protection().expect("the DACL can be read back");
+
+        assert!(
+            protection.description().contains(";;;SY)"),
+            "the machine-scoped store must admit LocalSystem, or a boot-start service cannot \
+             read the token. `d2` writes this DACL and it is not this task's to widen. Got: {}",
+            protection.description()
+        );
+        assert_eq!(
+            ServiceAccount::for_definition(DefinitionKind::WindowsService, StartMode::Boot),
+            ServiceAccount::LocalSystem,
+            "and that is the account this installer registers, which is why SY is what matters"
+        );
+        assert!(
+            !protection.readable_by_other_local_users(),
+            "the same DACL must still exclude ordinary local users: {}",
+            protection.description()
+        );
+
+        // The other half of the analysis in `docs/service-account.md`, and the
+        // reason LocalService and NetworkService are not used: the DACL names
+        // three trustees and neither of them is among them.
+        for rejected in [";;;LS)", ";;;NS)"] {
+            assert!(
+                !protection.description().contains(rejected),
+                "if the store ever admitted {rejected}, the least-privilege analysis in \
+                 docs/service-account.md would need redoing: {}",
+                protection.description()
+            );
+        }
+    }
 }
