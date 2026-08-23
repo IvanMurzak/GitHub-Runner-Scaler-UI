@@ -2,11 +2,13 @@
 
 //! The foreground agent and its graceful drain boundary.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use runner_manager_agent::lifecycle::{
@@ -112,7 +114,6 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         Arc::new(runner_manager_agent::reconcile::EventLog::new()),
     ));
     let shared_lock = Arc::new(FileAllocationLock::new(paths));
-    let recovery_policies: Vec<_> = targets.iter().flatten().cloned().collect();
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -131,6 +132,10 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
                 clock: Arc::clone(&clock),
             },
         ));
+        let lifecycle_store = Arc::new(TargetRecoveryStore::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            &policies,
+        ));
         let launcher = Arc::new(LifecycleLauncher::new(
             host.id,
             context.paths().runtime_dir(),
@@ -139,7 +144,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
             runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
             RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
             LifecyclePorts {
-                store: Arc::clone(&store) as Arc<dyn Store>,
+                store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
                 github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
                 packages: Arc::new(CachedRuntimePackages::new(cache)),
                 processes: Arc::new(NativeProcesses::new()),
@@ -151,10 +156,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
             },
         ));
         launcher
-            // Startup recovery is journal-wide. Each target owns its launcher
-            // for package acquisition, but unknown live policies make recovery
-            // fail closed, so every launcher proves the same active policy set.
-            .recover_startup(&recovery_policies)
+            .recover_startup(&policies)
             .await
             .map_err(|source| {
                 CliError::new(
@@ -165,6 +167,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
                     ),
                 )
             })?;
+        lifecycle_store.finish_recovery();
         let cancel = CancelToken::new();
         let demand = Arc::new(GatewayDemand::new(
             RestDemand::new(Arc::clone(&client), Arc::clone(&clock)),
@@ -234,6 +237,135 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(())
+}
+
+/// Gives one lifecycle launcher a target-scoped journal only while it performs
+/// startup recovery. Ordinary reconciliation sees the complete host attempt
+/// set again, which preserves the host-wide capacity invariant.
+#[derive(Debug)]
+struct TargetRecoveryStore {
+    inner: Arc<dyn Store>,
+    policies: BTreeSet<runner_manager_domain::model::PolicyId>,
+    recovering: AtomicBool,
+}
+
+impl TargetRecoveryStore {
+    fn new(inner: Arc<dyn Store>, policies: &[ScalePolicy]) -> Self {
+        Self {
+            inner,
+            policies: policies.iter().map(|policy| policy.id).collect(),
+            recovering: AtomicBool::new(true),
+        }
+    }
+
+    fn finish_recovery(&self) {
+        self.recovering.store(false, Ordering::Release);
+    }
+}
+
+impl Store for TargetRecoveryStore {
+    fn put_host(
+        &self,
+        host: &runner_manager_domain::model::Host,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.put_host(host)
+    }
+
+    fn host(
+        &self,
+        id: runner_manager_domain::model::HostId,
+    ) -> Result<Option<runner_manager_domain::model::Host>, runner_manager_domain::store::StoreError>
+    {
+        self.inner.host(id)
+    }
+
+    fn hosts(
+        &self,
+    ) -> Result<Vec<runner_manager_domain::model::Host>, runner_manager_domain::store::StoreError>
+    {
+        self.inner.hosts()
+    }
+
+    fn insert_policy(
+        &self,
+        policy: &ScalePolicy,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.insert_policy(policy)
+    }
+
+    fn update_policy(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.update_policy(policy, expected_revision)
+    }
+
+    fn remove_policy(
+        &self,
+        id: runner_manager_domain::model::PolicyId,
+        expected_revision: u64,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.remove_policy(id, expected_revision)
+    }
+
+    fn policy(
+        &self,
+        id: runner_manager_domain::model::PolicyId,
+    ) -> Result<Option<ScalePolicy>, runner_manager_domain::store::StoreError> {
+        self.inner.policy(id)
+    }
+
+    fn policies(&self) -> Result<Vec<ScalePolicy>, runner_manager_domain::store::StoreError> {
+        self.inner.policies()
+    }
+
+    fn record_attempt(
+        &self,
+        attempt: &runner_manager_domain::attempt::RunnerAttempt,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.record_attempt(attempt)
+    }
+
+    fn attempt(
+        &self,
+        id: AttemptId,
+    ) -> Result<
+        Option<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.attempt(id)
+    }
+
+    fn attempts(
+        &self,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        let mut attempts = self.inner.attempts()?;
+        if self.recovering.load(Ordering::Acquire) {
+            attempts.retain(|attempt| self.policies.contains(&attempt.policy_id));
+        }
+        Ok(attempts)
+    }
+
+    fn attempts_for_policy(
+        &self,
+        policy_id: runner_manager_domain::model::PolicyId,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.attempts_for_policy(policy_id)
+    }
+
+    fn remove_attempt(
+        &self,
+        id: AttemptId,
+    ) -> Result<bool, runner_manager_domain::store::StoreError> {
+        self.inner.remove_attempt(id)
+    }
 }
 
 fn active_autoscale_targets(mut policies: Vec<ScalePolicy>) -> Vec<Vec<ScalePolicy>> {
@@ -522,8 +654,95 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use runner_manager_agent::lifecycle::{JitRequestFailure, PruneAuthority, RuntimePackages};
+    use runner_manager_agent::package::RunnerVersion;
+    use runner_manager_domain::attempt::RunnerAttempt;
+    use runner_manager_domain::model::PolicyId;
+    use runner_manager_domain::store::SqliteStore;
+    use runner_manager_github::jit::JitRegistration;
     use runner_manager_github::rest::RefreshState;
+    use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    #[derive(Debug)]
+    struct RecoveryGithub {
+        expected: ScaleTarget,
+    }
+
+    impl LifecycleGithub for RecoveryGithub {
+        fn register<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+            &'life0 self,
+            _target: &'life1 ScaleTarget,
+            _request: &'life2 JitRunnerRequest,
+            _cancel: &'life3 CancelToken,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<JitRegistration, JitRequestFailure>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            'life3: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { panic!("startup recovery must not register a runner") })
+        }
+
+        fn observe<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            target: &'life1 ScaleTarget,
+            _attempt: AttemptId,
+            _cancel: &'life2 CancelToken,
+        ) -> Pin<Box<dyn Future<Output = LifecycleGithubObservation> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            assert_eq!(
+                target, &self.expected,
+                "a target launcher observed another target's startup attempt"
+            );
+            Box::pin(std::future::ready(LifecycleGithubObservation::registered(
+                73, false,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnusedPackages;
+
+    impl RuntimePackages for UnusedPackages {
+        fn materialize<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _attempt: &'life1 RunnerAttempt,
+        ) -> Pin<Box<dyn Future<Output = Result<RunnerVersion, FailureReason>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { panic!("startup recovery must not materialize a package") })
+        }
+
+        fn release(&self, _attempt: AttemptId) -> Result<(), FailureReason> {
+            Ok(())
+        }
+
+        fn prune_obsolete_guarded(
+            &self,
+            _authority: PruneAuthority<'_>,
+            _current: &RunnerVersion,
+            _attempts: &[RunnerAttempt],
+        ) -> Result<(), FailureReason> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct FakeTarget {
@@ -674,6 +893,97 @@ mod tests {
                 .flatten()
                 .all(ScalePolicy::may_start_runners)
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_keeps_each_targets_replacement_intent_in_its_launcher() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let policy_a = fixtures::policy()
+            .id(PolicyId::from_u128(1))
+            .repository("acme/alpha")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let policy_b = fixtures::policy()
+            .id(PolicyId::from_u128(2))
+            .repository("acme/beta")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        store.insert_policy(&policy_a).unwrap();
+        store.insert_policy(&policy_b).unwrap();
+
+        let attempt_for = |id: u128, policy: &ScalePolicy, directory: &str| {
+            let runtime = temporary.path().join(directory);
+            std::fs::create_dir_all(&runtime).unwrap();
+            fixtures::attempt()
+                .id(AttemptId::from_u128(id))
+                .policy_id(policy.id)
+                .runtime_path(runtime.to_string_lossy())
+                .build()
+        };
+        let attempt_a = attempt_for(11, &policy_a, "alpha");
+        let attempt_b = attempt_for(22, &policy_b, "beta");
+        store.record_attempt(&attempt_a).unwrap();
+        store.record_attempt(&attempt_b).unwrap();
+
+        let build_launcher = |policy: &ScalePolicy| {
+            let scoped = Arc::new(TargetRecoveryStore::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                std::slice::from_ref(policy),
+            ));
+            let launcher = LifecycleLauncher::new(
+                policy.to_persisted().host_id,
+                temporary.path().join("runtime"),
+                temporary.path().join("logs"),
+                1,
+                runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
+                RetryPolicy::bounded(1, Duration::from_millis(1), Duration::from_millis(1)),
+                LifecyclePorts {
+                    store: Arc::clone(&scoped) as Arc<dyn Store>,
+                    github: Arc::new(RecoveryGithub {
+                        expected: policy.target.clone(),
+                    }),
+                    packages: Arc::new(UnusedPackages),
+                    processes: Arc::new(NativeProcesses::new()),
+                    clock: Arc::new(FakeClock::default()),
+                    demand: Arc::new(PersistentDemand),
+                    delay: Arc::new(TokioRetryDelay),
+                    events: Arc::new(NoAttemptEvents),
+                    reconcile_events: Arc::new(runner_manager_agent::reconcile::EventLog::new()),
+                },
+            );
+            (launcher, scoped)
+        };
+        let (launcher_a, scoped_a) = build_launcher(&policy_a);
+        let (launcher_b, scoped_b) = build_launcher(&policy_b);
+
+        let placed_a = launcher_a
+            .recover_startup(std::slice::from_ref(&policy_a))
+            .await
+            .unwrap();
+        scoped_a.finish_recovery();
+        let placed_b = launcher_b
+            .recover_startup(std::slice::from_ref(&policy_b))
+            .await
+            .unwrap();
+        scoped_b.finish_recovery();
+        assert_eq!(placed_a.len(), 1);
+        assert_eq!(placed_a[0].policy, policy_a.id);
+        assert_eq!(placed_a[0].previous_attempt, attempt_a.id);
+        assert_eq!(placed_b.len(), 1);
+        assert_eq!(placed_b[0].policy, policy_b.id);
+        assert_eq!(placed_b[0].previous_attempt, attempt_b.id);
+
+        let consumed_a = launcher_a.supervise(&policy_a).await.unwrap();
+        let consumed_b = launcher_b.supervise(&policy_b).await.unwrap();
+        assert_eq!(consumed_a, placed_a);
+        assert_eq!(consumed_b, placed_b);
+        assert!(launcher_a.supervise(&policy_a).await.unwrap().is_empty());
+        assert!(launcher_b.supervise(&policy_b).await.unwrap().is_empty());
+        assert_eq!(scoped_a.attempts().unwrap().len(), 2);
+        assert_eq!(scoped_b.attempts().unwrap().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
