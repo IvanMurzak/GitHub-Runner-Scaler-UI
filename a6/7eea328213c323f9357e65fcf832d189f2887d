@@ -1,0 +1,58 @@
+crates/github/src/demand.rs
+  s_d14c0886a58be6::t_725fc61b34d630 1191-1194,1228,1233,1239-1241,1243-1245,1249-1250,1253-1256
+crates/github/src/rest.rs
+  s_d14c0886a58be6::t_0e2e12ac876539 145,151-174,183,1413-1417,1491,4502,4505,4510,4527,4534,4539-4540,4542,4544-4545,4569-4570,4581-4582,4595,4606,4608,4611,4633-4634,4673-4679,4713,4720-4721,4726,4729,4741,4744-4745
+crates/app/tests/policy_commands.rs
+  s_d14c0886a58be6::t_7ed4d1cc43ff9b 6,144-147,168-173,182-192
+  s_d14c0886a58be6::t_7f90e8f4c0f02d 10,78,96-103,116,122,128-143,148-149,198,204-209
+  s_d14c0886a58be6::t_bae53530308597 45-48,52-54,58-63,104-111
+  s_d14c0886a58be6::t_11913703fd0cb9 1-5,7-9,11-44,49-51,55-57,64-77,79-95,112-115,117-121,123-127,150-167,174-181,193-197,199-203,210-236
+crates/app/src/cli/mod.rs
+  s_d14c0886a58be6::t_130553ef0045d3 526,575,1231
+  s_d14c0886a58be6::t_45c034afca44ec 1209-1230
+crates/domain/src/store/migrations/0002_policy_host_label.sql
+  s_d14c0886a58be6::t_c201af86f2f664 1-4
+crates/github/tests/fake_inventory_gateway.rs
+  s_d14c0886a58be6::t_725fc61b34d630 292,295-296,300
+crates/domain/src/store.rs
+  s_d14c0886a58be6::t_c201af86f2f664 76,272-283,290,883,887,951,1132-1135,1274-1278
+  s_d14c0886a58be6::t_b6f459bd7a7ded 75
+crates/app/src/cli/policy.rs
+  s_d14c0886a58be6::t_636d232c303f2b 740,756-782,784-824,829-832
+  s_d14c0886a58be6::t_411ee632875532 127,140,154-180,187,235
+  s_d14c0886a58be6::t_46a4c0d70018ea 340-348
+  s_d14c0886a58be6::t_f3a39786d1e377 234,239
+  s_d14c0886a58be6::t_7b9e35477f5acf 128,131,136,671,674,724,837,861-863,867,869,910
+  s_d14c0886a58be6::t_3ac78e0a50dc30 714,783,825-828
+  s_d14c0886a58be6::t_c5b37b2eaca75e 378
+  s_d14c0886a58be6::t_1c493ed1528ddd 662,666,713,719,873,876,900,905
+  s_d14c0886a58be6::t_554b74f6c3ff8f 833
+crates/domain/src/policy.rs
+  s_d14c0886a58be6::t_c201af86f2f664 945-946,986,1039,1048,1070,1086,1107
+  s_d14c0886a58be6::t_f3a39786d1e377 1020-1038,1041
+  s_d14c0886a58be6::t_b7cb6d98d64fe5 1040
+crates/app/src/cli/host.rs
+  s_d14c0886a58be6::t_a0024d037cf5ef 114,156,162
+  s_d14c0886a58be6::t_3ac78e0a50dc30 66-67,99,285-290,297-301,305,309,313,317,659-660,664-665,670,679,692-693
+  s_d14c0886a58be6::t_46a4c0d70018ea 64,68
+  s_d14c0886a58be6::t_c78c7fc60a65fe 619,654,675-676,681,761-762,813-814
+crates/app/tests/host_capacity_and_status.rs
+  s_d14c0886a58be6::t_c78c7fc60a65fe 255,264,279
+  s_d14c0886a58be6::t_1995a77b762505 240,251-252,256-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a67eea328213c323f9357e65fcf832d189f2887d",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
