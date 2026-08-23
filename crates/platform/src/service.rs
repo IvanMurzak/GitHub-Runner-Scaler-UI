@@ -1186,6 +1186,29 @@ impl ServiceDefinition {
         self.install_path.as_deref()
     }
 
+    /// The definition this host's own service manager would be given.
+    ///
+    /// The value-level twin of [`host_definition_kind`]. Rendering needs no
+    /// privileges and no service manager, so anything that wants to *see* what
+    /// an install would register — `f3`'s `service install --dry-run`, a
+    /// support bundle, [`RecordingControls`] — can have it without registering
+    /// anything.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Control`] when a Windows logon-triggered registration is
+    /// asked for and the session reports no account to register it for.
+    pub fn for_host(plan: &InstallPlan) -> Result<Self, ServiceError> {
+        Ok(match host_definition_kind(plan.start_mode()) {
+            DefinitionKind::WindowsService => Self::windows_service(plan),
+            DefinitionKind::WindowsScheduledTask => {
+                Self::windows_scheduled_task(plan, &TaskPrincipal::current()?)
+            }
+            DefinitionKind::LaunchdPlist => Self::launchd(plan, host_home().as_deref()),
+            DefinitionKind::SystemdUnit => Self::systemd(plan, host_home().as_deref()),
+        })
+    }
+
     /// The Windows service parameters, as a canonical descriptor.
     #[must_use]
     pub fn windows_service(plan: &InstallPlan) -> Self {
@@ -1972,8 +1995,12 @@ fn permitted_paths(plan: &InstallPlan) -> Vec<String> {
         .collect()
 }
 
-/// Whether two path spellings name the same place, as far as a text review can
-/// tell. Case-insensitive on Windows, exact elsewhere.
+/// Whether two path spellings name the same place on **this host's**
+/// filesystem. Case-insensitive on Windows, exact elsewhere.
+///
+/// For a rendered definition use [`same_path_for`] instead: which comparison is
+/// right there follows the platform the definition is *for*, and every leg of
+/// the CI matrix reviews all four.
 fn same_path_text(left: &str, right: &str) -> bool {
     if cfg!(windows) {
         left.eq_ignore_ascii_case(right)
@@ -1982,8 +2009,20 @@ fn same_path_text(left: &str, right: &str) -> bool {
     }
 }
 
+/// Whether two path spellings name the same place on the platform a given
+/// definition targets.
+fn same_path_for(kind: DefinitionKind, left: &str, right: &str) -> bool {
+    match kind {
+        DefinitionKind::WindowsService | DefinitionKind::WindowsScheduledTask => {
+            left.eq_ignore_ascii_case(right)
+        }
+        DefinitionKind::LaunchdPlist | DefinitionKind::SystemdUnit => left == right,
+    }
+}
+
 /// Checks a `ReadWritePaths`-style list against the four permitted directories.
 fn review_writable_paths(
+    kind: DefinitionKind,
     subject: &str,
     listed: &[String],
     plan: &InstallPlan,
@@ -1994,7 +2033,7 @@ fn review_writable_paths(
     for entry in listed {
         if !permitted
             .iter()
-            .any(|allowed| same_path_text(allowed, entry))
+            .any(|allowed| same_path_for(kind, allowed, entry))
         {
             findings.push(PrivilegeFinding {
                 kind: FindingKind::Excess,
@@ -2007,7 +2046,10 @@ fn review_writable_paths(
         }
     }
     for allowed in &permitted {
-        if !listed.iter().any(|entry| same_path_text(allowed, entry)) {
+        if !listed
+            .iter()
+            .any(|entry| same_path_for(kind, allowed, entry))
+        {
             findings.push(PrivilegeFinding {
                 kind: FindingKind::Shortfall,
                 subject: subject.to_string(),
@@ -2090,7 +2132,14 @@ fn review_systemd(
     match directives.get("ReadWritePaths") {
         Some(value) => {
             let listed = split_quoted(value);
-            review_writable_paths("ReadWritePaths", &listed, plan, controls, findings);
+            review_writable_paths(
+                DefinitionKind::SystemdUnit,
+                "ReadWritePaths",
+                &listed,
+                plan,
+                controls,
+                findings,
+            );
         }
         None => findings.push(PrivilegeFinding {
             kind: FindingKind::Shortfall,
@@ -2328,7 +2377,14 @@ fn review_windows_service(
     match directives.get("ReadWritePaths") {
         Some(value) => {
             let listed = split_quoted(value);
-            review_writable_paths("ReadWritePaths", &listed, plan, controls, findings);
+            review_writable_paths(
+                DefinitionKind::WindowsService,
+                "ReadWritePaths",
+                &listed,
+                plan,
+                controls,
+                findings,
+            );
         }
         None => findings.push(PrivilegeFinding {
             kind: FindingKind::Shortfall,
@@ -3828,10 +3884,11 @@ impl ServiceControl for RecordingControl {
 
     fn install(&self, plan: &InstallPlan) -> Result<ServiceDefinition, ServiceError> {
         self.note("install", plan.identity().name());
-        let definition = ServiceDefinition::from_text(
-            self.manager(),
-            format!("[recorded]\nCommandLine={}\n", plan.command_line()),
-        );
+        // The real definition, not a stub. Rendering is pure, so the double can
+        // afford it -- and a stub would make `Installed::review` report that the
+        // definition confirms nothing, which is exactly the shape of false
+        // assurance a test double must never hand back.
+        let definition = ServiceDefinition::for_host(plan)?;
         let mut state = self.state.lock().expect("not poisoned");
         state.registrations.insert(
             (self.mode, plan.identity().name().to_string()),
@@ -3918,9 +3975,14 @@ impl ControlFactory for HostControls {
 /// unit both live under it — and it is resolved lazily so that a boot-mode
 /// operation on an account with no profile is not refused for wanting something
 /// it never uses.
+fn host_home() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+
+/// The Unix backends' name for the same thing.
 #[cfg(unix)]
 fn home_directory() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+    host_home()
 }
 
 /// Runs a command and returns its exit status with both streams as text.
@@ -5131,8 +5193,11 @@ mod tests {
     #[test]
     fn xml_escaping_round_trips_the_characters_a_path_or_an_account_may_hold() {
         let awkward = r#"DOMAIN\R&D <team> "ops""#;
+        assert_eq!(
+            xml_escape(awkward),
+            "DOMAIN\\R&amp;D &lt;team&gt; &quot;ops&quot;"
+        );
         assert_eq!(xml_unescape(&xml_escape(awkward)), awkward);
-        assert!(!xml_escape(awkward).contains('&') || xml_escape(awkward).contains("&amp;"));
     }
 
     // -----------------------------------------------------------------------
@@ -5257,9 +5322,6 @@ mod tests {
                 .expect("the unit names its writable paths"),
         );
         assert_eq!(listed.len(), 4, "{listed:?}");
-        for (_, path) in plan.directories().all().iter().zip(0..) {
-            let _ = path;
-        }
         for path in plan.directories().all() {
             assert!(
                 listed.iter().any(|entry| entry == &path.to_string_lossy()),
@@ -6104,9 +6166,20 @@ mod tests {
             .operations()
             .install(&host.request(StartMode::Boot))
             .expect("an install");
+        assert!(
+            installed.review.is_least_privilege(),
+            "{}",
+            installed.review
+        );
+        assert!(
+            !installed.review.controls().is_empty(),
+            "a review that confirms nothing proves nothing: {}",
+            installed.review
+        );
         assert_eq!(
-            installed.review.account(),
-            &ServiceAccount::for_start_mode(StartMode::Boot)
+            installed.review.kind(),
+            host_definition_kind(StartMode::Boot),
+            "the review must be of the definition this host's manager was given"
         );
         assert!(
             !installed.review.account().justification().is_empty(),
