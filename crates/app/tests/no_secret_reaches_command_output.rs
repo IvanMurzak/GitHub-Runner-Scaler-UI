@@ -93,16 +93,16 @@ const COMMANDS: &[&[&str]] = &[
     &[
         "repo",
         "add",
-        "owner/repo",
+        "acme/repo",
         "--host-label",
         "home-win",
         "--max-capacity",
         "1",
     ],
     &["repo", "list"],
-    &["repo", "set-capacity", "owner/repo", "--max-capacity", "2"],
-    &["repo", "set-scale", "owner/repo", "--enabled", "true"],
-    &["repo", "remove", "owner/repo"],
+    &["repo", "set-capacity", "acme/repo", "--max-capacity", "2"],
+    &["repo", "set-scale", "acme/repo", "--enabled", "true"],
+    &["repo", "remove", "acme/repo"],
     &[
         "org",
         "add",
@@ -168,17 +168,11 @@ fn corpus_from_the_full_command_set(verbose: bool) -> (tempfile::TempDir, Vec<Fr
     let github = FakeGithub::start();
     github.with_device_code();
     github.with_approval();
-    github.with_installation(
-        11,
-        "operator",
-        "User",
-        "selected",
-        &["operator/one", "operator/two"],
-    );
+    github.with_installation(11, "acme", "Organization", "selected", &["acme/repo"]);
 
     let mut corpus = Vec::new();
 
-    let mut record = |name: String, arguments: &[&str]| {
+    let mut record = |name: String, arguments: &[&str], expected_code: i32| {
         let outcome = run({
             let mut command = runner_manager_against(data_dir.path(), &github);
             if verbose {
@@ -187,6 +181,12 @@ fn corpus_from_the_full_command_set(verbose: bool) -> (tempfile::TempDir, Vec<Fr
             command.args(arguments);
             command
         });
+        assert_eq!(
+            outcome.code,
+            expected_code,
+            "`{name}` did not exercise its intended path:\n{}",
+            outcome.both()
+        );
         corpus.push(Fragment {
             origin: format!("`{name}` stdout"),
             text: outcome.stdout,
@@ -197,11 +197,16 @@ fn corpus_from_the_full_command_set(verbose: bool) -> (tempfile::TempDir, Vec<Fr
         });
     };
 
-    record("auth login".to_string(), &["auth", "login"]);
+    record("auth login".to_string(), &["auth", "login"], 0);
     for arguments in COMMANDS {
-        record(arguments.join(" "), arguments);
+        let expected_code = match arguments[0] {
+            "daemon" | "service" => 17,
+            "tui" => 1,
+            _ => 0,
+        };
+        record(arguments.join(" "), arguments, expected_code);
     }
-    record("auth logout".to_string(), &["auth", "logout"]);
+    record("auth logout".to_string(), &["auth", "logout"], 0);
 
     // Everything the commands left on disk, except the store itself.
     //
@@ -356,11 +361,17 @@ fn the_scanned_corpus_contains_what_it_should_contain() {
         everything.contains("\"schema_version\""),
         "`status --json` must be in the corpus"
     );
-    assert!(
-        everything.contains("task f2") && everything.contains("task f3"),
-        "the declared-but-unimplemented commands must have been run too: the gate is over \
-         the FULL command set, and a command nobody ran cannot leak in a test"
-    );
+    for arguments in COMMANDS {
+        let command = arguments.join(" ");
+        for stream in ["stdout", "stderr"] {
+            let origin = format!("`{command}` {stream}");
+            assert!(
+                corpus.iter().any(|fragment| fragment.origin == origin),
+                "{origin} must be in the scanned corpus: the gate is over the FULL command \
+                 set, and a command nobody ran cannot leak in a test"
+            );
+        }
+    }
 
     // The diagnostics file exists and was written to, so "no secret in the
     // logs" is a statement about logs that exist.
