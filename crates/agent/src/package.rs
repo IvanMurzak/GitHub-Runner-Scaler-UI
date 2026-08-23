@@ -1664,15 +1664,8 @@ impl PackageCache {
             // written non-atomically, so a crash mid-write leaves exactly this
             // shape, and the consequence is deleting the package a live runner
             // is executing from.
-            let unreadable = || PackageError::UnreadableLease { path: path.clone() };
-            let uuid = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
-                .ok_or_else(unreadable)?;
-            let lease = read_lease(&path)?.ok_or_else(unreadable)?;
-            if lease.version == *version {
-                holders.push(AttemptId::from_uuid(uuid));
+            if let Some(holder) = holder_of(&path, version)? {
+                holders.push(holder);
             }
         }
         holders.sort_unstable();
@@ -1716,18 +1709,29 @@ impl PackageCache {
     /// [`Self::holders`] and *before* it removes the directory, leaving a live
     /// attempt holding a package that is gone. Nothing here detects that.
     ///
-    /// It is not closed with a lock of this module's own, because a second lock
-    /// beside `e1`'s host allocation lock is a second ordering to get wrong.
-    /// **The caller must prune under the same host-wide allocation lock it
-    /// launches under** — that lock already serialises the launch that takes a
-    /// lease, so holding it here makes the read-then-remove indivisible with
-    /// respect to every lease this agent creates. It does not protect against a
-    /// second agent on the same machine, which the single-instance lock is
-    /// there to prevent.
+    /// **What makes it safe is `e1`'s host allocation lock, and nothing this
+    /// module could add.** A `Mutex` of its own would not help, and saying it
+    /// was declined merely to avoid "a second ordering to get wrong" overstated
+    /// the alternative: a leaf mutex taken and released inside two synchronous
+    /// `&self` methods cannot span the caller's decide-then-launch sequence, so
+    /// it could not order a lease against a prune even in principle. The window
+    /// is between *callers*, and only a lock the caller already holds across
+    /// both can close it.
     ///
-    /// Stated rather than silently assumed: an unstated locking requirement is
-    /// exactly the shape of defect `e1` reported when a caller was left to
-    /// supply an attempt set separately from the thing that created it.
+    /// So the requirement is on the caller: **prune under the same host-wide
+    /// allocation lock a launch is taken under.** That lock already serialises
+    /// the launch that takes a lease, which makes this method's
+    /// read-then-remove indivisible with respect to every lease this agent
+    /// creates. It says nothing about a second agent on the same machine; the
+    /// single-instance lock is what prevents that.
+    ///
+    /// Stated rather than silently assumed, and stated here rather than
+    /// enforced, which is a weaker position than this module takes at
+    /// [`Self::lease`] — where the note argues that a documented invariant with
+    /// no enforcement is how a property silently stops holding. The difference
+    /// is that `lease` can check its invariant from inside a single call and
+    /// this one cannot: the lock that would close this window is not this
+    /// module's to take.
     ///
     /// # Errors
     /// [`PackageError::VersionInUse`],
@@ -1895,10 +1899,15 @@ fn extract_zip(archive: &Path, into: &Path) -> Result<(), PackageError> {
             .ok_or_else(|| PackageError::UnsafeArchiveEntry {
                 entry: raw_name.clone(),
             })?;
-        let destination = resolve_inside(into, &relative, &raw_name)?;
+        let Some(destination) = entry_destination(into, &relative, &raw_name)? else {
+            continue;
+        };
 
         if entry.is_dir() {
             create_dir_all(&destination)?;
+            // The zip path used to `continue` here and never reach the policy,
+            // so a directory published world-writable or setgid kept it.
+            apply_mode_policy(&destination, intended_mode(true, entry.unix_mode()))?;
             continue;
         }
         if entry.is_symlink() {
@@ -1920,7 +1929,7 @@ fn extract_zip(archive: &Path, into: &Path) -> Result<(), PackageError> {
             path: destination.clone(),
             source,
         })?;
-        apply_mode_policy(&destination, entry.unix_mode())?;
+        apply_mode_policy(&destination, intended_mode(false, entry.unix_mode()))?;
     }
     Ok(())
 }
@@ -1966,7 +1975,11 @@ fn extract_tar_gz(archive: &Path, into: &Path) -> Result<(), PackageError> {
         // This module's own containment check, before `tar`'s. Its result is
         // load-bearing rather than discarded: `destination` is what the mode
         // policy is applied to below, so removing this call does not compile.
-        let destination = resolve_inside(into, &relative, &display)?;
+        let Some(destination) = entry_destination(into, &relative, &display)? else {
+            // `.` or `./`, the archive's own root. Skipped before `unpack_in`,
+            // which would otherwise set the extraction root's mode itself.
+            continue;
+        };
 
         // A link's *target* is a second path, and `tar` does not check it
         // against the extraction root. An unvalidated one is the classic
@@ -2012,7 +2025,8 @@ fn extract_tar_gz(archive: &Path, into: &Path) -> Result<(), PackageError> {
         // Links are skipped: a symlink's own mode is meaningless, and
         // `set_permissions` follows the link and would change the target's.
         if !matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
-            apply_mode_policy(&destination, Some(mode))?;
+            let is_directory = matches!(kind, tar::EntryType::Directory);
+            apply_mode_policy(&destination, intended_mode(is_directory, Some(mode)))?;
         }
     }
     Ok(())
@@ -2061,6 +2075,55 @@ fn resolve_link_target(
         return Err(unsafe_entry());
     }
     Ok(())
+}
+
+/// Where one archive entry lands, or `None` when it names the extraction root.
+///
+/// # Why a root entry is skipped rather than refused
+///
+/// An entry called `.` or `./` resolves to the extraction directory itself.
+/// Left alone that hands the archive control over the mode of a directory this
+/// module created and owns — [`apply_mode_policy`] would chmod the root, and
+/// `tar`'s own unpack would too. Not an escape, since the policy fails closed,
+/// but not the archive's decision to make either.
+///
+/// Refusing it was the obvious fix and is the wrong one: `tar -C dir -czf
+/// out.tgz .` emits exactly this entry for the archive's own root, so a refusal
+/// would reject a perfectly ordinary package. The root already exists — it is
+/// created at the top of [`extract`] — so there is nothing such an entry can
+/// contribute and nothing lost by ignoring it. Skipping closes the hole
+/// completely and cannot fail a legitimate archive.
+///
+/// This is the same trade as the link-target check in [`extract_tar_gz`]:
+/// validate the dangerous property, do not refuse the shape.
+fn entry_destination(
+    root: &Path,
+    relative: &Path,
+    raw: &str,
+) -> Result<Option<PathBuf>, PackageError> {
+    let resolved = resolve_inside(root, relative, raw)?;
+    if resolved == root {
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
+/// The mode an extracted entry should end up with, or `None` to leave it alone.
+///
+/// Pure, and separated from the two extraction paths on purpose: it is the only
+/// place the directory rule exists, and it can be asserted on a CI leg whose
+/// filesystem has no mode bits.
+///
+/// **A directory always gets the executable bit.** `policy_mode` alone would
+/// turn a published `0o644` directory into `0o600`, which the agent could not
+/// then descend into — traversability is not the archive's to withhold. A
+/// directory with no published mode at all (a zip written on Windows) gets the
+/// same answer rather than being left at whatever `create_dir_all` chose.
+fn intended_mode(is_directory: bool, published: Option<u32>) -> Option<u32> {
+    if is_directory {
+        return Some(policy_mode(published.unwrap_or(0o700) | 0o100));
+    }
+    published.map(policy_mode)
 }
 
 /// Join `relative` onto `root` and prove the result stays inside it.
@@ -2226,6 +2289,43 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PackageError> 
     })
 }
 
+/// Which attempt one lease file records as holding `version`, if any.
+///
+/// Split out of [`PackageCache::holders`] so the three answers can be asserted
+/// directly. The middle one is a race that only a seam like this can be shown
+/// to handle: a lease file listed and then gone cannot be produced on demand
+/// from outside, but it is exactly what a concurrent [`PackageCache::release`]
+/// leaves behind.
+///
+/// * **Gone** — `Ok(None)`. The directory was listed a moment ago, so a lease
+///   that has since disappeared was released in between. That is an ordinary
+///   race and precisely the outcome a prune is waiting for. Reporting it as
+///   [`PackageError::UnreadableLease`] would make `prune` refuse for a reason
+///   that is not true and send the operator to inspect a file that is not
+///   there.
+/// * **Present and unintelligible** — `Err`. Unreadable is not "nothing holds
+///   this", and a lease is written non-atomically, so a crash mid-write leaves
+///   exactly this shape. Fails closed.
+/// * **Present and readable** — `Ok(Some(id))` when it names `version`.
+///
+/// # Errors
+/// [`PackageError::UnreadableLease`] for a file whose name is not an attempt
+/// identifier or whose contents do not parse, [`PackageError::Io`] otherwise.
+fn holder_of(path: &Path, version: &RunnerVersion) -> Result<Option<AttemptId>, PackageError> {
+    let unreadable = || PackageError::UnreadableLease {
+        path: path.to_path_buf(),
+    };
+    let uuid = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+        .ok_or_else(unreadable)?;
+    let Some(lease) = read_lease(path)? else {
+        return Ok(None);
+    };
+    Ok((lease.version == *version).then(|| AttemptId::from_uuid(uuid)))
+}
+
 /// Reads one lease, strictly.
 ///
 /// The counterpart of [`read_json`], and deliberately not the same policy.
@@ -2308,6 +2408,33 @@ mod tests {
             writer
                 .write_all(body.as_bytes())
                 .expect("write a zip entry");
+        }
+        writer.finish().expect("finish the zip").into_inner()
+    }
+
+    /// A real `.zip` whose entries carry explicit unix modes.
+    ///
+    /// A name ending in `/` becomes a directory entry, which is how a zip
+    /// records one and is the case the mode policy used to skip.
+    fn zip_bytes_with_modes(entries: &[(&str, &str, Option<u32>)]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        for (name, body, mode) in entries {
+            let mut options = zip::write::SimpleFileOptions::default();
+            if let Some(mode) = mode {
+                options = options.unix_permissions(*mode);
+            }
+            if name.ends_with('/') {
+                writer
+                    .add_directory(name.trim_end_matches('/'), options)
+                    .expect("start a zip directory");
+            } else {
+                writer
+                    .start_file(*name, options)
+                    .expect("start a zip entry");
+                writer
+                    .write_all(body.as_bytes())
+                    .expect("write a zip entry");
+            }
         }
         writer.finish().expect("finish the zip").into_inner()
     }
@@ -4189,6 +4316,45 @@ mod tests {
             .expect("a resolved lease lets it proceed");
     }
 
+    #[test]
+    fn a_lease_released_while_holders_is_listing_is_not_reported_as_corrupt() {
+        // The three answers, including the race that cannot be produced from
+        // outside `holders`: a lease file listed and then released before it is
+        // read. Reporting that as corruption makes `prune` refuse for a reason
+        // that is not true.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let held = version("2.330.0");
+        let id = AttemptId::from_u128(0x100);
+
+        // Gone — released between the listing and the read.
+        let missing = dir.path().join(format!("{id}.{LEASE_EXTENSION}"));
+        assert!(!missing.exists());
+        assert_eq!(
+            holder_of(&missing, &held).expect("a released lease is not an error"),
+            None
+        );
+
+        // Present and readable, for this version and for another.
+        fs::write(&missing, br#"{"version":"2.330.0"}"#).unwrap();
+        assert_eq!(holder_of(&missing, &held).unwrap(), Some(id));
+        assert_eq!(holder_of(&missing, &version("2.340.0")).unwrap(), None);
+
+        // Present and unintelligible — still fails closed.
+        fs::write(&missing, b"{\"version\":\"2.33").unwrap();
+        assert!(matches!(
+            holder_of(&missing, &held),
+            Err(PackageError::UnreadableLease { .. })
+        ));
+
+        // Present, readable, but not named after an attempt.
+        let anonymous = dir.path().join(format!("not-a-uuid.{LEASE_EXTENSION}"));
+        fs::write(&anonymous, br#"{"version":"2.330.0"}"#).unwrap();
+        assert!(matches!(
+            holder_of(&anonymous, &held),
+            Err(PackageError::UnreadableLease { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn a_lease_file_that_is_not_named_after_an_attempt_refuses_a_prune() {
         let (harness, _, _) = linux_fixture();
@@ -4470,19 +4636,31 @@ mod tests {
         //
         // `resolve_inside` itself is pinned by
         // `an_archive_entry_may_not_resolve_outside_the_directory_it_is_
-        // extracted_into`, which reds when the function is gutted. Its two
-        // **call sites** are pinned by compilation rather than by behaviour:
-        // each uses the returned path as the destination it writes to or
-        // applies the mode policy to, so neither can be deleted. `extract_tar_gz`
-        // used to discard the result, which meant the line could be removed with
-        // every test still green — that is fixed, and the fix is why the tar
-        // path can apply a mode at all.
+        // extracted_into`, which reds when the function is gutted.
         //
-        // No input distinguishes this module's layer from the archive crates'
-        // layers today, so no better test can close that gap. **The layer's
-        // value is insurance against a dependency changing its mind**, not
-        // coverage of a reachable hole — a `zip` or `tar` release that relaxed
-        // its own sanitising would be caught here rather than shipped.
+        // # The tar call site is pinned by behaviour, and the input is below
+        //
+        // An earlier version of this comment claimed no input distinguishes
+        // this module's layer from the archive crates' layers. That is false,
+        // and the distinguishing input is the `"tar.gz absolute"` case in this
+        // very table. Measured against tar 0.4.46:
+        //
+        // ```text
+        // entry  /tmp/escaped.txt   resolve_inside refuses   unpack_in -> Ok(true)
+        // entry    ../escaped.txt   resolve_inside refuses   unpack_in -> Ok(false)
+        // ```
+        //
+        // `tar` documents it — "Leading `/`s are trimmed" — so for an absolute
+        // entry it strips the root and unpacks happily into `into/tmp/...`.
+        // `unpack_in` alone therefore *admits* that entry; `resolve_inside` is
+        // the only thing that refuses it. Replacing the call with a plain
+        // `into.join(...)` reds this test.
+        //
+        // The **zip** call site is the one that really is compile-pinned only:
+        // `enclosed_name` already answers `None` for absolute paths, drive
+        // prefixes and `..`, so no input separates the two layers there. Its
+        // value is insurance against a dependency relaxing its own sanitising,
+        // not coverage of a reachable hole.
         let dir = tempfile::tempdir().expect("a temporary root");
         let target = dir.path().join("target");
         let outside = dir.path().join("escaped.txt");
@@ -4764,6 +4942,197 @@ mod tests {
                 .is_symlink(),
             "the link should have been created"
         );
+    }
+
+    #[test]
+    fn an_entry_that_names_the_extraction_root_resolves_to_nothing() {
+        // The cross-platform half of the root-entry fix. The end-to-end test
+        // below can only see the consequence on a filesystem with mode bits,
+        // so the decision itself is asserted here, where every CI leg runs it.
+        let root = Path::new("/cache/staging/root");
+        for names_the_root in [".", "./", "./."] {
+            assert_eq!(
+                entry_destination(root, Path::new(names_the_root), names_the_root).unwrap(),
+                None,
+                "`{names_the_root}` names the extraction root and must not resolve to it"
+            );
+        }
+        // And an ordinary entry still resolves normally, so the check above is
+        // not simply swallowing everything.
+        assert_eq!(
+            entry_destination(root, Path::new("bin/run.sh"), "bin/run.sh").unwrap(),
+            Some(root.join("bin").join("run.sh"))
+        );
+        assert_eq!(
+            entry_destination(root, Path::new("./bin/run.sh"), "./bin/run.sh").unwrap(),
+            Some(root.join("bin").join("run.sh"))
+        );
+        // An escape is still an escape rather than a skipped root entry.
+        assert!(entry_destination(root, Path::new("../x"), "../x").is_err());
+    }
+
+    #[test]
+    fn a_directory_always_gets_a_traversable_owner_only_mode() {
+        // The directory rule, asserted where every CI leg runs it. The zip path
+        // used to skip the policy for directories entirely, and `policy_mode`
+        // alone would have made a `0o644` directory undescendable.
+        for published in [Some(0o2777), Some(0o755), Some(0o644), Some(0o000), None] {
+            assert_eq!(
+                intended_mode(true, published),
+                Some(0o700),
+                "a directory published as {published:?} must end up traversable and owner-only"
+            );
+        }
+        // Files keep the file rule, including "no published mode, leave it".
+        assert_eq!(intended_mode(false, Some(0o4755)), Some(0o700));
+        assert_eq!(intended_mode(false, Some(0o644)), Some(0o600));
+        assert_eq!(
+            intended_mode(false, None),
+            None,
+            "a zip written on Windows publishes no mode, and there is nothing to apply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zip_directory_entry_gets_the_same_mode_policy_as_a_tar_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The zip path returned early for directories and never reached the
+        // policy, so a `.zip` published with a world-writable or setgid
+        // directory got it applied verbatim by `create_dir_all` + the archive.
+        // Both formats extract on every platform, so this is not hypothetical
+        // just because Windows packages are the zips.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let bytes = zip_bytes_with_modes(&[
+            ("bin/", "", Some(0o2777)),
+            ("bin/run.sh", "#!/bin/sh\n", Some(0o4755)),
+        ]);
+        let archive = dir.path().join("p.archive");
+        fs::write(&archive, &bytes).unwrap();
+        let target = dir.path().join("target");
+
+        extract(&archive, ArchiveKind::Zip, &target).expect("extraction");
+
+        let dir_mode = fs::metadata(target.join("bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "a zip directory must get the owner-only policy (mode {dir_mode:o})"
+        );
+        let file_mode = fs::metadata(target.join("bin/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            file_mode, 0o700,
+            "a zip file must get the owner-only policy (mode {file_mode:o})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_entry_with_no_executable_bit_is_still_traversable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // `policy_mode` alone would turn a `0o644` directory into `0o600`,
+        // which the agent could not then descend into. A directory's
+        // traversability is not the archive's to withhold.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        for (label, bytes, kind) in [
+            (
+                "tar.gz",
+                tar_gz_special("bin/", "", 0o644, tar::EntryType::Directory, None),
+                ArchiveKind::TarGz,
+            ),
+            (
+                "zip",
+                zip_bytes_with_modes(&[("bin/", "", Some(0o644))]),
+                ArchiveKind::Zip,
+            ),
+        ] {
+            let archive = dir.path().join(format!("{label}.archive"));
+            fs::write(&archive, &bytes).unwrap();
+            let target = dir.path().join(label);
+
+            extract(&archive, kind, &target).expect("extraction");
+
+            let mode = fs::metadata(target.join("bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o700,
+                "{label}: a directory must stay traversable (mode {mode:o})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_naming_the_extraction_root_cannot_touch_it() {
+        // An entry called `.` or `./` resolves to the extraction directory
+        // itself, which would hand the archive control of the mode of a
+        // directory this module owns and created. It is not an escape — the
+        // policy fails closed — but the archive does not get a say here.
+        //
+        // **Which half of this proves what.** The mode assertion below is the
+        // one that detects the defect, and it is `#[cfg(unix)]`, so on Windows
+        // this test only shows that a root entry is tolerated rather than
+        // fatal. The decision itself is asserted on every leg by
+        // `an_entry_that_names_the_extraction_root_resolves_to_nothing`, which
+        // reds when the skip is removed. Said here so nobody reads a green
+        // Windows run as proof of the mode property.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        for (label, bytes, kind) in [
+            (
+                "tar.gz dot",
+                tar_gz_special(".", "", 0o777, tar::EntryType::Directory, None),
+                ArchiveKind::TarGz,
+            ),
+            (
+                "tar.gz dot slash",
+                tar_gz_special("./", "", 0o777, tar::EntryType::Directory, None),
+                ArchiveKind::TarGz,
+            ),
+            (
+                "zip dot",
+                zip_bytes_with_modes(&[("./", "", Some(0o777))]),
+                ArchiveKind::Zip,
+            ),
+        ] {
+            let archive = dir.path().join(format!("{label}.archive"));
+            fs::write(&archive, &bytes).unwrap();
+            let target = dir.path().join(label);
+            fs::create_dir_all(&target).unwrap();
+            let marker = target.join("owned-by-this-module");
+            fs::write(&marker, b"x").unwrap();
+
+            // Skipped, not refused: `tar -C dir -czf out.tgz .` emits exactly
+            // this entry for the archive's own root, so refusing it would fail
+            // a legitimate package. See `resolve_inside` for the reasoning.
+            extract(&archive, kind, &target).unwrap_or_else(|error| {
+                panic!("{label}: a root entry is skipped, not fatal: {error}")
+            });
+
+            assert!(
+                marker.is_file(),
+                "{label}: the extraction root must be untouched"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+                assert_ne!(
+                    mode, 0o777,
+                    "{label}: the archive must not have set the root's mode"
+                );
+            }
+        }
     }
 
     #[test]
