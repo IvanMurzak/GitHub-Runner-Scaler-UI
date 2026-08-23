@@ -289,15 +289,15 @@ fn a_consumer_projects_the_budget_from_the_scope_it_will_actually_poll() {
     // One organization reaching two repositories.
     let cost = TargetCost::from_activity_scope(&org_scope());
     assert_eq!(cost.installed_repositories(), 2);
-    assert_eq!(cost.requests_per_hour(default), 420);
+    assert_eq!(cost.requests_per_hour(default), 780);
 
     let projection = BudgetProjection::new(default, [cost]);
-    assert_eq!(projection.requests_per_hour(), 420);
-    assert_eq!(projection.headroom(), 2_080);
+    assert_eq!(projection.requests_per_hour(), 780);
+    assert_eq!(projection.headroom(), 1_720);
     assert!(!projection.exceeds_allowance());
     assert_eq!(
-        BudgetProjection::max_repository_targets(default),
-        10,
+        BudgetProjection::max_repository_targets(default, TargetCost::repository()),
+        5,
         "the figure `host show` prints"
     );
 

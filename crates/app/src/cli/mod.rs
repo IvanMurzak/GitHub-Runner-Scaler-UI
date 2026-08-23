@@ -933,7 +933,8 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Cl
         Command::Auth(command) => auth::dispatch(&context, command, out),
         Command::Host(command) => host::dispatch(&context, command, out),
         Command::Status(args) => status::dispatch(&context, args, out),
-        Command::Repo(_) | Command::Org(_) => Err(not_implemented("f2")),
+        Command::Repo(command) => policy::dispatch_repo(&context, command, out),
+        Command::Org(command) => policy::dispatch_org(&context, command, out),
         Command::Daemon(_) | Command::Service(_) => Err(not_implemented("f3")),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.

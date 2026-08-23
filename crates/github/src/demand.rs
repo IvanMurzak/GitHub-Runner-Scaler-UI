@@ -1188,10 +1188,9 @@ mod tests {
             "the seam must actually replace the estimate; a `target_cost` that returned \
              `from_activity_scope` unchanged would report the estimate as measured"
         );
-        // 1 inventory request + 3 repositories * (1 activity + 1 demand).
-        assert_eq!(measured.requests_per_refresh(), 7);
-        // 1 + 3 * (1 + 2), the pre-decision estimate.
-        assert_eq!(estimated.requests_per_refresh(), 10);
+        // 1 inventory + 3 repositories * (4 worst-case activity + demand).
+        assert_eq!(measured.requests_per_refresh(), 16);
+        assert_eq!(estimated.requests_per_refresh(), 19);
         assert!(
             measured.requests_per_refresh() < estimated.requests_per_refresh(),
             "removing the per-run job listing removed requests; a measured cost that \
@@ -1225,35 +1224,33 @@ mod tests {
     /// act on it, and fails if it is ever closed, at which point this test and
     /// the note above should go.
     #[test]
-    fn the_printed_target_ceiling_still_projects_the_pre_decision_estimate() {
+    fn the_printed_target_ceiling_uses_the_same_measured_cost_as_admission() {
         use crate::rest::{BudgetProjection, budget_allowance};
         use runner_manager_domain::model::RefreshInterval;
 
         let interval = RefreshInterval::default();
-        let printed = BudgetProjection::max_repository_targets(interval);
+        let measured = TargetCost::repository()
+            .with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL);
+        let printed = BudgetProjection::max_repository_targets(interval, measured);
         let per_hour_estimated = TargetCost::repository().requests_per_hour(interval);
         let per_hour_measured = TargetCost::repository()
             .with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
             .requests_per_hour(interval);
 
-        // 4 requests per refresh * 60 refreshes, against 3 * 60.
-        assert_eq!(per_hour_estimated, 240);
-        assert_eq!(per_hour_measured, 180);
+        assert_eq!(per_hour_estimated, 420);
+        assert_eq!(per_hour_measured, 360);
         assert_eq!(
-            printed, 10,
-            "the printed ceiling is `04-subsystem-contracts.md`'s figure, computed from \
-             the estimate"
+            printed, 6,
+            "the printed ceiling uses the cost admission was given"
         );
         assert_eq!(
             budget_allowance() / per_hour_measured,
-            13,
-            "while the cost this module actually issues would allow thirteen"
+            6,
+            "the measured worst-case cost allows six"
         );
         assert!(
-            printed < budget_allowance() / per_hour_measured,
-            "the gap is in the conservative direction, which is why this is a reporting \
-             discrepancy rather than a budget overrun -- if it ever inverts, the printed \
-             ceiling would be admitting targets the budget cannot pay for"
+            printed == budget_allowance() / per_hour_measured,
+            "display and admission must use the same candidate cost"
         );
     }
 

@@ -211,14 +211,14 @@ fn an_undocumented_command_is_refused() {
     );
 }
 
-/// `f2` and `f3`'s commands are declared and not implemented, and a script has
+/// `f3`'s commands are declared and not implemented, and a script has
 /// to be able to tell that apart from a usage error.
 #[test]
 fn a_declared_but_unimplemented_command_exits_distinctly_from_a_usage_error() {
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let outcome = run({
         let mut command = runner_manager(temporary.path());
-        command.args(["repo", "list"]);
+        command.args(["daemon", "run"]);
         command
     });
     assert_eq!(
@@ -228,7 +228,7 @@ fn a_declared_but_unimplemented_command_exits_distinctly_from_a_usage_error() {
     );
     assert_ne!(outcome.code, 2, "and it must not be clap's usage code");
     assert!(
-        outcome.stderr.contains("task f2"),
+        outcome.stderr.contains("task f3"),
         "the message must name the task that owns it, so a reader knows this is an \
          unfinished build rather than a typo: {}",
         outcome.stderr

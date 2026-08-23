@@ -284,40 +284,34 @@ impl HostBudget {
 
 /// States the one assumption a reader would otherwise take the ceiling for.
 ///
-/// The projection prices each per-repository request class at its **best case**
-/// of one request. Both classes fall back to walking pages when GitHub omits
-/// `total_count`, and both walks are bounded at [`FALLBACK_COST_MULTIPLE`]
-/// pages. So "about N targets" is a best-case figure, and a host whose
-/// repositories all take the fallback path spends up to four times what the
-/// per-repository half of this projection says.
+/// Activity polling is priced at its bounded four-page worst case. Demand still
+/// uses its measured one-request best case and can walk four pages when GitHub
+/// omits `total_count`, so "about N targets" remains approximate.
 ///
 /// # Errors
 /// Whatever `out` fails with.
 pub fn write_best_case_caveat(out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
-        "  About: these are BEST-CASE costs. Each repository is priced at one request for"
+        "  About: queued-run polling is a BEST-CASE cost of one request per repository;"
     )?;
     writeln!(
         out,
-        "  its in-progress count and one for its queued-run count, which is what GitHub"
+        "  it can cost up to {FALLBACK_COST_MULTIPLE}x as much when GitHub omits a total. In-progress polling is"
     )?;
     writeln!(
         out,
-        "  charges when it sends a total with the first page. When it does not, each of"
+        "  already priced at that bounded worst case. Treat the target figure as"
     )?;
     writeln!(
         out,
-        "  those counts walks pages instead and costs up to {FALLBACK_COST_MULTIPLE}x as much. Treat the"
+        "  approximate, not as a threshold: the other half of GitHub's hourly ceiling"
     )?;
     writeln!(
         out,
-        "  target figure as approximate, not as a threshold: the other half of GitHub's"
+        "  is deliberately left unplanned to absorb paging and interactive requests."
     )?;
-    writeln!(
-        out,
-        "  hourly ceiling is deliberately left unplanned to absorb exactly this."
-    )?;
+    writeln!(out)?;
     Ok(())
 }
 
@@ -653,35 +647,34 @@ mod tests {
     /// documentation above, should go, and [`max_repository_targets`] can
     /// become a call into `c3`'s.
     #[test]
-    fn c3s_ceiling_still_prices_demand_at_the_pre_decision_estimate() {
+    fn c3s_ceiling_accepts_the_same_measured_cost_as_admission() {
         let interval = RefreshInterval::default();
 
         assert_eq!(
             TargetCost::repository().requests_per_hour(interval),
-            240,
-            "c3's estimate: 1 inventory + 1 activity + 2 demand, 60 times an hour"
+            420,
+            "c3's estimate: 1 inventory + 4 activity + 2 demand, 60 times an hour"
         );
         assert_eq!(
             measured(TargetCost::repository()).requests_per_hour(interval),
-            180,
-            "the measured cost: 1 inventory + 1 activity + 1 demand, 60 times an hour"
+            360,
+            "the measured cost: 1 inventory + 4 activity + 1 demand, 60 times an hour"
         );
 
         assert_eq!(
-            BudgetProjection::max_repository_targets(interval),
-            10,
+            BudgetProjection::max_repository_targets(interval, TargetCost::repository()),
+            5,
             "c3's printed ceiling, computed from the estimate"
         );
         assert_eq!(
             max_repository_targets(interval),
-            13,
+            6,
             "this CLI's ceiling, computed from the cost `c4` actually issues"
         );
         assert!(
-            BudgetProjection::max_repository_targets(interval) < max_repository_targets(interval),
-            "the gap must stay in the conservative direction. If it ever inverts, c3's \
-             figure would be admitting targets the budget cannot pay for, and the direction \
-             of the fix changes."
+            BudgetProjection::max_repository_targets(interval, measured(TargetCost::repository()))
+                == max_repository_targets(interval),
+            "the caller-supplied measured cost must make display and admission agree"
         );
     }
 
@@ -692,8 +685,8 @@ mod tests {
     #[test]
     fn the_stated_fallback_multiple_is_the_one_the_gateways_can_spend() {
         assert_eq!(
-            ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, 1,
-            "the projection prices the activity count at one request"
+            ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, FALLBACK_COST_MULTIPLE,
+            "the projection prices the activity count at its bounded worst case"
         );
         assert_eq!(
             u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap(),
@@ -761,8 +754,8 @@ mod tests {
                 repository("o/three"),
             ],
         );
-        assert_eq!(one.requests_per_hour(), 180);
-        assert_eq!(three.requests_per_hour(), 540);
+        assert_eq!(one.requests_per_hour(), 360);
+        assert_eq!(three.requests_per_hour(), 1_080);
         assert!(
             budget_text(&three).contains("policies priced           3"),
             "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
@@ -813,8 +806,8 @@ mod tests {
             max_repository_targets(floor),
             max_repository_targets(default)
         );
-        assert_eq!(max_repository_targets(floor), 6);
-        assert_eq!(max_repository_targets(default), 13);
+        assert_eq!(max_repository_targets(floor), 3);
+        assert_eq!(max_repository_targets(default), 6);
     }
 
     #[test]

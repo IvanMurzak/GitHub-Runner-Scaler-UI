@@ -254,7 +254,7 @@ fn host_show_prints_one_target_ceiling_and_it_is_the_measured_one() {
          exists to prevent. Found: {ceilings:?}"
     );
     assert!(
-        ceilings[0].contains("about 13"),
+        ceilings[0].contains("about 6"),
         "the printed ceiling must be the one computed from the demand cost `c4` actually \
          issues (one request per repository per poll), not from `c3`'s pre-decision \
          estimate of two, which would print 10. Got: {}",
@@ -264,7 +264,7 @@ fn host_show_prints_one_target_ceiling_and_it_is_the_measured_one() {
     // And the other rendering of the same state must agree.
     assert_eq!(
         status_json(data_dir.path())["budget"]["max_repository_targets"],
-        Value::from(13),
+        Value::from(6),
         "`host show` and `status --json` must agree; `g3` shows the same numbers in the \
          TUI and this is the CLI half of that parity"
     );
@@ -279,7 +279,7 @@ fn the_target_ceiling_is_hedged_and_the_fallback_multiple_is_stated() {
     let text = show(data_dir.path());
 
     assert!(
-        text.contains("about 13"),
+        text.contains("about 6"),
         "the number must be hedged:\n{text}"
     );
     assert!(
