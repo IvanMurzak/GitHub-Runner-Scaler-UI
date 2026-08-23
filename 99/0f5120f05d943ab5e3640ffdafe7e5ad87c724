@@ -1,0 +1,31 @@
+crates/app/src/cli/policy.rs
+  s_e3f2ebf0732f36::t_4f152834e19628 244-249,251-257,259-263,677,683,693,708,710,925-926
+  s_e3f2ebf0732f36::t_8e1bfa61ac2442 250,258
+crates/app/tests/no_secret_reaches_command_output.rs
+  s_e3f2ebf0732f36::t_4f152834e19628 360-367
+  s_d14c0886a58be6::t_0df3b5c71b12b2 359,368-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "990f5120f05d943ab5e3640ffdafe7e5ad87c724",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
