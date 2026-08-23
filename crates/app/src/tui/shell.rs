@@ -12,12 +12,13 @@ use crossterm::event::{
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures::StreamExt;
+use crossterm::{Command, execute};
+use futures::{Stream, StreamExt};
 use ratatui::Frame;
+use ratatui::backend::Backend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -192,10 +193,83 @@ pub enum Effect {
     ActivateFocusedControl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NavHit {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NavigationItem {
     screen: Screen,
+    label: String,
     area: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NavigationLayout {
+    items: Vec<NavigationItem>,
+}
+
+impl NavigationLayout {
+    fn for_area(area: Rect) -> Self {
+        let labels: Vec<String> = Screen::ALL
+            .into_iter()
+            .map(|screen| navigation_label(screen, area.width))
+            .collect();
+        let gaps = labels.len().saturating_sub(1) as u16;
+        let labels_width = labels
+            .iter()
+            .map(|label| u16::try_from(label.chars().count()).unwrap_or(u16::MAX))
+            .sum::<u16>();
+        let leading = area.width.saturating_sub(labels_width.saturating_add(gaps)) / 2;
+        let mut x = area.x.saturating_add(leading);
+        let mut items = Vec::with_capacity(labels.len());
+        for (screen, label) in Screen::ALL.into_iter().zip(labels) {
+            let width = u16::try_from(label.chars().count())
+                .unwrap_or(u16::MAX)
+                .min(area.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            items.push(NavigationItem {
+                screen,
+                label,
+                area: Rect::new(x, area.y, width, 1),
+            });
+            x = x.saturating_add(width).saturating_add(1);
+        }
+        Self { items }
+    }
+
+    fn hit(&self, column: u16, row: u16) -> Option<Screen> {
+        self.items
+            .iter()
+            .find(|item| {
+                column >= item.area.x
+                    && column < item.area.right()
+                    && row >= item.area.y
+                    && row < item.area.bottom()
+            })
+            .map(|item| item.screen)
+    }
+}
+
+fn navigation_label(screen: Screen, width: u16) -> String {
+    let key = screen_key(screen);
+    if width < 60 {
+        format!("[{key}]")
+    } else if width < 110 {
+        let short = match screen {
+            Screen::Dashboard => "Dash",
+            Screen::Repositories => "Repos",
+            Screen::Runners => "Run",
+            Screen::RepositorySettings => "RepoCfg",
+            Screen::HostSettings => "HostCfg",
+            Screen::Activity => "Activity",
+        };
+        format!("[{key}]{short}")
+    } else {
+        format!("[{key}] {}", screen.title())
+    }
+}
+
+fn navigation_area(size: Rect) -> Rect {
+    Rect::new(size.x, size.y.saturating_add(1), size.width, 1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,12 +286,12 @@ pub struct AppState {
     pub should_exit: bool,
     pub ticks: u64,
     pub last_tick: Option<Instant>,
-    nav_hits: Vec<NavHit>,
+    navigation: NavigationLayout,
 }
 
 impl AppState {
     pub fn new(presentation: PresentationState, width: u16, height: u16) -> Self {
-        let mut state = Self {
+        Self {
             screen: Screen::Dashboard,
             focus: Focus::Content,
             presentation,
@@ -230,31 +304,12 @@ impl AppState {
             should_exit: false,
             ticks: 0,
             last_tick: None,
-            nav_hits: Vec::new(),
-        };
-        state.relayout();
-        state
+            navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
+        }
     }
 
     fn relayout(&mut self) {
-        self.nav_hits.clear();
-        if self.size.height < 3 || self.size.width < 12 {
-            return;
-        }
-        let nav = Rect::new(0, 1, self.size.width, 1);
-        let each = (nav.width / Screen::ALL.len() as u16).max(1);
-        for (index, screen) in Screen::ALL.into_iter().enumerate() {
-            let x = nav.x.saturating_add((index as u16).saturating_mul(each));
-            let right = if index + 1 == Screen::ALL.len() {
-                nav.right()
-            } else {
-                x.saturating_add(each).min(nav.right())
-            };
-            self.nav_hits.push(NavHit {
-                screen,
-                area: Rect::new(x, nav.y, right.saturating_sub(x), 1),
-            });
-        }
+        self.navigation = NavigationLayout::for_area(navigation_area(self.size));
     }
 }
 
@@ -369,13 +424,8 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(hit) = state.nav_hits.iter().find(|hit| {
-                mouse.column >= hit.area.x
-                    && mouse.column < hit.area.right()
-                    && mouse.row >= hit.area.y
-                    && mouse.row < hit.area.bottom()
-            }) {
-                state.screen = hit.screen;
+            if let Some(screen) = state.navigation.hit(mouse.column, mouse.row) {
+                state.screen = screen;
                 state.focus = Focus::Navigation;
             } else {
                 state.focus = Focus::Content;
@@ -420,23 +470,15 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         rows[0],
     );
 
-    let navigation = if compact {
-        "[d] Dash  [r] Repos  [n] Runners  [?] Help".to_owned()
-    } else {
-        Screen::ALL
-            .iter()
-            .map(|screen| {
-                let key = screen_key(*screen);
-                if *screen == state.screen {
-                    format!("[{key}:{}]", screen.title())
-                } else {
-                    format!(" {key}:{} ", screen.title())
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    frame.render_widget(Paragraph::new(navigation), rows[1]);
+    let navigation = NavigationLayout::for_area(rows[1]);
+    for item in &navigation.items {
+        let style = if item.screen == state.screen {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(item.label.as_str()).style(style), item.area);
+    }
 
     let content = if compact {
         let filter = if state.filtering {
@@ -512,13 +554,23 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, compact: bool) {
     if width < 8 || height < 3 {
         return;
     }
+    let popup_y = if compact {
+        area.y.saturating_add(3)
+    } else {
+        area.y + area.height.saturating_sub(height) / 2
+    };
+    let height = height.min(area.bottom().saturating_sub(popup_y).saturating_sub(1));
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
+        popup_y,
         width,
         height,
     );
-    let help = "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nMouse actions always have the keyboard equivalents above.";
+    let help = if compact {
+        "d Dashboard  r Repositories  n Runners\ns Repo settings  h Host settings  a Activity\n/ Filter F5 Refresh ? Help Esc Back q Quit\nTab Shift-Tab Arrows Focus  Enter Activate\nc Copy diagnostics  m Mouse capture\nKeys mirror every mouse action"
+    } else {
+        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nMouse actions always have the keyboard equivalents above."
+    };
     frame.render_widget(Clear, popup);
     let title = if compact {
         "Key help - compact layout"
@@ -555,31 +607,83 @@ trait TerminalActions {
     fn disable_bracketed_paste(&mut self) -> io::Result<()>;
 }
 
-struct CrosstermActions;
-impl TerminalActions for CrosstermActions {
-    fn enable_raw(&mut self) -> io::Result<()> {
+trait RawModeActions {
+    fn enable(&mut self) -> io::Result<()>;
+    fn disable(&mut self) -> io::Result<()>;
+}
+
+struct SystemRawMode;
+impl RawModeActions for SystemRawMode {
+    fn enable(&mut self) -> io::Result<()> {
         enable_raw_mode()
     }
-    fn disable_raw(&mut self) -> io::Result<()> {
+    fn disable(&mut self) -> io::Result<()> {
         disable_raw_mode()
     }
+}
+
+struct CrosstermActions<W: Write, R: RawModeActions> {
+    writer: W,
+    raw_mode: R,
+    force_ansi: bool,
+}
+
+impl<W: Write, R: RawModeActions> CrosstermActions<W, R> {
+    fn new(writer: W, raw_mode: R) -> Self {
+        Self {
+            writer,
+            raw_mode,
+            force_ansi: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_ansi_transport(writer: W, raw_mode: R) -> Self {
+        Self {
+            writer,
+            raw_mode,
+            force_ansi: true,
+        }
+    }
+
+    fn emit(&mut self, command: impl Command) -> io::Result<()> {
+        if self.force_ansi {
+            let mut ansi = String::new();
+            command
+                .write_ansi(&mut ansi)
+                .map_err(|_| io::Error::other("Crossterm command could not be encoded"))?;
+            self.writer.write_all(ansi.as_bytes())?;
+            self.writer.flush()
+        } else {
+            execute!(self.writer, command).map(|_| ())
+        }
+    }
+}
+
+impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
+    fn enable_raw(&mut self) -> io::Result<()> {
+        self.raw_mode.enable()
+    }
+    fn disable_raw(&mut self) -> io::Result<()> {
+        self.raw_mode.disable()
+    }
     fn enter_alternate_screen(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), EnterAlternateScreen).map(|_| ())
+        self.emit(EnterAlternateScreen)
     }
     fn leave_alternate_screen(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), LeaveAlternateScreen).map(|_| ())
+        self.emit(LeaveAlternateScreen)
     }
     fn enable_mouse_capture(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), EnableMouseCapture).map(|_| ())
+        self.emit(EnableMouseCapture)
     }
     fn disable_mouse_capture(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), DisableMouseCapture).map(|_| ())
+        self.emit(DisableMouseCapture)
     }
     fn enable_bracketed_paste(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), EnableBracketedPaste).map(|_| ())
+        self.emit(EnableBracketedPaste)
     }
     fn disable_bracketed_paste(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), DisableBracketedPaste).map(|_| ())
+        self.emit(DisableBracketedPaste)
     }
 }
 
@@ -690,28 +794,42 @@ impl<A: TerminalActions> SessionControl for TerminalSession<A> {
 
 /// Crossterm, timer, and agent sources are merged by `select!`; exactly one
 /// resulting [`AppEvent`] is sent to [`reduce`] each iteration.
-pub async fn run_loop(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+pub async fn run_loop<B, I>(
+    terminal: &mut ratatui::Terminal<B>,
     session: &mut impl SessionControl,
+    mut input: I,
     mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
-) -> io::Result<()> {
-    let size = terminal.size()?;
+) -> io::Result<AppState>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    I: Stream<Item = io::Result<Event>> + Unpin,
+{
+    let size = terminal.size().map_err(io::Error::other)?;
     let mut state = AppState::new(PresentationState::default(), size.width, size.height);
-    let mut input = EventStream::new();
     let mut timer = tokio::time::interval(TICK_RATE);
+    let mut agent_events_open = true;
     loop {
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal
+            .draw(|frame| render(frame, &state))
+            .map_err(io::Error::other)?;
         if state.should_exit {
-            return Ok(());
+            return Ok(state);
         }
         let event = tokio::select! {
             input = input.next() => match input {
                 Some(Ok(event)) => AppEvent::from(event),
                 Some(Err(error)) => AppEvent::InputFailed(error.to_string()),
-                None => return Ok(()),
+                None => return Ok(state),
             },
             instant = timer.tick() => AppEvent::Timer(instant.into_std()),
-            agent = agent_events.recv() => match agent { Some(agent) => AppEvent::Agent(agent), None => continue },
+            agent = agent_events.recv(), if agent_events_open => match agent {
+                Some(agent) => AppEvent::Agent(agent),
+                None => {
+                    agent_events_open = false;
+                    continue;
+                }
+            },
         };
         for effect in reduce(&mut state, event) {
             match effect {
@@ -725,18 +843,39 @@ pub async fn run_loop(
     }
 }
 
-pub fn run_terminal() -> io::Result<()> {
-    let mut session = TerminalSession::start(CrosstermActions)?;
+/// Runs the production terminal against an injected agent-event receiver.
+///
+/// This is the composition seam for an in-process agent. The standalone
+/// `runner-manager tui` process uses [`run_terminal`], while an embedding host
+/// passes its real receiver here; the loop test exercises this exact path.
+pub fn run_terminal_with_agent_events(
+    agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+) -> io::Result<()> {
+    let mut session = TerminalSession::start(CrosstermActions::new(io::stdout(), SystemRawMode))?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.clear()?;
-    let (_agent_sender, agent_events) = mpsc::unbounded_channel();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run_loop(&mut terminal, &mut session, agent_events));
+    let result = runtime
+        .block_on(run_loop(
+            &mut terminal,
+            &mut session,
+            EventStream::new(),
+            agent_events,
+        ))
+        .map(|_| ());
     let _ = terminal.show_cursor();
     result
+}
+
+pub fn run_terminal() -> io::Result<()> {
+    // A standalone TUI does not own the already-running daemon (and `q` must
+    // not stop it). It therefore starts with a disconnected in-process stream;
+    // embedders that do own an agent use `run_terminal_with_agent_events`.
+    let agent_events = mpsc::unbounded_channel::<AgentEvent>().1;
+    run_terminal_with_agent_events(agent_events)
 }
 
 #[cfg(test)]
@@ -748,21 +887,27 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Mutex};
 
-    fn key(code: KeyCode) -> AppEvent {
-        AppEvent::Key(KeyEvent {
+    fn crossterm_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
             code,
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
-        })
+        }
     }
-    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> AppEvent {
-        AppEvent::Mouse(MouseEvent {
+    fn key(code: KeyCode) -> AppEvent {
+        AppEvent::Key(crossterm_key(code))
+    }
+    fn crossterm_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
             kind,
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        })
+        }
+    }
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> AppEvent {
+        AppEvent::Mouse(crossterm_mouse(kind, column, row))
     }
     fn rendered(width: u16, height: u16, state: &AppState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -783,15 +928,16 @@ mod tests {
         let mut state = AppState::new(PresentationState::default(), 120, 30);
         reduce(&mut state, key(KeyCode::Char('r')));
         assert_eq!(state.screen, Screen::Repositories);
-        let area = state
-            .nav_hits
-            .iter()
-            .find(|hit| hit.screen == Screen::Activity)
+        let frame = rendered(120, 30, &state);
+        let x = frame
+            .lines()
+            .nth(1)
             .unwrap()
-            .area;
+            .find("[a] Activity & errors")
+            .expect("the rendered Activity label") as u16;
         reduce(
             &mut state,
-            mouse(MouseEventKind::Down(MouseButton::Left), area.x, area.y),
+            mouse(MouseEventKind::Down(MouseButton::Left), x, 1),
         );
         assert_eq!(
             state.screen,
@@ -820,6 +966,30 @@ mod tests {
         assert!(!state.terminal_focused);
         reduce(&mut state, AppEvent::from(Event::FocusGained));
         assert!(state.terminal_focused);
+    }
+
+    #[test]
+    fn compact_and_full_click_targets_follow_the_labels_actually_rendered() {
+        for (width, height, rendered_label) in [(48, 12, "[a]"), (120, 30, "[a] Activity & errors")]
+        {
+            let mut state = AppState::new(PresentationState::default(), width, height);
+            let frame = rendered(width, height, &state);
+            let nav_row = frame.lines().nth(1).expect("navigation row");
+            let x = nav_row
+                .find(rendered_label)
+                .unwrap_or_else(|| panic!("{rendered_label:?} was not rendered at width {width}"))
+                as u16;
+
+            reduce(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), x, 1),
+            );
+            assert_eq!(
+                state.screen,
+                Screen::Activity,
+                "the pixels spelling Activity at width {width} must be its hitbox"
+            );
+        }
     }
 
     #[test]
@@ -880,6 +1050,100 @@ mod tests {
         let effects = reduce(&mut state, key(KeyCode::Char('q')));
         assert!(state.should_exit);
         assert!(effects.is_empty());
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopRawMode;
+    impl RawModeActions for NoopRawMode {
+        fn enable(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disable(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn crossterm_capture_emission_and_merged_loop_causally_deliver_mouse_and_agent_events() {
+        const ENABLE_MOUSE_CAPTURE_ANSI: &[u8] =
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+
+        let output = SharedWriter::default();
+        let observed_output = Arc::clone(&output.0);
+        let mut session =
+            TerminalSession::start(CrosstermActions::with_ansi_transport(output, NoopRawMode))
+                .expect("test terminal setup");
+        assert!(
+            observed_output
+                .lock()
+                .unwrap()
+                .windows(ENABLE_MOUSE_CAPTURE_ANSI.len())
+                .any(|window| window == ENABLE_MOUSE_CAPTURE_ANSI),
+            "the real Crossterm action must emit every mouse tracking mode"
+        );
+
+        let width = 80;
+        let height = 24;
+        let initial = AppState::new(PresentationState::default(), width, height);
+        let frame = rendered(width, height, &initial);
+        let activity_x = frame
+            .lines()
+            .nth(1)
+            .expect("navigation row")
+            .find("[a]Activity")
+            .expect("rendered Activity label") as u16;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let (input_sender, input) = futures::channel::mpsc::unbounded::<io::Result<Event>>();
+        let (agent_sender, agent_events) = mpsc::unbounded_channel();
+        let producer = async move {
+            agent_sender
+                .send(AgentEvent {
+                    summary: "AGENT_EVENT_REACHED_REDUCER".to_owned(),
+                    health: Health::Busy,
+                })
+                .unwrap();
+            input_sender
+                .unbounded_send(Ok(Event::Mouse(crossterm_mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    activity_x,
+                    1,
+                ))))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            input_sender
+                .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::Char('q')))))
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            run_loop(&mut terminal, &mut session, input, agent_events),
+            producer
+        );
+        let final_state = result.expect("merged loop");
+        assert_eq!(final_state.screen, Screen::Activity);
+        assert_eq!(final_state.presentation.health, Health::Busy);
+        assert!(
+            final_state
+                .presentation
+                .diagnostics
+                .iter()
+                .any(|line| line == "AGENT_EVENT_REACHED_REDUCER")
+        );
+        assert!(final_state.should_exit);
     }
 
     #[derive(Clone)]
@@ -1067,9 +1331,31 @@ mod tests {
             12,
         );
         let frame = rendered(48, 12, &state);
-        assert!(frame.contains("compact layout"));
-        assert!(frame.contains("Key help"));
-        assert!(frame.contains("m release/re-enable"));
+        for visible_control in [
+            "Key help - compact layout",
+            "d Dashboard",
+            "r Repositories",
+            "n Runners",
+            "s Repo settings",
+            "h Host settings",
+            "a Activity",
+            "/ Filter",
+            "F5 Refresh",
+            "? Help",
+            "Esc Back",
+            "q Quit",
+            "Tab Shift-Tab Arrows Focus",
+            "Enter Activate",
+            "c Copy diagnostics",
+            "m Mouse capture",
+            "Keys mirror every mouse action",
+        ] {
+            assert!(
+                frame.contains(visible_control),
+                "compact help clipped or omitted {visible_control:?}:\n{frame}"
+            );
+        }
+        assert!(frame.lines().nth(1).unwrap().contains("[a]"));
         assert_eq!(frame.lines().count(), 12);
         assert!(frame.lines().all(|line| line.chars().count() == 48));
     }
@@ -1121,5 +1407,32 @@ mod tests {
             "frame exceeded {FRAME_BUDGET:?}"
         );
         let _structural_proof: fn(&mut Frame<'_>, &AppState) = render;
+
+        let source = include_str!("shell.rs");
+        let render_source = source
+            .split_once("pub fn render(")
+            .expect("render function")
+            .1
+            .split_once("const fn screen_key")
+            .expect("end of render-only section")
+            .0;
+        for forbidden_capability in [
+            "std::fs",
+            "std::net",
+            "reqwest",
+            "Context",
+            "Store",
+            "Gateway",
+            "File::",
+            "TcpStream",
+            "read_to_",
+            "block_on",
+            ".await",
+        ] {
+            assert!(
+                !render_source.contains(forbidden_capability),
+                "render acquired forbidden I/O capability {forbidden_capability:?}"
+            );
+        }
     }
 }
