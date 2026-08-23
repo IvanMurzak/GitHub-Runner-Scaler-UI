@@ -10,9 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -675,6 +675,8 @@ trait TerminalActions {
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
     fn enable_mouse_capture(&mut self) -> io::Result<()>;
     fn disable_mouse_capture(&mut self) -> io::Result<()>;
+    fn enable_focus_change(&mut self) -> io::Result<()>;
+    fn disable_focus_change(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> io::Result<()>;
 }
@@ -694,36 +696,57 @@ impl RawModeActions for SystemRawMode {
     }
 }
 
-struct CrosstermActions<W: Write, R: RawModeActions> {
-    writer: W,
-    raw_mode: R,
+trait MouseCaptureActions<W: Write> {
+    fn enable(&mut self, writer: &mut W) -> io::Result<()>;
+    fn disable(&mut self, writer: &mut W) -> io::Result<()>;
 }
 
-impl<W: Write, R: RawModeActions> CrosstermActions<W, R> {
+struct CrosstermMouseCapture;
+
+impl<W: Write> MouseCaptureActions<W> for CrosstermMouseCapture {
+    fn enable(&mut self, writer: &mut W) -> io::Result<()> {
+        execute!(writer, EnableMouseCapture).map(|_| ())
+    }
+
+    fn disable(&mut self, writer: &mut W) -> io::Result<()> {
+        execute!(writer, DisableMouseCapture).map(|_| ())
+    }
+}
+
+struct CrosstermActions<W: Write, R: RawModeActions, M: MouseCaptureActions<W>> {
+    writer: W,
+    raw_mode: R,
+    mouse_capture: M,
+}
+
+impl<W: Write, R: RawModeActions> CrosstermActions<W, R, CrosstermMouseCapture> {
     fn new(writer: W, raw_mode: R) -> Self {
-        Self { writer, raw_mode }
+        Self {
+            writer,
+            raw_mode,
+            mouse_capture: CrosstermMouseCapture,
+        }
+    }
+}
+
+impl<W: Write, R: RawModeActions, M: MouseCaptureActions<W>> CrosstermActions<W, R, M> {
+    #[cfg(test)]
+    fn with_mouse_capture(writer: W, raw_mode: R, mouse_capture: M) -> Self {
+        Self {
+            writer,
+            raw_mode,
+            mouse_capture,
+        }
     }
 
     fn emit(&mut self, command: impl Command) -> io::Result<()> {
         execute!(self.writer, command).map(|_| ())
     }
-
-    fn enable_capture(&mut self) -> io::Result<()> {
-        // Mouse tracking is a terminal protocol command, so write its encoded
-        // bytes through the owned terminal writer on every platform. This
-        // makes the setup side effect part of the same observable output path
-        // as the terminal session instead of an unobservable process-global
-        // Windows console mutation.
-        let mut ansi = String::new();
-        EnableMouseCapture
-            .write_ansi(&mut ansi)
-            .map_err(|_| io::Error::other("mouse capture command could not be encoded"))?;
-        self.writer.write_all(ansi.as_bytes())?;
-        self.writer.flush()
-    }
 }
 
-impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
+impl<W: Write, R: RawModeActions, M: MouseCaptureActions<W>> TerminalActions
+    for CrosstermActions<W, R, M>
+{
     fn enable_raw(&mut self) -> io::Result<()> {
         self.raw_mode.enable()
     }
@@ -737,10 +760,16 @@ impl<W: Write, R: RawModeActions> TerminalActions for CrosstermActions<W, R> {
         self.emit(LeaveAlternateScreen)
     }
     fn enable_mouse_capture(&mut self) -> io::Result<()> {
-        self.enable_capture()
+        self.mouse_capture.enable(&mut self.writer)
     }
     fn disable_mouse_capture(&mut self) -> io::Result<()> {
-        self.emit(DisableMouseCapture)
+        self.mouse_capture.disable(&mut self.writer)
+    }
+    fn enable_focus_change(&mut self) -> io::Result<()> {
+        self.emit(EnableFocusChange)
+    }
+    fn disable_focus_change(&mut self) -> io::Result<()> {
+        self.emit(DisableFocusChange)
     }
     fn enable_bracketed_paste(&mut self) -> io::Result<()> {
         self.emit(EnableBracketedPaste)
@@ -756,6 +785,7 @@ struct TerminalSession<A: TerminalActions> {
     raw: bool,
     alternate: bool,
     mouse: bool,
+    focus_change: bool,
     paste: bool,
 }
 
@@ -766,6 +796,7 @@ impl<A: TerminalActions> TerminalSession<A> {
             raw: false,
             alternate: false,
             mouse: false,
+            focus_change: false,
             paste: false,
         };
         session.actions.enable_raw()?;
@@ -774,6 +805,8 @@ impl<A: TerminalActions> TerminalSession<A> {
         session.alternate = true;
         session.actions.enable_mouse_capture()?;
         session.mouse = true;
+        session.actions.enable_focus_change()?;
+        session.focus_change = true;
         session.actions.enable_bracketed_paste()?;
         session.paste = true;
         Ok(session)
@@ -796,6 +829,10 @@ impl<A: TerminalActions> TerminalSession<A> {
         if self.paste {
             let _ = self.actions.disable_bracketed_paste();
             self.paste = false;
+        }
+        if self.focus_change {
+            let _ = self.actions.disable_focus_change();
+            self.focus_change = false;
         }
         if self.mouse {
             let _ = self.actions.disable_mouse_capture();
@@ -1163,23 +1200,32 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn crossterm_capture_emission_and_merged_loop_causally_deliver_mouse_and_agent_events() {
-        const ENABLE_MOUSE_CAPTURE_ANSI: &[u8] =
-            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+    #[derive(Clone)]
+    struct RecordingMouseCapture(Arc<Mutex<Vec<&'static str>>>);
 
+    impl MouseCaptureActions<SharedWriter> for RecordingMouseCapture {
+        fn enable(&mut self, _writer: &mut SharedWriter) -> io::Result<()> {
+            self.0.lock().unwrap().push("mouse:on");
+            Ok(())
+        }
+
+        fn disable(&mut self, _writer: &mut SharedWriter) -> io::Result<()> {
+            self.0.lock().unwrap().push("mouse:off");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_seam_and_merged_loop_causally_deliver_mouse_and_agent_events() {
         let output = SharedWriter::default();
-        let observed_output = Arc::clone(&output.0);
-        let mut session = TerminalSession::start(CrosstermActions::new(output, NoopRawMode))
-            .expect("production terminal setup");
-        assert!(
-            observed_output
-                .lock()
-                .unwrap()
-                .windows(ENABLE_MOUSE_CAPTURE_ANSI.len())
-                .any(|window| window == ENABLE_MOUSE_CAPTURE_ANSI),
-            "the production Crossterm capture path must emit every mouse tracking mode"
-        );
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = TerminalSession::start(CrosstermActions::with_mouse_capture(
+            output,
+            NoopRawMode,
+            RecordingMouseCapture(Arc::clone(&capture_log)),
+        ))
+        .expect("terminal setup through the injected capture seam");
+        assert_eq!(*capture_log.lock().unwrap(), ["mouse:on"]);
 
         let width = 80;
         let height = 24;
@@ -1233,6 +1279,44 @@ mod tests {
             "the actual `tui` composition source must reach the reducer"
         );
         assert!(final_state.should_exit);
+        drop(session);
+        assert_eq!(
+            *capture_log.lock().unwrap(),
+            ["mouse:on", "mouse:off"],
+            "the same capture controller must pair enable and disable"
+        );
+    }
+
+    #[test]
+    fn production_mouse_and_focus_commands_keep_crossterm_platform_dispatch() {
+        let source = include_str!("shell.rs");
+        let runtime_source = source
+            .split_once("mod tests {")
+            .expect("test module boundary")
+            .0;
+        assert!(runtime_source.contains("execute!(self.writer, command)"));
+        assert!(runtime_source.contains("mouse_capture: CrosstermMouseCapture"));
+        let native_capture = source
+            .split_once("impl<W: Write> MouseCaptureActions<W> for CrosstermMouseCapture")
+            .expect("native mouse capture implementation")
+            .1
+            .split_once("struct CrosstermActions")
+            .expect("end of native mouse capture implementation")
+            .0;
+        assert!(native_capture.contains("execute!(writer, EnableMouseCapture)"));
+        assert!(native_capture.contains("execute!(writer, DisableMouseCapture)"));
+
+        let production_actions = source
+            .split_once(
+                "impl<W: Write, R: RawModeActions, M: MouseCaptureActions<W>> TerminalActions",
+            )
+            .expect("production terminal actions")
+            .1
+            .split_once("/// Owns all terminal modes")
+            .expect("end of production terminal actions")
+            .0;
+        assert!(production_actions.contains("self.emit(EnableFocusChange)"));
+        assert!(production_actions.contains("self.emit(DisableFocusChange)"));
     }
 
     #[derive(Clone)]
@@ -1267,6 +1351,14 @@ mod tests {
             self.record("mouse:off");
             Ok(())
         }
+        fn enable_focus_change(&mut self) -> io::Result<()> {
+            self.record("focus:on");
+            Ok(())
+        }
+        fn disable_focus_change(&mut self) -> io::Result<()> {
+            self.record("focus:off");
+            Ok(())
+        }
         fn enable_bracketed_paste(&mut self) -> io::Result<()> {
             self.record("paste:on");
             Ok(())
@@ -1278,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn recorded_session_enables_mouse_and_paste_and_restores_normally() {
+    fn recorded_session_enables_input_modes_and_restores_normally() {
         let log = Arc::new(Mutex::new(Vec::new()));
         {
             let _session = TerminalSession::start(RecordingActions(Arc::clone(&log))).unwrap();
@@ -1289,8 +1381,10 @@ mod tests {
                 "raw:on",
                 "alternate:on",
                 "mouse:on",
+                "focus:on",
                 "paste:on",
                 "paste:off",
+                "focus:off",
                 "mouse:off",
                 "alternate:off",
                 "raw:off"
@@ -1311,6 +1405,7 @@ mod tests {
         assert!(caught.is_err());
         assert!(log.lock().unwrap().ends_with(&[
             "paste:off",
+            "focus:off",
             "mouse:off",
             "alternate:off",
             "raw:off"
@@ -1352,6 +1447,14 @@ mod tests {
             self.record("mouse:off");
             Ok(())
         }
+        fn enable_focus_change(&mut self) -> io::Result<()> {
+            self.record("focus:on");
+            Ok(())
+        }
+        fn disable_focus_change(&mut self) -> io::Result<()> {
+            self.record("focus:off");
+            Ok(())
+        }
         fn enable_bracketed_paste(&mut self) -> io::Result<()> {
             self.record("paste:on:error");
             Err(io::Error::other("injected paste setup failure"))
@@ -1375,7 +1478,9 @@ mod tests {
                 "raw:on",
                 "alternate:on",
                 "mouse:on",
+                "focus:on",
                 "paste:on:error",
+                "focus:off",
                 "mouse:off",
                 "alternate:off",
                 "raw:off"
