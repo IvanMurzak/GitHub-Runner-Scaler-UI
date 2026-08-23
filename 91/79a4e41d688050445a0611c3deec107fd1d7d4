@@ -1,0 +1,20 @@
+crates/app/src/tui/shell.rs
+  s_e3f2ebf0732f36::t_fe415057581c25 7,953-965,974,1336-1343
+  s_e3f2ebf0732f36::t_02103ca623cff7 1344-1347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "9179a4e41d688050445a0611c3deec107fd1d7d4",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
