@@ -1,0 +1,46 @@
+.taskflow/2026-08-21-local-runner-manager/02-target-architecture.md
+  s_e3f2ebf0732f36::t_06d42a3ccd508b 57
+crates/app/src/cli/service.rs
+  s_e3f2ebf0732f36::t_d1f3dce1435b1c 250,283-296,298-345,347
+  s_e3f2ebf0732f36::t_c9ad1a04a230ce 64-78,90-112,132-136,139-143,161-169,235,263-266,275-276
+  s_e3f2ebf0732f36::t_caccf6127c56e7 42-43
+  s_e3f2ebf0732f36::t_2a301f1698aa80 41
+  s_e3f2ebf0732f36::t_605bc3f5746f1e 197
+  s_e3f2ebf0732f36::t_d7f0d9174b471c 2-40,44-63,79-89,113-131,137-138,144-160,170-196,198-234,236-249,251-252,254-262,267-274,277-282,348-349
+  s_e3f2ebf0732f36::t_3c13cdfc0b59e4 253,297,346
+crates/app/tests/no_secret_reaches_command_output.rs
+  s_e3f2ebf0732f36::t_750ba4a6ff634d 119-125,127,207
+crates/app/src/cli/daemon.rs
+  s_e3f2ebf0732f36::t_a41d1389bfdbbd 2-4,6,8,10-24,29-101,106-108,110-132,135-151,153-158,160-240,254-299,337-338,342,364-373,400-405,407-417,439-440
+  s_e3f2ebf0732f36::t_6c838ba02f9ab1 5,7,300-304,316-336,339-341,343-363,374-399
+  s_e3f2ebf0732f36::t_d5bafbdbacfdad 9,25,27-28,109,133-134,241-243,245-253
+  s_e3f2ebf0732f36::t_0c8634b42fe9d8 152,244
+  s_e3f2ebf0732f36::t_605bc3f5746f1e 305-315
+  s_e3f2ebf0732f36::t_893fb5499d6c4d 406,418-438
+  s_e3f2ebf0732f36::t_a5c270653d372e 26,102-105,159
+crates/app/tests/cli_command_surface.rs
+  s_e3f2ebf0732f36::t_78d40dfaf02e5e 217-218,220-223,225-227,234-235,240-241,246-255,262
+  s_e3f2ebf0732f36::t_06d42a3ccd508b 39-40
+  s_e3f2ebf0732f36::t_8091d31c0439d1 38,41,256-261
+crates/app/src/cli/mod.rs
+  s_e3f2ebf0732f36::t_8e01d104a9bd47 592-622,633-634,644-650,715-734,978-991,1011-1012
+crates/platform/src/paths.rs
+  s_e3f2ebf0732f36::t_8e01d104a9bd47 167-185
+  s_e3f2ebf0732f36::t_b76697d6098400 186-188
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "49776c60648c26cd627f6a0d526669b6b2c6dc8a",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
