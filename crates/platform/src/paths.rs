@@ -164,6 +164,28 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Rebuilds a previously resolved four-directory layout.
+    ///
+    /// Service registrations use this to carry the installing operator's
+    /// application-data directories across the account boundary to the daemon.
+    /// It is deliberately distinct from [`Self::rooted_at`]: these paths are
+    /// already the four leaves, and forcing them under a new root would point
+    /// the service at a second SQLite database.
+    #[must_use]
+    pub fn from_directories(
+        config: impl Into<PathBuf>,
+        state: impl Into<PathBuf>,
+        runtime: impl Into<PathBuf>,
+        logs: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            config: config.into(),
+            state: state.into(),
+            runtime: runtime.into(),
+            logs: logs.into(),
+        }
+    }
+
     /// Resolves the platform-standard locations for this account.
     ///
     /// # Errors

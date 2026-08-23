@@ -211,27 +211,72 @@ fn an_undocumented_command_is_refused() {
     );
 }
 
-/// `f3`'s commands are declared and not implemented, and a script has
-/// to be able to tell that apart from a usage error.
 #[test]
-fn a_declared_but_unimplemented_command_exits_distinctly_from_a_usage_error() {
+fn service_set_start_mode_is_neither_listed_nor_accepted() {
+    let help = help_for(&["service"]);
+    assert!(
+        !commands_in(&help)
+            .iter()
+            .any(|name| name == "set-start-mode"),
+        "the immutable service surface must not advertise set-start-mode: {help}"
+    );
+
     let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.args(["service", "set-start-mode", "login"]);
+        command
+    });
+    assert_eq!(
+        outcome.code, 2,
+        "set-start-mode is not an F3 CLI command; stderr: {}",
+        outcome.stderr
+    );
+}
+
+/// `daemon run` is noninteractive: when another instance owns the host it
+/// returns immediately with the conflict class and names that holder.
+#[test]
+fn daemon_run_refuses_a_second_instance_without_prompting() {
+    use runner_manager_platform::lock::{HostLock, LockKind};
+    use runner_manager_platform::paths::AppPaths;
+
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let paths = AppPaths::rooted_at(temporary.path());
+    paths.create_all().unwrap();
+    let _held = HostLock::try_acquire(&paths, LockKind::SingleInstance).unwrap();
     let outcome = run({
         let mut command = runner_manager(temporary.path());
         command.args(["daemon", "run"]);
         command
     });
     assert_eq!(
-        outcome.code, 17,
-        "the not-implemented class; stderr: {}",
+        outcome.code, 11,
+        "the conflict class; stderr: {}",
         outcome.stderr
     );
     assert_ne!(outcome.code, 2, "and it must not be clap's usage code");
     assert!(
-        outcome.stderr.contains("task f3"),
-        "the message must name the task that owns it, so a reader knows this is an \
-         unfinished build rather than a typo: {}",
+        outcome.stderr.contains(&std::process::id().to_string()),
+        "the message must name the holder and return without reading stdin: {}",
         outcome.stderr
+    );
+}
+
+#[test]
+fn service_status_runs_unattended_and_reports_offline_honestly() {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.args(["service", "status"]);
+        command
+    });
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert!(outcome.stdout.contains("offline"), "{}", outcome.stdout);
+    assert!(
+        outcome.stdout.contains("no successful contact"),
+        "{}",
+        outcome.stdout
     );
 }
 
