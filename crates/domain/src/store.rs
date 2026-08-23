@@ -72,8 +72,8 @@ use uuid::Uuid;
 
 use crate::attempt::{AttemptError, AttemptOutcome, AttemptState, PersistedAttempt, RunnerAttempt};
 use crate::model::{
-    Arch, AttemptId, CachePolicy, Clock, Host, HostId, Os, PolicyId, RefreshInterval, ScaleTarget,
-    StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
+    Arch, AttemptId, CachePolicy, Clock, Host, HostId, HostLabel, Os, PolicyId, RefreshInterval,
+    ScaleTarget, StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
 };
 use crate::policy::{PersistedPolicy, PolicyError, PolicyState, RoutingLabels, ScalePolicy};
 
@@ -269,18 +269,25 @@ struct Migration {
 /// Adding a step means adding a numbered `.sql` file beside this module and one
 /// entry here. It never means editing an applied file; see the header of
 /// `store/migrations/0001_initial_schema.sql`.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_schema",
-    sql: include_str!("store/migrations/0001_initial_schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        sql: include_str!("store/migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "policy_host_label",
+        sql: include_str!("store/migrations/0002_policy_host_label.sql"),
+    },
+];
 
 /// The schema version this build writes and understands.
 ///
 /// A database above this is refused with [`StoreError::SchemaTooNew`]; a database
 /// below it is migrated up on open. Both directions are decided from the
 /// `schema_migrations` table, which records every applied step and when.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Created outside the numbered chain, because the chain needs somewhere to
 /// record itself before its first step runs.
@@ -873,11 +880,11 @@ impl Store for SqliteStore {
         conn.execute(
             "INSERT INTO policies (
                  id, target_scope, target_slug, installation_id, host_id,
-                 routing_labels, min_capacity, max_capacity, enabled, state,
+                 requested_host_label, routing_labels, min_capacity, max_capacity, enabled, state,
                  cache_policy, revision
              ) VALUES (
                  :id, :target_scope, :target_slug, :installation_id, :host_id,
-                 :routing_labels, :min_capacity, :max_capacity, :enabled, :state,
+                 :requested_host_label, :routing_labels, :min_capacity, :max_capacity, :enabled, :state,
                  :cache_policy, :revision
              )",
             &bind(&params)[..],
@@ -941,6 +948,7 @@ impl Store for SqliteStore {
                  target_slug     = :target_slug,
                  installation_id = :installation_id,
                  host_id         = :host_id,
+                 requested_host_label = :requested_host_label,
                  routing_labels  = :routing_labels,
                  min_capacity    = :min_capacity,
                  max_capacity    = :max_capacity,
@@ -1122,6 +1130,10 @@ fn policy_params(fields: &PersistedPolicy) -> Result<NamedParams, StoreError> {
         ),
         (":host_id", text(uuid_text(fields.host_id.as_uuid()))),
         (
+            ":requested_host_label",
+            text(fields.requested_host_label.to_string()),
+        ),
+        (
             ":routing_labels",
             opt_text(fields.routing_labels.as_ref().map(json)),
         ),
@@ -1259,6 +1271,11 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
         target,
         installation_id: u64_column(row, TABLE, "installation_id", &key)?,
         host_id: HostId::from_uuid(uuid_column(row, TABLE, "host_id")?),
+        requested_host_label: HostLabel::new(row.get::<_, String>("requested_host_label")?)
+            .map_err(|source| StoreError::CorruptPolicy {
+                id,
+                source: PolicyError::Invalid(source),
+            })?,
         routing_labels,
         min_capacity: u16_column(row, TABLE, "min_capacity", &key)?,
         max_capacity,
