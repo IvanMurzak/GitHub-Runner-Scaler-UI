@@ -1,0 +1,45 @@
+crates/agent/src/lifecycle.rs
+  s_e3f2ebf0732f36::t_ebe32ab44605f0 1679,1691,1732,1735,1739
+  s_e3f2ebf0732f36::t_edcffbb68a09c2 901-907,915-926
+  s_e3f2ebf0732f36::t_316476399b3d73 536,544-565,582-589,660
+  s_e3f2ebf0732f36::t_5c33d97fd30439 3032-3036
+  s_e3f2ebf0732f36::t_5c7cf31d208e17 41,1454-1457
+  s_e3f2ebf0732f36::t_8a1cedb167dc28 293,299-317,356,1433,1443-1447,1734
+  s_e3f2ebf0732f36::t_1556122fd5619e 2777-2787
+  s_e3f2ebf0732f36::t_915f25c2b765c5 362-365
+  s_e3f2ebf0732f36::t_cd17d53b8765a5 2962-2989,3021
+  s_e3f2ebf0732f36::t_18a50ed5b307ba 1458-1462
+  s_e3f2ebf0732f36::t_45027d72d95839 291,294,354,357,360-361,366-368
+  s_d14c0886a58be6::t_b568b5f7022deb 318
+crates/agent/src/reconcile.rs
+  s_e3f2ebf0732f36::t_55324c6a721c95 808-811
+  s_e3f2ebf0732f36::t_062ab9746de703 826-832,884-888
+  s_e3f2ebf0732f36::t_18a50ed5b307ba 880-883,889
+  s_e3f2ebf0732f36::t_edcffbb68a09c2 833-834,890,1566-1568,1760,1768,1774-1788,1841-1843,2416,2475-2479,2484-2504,3193-3218
+crates/agent/src/package.rs
+  s_e3f2ebf0732f36::t_45027d72d95839 1740
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "99199ce08164b49bb0d64b137dbf641d5e149702",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
