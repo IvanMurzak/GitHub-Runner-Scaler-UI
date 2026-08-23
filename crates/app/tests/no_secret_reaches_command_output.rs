@@ -356,11 +356,17 @@ fn the_scanned_corpus_contains_what_it_should_contain() {
         everything.contains("\"schema_version\""),
         "`status --json` must be in the corpus"
     );
-    assert!(
-        everything.contains("task f2") && everything.contains("task f3"),
-        "the declared-but-unimplemented commands must have been run too: the gate is over \
-         the FULL command set, and a command nobody ran cannot leak in a test"
-    );
+    for arguments in COMMANDS {
+        let command = arguments.join(" ");
+        for stream in ["stdout", "stderr"] {
+            let origin = format!("`{command}` {stream}");
+            assert!(
+                corpus.iter().any(|fragment| fragment.origin == origin),
+                "{origin} must be in the scanned corpus: the gate is over the FULL command \
+                 set, and a command nobody ran cannot leak in a test"
+            );
+        }
+    }
 
     // The diagnostics file exists and was written to, so "no secret in the
     // logs" is a statement about logs that exist.

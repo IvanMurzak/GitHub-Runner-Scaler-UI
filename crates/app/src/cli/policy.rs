@@ -241,8 +241,26 @@ fn record_policy_with_id(
         CachePolicy::default(),
     );
     if let Err(initial_failure) = store.insert_policy(&policy) {
-        let mut repair = policy.clone();
-        if repair.repair_required().is_ok() && store.insert_policy(&repair).is_ok() {
+        // A failed write can be ambiguous: the database may have committed the
+        // row before reporting an I/O failure. Re-read by the generated id
+        // before deciding whether repair is an insert or an update. Trying a
+        // second insert unconditionally leaves an ambiguously committed row in
+        // `pending`, because the second insert correctly reports AlreadyExists.
+        let persisted = store.policy(policy.id).map_err(store_failure)?;
+        let was_persisted = persisted.is_some();
+        let mut repair = match persisted {
+            Some(existing) if existing == policy => existing,
+            Some(_) => return Err(store_failure(initial_failure)),
+            None => policy.clone(),
+        };
+        let expected_revision = repair.revision();
+        if repair.repair_required().is_ok()
+            && if was_persisted {
+                store.update_policy(&repair, expected_revision).is_ok()
+            } else {
+                store.insert_policy(&repair).is_ok()
+            }
+        {
             let command = format!(
                 "runner-manager {} remove {} --purge",
                 scope_word(repair.target.scope()),
@@ -656,13 +674,13 @@ mod tests {
     use runner_manager_domain::store::SqliteStore;
 
     #[derive(Debug)]
-    struct FailFirstPolicyInsert {
+    struct AmbiguousFirstPolicyInsert {
         inner: SqliteStore,
         fail_next_insert: AtomicBool,
         remove_policy_calls: AtomicUsize,
     }
 
-    impl FailFirstPolicyInsert {
+    impl AmbiguousFirstPolicyInsert {
         fn new() -> Self {
             Self {
                 inner: SqliteStore::open_in_memory().unwrap(),
@@ -672,7 +690,7 @@ mod tests {
         }
     }
 
-    impl Store for FailFirstPolicyInsert {
+    impl Store for AmbiguousFirstPolicyInsert {
         fn put_host(&self, host: &Host) -> Result<(), StoreError> {
             self.inner.put_host(host)
         }
@@ -687,8 +705,9 @@ mod tests {
 
         fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
             if self.fail_next_insert.swap(false, Ordering::SeqCst) {
+                self.inner.insert_policy(policy)?;
                 return Err(StoreError::AlreadyExists {
-                    what: "fault-injected policy insert",
+                    what: "ambiguously committed policy",
                     id: policy.id.to_string(),
                 });
             }
@@ -903,8 +922,8 @@ mod tests {
     }
 
     #[test]
-    fn faulted_initial_insert_persists_repair_state_and_prints_the_repair_command() {
-        let store = FailFirstPolicyInsert::new();
+    fn ambiguously_committed_initial_insert_is_updated_to_repair_required() {
+        let store = AmbiguousFirstPolicyInsert::new();
         let local = host("machine");
         store.put_host(&local).unwrap();
         let policy_id = PolicyId::new_random();
