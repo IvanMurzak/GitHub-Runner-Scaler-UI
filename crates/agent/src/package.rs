@@ -69,6 +69,26 @@
 //!    package cache. [`PackageCache::lease`] **enforces** this rather than
 //!    documenting it: a lease whose attempt's runtime path resolves inside the
 //!    cache root is refused.
+//!
+//! # What is built here and not yet reachable in production
+//!
+//! Two mechanisms in this module are complete and tested but have no live
+//! caller, and both are easier to find written down here than inferred from an
+//! absence:
+//!
+//! * **[`PinnedDigests`] has no operator-facing surface.** It is the entire
+//!   remedy [`PackageError::ChecksumAbsent`] names, and today it can only be
+//!   supplied by [`PackageCache::with_pins`] from Rust. Until a configuration
+//!   or CLI path reaches it, an operator who hits that refusal has been given
+//!   an instruction they cannot carry out. Wiring it is a `g`/`f`-group
+//!   concern, not this module's.
+//! * **[`PackageError::VersionRejected`] cannot be produced through the real
+//!   adapter.** [`GatewayCatalog`] maps every `InventoryError` to the retryable
+//!   [`PackageError::CatalogUnavailable`], correctly — the downloads endpoint
+//!   has no version-rejection response. The rejection lands at *registration*,
+//!   which is `e3`'s path, and [`DownloadCatalog`] exists to carry it here when
+//!   `e3` reports it. So the no-retry behaviour is proven and nothing yet
+//!   supplies its input.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -77,7 +97,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use runner_manager_domain::attempt::{FailureReason, RunnerAttempt};
+use runner_manager_domain::attempt::{AttemptState, FailureReason, RunnerAttempt};
 use runner_manager_domain::model::{Arch, AttemptId, Clock, Elapsed, Os, Timestamp};
 use runner_manager_github::rest::{RunnerDownload, RunnerDownloads};
 use runner_manager_platform::os::{self as host_os, UnsupportedHost};
@@ -191,12 +211,13 @@ impl RunnerVersion {
     /// when the trailing segment is not a version.
     pub fn from_filename(filename: &str) -> Result<Self, PackageError> {
         let (stem, _) = ArchiveKind::split(filename)?;
-        let last = stem
-            .rsplit('-')
-            .next()
-            .ok_or_else(|| PackageError::UnrecognisedVersion {
-                raw: filename.to_string(),
-            })?;
+        // `rsplit` always yields at least one item — the whole string when
+        // there is no `-` — so this cannot be `None`. `unwrap_or(stem)` says
+        // that, where the `ok_or_else` it replaced dressed an unreachable arm
+        // up as a handled error and invited a reader to look for the input that
+        // reaches it. If there is no `-`, the whole stem is the candidate and
+        // `parse` refuses it.
+        let last = stem.rsplit('-').next().unwrap_or(stem);
         Self::parse(last)
     }
 
@@ -279,6 +300,40 @@ impl TryFrom<String> for Sha256Hex {
 impl From<Sha256Hex> for String {
     fn from(value: Sha256Hex) -> Self {
         value.0
+    }
+}
+
+/// Which unusable shape GitHub's optional `sha256_checksum` arrived in.
+///
+/// Three distinct facts about the response, one shared remedy. They are not
+/// collapsed into a boolean because the operator reading the refusal is
+/// troubleshooting GitHub's response, and "the field was missing", "the field
+/// was blank" and "the field was not a digest" send them to three different
+/// places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedChecksum {
+    /// The field was not present at all.
+    Absent,
+    /// The field was present and blank.
+    Empty,
+    /// The field was present and was not 64 hexadecimal characters.
+    Malformed,
+}
+
+impl PublishedChecksum {
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Absent => "no sha256_checksum",
+            Self::Empty => "an empty sha256_checksum",
+            Self::Malformed => "a malformed sha256_checksum",
+        }
+    }
+}
+
+impl fmt::Display for PublishedChecksum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.describe())
     }
 }
 
@@ -378,24 +433,29 @@ pub enum PackageError {
     #[error("GitHub publishes no runner package for {os}/{arch}")]
     NoPackagePublished { os: Os, arch: Arch },
 
-    /// GitHub published no usable `sha256_checksum` and no operator-pinned
+    /// GitHub published no *usable* `sha256_checksum` and no operator-pinned
     /// digest is configured. Terminal: the agent fails closed
     /// (`05-infrastructure.md`).
     ///
-    /// `empty` distinguishes a field GitHub omitted from one it sent as `""`.
-    /// Both are unusable, but they are different facts about the response and
-    /// `c3` deliberately keeps them apart.
+    /// `published` says which of the three unusable shapes arrived. They are
+    /// kept apart because they are different facts about GitHub's response —
+    /// `c3` distinguishes absent from empty deliberately — and because an
+    /// operator reading this is entitled to the one that actually happened.
+    /// **All three carry the same remedy, and that is the point of the variant:
+    /// every unusable shape routes to the operator-pinned digest.** An earlier
+    /// version let a malformed value bypass the pin and then told the operator
+    /// to pin one, which was advice that could not work.
     #[error(
         "GitHub published {} for runner package {version} ({os}/{arch}), so it \
          cannot be verified and will not be installed. Pin the digest you have \
          independently confirmed for {version} and retry.",
-        if *empty { "an empty sha256_checksum" } else { "no sha256_checksum" }
+        published.describe()
     )]
     ChecksumAbsent {
         version: RunnerVersion,
         os: Os,
         arch: Arch,
-        empty: bool,
+        published: PublishedChecksum,
     },
 
     /// The bytes on disk are not the bytes GitHub published. The partial file
@@ -468,7 +528,11 @@ pub enum PackageError {
     VersionInUse {
         version: RunnerVersion,
         attempt: AttemptId,
-        state: &'static str,
+        /// `b1`'s type, rendered by `b1`'s `Display`. This module had its own
+        /// nine-arm `match` producing the same nine strings; a second rendering
+        /// of someone else's enum is a second thing to keep in step, and it
+        /// silently stops matching the moment a state is added.
+        state: AttemptState,
     },
 
     /// A prune was refused because a lease names an attempt the caller did not
@@ -483,6 +547,15 @@ pub enum PackageError {
         version: RunnerVersion,
         attempt: AttemptId,
     },
+
+    /// A lease file exists but cannot be understood, so what it holds is
+    /// unknown and no prune can be shown to be safe.
+    #[error(
+        "the runner package lease at `{}` cannot be read, so which version it \
+         holds is unknown; refusing to prune anything until it is resolved",
+        path.display()
+    )]
+    UnreadableLease { path: PathBuf },
 
     /// A lease was refused because the attempt's workspace is inside the cache.
     #[error(
@@ -537,6 +610,7 @@ impl PackageError {
             | Self::UnsafeArchiveEntry { .. }
             | Self::VersionInUse { .. }
             | Self::VersionHeldByUnknownAttempt { .. }
+            | Self::UnreadableLease { .. }
             | Self::WorkspaceInsideCache { .. }
             | Self::NotInstalled { .. } => true,
             // A truncated transfer, a 5xx, a rate limit, a locked file: the next
@@ -608,6 +682,10 @@ impl PackageError {
             Self::VersionHeldByUnknownAttempt { .. } => Some(
                 "release the lease for the attempt named above if it is known to \
                  be gone, then prune again",
+            ),
+            Self::UnreadableLease { .. } => Some(
+                "inspect the lease file named above; delete it once the attempt \
+                 it belonged to is known to be gone, then prune again",
             ),
             Self::WorkspaceInsideCache { .. } => {
                 Some("place job workspaces under the runtime directory")
@@ -1225,25 +1303,36 @@ impl PackageCache {
     /// This is the fail-closed gate. `sha256_checksum` is optional in GitHub's
     /// schema, and the only two acceptable outcomes when it is unusable are an
     /// operator-pinned digest or a refusal to install. There is no third.
+    ///
+    /// # Every unusable shape routes to the same remedy
+    ///
+    /// Absent, empty, and *malformed* are all "GitHub did not give me a digest
+    /// I can check", and all three fall through to the pin. Malformed used to
+    /// return immediately instead, which produced a refusal whose message told
+    /// the operator to pin a digest — down a path where a pin was never
+    /// consulted. A security refusal that names a remedy has to name one that
+    /// works, or the operator does the work and watches it fail again.
     fn required_digest(
         &self,
         download: &RunnerDownload,
         version: &RunnerVersion,
     ) -> Result<Sha256Hex, PackageError> {
-        match download.sha256_checksum() {
-            Some(raw) if !raw.trim().is_empty() => Sha256Hex::parse(raw),
-            published => match self.pins.get(version) {
-                Some(pinned) => Ok(pinned.clone()),
-                None => Err(PackageError::ChecksumAbsent {
-                    version: version.clone(),
-                    os: self.os,
-                    arch: self.arch,
-                    // `c3` keeps "absent" and "empty" apart deliberately; both
-                    // are unusable, but they are different facts about the
-                    // response and the operator is owed the one that happened.
-                    empty: published.is_some(),
-                }),
+        let published = match download.sha256_checksum() {
+            None => PublishedChecksum::Absent,
+            Some(raw) if raw.trim().is_empty() => PublishedChecksum::Empty,
+            Some(raw) => match Sha256Hex::parse(raw) {
+                Ok(digest) => return Ok(digest),
+                Err(_) => PublishedChecksum::Malformed,
             },
+        };
+        match self.pins.get(version) {
+            Some(pinned) => Ok(pinned.clone()),
+            None => Err(PackageError::ChecksumAbsent {
+                version: version.clone(),
+                os: self.os,
+                arch: self.arch,
+                published,
+            }),
         }
     }
 
@@ -1251,12 +1340,20 @@ impl PackageCache {
     ///
     /// # Why the downloaded file is not inside the guarded staging directory
     ///
-    /// [`StagingGuard`] removes the *extraction* directory on every path out of
-    /// here, which is right for a half-unpacked tree. Putting the download under
-    /// it too would have made "the partially downloaded file is removed" true
-    /// for a reason no test could distinguish from tidying up — the guard would
-    /// remove the archive whether or not the mismatch path ever did, so deleting
-    /// the removal would not turn any test red. The archive therefore lives
+    /// [`StagingGuard`] covers the *extraction* directory from the point the
+    /// archive has been verified and unpacked to the point the entry lands —
+    /// the manifest write and the rename. It does **not** cover a fetch,
+    /// verification or extraction failure: the guard is not constructed until
+    /// after those succeed, so a half-unpacked tree from one of them is left
+    /// for [`Self::sweep_staging`] rather than unwound here. That is a
+    /// deliberately narrow reach, and stating it wider than it is would be the
+    /// sort of claim a reader relies on and a crash disproves.
+    ///
+    /// Putting the download under that directory would have made "the partially
+    /// downloaded file is removed" true for a reason no test could distinguish
+    /// from tidying up — the guard would remove the archive on the paths it
+    /// does cover, whether or not the mismatch path ever did, so deleting the
+    /// removal would not turn any test red. The archive therefore lives
     /// beside the extraction directory with its lifetime managed explicitly, at
     /// exactly one place below, and [`Self::sweep_staging`] is the backstop for
     /// a crash rather than the mechanism.
@@ -1558,15 +1655,22 @@ impl PackageCache {
             if path.extension().and_then(|e| e.to_str()) != Some(LEASE_EXTENSION) {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
-                continue;
-            };
-            let Some(lease) = read_json::<Lease>(&path)? else {
-                continue;
-            };
+            // Everything below refuses rather than skips.
+            //
+            // A `.lease` file this module cannot make sense of is not "no
+            // lease" — it is a lease whose holder is unknown, and treating the
+            // two alike is the one fail-OPEN path in an otherwise fail-closed
+            // guard. It would also be among the easiest to reach: a lease is
+            // written non-atomically, so a crash mid-write leaves exactly this
+            // shape, and the consequence is deleting the package a live runner
+            // is executing from.
+            let unreadable = || PackageError::UnreadableLease { path: path.clone() };
+            let uuid = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+                .ok_or_else(unreadable)?;
+            let lease = read_lease(&path)?.ok_or_else(unreadable)?;
             if lease.version == *version {
                 holders.push(AttemptId::from_uuid(uuid));
             }
@@ -1604,6 +1708,27 @@ impl PackageCache {
     /// can refuse to prune something it knows is held; it cannot discover a
     /// reference nobody recorded. See the module documentation's seam contract.
     ///
+    /// # A window this function does not close, recorded deliberately
+    ///
+    /// [`Self::lease`] and this method both take `&self` on a `Send + Sync`
+    /// type and take no lock between them. A `lease` that passes its own
+    /// `entry()` check can therefore be written *after* this method has read
+    /// [`Self::holders`] and *before* it removes the directory, leaving a live
+    /// attempt holding a package that is gone. Nothing here detects that.
+    ///
+    /// It is not closed with a lock of this module's own, because a second lock
+    /// beside `e1`'s host allocation lock is a second ordering to get wrong.
+    /// **The caller must prune under the same host-wide allocation lock it
+    /// launches under** — that lock already serialises the launch that takes a
+    /// lease, so holding it here makes the read-then-remove indivisible with
+    /// respect to every lease this agent creates. It does not protect against a
+    /// second agent on the same machine, which the single-instance lock is
+    /// there to prevent.
+    ///
+    /// Stated rather than silently assumed: an unstated locking requirement is
+    /// exactly the shape of defect `e1` reported when a caller was left to
+    /// supply an attempt set separately from the thing that created it.
+    ///
     /// # Errors
     /// [`PackageError::VersionInUse`],
     /// [`PackageError::VersionHeldByUnknownAttempt`],
@@ -1625,7 +1750,7 @@ impl PackageCache {
                     return Err(PackageError::VersionInUse {
                         version: version.clone(),
                         attempt: *holder,
-                        state: state_name(attempt),
+                        state: attempt.state(),
                     });
                 }
                 Some(_) => {}
@@ -1700,22 +1825,6 @@ impl PackageCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lease {
     version: RunnerVersion,
-}
-
-/// A stable name for an attempt's state, for an error message.
-fn state_name(attempt: &RunnerAttempt) -> &'static str {
-    use runner_manager_domain::attempt::AttemptState as S;
-    match attempt.state() {
-        S::Allocated => "allocated",
-        S::JitReceived => "jit_received",
-        S::Starting => "starting",
-        S::Idle => "idle",
-        S::Busy => "busy",
-        S::Finished => "finished",
-        S::Failed => "failed",
-        S::Orphaned => "orphaned",
-        S::Cleaned => "cleaned",
-    }
 }
 
 /// Removes a staging directory unless the install committed it.
@@ -1811,7 +1920,7 @@ fn extract_zip(archive: &Path, into: &Path) -> Result<(), PackageError> {
             path: destination.clone(),
             source,
         })?;
-        set_executable(&destination, entry.unix_mode())?;
+        apply_mode_policy(&destination, entry.unix_mode())?;
     }
     Ok(())
 }
@@ -1830,17 +1939,67 @@ fn extract_tar_gz(archive: &Path, into: &Path) -> Result<(), PackageError> {
         let mut entry = entry.map_err(|source| PackageError::Extract {
             detail: source.to_string(),
         })?;
-        let path = entry.path().map_err(|source| PackageError::Extract {
-            detail: source.to_string(),
-        })?;
-        let display = path.display().to_string();
-        // Our own containment check, before `tar`'s. It costs a path walk and
-        // it means the refusal is this module's behaviour rather than a
-        // dependency's default that a version bump could change.
-        resolve_inside(into, path.as_ref(), &display)?;
-        // The runner's `run.sh`, `config.sh` and `bin/*` are useless without
-        // their mode bits.
-        entry.set_preserve_permissions(true);
+
+        // Everything is read out of the header up front: `entry` is borrowed
+        // mutably below, and a `Cow` borrowed from it cannot survive that.
+        let relative = entry
+            .path()
+            .map_err(|source| PackageError::Extract {
+                detail: source.to_string(),
+            })?
+            .into_owned();
+        let display = relative.display().to_string();
+        let kind = entry.header().entry_type();
+        let mode = entry
+            .header()
+            .mode()
+            .map_err(|source| PackageError::Extract {
+                detail: source.to_string(),
+            })?;
+        let link_target = entry
+            .link_name()
+            .map_err(|source| PackageError::Extract {
+                detail: source.to_string(),
+            })?
+            .map(|target| target.into_owned());
+
+        // This module's own containment check, before `tar`'s. Its result is
+        // load-bearing rather than discarded: `destination` is what the mode
+        // policy is applied to below, so removing this call does not compile.
+        let destination = resolve_inside(into, &relative, &display)?;
+
+        // A link's *target* is a second path, and `tar` does not check it
+        // against the extraction root. An unvalidated one is the classic
+        // archive escape: a link out of the tree, then a later entry written
+        // through it. `extract_zip` refuses links outright because a Windows
+        // package has never carried one and creating one needs a privilege
+        // this agent should not want. That reasoning is Windows-specific, so
+        // rather than copy the conclusion this path checks the target: a link
+        // that stays inside the package is legitimate on Unix and is kept, and
+        // one that reaches outside is refused.
+        if matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
+            let target =
+                link_target
+                    .as_deref()
+                    .ok_or_else(|| PackageError::UnsafeArchiveEntry {
+                        entry: display.clone(),
+                    })?;
+            resolve_link_target(into, &destination, kind, target, &display)?;
+        }
+
+        // `tar`'s own mode handling has to be turned *down* here, not up.
+        //
+        // `set_preserve_permissions(true)` is weaker than the default, not
+        // stronger: `Entry::_set_perms` computes
+        // `let mode = if preserve { mode } else { mode & 0o777 }; mode & !mask`
+        // with `mask` defaulting to zero, so preserving applies setuid, setgid,
+        // sticky and world-writable bits exactly as published. On a package
+        // fetched over the network that is the wrong direction. `false` drops
+        // the top three bits and the mask drops every group and other bit, so
+        // nothing dangerous exists on disk even momentarily; the policy below
+        // then sets the mode this agent actually intends.
+        entry.set_preserve_permissions(false);
+        entry.set_mask(0o077);
         let unpacked = entry
             .unpack_in(into)
             .map_err(|source| PackageError::Extract {
@@ -1849,6 +2008,57 @@ fn extract_tar_gz(archive: &Path, into: &Path) -> Result<(), PackageError> {
         if !unpacked {
             return Err(PackageError::UnsafeArchiveEntry { entry: display });
         }
+
+        // Links are skipped: a symlink's own mode is meaningless, and
+        // `set_permissions` follows the link and would change the target's.
+        if !matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
+            apply_mode_policy(&destination, Some(mode))?;
+        }
+    }
+    Ok(())
+}
+
+/// Prove an archive link's target cannot reach outside the package.
+///
+/// A symlink's target is resolved relative to the link's own directory; a hard
+/// link's is relative to the archive root. Both must land inside `into`, and an
+/// absolute target is refused outright — nothing GitHub publishes needs one,
+/// and it is the shape an escape takes.
+fn resolve_link_target(
+    into: &Path,
+    entry_destination: &Path,
+    kind: tar::EntryType,
+    target: &Path,
+    raw: &str,
+) -> Result<(), PackageError> {
+    let unsafe_entry = || PackageError::UnsafeArchiveEntry {
+        entry: raw.to_string(),
+    };
+    if target.is_absolute() {
+        return Err(unsafe_entry());
+    }
+    let mut resolved = if matches!(kind, tar::EntryType::Symlink) {
+        entry_destination.parent().unwrap_or(into).to_path_buf()
+    } else {
+        into.to_path_buf()
+    };
+    for component in target.components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            // Climbing is legitimate inside a package — `bin/current` may point
+            // at `../run.sh` — so it is followed rather than refused, and the
+            // containment check below is what decides.
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(unsafe_entry());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Err(unsafe_entry()),
+        }
+    }
+    if !is_inside(into, &resolved) {
+        return Err(unsafe_entry());
     }
     Ok(())
 }
@@ -1885,6 +2095,18 @@ fn resolve_inside(root: &Path, relative: &Path, raw: &str) -> Result<PathBuf, Pa
 /// Lexical on purpose: it must answer for paths that do not exist yet — an
 /// archive entry's destination, an attempt's runtime directory before `e3`
 /// creates it — and `canonicalize` cannot.
+///
+/// # Known limit
+///
+/// Components are compared byte-exactly, so on Windows a path differing from
+/// the root only in case, or reaching it through an 8.3 short name, is not
+/// recognised as inside. That would weaken [`PackageCache::lease`]'s workspace
+/// guard, which is the caller that matters. It is latent rather than live:
+/// every path on both sides of that comparison is derived from the same
+/// [`AppPaths`] instance, so the spellings match by construction. Case-folding
+/// here would be wrong for the archive-entry caller, where two entries
+/// differing only in case are two entries — closing it properly means a
+/// platform-aware comparison, not a `to_lowercase`.
 fn is_inside(root: &Path, candidate: &Path) -> bool {
     let normalise = |path: &Path| -> Vec<std::ffi::OsString> {
         path.components()
@@ -1909,24 +2131,60 @@ fn is_inside(root: &Path, candidate: &Path) -> bool {
     candidate.len() >= root.len() && candidate[..root.len()] == root[..]
 }
 
-#[cfg(unix)]
-fn set_executable(path: &Path, mode: Option<u32>) -> Result<(), PackageError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let Some(mode) = mode else { return Ok(()) };
-    // Only the executable bits are honoured. A mode from an archive is not a
-    // security decision this agent delegates: group- and world-writable bits
-    // from a package would be, so they are dropped.
-    let mode = (mode & 0o111) | 0o600;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| PackageError::Io {
-        what: "set permissions on an extracted runner package file",
-        path: path.to_path_buf(),
-        source,
-    })
+/// The only mode this agent ever applies to something it extracted.
+///
+/// **A mode published in an archive is not a security decision this agent
+/// delegates.** Exactly one bit group is honoured — the executable bits,
+/// because the runner's `run.sh`, `config.sh` and `bin/*` are useless without
+/// them — and the owner gets read and write so the tree is usable. Everything
+/// else is dropped: setuid and setgid, which would turn a downloaded package
+/// into a privilege escalation; the sticky bit; and every group and other bit,
+/// which would let another account on the machine rewrite the binaries every
+/// future runner is launched from.
+///
+/// The result is **owner-only**, matching the `0700` posture `d1` already uses
+/// for every directory it creates. Writing this as `(published & 0o111) |
+/// 0o600` looks equivalent and is not: it carries the *group and other*
+/// execute bits straight through from the archive, so a published `0755` would
+/// leave every account on the machine able to execute the runner binaries. The
+/// archive's only say here is whether the file is executable at all.
+///
+/// Deliberately **not** `cfg`-gated and deliberately pure, so the policy has
+/// one definition, both extraction paths reach the same one, and it can be
+/// asserted on a CI leg whose filesystem has no modes at all.
+const fn policy_mode(published: u32) -> u32 {
+    if published & 0o111 == 0 { 0o600 } else { 0o700 }
 }
 
-#[cfg(not(unix))]
-fn set_executable(_path: &Path, _mode: Option<u32>) -> Result<(), PackageError> {
-    Ok(())
+/// Apply [`policy_mode`] to something just extracted.
+///
+/// One function rather than a `cfg`-gated pair, so [`policy_mode`] is reached
+/// on every target. As two functions the Windows build never called it, and
+/// `-D warnings` failed the Windows leg on dead code — a small thing, but it
+/// pointed at a real one: a security policy that is compiled out on a platform
+/// is a policy nobody can be sure still exists there.
+fn apply_mode_policy(path: &Path, mode: Option<u32>) -> Result<(), PackageError> {
+    let Some(published) = mode else { return Ok(()) };
+    let mode = policy_mode(published);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+            PackageError::Io {
+                what: "set permissions on an extracted runner package file",
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode bits to apply, and the `.zip` packages are the
+        // Windows ones — which is exactly why the policy has to be enforced on
+        // the `.tar.gz` path, the one that runs where modes exist.
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,6 +2226,38 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PackageError> 
     })
 }
 
+/// Reads one lease, strictly.
+///
+/// The counterpart of [`read_json`], and deliberately not the same policy.
+/// `read_json` treats a corrupt file as absent, which is right for a
+/// **manifest**: the fallback there is "this directory is not an entry", and
+/// the caller's next move is the same either way. It is wrong for a **lease**,
+/// where the fallback would be "nothing holds this version" — the most
+/// dangerous answer this module can give, and the one thing that would make an
+/// otherwise fail-closed prune guard fail open.
+///
+/// # Errors
+/// [`PackageError::UnreadableLease`] when the file exists and does not parse,
+/// [`PackageError::Io`] when it cannot be read at all.
+fn read_lease(path: &Path) -> Result<Option<Lease>, PackageError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(PackageError::Io {
+                what: "read a runner package lease",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| PackageError::UnreadableLease {
+            path: path.to_path_buf(),
+        })
+}
+
 /// Reads a JSON file, answering `None` when it is absent or unreadable as `T`.
 ///
 /// A corrupt manifest reads as "not an entry" rather than as an error: the
@@ -1997,7 +2287,6 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Pac
 mod tests {
     use super::*;
 
-    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2073,6 +2362,71 @@ mod tests {
             .expect("finish the tar")
             .finish()
             .expect("finish the gzip")
+    }
+
+    /// A `.tar.gz` carrying one entry with an exact mode and entry type.
+    ///
+    /// `tar::Header::set_mode` writes the value verbatim with no masking, which
+    /// is what lets a fixture carry a setuid bit — the thing a published
+    /// archive could carry and this module must refuse to apply.
+    fn tar_gz_special(
+        name: &str,
+        body: &str,
+        mode: u32,
+        kind: tar::EntryType,
+        link_target: Option<&str>,
+    ) -> Vec<u8> {
+        let is_link = matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(if is_link { 0 } else { body.len() as u64 });
+        header.set_mode(mode);
+        header.set_entry_type(kind);
+        if let Some(target) = link_target {
+            header
+                .set_link_name_literal(target)
+                .expect("a raw link target");
+        }
+        {
+            let gnu = header.as_gnu_mut().expect("a GNU header");
+            let bytes = name.as_bytes();
+            assert!(bytes.len() < gnu.name.len(), "the fixture name must fit");
+            gnu.name[..bytes.len()].copy_from_slice(bytes);
+        }
+        header.set_cksum();
+
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let data: &[u8] = if is_link { &[] } else { body.as_bytes() };
+        builder
+            .append(&header, data)
+            .expect("append a raw tar entry");
+        builder
+            .into_inner()
+            .expect("finish the tar")
+            .finish()
+            .expect("finish the gzip")
+    }
+
+    /// Read one entry's header back out of a `.tar.gz`.
+    ///
+    /// Every fixture below is checked through this before it is used. A test
+    /// that asserts "the setuid bit was not applied" proves nothing if the
+    /// fixture never carried one.
+    fn first_entry_header(bytes: &[u8]) -> (u32, tar::EntryType, Option<PathBuf>) {
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(io::Cursor::new(
+            bytes.to_vec(),
+        )));
+        let mut entries = archive.entries().expect("entries");
+        let entry = entries
+            .next()
+            .expect("one entry")
+            .expect("a readable entry");
+        let link = entry
+            .link_name()
+            .expect("a link name field")
+            .map(|path| path.into_owned());
+        let header = entry.header();
+        (header.mode().expect("a mode"), header.entry_type(), link)
     }
 
     /// The two entries every fixture package carries.
@@ -2286,50 +2640,6 @@ mod tests {
             Some(&digest),
         )];
         (Harness::new(downloads, payload.clone()), payload, digest)
-    }
-
-    /// Every file under `root`, keyed by its path relative to `root`, valued by
-    /// `(length, modified-time, content-digest)`.
-    ///
-    /// Used to prove a directory was not rewritten. A content digest alone
-    /// would miss a rewrite with identical bytes; a modification time alone is
-    /// coarse on some filesystems. Together with a marker file the test plants
-    /// itself, the three cover each other.
-    fn snapshot(root: &Path) -> BTreeMap<String, (u64, std::time::SystemTime, String)> {
-        fn walk(
-            base: &Path,
-            dir: &Path,
-            out: &mut BTreeMap<String, (u64, std::time::SystemTime, String)>,
-        ) {
-            for entry in fs::read_dir(dir).expect("read a snapshot directory") {
-                let entry = entry.expect("a snapshot entry");
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(base, &path, out);
-                    continue;
-                }
-                let relative = path
-                    .strip_prefix(base)
-                    .expect("a path under the snapshot root")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let metadata = entry.metadata().expect("snapshot metadata");
-                let bytes = fs::read(&path).expect("snapshot contents");
-                out.insert(
-                    relative,
-                    (
-                        metadata.len(),
-                        metadata.modified().expect("a modification time"),
-                        hex_digest(&bytes),
-                    ),
-                );
-            }
-        }
-        let mut out = BTreeMap::new();
-        if root.is_dir() {
-            walk(root, root, &mut out);
-        }
-        out
     }
 
     /// Every path under `root`, for asserting that nothing landed somewhere.
@@ -2804,7 +3114,13 @@ mod tests {
         let error = cache.ensure_installed().await.unwrap_err();
 
         assert!(
-            matches!(error, PackageError::ChecksumAbsent { empty: false, .. }),
+            matches!(
+                error,
+                PackageError::ChecksumAbsent {
+                    published: PublishedChecksum::Absent,
+                    ..
+                }
+            ),
             "expected an absent checksum, got {error:?}"
         );
         assert!(error.is_terminal(), "failing closed is never retryable");
@@ -2842,7 +3158,13 @@ mod tests {
         let error = harness.cache().ensure_installed().await.unwrap_err();
 
         assert!(
-            matches!(error, PackageError::ChecksumAbsent { empty: true, .. }),
+            matches!(
+                error,
+                PackageError::ChecksumAbsent {
+                    published: PublishedChecksum::Empty,
+                    ..
+                }
+            ),
             "expected an empty checksum, got {error:?}"
         );
         assert!(error.to_string().contains("an empty sha256_checksum"));
@@ -2917,6 +3239,108 @@ mod tests {
         assert_eq!(harness.fetcher.count(), 0);
     }
 
+    #[tokio::test]
+    async fn a_malformed_published_checksum_refuses_and_says_it_was_malformed() {
+        // The third unusable shape, and the one that used to name a remedy the
+        // operator could not carry out: it returned `MalformedDigest` from a
+        // path where the pin was never consulted, while telling them to pin.
+        let payload = tar_gz_bytes(&package_entries());
+        for bad in ["sha256:9f86d081884c7d65", &"a".repeat(63), "not a digest"] {
+            let harness = Harness::new(
+                vec![published("linux", "x64", "2.330.0", ".tar.gz", Some(bad))],
+                payload.clone(),
+            );
+
+            let error = harness.cache().ensure_installed().await.unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    PackageError::ChecksumAbsent {
+                        published: PublishedChecksum::Malformed,
+                        ..
+                    }
+                ),
+                "`{bad}` should be reported as malformed, got {error:?}"
+            );
+            assert!(error.is_terminal());
+            assert_eq!(
+                error.failure_reason(),
+                Some(FailureReason::RunnerPackageUnverified)
+            );
+            assert!(
+                error.to_string().contains("a malformed sha256_checksum"),
+                "the operator is owed the shape that actually arrived: `{error}`"
+            );
+            assert_eq!(harness.fetcher.count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_published_checksum_is_rescued_by_an_operator_pin() {
+        // The remedy the refusal names has to be one that works. Every unusable
+        // shape — absent, empty, malformed — routes to the pin.
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        let harness = Harness::new(
+            vec![published(
+                "linux",
+                "x64",
+                "2.330.0",
+                ".tar.gz",
+                Some("sha256:9f86d081884c7d65"),
+            )],
+            payload,
+        );
+        let cache = harness
+            .cache()
+            .with_pins(PinnedDigests::new().pin("2.330.0", &digest).unwrap());
+
+        let installed = cache
+            .ensure_installed()
+            .await
+            .expect("a pin rescues a malformed published checksum");
+
+        assert_eq!(installed.digest().as_str(), digest);
+        assert!(installed.root().join("run.sh").is_file());
+    }
+
+    #[tokio::test]
+    async fn every_unusable_published_checksum_shape_names_the_same_workable_remedy() {
+        let payload = tar_gz_bytes(&package_entries());
+        let digest = hex_digest(&payload);
+        for (raw, expected) in [
+            (None, PublishedChecksum::Absent),
+            (Some(""), PublishedChecksum::Empty),
+            (Some("nonsense"), PublishedChecksum::Malformed),
+        ] {
+            let downloads = vec![published("linux", "x64", "2.330.0", ".tar.gz", raw)];
+
+            // Without a pin: refused, and the message names pinning.
+            let harness = Harness::new(downloads.clone(), payload.clone());
+            let error = harness.cache().ensure_installed().await.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    PackageError::ChecksumAbsent { published, .. } if *published == expected
+                ),
+                "{expected:?}: got {error:?}"
+            );
+            assert!(error.operator_action().unwrap().contains("pin"));
+
+            // With a pin: installed. This is the assertion that makes the
+            // remedy true rather than merely stated.
+            let harness = Harness::new(downloads, payload.clone());
+            let cache = harness
+                .cache()
+                .with_pins(PinnedDigests::new().pin("2.330.0", &digest).unwrap());
+            cache
+                .ensure_installed()
+                .await
+                .unwrap_or_else(|error| panic!("{expected:?} should be pinnable: {error}"));
+        }
+    }
+
     // =====================================================================
     // DoD 4 — a cache entry is never mutated after extraction, and a second
     // install of the same version is a no-op.
@@ -2930,15 +3354,6 @@ mod tests {
         let first = cache.ensure_installed().await.expect("the first install");
         assert_eq!(harness.fetcher.count(), 1);
         assert_eq!(harness.catalog.calls(), 1);
-
-        // A marker the test plants inside the entry. Nothing in production
-        // writes this, so if a second install re-extracted and re-committed the
-        // directory the marker would be gone. That is a deterministic witness
-        // to a rewrite, independent of modification-time granularity.
-        let marker = first.root().join("planted-by-the-test");
-        fs::write(&marker, b"witness").expect("plant the marker");
-        let before = snapshot(first.root());
-        assert!(before.contains_key("planted-by-the-test"));
 
         // Past the freshness window, with the SAME version still published.
         //
@@ -2962,19 +3377,65 @@ mod tests {
             2,
             "the published version should have been re-checked"
         );
+        // THIS is the assertion that proves the no-op, and it is the only one
+        // here that can distinguish a no-op from a re-install.
+        //
+        // An earlier version of this test also planted a marker file inside the
+        // entry and compared a `(len, mtime, digest)` snapshot before and
+        // after, and presented all three as proof. Two of the three could not
+        // fail. The commit point is a single `fs::rename` onto the version
+        // directory, which cannot replace a non-empty directory on any platform
+        // this product targets — so even with the short-circuit deleted, the
+        // rename fails, `entry()` answers `Some`, and the existing entry is
+        // returned untouched. The marker survives and the snapshot matches for
+        // a reason that has nothing to do with the branch under test. Three
+        // legs that read as triple-proof and were single-proof is worse than
+        // one honest leg, so the other two are gone.
+        //
+        // The immutability property they were reaching for is real and is
+        // pinned separately, by `the_commit_rename_never_replaces_an_existing_
+        // entry` below, which asserts the platform behaviour this design rests
+        // on and *can* fail if it ever stops holding.
         assert_eq!(
             harness.fetcher.count(),
             1,
             "a version already held must not be downloaded again"
         );
+    }
+
+    #[test]
+    fn the_commit_rename_never_replaces_an_existing_entry() {
+        // The assumption the whole immutability claim rests on, asserted
+        // directly instead of being inferred from an install that would not
+        // have exercised it.
+        //
+        // `download_verify_and_install` commits by renaming a staging directory
+        // onto `packages/<version>/`. If that rename could clobber a populated
+        // directory, an entry would be mutable after it landed and every
+        // runtime copied from it could change underfoot. It cannot — and this
+        // is where that stops being a comment.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let existing = dir.path().join("2.330.0");
+        fs::create_dir_all(existing.join("bin")).unwrap();
+        fs::write(existing.join("run.sh"), b"the original").unwrap();
+        let replacement = dir.path().join("staging");
+        fs::create_dir_all(&replacement).unwrap();
+        fs::write(replacement.join("run.sh"), b"the replacement").unwrap();
+
+        let result = fs::rename(&replacement, &existing);
+
         assert!(
-            marker.is_file(),
-            "the entry was replaced: the planted marker is gone"
+            result.is_err(),
+            "renaming onto a populated entry must fail, or entries are mutable"
         );
         assert_eq!(
-            snapshot(first.root()),
-            before,
-            "no file in a cache entry may change after it lands"
+            fs::read_to_string(existing.join("run.sh")).unwrap(),
+            "the original",
+            "the existing entry's contents must survive"
+        );
+        assert!(
+            existing.join("bin").is_dir(),
+            "the existing entry's structure must survive"
         );
     }
 
@@ -2982,8 +3443,19 @@ mod tests {
     async fn a_stale_entry_that_is_still_the_published_version_is_reused() {
         // Past the freshness deadline, but GitHub has published nothing newer.
         // There is no fresher package to fetch, so re-downloading identical
-        // bytes would cost 150-300 MB and change nothing. This is the branch
-        // the no-op test above rides on, asserted in its own right.
+        // bytes would cost 150-300 MB and change nothing.
+        //
+        // **This exits at the `entry(&version)` short-circuit, not at the
+        // freshness branch** — the published version and the cached one are the
+        // same, so the entry is found before staleness is ever consulted. An
+        // earlier comment here claimed the freshness branch, which was wrong:
+        // that branch is the one where the published version *differs* and the
+        // cache is still inside the window, and it is pinned by
+        // `a_cached_version_inside_the_window_is_not_re_downloaded`.
+        //
+        // What this test adds over the no-op test is the *staleness* of the
+        // entry: it asserts that being past the deadline does not by itself
+        // force a download when there is nothing newer to download.
         let (harness, _, _) = linux_fixture();
         let cache = harness.cache();
         let first = cache.ensure_installed().await.expect("an install");
@@ -3289,90 +3761,236 @@ mod tests {
         );
     }
 
+    /// One `PackageError` variant's name, by an **exhaustive** match.
+    ///
+    /// This is the mechanism that keeps the classification table below honest.
+    /// Two hand-written sample lists preceded it, and between them they omitted
+    /// `Io` and `Exhausted` entirely — a new variant joined neither list and
+    /// nothing complained. Adding a variant now stops this function compiling,
+    /// which puts the author in front of the table, and the coverage assertion
+    /// in `every_variant_is_classified_and_classification_matches_the_remedy`
+    /// then fails until a sample joins it.
+    fn variant_name(error: &PackageError) -> &'static str {
+        match error {
+            PackageError::UnsupportedHost(_) => "UnsupportedHost",
+            PackageError::NoPackagePublished { .. } => "NoPackagePublished",
+            PackageError::ChecksumAbsent { .. } => "ChecksumAbsent",
+            PackageError::ChecksumMismatch { .. } => "ChecksumMismatch",
+            PackageError::MalformedDigest { .. } => "MalformedDigest",
+            PackageError::VersionRejected { .. } => "VersionRejected",
+            PackageError::CatalogUnavailable { .. } => "CatalogUnavailable",
+            PackageError::Download { .. } => "Download",
+            PackageError::UnrecognisedVersion { .. } => "UnrecognisedVersion",
+            PackageError::UnsupportedArchive { .. } => "UnsupportedArchive",
+            PackageError::UnsafeArchiveEntry { .. } => "UnsafeArchiveEntry",
+            PackageError::Extract { .. } => "Extract",
+            PackageError::VersionInUse { .. } => "VersionInUse",
+            PackageError::VersionHeldByUnknownAttempt { .. } => "VersionHeldByUnknownAttempt",
+            PackageError::UnreadableLease { .. } => "UnreadableLease",
+            PackageError::WorkspaceInsideCache { .. } => "WorkspaceInsideCache",
+            PackageError::NotInstalled { .. } => "NotInstalled",
+            PackageError::Io { .. } => "Io",
+            PackageError::Exhausted { .. } => "Exhausted",
+        }
+    }
+
+    /// How many variants `variant_name` covers.
+    ///
+    /// Bumped by hand, and the assertion that uses it is what makes forgetting
+    /// impossible to do quietly: a new variant that reaches `variant_name` but
+    /// not the sample table fails the coverage check, and bumping this without
+    /// adding a sample fails it too.
+    const PACKAGE_ERROR_VARIANTS: usize = 19;
+
     #[test]
-    fn every_terminal_condition_names_an_operator_action() {
-        // `03-control-flows.md` calls these "terminal, operator-actionable"
-        // conditions. A terminal error with nothing for the operator to do
-        // would strand them.
-        let samples = [
-            PackageError::UnsupportedHost(UnsupportedHost::UndocumentedPair {
-                os: Os::Windows,
-                arch: Arch::Arm32,
-            }),
-            PackageError::NoPackagePublished {
-                os: Os::Linux,
-                arch: Arch::Arm32,
-            },
-            PackageError::ChecksumAbsent {
-                version: version("2.330.0"),
-                os: Os::Linux,
-                arch: Arch::X64,
-                empty: false,
-            },
-            PackageError::MalformedDigest {
-                raw: "nope".to_string(),
-            },
-            PackageError::VersionRejected {
-                version: None,
-                detail: None,
-            },
-            PackageError::UnrecognisedVersion {
-                raw: "nope".to_string(),
-            },
-            PackageError::UnsupportedArchive {
-                filename: "x.rar".to_string(),
-            },
-            PackageError::UnsafeArchiveEntry {
-                entry: "../x".to_string(),
-            },
-            PackageError::VersionInUse {
-                version: version("2.330.0"),
-                attempt: fixtures::ATTEMPT_ID,
-                state: "busy",
-            },
-            PackageError::VersionHeldByUnknownAttempt {
-                version: version("2.330.0"),
-                attempt: fixtures::ATTEMPT_ID,
-            },
-            PackageError::WorkspaceInsideCache {
-                attempt: fixtures::ATTEMPT_ID,
-                path: PathBuf::from("x"),
-            },
-            PackageError::NotInstalled {
-                version: version("2.330.0"),
-            },
+    fn every_variant_is_classified_and_classification_matches_the_remedy() {
+        // One table, every variant, each declaring what it should be. The two
+        // separate lists this replaced could not express "these are all of
+        // them", which is how `Io` and `Exhausted` went untested.
+        let samples: Vec<(PackageError, bool)> = vec![
+            (
+                PackageError::Io {
+                    what: "read",
+                    path: PathBuf::from("x"),
+                    source: io::Error::other("disk"),
+                },
+                false,
+            ),
+            (
+                PackageError::Exhausted {
+                    attempts: 3,
+                    source: Box::new(PackageError::Download {
+                        detail: "reset".to_string(),
+                    }),
+                },
+                true,
+            ),
+            (
+                PackageError::UnreadableLease {
+                    path: PathBuf::from("x.lease"),
+                },
+                true,
+            ),
+            (
+                PackageError::ChecksumMismatch {
+                    version: version("2.330.0"),
+                    expected: Sha256Hex::parse(&"a".repeat(64)).unwrap(),
+                    actual: Sha256Hex::parse(&"b".repeat(64)).unwrap(),
+                },
+                false,
+            ),
+            (
+                PackageError::CatalogUnavailable {
+                    detail: "502".to_string(),
+                },
+                false,
+            ),
+            (
+                PackageError::Download {
+                    detail: "reset".to_string(),
+                },
+                false,
+            ),
+            (
+                PackageError::Extract {
+                    detail: "short read".to_string(),
+                },
+                false,
+            ),
+            (
+                PackageError::UnsupportedHost(UnsupportedHost::UndocumentedPair {
+                    os: Os::Windows,
+                    arch: Arch::Arm32,
+                }),
+                true,
+            ),
+            (
+                PackageError::NoPackagePublished {
+                    os: Os::Linux,
+                    arch: Arch::Arm32,
+                },
+                true,
+            ),
+            (
+                PackageError::ChecksumAbsent {
+                    version: version("2.330.0"),
+                    os: Os::Linux,
+                    arch: Arch::X64,
+                    published: PublishedChecksum::Absent,
+                },
+                true,
+            ),
+            (
+                PackageError::MalformedDigest {
+                    raw: "nope".to_string(),
+                },
+                true,
+            ),
+            (
+                PackageError::VersionRejected {
+                    version: None,
+                    detail: None,
+                },
+                true,
+            ),
+            (
+                PackageError::UnrecognisedVersion {
+                    raw: "nope".to_string(),
+                },
+                true,
+            ),
+            (
+                PackageError::UnsupportedArchive {
+                    filename: "x.rar".to_string(),
+                },
+                true,
+            ),
+            (
+                PackageError::UnsafeArchiveEntry {
+                    entry: "../x".to_string(),
+                },
+                true,
+            ),
+            (
+                PackageError::VersionInUse {
+                    version: version("2.330.0"),
+                    attempt: fixtures::ATTEMPT_ID,
+                    state: AttemptState::Busy,
+                },
+                true,
+            ),
+            (
+                PackageError::VersionHeldByUnknownAttempt {
+                    version: version("2.330.0"),
+                    attempt: fixtures::ATTEMPT_ID,
+                },
+                true,
+            ),
+            (
+                PackageError::WorkspaceInsideCache {
+                    attempt: fixtures::ATTEMPT_ID,
+                    path: PathBuf::from("x"),
+                },
+                true,
+            ),
+            (
+                PackageError::NotInstalled {
+                    version: version("2.330.0"),
+                },
+                true,
+            ),
         ];
-        for error in samples {
-            assert!(error.is_terminal(), "{error:?} should be terminal");
-            assert!(
+
+        let covered: std::collections::BTreeSet<&'static str> = samples
+            .iter()
+            .map(|(error, _)| variant_name(error))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            PACKAGE_ERROR_VARIANTS,
+            "every variant needs a sample; covered {covered:?}"
+        );
+
+        for (error, terminal) in samples {
+            let name = variant_name(&error);
+            assert_eq!(
+                error.is_terminal(),
+                terminal,
+                "{name} is classified the wrong way"
+            );
+            // `03-control-flows.md` calls the terminal ones "operator-
+            // actionable": every one must say what to do, and a retryable one
+            // must not, because the answer there is to wait.
+            //
+            // `Exhausted` is the exception that proves the rule — it is
+            // terminal and delegates both its action and its journal reason to
+            // whatever the budget was spent on, so it has an action only when
+            // that inner error does.
+            if name == "Exhausted" {
+                continue;
+            }
+            assert_eq!(
                 error.operator_action().is_some(),
-                "{error:?} is terminal but tells the operator nothing"
+                terminal,
+                "{name}: a terminal condition owes an action and a retryable one does not"
             );
         }
     }
 
     #[test]
-    fn every_retryable_condition_withholds_an_operator_action() {
-        let samples = [
-            PackageError::ChecksumMismatch {
-                version: version("2.330.0"),
-                expected: Sha256Hex::parse(&"a".repeat(64)).unwrap(),
-                actual: Sha256Hex::parse(&"b".repeat(64)).unwrap(),
-            },
-            PackageError::CatalogUnavailable {
-                detail: "502".to_string(),
-            },
-            PackageError::Download {
-                detail: "reset".to_string(),
-            },
-            PackageError::Extract {
-                detail: "short read".to_string(),
-            },
-        ];
-        for error in samples {
-            assert!(!error.is_terminal(), "{error:?} should be retryable");
-            assert!(error.operator_action().is_none());
-        }
+    fn a_removed_sample_is_caught_by_the_coverage_assertion() {
+        // The coverage check above is the only thing standing between a new
+        // variant and going untested, so it gets its own negative control.
+        let short: Vec<PackageError> = vec![PackageError::NotInstalled {
+            version: version("2.330.0"),
+        }];
+        let covered: std::collections::BTreeSet<&'static str> =
+            short.iter().map(variant_name).collect();
+        assert_ne!(
+            covered.len(),
+            PACKAGE_ERROR_VARIANTS,
+            "an incomplete sample list must not satisfy the coverage check"
+        );
     }
 
     #[test]
@@ -3529,6 +4147,65 @@ mod tests {
         cache.release(attempt.id).expect("release");
         cache.prune(&held, &[]).expect("a released version prunes");
         assert!(cache.entry(&held).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_lease_refuses_a_prune_rather_than_vanishing() {
+        // Everything else in this guard fails closed, including an attempt the
+        // caller did not report. A lease file that cannot be parsed must not be
+        // the one thing that fails open — "unreadable" is not "nothing holds
+        // this version", and a lease is written non-atomically, so a crash
+        // mid-write leaves exactly this shape.
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+        let live = attempt_in(&harness, 0x100, AttemptState::Busy);
+        cache.lease(&live, &held).expect("a lease");
+
+        // Truncate it the way an interrupted write would.
+        let lease_file = cache.lease_path(live.id);
+        assert!(lease_file.is_file(), "the lease must exist to be corrupted");
+        fs::write(&lease_file, b"{\"version\":\"2.33").expect("corrupt the lease");
+
+        let error = cache.prune(&held, &[]).unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::UnreadableLease { .. }),
+            "expected a refusal naming the unreadable lease, got {error:?}"
+        );
+        assert!(error.is_terminal());
+        assert!(error.operator_action().is_some());
+        assert!(
+            cache.entry(&held).unwrap().is_some(),
+            "the package a live runner may be executing from must still be there"
+        );
+        // `holders` refuses for the same reason rather than answering "none".
+        assert!(cache.holders(&held).is_err());
+
+        // And the named remedy works.
+        fs::remove_file(&lease_file).unwrap();
+        cache
+            .prune(&held, &[])
+            .expect("a resolved lease lets it proceed");
+    }
+
+    #[tokio::test]
+    async fn a_lease_file_that_is_not_named_after_an_attempt_refuses_a_prune() {
+        let (harness, _, _) = linux_fixture();
+        let cache = cache_with_one_entry(&harness).await;
+        let held = version("2.330.0");
+        let strays = cache.root().join(LEASES_DIR);
+        fs::create_dir_all(&strays).unwrap();
+        let stray = strays.join(format!("not-a-uuid.{LEASE_EXTENSION}"));
+        fs::write(&stray, b"{\"version\":\"2.330.0\"}").unwrap();
+
+        let error = cache.prune(&held, &[]).unwrap_err();
+
+        assert!(
+            matches!(error, PackageError::UnreadableLease { .. }),
+            "a lease whose holder cannot be identified must refuse, got {error:?}"
+        );
+        assert!(cache.entry(&held).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -3787,11 +4464,25 @@ mod tests {
         // this module's `resolve_inside`, and the archive crates' own guards
         // (`ZipFile::enclosed_name` answering `None`, `Entry::unpack_in`
         // answering `false`). Gutting either layer alone leaves the property
-        // standing, which is what defence in depth is for and is also why this
-        // test alone does not prove `resolve_inside` does anything. The unit
-        // test `an_archive_entry_may_not_resolve_outside_the_directory_it_is_
-        // extracted_into` is what pins this module's own layer; the two are
-        // complementary and neither replaces the other.
+        // standing; removing both turns this red.
+        //
+        // # What that means for the call sites, stated rather than glossed
+        //
+        // `resolve_inside` itself is pinned by
+        // `an_archive_entry_may_not_resolve_outside_the_directory_it_is_
+        // extracted_into`, which reds when the function is gutted. Its two
+        // **call sites** are pinned by compilation rather than by behaviour:
+        // each uses the returned path as the destination it writes to or
+        // applies the mode policy to, so neither can be deleted. `extract_tar_gz`
+        // used to discard the result, which meant the line could be removed with
+        // every test still green — that is fixed, and the fix is why the tar
+        // path can apply a mode at all.
+        //
+        // No input distinguishes this module's layer from the archive crates'
+        // layers today, so no better test can close that gap. **The layer's
+        // value is insurance against a dependency changing its mind**, not
+        // coverage of a reachable hole — a `zip` or `tar` release that relaxed
+        // its own sanitising would be caught here rather than shipped.
         let dir = tempfile::tempdir().expect("a temporary root");
         let target = dir.path().join("target");
         let outside = dir.path().join("escaped.txt");
@@ -3842,6 +4533,237 @@ mod tests {
                 Some(FailureReason::RunnerPackageUnverified)
             );
         }
+    }
+
+    #[test]
+    fn the_mode_policy_drops_every_bit_that_is_not_an_executable_bit() {
+        // The policy itself, asserted on every CI leg including the one whose
+        // filesystem has no mode bits — the `#[cfg(unix)]` tests below prove
+        // the extraction paths reach this function, and this proves what the
+        // function decides.
+        for (published, expected, what) in [
+            (0o4755, 0o700, "setuid is dropped"),
+            (0o2755, 0o700, "setgid is dropped"),
+            (0o1777, 0o700, "the sticky bit is dropped"),
+            (
+                0o7777,
+                0o700,
+                "all three, plus group and other, are dropped",
+            ),
+            (0o777, 0o700, "group and other lose everything"),
+            (0o666, 0o600, "a non-executable file stays non-executable"),
+            (0o644, 0o600, "the ordinary case"),
+            (0o755, 0o700, "an executable stays executable"),
+            (0o000, 0o600, "the owner can always read it back"),
+        ] {
+            assert_eq!(
+                policy_mode(published),
+                expected,
+                "{what}: policy_mode({published:o}) should be {expected:o}"
+            );
+        }
+        // Stated as properties too, so a policy change has to be deliberate.
+        for published in 0..=0o7777_u32 {
+            let applied = policy_mode(published);
+            assert_eq!(applied & 0o7000, 0, "no setuid, setgid or sticky ever");
+            assert_eq!(applied & 0o077, 0, "nothing for group or other ever");
+            assert_eq!(
+                applied & 0o100 != 0,
+                published & 0o111 != 0,
+                "executability is the only thing carried through, and only for \
+                 the owner (published {published:o} -> {applied:o})"
+            );
+        }
+    }
+
+    /// `.tar.gz` is the format for Linux and macOS, so this is where modes and
+    /// links actually reach a filesystem that has them.
+    #[cfg(unix)]
+    #[test]
+    fn a_published_archives_setuid_and_group_bits_are_never_applied_to_an_extracted_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temporary root");
+        // setuid + setgid + sticky, world-writable, and executable: everything
+        // a hostile or merely careless publisher could put in a header.
+        let bytes = tar_gz_special(
+            "run.sh",
+            "#!/bin/sh\n",
+            0o7777,
+            tar::EntryType::Regular,
+            None,
+        );
+        // The fixture really carries them. Without this the assertions below
+        // would hold over an archive that never had a setuid bit to drop.
+        let (mode, kind, _) = first_entry_header(&bytes);
+        assert_eq!(mode, 0o7777, "the fixture must carry the full mode");
+        assert_eq!(kind, tar::EntryType::Regular);
+
+        let archive = dir.path().join("p.archive");
+        fs::write(&archive, &bytes).unwrap();
+        let target = dir.path().join("target");
+        extract(&archive, ArchiveKind::TarGz, &target).expect("extraction");
+
+        let applied = fs::metadata(target.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            applied & 0o4000,
+            0,
+            "setuid must never survive extraction (mode {applied:o})"
+        );
+        assert_eq!(
+            applied & 0o2000,
+            0,
+            "setgid must never survive extraction (mode {applied:o})"
+        );
+        assert_eq!(
+            applied & 0o022,
+            0,
+            "group and world write must never survive (mode {applied:o})"
+        );
+        // The policy `extract_zip` documents, applied identically here:
+        // executable bits kept, owner read/write, nothing else.
+        assert_eq!(
+            applied, 0o700,
+            "the tar path must apply the same mode policy as the zip path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_extracted_directorys_mode_is_owner_only_and_still_usable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let bytes = tar_gz_special("bin/", "", 0o2777, tar::EntryType::Directory, None);
+        let archive = dir.path().join("p.archive");
+        fs::write(&archive, &bytes).unwrap();
+        let target = dir.path().join("target");
+
+        extract(&archive, ArchiveKind::TarGz, &target).expect("extraction");
+
+        let applied = fs::metadata(target.join("bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            applied & 0o2000,
+            0,
+            "setgid must not survive on a directory"
+        );
+        assert_eq!(applied & 0o077, 0, "group and other get nothing");
+        assert!(
+            applied & 0o300 == 0o300,
+            "the owner must still be able to write and traverse it (mode {applied:o})"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_target_escapes_the_package_is_refused() {
+        // Refused before any filesystem link call, so this runs on every CI
+        // leg — creating a symlink on Windows needs a privilege the agent
+        // should not want, and this test never needs one.
+        let dir = tempfile::tempdir().expect("a temporary root");
+        for (label, bytes) in [
+            (
+                "symlink to an absolute path",
+                tar_gz_special(
+                    "link",
+                    "",
+                    0o777,
+                    tar::EntryType::Symlink,
+                    Some("/etc/passwd"),
+                ),
+            ),
+            (
+                "symlink climbing out",
+                tar_gz_special(
+                    "link",
+                    "",
+                    0o777,
+                    tar::EntryType::Symlink,
+                    Some("../../escape"),
+                ),
+            ),
+            (
+                "symlink climbing out from a subdirectory",
+                tar_gz_special(
+                    "bin/link",
+                    "",
+                    0o777,
+                    tar::EntryType::Symlink,
+                    Some("../../escape"),
+                ),
+            ),
+            (
+                "hard link",
+                tar_gz_special("link", "", 0o644, tar::EntryType::Link, Some("/etc/passwd")),
+            ),
+        ] {
+            // The fixture really is a link with that target.
+            let (_, kind, link) = first_entry_header(&bytes);
+            assert!(
+                matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link),
+                "{label}: the fixture must be a link entry"
+            );
+            assert!(link.is_some(), "{label}: the fixture must carry a target");
+
+            let archive = dir.path().join(format!("{label}.archive"));
+            fs::write(&archive, &bytes).unwrap();
+            let target = dir.path().join(label);
+
+            let error = extract(&archive, ArchiveKind::TarGz, &target)
+                .expect_err(&format!("{label} must be refused"));
+
+            assert!(
+                matches!(error, PackageError::UnsafeArchiveEntry { .. }),
+                "{label}: expected an unsafe-entry refusal, got {error:?}"
+            );
+            assert!(error.is_terminal());
+            assert_eq!(
+                error.failure_reason(),
+                Some(FailureReason::RunnerPackageUnverified)
+            );
+            assert!(
+                !target.join("link").exists(),
+                "{label}: nothing may have been created"
+            );
+        }
+    }
+
+    /// The negative control for the refusal above: a link that stays inside the
+    /// package is legitimate and must still extract.
+    ///
+    /// Unix-only because creating the symlink is the point, and Windows needs a
+    /// privilege for that. The *refusal* path above is cross-platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_stays_inside_the_package_is_extracted() {
+        let dir = tempfile::tempdir().expect("a temporary root");
+        let bytes = tar_gz_special(
+            "bin/current",
+            "",
+            0o777,
+            tar::EntryType::Symlink,
+            Some("../run.sh"),
+        );
+        let archive = dir.path().join("p.archive");
+        fs::write(&archive, &bytes).unwrap();
+        let target = dir.path().join("target");
+
+        extract(&archive, ArchiveKind::TarGz, &target)
+            .expect("a link inside the package is legitimate");
+
+        assert!(
+            fs::symlink_metadata(target.join("bin/current"))
+                .unwrap()
+                .is_symlink(),
+            "the link should have been created"
+        );
     }
 
     #[test]
