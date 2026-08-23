@@ -1,0 +1,35 @@
+crates/app/src/cli/mod.rs
+  s_d14c0886a58be6::t_51d87b02db6d27 883-885,887
+crates/app/src/tui/shell.rs
+  s_d14c0886a58be6::t_65ecd63812fd7b 980,1207-1209,1211,1217,1228
+  s_d14c0886a58be6::t_7806fcae7e619f 1308,1310,1393,1395
+  s_d14c0886a58be6::t_b7fbbfc64c503a 1210,1212-1214,1243-1251,1272,1278-1279
+  s_d14c0886a58be6::t_3b2ebf92517579 676,682-690,742-750,770-771,790,801,808,810,821-822,838
+  s_d14c0886a58be6::t_f0af17f9703f16 1156-1175
+  s_d14c0886a58be6::t_f512670d3f8cb3 753-754,887,893-895,937-939
+  s_d14c0886a58be6::t_652fc09ca2f44b 187
+  s_d14c0886a58be6::t_0e73f8ce75de59 751-752
+  s_d14c0886a58be6::t_60447d63497ec4 8-9,33,164-176,178-179,183-184,191,194-198,200-232,979
+  s_d14c0886a58be6::t_dfd7618deb7e3a 177,192-193,199
+  s_d14c0886a58be6::t_8c7a02186165b0 180-181,185,188-190
+  s_d14c0886a58be6::t_cac13e6d6b5bc8 182
+  s_d14c0886a58be6::t_671b809be7b94e 186
+crates/app/src/tui/mod.rs
+  s_d14c0886a58be6::t_51d87b02db6d27 11,14-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "dce5cbfedcbf41298344e773b0b7ef159b18ea45",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
