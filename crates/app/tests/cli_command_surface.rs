@@ -35,10 +35,7 @@ const SURFACE: [(&str, &[&str]); 8] = [
         &["add", "list", "set-capacity", "set-scale", "remove"],
     ),
     ("daemon", &["run"]),
-    (
-        "service",
-        &["install", "uninstall", "status", "set-start-mode"],
-    ),
+    ("service", &["install", "uninstall", "status"]),
     ("tui", &[]),
     ("status", &[]),
 ];
@@ -210,6 +207,29 @@ fn an_undocumented_command_is_refused() {
         outcome.code, 2,
         "clap owns exit code 2 for a usage error, which is why no runtime failure class \
          uses it; got stderr: {}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn service_set_start_mode_is_neither_listed_nor_accepted() {
+    let help = help_for(&["service"]);
+    assert!(
+        !commands_in(&help)
+            .iter()
+            .any(|name| name == "set-start-mode"),
+        "the immutable service surface must not advertise set-start-mode: {help}"
+    );
+
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.args(["service", "set-start-mode", "login"]);
+        command
+    });
+    assert_eq!(
+        outcome.code, 2,
+        "set-start-mode is not an F3 CLI command; stderr: {}",
         outcome.stderr
     );
 }

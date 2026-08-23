@@ -630,21 +630,12 @@ pub enum ServiceCommand {
     Uninstall,
     /// Report the start mode, resolved binary path, and last GitHub contact.
     Status,
-    /// Switch between boot and login start without reinstalling the product.
-    SetStartMode(ServiceSetStartModeArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceInstallArgs {
     /// `boot` starts the agent with the machine; `login` waits for a session.
     #[arg(long, value_name = "WHEN", default_value = "boot")]
-    pub start_at: StartAt,
-}
-
-#[derive(Debug, Args)]
-pub struct ServiceSetStartModeArgs {
-    /// `boot` starts the agent with the machine; `login` waits for a session.
-    #[arg(value_name = "WHEN")]
     pub start_at: StartAt,
 }
 

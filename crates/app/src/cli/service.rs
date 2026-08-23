@@ -9,10 +9,7 @@ use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_platform::service::{InstallRequest, ServiceError, ServiceOperations};
 
-use super::{
-    CliError, Context, Failure, ServiceCommand, ServiceInstallArgs, ServiceSetStartModeArgs,
-    write_failed,
-};
+use super::{CliError, Context, Failure, ServiceCommand, ServiceInstallArgs, write_failed};
 
 /// Routes one service command. Every arm is synchronous and reads no stdin.
 pub fn dispatch(
@@ -24,7 +21,6 @@ pub fn dispatch(
         ServiceCommand::Install(args) => install(context, args, out),
         ServiceCommand::Uninstall => uninstall(context, out),
         ServiceCommand::Status => status(context, out),
-        ServiceCommand::SetStartMode(args) => set_start_mode(context, args, out),
     }
 }
 
@@ -153,42 +149,6 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
     }
 }
 
-pub fn set_start_mode(
-    context: &Context,
-    args: &ServiceSetStartModeArgs,
-    out: &mut dyn Write,
-) -> Result<(), CliError> {
-    set_start_mode_with(context, args, out, &operations(context))
-}
-
-fn set_start_mode_with(
-    context: &Context,
-    args: &ServiceSetStartModeArgs,
-    out: &mut dyn Write,
-    operations: &ServiceOperations,
-) -> Result<(), CliError> {
-    let to: StartMode = args.start_at.into();
-    let change = operations.set_start_mode(to).map_err(service_failure)?;
-    let store = context.store()?;
-    let mut host = super::host::local_host_or_create(context, &store)?;
-
-    if let Err(source) = persist_mode(&store, &mut host, to)
-        && durable_mode(&store).ok().flatten() != Some(to)
-    {
-        if change.changed {
-            let rollback = operations.set_start_mode(change.from);
-            return Err(rollback_failure(
-                "persist the new service start mode",
-                source,
-                rollback.err(),
-            ));
-        }
-        return Err(local_state(source));
-    }
-
-    writeln!(out, "{change}").map_err(write_failed("this start-mode change"))
-}
-
 fn persist_mode(
     store: &dyn Store,
     host: &mut runner_manager_domain::model::Host,
@@ -268,58 +228,6 @@ mod tests {
             panic!("wrong command");
         };
         assert_eq!(args.service_paths().as_ref(), Some(context.paths()));
-    }
-
-    #[test]
-    fn set_start_mode_is_a_scriptable_command_with_no_prompt_input() {
-        let cli = Cli::try_parse_from(["runner-manager", "service", "set-start-mode", "login"])
-            .expect("the command parses without stdin");
-        assert!(matches!(
-            cli.command,
-            Command::Service(ServiceCommand::SetStartMode(ServiceSetStartModeArgs {
-                start_at: super::super::StartAt::Login
-            }))
-        ));
-    }
-
-    #[test]
-    fn switching_start_mode_persists_the_same_mode_host_show_reads() {
-        let temporary = tempfile::tempdir().unwrap();
-        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
-        let controls = Arc::new(RecordingControls::new());
-        let operations = ServiceOperations::with_controls(
-            context.paths().clone(),
-            ServiceIdentity::fixture("f3-mode-round-trip"),
-            controls,
-        );
-        operations
-            .install(
-                &InstallRequest::new(StartMode::Boot).for_binary(std::env::current_exe().unwrap()),
-            )
-            .unwrap();
-        let store = context.store().unwrap();
-        super::super::host::local_host_or_create(&context, &store).unwrap();
-
-        set_start_mode_with(
-            &context,
-            &ServiceSetStartModeArgs {
-                start_at: super::super::StartAt::Login,
-            },
-            &mut Vec::new(),
-            &operations,
-        )
-        .unwrap();
-
-        assert_eq!(
-            operations.status().unwrap().start_mode(),
-            Some(StartMode::Login),
-            "the service manager/record side must switch"
-        );
-        assert_eq!(
-            context.recorded_start_mode(&store).unwrap(),
-            StartMode::Login,
-            "host show reads this SQLite field; it must be the returned mode"
-        );
     }
 
     #[test]

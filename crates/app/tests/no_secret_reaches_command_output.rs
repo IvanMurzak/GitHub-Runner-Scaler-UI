@@ -124,7 +124,6 @@ const COMMANDS: &[&[&str]] = &[
     &["service", "install", "--help"],
     &["service", "uninstall", "--help"],
     &["service", "status"],
-    &["service", "set-start-mode", "--help"],
     &["tui"],
     &["status"],
     &["status", "--json"],
