@@ -1,0 +1,19 @@
+.taskflow/2026-08-21-local-runner-manager/ROADMAP.md
+  s_5332f62e0ed5a7::t_4e0ec67ea3248b 110,139,141,300-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "689cb7e71388e015b2946533e335f4883568049e",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
