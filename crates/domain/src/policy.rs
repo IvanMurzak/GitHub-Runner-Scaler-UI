@@ -942,6 +942,8 @@ pub struct ScalePolicy {
     pub target: ScaleTarget,
     pub installation_id: u64,
     pub host_id: HostId,
+    /// Operator-chosen host identity retained even for MonitorOnly policies.
+    pub requested_host_label: HostLabel,
     mode: PolicyMode,
     enabled: bool,
     state: PolicyState,
@@ -981,6 +983,7 @@ pub struct PersistedPolicy {
     /// The GitHub App installation this policy authenticates through.
     pub installation_id: u64,
     pub host_id: HostId,
+    pub requested_host_label: HostLabel,
     /// `Some` for an Autoscale policy, `None` for a MonitorOnly one (D19).
     pub routing_labels: Option<RoutingLabels>,
     pub min_capacity: u16,
@@ -1015,11 +1018,34 @@ impl ScalePolicy {
         mode: PolicyMode,
         cache_policy: CachePolicy,
     ) -> Self {
+        Self::new_for_host_label(
+            id,
+            target,
+            installation_id,
+            host_id,
+            HostLabel::new("host").expect("the compatibility host label is valid"),
+            mode,
+            cache_policy,
+        )
+    }
+
+    /// New policy retaining the exact operator-requested host identity.
+    #[must_use]
+    pub fn new_for_host_label(
+        id: PolicyId,
+        target: ScaleTarget,
+        installation_id: u64,
+        host_id: HostId,
+        requested_host_label: HostLabel,
+        mode: PolicyMode,
+        cache_policy: CachePolicy,
+    ) -> Self {
         Self {
             id,
             target,
             installation_id,
             host_id,
+            requested_host_label,
             mode,
             enabled: false,
             state: PolicyState::Pending,
@@ -1041,6 +1067,7 @@ impl ScalePolicy {
             target,
             installation_id,
             host_id,
+            requested_host_label,
             routing_labels,
             min_capacity,
             max_capacity,
@@ -1056,6 +1083,7 @@ impl ScalePolicy {
             target,
             installation_id,
             host_id,
+            requested_host_label,
             mode,
             enabled,
             state,
@@ -1076,6 +1104,7 @@ impl ScalePolicy {
             target: self.target.clone(),
             installation_id: self.installation_id,
             host_id: self.host_id,
+            requested_host_label: self.requested_host_label.clone(),
             routing_labels: self.routing_labels().cloned(),
             min_capacity: self.min_capacity(),
             max_capacity: self.max_capacity(),

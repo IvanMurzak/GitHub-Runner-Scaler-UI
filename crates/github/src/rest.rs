@@ -142,17 +142,36 @@ pub const SECONDS_PER_HOUR: u32 = 3_600;
 /// [`TargetCost::requests_per_refresh`].
 pub const RUNNER_INVENTORY_REQUESTS_PER_REFRESH: u32 = 1;
 
-/// Requests budgeted for one in-progress workflow count, **per repository**.
+/// Requests one in-progress workflow count costs, **per repository**.
 ///
 /// Workflow runs are a per-repository resource. There is no organization-wide
 /// workflow-runs endpoint, so an organization pays this once per repository the
 /// App is installed on.
 ///
-/// This is the bounded fallback worst case. The ordinary response carrying
-/// `total_count` costs one request, but the no-total fallback may walk
-/// [`MAX_ACTIVITY_FALLBACK_PAGES`]. Configuration admission must budget what the
-/// gateway is allowed to spend, not only its cheapest response.
-pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = MAX_ACTIVITY_FALLBACK_PAGES as u32;
+/// # This is the best case, not the worst one
+///
+/// One request is what a repository costs **when GitHub sends `total_count`**,
+/// which is the ordinary answer from the workflow-runs endpoint and the reason
+/// the figure is `1`. When it is absent the count falls back to walking pages,
+/// and that walk may spend up to [`MAX_ACTIVITY_FALLBACK_PAGES`] — so the true
+/// worst case per repository per refresh is **four**, not one.
+///
+/// The gap is stated rather than modelled, deliberately, and the same way
+/// [`RUNNER_INVENTORY_REQUESTS_PER_REFRESH`] states that a paginated inventory
+/// costs more than the one request it claims. But it is worth naming here
+/// because things are built on top of it: `f1`'s `host show` headroom and `f2`'s
+/// `add` refusals both read *this* constant, so both are projecting the
+/// best case. A target sitting at the edge of what `f2` will allow could
+/// overrun by up to 4x on repositories whose counts take the fallback.
+///
+/// [`BUDGET_SHARE_DIVISOR`] is what absorbs this: the projection is compared
+/// against half the ceiling precisely so that the half this model does not
+/// attempt to count has somewhere to go. The fallback is also bounded and
+/// **says when it was reached** — a repository that walked to the ceiling lands
+/// in [`ActivityCount::truncated`] — so an overrun is visible rather than
+/// silent. That visibility, not the number `1`, is what makes the projection
+/// honest.
+pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = 1;
 
 /// The most pages one repository's in-progress count may walk when GitHub sends
 /// no `total_count`.
@@ -161,7 +180,7 @@ pub const ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH: u32 = MAX_ACTIVITY_FALLB
 /// is a budget one rather than a stylistic one. `MAX_PAGES` exists to stop a
 /// `Link: rel="next"` cycle looping *forever*; it is not a number anything
 /// budgeted for. This walk is charged against
-/// [`ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which is **four**, and that
+/// [`ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which is **one**, and that
 /// constant is what [`TargetCost`] projects and what `f2` computes its `add`
 /// refusals from.
 ///
@@ -1391,9 +1410,11 @@ pub struct InventorySnapshot {
 /// projection is compared against half the ceiling, and the other half absorbs
 /// everything this model deliberately does not attempt to count.
 ///
-/// It prices each repository's activity count at the bounded fallback worst
-/// case, so the `f2` admission check cannot approve a target whose legal polling
-/// behavior would immediately exceed the allowance.
+/// It also prices each repository's activity count at its **best case** of one
+/// request. A count that has to take the no-`total_count` fallback costs up to
+/// [`MAX_ACTIVITY_FALLBACK_PAGES`] — see
+/// [`ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which `f1` and `f2` read
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetCost {
     scope: TargetScope,
@@ -1467,7 +1488,7 @@ impl TargetCost {
         self.installed_repositories
     }
 
-    /// A one-repository cost carrying the same measured demand price.
+    /// A one-repository cost preserving the caller's demand measurement.
     #[must_use]
     pub const fn repository_equivalent(self) -> Self {
         Self {
@@ -4478,15 +4499,15 @@ mod tests {
         assert_eq!(refreshes_per_hour(floor), 120);
 
         let target = TargetCost::repository();
-        assert_eq!(target.requests_per_refresh(), 7);
+        assert_eq!(target.requests_per_refresh(), 4);
         assert_eq!(
             target.requests_per_hour(default),
-            420,
+            240,
             "the documented per-target total at the 60-second default"
         );
         assert_eq!(
             target.requests_per_hour(floor),
-            840,
+            480,
             "and at the 30-second floor"
         );
     }
@@ -4503,25 +4524,25 @@ mod tests {
                 interval(RefreshInterval::DEFAULT_SECS),
                 TargetCost::repository()
             ),
-            5
+            10
         );
         assert_eq!(
             BudgetProjection::max_repository_targets(
                 interval(RefreshInterval::MIN_SECS),
                 TargetCost::repository()
             ),
-            2
+            5
         );
 
         // And the boundary is where the documented ceilings say it is.
         let default = interval(RefreshInterval::DEFAULT_SECS);
-        let ten = BudgetProjection::new(default, vec![TargetCost::repository(); 5]);
-        assert_eq!(ten.requests_per_hour(), 2_100);
+        let ten = BudgetProjection::new(default, vec![TargetCost::repository(); 10]);
+        assert_eq!(ten.requests_per_hour(), 2_400);
         assert!(!ten.exceeds_allowance());
-        assert_eq!(ten.headroom(), 400);
+        assert_eq!(ten.headroom(), 100);
 
-        let eleven = BudgetProjection::new(default, vec![TargetCost::repository(); 6]);
-        assert_eq!(eleven.requests_per_hour(), 2_520);
+        let eleven = BudgetProjection::new(default, vec![TargetCost::repository(); 11]);
+        assert_eq!(eleven.requests_per_hour(), 2_640);
         assert!(
             eleven.exceeds_allowance(),
             "the eleventh repository is the one an operator needs told about"
@@ -4545,8 +4566,8 @@ mod tests {
         );
 
         let ten = TargetCost::organization(10);
-        assert_eq!(ten.requests_per_refresh(), 61);
-        assert_eq!(ten.requests_per_hour(default), 3_660);
+        assert_eq!(ten.requests_per_refresh(), 31);
+        assert_eq!(ten.requests_per_hour(default), 1_860);
         assert!(
             ten.requests_per_hour(default) > repository * 7,
             "an organization on ten repositories costs nearly eight times a \
@@ -4557,8 +4578,8 @@ mod tests {
         // Which is why the refusal arrives far earlier for an organization.
         let empty = BudgetProjection::new(default, Vec::new());
         assert!(empty.admit(TargetCost::repository()).is_admitted());
-        assert!(empty.admit(TargetCost::organization(6)).is_admitted());
-        let refusal = empty.admit(TargetCost::organization(7));
+        assert!(empty.admit(TargetCost::organization(13)).is_admitted());
+        let refusal = empty.admit(TargetCost::organization(14));
         assert!(
             !refusal.is_admitted(),
             "a single organization on fourteen repositories already exceeds a \
@@ -4571,7 +4592,7 @@ mod tests {
     #[test]
     fn a_refused_configuration_states_the_numbers_and_the_maximum_target_count() {
         let default = interval(RefreshInterval::DEFAULT_SECS);
-        let full = BudgetProjection::new(default, vec![TargetCost::repository(); 5]);
+        let full = BudgetProjection::new(default, vec![TargetCost::repository(); 10]);
 
         let Admission::Refused {
             projected_requests_per_hour,
@@ -4582,12 +4603,12 @@ mod tests {
         else {
             panic!("the eleventh repository must be refused");
         };
-        assert_eq!(projected_requests_per_hour, 2_520);
+        assert_eq!(projected_requests_per_hour, 2_640);
         assert_eq!(allowance, 2_500);
-        assert_eq!(max_repository_targets, 5);
+        assert_eq!(max_repository_targets, 10);
 
         let message = full.admit(TargetCost::repository()).to_string();
-        for expected in ["2520", "2500", "5000", "60-second", "about 5 repository"] {
+        for expected in ["2640", "2500", "5000", "60-second", "about 10 repository"] {
             assert!(
                 message.contains(expected),
                 "{expected:?} missing from: {message}"
@@ -4609,8 +4630,8 @@ mod tests {
         let admitted = BudgetProjection::new(default, vec![TargetCost::repository(); 2])
             .admit(TargetCost::repository())
             .to_string();
-        assert!(admitted.contains("1260"), "{admitted}");
-        assert!(admitted.contains("1240"), "{admitted}");
+        assert!(admitted.contains("720"), "{admitted}");
+        assert!(admitted.contains("1780"), "{admitted}");
     }
 
     /// The projection's per-refresh constants, pinned against the requests the
@@ -4649,7 +4670,13 @@ mod tests {
 
         let modelled_without_demand = cost.requests_per_refresh()
             - DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH * cost.installed_repositories();
-        assert!(gateway.requests_issued() <= u64::from(modelled_without_demand));
+        assert_eq!(
+            gateway.requests_issued(),
+            u64::from(modelled_without_demand),
+            "the model projects {modelled_without_demand} inventory-and-activity \
+             requests per refresh for this scope, and the gateway issued {}",
+            gateway.requests_issued()
+        );
         assert_eq!(
             modelled_without_demand,
             RUNNER_INVENTORY_REQUESTS_PER_REFRESH + scope.requests_per_refresh()
@@ -4683,23 +4710,23 @@ mod tests {
 
         assert_eq!(
             TargetCost::repository().requests_per_hour(default),
-            420,
+            240,
             "the documented estimate is the default"
         );
 
         // A demand poll that turned out to need three requests per repository,
         // not two.
         let measured = TargetCost::repository().with_demand_requests_per_repository(3);
-        assert_eq!(measured.requests_per_refresh(), 8);
-        assert_eq!(measured.requests_per_hour(default), 480);
+        assert_eq!(measured.requests_per_refresh(), 5);
+        assert_eq!(measured.requests_per_hour(default), 300);
 
         // And it scales with an organization's repository count like everything
         // else per-repository does.
         let org = TargetCost::organization(4).with_demand_requests_per_repository(3);
-        assert_eq!(org.requests_per_refresh(), 1 + 4 * (4 + 3));
+        assert_eq!(org.requests_per_refresh(), 1 + 4 * (1 + 3));
         assert_eq!(
             org.requests_per_hour(default),
-            1_740,
+            1_020,
             "a worse demand cost lands hardest on an organization, which is \
              exactly the effect a flat per-target model would hide"
         );
@@ -4711,14 +4738,11 @@ mod tests {
     fn a_repository_activity_scope_covers_exactly_one_repository() {
         let scope = ActivityScope::repository(repo());
         assert_eq!(scope.repositories(), [repo()]);
-        assert_eq!(
-            scope.requests_per_refresh(),
-            MAX_ACTIVITY_FALLBACK_PAGES as u32
-        );
+        assert_eq!(scope.requests_per_refresh(), 1);
         assert_eq!(scope.target(), &repo_target());
         assert_eq!(
-            TargetCost::from_activity_scope(&scope).installed_repositories(),
-            1
+            TargetCost::from_activity_scope(&scope),
+            TargetCost::repository()
         );
     }
 

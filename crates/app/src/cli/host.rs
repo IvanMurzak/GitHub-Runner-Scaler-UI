@@ -61,10 +61,11 @@ use std::num::NonZeroU16;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::store::{Store, StoreError};
+#[cfg(test)]
 use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
-use runner_manager_github::rest::{
-    BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
-};
+#[cfg(test)]
+use runner_manager_github::rest::budget_allowance;
+use runner_manager_github::rest::{BudgetProjection, TargetCost, refreshes_per_hour};
 use runner_manager_platform::secrets::SecretStore;
 
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, write_failed};
@@ -95,6 +96,7 @@ pub const FALLBACK_COST_MULTIPLE: u32 = 4;
 /// ceiling below has no scope to price — it is a statement about a hypothetical
 /// eleventh repository, not about a configured one.
 #[must_use]
+#[cfg(test)]
 pub fn measured(cost: TargetCost) -> TargetCost {
     cost.with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
 }
@@ -109,11 +111,7 @@ pub fn measured(cost: TargetCost) -> TargetCost {
 /// invent one.
 #[must_use]
 pub fn max_repository_targets(interval: RefreshInterval) -> u32 {
-    let per_target = measured(TargetCost::repository()).requests_per_hour(interval);
-    if per_target == 0 {
-        return 0;
-    }
-    budget_allowance() / per_target
+    BudgetProjection::max_repository_targets(interval, TargetCost::repository())
 }
 
 /// What this host's configured target set costs per hour, and what still fits.
@@ -155,13 +153,13 @@ impl HostBudget {
         let mut costs = Vec::with_capacity(targets.len());
         let mut organization_targets = 0;
         for target in targets {
-            costs.push(measured(match target {
+            costs.push(match target {
                 ScaleTarget::Repository(_) => TargetCost::repository(),
                 ScaleTarget::Organization(_) => {
                     organization_targets += 1;
                     TargetCost::organization(1)
                 }
-            }));
+            });
         }
         Self {
             interval,
@@ -284,34 +282,40 @@ impl HostBudget {
 
 /// States the one assumption a reader would otherwise take the ceiling for.
 ///
-/// Activity polling is priced at its bounded four-page worst case. Demand still
-/// uses its measured one-request best case and can walk four pages when GitHub
-/// omits `total_count`, so "about N targets" remains approximate.
+/// The projection prices each per-repository request class at its **best case**
+/// of one request. Both classes fall back to walking pages when GitHub omits
+/// `total_count`, and both walks are bounded at [`FALLBACK_COST_MULTIPLE`]
+/// pages. So "about N targets" is a best-case figure, and a host whose
+/// repositories all take the fallback path spends up to four times what the
+/// per-repository half of this projection says.
 ///
 /// # Errors
 /// Whatever `out` fails with.
 pub fn write_best_case_caveat(out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
-        "  About: queued-run polling is a BEST-CASE cost of one request per repository;"
+        "  About: these are BEST-CASE costs. Each repository is priced at one request for"
     )?;
     writeln!(
         out,
-        "  it can cost up to {FALLBACK_COST_MULTIPLE}x as much when GitHub omits a total. In-progress polling is"
+        "  its in-progress count and one for its queued-run count, which is what GitHub"
     )?;
     writeln!(
         out,
-        "  already priced at that bounded worst case. Treat the target figure as"
+        "  charges when it sends a total with the first page. When it does not, each of"
     )?;
     writeln!(
         out,
-        "  approximate, not as a threshold: the other half of GitHub's hourly ceiling"
+        "  those counts walks pages instead and costs up to {FALLBACK_COST_MULTIPLE}x as much. Treat the"
     )?;
     writeln!(
         out,
-        "  is deliberately left unplanned to absorb paging and interactive requests."
+        "  target figure as approximate, not as a threshold: the other half of GitHub's"
     )?;
-    writeln!(out)?;
+    writeln!(
+        out,
+        "  hourly ceiling is deliberately left unplanned to absorb exactly this."
+    )?;
     Ok(())
 }
 
@@ -612,7 +616,7 @@ mod tests {
             let mut costs: Vec<TargetCost> = Vec::new();
             loop {
                 let projection = BudgetProjection::new(interval, costs.clone());
-                let candidate = measured(TargetCost::repository());
+                let candidate = TargetCost::repository();
                 if !projection.admit(candidate).is_admitted() {
                     break;
                 }
@@ -647,34 +651,34 @@ mod tests {
     /// documentation above, should go, and [`max_repository_targets`] can
     /// become a call into `c3`'s.
     #[test]
-    fn c3s_ceiling_accepts_the_same_measured_cost_as_admission() {
+    fn c3s_ceiling_preserves_the_authoritative_contract() {
         let interval = RefreshInterval::default();
 
         assert_eq!(
             TargetCost::repository().requests_per_hour(interval),
-            420,
-            "c3's estimate: 1 inventory + 4 activity + 2 demand, 60 times an hour"
+            240,
+            "c3's estimate: 1 inventory + 1 activity + 2 demand, 60 times an hour"
         );
         assert_eq!(
             measured(TargetCost::repository()).requests_per_hour(interval),
-            360,
-            "the measured cost: 1 inventory + 4 activity + 1 demand, 60 times an hour"
+            180,
+            "the measured cost: 1 inventory + 1 activity + 1 demand, 60 times an hour"
         );
 
         assert_eq!(
             BudgetProjection::max_repository_targets(interval, TargetCost::repository()),
-            5,
+            10,
             "c3's printed ceiling, computed from the estimate"
         );
         assert_eq!(
             max_repository_targets(interval),
-            6,
-            "this CLI's ceiling, computed from the cost `c4` actually issues"
+            10,
+            "the CLI preserves the documented 240 request/hour contract"
         );
         assert!(
-            BudgetProjection::max_repository_targets(interval, measured(TargetCost::repository()))
+            BudgetProjection::max_repository_targets(interval, TargetCost::repository())
                 == max_repository_targets(interval),
-            "the caller-supplied measured cost must make display and admission agree"
+            "display and admission use the same authoritative candidate cost"
         );
     }
 
@@ -685,8 +689,8 @@ mod tests {
     #[test]
     fn the_stated_fallback_multiple_is_the_one_the_gateways_can_spend() {
         assert_eq!(
-            ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, FALLBACK_COST_MULTIPLE,
-            "the projection prices the activity count at its bounded worst case"
+            ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, 1,
+            "the projection prices the activity count at one request"
         );
         assert_eq!(
             u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap(),
@@ -754,8 +758,8 @@ mod tests {
                 repository("o/three"),
             ],
         );
-        assert_eq!(one.requests_per_hour(), 360);
-        assert_eq!(three.requests_per_hour(), 1_080);
+        assert_eq!(one.requests_per_hour(), 240);
+        assert_eq!(three.requests_per_hour(), 720);
         assert!(
             budget_text(&three).contains("policies priced           3"),
             "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
@@ -806,8 +810,8 @@ mod tests {
             max_repository_targets(floor),
             max_repository_targets(default)
         );
-        assert_eq!(max_repository_targets(floor), 3);
-        assert_eq!(max_repository_targets(default), 6);
+        assert_eq!(max_repository_targets(floor), 5);
+        assert_eq!(max_repository_targets(default), 10);
     }
 
     #[test]

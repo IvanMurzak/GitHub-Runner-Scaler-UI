@@ -523,7 +523,7 @@ pub struct RepoSetCapacityArgs {
 pub struct RepoSetScaleArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
-    #[arg(long, value_name = "BOOL")]
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub enabled: bool,
 }
 
@@ -572,7 +572,7 @@ pub struct OrgSetCapacityArgs {
 pub struct OrgSetScaleArgs {
     #[arg(value_name = "ORG")]
     pub organization: String,
-    #[arg(long, value_name = "BOOL")]
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub enabled: bool,
 }
 
@@ -1204,6 +1204,29 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn repository_and_organization_set_scale_parse_explicit_true_and_false() {
+        for (scope, target) in [("repo", "octo/repo"), ("org", "octo")] {
+            for expected in [true, false] {
+                let cli = Cli::try_parse_from([
+                    "runner-manager",
+                    scope,
+                    "set-scale",
+                    target,
+                    "--enabled",
+                    if expected { "true" } else { "false" },
+                ])
+                .unwrap();
+                let actual = match cli.command {
+                    Command::Repo(RepoCommand::SetScale(args)) => args.enabled,
+                    Command::Org(OrgCommand::SetScale(args)) => args.enabled,
+                    _ => panic!("wrong command parsed for {scope}"),
+                };
+                assert_eq!(actual, expected, "{scope} must retain explicit {expected}");
+            }
+        }
     }
 
     /// The override is the one environment variable that can send a credential

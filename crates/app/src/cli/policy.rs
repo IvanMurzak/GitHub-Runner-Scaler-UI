@@ -12,7 +12,6 @@ use runner_manager_domain::model::{
 use runner_manager_domain::policy::{PolicyMode, PolicyState, RoutingLabels, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_github::InstallationAccount;
-use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
 use runner_manager_github::rest::{Admission, BudgetProjection, TargetCost};
 
 use super::auth::CredentialState;
@@ -125,20 +124,20 @@ fn add(
     })?;
     let (installation_id, installed_repositories) = installation_for(&target, reachable)?;
 
-    let mut host = super::host::local_host_or_create(context, &store)?;
-    let candidate = measured(match target.scope() {
+    let host = super::host::local_host_or_create(context, &store)?;
+    let candidate = match target.scope() {
         TargetScope::Repository => TargetCost::repository(),
         TargetScope::Organization => TargetCost::organization(installed_repositories),
-    });
+    };
     let costs = store
         .policies()
         .map_err(store_failure)?
         .iter()
-        .map(|policy| measured(cost_for(&policy.target, reachable)))
+        .map(|policy| cost_for(&policy.target, reachable))
         .collect();
     record_policy(
         &store,
-        &mut host,
+        &host,
         target,
         host_label,
         maximum,
@@ -152,13 +151,40 @@ fn add(
 #[allow(clippy::too_many_arguments)]
 fn record_policy(
     store: &dyn Store,
-    host: &mut Host,
+    host: &Host,
     target: ScaleTarget,
     host_label: HostLabel,
     maximum: Option<NonZeroU16>,
     installation_id: u64,
     candidate: TargetCost,
     existing_costs: Vec<TargetCost>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    record_policy_with_id(
+        store,
+        host,
+        target,
+        host_label,
+        maximum,
+        installation_id,
+        candidate,
+        existing_costs,
+        PolicyId::new_random(),
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_policy_with_id(
+    store: &dyn Store,
+    host: &Host,
+    target: ScaleTarget,
+    host_label: HostLabel,
+    maximum: Option<NonZeroU16>,
+    installation_id: u64,
+    candidate: TargetCost,
+    existing_costs: Vec<TargetCost>,
+    policy_id: PolicyId,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     if store
@@ -181,8 +207,6 @@ fn record_policy(
             "runner-manager host show",
         ));
     }
-    host.display_name = host_label.to_string();
-    store.put_host(host).map_err(store_failure)?;
     let mode = match maximum {
         Some(maximum) => PolicyMode::autoscale(
             RoutingLabels::derive(&host_label, host.os, host.architecture),
@@ -207,11 +231,12 @@ fn record_policy(
         let failed = write_failed("this routing warning");
         writeln!(out, "warning: routing label {} is already recorded for another host. Both hosts may start for the same queued job; the surplus runner exits after wasting a slot.", labels.host_label()).map_err(failed)?;
     }
-    let policy = ScalePolicy::new(
-        PolicyId::new_random(),
+    let policy = ScalePolicy::new_for_host_label(
+        policy_id,
         target,
         installation_id,
         host.id,
+        host_label,
         mode,
         CachePolicy::default(),
     );
@@ -312,6 +337,15 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
             maximum
         )
         .map_err(failed)?;
+        if policy.state() == PolicyState::RepairRequired {
+            writeln!(
+                out,
+                "repair: runner-manager {} remove {} --purge",
+                scope_word(policy.target.scope()),
+                policy.target
+            )
+            .map_err(failed)?;
+        }
     }
     if count == 0 {
         writeln!(out, "No {} policies.", scope_word(scope)).map_err(failed)?;
@@ -339,10 +373,9 @@ fn set_capacity(
                     format!("policy {target} refers to a missing local host"),
                 )
             })?;
-        let label = HostLabel::new(&host.display_name).map_err(invalid)?;
         policy
             .promote_to_autoscale(
-                RoutingLabels::derive(&label, host.os, host.architecture),
+                RoutingLabels::derive(&policy.requested_host_label, host.os, host.architecture),
                 0,
                 maximum,
             )
@@ -561,9 +594,6 @@ fn cost_for(
     }
 }
 
-fn measured(cost: TargetCost) -> TargetCost {
-    cost.with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
-}
 fn non_zero_capacity(value: u16) -> Result<NonZeroU16, CliError> {
     NonZeroU16::new(value).ok_or_else(|| {
         CliError::new(
@@ -629,19 +659,19 @@ mod tests {
     fn repository_and_organization_add_share_pending_non_arming_behavior() {
         for target in targets() {
             let store = SqliteStore::open_in_memory().unwrap();
-            let mut local = host("machine");
+            let local = host("machine");
             let mut output = Vec::new();
             record_policy(
                 &store,
-                &mut local,
+                &local,
                 target.clone(),
                 HostLabel::new("home").unwrap(),
                 Some(nz(2)),
                 77,
-                measured(match target.scope() {
+                match target.scope() {
                     TargetScope::Repository => TargetCost::repository(),
                     TargetScope::Organization => TargetCost::organization(1),
-                }),
+                },
                 Vec::new(),
                 &mut output,
             )
@@ -680,17 +710,18 @@ mod tests {
     #[test]
     fn monitor_only_reserves_nothing_and_promotes_with_the_recorded_host_identity() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let mut local = host("machine");
+        let local = host("machine");
+        store.put_host(&local).unwrap();
         let target = targets()[0].clone();
         let mut output = Vec::new();
         record_policy(
             &store,
-            &mut local,
+            &local,
             target,
             HostLabel::new("home").unwrap(),
             None,
             77,
-            measured(TargetCost::repository()),
+            TargetCost::repository(),
             Vec::new(),
             &mut output,
         )
@@ -706,7 +737,7 @@ mod tests {
         policy
             .promote_to_autoscale(
                 RoutingLabels::derive(
-                    &HostLabel::new(&persisted_host.display_name).unwrap(),
+                    &policy.requested_host_label,
                     persisted_host.os,
                     persisted_host.architecture,
                 ),
@@ -723,9 +754,87 @@ mod tests {
     }
 
     #[test]
+    fn monitor_policy_keeps_its_own_label_when_another_policy_is_added_before_promotion() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = host("machine");
+        store.put_host(&local).unwrap();
+        for (target, label) in targets().into_iter().zip(["home", "office"]) {
+            record_policy(
+                &store,
+                &local,
+                target,
+                HostLabel::new(label).unwrap(),
+                None,
+                77,
+                TargetCost::repository(),
+                Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+
+        let mut policies = store.policies().unwrap();
+        let mut first = policies
+            .drain(..)
+            .find(|policy| policy.target == targets()[0])
+            .unwrap();
+        first
+            .promote_to_autoscale(
+                RoutingLabels::derive(&first.requested_host_label, local.os, local.architecture),
+                0,
+                nz(2),
+            )
+            .unwrap();
+        assert_eq!(
+            first.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-linux-x64"
+        );
+    }
+
+    #[test]
+    fn failed_policy_insert_cannot_mutate_the_committed_host() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = host("machine");
+        store.put_host(&local).unwrap();
+        let duplicate_id = PolicyId::new_random();
+        let existing = ScalePolicy::new_for_host_label(
+            duplicate_id,
+            targets()[0].clone(),
+            77,
+            local.id,
+            HostLabel::new("home").unwrap(),
+            PolicyMode::monitor_only(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&existing).unwrap();
+
+        let error = record_policy_with_id(
+            &store,
+            &local,
+            targets()[1].clone(),
+            HostLabel::new("office").unwrap(),
+            None,
+            78,
+            TargetCost::organization(1),
+            vec![TargetCost::repository()],
+            duplicate_id,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.class(), Failure::LocalState);
+        assert_eq!(
+            store.host(local.id).unwrap().unwrap().display_name,
+            "machine"
+        );
+        let policies = store.policies().unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].requested_host_label.as_str(), "home");
+    }
+
+    #[test]
     fn refusal_prints_the_ceiling_admission_actually_used() {
         let interval = RefreshInterval::default();
-        let candidate = measured(TargetCost::repository());
+        let candidate = TargetCost::repository();
         let maximum = BudgetProjection::max_repository_targets(interval, candidate);
         let projection = BudgetProjection::new(interval, vec![candidate; maximum as usize]);
         let refusal = projection.admit(candidate);
@@ -749,22 +858,22 @@ mod tests {
         for (target, candidate, existing, expected) in [
             (
                 targets()[0].clone(),
-                measured(TargetCost::repository()),
-                vec![measured(TargetCost::repository()); 6],
-                "about 6 repository",
+                TargetCost::repository(),
+                vec![TargetCost::repository(); 10],
+                "about 10 repository",
             ),
             (
                 targets()[1].clone(),
-                measured(TargetCost::organization(9)),
+                TargetCost::organization(14),
                 Vec::new(),
-                "installed on 9 of its repositories",
+                "installed on 14 of its repositories",
             ),
         ] {
             let store = SqliteStore::open_in_memory().unwrap();
-            let mut local = host("machine");
+            let local = host("machine");
             let error = record_policy(
                 &store,
-                &mut local,
+                &local,
                 target,
                 HostLabel::new("home").unwrap(),
                 Some(nz(2)),
@@ -788,17 +897,17 @@ mod tests {
             Failure::InvalidArgument
         );
         let store = SqliteStore::open_in_memory().unwrap();
-        let mut local = host("machine");
+        let local = host("machine");
         let target = targets()[0].clone();
         for attempt in 0..2 {
             let result = record_policy(
                 &store,
-                &mut local,
+                &local,
                 target.clone(),
                 HostLabel::new("home").unwrap(),
                 Some(nz(2)),
                 77,
-                measured(TargetCost::repository()),
+                TargetCost::repository(),
                 Vec::new(),
                 &mut Vec::new(),
             );
