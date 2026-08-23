@@ -6,6 +6,7 @@ use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use runner_manager_agent::lifecycle::{
@@ -17,11 +18,12 @@ use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
 };
 use runner_manager_agent::reconcile::{
-    FileAllocationLock, GatewayDemand, RandomJitter, Reconciler, ReconcilerPorts,
+    FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts,
     RepositoryDirectory, TeeEvents, TracingEvents,
 };
 use runner_manager_domain::attempt::FailureReason;
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget};
+use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
 use runner_manager_github::jit::{JitError, JitGateway, JitRunnerRequest, RestJit};
@@ -50,7 +52,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     let _instance = acquire_instance(context)?;
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
-    let policies = store.policies().map_err(local_store_failure)?;
+    let targets = active_autoscale_targets(store.policies().map_err(local_store_failure)?);
     let failed = write_failed("the daemon state");
 
     writeln!(out, "daemon running (pid {})", std::process::id()).map_err(failed)?;
@@ -58,7 +60,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     // A host with no policies owns no GitHub work. It still holds the lock and
     // behaves as a real daemon, but it neither demands a credential nor opens a
     // network connection while waiting to be configured or stopped.
-    if policies.is_empty() {
+    if targets.is_empty() {
         shutdown_signal().await.map_err(signal_failure)?;
         writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
         return Ok(());
@@ -104,129 +106,243 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         app,
     });
 
-    let package_target = policies[0].target.clone();
-    let catalog = Arc::new(GatewayCatalog::new(
-        RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
-        package_target,
-    ));
-    let cache = Arc::new(PackageCache::new(
-        context.paths(),
-        host.os,
-        host.architecture,
-        CachePorts {
-            catalog,
-            fetcher: Arc::new(HttpFetcher::default()),
-            backoff: Arc::new(ExponentialBackoff::default()),
-            clock: Arc::clone(&clock),
-        },
-    ));
     let paths = Arc::new(context.paths().clone());
     let events: Arc<dyn runner_manager_agent::reconcile::EventSink> = Arc::new(TeeEvents(
         Arc::new(TracingEvents),
         Arc::new(runner_manager_agent::reconcile::EventLog::new()),
     ));
-    let launcher = Arc::new(LifecycleLauncher::new(
-        host.id,
-        context.paths().runtime_dir(),
-        context.paths().logs_dir(),
-        1,
-        runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
-        RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
-        LifecyclePorts {
-            store: Arc::clone(&store) as Arc<dyn Store>,
-            github: lifecycle_github,
-            packages: Arc::new(CachedRuntimePackages::new(cache)),
-            processes: Arc::new(NativeProcesses::new()),
-            clock: Arc::clone(&clock),
-            demand: Arc::new(PersistentDemand),
-            delay: Arc::new(TokioRetryDelay),
-            events: Arc::new(NoAttemptEvents),
-            reconcile_events: Arc::clone(&events),
-        },
-    ));
-    launcher
-        .recover_startup(&policies)
-        .await
-        .map_err(|source| {
-            CliError::new(
-                Failure::LocalState,
-                format!("startup recovery did not complete: {source}"),
-            )
-        })?;
-
-    let demand_cancel = CancelToken::new();
-    let demand = Arc::new(GatewayDemand::new(
-        RestDemand::new(client, Arc::clone(&clock)),
-        demand_cancel.clone(),
-    ));
-    let mut reconciler = Reconciler::new(
-        host,
-        ReconcilerPorts {
-            demand,
-            launcher,
-            lock: Arc::new(FileAllocationLock::new(paths)),
-            directory,
-            clock: Arc::clone(&clock),
-            jitter: Arc::new(RandomJitter),
-            events,
-        },
-    );
-
-    let mut stopping = Box::pin(shutdown_signal());
-    let mut draining = false;
-    let mut drain_policies = policies.clone();
-    loop {
-        let active = store
-            .attempts()
-            .map_err(local_store_failure)?
-            .into_iter()
-            .filter(|attempt| attempt.counts_against_capacity())
-            .count();
-        if draining && active == 0 {
-            // One last pass removes terminal runtime directories.
-            let _ = reconciler.reconcile(&drain_policies).await;
-            writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
-            return Ok(());
-        }
-
-        let selected = if draining { &drain_policies } else { &policies };
-        let report = if draining {
-            reconciler.reconcile(selected).await
-        } else {
-            tokio::select! {
-                signal = &mut stopping => {
-                    signal.map_err(signal_failure)?;
-                    demand_cancel.cancel();
-                    begin_drain(&mut drain_policies);
-                    draining = true;
-                    continue;
-                }
-                report = reconciler.reconcile(selected) => report,
-            }
-        };
-        if !draining && !selected.is_empty() && report.failure.is_none() {
-            record_github_contact(context.paths(), clock.now()).map_err(|source| {
+    let shared_lock = Arc::new(FileAllocationLock::new(paths));
+    let recovery_policies: Vec<_> = targets.iter().flatten().cloned().collect();
+    let mut managed_targets = Vec::with_capacity(targets.len());
+    for policies in targets {
+        let package_target = policies[0].target.clone();
+        let catalog = Arc::new(GatewayCatalog::new(
+            RestInventory::new(Arc::clone(&client), Arc::clone(&clock)),
+            package_target.clone(),
+        ));
+        let cache = Arc::new(PackageCache::new(
+            context.paths(),
+            host.os,
+            host.architecture,
+            CachePorts {
+                catalog,
+                fetcher: Arc::new(HttpFetcher::default()),
+                backoff: Arc::new(ExponentialBackoff::default()),
+                clock: Arc::clone(&clock),
+            },
+        ));
+        let launcher = Arc::new(LifecycleLauncher::new(
+            host.id,
+            context.paths().runtime_dir(),
+            context.paths().logs_dir(),
+            1,
+            runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
+            RetryPolicy::bounded(3, Duration::from_secs(2), Duration::from_secs(30)),
+            LifecyclePorts {
+                store: Arc::clone(&store) as Arc<dyn Store>,
+                github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
+                packages: Arc::new(CachedRuntimePackages::new(cache)),
+                processes: Arc::new(NativeProcesses::new()),
+                clock: Arc::clone(&clock),
+                demand: Arc::new(PersistentDemand),
+                delay: Arc::new(TokioRetryDelay),
+                events: Arc::new(NoAttemptEvents),
+                reconcile_events: Arc::clone(&events),
+            },
+        ));
+        launcher
+            // Startup recovery is journal-wide. Each target owns its launcher
+            // for package acquisition, but unknown live policies make recovery
+            // fail closed, so every launcher proves the same active policy set.
+            .recover_startup(&recovery_policies)
+            .await
+            .map_err(|source| {
                 CliError::new(
                     Failure::LocalState,
-                    format!("cannot record the last successful GitHub contact: {source}"),
+                    format!(
+                        "startup recovery for {} did not complete: {source}",
+                        package_target
+                    ),
                 )
             })?;
-        }
+        let cancel = CancelToken::new();
+        let demand = Arc::new(GatewayDemand::new(
+            RestDemand::new(Arc::clone(&client), Arc::clone(&clock)),
+            cancel.clone(),
+        ));
+        managed_targets.push(ManagedTarget {
+            policies,
+            reconciler: Reconciler::new(
+                host.clone(),
+                ReconcilerPorts {
+                    demand,
+                    launcher,
+                    lock: Arc::clone(&shared_lock) as Arc<_>,
+                    directory: Arc::clone(&directory) as Arc<_>,
+                    clock: Arc::clone(&clock),
+                    jitter: Arc::new(RandomJitter),
+                    events: Arc::clone(&events),
+                },
+            ),
+            cancel,
+        });
+    }
 
-        if draining {
-            tokio::time::sleep(report.next_poll.delay).await;
-        } else {
-            tokio::select! {
-                signal = &mut stopping => {
-                    signal.map_err(signal_failure)?;
-                    demand_cancel.cancel();
-                    begin_drain(&mut drain_policies);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let mut loops = tokio::task::JoinSet::new();
+    let contacts: Arc<dyn ContactRecorder> = Arc::new(FileContactRecorder {
+        paths: context.paths().clone(),
+        clock: Arc::clone(&clock),
+        write: Mutex::new(()),
+    });
+    for target in managed_targets {
+        loops.spawn(run_target_loop(
+            target,
+            shutdown.subscribe(),
+            Arc::clone(&contacts),
+        ));
+    }
+
+    let early = tokio::select! {
+        signal = shutdown_signal() => {
+            signal.map_err(signal_failure)?;
+            None
+        }
+        result = loops.join_next() => result,
+    };
+    let _ = shutdown.send(true);
+    if let Some(result) = early {
+        let outcome = result.map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("a daemon target loop failed: {source}"),
+            )
+        })?;
+        outcome?;
+        return Err(CliError::new(
+            Failure::LocalState,
+            "a daemon target loop stopped before shutdown",
+        ));
+    }
+    while let Some(result) = loops.join_next().await {
+        result.map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("a daemon target loop failed: {source}"),
+            )
+        })??;
+    }
+    writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
+    Ok(())
+}
+
+fn active_autoscale_targets(mut policies: Vec<ScalePolicy>) -> Vec<Vec<ScalePolicy>> {
+    policies.retain(ScalePolicy::may_start_runners);
+    policies.sort_by(|left, right| left.target.to_string().cmp(&right.target.to_string()));
+    let mut targets: Vec<Vec<ScalePolicy>> = Vec::new();
+    for policy in policies {
+        match targets.last_mut() {
+            Some(group) if group[0].target == policy.target => group.push(policy),
+            _ => targets.push(vec![policy]),
+        }
+    }
+    targets
+}
+
+trait TargetReconciler: Send + 'static {
+    fn policies(&self) -> &[ScalePolicy];
+    fn begin_drain(&mut self);
+    fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>>;
+    fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
+        active_owned(report, self.policies())
+    }
+}
+
+struct ManagedTarget {
+    policies: Vec<ScalePolicy>,
+    reconciler: Reconciler,
+    cancel: CancelToken,
+}
+
+impl TargetReconciler for ManagedTarget {
+    fn policies(&self) -> &[ScalePolicy] {
+        &self.policies
+    }
+
+    fn begin_drain(&mut self) {
+        self.cancel.cancel();
+        begin_drain(&mut self.policies);
+    }
+
+    fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>> {
+        Box::pin(self.reconciler.reconcile(&self.policies))
+    }
+}
+
+trait ContactRecorder: Send + Sync + 'static {
+    fn record(&self) -> Result<(), CliError>;
+}
+
+struct FileContactRecorder {
+    paths: runner_manager_platform::paths::AppPaths,
+    clock: Arc<dyn Clock>,
+    write: Mutex<()>,
+}
+
+impl ContactRecorder for FileContactRecorder {
+    fn record(&self) -> Result<(), CliError> {
+        let _write = self.write.lock().map_err(|_| {
+            CliError::new(
+                Failure::LocalState,
+                "cannot lock the last successful GitHub contact record",
+            )
+        })?;
+        record_github_contact(&self.paths, self.clock.now()).map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot record the last successful GitHub contact: {source}"),
+            )
+        })
+    }
+}
+
+async fn run_target_loop<T: TargetReconciler>(
+    mut target: T,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    contacts: Arc<dyn ContactRecorder>,
+) -> Result<(), CliError> {
+    let mut draining = *shutdown.borrow();
+    if draining {
+        target.begin_drain();
+    }
+    loop {
+        let report = target.reconcile().await;
+        if !draining && report.failure.is_none() {
+            contacts.record()?;
+        }
+        if draining && target.active_owned(&report) == Some(0) {
+            return Ok(());
+        }
+        tokio::select! {
+            () = tokio::time::sleep(report.next_poll.delay) => {}
+            changed = shutdown.changed(), if !draining => {
+                if changed.is_err() || *shutdown.borrow() {
+                    target.begin_drain();
                     draining = true;
                 }
-                () = tokio::time::sleep(report.next_poll.delay) => {}
             }
         }
     }
+}
+
+fn active_owned(report: &ReconcileReport, policies: &[ScalePolicy]) -> Option<u16> {
+    policies.iter().try_fold(0_u16, |total, policy| {
+        report
+            .allocations
+            .iter()
+            .find(|allocation| allocation.policy_id == policy.id)
+            .map(|allocation| total.saturating_add(allocation.active_owned))
+    })
 }
 
 fn begin_drain(policies: &mut [runner_manager_domain::policy::ScalePolicy]) {
@@ -403,7 +519,92 @@ impl RepositoryDirectory for GithubDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use runner_manager_github::rest::RefreshState;
     use runner_manager_testkit::fixtures;
+
+    #[derive(Debug)]
+    struct FakeTarget {
+        policy: ScalePolicy,
+        reports: VecDeque<ReconcileReport>,
+        calls: Arc<AtomicUsize>,
+        active: u16,
+        draining: bool,
+        busy_was_terminated: Arc<AtomicUsize>,
+    }
+
+    impl FakeTarget {
+        fn repeating(policy: ScalePolicy, report: ReconcileReport) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    policy,
+                    reports: VecDeque::from([report]),
+                    calls: Arc::clone(&calls),
+                    active: 0,
+                    draining: false,
+                    busy_was_terminated: Arc::new(AtomicUsize::new(0)),
+                },
+                calls,
+            )
+        }
+
+        fn busy_then_finished(policy: ScalePolicy) -> Self {
+            Self {
+                policy,
+                reports: VecDeque::new(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                active: 1,
+                draining: false,
+                busy_was_terminated: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl TargetReconciler for FakeTarget {
+        fn policies(&self) -> &[ScalePolicy] {
+            std::slice::from_ref(&self.policy)
+        }
+
+        fn begin_drain(&mut self) {
+            self.draining = true;
+            begin_drain(std::slice::from_mut(&mut self.policy));
+        }
+
+        fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.draining && self.active > 0 {
+                // The first drain pass supervises the busy child without any
+                // termination action. The next pass observes its ordinary
+                // completion and permits daemon exit.
+                if self.calls.load(Ordering::SeqCst) >= 3 {
+                    self.active = 0;
+                }
+            }
+            let report = self.reports.front().cloned().unwrap_or_else(|| {
+                let mut report = ReconcileReport::default();
+                report.next_poll.delay = Duration::from_secs(1);
+                report
+            });
+            Box::pin(std::future::ready(report))
+        }
+
+        fn active_owned(&self, _report: &ReconcileReport) -> Option<u16> {
+            Some(self.active)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingContacts(AtomicUsize);
+
+    impl ContactRecorder for CountingContacts {
+        fn record(&self) -> Result<(), CliError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[test]
     fn a_second_daemon_names_the_holder_and_uses_the_conflict_exit_class() {
@@ -418,23 +619,157 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_drain_stops_new_launches_without_having_process_termination_capability() {
-        let mut policies = [fixtures::policy()
-            .repository("acme/repo")
+    fn only_active_autoscale_policies_are_loaded_in_stable_target_order() {
+        let active_z = fixtures::policy()
+            .repository("zeta/repo")
             .autoscale("home", 1)
             .active()
-            .build()];
-        assert!(policies[0].may_start_runners());
+            .build();
+        let active_a = fixtures::policy()
+            .repository("alpha/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let pending = fixtures::policy()
+            .repository("pending/repo")
+            .autoscale("home", 1)
+            .build();
+        let monitor = fixtures::policy()
+            .repository("monitor/repo")
+            .monitor_only()
+            .active()
+            .build();
+        let mut draining = fixtures::policy()
+            .repository("draining/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        draining.request_disable().unwrap();
+        let mut disabled = draining.clone();
+        disabled.drain_completed(0).unwrap();
 
-        begin_drain(&mut policies);
-
-        assert!(!policies[0].may_start_runners());
-        assert_eq!(
-            policies[0].state(),
-            runner_manager_domain::policy::PolicyState::Draining
+        let active_a_second = fixtures::policy()
+            .repository("alpha/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let selected = active_autoscale_targets(vec![
+            active_z,
+            pending,
+            disabled,
+            monitor,
+            active_a,
+            draining,
+            active_a_second,
+        ]);
+        let targets: Vec<_> = selected
+            .iter()
+            .map(|policies| policies[0].target.to_string())
+            .collect();
+        assert_eq!(targets, ["alpha/repo", "zeta/repo"]);
+        assert_eq!(selected[0].len(), 2, "same-target policies share one loop");
+        assert!(
+            selected
+                .iter()
+                .flatten()
+                .all(ScalePolicy::may_start_runners)
         );
-        // `begin_drain` accepts only policy records. It has no launcher,
-        // process supervisor, attempt, or PID with which it could terminate a
-        // busy runner; ordinary reconciliation supervises it to completion.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_target_neither_suppresses_contacts_nor_backs_off_a_healthy_target() {
+        let policy = |repository| {
+            fixtures::policy()
+                .repository(repository)
+                .autoscale("home", 1)
+                .active()
+                .build()
+        };
+        let healthy_report = ReconcileReport {
+            next_poll: runner_manager_agent::reconcile::NextPoll {
+                delay: Duration::from_secs(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let offline_report = ReconcileReport {
+            failure: Some(RefreshState::Offline),
+            next_poll: runner_manager_agent::reconcile::NextPoll {
+                delay: Duration::from_secs(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (healthy, healthy_calls) =
+            FakeTarget::repeating(policy("acme/healthy"), healthy_report);
+        let (offline, offline_calls) =
+            FakeTarget::repeating(policy("acme/offline"), offline_report);
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let healthy_loop = tokio::spawn(run_target_loop(
+            healthy,
+            stop.subscribe(),
+            Arc::clone(&contacts) as Arc<dyn ContactRecorder>,
+        ));
+        let offline_loop = tokio::spawn(run_target_loop(
+            offline,
+            stop.subscribe(),
+            Arc::clone(&contacts) as Arc<dyn ContactRecorder>,
+        ));
+
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(healthy_calls.load(Ordering::SeqCst) >= 3);
+        assert_eq!(offline_calls.load(Ordering::SeqCst), 1);
+        assert!(contacts.0.load(Ordering::SeqCst) >= 3);
+
+        stop.send(true).unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        healthy_loop.await.unwrap().unwrap();
+        offline_loop.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_loop_supervises_a_busy_child_to_completion_without_terminating_it() {
+        let target = FakeTarget::busy_then_finished(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+        );
+        let calls = Arc::clone(&target.calls);
+        let terminations = Arc::clone(&target.busy_was_terminated);
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            contacts as Arc<dyn ContactRecorder>,
+        ));
+
+        tokio::task::yield_now().await;
+        stop.send(true).unwrap();
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("the daemon exits after supervised completion")
+            .unwrap()
+            .unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "shutdown skipped supervision"
+        );
+        assert_eq!(
+            terminations.load(Ordering::SeqCst),
+            0,
+            "busy child was terminated"
+        );
     }
 }

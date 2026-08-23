@@ -54,7 +54,7 @@ runner-manager org set-capacity ORG --max-capacity N
 runner-manager org set-scale ORG --enabled true
 runner-manager org remove ORG [--purge]
 runner-manager daemon run
-runner-manager service install [--start-at boot|login] | uninstall | status | set-start-mode boot|login
+runner-manager service install [--start-at boot|login] | uninstall | status
 runner-manager tui
 runner-manager status --json
 ```
