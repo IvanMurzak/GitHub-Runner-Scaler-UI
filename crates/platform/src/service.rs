@@ -334,6 +334,34 @@ impl RestartPolicy {
     pub const fn reset_after(&self) -> Duration {
         self.reset_after
     }
+
+    /// The delay a given manager can actually express.
+    ///
+    /// Three of the four take seconds and enforce exactly what they are given.
+    /// **Windows Task Scheduler does not**: `RestartOnFailure/Interval` is
+    /// expressed in whole minutes with a one-minute floor, and it *rejects* the
+    /// registration outright rather than rounding — `PT15S` comes back as
+    /// "The task XML contains a value which is incorrectly formatted or out of
+    /// range", which is how this was found.
+    ///
+    /// So the interval is rounded **up**, never down, and never below one
+    /// minute. The direction is the point: the requirement is that the service
+    /// *"does not restart-loop faster than that bound"*, and a delay longer
+    /// than the configured one still satisfies it, while a shorter one would
+    /// not. `service status` reports the difference as a note so that an
+    /// operator reading `15s` in the record and `60s` from the manager is told
+    /// why rather than left to wonder.
+    #[must_use]
+    pub const fn effective_delay(&self, kind: DefinitionKind) -> Duration {
+        match kind {
+            DefinitionKind::WindowsScheduledTask => {
+                let seconds = self.delay.as_secs();
+                let minutes = seconds.div_ceil(60);
+                Duration::from_secs(if minutes == 0 { 60 } else { minutes * 60 })
+            }
+            _ => self.delay,
+        }
+    }
 }
 
 impl Default for RestartPolicy {
@@ -692,6 +720,7 @@ pub struct InstallRequest {
     binary: Option<PathBuf>,
     arguments: Vec<OsString>,
     restart: RestartPolicy,
+    on_demand: bool,
 }
 
 impl InstallRequest {
@@ -703,7 +732,23 @@ impl InstallRequest {
             binary: None,
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
             restart: RestartPolicy::default(),
+            on_demand: false,
         }
+    }
+
+    /// Registers the service but does not ask the manager to start it by
+    /// itself.
+    ///
+    /// Production never uses this: a boot-mode registration that does not start
+    /// at boot is the failure `service status` reports. **The privileged
+    /// installer tests use it for every fixture they create**, so that a
+    /// registration which somehow escaped its cleanup guard cannot start with
+    /// the owner's machine on the next reboot. A leaked service is bad; a
+    /// leaked service that runs is worse, and the difference costs one flag.
+    #[must_use]
+    pub const fn started_on_demand(mut self) -> Self {
+        self.on_demand = true;
+        self
     }
 
     /// Register a named binary instead of the running one.
@@ -760,6 +805,7 @@ pub struct InstallPlan {
     restart: RestartPolicy,
     directories: ServiceDirectories,
     secret_guard: Option<PathBuf>,
+    on_demand: bool,
 }
 
 impl InstallPlan {
@@ -801,6 +847,7 @@ impl InstallPlan {
             restart: request.restart,
             directories,
             secret_guard,
+            on_demand: request.on_demand,
         })
     }
 
@@ -826,7 +873,22 @@ impl InstallPlan {
             restart: RestartPolicy::default(),
             directories,
             secret_guard: None,
+            on_demand: false,
         }
+    }
+
+    /// Registers without arming the manager's automatic start. See
+    /// [`InstallRequest::started_on_demand`].
+    #[must_use]
+    pub const fn started_on_demand(mut self) -> Self {
+        self.on_demand = true;
+        self
+    }
+
+    /// Whether the manager was asked not to start this by itself.
+    #[must_use]
+    pub const fn is_on_demand(&self) -> bool {
+        self.on_demand
     }
 
     /// Names the file the machine-scoped secret store lives in, for the
@@ -1551,7 +1613,10 @@ pub fn windows_scheduled_task_xml(plan: &InstallPlan, principal: &TaskPrincipal)
     out.push_str("    <RestartOnFailure>\n");
     out.push_str(&format!(
         "      <Interval>{}</Interval>\n",
-        iso8601_seconds(plan.restart().delay())
+        iso8601_minutes(
+            plan.restart()
+                .effective_delay(DefinitionKind::WindowsScheduledTask)
+        )
     ));
     out.push_str(&format!("      <Count>{START_LIMIT_BURST}</Count>\n"));
     out.push_str("    </RestartOnFailure>\n");
@@ -1577,9 +1642,10 @@ pub fn windows_scheduled_task_xml(plan: &InstallPlan, principal: &TaskPrincipal)
     out
 }
 
-/// `PT<n>S`, the only ISO 8601 duration shape any definition here needs.
-fn iso8601_seconds(duration: Duration) -> String {
-    format!("PT{}S", duration.as_secs())
+/// `PT<n>M`, which is the only shape Task Scheduler accepts for a restart
+/// interval. See [`RestartPolicy::effective_delay`].
+fn iso8601_minutes(duration: Duration) -> String {
+    format!("PT{}M", duration.as_secs() / 60)
 }
 
 /// Escapes the five XML entities. Applied to every value that reaches a plist
@@ -1652,7 +1718,7 @@ pub fn windows_service_spec(plan: &InstallPlan) -> WindowsServiceSpec {
         // is a scheduled task. So an automatic start is the only kind here, and
         // the field exists because the privileged tests register an on-demand
         // fixture rather than one that starts with the test machine.
-        automatic_start: plan.start_mode() == StartMode::Boot,
+        automatic_start: plan.start_mode() == StartMode::Boot && !plan.is_on_demand(),
         account: match ServiceAccount::for_definition(
             DefinitionKind::WindowsService,
             plan.start_mode(),
@@ -2420,6 +2486,15 @@ pub struct InstallRecord {
     pub restart_reset_secs: u64,
     /// The rotating diagnostic log's stem. Item 4.
     pub log_file: PathBuf,
+    /// Whether the manager was asked not to start this by itself. Always
+    /// `false` for a registration an operator made; see
+    /// [`InstallRequest::started_on_demand`].
+    ///
+    /// `#[serde(default)]` so that a record missing the field is rejected by
+    /// the schema check below, with its remedy, rather than by a parse error
+    /// that names a field an operator has never heard of.
+    #[serde(default)]
+    pub starts_on_demand: bool,
     /// Where the platform's definition file was written, when there is one.
     pub definition_path: Option<PathBuf>,
     /// When the registration was made.
@@ -2457,6 +2532,7 @@ impl InstallRecord {
                 .collect(),
             restart_delay_secs: plan.restart().delay().as_secs(),
             restart_reset_secs: plan.restart().reset_after().as_secs(),
+            starts_on_demand: plan.is_on_demand(),
             log_file: plan.directories().log_file(),
             definition_path: definition.install_path().map(Path::to_path_buf),
             installed_at: at,
@@ -3181,6 +3257,11 @@ impl ServiceOperations {
         )
         .with_arguments(record.arguments.clone())
         .with_restart(record.restart());
+        let plan = if record.starts_on_demand {
+            plan.started_on_demand()
+        } else {
+            plan
+        };
         let plan = match crate::secrets::PlatformSecretStore::for_start_mode(to) {
             Ok(store) => plan.with_secret_guard(store.guard()),
             Err(_) => plan,
@@ -3387,19 +3468,34 @@ impl ServiceStatus {
                         ),
                     });
                 }
-                if let Some(actual) = found.restart_delay
-                    && actual != record.restart().delay()
-                {
-                    problems.push(StatusProblem {
-                        subject: "restart policy",
-                        detail: format!(
-                            "the record says the service restarts after {}s and {} reports {}s. \
-                             Something has edited the registration since it was installed.",
-                            record.restart().delay().as_secs(),
+                if let Some(actual) = found.restart_delay {
+                    let expected = record.restart().effective_delay(found.manager);
+                    if actual != expected {
+                        problems.push(StatusProblem {
+                            subject: "restart policy",
+                            detail: format!(
+                                "the record says the service restarts after {}s and {} reports \
+                                 {}s. Something has edited the registration since it was \
+                                 installed.",
+                                expected.as_secs(),
+                                found.manager,
+                                actual.as_secs()
+                            ),
+                        });
+                    } else if expected != record.restart().delay() {
+                        // Not a fault. Task Scheduler expresses this in whole
+                        // minutes, so the delay in force is longer than the one
+                        // asked for -- never shorter, which is the direction
+                        // the requirement cares about.
+                        notes.push(format!(
+                            "{} expresses the restart delay in whole minutes, so the {}s asked \
+                             for is enforced as {}s. The service therefore never restarts faster \
+                             than the configured bound.",
                             found.manager,
-                            actual.as_secs()
-                        ),
-                    });
+                            record.restart().delay().as_secs(),
+                            expected.as_secs()
+                        ));
+                    }
                 }
             }
             (None, None) => {}
@@ -4262,7 +4358,7 @@ mod sys {
                     && xml_value(&document, "Enabled").as_deref() == Some("true"),
                 restart_delay: xml_value(&document, "Interval")
                     .as_deref()
-                    .and_then(parse_iso8601_seconds),
+                    .and_then(parse_iso8601),
             }))
         }
 
@@ -4339,11 +4435,21 @@ mod sys {
             })
     }
 
-    /// Parses the `PT<n>S` shape this module writes. Anything else is `None`
-    /// rather than a guess.
-    fn parse_iso8601_seconds(value: &str) -> Option<Duration> {
-        let rest = value.strip_prefix("PT")?.strip_suffix('S')?;
-        rest.parse::<u64>().ok().map(Duration::from_secs)
+    /// Parses the `PT<n>M` shape this module writes, and the `PT<n>S` shape
+    /// Task Scheduler would accept if it took seconds. Anything richer -- days,
+    /// hours, a combination -- is `None` rather than a guess.
+    fn parse_iso8601(value: &str) -> Option<Duration> {
+        let rest = value.strip_prefix("PT")?;
+        if let Some(minutes) = rest.strip_suffix('M') {
+            return minutes
+                .parse::<u64>()
+                .ok()
+                .map(|minutes| Duration::from_secs(minutes * 60));
+        }
+        rest.strip_suffix('S')?
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
     }
 }
 
@@ -5037,14 +5143,20 @@ mod tests {
     fn a_restart_delay_under_the_floor_is_refused() {
         let error = RestartPolicy::new(Duration::from_millis(500), Duration::from_secs(60))
             .expect_err("half a second is under the one-second floor");
-        assert!(matches!(error, ServiceError::RestartDelay { .. }), "{error}");
+        assert!(
+            matches!(error, ServiceError::RestartDelay { .. }),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_restart_delay_over_the_ceiling_is_refused() {
         let error = RestartPolicy::new(Duration::from_secs(3600), Duration::from_secs(7200))
             .expect_err("an hour is over the five-minute ceiling");
-        assert!(matches!(error, ServiceError::RestartDelay { .. }), "{error}");
+        assert!(
+            matches!(error, ServiceError::RestartDelay { .. }),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5191,7 +5303,10 @@ mod tests {
     #[test]
     fn a_launch_daemon_names_root_and_a_launch_agent_names_nobody() {
         let daemon = launchd_plist(&linux_plan(StartMode::Boot));
-        assert_eq!(plist_string_value(&daemon, "UserName").as_deref(), Some("root"));
+        assert_eq!(
+            plist_string_value(&daemon, "UserName").as_deref(),
+            Some("root")
+        );
         assert_eq!(plist_bool_value(&daemon, "SessionCreate"), Some(false));
 
         let agent = launchd_plist(&linux_plan(StartMode::Login));
@@ -5239,8 +5354,86 @@ mod tests {
         );
         assert!(xml.contains("<UserId>HOST\\operator</UserId>"), "{xml}");
         assert!(
-            xml.contains("<Interval>PT15S</Interval>"),
-            "the task must carry the same bounded delay as every other manager:\n{xml}"
+            xml.contains("<Interval>PT1M</Interval>"),
+            "Task Scheduler takes whole minutes only, and rejects the registration outright \
+             for anything finer:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn task_schedulers_minute_granularity_only_ever_rounds_the_delay_up() {
+        // Measured against the real Task Scheduler, which answers `PT15S` with
+        // "The task XML contains a value which is incorrectly formatted or out
+        // of range". Rounding *up* is what keeps "does not restart-loop faster
+        // than that bound" true on this manager.
+        for (asked, enforced) in [(1u64, 60u64), (15, 60), (60, 60), (61, 120), (300, 300)] {
+            let policy =
+                RestartPolicy::new(Duration::from_secs(asked), Duration::from_secs(asked + 600))
+                    .expect("inside the supported range");
+            assert_eq!(
+                policy
+                    .effective_delay(DefinitionKind::WindowsScheduledTask)
+                    .as_secs(),
+                enforced,
+                "a {asked}s delay must be enforced as {enforced}s"
+            );
+            assert!(
+                policy.effective_delay(DefinitionKind::WindowsScheduledTask) >= policy.delay(),
+                "rounding must never shorten the bound"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_manager_enforces_the_delay_exactly_as_configured() {
+        let policy = RestartPolicy::default();
+        for kind in [
+            DefinitionKind::WindowsService,
+            DefinitionKind::LaunchdPlist,
+            DefinitionKind::SystemdUnit,
+        ] {
+            assert_eq!(
+                policy.effective_delay(kind),
+                policy.delay(),
+                "{kind:?} takes seconds and enforces exactly what it is given"
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_whose_manager_reports_the_rounded_delay_is_not_a_fault() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Login))
+            .expect("an install at login");
+        // What a real Task Scheduler reports back for a 15-second policy.
+        host.controls.edit("runner-manager", |registration| {
+            registration.manager = DefinitionKind::WindowsScheduledTask;
+            registration.restart_delay = Some(Duration::from_secs(60));
+        });
+
+        let status = operations.status().expect("a status");
+        assert!(
+            status.is_healthy(),
+            "minute granularity is the manager's, not a mis-registration: {status}"
+        );
+        assert!(
+            status
+                .notes()
+                .iter()
+                .any(|note| note.contains("whole minutes")),
+            "but the operator must be told why 15 became 60: {status}"
+        );
+
+        // The discriminator: a delay that is neither the configured one nor its
+        // rounding is still a fault.
+        host.controls.edit("runner-manager", |registration| {
+            registration.restart_delay = Some(Duration::from_secs(1));
+        });
+        assert!(
+            !operations.status().expect("a status").is_healthy(),
+            "a one-second delay is not what any manager was asked for"
         );
     }
 
@@ -5274,7 +5467,10 @@ mod tests {
     fn the_service_starts_automatically_under_the_account_the_store_admits() {
         let text = windows_service_descriptor(&windows_plan(StartMode::Boot));
         let directives = ini_directives(&text, "windows-service");
-        assert_eq!(directives.get("StartType").map(String::as_str), Some("AutoStart"));
+        assert_eq!(
+            directives.get("StartType").map(String::as_str),
+            Some("AutoStart")
+        );
         assert_eq!(
             directives.get("Account").map(String::as_str),
             Some("NT AUTHORITY\\SYSTEM")
@@ -5284,7 +5480,9 @@ mod tests {
             Some("OWN_PROCESS")
         );
         assert_eq!(
-            directives.get("FailureActionRestartDelaySecs").map(String::as_str),
+            directives
+                .get("FailureActionRestartDelaySecs")
+                .map(String::as_str),
             Some("15")
         );
         assert_eq!(
@@ -5301,7 +5499,11 @@ mod tests {
         let spec = windows_service_spec(&windows_plan(StartMode::Boot));
         assert_eq!(spec.account, None);
         assert!(spec.automatic_start);
-        assert!(spec.command_line.contains("daemon run"), "{}", spec.command_line);
+        assert!(
+            spec.command_line.contains("daemon run"),
+            "{}",
+            spec.command_line
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5313,9 +5515,9 @@ mod tests {
         let home = PathBuf::from("/home/op");
         assert_eq!(
             ServiceDefinition::launchd(&linux_plan(StartMode::Boot), Some(&home)).install_path(),
-            Some(
-                Path::new("/Library/LaunchDaemons/io.github.IvanMurzak.runner-manager.plist")
-            )
+            Some(Path::new(
+                "/Library/LaunchDaemons/io.github.IvanMurzak.runner-manager.plist"
+            ))
         );
         assert_eq!(
             ServiceDefinition::launchd(&linux_plan(StartMode::Login), Some(&home)).install_path(),
@@ -5483,11 +5685,7 @@ mod tests {
     fn a_unit_that_makes_a_directory_unwritable_is_a_shortfall_not_an_excess() {
         let plan = linux_plan(StartMode::Boot);
         let rendered = systemd_unit(&plan);
-        let narrowed = edited(
-            &rendered,
-            " /var/lib/runner-manager/runtime",
-            "",
-        );
+        let narrowed = edited(&rendered, " /var/lib/runner-manager/runtime", "");
         let review = review_least_privilege(
             &ServiceDefinition::from_text(DefinitionKind::SystemdUnit, narrowed),
             &plan,
@@ -5571,8 +5769,7 @@ mod tests {
     #[test]
     fn a_task_asking_for_the_highest_available_token_is_not_least_privilege() {
         let plan = windows_plan(StartMode::Login);
-        let rendered =
-            windows_scheduled_task_xml(&plan, &TaskPrincipal::named("HOST\\op"));
+        let rendered = windows_scheduled_task_xml(&plan, &TaskPrincipal::named("HOST\\op"));
         let widened = edited(
             &rendered,
             "<RunLevel>LeastPrivilege</RunLevel>",
@@ -5801,7 +5998,10 @@ mod tests {
             .expect("a valid timestamp")
             .with_timezone(&Utc);
         record_github_contact(&host.paths, at).expect("a writable heartbeat");
-        assert_eq!(last_github_contact(&host.paths).expect("readable"), Some(at));
+        assert_eq!(
+            last_github_contact(&host.paths).expect("readable"),
+            Some(at)
+        );
     }
 
     #[test]
@@ -5833,7 +6033,10 @@ mod tests {
             installed.record.directories,
             ServiceDirectories::of(&host.paths)
         );
-        assert_eq!(installed.record.log_file, host.paths.logs_dir().join(LOG_FILE_STEM));
+        assert_eq!(
+            installed.record.log_file,
+            host.paths.logs_dir().join(LOG_FILE_STEM)
+        );
         assert_eq!(installed.record.restart_delay_secs, 15);
 
         let registrations = host.controls.registrations();
@@ -5901,7 +6104,10 @@ mod tests {
             .operations()
             .install(&host.request(StartMode::Boot))
             .expect("an install");
-        assert_eq!(installed.review.account(), &ServiceAccount::for_start_mode(StartMode::Boot));
+        assert_eq!(
+            installed.review.account(),
+            &ServiceAccount::for_start_mode(StartMode::Boot)
+        );
         assert!(
             !installed.review.account().justification().is_empty(),
             "a privileged account with no stated reason is an unreviewed one"
@@ -5926,10 +6132,11 @@ mod tests {
         let config = host.paths.config_dir();
         std::fs::write(config.join("runner-manager.db"), b"sqlite fixture").expect("writable");
         std::fs::write(config.join("config.toml"), b"host_capacity = 2").expect("writable");
-        std::fs::create_dir_all(host.paths.state_dir().join("packages/2.330.0"))
-            .expect("writable");
+        std::fs::create_dir_all(host.paths.state_dir().join("packages/2.330.0")).expect("writable");
         std::fs::write(
-            host.paths.state_dir().join("packages/2.330.0/runner.tar.gz"),
+            host.paths
+                .state_dir()
+                .join("packages/2.330.0/runner.tar.gz"),
             b"cached package",
         )
         .expect("writable");
@@ -6091,7 +6298,10 @@ mod tests {
             .operations()
             .set_start_mode(StartMode::Login)
             .expect_err("there is nothing to switch");
-        assert!(matches!(error, ServiceError::NotInstalled { .. }), "{error}");
+        assert!(
+            matches!(error, ServiceError::NotInstalled { .. }),
+            "{error}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6308,6 +6518,9 @@ mod tests {
     fn starting_a_host_with_no_registration_is_refused() {
         let host = Host::new();
         let error = host.operations().start().expect_err("nothing to start");
-        assert!(matches!(error, ServiceError::NotInstalled { .. }), "{error}");
+        assert!(
+            matches!(error, ServiceError::NotInstalled { .. }),
+            "{error}"
+        );
     }
 }
