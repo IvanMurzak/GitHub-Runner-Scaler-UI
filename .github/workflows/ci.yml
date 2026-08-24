@@ -65,6 +65,11 @@ jobs:
   check:
     name: check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    env:
+      # The managed Windows runner uses an intentionally deep isolated workspace.
+      GIT_CONFIG_COUNT: 1
+      GIT_CONFIG_KEY_0: core.longpaths
+      GIT_CONFIG_VALUE_0: "true"
     strategy:
       # One red leg must not hide the state of the other two.
       fail-fast: false
