@@ -541,17 +541,23 @@ pub fn render_text(model: &ScreenModel) -> String {
             "Waiting for the first GitHub inventory snapshot.",
             "Action: F5 refresh now",
         ),
-        Availability::Unauthorized => state_panel(
-            "UNAUTHORIZED",
-            "GitHub authorization is missing or no longer valid.",
-            "Action: runner-manager auth login",
+        Availability::Unauthorized => with_activity_details(
+            model,
+            state_panel(
+                "UNAUTHORIZED",
+                "GitHub authorization is missing or no longer valid.",
+                "Action: runner-manager auth login",
+            ),
         ),
         Availability::RateLimited {
             retry_after_seconds,
-        } => state_panel(
-            "RATE LIMITED",
-            &format!("GitHub asked this host to wait {retry_after_seconds}s."),
-            "Action: a opens rate-limit details; retry is automatic",
+        } => with_activity_details(
+            model,
+            state_panel(
+                "RATE LIMITED",
+                &format!("GitHub asked this host to wait {retry_after_seconds}s."),
+                "Action: a opens rate-limit details; retry is automatic",
+            ),
         ),
         Availability::Offline {
             last_successful_contact,
@@ -560,33 +566,46 @@ pub fn render_text(model: &ScreenModel) -> String {
             let common = format!(
                 "OFFLINE - no new runners will start\nLast successful GitHub contact: {last_successful_contact}\nRetry in: {retry_after_seconds}s\nLocal remediation: check this host's network, DNS, proxy, and system clock.\n{QUEUE_CANCELLATION_WARNING}\nAction: a opens Activity & errors"
             );
-            if model.screen == ReadOnlyScreen::Activity {
-                format!("{common}\n\n{}", render_activity(model))
-            } else {
-                common
-            }
+            with_activity_details(model, common)
         }
-        Availability::Forbidden { message } => state_panel(
-            "FORBIDDEN",
-            &format!(
-                "GitHub is reachable but refused this target: {}",
-                message
-                    .as_deref()
-                    .unwrap_or("required permission is missing")
+        Availability::Forbidden { message } => with_activity_details(
+            model,
+            state_panel(
+                "FORBIDDEN",
+                &format!(
+                    "GitHub is reachable but refused this target: {}",
+                    message
+                        .as_deref()
+                        .unwrap_or("required permission is missing")
+                ),
+                "Action: verify repository access and GitHub App/user permissions",
             ),
-            "Action: verify repository access and GitHub App/user permissions",
         ),
-        Availability::Failed { detail } => state_panel(
-            "REFRESH FAILED",
-            &format!("GitHub answered, but inventory could not be collected: {detail}"),
-            "Action: open Activity & errors and retry with F5",
+        Availability::Failed { detail } => with_activity_details(
+            model,
+            state_panel(
+                "REFRESH FAILED",
+                &format!("GitHub answered, but inventory could not be collected: {detail}"),
+                "Action: open Activity & errors and retry with F5",
+            ),
         ),
-        Availability::Cancelled => state_panel(
-            "REFRESH CANCELLED",
-            "The previous inventory collection was superseded or the TUI is stopping.",
-            "Action: F5 starts one latest refresh",
+        Availability::Cancelled => with_activity_details(
+            model,
+            state_panel(
+                "REFRESH CANCELLED",
+                "The previous inventory collection was superseded or the TUI is stopping.",
+                "Action: F5 starts one latest refresh",
+            ),
         ),
         Availability::Ready => render_ready(model),
+    }
+}
+
+fn with_activity_details(model: &ScreenModel, summary: String) -> String {
+    if model.screen == ReadOnlyScreen::Activity && !model.snapshot.activity.is_empty() {
+        format!("{summary}\n\n{}", render_activity(model))
+    } else {
+        summary
     }
 }
 

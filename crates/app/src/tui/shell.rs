@@ -7,8 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,6 +47,7 @@ use super::screens::{
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const TICK_RATE: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_POLL_RATE: Duration = Duration::from_secs(60);
+const MAX_ACTIVITY_HISTORY: usize = 256;
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,10 +187,14 @@ pub struct AgentEvent {
 /// the product exposes no inbound control surface and `q` owns only this
 /// reader thread.
 struct LocalAgentEventSource {
-    refresh: std_mpsc::SyncSender<()>,
-    stopped: Arc<AtomicBool>,
-    active: Arc<Mutex<Option<CancelToken>>>,
+    control: Arc<(Mutex<SourceState>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+struct SourceState {
+    stopped: bool,
+    requested_generation: u64,
+    active: Option<(u64, CancelToken)>,
 }
 
 impl LocalAgentEventSource {
@@ -198,54 +202,78 @@ impl LocalAgentEventSource {
         context: Arc<crate::cli::Context>,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
-        Self::start_with_cancel(move |cancel| local_agent_event(&context, cancel), poll_rate)
+        Self::start_with(move |cancel| local_agent_event(&context, cancel), poll_rate)
     }
 
-    #[cfg(test)]
     fn start_with(
-        produce: impl Fn() -> AgentEvent + Send + 'static,
-        poll_rate: Duration,
-    ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
-        Self::start_with_cancel(move |_| produce(), poll_rate)
-    }
-
-    fn start_with_cancel(
         produce: impl Fn(&CancelToken) -> AgentEvent + Send + 'static,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
         let (events, receiver) = mpsc::unbounded_channel();
-        // Capacity one makes F5 latest-wins: one collection may run and at most
-        // one follow-up may be pending, regardless of key-repeat volume.
-        let (refresh, refreshes) = std_mpsc::sync_channel(1);
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_stopped = Arc::clone(&stopped);
-        let active = Arc::new(Mutex::new(None));
-        let worker_active = Arc::clone(&active);
+        let control = Arc::new((
+            Mutex::new(SourceState {
+                stopped: false,
+                requested_generation: 1,
+                active: None,
+            }),
+            Condvar::new(),
+        ));
+        let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("runner-manager-tui-events".to_owned())
             .spawn(move || {
+                let mut completed_generation = 0_u64;
                 loop {
-                    if worker_stopped.load(AtomicOrdering::Acquire) {
+                    let (state_lock, wake) = &*worker_control;
+                    let mut state = state_lock.lock().unwrap();
+                    while !state.stopped && state.requested_generation <= completed_generation {
+                        let (next, timeout) = wake.wait_timeout(state, poll_rate).unwrap();
+                        state = next;
+                        if timeout.timed_out() && state.requested_generation <= completed_generation
+                        {
+                            state.requested_generation = completed_generation.saturating_add(1);
+                        }
+                    }
+                    if state.stopped {
                         break;
                     }
+                    let generation = state.requested_generation;
                     let cancel = CancelToken::new();
-                    *worker_active.lock().unwrap() = Some(cancel.clone());
+                    // Publication happens while holding the same lock used by
+                    // refresh and stop, so neither can slip through before an
+                    // active token exists to cancel.
+                    state.active = Some((generation, cancel.clone()));
+                    drop(state);
+
                     let event = produce(&cancel);
-                    *worker_active.lock().unwrap() = None;
-                    if worker_stopped.load(AtomicOrdering::Acquire) || events.send(event).is_err() {
+                    let mut state = state_lock.lock().unwrap();
+                    let publish = !state.stopped
+                        && state.requested_generation == generation
+                        && !cancel.is_cancelled();
+                    if state
+                        .active
+                        .as_ref()
+                        .is_some_and(|(active_generation, _)| *active_generation == generation)
+                    {
+                        state.active = None;
+                    }
+                    completed_generation = generation;
+                    if state.stopped {
                         break;
                     }
-                    match refreshes.recv_timeout(poll_rate) {
-                        Ok(()) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                    // Keep the control lock through the non-blocking publish.
+                    // This linearizes a refresh request either before publish
+                    // (and suppresses this result) or after it; there is no
+                    // unlocked stale-send window between the generation check
+                    // and delivery.
+                    if publish && events.send(event).is_err() {
+                        break;
                     }
                 }
             })?;
         Ok((
             Self {
-                refresh,
-                stopped,
-                active,
+                control,
                 worker: Some(worker),
             },
             receiver,
@@ -253,25 +281,34 @@ impl LocalAgentEventSource {
     }
 
     fn request_refresh(&self) -> io::Result<()> {
-        match self.refresh.try_send(()) {
-            Ok(()) | Err(std_mpsc::TrySendError::Full(())) => Ok(()),
-            Err(std_mpsc::TrySendError::Disconnected(())) => {
-                Err(io::Error::other("the TUI snapshot source stopped"))
-            }
+        let (state_lock, wake) = &*self.control;
+        let mut state = state_lock.lock().unwrap();
+        if state.stopped {
+            return Err(io::Error::other("the TUI snapshot source stopped"));
         }
+        state.requested_generation = state.requested_generation.saturating_add(1);
+        if let Some((_, cancel)) = &state.active {
+            cancel.cancel();
+        }
+        wake.notify_one();
+        Ok(())
     }
 }
 
 impl Drop for LocalAgentEventSource {
     fn drop(&mut self) {
-        self.stopped.store(true, AtomicOrdering::Release);
-        if let Some(cancel) = self.active.lock().unwrap().as_ref() {
-            cancel.cancel();
+        let (state_lock, wake) = &*self.control;
+        {
+            let mut state = state_lock.lock().unwrap();
+            state.stopped = true;
+            if let Some((_, cancel)) = &state.active {
+                cancel.cancel();
+            }
+            wake.notify_one();
         }
-        // A GitHub transport outside the cancellable inventory seam must not
-        // hold terminal restoration hostage. Dropping the JoinHandle detaches;
-        // the stop latch prevents any queued refresh from being drained.
-        self.worker.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -335,7 +372,11 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                         activity: production_activity(context)
                             .unwrap_or_default()
                             .into_iter()
-                            .chain(std::iter::once(refresh_activity(&availability, &detail)))
+                            .chain(std::iter::once(refresh_activity(
+                                &availability,
+                                &detail,
+                                context.clock().now(),
+                            )))
                             .collect(),
                         availability,
                         ..Snapshot::default()
@@ -627,7 +668,11 @@ fn failure_remediation(reason: &FailureReason) -> &'static str {
     }
 }
 
-fn refresh_activity(availability: &Availability, detail: &str) -> screens::ActivityRow {
+fn refresh_activity(
+    availability: &Availability,
+    detail: &str,
+    occurred_at: runner_manager_domain::model::Timestamp,
+) -> screens::ActivityRow {
     let (outcome, remediation) = match availability {
         Availability::RateLimited { .. } => (
             screens::ActivityOutcome::RateLimit,
@@ -655,8 +700,11 @@ fn refresh_activity(availability: &Availability, detail: &str) -> screens::Activ
         ),
     };
     screens::ActivityRow {
-        id: "github-inventory-refresh".into(),
-        occurred_at: "current refresh".into(),
+        id: format!(
+            "github-inventory-refresh:{}",
+            occurred_at.timestamp_nanos_opt().unwrap_or_default()
+        ),
+        occurred_at: occurred_at.to_rfc3339(),
         outcome,
         summary: screens::copy_safe(detail),
         remediation: remediation.into(),
@@ -929,7 +977,11 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             state.presentation.health = agent.health;
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
-            if let Some(snapshot) = agent.snapshot {
+            if let Some(mut snapshot) = agent.snapshot {
+                snapshot.activity = merge_activity_history(
+                    &state.screen_model.snapshot.activity,
+                    snapshot.activity,
+                );
                 state.screen_model.apply(ScreenAction::Refresh(snapshot));
             }
             Vec::new()
@@ -944,6 +996,25 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         }
         AppEvent::Key(_) => Vec::new(),
     }
+}
+
+fn merge_activity_history(
+    previous: &[screens::ActivityRow],
+    mut current: Vec<screens::ActivityRow>,
+) -> Vec<screens::ActivityRow> {
+    let mut ids = current
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<HashSet<_>>();
+    current.extend(
+        previous
+            .iter()
+            .filter(|row| ids.insert(row.id.clone()))
+            .cloned(),
+    );
+    current.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    current.truncate(MAX_ACTIVITY_HISTORY);
+    current
 }
 
 fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
@@ -1947,7 +2018,7 @@ mod tests {
         let produced = Arc::new(AtomicUsize::new(0));
         let producer_count = Arc::clone(&produced);
         let (source, agent_events) = LocalAgentEventSource::start_with(
-            move || {
+            move |_| {
                 let refresh = producer_count.fetch_add(1, Ordering::SeqCst);
                 let snapshot = if refresh == 0 {
                     Snapshot::default()
@@ -2533,20 +2604,75 @@ mod tests {
     }
 
     #[test]
-    fn repeated_f5_is_coalesced_and_drop_does_not_drain_or_wait_for_collection() {
-        use std::sync::atomic::AtomicUsize;
+    fn rate_limited_activity_opens_acknowledges_copies_and_survives_ready_refresh() {
+        let row = screens::ActivityRow {
+            id: "rate-limit-1".into(),
+            occurred_at: "2026-08-23T10:00:00Z".into(),
+            outcome: screens::ActivityOutcome::RateLimit,
+            summary: "GitHub primary rate limit was reached".into(),
+            remediation: "wait 90 seconds before retrying".into(),
+        };
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        reduce(
+            &mut state,
+            AppEvent::Agent(AgentEvent {
+                summary: "rate limited".into(),
+                health: Health::Error,
+                snapshot: Some(Snapshot {
+                    availability: Availability::RateLimited {
+                        retry_after_seconds: 90,
+                    },
+                    activity: vec![row],
+                    ..Snapshot::default()
+                }),
+            }),
+        );
+        reduce(&mut state, key(KeyCode::Char('a')));
+        let detail = screens::render_text(&state.screen_model);
+        assert!(detail.contains("RATE LIMITED"), "{detail}");
+        assert!(detail.contains("RATE-LIMIT"), "{detail}");
+        assert!(
+            detail.contains("wait 90 seconds before retrying"),
+            "{detail}"
+        );
+        reduce(&mut state, key(KeyCode::Enter));
+        assert!(screens::render_text(&state.screen_model).contains("[acknowledged]"));
+        let Effect::Copy(copied) = &reduce(&mut state, key(KeyCode::Char('c')))[0] else {
+            panic!("Activity copy effect")
+        };
+        assert!(copied.contains("wait 90 seconds before retrying"));
+
+        reduce(
+            &mut state,
+            AppEvent::Agent(AgentEvent {
+                summary: "ready again".into(),
+                health: Health::Ready,
+                snapshot: Some(Snapshot {
+                    availability: Availability::Ready,
+                    ..Snapshot::default()
+                }),
+            }),
+        );
+        let retained = screens::render_text(&state.screen_model);
+        assert!(retained.contains("RATE-LIMIT"), "{retained}");
+        assert!(retained.contains("[acknowledged]"), "{retained}");
+    }
+
+    #[test]
+    fn repeated_f5_cancels_stale_work_and_publishes_only_the_latest_collection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let collections = Arc::new(AtomicUsize::new(0));
-        let releases = Arc::new((Mutex::new(0_usize), std::sync::Condvar::new()));
         let worker_collections = Arc::clone(&collections);
-        let worker_releases = Arc::clone(&releases);
-        let (source, _events) = LocalAgentEventSource::start_with(
-            move || {
-                let number = worker_collections.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                let (lock, ready) = &*worker_releases;
-                let mut released = lock.lock().unwrap();
-                while *released < number {
-                    released = ready.wait(released).unwrap();
+        let (first_started, first_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (source, mut events) = LocalAgentEventSource::start_with(
+            move |cancel| {
+                let number = worker_collections.fetch_add(1, Ordering::SeqCst) + 1;
+                if number == 1 {
+                    first_started.send(()).unwrap();
+                    while !cancel.is_cancelled() {
+                        thread::yield_now();
+                    }
                 }
                 AgentEvent {
                     summary: format!("collection {number}"),
@@ -2557,34 +2683,59 @@ mod tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        while collections.load(AtomicOrdering::SeqCst) == 0 {
-            thread::yield_now();
-        }
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         for _ in 0..100 {
             source.request_refresh().unwrap();
         }
-        {
-            let (lock, ready) = &*releases;
-            *lock.lock().unwrap() = 1;
-            ready.notify_all();
-        }
-        for _ in 0..1000 {
-            if collections.load(AtomicOrdering::SeqCst) >= 2 {
-                break;
-            }
-            thread::yield_now();
-        }
-        assert_eq!(collections.load(AtomicOrdering::SeqCst), 2);
-        let before_drop = Instant::now();
+        let published = events.blocking_recv().unwrap();
+        assert_eq!(published.summary, "collection 2");
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(collections.load(Ordering::SeqCst), 2);
         drop(source);
-        assert!(before_drop.elapsed() < Duration::from_millis(50));
-        {
-            let (lock, ready) = &*releases;
-            *lock.lock().unwrap() = 2;
-            ready.notify_all();
-        }
+    }
+
+    #[test]
+    fn drop_cancels_active_collection_joins_worker_and_allows_no_post_exit_calls() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_calls = Arc::clone(&calls);
+        let worker_finished = Arc::clone(&finished);
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (source, _events) = LocalAgentEventSource::start_with(
+            move |cancel| {
+                worker_calls.fetch_add(1, Ordering::SeqCst);
+                started.send(()).unwrap();
+                while !cancel.is_cancelled() {
+                    thread::yield_now();
+                }
+                thread::sleep(Duration::from_millis(20));
+                worker_finished.store(true, Ordering::SeqCst);
+                AgentEvent {
+                    summary: "cancelled collection".into(),
+                    health: Health::Ready,
+                    snapshot: None,
+                }
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(source);
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "Drop returned before worker exit"
+        );
+        let calls_at_exit = calls.load(Ordering::SeqCst);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(collections.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), calls_at_exit);
+        assert_eq!(calls_at_exit, 1);
     }
 
     #[test]
