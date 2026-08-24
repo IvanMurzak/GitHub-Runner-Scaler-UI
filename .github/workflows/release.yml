@@ -548,6 +548,28 @@ jobs:
           # dependency graph that no test leg ever ran.
           cargo build --release --locked --package runner-manager --target "$TARGET"
 
+      # THE LINKER SIGNS arm64 AND ONLY arm64, WHICH IS WHY THIS STEP EXISTS.
+      #
+      # Apple's linker applies the free ad-hoc signature automatically to arm64
+      # Mach-O, because the kernel refuses to execute unsigned native arm64
+      # code at all. An x86_64 binary has no such requirement, so it comes out
+      # of the same `cargo build` carrying no signature whatsoever -- and the
+      # verification below, which is deliberately uniform across both macOS
+      # legs, then fails the release on the Intel leg every single time. That
+      # is exactly how release 0.1.1 first failed.
+      #
+      # Signing here rather than relaxing the check keeps the stronger property:
+      # every macOS artifact this project publishes carries a signature. `-` is
+      # the ad-hoc identity, which needs no certificate and no keychain, so D12
+      # ("no paid code signing") is untouched. `--force` makes it idempotent on
+      # the arm64 leg, where the linker has already done it.
+      - name: Step 5 - ad-hoc sign the macOS binary
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          codesign --force --sign - "target/${TARGET}/release/runner-manager"
+
       - name: Step 5 - verify the macOS binary is signed
         if: runner.os == 'macOS'
         env:
@@ -555,7 +577,7 @@ jobs:
         run: |
           # D12 buys no certificate, but the free ad-hoc signature is not
           # optional: macOS refuses to execute unsigned native arm64 code. The
-          # linker normally applies it -- which is precisely why this verifies
+          # step above applies it -- which is precisely why this verifies
           # instead of assuming.
           bash .github/scripts/release.sh verify-macos-signature \
             "target/${TARGET}/release/runner-manager"
