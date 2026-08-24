@@ -2848,7 +2848,7 @@ pub enum BinaryPath {
     },
     /// **Nothing is at the recorded path.**
     ///
-    /// This is the npm upgrade: `npm i -g runner-manager` puts the binary under
+    /// This is the npm upgrade: `npm i -g @ivan-murzak/runner-manager` puts the binary under
     /// the active Node installation's global prefix, and switching Node versions
     /// with `nvm`, `fnm`, or `volta` moves that prefix. The service is still
     /// registered, still set to start at boot, and starts nothing.

@@ -100,30 +100,56 @@ permission set for every user:
 
 ## Install
 
-Every path below is a terminal command, deliberately: Gatekeeper on macOS and SmartScreen
-on Windows act on the quarantine flag a *browser* sets, and `curl`, `irm`, `tar`, `brew`,
-`npm` and `cargo` do not set one — so no install here raises a security prompt.
+**npm** — any OS with Node 18+:
 
-### Install script — recommended
+```sh
+npm i -g @ivan-murzak/runner-manager
+```
 
-Installs to a fixed location that does not move when a toolchain moves: `~/.local/bin` on
-macOS and Linux, `%LOCALAPPDATA%\Programs\runner-manager` on Windows. That matters for a
-boot-start service, which records the binary's absolute path.
+**Homebrew** — macOS, Linux:
 
-**macOS, Linux**
+```sh
+brew install IvanMurzak/tap/runner-manager
+```
+
+**Install script** — macOS, Linux, no Node needed:
 
 ```sh
 curl -fsSL https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.sh | sh
 ```
 
-**Windows** — PowerShell 5.1 or 7, no Node required
+**Install script** — Windows, PowerShell 5.1 or 7, no Node needed:
 
 ```powershell
 irm https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.ps1 | iex
 ```
 
-Both detect your OS and CPU, verify the archive's SHA-256 against the release's published
-`SHA256SUMS`, and abort without installing anything if it does not match. To pin a
+Then check it:
+
+```sh
+runner-manager --version
+```
+
+Every path above is a terminal command, deliberately: Gatekeeper on macOS and SmartScreen
+on Windows act on the quarantine flag a *browser* sets, and `curl`, `irm`, `tar`, `brew`,
+`npm` and `cargo` do not set one — so no install here raises a security prompt.
+
+### Which one to pick
+
+The **install script** is the one to use for a boot-start service. It installs to a fixed
+location — `~/.local/bin`, or `%LOCALAPPDATA%\Programs\runner-manager` on Windows — that
+does not move when a toolchain moves, and `service install` records the binary's absolute
+path.
+
+An **npm** global binary lives under the *active* Node prefix, which moves when you switch
+versions with nvm, fnm, volta or asdf. `runner-manager service status` reports the recorded
+path as stale when that happens; re-run `service install` to fix it. The npm package name is
+scoped: plain `runner-manager` on npmjs.com is an unrelated project.
+
+### Install script details
+
+Both scripts detect your OS and CPU, verify the archive's SHA-256 against the release's
+published `SHA256SUMS`, and abort without installing anything if it does not match. To pin a
 version — a piped script gets no arguments of its own, hence the separator:
 
 ```sh
@@ -153,26 +179,6 @@ The last line runs the script's text rather than the file on purpose: a Windows 
 default execution policy is `Restricted`, which refuses `.\install.ps1` after you have
 already read it.
 
-### npm
-
-```sh
-npm i -g runner-manager
-```
-
-A thin wrapper whose per-platform binaries are `optionalDependencies`, so npm installs only
-the one that matches your machine. One caveat for boot-start service users: an `npm i -g`
-binary lives under the *active* Node prefix, which moves when you switch versions with nvm,
-fnm, volta or asdf. `runner-manager service status` reports the recorded path as stale when
-that happens; re-run `service install` to fix it.
-
-### Homebrew
-
-```sh
-brew install IvanMurzak/tap/runner-manager
-```
-
-macOS and Linux, pinned to the SHA-256 the release published.
-
 ### From source
 
 ```sh
@@ -190,14 +196,9 @@ The binary lands in `target/release/`. Both need the Rust toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml). Put it somewhere permanent before
 `service install` records its absolute path.
 
-### Confirm it worked
-
-```sh
-runner-manager --version
-```
-
-If the command is not found, the installer printed the one line that adds its directory to
-your `PATH`. Neither script edits a shell profile or the registry on your behalf.
+If `runner-manager --version` is not found after installing, the installer printed the one
+line that adds its directory to your `PATH`. Neither script edits a shell profile or the
+registry on your behalf.
 
 ## Supported platforms
 

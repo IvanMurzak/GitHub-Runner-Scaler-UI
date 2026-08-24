@@ -90,6 +90,14 @@ x86_64-unknown-linux-gnu|linux|x64|tar.gz|runner-manager
 aarch64-unknown-linux-gnu|linux|arm64|tar.gz|runner-manager'
 
 readonly PRODUCT="runner-manager"
+# The npm scope every published package lives in. The COMMAND stays
+# `runner-manager` -- that is the root package's `bin` key, not its name.
+readonly NPM_SCOPE="@ivan-murzak"
+# The `author` every generated manifest carries. npmjs.com renders it on the
+# package page and links the URL, so this is where the maintainer is reachable
+# from a package a user found through the registry rather than through GitHub.
+readonly PRODUCT_AUTHOR="Ivan Murzak (https://github.com/IvanMurzak)"
+readonly NPM_PACKAGE="${NPM_SCOPE}/${PRODUCT}"
 readonly PRODUCT_DESCRIPTION="Local-first autoscaling manager for ephemeral GitHub Actions self-hosted runners, with a CLI and a Ratatui TUI."
 
 # ----------------------------------------------------------------------------
@@ -201,7 +209,7 @@ cmd_npm_package_name() {
     local os cpu
     os="$(field_of "$target" 2)"
     cpu="$(field_of "$target" 3)"
-    printf '%s-%s-%s\n' "$PRODUCT" "$os" "$cpu"
+    printf '%s/%s-%s-%s\n' "$NPM_SCOPE" "$PRODUCT" "$os" "$cpu"
 }
 
 # ----------------------------------------------------------------------------
@@ -304,23 +312,22 @@ FORMULA
 # so on a normal `dependencies` line every user on four of the five platforms
 # would fail to install at all.
 #
-# UNSCOPED NAMES, AND THE REASON IS AN OWNER'S CHOICE RATHER THAN A LIMIT.
+# EVERY PACKAGE IS SCOPED, BECAUSE THE UNSCOPED NAME IS SOMEBODY ELSE'S.
 #
-# An earlier version of this comment said a scoped name needs an npm
-# ORGANISATION to exist first, and that this repository cannot create one.
-# THAT PREMISE IS FALSE and it is corrected here rather than deleted, because a
-# wrong reason left standing is what gets quoted the next time somebody asks:
-# every npm account already owns the scope matching its username, and
-# publishing into it needs nothing but `--access public`, which release.yml
-# already passes. `@ivanmurzak/runner-manager-linux-x64` was always available.
+# `runner-manager` on npmjs.com is an unrelated project
+# (github.com/rvanbaalen/runner-manager). `npm i -g runner-manager` installs
+# THAT tool, and on a machine that already has one of these on PATH the wrong
+# binary answers. So the root package is `@ivan-murzak/runner-manager` and the
+# five platform packages are scoped to match.
 #
-# The names stay unscoped anyway. It is esbuild's actual shape -- an unscoped
-# root so that `npm i -g runner-manager` reads well, which is the command the
-# README documents -- and changing it is the owner's call, not this script's.
-# The argument on the other side, recorded so it is not rediscovered as a
-# surprise: five unscoped names are five separate namespace claims that anyone
-# can register before the first release, where one scope claims them all at
-# once.
+# A scope needs no npm ORGANISATION: every npm account already owns the scope
+# matching its username, and publishing into it needs nothing but
+# `--access public`, which release.yml already passes. One scope also claims
+# all six names at once, where six unscoped names are six separate claims
+# anyone can register before the first release.
+#
+# THE COMMAND IS STILL `runner-manager`. It is the root package's `bin` KEY,
+# which npm links onto PATH, and it is independent of the package name.
 #
 # Each platform manifest records the archive its binary was taken from and that
 # archive's published digest. npm does not check it -- nothing in npm can --
@@ -356,21 +363,22 @@ cmd_npm_manifests() {
         binaries+=("$binary")
         assets+=("$asset")
         digests+=("$digest")
-        names+=("${PRODUCT}-${os}-${cpu}")
+        names+=("${NPM_SCOPE}/${PRODUCT}-${os}-${cpu}")
     done <<<"$PUBLISHED_TARGETS"
 
     ((${#names[@]} == 5)) ||
         die "npm-manifests: expected five platform packages, prepared ${#names[@]}"
 
-    mkdir -p "${outdir}/${PRODUCT}"
+    mkdir -p "${outdir}/${NPM_PACKAGE}"
 
     # ---- the root package ---------------------------------------------------
     {
         printf '{\n'
-        printf '  "name": "%s",\n' "$PRODUCT"
+        printf '  "name": "%s",\n' "$NPM_PACKAGE"
         printf '  "version": "%s",\n' "$version"
         printf '  "description": "%s",\n' "$PRODUCT_DESCRIPTION"
         printf '  "license": "MIT",\n'
+        printf '  "author": "%s",\n' "$PRODUCT_AUTHOR"
         printf '  "homepage": "https://github.com/%s",\n' "$repository"
         printf '  "repository": { "type": "git", "url": "git+https://github.com/%s.git" },\n' "$repository"
         printf '  "engines": { "node": ">=18" },\n'
@@ -385,7 +393,7 @@ cmd_npm_manifests() {
         done
         printf '  }\n'
         printf '}\n'
-    } >"${outdir}/${PRODUCT}/package.json"
+    } >"${outdir}/${NPM_PACKAGE}/package.json"
 
     # ---- one package per platform -------------------------------------------
     for index in "${!names[@]}"; do
@@ -396,6 +404,7 @@ cmd_npm_manifests() {
             printf '  "version": "%s",\n' "$version"
             printf '  "description": "The %s binary for %s.",\n' "${targets[index]}" "$PRODUCT"
             printf '  "license": "MIT",\n'
+            printf '  "author": "%s",\n' "$PRODUCT_AUTHOR"
             printf '  "homepage": "https://github.com/%s",\n' "$repository"
             printf '  "repository": { "type": "git", "url": "git+https://github.com/%s.git" },\n' "$repository"
             printf '  "os": [ "%s" ],\n' "${oses[index]}"
@@ -412,7 +421,7 @@ cmd_npm_manifests() {
     done
 
     printf 'wrote %s root manifest and %d platform manifests under %s\n' \
-        "$PRODUCT" "${#names[@]}" "$outdir"
+        "$NPM_PACKAGE" "${#names[@]}" "$outdir"
 }
 
 # ----------------------------------------------------------------------------
@@ -471,7 +480,7 @@ cmd_npm_stage() {
     local -a order=()
     while IFS='|' read -r target os cpu extension binary; do
         [[ -n "$target" ]] || continue
-        package="${PRODUCT}-${os}-${cpu}"
+        package="${NPM_SCOPE}/${PRODUCT}-${os}-${cpu}"
         asset="$(cmd_asset_name "$version" "$target")"
         expected="$(cmd_checksum "$sums" "$asset")"
 
@@ -523,11 +532,11 @@ cmd_npm_stage() {
 
     ((${#order[@]} == 5)) || die "npm-stage: staged ${#order[@]} platform packages, expected 5"
 
-    mkdir -p "${outdir}/${PRODUCT}/bin"
-    cp "$shim" "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
-    chmod 755 "${outdir}/${PRODUCT}/bin/${PRODUCT}.cjs"
-    cp "$wrapper_readme" "${outdir}/${PRODUCT}/README.md"
-    cp "$licence" "${outdir}/${PRODUCT}/LICENSE"
+    mkdir -p "${outdir}/${NPM_PACKAGE}/bin"
+    cp "$shim" "${outdir}/${NPM_PACKAGE}/bin/${PRODUCT}.cjs"
+    chmod 755 "${outdir}/${NPM_PACKAGE}/bin/${PRODUCT}.cjs"
+    cp "$wrapper_readme" "${outdir}/${NPM_PACKAGE}/README.md"
+    cp "$licence" "${outdir}/${NPM_PACKAGE}/LICENSE"
 
     # THE ROOT PACKAGE IS PUBLISHED LAST, AND THE ORDER IS WRITTEN DOWN RATHER
     # THAN LEFT TO WHOEVER LOOPS OVER THE DIRECTORY. It declares every platform
@@ -536,7 +545,7 @@ cmd_npm_stage() {
     # fails at the point where npm resolves them.
     {
         printf '%s\n' "${order[@]}"
-        printf '%s\n' "$PRODUCT"
+        printf '%s\n' "$NPM_PACKAGE"
     } >"${outdir}/PUBLISH_ORDER"
 
     printf 'staged %d packages under %s; publish in the order in %s/PUBLISH_ORDER\n' \

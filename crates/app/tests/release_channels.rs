@@ -479,8 +479,12 @@ fn the_npm_manifests_pin_every_platform_package_and_its_published_digest() {
         &posix(&out),
     ]);
 
-    let root = json(&out.join("runner-manager").join("package.json"));
-    assert_eq!(root["name"], "runner-manager");
+    let root = json(
+        &out.join("@ivan-murzak")
+            .join("runner-manager")
+            .join("package.json"),
+    );
+    assert_eq!(root["name"], "@ivan-murzak/runner-manager");
     assert_eq!(root["version"], "1.2.3");
     assert_eq!(
         root["bin"]["runner-manager"], "bin/runner-manager.cjs",
@@ -636,7 +640,7 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
     }
 
     // The root package carries the shim and nothing platform-specific.
-    let root = out.join("runner-manager");
+    let root = out.join("@ivan-murzak").join("runner-manager");
     assert!(
         root.join("bin").join("runner-manager.cjs").is_file(),
         "the root package is missing the shim npm's `bin` entry points at"
@@ -654,7 +658,7 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
     // dependencies exist -- and every install in that window fails when npm
     // resolves them. A `for d in dist-npm/*` loop would publish in whatever
     // order the filesystem returns, which on a sorted listing puts
-    // `runner-manager` before `runner-manager-darwin-arm64`.
+    // `@ivan-murzak/runner-manager` before its own platform packages.
     let order = read(&out.join("PUBLISH_ORDER"));
     let lines: Vec<&str> = order.lines().filter(|line| !line.is_empty()).collect();
     assert_eq!(
@@ -664,7 +668,7 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
     );
     assert_eq!(
         lines.last(),
-        Some(&"runner-manager"),
+        Some(&"@ivan-murzak/runner-manager"),
         "the root package must be published LAST:\n{order}"
     );
     for (target, _, _) in TARGETS {
@@ -981,15 +985,17 @@ fn the_npm_readme_warns_that_a_global_npm_prefix_moves() {
     // is offered to npm users, and the comment above this test already argues
     // that those users "may never see the repository at all". A disclosure
     // seventy lines below the command they came to copy is not prominent.
-    let install = readme.find("npm i -g runner-manager").unwrap_or_else(|| {
-        panic!("npm/README.md must carry the install command it exists to serve")
-    });
+    let install = readme
+        .find("npm i -g @ivan-murzak/runner-manager")
+        .unwrap_or_else(|| {
+            panic!("npm/README.md must carry the install command it exists to serve")
+        });
     let disclosure = readme
         .find("Administration")
         .unwrap_or_else(|| panic!("checked above: the permission is named somewhere in this file"));
     assert!(
         disclosure < install,
-        "npm/README.md puts `npm i -g runner-manager` at byte {install} and the \
+        "npm/README.md puts `npm i -g @ivan-murzak/runner-manager` at byte {install} and \
          first mention of `Administration` at byte {disclosure}. A reader who \
          stops at the first thing they can copy must already have passed the \
          sentence about deleting their repositories."
@@ -1020,18 +1026,21 @@ fn node_or_skip() -> Option<PathBuf> {
 /// Lays out `<root>/node_modules/...` the way `npm i -g` would.
 fn install_wrapper(node: &Path, root: &Path, with_platform_package: bool) -> PathBuf {
     let modules = root.join("node_modules");
-    let wrapper = modules.join("runner-manager").join("bin");
+    let wrapper = modules
+        .join("@ivan-murzak")
+        .join("runner-manager")
+        .join("bin");
     std::fs::create_dir_all(&wrapper).expect("the wrapper directory");
     std::fs::copy(shim_path(), wrapper.join("runner-manager.cjs")).expect("copying the shim");
 
     if with_platform_package {
         let (platform, arch) = (std::env::consts::OS, std::env::consts::ARCH);
         let package = match (platform, arch) {
-            ("windows", "x86_64") => "runner-manager-win32-x64",
-            ("macos", "aarch64") => "runner-manager-darwin-arm64",
-            ("macos", "x86_64") => "runner-manager-darwin-x64",
-            ("linux", "x86_64") => "runner-manager-linux-x64",
-            ("linux", "aarch64") => "runner-manager-linux-arm64",
+            ("windows", "x86_64") => "@ivan-murzak/runner-manager-win32-x64",
+            ("macos", "aarch64") => "@ivan-murzak/runner-manager-darwin-arm64",
+            ("macos", "x86_64") => "@ivan-murzak/runner-manager-darwin-x64",
+            ("linux", "x86_64") => "@ivan-murzak/runner-manager-linux-x64",
+            ("linux", "aarch64") => "@ivan-murzak/runner-manager-linux-arm64",
             other => panic!("this host ({other:?}) is not one the wrapper publishes for"),
         };
         let binary_name = if cfg!(windows) {
@@ -1194,7 +1203,7 @@ fn the_shim_explains_a_platform_package_npm_skipped() {
          npm skipped it without saying so:\n{text}"
     );
     assert!(
-        text.contains("npm install -g runner-manager"),
+        text.contains("npm install -g @ivan-murzak/runner-manager"),
         "the shim must give the command that fixes it:\n{text}"
     );
 }
@@ -1528,20 +1537,29 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     // ------------------------------------------------------------------------
     // A SKIPPED CHANNEL LOOKS EXACTLY LIKE AN UPDATED ONE.
     // ------------------------------------------------------------------------
-    // `if: env.NPM_TOKEN != ''` is the obvious way to write this and it is the
-    // wrong one: a release with no npm secret would go green having published
-    // nothing to npm, and the first symptom is a user installing a version
-    // behind with no way to tell why. The check is also FIRST, before anything
-    // is uploaded or pushed, so a missing secret costs no partial update.
+    // `if: env.HOMEBREW_TAP_TOKEN != ''` is the obvious way to write this and it
+    // is the wrong one: a release missing a channel credential would go green
+    // having published nothing there, and the first symptom is a user
+    // installing a version behind with no way to tell why. The check is also
+    // FIRST, before anything is uploaded or pushed, so a missing credential
+    // costs no partial update.
+    //
+    // npm's half is no longer a secret. Trusted publishing authenticates the
+    // job by its OIDC claims, so what the guard checks for npm is the presence
+    // of the minting endpoint -- `ACTIONS_ID_TOKEN_REQUEST_URL`, which the
+    // runner sets only under `id-token: write`.
     let block = job_block("channels");
     let bodies = run_bodies(&block);
     assert!(!bodies.is_empty(), "no run bodies parsed:\n{block}");
 
     let guard = bodies
         .iter()
-        .position(|body| body.contains("NPM_TOKEN") && body.contains("HOMEBREW_TAP_TOKEN"))
+        .position(|body| {
+            body.contains("ACTIONS_ID_TOKEN_REQUEST_URL") && body.contains("HOMEBREW_TAP_TOKEN")
+        })
         .expect(
-            "the channels job must check both channel secrets in one step \
+            "the channels job must check both channel credentials -- the OIDC \
+             endpoint npm publishes through and the tap token -- in one step \
              before it does anything else",
         );
     assert_eq!(
@@ -1552,8 +1570,8 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     );
     assert!(
         bodies[guard].contains("exit 1"),
-        "the credential check must FAIL the run when a secret is missing, not \
-         warn and continue:\n{}",
+        "the credential check must FAIL the run when a credential is missing, \
+         not warn and continue:\n{}",
         bodies[guard]
     );
 

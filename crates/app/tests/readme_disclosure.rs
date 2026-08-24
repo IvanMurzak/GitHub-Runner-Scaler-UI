@@ -95,7 +95,12 @@ const INSTALL_COMMANDS: [(&str, &str); 5] = [
         "the install script, Windows -- the path a clean Windows host with no \
          Node installed depends on",
     ),
-    ("npm i -g runner-manager", "the npm wrapper"),
+    (
+        "npm i -g @ivan-murzak/runner-manager",
+        "the npm wrapper -- SCOPED, because the unscoped `runner-manager` on \
+         npmjs.com is an unrelated project and installing it puts a different \
+         tool on PATH under this one's name",
+    ),
     (
         "brew install IvanMurzak/tap/runner-manager",
         "the Homebrew tap",
@@ -135,31 +140,44 @@ fn every_documented_channel_appears_in_the_readme() {
     }
 
     // ------------------------------------------------------------------------
-    // THE INSTALL SCRIPT IS FIRST, AND THAT IS A REQUIREMENT WITH A REASON.
+    // THE ORDER IS THE OWNER'S; THE CAVEAT TRAVELLING WITH npm IS NOT.
     // ------------------------------------------------------------------------
-    // "one block per channel, install script first" (the task spec). It is
-    // first because it is the only channel that installs to a path that does
-    // not move when a toolchain moves -- and `service install` records an
-    // ABSOLUTE binary path (`05-infrastructure.md`). A reader who takes the
-    // first option they see should be taking the one that survives a Node
-    // upgrade.
-    let script = source
-        .find(INSTALL_COMMANDS[0].0)
-        .expect("checked above: the install script command is present");
-    for (command, what) in [
-        INSTALL_COMMANDS[2],
-        INSTALL_COMMANDS[3],
-        INSTALL_COMMANDS[4],
+    // This used to require the install script to be the FIRST channel offered,
+    // because it is the only one whose install location does not move when a
+    // toolchain moves -- and `service install` records an ABSOLUTE binary path
+    // (`05-infrastructure.md`). The owner has since put the short commands, npm
+    // among them, at the top of the section, which is a presentation decision
+    // and is theirs to make.
+    //
+    // What is NOT theirs to lose is the sentence that makes the first command
+    // safe to take: an `npm i -g` binary lives under the ACTIVE Node prefix, a
+    // Node upgrade moves it, and the installed service then points at a path
+    // that no longer exists. So the rule now binds the hazard to the offer --
+    // the npm command must be followed by the caveat and by the command that
+    // reports it -- rather than binding the order.
+    let npm = source
+        .find(INSTALL_COMMANDS[2].0)
+        .expect("checked above: the npm command is present");
+    for (needle, why) in [
+        (
+            "stale",
+            "the word `service status` prints for a recorded path whose binary \
+             has moved",
+        ),
+        (
+            "service status",
+            "the command that reports it, rather than the service quietly \
+             appearing healthy until the next unattended boot",
+        ),
     ] {
-        let offset = source
-            .find(command)
-            .expect("checked above: every channel is present");
+        // Searched from the npm command onwards, not from the top of the file:
+        // `service status` also appears in the command reference far above the
+        // install section, and a mention there is not the caveat this is about.
         assert!(
-            script < offset,
-            "README.md offers {what} before the install script. The install \
-             script must be the first channel offered: it is the only one whose \
-             install location does not move when a toolchain moves, and a \
-             boot-start service records the binary's absolute path."
+            source[npm..].contains(needle),
+            "README.md offers `npm i -g` at byte {npm} and never mentions \
+             `{needle}` after it. A reader who takes the first command in the \
+             section must still meet the caveat that makes it safe: {why}."
         );
     }
 }

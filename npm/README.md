@@ -1,4 +1,4 @@
-# runner-manager (npm wrapper)
+# @ivan-murzak/runner-manager (npm wrapper)
 
 Local-first autoscaling manager for ephemeral GitHub Actions self-hosted
 runners, with a CLI and a Ratatui TUI.
@@ -12,7 +12,7 @@ runners, with a CLI and a Ratatui TUI.
 > [What you are granting](#what-you-are-granting) below.
 
 ```sh
-npm i -g runner-manager
+npm i -g @ivan-murzak/runner-manager
 runner-manager --version
 ```
 
@@ -22,11 +22,11 @@ only the one that matches your OS and CPU:
 
 | Platform package | os / cpu | Rust target |
 |---|---|---|
-| `runner-manager-win32-x64` | `win32` / `x64` | `x86_64-pc-windows-msvc` |
-| `runner-manager-darwin-arm64` | `darwin` / `arm64` | `aarch64-apple-darwin` |
-| `runner-manager-darwin-x64` | `darwin` / `x64` | `x86_64-apple-darwin` |
-| `runner-manager-linux-x64` | `linux` / `x64` | `x86_64-unknown-linux-gnu` |
-| `runner-manager-linux-arm64` | `linux` / `arm64` | `aarch64-unknown-linux-gnu` |
+| `@ivan-murzak/runner-manager-win32-x64` | `win32` / `x64` | `x86_64-pc-windows-msvc` |
+| `@ivan-murzak/runner-manager-darwin-arm64` | `darwin` / `arm64` | `aarch64-apple-darwin` |
+| `@ivan-murzak/runner-manager-darwin-x64` | `darwin` / `x64` | `x86_64-apple-darwin` |
+| `@ivan-murzak/runner-manager-linux-x64` | `linux` / `x64` | `x86_64-unknown-linux-gnu` |
+| `@ivan-murzak/runner-manager-linux-arm64` | `linux` / `arm64` | `aarch64-unknown-linux-gnu` |
 
 Each platform package records, in its `package.json`, the release archive its
 binary was taken from and that archive's published SHA-256 — the same digest
@@ -57,8 +57,8 @@ does not come up.
 **stale** rather than reporting the service as healthy. If you see that:
 
 ```sh
-npm i -g runner-manager          # into the Node version you are now using
-runner-manager service install   # re-records the new absolute path
+npm i -g @ivan-murzak/runner-manager   # into the Node version you are now using
+runner-manager service install        # re-records the new absolute path
 ```
 
 **If you want a boot-start service, prefer the install script.** It installs to

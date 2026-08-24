@@ -125,10 +125,13 @@
 #
 # Two failures need a human decision rather than a re-run:
 #
-#   * A MISSING SECRET. `NPM_TOKEN` or `HOMEBREW_TAP_TOKEN` absent fails the
-#     job on purpose rather than skipping the channel quietly -- a release that
-#     silently did not update npm is worse than one that says so. Add the
-#     secret, then re-run the job.
+#   * A MISSING CREDENTIAL. `HOMEBREW_TAP_TOKEN` absent, or the Actions OIDC
+#     endpoint absent, fails the job on purpose rather than skipping the
+#     channel quietly -- a release that silently did not update npm is worse
+#     than one that says so. There is no `NPM_TOKEN`: npm authenticates this
+#     job through trusted publishing, so an npm rejection here means the
+#     package's trusted publisher on npmjs.com does not name this repository,
+#     this workflow file, and `npm publish`. Fix it there, then re-run the job.
 #   * A NON-FAST-FORWARD ON THE TAP. Somebody pushed to the tap repository
 #     while this ran. Nothing here force-pushes, so the push is refused and the
 #     job fails; a re-run re-clones and succeeds.
@@ -887,8 +890,24 @@ jobs:
     needs: [validate, tag, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # ------------------------------------------------------------------------
+    # `id-token: write` IS HERE ON PURPOSE, AND IT REPLACES A SECRET.
+    # ------------------------------------------------------------------------
+    # It was refused across this whole workflow until npm trusted publishing
+    # existed, on the reasoning that the one job holding a publishing
+    # credential must not also be able to mint credentials. Trusted publishing
+    # inverts that trade: npm authenticates this job by its OIDC claims --
+    # repository, workflow FILE NAME, ref -- and there is no NPM_TOKEN in the
+    # repository at all any more. The long-lived secret that could be exfil-
+    # trated, leaked in a log, or used from anywhere was the larger exposure;
+    # a token minted for this workflow, valid for minutes, is the smaller one.
+    #
+    # The scope stays on THIS job. `crates/app/tests/workflow_triggers.rs`
+    # keeps refusing `id-token: write` at the top level and in every other job,
+    # so the grant cannot spread by inheritance.
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@v7
@@ -897,19 +916,31 @@ jobs:
 
       - name: Refuse to start without the credentials this job needs
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPOSITORY: ${{ vars.RUNNER_MANAGER_TAP_REPOSITORY || 'IvanMurzak/homebrew-tap' }}
           TAP_BRANCH: ${{ vars.RUNNER_MANAGER_TAP_BRANCH || 'main' }}
         run: |
           # Checked FIRST, before anything is uploaded or pushed, so a missing
-          # secret costs no partial channel update. And checked rather than
+          # credential costs no partial channel update. And checked rather than
           # skipped: a release that quietly did not update npm looks identical
           # to one that did, and the difference surfaces as a user installing a
           # version behind and never knowing why.
           missing=0
-          if [ -z "${NPM_TOKEN}" ]; then
-            echo "MISSING: repository secret NPM_TOKEN (npm publish)" >&2
+          # npm publishes through trusted publishing, so what has to be present
+          # is not a secret but the OIDC minting endpoint the runner exposes
+          # only when `id-token: write` is granted. Absent, `npm publish` would
+          # fall back to looking for a token, find none, and fail at the point
+          # where the packages are already staged.
+          #
+          # Read from the runner's own environment rather than through a
+          # workflow expression over the `env` context: that context holds only
+          # what this file puts there, so the expression would interpolate an
+          # empty string and this check would pass exactly when OIDC is missing.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
+            echo "MISSING: the Actions OIDC endpoint (npm trusted publishing)" >&2
+            echo "  This job declares \`id-token: write\`; if that is still true" >&2
+            echo "  and the variable is empty, OIDC is disabled for the" >&2
+            echo "  repository or the organisation." >&2
             missing=1
           fi
           if [ -z "${TAP_TOKEN}" ]; then
@@ -918,11 +949,11 @@ jobs:
           fi
           if [ "$missing" -ne 0 ]; then
             echo "REJECTED: step 8 cannot update the channels it is responsible for." >&2
-            echo "The release itself is published and correct; add the secrets" >&2
+            echo "The release itself is published and correct; fix the cause" >&2
             echo "above and re-run THIS JOB. Do not re-dispatch the workflow." >&2
             exit 1
           fi
-          echo "both channel credentials are present"
+          echo "npm authenticates through OIDC; the tap credential is present"
 
           # --------------------------------------------------------------
           # PRESENT IS NOT THE SAME AS WORKING, AND THE TAP IS VALIDATED LAST.
@@ -1121,15 +1152,36 @@ jobs:
           echo "--- Formula/runner-manager.rb ---"
           cat dist-brew/runner-manager.rb
 
+      # Node 24 for its npm, not for its runtime: trusted publishing needs npm
+      # 11.5.1 or newer (and Node 22.14+), and the npm bundled with Node 22 on
+      # this image is older than that. `registry-url` still matters -- it is
+      # what writes the `.npmrc` naming registry.npmjs.org as the registry the
+      # OIDC exchange happens against.
       - name: Set up Node with the npm registry configured
         uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      # Asserted rather than assumed. An npm older than 11.5.1 does not know
+      # how to exchange an OIDC token at all: it looks for a token instead,
+      # finds none, and fails with an authentication error that says nothing
+      # about the version -- after the packages are staged and the release is
+      # already published.
+      - name: Refuse an npm that cannot do trusted publishing
+        run: |
+          required="11.5.1"
+          actual="$(npm --version)"
+          echo "npm ${actual} (need >= ${required} for trusted publishing)"
+          lowest="$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -n 1)"
+          if [ "$lowest" != "$required" ]; then
+            echo "REJECTED: npm ${actual} predates trusted publishing." >&2
+            echo "Raise node-version above, or install npm@${required} or newer." >&2
+            exit 1
+          fi
 
       - name: Step 8 - publish the npm packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           # PUBLISH_ORDER puts the five platform packages first and the root
@@ -1148,13 +1200,18 @@ jobs:
               continue
             fi
 
-            # NO `--provenance`. npm's provenance attestation is signed with an
-            # OIDC token, which needs `id-token: write` -- a permission
-            # `crates/app/tests/workflow_triggers.rs` refuses outright for this
-            # workflow, because it would let the one workflow holding a
-            # publishing credential mint more (`07-security.md`). Artifact
-            # integrity here is SHA-256 plus the SBOM, and each platform
-            # package records the digest of the archive its binary came from.
+            # NO `--provenance` FLAG, AND PROVENANCE IS STILL PUBLISHED.
+            # Trusted publishing generates the attestation on its own, from the
+            # same OIDC token it authenticates with; passing the flag as well
+            # adds nothing. This is the reverse of the position recorded before
+            # trusted publishing existed, when `id-token: write` was refused and
+            # provenance was given up with it. Artifact integrity is now
+            # provenance PLUS SHA-256 and the SBOM, with each platform package
+            # still recording the digest of the archive its binary came from.
+            #
+            # NO NODE_AUTH_TOKEN either: authentication is the OIDC exchange.
+            # A token in scope here would be silently preferred over it and
+            # would put the workflow back on a long-lived credential.
             echo "--- publishing ${package}@${VERSION}"
             ( cd "dist-npm/${package}" && npm publish --access public )
           done < dist-npm/PUBLISH_ORDER
@@ -1204,7 +1261,7 @@ jobs:
             echo "### Channels updated for ${TAG}"
             echo
             echo "- install script: \`releases/latest/download/install.sh\` and \`install.ps1\`"
-            echo "- npm: \`runner-manager@${VERSION}\` plus five platform packages"
+            echo "- npm: \`@ivan-murzak/runner-manager@${VERSION}\` plus five platform packages"
             echo "- Homebrew: \`${TAP_REPOSITORY}\` Formula/runner-manager.rb"
             echo "- cargo: \`cargo install runner-manager\` builds from the published crate"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -1217,7 +1274,7 @@ jobs:
           name: release-channels
           path: |
             dist-brew/runner-manager.rb
-            dist-npm/*/package.json
+            dist-npm/*/*/package.json
             dist-npm/PUBLISH_ORDER
           if-no-files-found: error
           retention-days: 7

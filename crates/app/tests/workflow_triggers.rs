@@ -15,8 +15,12 @@
 //
 // Asserting them here makes them fail a pull request rather than a release
 // rehearsal. a2 rewrites release.yml's steps and a3 adds one more; neither
-// changes the trigger block, so neither should make this file fail — but a2
-// adding `id-token: write` to a release JOB is meant to red it, and does.
+// changes the trigger block, so neither should make this file fail.
+//
+// `id-token: write` in a release job used to red this file outright. It is now
+// allowed in exactly one job — `channels`, for npm trusted publishing, which
+// removed the `NPM_TOKEN` it replaces — and refused everywhere else, including
+// at the top level. The reasoning is on the assertion itself.
 //
 // This file belongs to a1 and to the A group. It is not part of the CLI
 // (group F) or TUI (group G) conflict domains.
@@ -372,17 +376,37 @@ fn release_workflow_requests_contents_write_and_nothing_else() {
              either name the scopes or delete the key"
         );
 
+        // --------------------------------------------------------------------
+        // ONE JOB MAY MINT AN OIDC TOKEN, AND ONLY BECAUSE IT HOLDS NO SECRET.
+        // --------------------------------------------------------------------
+        // `id-token: write` was refused everywhere while npm publishing used a
+        // long-lived `NPM_TOKEN`: adding it would have given the job that held
+        // a publishing credential the ability to mint more.
+        //
+        // npm trusted publishing removed the other half of that sentence. The
+        // `channels` job authenticates to npm by its OIDC claims -- repository,
+        // workflow file name, ref -- and `NPM_TOKEN` no longer exists in this
+        // repository. Trading a permanent secret for a token that lives for
+        // minutes and is bound to this workflow is the reason the exception is
+        // here, so it is deliberately NOT a general relaxation: every other
+        // job, and the top-level block above, still gets `contents` only.
+        const OIDC_JOB: &str = "channels";
+
         for (_, text) in &permissions.block {
             let (scope, level) = permission_entry(text);
+            let allowed = matches!(
+                (scope.as_str(), level.as_str()),
+                ("contents", "write") | ("contents", "read")
+            ) || (job == OIDC_JOB
+                && (scope.as_str(), level.as_str()) == ("id-token", "write"));
             assert!(
-                matches!(
-                    (scope.as_str(), level.as_str()),
-                    ("contents", "write") | ("contents", "read")
-                ),
+                allowed,
                 "release.yml job `{job}` requests `{text}`. A release job may \
                  request `contents: write` (or `contents: read`) and nothing \
-                 else: `id-token: write` and `packages: write` would let the \
-                 one workflow holding a publishing credential mint more \
+                 else, except `{OIDC_JOB}`, which may also request \
+                 `id-token: write` for npm trusted publishing. `packages: \
+                 write` -- and `id-token: write` in any other job -- would let \
+                 the workflow that publishes mint credentials of its own \
                  (`07-security.md`)."
             );
         }

@@ -41,11 +41,11 @@ const { spawnSync } = require("node:child_process");
 // renamed on one side and not the other produces a wrapper that installs
 // cleanly and then cannot find its own binary.
 const PLATFORMS = {
-  "darwin arm64": ["runner-manager-darwin-arm64", "runner-manager"],
-  "darwin x64": ["runner-manager-darwin-x64", "runner-manager"],
-  "linux arm64": ["runner-manager-linux-arm64", "runner-manager"],
-  "linux x64": ["runner-manager-linux-x64", "runner-manager"],
-  "win32 x64": ["runner-manager-win32-x64", "runner-manager.exe"],
+  "darwin arm64": ["@ivan-murzak/runner-manager-darwin-arm64", "runner-manager"],
+  "darwin x64": ["@ivan-murzak/runner-manager-darwin-x64", "runner-manager"],
+  "linux arm64": ["@ivan-murzak/runner-manager-linux-arm64", "runner-manager"],
+  "linux x64": ["@ivan-murzak/runner-manager-linux-x64", "runner-manager"],
+  "win32 x64": ["@ivan-murzak/runner-manager-win32-x64", "runner-manager.exe"],
 };
 
 function fail(lines) {
@@ -106,7 +106,7 @@ try {
     "",
     "Reinstall with optional dependencies enabled:",
     "",
-    "  npm install -g runner-manager",
+    "  npm install -g @ivan-murzak/runner-manager",
     "",
     `(resolution error: ${error && error.message ? error.message : error})`,
   ]);
