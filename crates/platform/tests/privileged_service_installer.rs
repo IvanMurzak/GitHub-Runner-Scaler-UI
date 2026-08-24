@@ -55,7 +55,7 @@ use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::{
     BinaryPath, HostControls, InstallRecord, InstallRequest, Installed, RestartPolicy,
-    ServiceError, ServiceIdentity, ServiceOperations,
+    ServiceError, ServiceIdentity, ServiceOperations, WINDOWS_SCM_HOST_ARGUMENT,
 };
 use windows_service::service::{ServiceAccess, ServiceExitCode};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -138,9 +138,13 @@ impl Fixture {
     }
 
     fn request(&self, mode: StartMode, restart: RestartPolicy) -> InstallRequest {
+        let mut arguments = vec![self.heartbeat.as_os_str().to_owned()];
+        if mode == StartMode::Boot {
+            arguments.push(std::ffi::OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
+        }
         InstallRequest::new(mode)
             .for_binary(&self.binary)
-            .with_arguments([self.heartbeat.as_os_str()])
+            .with_arguments(arguments)
             .with_restart(restart)
             .started_on_demand()
     }
@@ -265,8 +269,8 @@ fn runner_manager_binary() -> PathBuf {
     candidate
 }
 
-fn production_daemon_arguments(paths: &AppPaths) -> Vec<std::ffi::OsString> {
-    [
+fn production_daemon_arguments(paths: &AppPaths, windows_scm: bool) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<_> = [
         std::ffi::OsString::from("daemon"),
         std::ffi::OsString::from("run"),
         std::ffi::OsString::from("--service-config-dir"),
@@ -279,7 +283,11 @@ fn production_daemon_arguments(paths: &AppPaths) -> Vec<std::ffi::OsString> {
         paths.logs_dir().as_os_str().to_owned(),
     ]
     .into_iter()
-    .collect()
+    .collect();
+    if windows_scm {
+        arguments.push(std::ffi::OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
+    }
+    arguments
 }
 
 fn wait_for_running(fixture: &Fixture, running: bool, timeout: Duration) {
@@ -416,7 +424,7 @@ fn production_daemon_entrypoint_reaches_running_and_handles_scm_stop() {
         .expect("the fixture owns a copy of runner-manager.exe");
     let request = InstallRequest::new(StartMode::Boot)
         .for_binary(&fixture.binary)
-        .with_arguments(production_daemon_arguments(&fixture.paths))
+        .with_arguments(production_daemon_arguments(&fixture.paths, true))
         .started_on_demand();
     match fixture.operations.install(&request) {
         Ok(_) => {}
@@ -469,6 +477,68 @@ fn production_daemon_entrypoint_reaches_running_and_handles_scm_stop() {
             .registration()
             .is_none(),
         "the production-entrypoint fixture leaked a service registration"
+    );
+}
+
+#[test]
+#[ignore = "installs and starts the production login command as a real scheduled task"]
+fn production_login_entrypoint_runs_without_scm_and_stops_through_task_scheduler() {
+    let fixture = Fixture::new("production-login-entrypoint");
+    std::fs::copy(runner_manager_binary(), &fixture.binary)
+        .expect("the fixture owns a copy of runner-manager.exe");
+    let arguments = production_daemon_arguments(&fixture.paths, false);
+    assert!(
+        arguments
+            .iter()
+            .all(|argument| argument != WINDOWS_SCM_HOST_ARGUMENT),
+        "the login command must not carry the SCM discriminator"
+    );
+    let request = InstallRequest::new(StartMode::Login)
+        .for_binary(&fixture.binary)
+        .with_arguments(arguments)
+        .started_on_demand();
+    match fixture.operations.install(&request) {
+        Ok(_) => {}
+        Err(error @ ServiceError::NeedsElevation { .. }) => require_elevation(&error),
+        Err(error) => panic!("{error}"),
+    }
+
+    fixture
+        .operations
+        .start()
+        .expect("Task Scheduler starts the production login entrypoint");
+    wait_for_running(&fixture, true, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        fixture
+            .operations
+            .status()
+            .expect("Task Scheduler can report the live daemon")
+            .registration()
+            .is_some_and(|registration| registration.running),
+        "the login daemon exited as it would if it had incorrectly attempted to connect to SCM"
+    );
+
+    assert!(
+        fixture
+            .operations
+            .stop()
+            .expect("Task Scheduler ends its running task"),
+        "the scheduled task was expected to be running"
+    );
+    wait_for_running(&fixture, false, Duration::from_secs(30));
+    fixture
+        .operations
+        .uninstall()
+        .expect("the scheduled-task fixture is removed");
+    assert!(
+        fixture
+            .operations
+            .status()
+            .expect("Task Scheduler can prove cleanup")
+            .registration()
+            .is_none(),
+        "the production-login fixture leaked a scheduled task"
     );
 }
 
@@ -657,6 +727,14 @@ fn switching_start_mode_moves_the_registration_between_the_two_windows_facilitie
         "{login}"
     );
     assert_eq!(login.start_mode(), Some(StartMode::Login));
+    assert!(
+        !login
+            .registration()
+            .expect("Task Scheduler owns the login registration")
+            .command_line
+            .contains(WINDOWS_SCM_HOST_ARGUMENT),
+        "switching to login must remove the SCM-only marker"
+    );
     assert_eq!(
         login
             .registration()
@@ -664,6 +742,20 @@ fn switching_start_mode_moves_the_registration_between_the_two_windows_facilitie
             .as_deref(),
         Some(fixture.binary.as_path()),
         "the switch must carry the recorded path across, not re-resolve one"
+    );
+
+    fixture
+        .operations
+        .set_start_mode(StartMode::Boot)
+        .expect("switching back recreates the service without reinstalling the product");
+    let boot_again = fixture.operations.status().expect("a status");
+    assert!(
+        boot_again
+            .registration()
+            .expect("SCM owns the boot registration")
+            .command_line
+            .contains(WINDOWS_SCM_HOST_ARGUMENT),
+        "switching back to boot must restore the durable SCM marker"
     );
 }
 

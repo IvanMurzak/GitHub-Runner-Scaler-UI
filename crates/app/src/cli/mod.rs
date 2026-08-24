@@ -609,6 +609,10 @@ pub struct DaemonRunArgs {
     pub service_runtime_dir: Option<PathBuf>,
     #[arg(long, hide = true, requires_all = ["service_config_dir", "service_state_dir", "service_runtime_dir"])]
     pub service_logs_dir: Option<PathBuf>,
+    /// Installed only in Windows boot-service registrations. Login scheduled
+    /// tasks carry the same directory arguments but must never enter SCM.
+    #[arg(long, hide = true, requires = "service_config_dir")]
+    pub windows_service_host: bool,
 }
 
 impl DaemonRunArgs {
@@ -935,7 +939,7 @@ pub fn dispatch() -> ExitCode {
     #[cfg(windows)]
     if matches!(
         &cli.command,
-        Command::Daemon(DaemonCommand::Run(args)) if args.service_paths().is_some()
+        Command::Daemon(DaemonCommand::Run(args)) if args.windows_service_host
     ) {
         return dispatch_windows_service(cli);
     }

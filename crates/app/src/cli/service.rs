@@ -7,7 +7,9 @@ use std::io::Write;
 
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::{Store, StoreError};
-use runner_manager_platform::service::{InstallRequest, ServiceError, ServiceOperations};
+use runner_manager_platform::service::{
+    InstallRequest, ServiceError, ServiceOperations, WINDOWS_SCM_HOST_ARGUMENT,
+};
 
 use super::{CliError, Context, Failure, ServiceCommand, ServiceInstallArgs, write_failed};
 
@@ -28,9 +30,9 @@ fn operations(context: &Context) -> ServiceOperations {
     ServiceOperations::on_this_host(context.paths().clone())
 }
 
-fn daemon_arguments(context: &Context) -> Vec<OsString> {
+fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
     let paths = context.paths();
-    [
+    let mut arguments: Vec<OsString> = [
         OsString::from("daemon"),
         OsString::from("run"),
         OsString::from("--service-config-dir"),
@@ -43,7 +45,11 @@ fn daemon_arguments(context: &Context) -> Vec<OsString> {
         paths.logs_dir().as_os_str().to_owned(),
     ]
     .into_iter()
-    .collect()
+    .collect();
+    if cfg!(windows) && mode == StartMode::Boot {
+        arguments.push(OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
+    }
+    arguments
 }
 
 pub fn install(
@@ -72,7 +78,7 @@ pub fn install(
             "runner-manager --data-dir <ABSOLUTE-DIR> service install",
         ));
     }
-    let request = InstallRequest::new(mode).with_arguments(daemon_arguments(context));
+    let request = InstallRequest::new(mode).with_arguments(daemon_arguments(context, mode));
     let installed = operations.install(&request).map_err(service_failure)?;
 
     if let Err(source) = persist_mode(&store, &mut host, mode)
@@ -216,7 +222,7 @@ mod tests {
     fn installed_daemon_arguments_reproduce_all_four_directories_without_data_dir() {
         let temporary = tempfile::tempdir().unwrap();
         let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
-        let arguments = daemon_arguments(&context);
+        let arguments = daemon_arguments(&context, StartMode::Boot);
         let mut argv = vec![OsString::from("runner-manager")];
         argv.extend(arguments);
         let cli = Cli::try_parse_from(argv).expect("service arguments must parse unattended");
@@ -228,6 +234,22 @@ mod tests {
             panic!("wrong command");
         };
         assert_eq!(args.service_paths().as_ref(), Some(context.paths()));
+        assert_eq!(
+            args.windows_service_host,
+            cfg!(windows),
+            "only a Windows boot registration enters SCM"
+        );
+
+        let mut login_argv = vec![OsString::from("runner-manager")];
+        login_argv.extend(daemon_arguments(&context, StartMode::Login));
+        let login = Cli::try_parse_from(login_argv).expect("login arguments parse unattended");
+        let Command::Daemon(DaemonCommand::Run(login)) = login.command else {
+            panic!("wrong login command");
+        };
+        assert!(
+            !login.windows_service_host,
+            "Task Scheduler is not the Service Control Manager"
+        );
     }
 
     #[test]

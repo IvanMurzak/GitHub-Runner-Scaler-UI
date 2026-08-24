@@ -106,6 +106,12 @@ use crate::paths::AppPaths;
 
 /// The product's own service name, on every platform that wants a short one.
 pub const SERVICE_NAME: &str = "runner-manager";
+/// Hidden CLI marker carried only by Windows boot-service registrations.
+///
+/// Application-data arguments are shared by every service manager and cannot
+/// distinguish SCM from Task Scheduler. This marker is the durable routing
+/// contract between the Windows installer and the shipping binary.
+pub const WINDOWS_SCM_HOST_ARGUMENT: &str = "--windows-service-host";
 
 /// What an operator sees in `services.msc`, `launchctl list`, or
 /// `systemctl status`.
@@ -3355,13 +3361,21 @@ impl ServiceOperations {
             });
         }
 
+        let mut arguments = record.arguments.clone();
+        #[cfg(windows)]
+        {
+            arguments.retain(|argument| argument != WINDOWS_SCM_HOST_ARGUMENT);
+            if to == StartMode::Boot {
+                arguments.push(WINDOWS_SCM_HOST_ARGUMENT.to_string());
+            }
+        }
         let plan = InstallPlan::unchecked(
             self.identity.clone(),
             to,
             record.binary.clone(),
             record.directories.clone(),
         )
-        .with_arguments(record.arguments.clone())
+        .with_arguments(arguments)
         .with_restart(record.restart());
         let plan = if record.starts_on_demand {
             plan.started_on_demand()

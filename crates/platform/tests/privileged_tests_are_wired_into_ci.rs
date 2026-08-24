@@ -87,8 +87,23 @@ fn ci_builds_the_fixture_service_host_before_running_the_smoke_tests() {
          than the service host.",
         path.display()
     );
+    let lines: Vec<_> = source.lines().map(str::trim).collect();
+    let binary_build = lines
+        .iter()
+        .position(|line| *line == "cargo build -p runner-manager")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}'s installer job must build the shipping runner-manager binary before the \
+                 privileged regression installs and starts its exact production service entrypoint.",
+                path.display()
+            )
+        });
+    let privileged_test = lines
+        .iter()
+        .position(|line| line.contains("--test privileged_service_installer"))
+        .expect("the privileged test command was asserted above");
     assert!(
-        source.contains("cargo build -p runner-manager\n"),
+        binary_build < privileged_test,
         "{}'s installer job must build the shipping runner-manager binary before the privileged \
          regression installs and starts its exact production service entrypoint.",
         path.display()
