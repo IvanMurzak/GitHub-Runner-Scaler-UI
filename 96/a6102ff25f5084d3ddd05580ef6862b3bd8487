@@ -1,0 +1,33 @@
+crates/platform/tests/privileged_service_installer.rs
+  s_e3f2ebf0732f36::t_4bd9d51d3623cc 247-304,411-457,463-474
+  s_e3f2ebf0732f36::t_96b97343f44260 60-61,306-317,458-462
+  s_e3f2ebf0732f36::t_e8ccf8a4a3b58e 305
+.github/workflows/ci.yml
+  s_e3f2ebf0732f36::t_6b5e52b1f59cd9 199-200
+  s_e3f2ebf0732f36::t_9a374236c572dd 198
+crates/app/src/cli/mod.rs
+  s_e3f2ebf0732f36::t_17985eb664312d 930-942,982-990,1024,1032-1054
+crates/app/src/cli/daemon.rs
+  s_e3f2ebf0732f36::t_f980988593f781 44,49,54-58,71-73,217,249-260
+crates/platform/tests/privileged_tests_are_wired_into_ci.rs
+  s_e3f2ebf0732f36::t_6b5e52b1f59cd9 91-93
+  s_e3f2ebf0732f36::t_0ef1c57844e68f 90,94-95
+crates/platform/src/service.rs
+  s_e3f2ebf0732f36::t_38dd8a7325cbad 4228-4399
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "96a6102ff25f5084d3ddd05580ef6862b3bd8487",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
