@@ -1,0 +1,26 @@
+.github/workflows/ci.yml
+  s_e3f2ebf0732f36::t_7be8b567be47b5 89,107,165,173
+crates/app/tests/workflow_action_versions.rs
+  s_e3f2ebf0732f36::t_7be8b567be47b5 1-76
+.github/workflows/e2e.yml
+  s_e3f2ebf0732f36::t_7be8b567be47b5 158,168
+  s_e3f2ebf0732f36::t_860daa922d7979 111-112
+.github/workflows/release.yml
+  s_e3f2ebf0732f36::t_7be8b567be47b5 206,333,392,510,606,642,692,711,716,894,1125,1213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "71b44a1756b80ccdb894601d4a9b644076fd71d7",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
