@@ -193,7 +193,8 @@ struct LocalAgentEventSource {
 
 struct SourceState {
     stopped: bool,
-    requested_generation: u64,
+    refresh_pending: bool,
+    next_generation: u64,
     active: Option<(u64, CancelToken)>,
 }
 
@@ -213,7 +214,8 @@ impl LocalAgentEventSource {
         let control = Arc::new((
             Mutex::new(SourceState {
                 stopped: false,
-                requested_generation: 1,
+                refresh_pending: true,
+                next_generation: 1,
                 active: None,
             }),
             Condvar::new(),
@@ -222,22 +224,25 @@ impl LocalAgentEventSource {
         let worker = thread::Builder::new()
             .name("runner-manager-tui-events".to_owned())
             .spawn(move || {
-                let mut completed_generation = 0_u64;
                 loop {
                     let (state_lock, wake) = &*worker_control;
                     let mut state = state_lock.lock().unwrap();
-                    while !state.stopped && state.requested_generation <= completed_generation {
+                    while !state.stopped && !state.refresh_pending {
                         let (next, timeout) = wake.wait_timeout(state, poll_rate).unwrap();
                         state = next;
-                        if timeout.timed_out() && state.requested_generation <= completed_generation
-                        {
-                            state.requested_generation = completed_generation.saturating_add(1);
+                        if timeout.timed_out() {
+                            state.refresh_pending = true;
                         }
                     }
                     if state.stopped {
                         break;
                     }
-                    let generation = state.requested_generation;
+                    // A pending refresh is a bit, not a counter. Any number of
+                    // F5 presses while this collection is active can request
+                    // exactly one latest follow-up and nothing more.
+                    state.refresh_pending = false;
+                    let generation = state.next_generation;
+                    state.next_generation = state.next_generation.saturating_add(1);
                     let cancel = CancelToken::new();
                     // Publication happens while holding the same lock used by
                     // refresh and stop, so neither can slip through before an
@@ -247,9 +252,8 @@ impl LocalAgentEventSource {
 
                     let event = produce(&cancel);
                     let mut state = state_lock.lock().unwrap();
-                    let publish = !state.stopped
-                        && state.requested_generation == generation
-                        && !cancel.is_cancelled();
+                    let publish =
+                        !state.stopped && !state.refresh_pending && !cancel.is_cancelled();
                     if state
                         .active
                         .as_ref()
@@ -257,7 +261,6 @@ impl LocalAgentEventSource {
                     {
                         state.active = None;
                     }
-                    completed_generation = generation;
                     if state.stopped {
                         break;
                     }
@@ -286,7 +289,7 @@ impl LocalAgentEventSource {
         if state.stopped {
             return Err(io::Error::other("the TUI snapshot source stopped"));
         }
-        state.requested_generation = state.requested_generation.saturating_add(1);
+        state.refresh_pending = true;
         if let Some((_, cancel)) = &state.active {
             cancel.cancel();
         }
@@ -441,10 +444,15 @@ async fn production_screen_snapshot(
             .app_registration()
             .map_err(|error| (Availability::Unauthorized, error.to_string()))?;
         Some(
-            client
-                .discover_installations(&app)
+            cancel
+                .run(async {
+                    client
+                        .discover_installations(&app)
+                        .await
+                        .map_err(InventoryError::from)
+                })
                 .await
-                .map_err(|error| inventory_failure(context, &clock, InventoryError::from(error)))?,
+                .map_err(|error| inventory_failure(context, &clock, error))?,
         )
     } else {
         None
@@ -2662,45 +2670,61 @@ mod tests {
     fn repeated_f5_cancels_stale_work_and_publishes_only_the_latest_collection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let collections = Arc::new(AtomicUsize::new(0));
-        let worker_collections = Arc::clone(&collections);
-        let (first_started, first_started_rx) = std::sync::mpsc::sync_channel(0);
-        let (source, mut events) = LocalAgentEventSource::start_with(
-            move |cancel| {
-                let number = worker_collections.fetch_add(1, Ordering::SeqCst) + 1;
-                if number == 1 {
-                    first_started.send(()).unwrap();
-                    while !cancel.is_cancelled() {
-                        thread::yield_now();
+        for round in 0..50 {
+            let collections = Arc::new(AtomicUsize::new(0));
+            let worker_collections = Arc::clone(&collections);
+            let release_first = Arc::new((Mutex::new(false), Condvar::new()));
+            let worker_release = Arc::clone(&release_first);
+            let (first_started, first_started_rx) = std::sync::mpsc::sync_channel(0);
+            let (source, mut events) = LocalAgentEventSource::start_with(
+                move |_| {
+                    let number = worker_collections.fetch_add(1, Ordering::SeqCst) + 1;
+                    if number == 1 {
+                        first_started.send(()).unwrap();
+                        let (released, wake) = &*worker_release;
+                        let mut released = released.lock().unwrap();
+                        while !*released {
+                            released = wake.wait(released).unwrap();
+                        }
                     }
-                }
-                AgentEvent {
-                    summary: format!("collection {number}"),
-                    health: Health::Ready,
-                    snapshot: None,
-                }
-            },
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        first_started_rx
-            .recv_timeout(Duration::from_secs(1))
+                    AgentEvent {
+                        summary: format!("collection {number}"),
+                        health: Health::Ready,
+                        snapshot: None,
+                    }
+                },
+                Duration::from_secs(60),
+            )
             .unwrap();
-        for _ in 0..100 {
-            source.request_refresh().unwrap();
+            first_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            for _ in 0..100 {
+                source.request_refresh().unwrap();
+            }
+            {
+                let (released, wake) = &*release_first;
+                *released.lock().unwrap() = true;
+                wake.notify_one();
+            }
+            let published = events.blocking_recv().unwrap();
+            assert_eq!(published.summary, "collection 2", "stress round {round}");
+            assert!(matches!(
+                events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            thread::sleep(Duration::from_millis(1));
+            assert_eq!(
+                collections.load(Ordering::SeqCst),
+                2,
+                "stress round {round}"
+            );
+            drop(source);
         }
-        let published = events.blocking_recv().unwrap();
-        assert_eq!(published.summary, "collection 2");
-        assert!(matches!(
-            events.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        assert_eq!(collections.load(Ordering::SeqCst), 2);
-        drop(source);
     }
 
     #[test]
-    fn drop_cancels_active_collection_joins_worker_and_allows_no_post_exit_calls() {
+    fn drop_cancels_blocked_preflight_with_bounded_join_and_no_post_exit_calls() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2712,13 +2736,18 @@ mod tests {
             move |cancel| {
                 worker_calls.fetch_add(1, Ordering::SeqCst);
                 started.send(()).unwrap();
-                while !cancel.is_cancelled() {
-                    thread::yield_now();
-                }
-                thread::sleep(Duration::from_millis(20));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = runtime.block_on(
+                    cancel
+                        .run(async { std::future::pending::<Result<(), InventoryError>>().await }),
+                );
+                assert!(matches!(result, Err(InventoryError::Cancelled)));
                 worker_finished.store(true, Ordering::SeqCst);
                 AgentEvent {
-                    summary: "cancelled collection".into(),
+                    summary: "cancelled blocked preflight".into(),
                     health: Health::Ready,
                     snapshot: None,
                 }
@@ -2727,7 +2756,13 @@ mod tests {
         )
         .unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started_drop = Instant::now();
         drop(source);
+        assert!(
+            started_drop.elapsed() < Duration::from_millis(250),
+            "quit waited {:?} for a cancelled preflight",
+            started_drop.elapsed()
+        );
         assert!(
             finished.load(Ordering::SeqCst),
             "Drop returned before worker exit"
