@@ -3361,14 +3361,17 @@ impl ServiceOperations {
             });
         }
 
-        let mut arguments = record.arguments.clone();
         #[cfg(windows)]
-        {
+        let arguments = {
+            let mut arguments = record.arguments.clone();
             arguments.retain(|argument| argument != WINDOWS_SCM_HOST_ARGUMENT);
             if to == StartMode::Boot {
                 arguments.push(WINDOWS_SCM_HOST_ARGUMENT.to_string());
             }
-        }
+            arguments
+        };
+        #[cfg(not(windows))]
+        let arguments = record.arguments.clone();
         let plan = InstallPlan::unchecked(
             self.identity.clone(),
             to,
