@@ -6,8 +6,14 @@ fixture inputs absent it prints one `SKIP` line and succeeds.
 
 The suite deliberately does not pretend that a subprocess can reboot its host,
 isolate the host network, or create a second physical machine. The native host
-controller performs those operations and supplies its evidence directory with
-`RUNNER_MANAGER_E2E_EVIDENCE_DIR` (default: `.e2e-evidence/<os>`).
+controller performs those operations. CI imports only a complete controller
+journal through `bash tests/host-controller.sh prepare`; when the four GitHub
+fixture inputs exist, a missing journal is a failure rather than a skip.
+After the native commands finish, the controller runs
+`cargo run -p runner-manager-e2e --example e2e-host-controller -- sign DIR`.
+It HMAC-SHA-256 authenticates every scenario and rollback journal with the
+product fixture credential. The validator verifies the tag before decoding any
+facts, so copied, edited, or fabricated JSON cannot pass.
 
 The directory contains these schema-1 JSON records:
 
@@ -21,22 +27,37 @@ The directory contains these schema-1 JSON records:
 - `two_host_contention.json`
 - `rollback.json`
 
-Each scenario record names its scenario, OS and scope, includes non-empty
-`observed_evidence`, and records the three mandatory post-conditions:
-`registered_runners_after: 0`, `runtime_directories_after: 0`, and
-`legacy_label_reused: false`. The rollback record separately proves label
-restore, drain, terminal attempts, and legacy re-enable in that order.
+Each scenario record is a deny-unknown-fields typed causal journal stamped
+`runner-manager-e2e-host-controller/v1`. Scenario-specific facts include real
+run/job/runner/attempt identifiers and ordered timestamps. Every record also
+contains independent GitHub and local observations: registered runner IDs,
+legacy-label runner IDs, and runtime-directory paths must all be empty. The
+validator rejects mismatched fact variants, impossible ordering, fabricated
+controller names, wrong targets, and incomplete postconditions.
 
-`security/` contains schema-1 JSON evidence for `two_job_contamination`,
-`runner_package_integrity`, `revoked_token_rejection`, `workspace_removal`, and
-`restart_duplicate_poll`. Every record names its gate and OS, contains
-non-empty `observed_evidence`, and records the exact
-`control_removed_failure` observed during the deliberate mutation. It also
-contains `jit-marker.txt`,
+The rollback journal records four successful, non-overlapping timestamped
+commands against the fixture target in this exact order: restore label, drain,
+verify terminal, re-enable legacy. Its independent final observations must see
+one legacy runner, no managed runner, and no runtime directory.
+
+Security gates are not accepted from prose files. The suite executes exact
+repository negative-control tests for two-job contamination, checksum mismatch
+and absent checksum, revoked-token state/remediation/no-start behavior,
+successful and failed workspace cleanup, duplicate queued polling, and native
+OS process-list inspection. A receipt is valid only when the expected package
+and exact test filter ran successfully and matched one test.
+
+`security/` contains `jit-marker.txt`,
 `secret-scan-root/` (logs, database, snapshots, crash reports and CLI output),
-and `config-and-sqlite/`. The suite scans those artifacts with the real product
-token and JIT marker, and includes mutation checks showing the scanners reject
-deliberately injected values.
+and `config-and-sqlite/`. All five artifact categories, every evidence field,
+command output, and the completed report are scanned with the real product
+token and JIT marker before serialization or printing. The platform canonical
+redactor must also leave the report unchanged; deliberate exact-value and
+credential-shaped leaks prove both controls fail closed.
+
+CI sets `RUNNER_MANAGER_E2E_EVIDENCE_DIR` and
+`RUNNER_MANAGER_E2E_DATA_DIR`, runs the suite, finalizes the report through the
+same repository command, and uploads `e2e-report-<os>` for 30 days.
 
 The product token is used only to drive and inspect runner-manager. The fixture
 token is used only by the controller to edit/dispatch the disposable workflow
