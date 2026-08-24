@@ -106,6 +106,12 @@ use crate::paths::AppPaths;
 
 /// The product's own service name, on every platform that wants a short one.
 pub const SERVICE_NAME: &str = "runner-manager";
+/// Hidden CLI marker carried only by Windows boot-service registrations.
+///
+/// Application-data arguments are shared by every service manager and cannot
+/// distinguish SCM from Task Scheduler. This marker is the durable routing
+/// contract between the Windows installer and the shipping binary.
+pub const WINDOWS_SCM_HOST_ARGUMENT: &str = "--windows-service-host";
 
 /// What an operator sees in `services.msc`, `launchctl list`, or
 /// `systemctl status`.
@@ -3355,13 +3361,24 @@ impl ServiceOperations {
             });
         }
 
+        #[cfg(windows)]
+        let arguments = {
+            let mut arguments = record.arguments.clone();
+            arguments.retain(|argument| argument != WINDOWS_SCM_HOST_ARGUMENT);
+            if to == StartMode::Boot {
+                arguments.push(WINDOWS_SCM_HOST_ARGUMENT.to_string());
+            }
+            arguments
+        };
+        #[cfg(not(windows))]
+        let arguments = record.arguments.clone();
         let plan = InstallPlan::unchecked(
             self.identity.clone(),
             to,
             record.binary.clone(),
             record.directories.clone(),
         )
-        .with_arguments(record.arguments.clone())
+        .with_arguments(arguments)
         .with_restart(record.restart());
         let plan = if record.starts_on_demand {
             plan.started_on_demand()
@@ -4224,6 +4241,178 @@ fn enable_launchd_registration(
 // ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
+
+/// A stop request delivered by the Windows Service Control Manager.
+///
+/// The application owns the drain policy; this platform boundary only turns
+/// `SERVICE_CONTROL_STOP`/`SHUTDOWN` into an awaitable notification.
+#[derive(Debug)]
+pub struct ServiceShutdown(tokio::sync::watch::Receiver<bool>);
+
+impl ServiceShutdown {
+    /// Waits until SCM asks the service to stop or shut down.
+    pub async fn wait(mut self) {
+        if !*self.0.borrow() {
+            let _ = self.0.changed().await;
+        }
+    }
+}
+
+/// Runs the production process as a real Windows service host.
+///
+/// `StartServiceCtrlDispatcher` must run in the service process's main thread,
+/// so the callback is handed through a process-global slot to the entrypoint
+/// invoked by SCM. The slot is single-use by design: one process hosts exactly
+/// one own-process service.
+#[cfg(windows)]
+pub fn run_windows_service_host<F>(run: F) -> Result<u8, ServiceError>
+where
+    F: FnOnce(ServiceShutdown) -> u8 + Send + 'static,
+{
+    windows_host::run(Box::new(run))
+}
+
+#[cfg(windows)]
+mod windows_host {
+    use std::ffi::OsString;
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::time::Duration;
+
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{
+        self, ServiceControlHandlerResult, ServiceStatusHandle,
+    };
+
+    use super::{SERVICE_NAME, ServiceError, ServiceShutdown};
+
+    type Runner = Box<dyn FnOnce(ServiceShutdown) -> u8 + Send>;
+
+    struct Invocation {
+        run: Runner,
+        result: mpsc::SyncSender<Result<u8, String>>,
+    }
+
+    static INVOCATION: OnceLock<Mutex<Option<Invocation>>> = OnceLock::new();
+
+    windows_service::define_windows_service!(ffi_service_main, service_main);
+
+    pub(super) fn run(run: Runner) -> Result<u8, ServiceError> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let slot = INVOCATION.get_or_init(|| Mutex::new(None));
+        let mut invocation = slot
+            .lock()
+            .map_err(|_| host_error("prepare", "the service-host slot is poisoned"))?;
+        if invocation.is_some() {
+            return Err(host_error(
+                "prepare",
+                "the service-host slot was already used",
+            ));
+        }
+        *invocation = Some(Invocation {
+            run,
+            result: result_tx,
+        });
+        drop(invocation);
+
+        windows_service::service_dispatcher::start("", ffi_service_main)
+            .map_err(|error| host_error("connect", &error.to_string()))?;
+        result_rx
+            .recv()
+            .map_err(|error| host_error("finish", &error.to_string()))?
+            .map_err(|detail| host_error("run", &detail))
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        let Some(invocation) = INVOCATION.get().and_then(|slot| slot.lock().ok()?.take()) else {
+            return;
+        };
+        let result = run_service(invocation.run);
+        let _ = invocation.result.send(result);
+    }
+
+    fn run_service(run: Runner) -> Result<u8, String> {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let status: Arc<Mutex<Option<ServiceStatusHandle>>> = Arc::new(Mutex::new(None));
+        let handler_status = Arc::clone(&status);
+        let handler = move |control| match control {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                if let Some(handle) = handler_status.lock().ok().and_then(|guard| *guard) {
+                    let _ = handle.set_service_status(service_status(
+                        ServiceState::StopPending,
+                        ServiceControlAccept::empty(),
+                        1,
+                        Duration::from_secs(300),
+                        0,
+                    ));
+                }
+                let _ = stop_tx.send(true);
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        };
+        let handle = service_control_handler::register("", handler)
+            .map_err(|error| format!("cannot register the service control handler: {error}"))?;
+        *status
+            .lock()
+            .map_err(|_| "the service status handle is poisoned".to_string())? = Some(handle);
+        handle
+            .set_service_status(service_status(
+                ServiceState::Running,
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                0,
+                Duration::default(),
+                0,
+            ))
+            .map_err(|error| format!("cannot report SERVICE_RUNNING: {error}"))?;
+
+        let exit = run(ServiceShutdown(stop_rx));
+        handle
+            .set_service_status(service_status(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                0,
+                Duration::default(),
+                u32::from(exit),
+            ))
+            .map_err(|error| format!("cannot report SERVICE_STOPPED: {error}"))?;
+        Ok(exit)
+    }
+
+    fn service_status(
+        state: ServiceState,
+        accepted: ServiceControlAccept,
+        checkpoint: u32,
+        wait_hint: Duration,
+        exit: u32,
+    ) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accepted,
+            exit_code: if exit == 0 {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(exit)
+            },
+            checkpoint,
+            wait_hint,
+            process_id: None,
+        }
+    }
+
+    fn host_error(operation: &'static str, detail: &str) -> ServiceError {
+        ServiceError::Control {
+            operation,
+            name: SERVICE_NAME.to_string(),
+            manager: "the Windows Service Control Manager",
+            detail: detail.to_string(),
+        }
+    }
+}
 
 #[cfg(windows)]
 mod sys {

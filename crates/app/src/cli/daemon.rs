@@ -41,16 +41,21 @@ pub fn dispatch(
     context: &Context,
     command: &DaemonCommand,
     out: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
     match command {
         DaemonCommand::Run(_) => {
             let runtime = super::runtime()?;
-            runtime.block_on(run(context, out))
+            runtime.block_on(run(context, out, service_shutdown))
         }
     }
 }
 
-async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+async fn run(
+    context: &Context,
+    out: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+) -> Result<(), CliError> {
     let _instance = acquire_instance(context)?;
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
@@ -63,7 +68,9 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     // behaves as a real daemon, but it neither demands a credential nor opens a
     // network connection while waiting to be configured or stopped.
     if targets.is_empty() {
-        shutdown_signal().await.map_err(signal_failure)?;
+        wait_for_shutdown(service_shutdown)
+            .await
+            .map_err(signal_failure)?;
         writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
         return Ok(());
     }
@@ -207,7 +214,7 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     }
 
     let early = tokio::select! {
-        signal = shutdown_signal() => {
+        signal = wait_for_shutdown(service_shutdown) => {
             signal.map_err(signal_failure)?;
             None
         }
@@ -237,6 +244,18 @@ async fn run(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(())
+}
+
+async fn wait_for_shutdown(
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+) -> std::io::Result<()> {
+    match service_shutdown {
+        Some(shutdown) => {
+            shutdown.wait().await;
+            Ok(())
+        }
+        None => shutdown_signal().await,
+    }
 }
 
 /// Gives one lifecycle launcher a target-scoped journal only while it performs

@@ -195,7 +195,9 @@ jobs:
       # So the example is built by name, here, before the tests run.
       # `privileged_tests_are_wired_into_ci.rs` asserts this step still exists.
       - name: Build the fixture service host the restart measurement starts
-        run: cargo build -p runner-manager-platform --example service_host_fixture
+        run: |
+          cargo build -p runner-manager-platform --example service_host_fixture
+          cargo build -p runner-manager
 
       # `--test-threads=1` because these contend for one machine's service
       # database, and because the restart measurement times an interval that a
