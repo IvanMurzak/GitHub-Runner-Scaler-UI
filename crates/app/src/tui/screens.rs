@@ -2,7 +2,7 @@
 
 #![allow(
     dead_code,
-    reason = "g1 owns shell wiring; g2 exposes the complete presentation seam consumed at composition"
+    reason = "the agent inventory gateway populates the complete screen vocabulary through AppState"
 )]
 
 //! Pure presentation model for the four read-only TUI screens.
@@ -21,6 +21,7 @@ use ratatui::{
 };
 
 pub const QUEUE_CANCELLATION_WARNING: &str = "GitHub cancels queued jobs after 24 hours.";
+const TABLE_VIEWPORT_ROWS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadOnlyScreen {
@@ -246,6 +247,7 @@ pub enum ScreenAction {
     SetSort(SortOrder),
     SetFocus(TableFocus),
     Activate,
+    CloseRepositoryDetail,
     OpenRepositoryByMouse(String),
     Refresh(Snapshot),
 }
@@ -292,6 +294,7 @@ impl ScreenModel {
                     self.repository_detail = self.repositories.selected_id.clone()
                 }
             }
+            ScreenAction::CloseRepositoryDetail => self.repository_detail = None,
             ScreenAction::OpenRepositoryByMouse(id) => {
                 if self.snapshot.repositories.iter().any(|row| row.id == id) {
                     self.repositories.selected_id = Some(id.clone());
@@ -388,6 +391,12 @@ impl ScreenModel {
             .collect();
         rows.sort_by(|a, b| repository_cmp(a, b, self.repositories.sort_order));
         rows.into_iter().map(|row| row.id.clone()).collect()
+    }
+
+    pub fn repository_id_at_viewport_offset(&self, offset: usize) -> Option<String> {
+        self.visible_repository_ids()
+            .get(self.repositories.scroll.saturating_add(offset))
+            .cloned()
     }
     fn visible_runner_ids(&self) -> Vec<String> {
         let mut rows: Vec<_> = self
@@ -529,17 +538,17 @@ fn state_panel(title: &str, message: &str, action: &str) -> String {
     format!("{title}\n{message}\n{action}")
 }
 fn render_ready(model: &ScreenModel) -> String {
-    let empty = match model.screen {
+    let globally_empty = match model.screen {
         ReadOnlyScreen::Dashboard => {
             model.snapshot.repositories.is_empty()
                 && model.snapshot.runners.is_empty()
                 && model.snapshot.metrics == DashboardMetrics::default()
         }
-        ReadOnlyScreen::Repositories => model.visible_repository_ids().is_empty(),
-        ReadOnlyScreen::Runners => model.visible_runner_ids().is_empty(),
-        ReadOnlyScreen::Activity => model.visible_activity_ids().is_empty(),
+        ReadOnlyScreen::Repositories => model.snapshot.repositories.is_empty(),
+        ReadOnlyScreen::Runners => model.snapshot.runners.is_empty(),
+        ReadOnlyScreen::Activity => model.snapshot.activity.is_empty(),
     };
-    if empty {
+    if globally_empty {
         return match model.screen {
             ReadOnlyScreen::Dashboard | ReadOnlyScreen::Repositories => state_panel(
                 "EMPTY",
@@ -557,6 +566,19 @@ fn render_ready(model: &ScreenModel) -> String {
                 "Action: F5 refresh",
             ),
         };
+    }
+    let no_matches = match model.screen {
+        ReadOnlyScreen::Dashboard => false,
+        ReadOnlyScreen::Repositories => model.visible_repository_ids().is_empty(),
+        ReadOnlyScreen::Runners => model.visible_runner_ids().is_empty(),
+        ReadOnlyScreen::Activity => model.visible_activity_ids().is_empty(),
+    };
+    if no_matches {
+        return state_panel(
+            "NO MATCHES",
+            "Rows exist, but none match the current filter.",
+            "Action: Esc clears the filter",
+        );
     }
     match model.screen {
         ReadOnlyScreen::Dashboard => render_dashboard(model),
@@ -584,6 +606,7 @@ fn render_dashboard(model: &ScreenModel) -> String {
         &["Repository", "Workflows", "Mode", "Capacity", "Health"],
         &repository_rows(model),
         model.repositories.selected_id.as_deref(),
+        0,
     ));
     output.join("\n")
 }
@@ -615,6 +638,23 @@ fn repository_rows(model: &ScreenModel) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 fn render_repositories(model: &ScreenModel) -> String {
+    if let Some(detail_id) = model.repository_detail.as_deref()
+        && let Some(row) = model
+            .snapshot
+            .repositories
+            .iter()
+            .find(|row| row.id == detail_id)
+    {
+        return format!(
+            "REPOSITORY DETAIL\nTarget: {}\nIn-progress workflows: {}\nPolicy: {}\nMax capacity: {}\nAgent health: {}\nAction: Esc returns to the repository list",
+            row.target,
+            row.in_progress_workflows,
+            row.mode.marker(),
+            row.max_capacity
+                .map_or_else(|| "n/a".into(), |capacity| capacity.to_string()),
+            row.health.marker(),
+        );
+    }
     format!(
         "Filter: {} | Sort: {:?} | Focus: {:?} | Scroll: {}\n{}",
         visible_filter(&model.repositories.filter),
@@ -624,7 +664,8 @@ fn render_repositories(model: &ScreenModel) -> String {
         render_table(
             &["Repository", "Workflows", "Mode", "Max", "Agent"],
             &repository_rows(model),
-            model.repositories.selected_id.as_deref()
+            model.repositories.selected_id.as_deref(),
+            model.repositories.scroll,
         )
     )
 }
@@ -671,7 +712,8 @@ fn render_runners(model: &ScreenModel) -> String {
         render_table(
             &["Runner", "Owner", "Ownership", "OS", "Labels", "State"],
             &rows,
-            model.runners.selected_id.as_deref()
+            model.runners.selected_id.as_deref(),
+            model.runners.scroll,
         )
     )
 }
@@ -703,7 +745,8 @@ fn render_activity(model: &ScreenModel) -> String {
         render_table(
             &["When", "Outcome", "Summary", "Remediation"],
             &rows,
-            model.activity.selected_id.as_deref()
+            model.activity.selected_id.as_deref(),
+            model.activity.scroll,
         )
     )
 }
@@ -717,6 +760,7 @@ fn render_table(
     headers: &[&str],
     rows: &[(String, Vec<String>)],
     selected_id: Option<&str>,
+    scroll: usize,
 ) -> String {
     let mut output = headers.join(" | ");
     output.push('\n');
@@ -727,7 +771,8 @@ fn render_table(
             .collect::<Vec<_>>()
             .join("-+-"),
     );
-    for (id, cells) in rows {
+    let viewport_start = scroll.min(rows.len().saturating_sub(1));
+    for (id, cells) in rows.iter().skip(viewport_start).take(TABLE_VIEWPORT_ROWS) {
         output.push('\n');
         output.push_str(if selected_id == Some(id.as_str()) {
             "> "
@@ -741,25 +786,13 @@ fn render_table(
 
 /// Defensive final boundary for persisted diagnostics.
 pub fn copy_safe(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|word| {
-            let lower = word.to_ascii_lowercase();
-            if lower.starts_with("ghu_")
-                || lower.starts_with("ghp_")
-                || lower.starts_with("github_pat_")
-                || lower.starts_with("token=")
-                || lower.starts_with("authorization:")
-                || lower.starts_with("jitconfig=")
-                || lower.starts_with("--jitconfig=")
-            {
-                "[REDACTED]"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    // The shared scrubber understands credential-bearing keys, while command
+    // line diagnostics can prefix the same key with `--`. Remove only that
+    // syntactic decoration before applying the canonical shape rules.
+    let normalized = value
+        .replace("--jitconfig=", "jitconfig=")
+        .replace("--jit-config=", "jit_config=");
+    runner_manager_platform::logging::redact(&normalized)
 }
 
 #[cfg(test)]
@@ -1075,7 +1108,88 @@ mod tests {
         let rendered = render_text(&model);
         assert!(!rendered.contains(secret));
         assert!(!rendered.contains("encoded-secret"));
-        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains(runner_manager_platform::logging::REDACTION));
+    }
+
+    #[test]
+    fn copy_safe_reuses_the_shape_aware_redactor_for_adversarial_diagnostics() {
+        let jit =
+            "eyJlbmNvZGVkX2ppdF9jb25maWciOiJ0aGlzLWlzLWEtbGl2ZS1zaG9ydC1saXZlZC1jcmVkZW50aWFsIn0=";
+        let credentials = [
+            "gho_1234567890abcdefghijklmnopqrstuvwxyz",
+            "ghs_1234567890abcdefghijklmnopqrstuvwxyz",
+            "ghr_1234567890abcdefghijklmnopqrstuvwxyz",
+            "gh_1234567890abcdefghijklmnopqrstuvwxyz",
+            "ghu_1234567890abcdefghijklmnopqrstuvwxyz",
+            jit,
+        ];
+        let corpus = [
+            format!("embedded credential={}", credentials[4]),
+            format!(
+                "https://x-access-token:{}@github.com/acme/repo",
+                credentials[0]
+            ),
+            format!("https://github.com/api?token={}", credentials[1]),
+            format!("retry body={{\"encoded_jit_config\":\"{jit}\"}}"),
+            format!(
+                "families {} {} {}",
+                credentials[2], credentials[3], credentials[4]
+            ),
+        ];
+        for diagnostic in corpus {
+            let safe = copy_safe(&diagnostic);
+            for credential in credentials {
+                assert!(
+                    !safe.contains(credential),
+                    "credential survived {diagnostic:?} as {safe:?}"
+                );
+            }
+            assert!(safe.contains(runner_manager_platform::logging::REDACTION));
+        }
+    }
+
+    #[test]
+    fn repository_detail_is_a_visible_rendered_path() {
+        let mut model = ScreenModel::new(populated());
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::Activate);
+        let rendered = render_text(&model);
+        assert!(rendered.contains("REPOSITORY DETAIL"), "{rendered}");
+        assert!(rendered.contains("Target: acme/alpha"), "{rendered}");
+        assert!(rendered.contains("Policy: [autoscale]"), "{rendered}");
+        assert!(!rendered.contains("acme/observe"), "{rendered}");
+    }
+
+    #[test]
+    fn tables_render_only_the_selected_viewport_and_filters_distinguish_no_matches() {
+        let mut snapshot = populated();
+        snapshot.repositories = (0..20)
+            .map(|index| RepositoryRow {
+                id: format!("repo-{index:02}"),
+                target: format!("acme/repository-{index:02}"),
+                in_progress_workflows: index,
+                mode: PolicyMode::Autoscale,
+                max_capacity: Some(2),
+                health: AgentHealth::Healthy,
+            })
+            .collect();
+        let mut model = ScreenModel::new(snapshot);
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::MoveSelection(10));
+        let rendered = render_text(&model);
+        assert!(rendered.contains("> acme/repository-10"), "{rendered}");
+        assert!(rendered.contains("acme/repository-17"), "{rendered}");
+        assert!(!rendered.contains("acme/repository-09"), "{rendered}");
+        assert!(!rendered.contains("acme/repository-18"), "{rendered}");
+
+        model.apply(ScreenAction::Filter("does-not-exist".into()));
+        let no_matches = render_text(&model);
+        assert!(no_matches.starts_with("NO MATCHES\n"), "{no_matches}");
+        assert!(no_matches.contains("Esc clears the filter"), "{no_matches}");
+        assert!(
+            !no_matches.contains("No authorized targets"),
+            "{no_matches}"
+        );
     }
 
     #[test]

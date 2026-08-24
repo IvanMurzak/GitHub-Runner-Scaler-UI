@@ -27,6 +27,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
+use super::screens::{self, ReadOnlyScreen, ScreenAction, ScreenModel, Snapshot};
+
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const TICK_RATE: Duration = Duration::from_millis(250);
@@ -159,6 +161,10 @@ impl PresentationState {
 pub struct AgentEvent {
     pub summary: String,
     pub health: Health,
+    /// A fully collected GitHub inventory snapshot when the embedding agent
+    /// has one. The standalone local journal reader supplies `None`; it never
+    /// invents GitHub workload counts from local attempt counts.
+    pub snapshot: Option<Snapshot>,
 }
 
 /// Polls the durable lifecycle/status view written by the already-running
@@ -222,10 +228,12 @@ fn local_agent_event(context: &crate::cli::Context) -> AgentEvent {
             } else {
                 Health::Ready
             },
+            snapshot: None,
         },
         Err(error) => AgentEvent {
             summary: format!("Local agent journal could not be read: {error}"),
             health: Health::Error,
+            snapshot: None,
         },
     }
 }
@@ -349,6 +357,7 @@ pub struct AppState {
     pub screen: Screen,
     pub focus: Focus,
     pub presentation: PresentationState,
+    pub screen_model: ScreenModel,
     pub size: Rect,
     pub help_open: bool,
     pub filtering: bool,
@@ -367,6 +376,7 @@ impl AppState {
             screen: Screen::Dashboard,
             focus: Focus::Content,
             presentation,
+            screen_model: ScreenModel::new(Snapshot::default()),
             size: Rect::new(0, 0, width, height),
             help_open: false,
             filtering: false,
@@ -382,6 +392,23 @@ impl AppState {
 
     fn relayout(&mut self) {
         self.navigation = NavigationLayout::for_area(navigation_area(self.size));
+    }
+
+    fn open_screen(&mut self, screen: Screen) {
+        self.screen = screen;
+        if let Some(read_only) = read_only_screen(screen) {
+            self.screen_model.apply(ScreenAction::Open(read_only));
+        }
+    }
+}
+
+const fn read_only_screen(screen: Screen) -> Option<ReadOnlyScreen> {
+    match screen {
+        Screen::Dashboard => Some(ReadOnlyScreen::Dashboard),
+        Screen::Repositories => Some(ReadOnlyScreen::Repositories),
+        Screen::Runners => Some(ReadOnlyScreen::Runners),
+        Screen::Activity => Some(ReadOnlyScreen::Activity),
+        Screen::RepositorySettings | Screen::HostSettings => None,
     }
 }
 
@@ -400,6 +427,9 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         AppEvent::Paste(text) => {
             if state.filtering {
                 state.filter.push_str(&state.presentation.redact(&text));
+                state
+                    .screen_model
+                    .apply(ScreenAction::Filter(state.filter.clone()));
             }
             Vec::new()
         }
@@ -420,6 +450,9 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             state.presentation.health = agent.health;
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
+            if let Some(snapshot) = agent.snapshot {
+                state.screen_model.apply(ScreenAction::Refresh(snapshot));
+            }
             Vec::new()
         }
         AppEvent::InputFailed(message) => {
@@ -437,12 +470,23 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
 fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     if state.filtering {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
+                state.filtering = false;
+                state.filter.clear();
+                state
+                    .screen_model
+                    .apply(ScreenAction::Filter(String::new()));
+                return Vec::new();
+            }
+            KeyCode::Enter => {
                 state.filtering = false;
                 return Vec::new();
             }
             KeyCode::Backspace => {
                 state.filter.pop();
+                state
+                    .screen_model
+                    .apply(ScreenAction::Filter(state.filter.clone()));
                 return Vec::new();
             }
             KeyCode::Char(character)
@@ -451,6 +495,9 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 state.filter.push(character);
+                state
+                    .screen_model
+                    .apply(ScreenAction::Filter(state.filter.clone()));
                 return Vec::new();
             }
             _ => {}
@@ -458,17 +505,24 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
 
     match key.code {
-        KeyCode::Char('d') => state.screen = Screen::Dashboard,
-        KeyCode::Char('r') => state.screen = Screen::Repositories,
-        KeyCode::Char('n') => state.screen = Screen::Runners,
-        KeyCode::Char('s') => state.screen = Screen::RepositorySettings,
-        KeyCode::Char('h') => state.screen = Screen::HostSettings,
-        KeyCode::Char('a') => state.screen = Screen::Activity,
+        KeyCode::Char('d') => state.open_screen(Screen::Dashboard),
+        KeyCode::Char('r') => state.open_screen(Screen::Repositories),
+        KeyCode::Char('n') => state.open_screen(Screen::Runners),
+        KeyCode::Char('s') => state.open_screen(Screen::RepositorySettings),
+        KeyCode::Char('h') => state.open_screen(Screen::HostSettings),
+        KeyCode::Char('a') => state.open_screen(Screen::Activity),
         KeyCode::Char('/') => state.filtering = true,
         KeyCode::F(5) => return vec![Effect::Refresh],
         KeyCode::Char('?') => state.help_open = !state.help_open,
         KeyCode::Char('q') => state.should_exit = true,
-        KeyCode::Char('c') => return vec![Effect::Copy(state.presentation.copy_text())],
+        KeyCode::Char('c') => {
+            let copy = if read_only_screen(state.screen) == Some(ReadOnlyScreen::Activity) {
+                screens::render_text(&state.screen_model)
+            } else {
+                state.presentation.copy_text()
+            };
+            return vec![Effect::Copy(copy)];
+        }
         KeyCode::Char('m') => {
             state.mouse_capture = !state.mouse_capture;
             return vec![Effect::SetMouseCapture(state.mouse_capture)];
@@ -476,8 +530,18 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Esc => {
             if state.help_open {
                 state.help_open = false;
+            } else if state.screen_model.repository_detail.is_some() {
+                state
+                    .screen_model
+                    .apply(ScreenAction::CloseRepositoryDetail);
+            } else if state.filtering || !state.filter.is_empty() {
+                state.filtering = false;
+                state.filter.clear();
+                state
+                    .screen_model
+                    .apply(ScreenAction::Filter(String::new()));
             } else if state.screen != Screen::Dashboard {
-                state.screen = Screen::Dashboard;
+                state.open_screen(Screen::Dashboard);
             }
         }
         KeyCode::Tab => {
@@ -485,9 +549,24 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 .focus
                 .next(key.modifiers.contains(KeyModifiers::SHIFT))
         }
+        KeyCode::Up
+            if state.focus == Focus::Content && read_only_screen(state.screen).is_some() =>
+        {
+            state.screen_model.apply(ScreenAction::MoveSelection(-1));
+        }
+        KeyCode::Down
+            if state.focus == Focus::Content && read_only_screen(state.screen).is_some() =>
+        {
+            state.screen_model.apply(ScreenAction::MoveSelection(1));
+        }
         KeyCode::BackTab | KeyCode::Up | KeyCode::Left => state.focus = state.focus.next(true),
         KeyCode::Down | KeyCode::Right => state.focus = state.focus.next(false),
-        KeyCode::Enter => return vec![Effect::ActivateFocusedControl],
+        KeyCode::Enter => {
+            if state.focus == Focus::Content && read_only_screen(state.screen).is_some() {
+                state.screen_model.apply(ScreenAction::Activate);
+            }
+            return vec![Effect::ActivateFocusedControl];
+        }
         _ => {}
     }
     Vec::new()
@@ -497,10 +576,25 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(screen) = state.navigation.hit(mouse.column, mouse.row) {
-                state.screen = screen;
+                state.open_screen(screen);
                 state.focus = Focus::Navigation;
             } else {
                 state.focus = Focus::Content;
+                if state.screen == Screen::Repositories {
+                    let content_first_row = 6;
+                    if mouse.row >= content_first_row
+                        && let Some(id) =
+                            state
+                                .screen_model
+                                .repository_id_at_viewport_offset(usize::from(
+                                    mouse.row - content_first_row,
+                                ))
+                    {
+                        state
+                            .screen_model
+                            .apply(ScreenAction::OpenRepositoryByMouse(id));
+                    }
+                }
             }
         }
         MouseEventKind::ScrollUp => state.focus = state.focus.next(true),
@@ -552,45 +646,51 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         frame.render_widget(Paragraph::new(item.label.as_str()).style(style), item.area);
     }
 
-    let content = if compact {
-        let filter = if state.filtering {
-            format!("\nFilter: {}", state.presentation.redact(&state.filter))
-        } else {
-            String::new()
-        };
-        format!(
-            "{}\n{}{}\n\nCompact layout active. Press ? for every control.",
-            state.screen.title(),
-            state.presentation.redact(&state.presentation.heading),
-            filter
-        )
+    if let Some(read_only) = read_only_screen(state.screen) {
+        let mut model = state.screen_model.clone();
+        model.apply(ScreenAction::Open(read_only));
+        screens::render(frame, rows[2], &model);
     } else {
-        let source = if state.screen == Screen::Activity {
-            &state.presentation.diagnostics
-        } else {
-            &state.presentation.body
-        };
-        let mut lines = vec![Line::from(Span::styled(
-            state.presentation.redact(&state.presentation.heading),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))];
-        lines.extend(
-            source
-                .iter()
-                .map(|line| Line::from(state.presentation.redact(line))),
-        );
-        Text::from(lines).to_string()
-    };
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(
-                Block::default()
-                    .title(state.screen.title())
-                    .borders(Borders::ALL),
+        let content = if compact {
+            let filter = if state.filtering {
+                format!("\nFilter: {}", state.presentation.redact(&state.filter))
+            } else {
+                String::new()
+            };
+            format!(
+                "{}\n{}{}\n\nCompact layout active. Press ? for every control.",
+                state.screen.title(),
+                state.presentation.redact(&state.presentation.heading),
+                filter
             )
-            .wrap(Wrap { trim: false }),
-        rows[2],
-    );
+        } else {
+            let source = if state.screen == Screen::Activity {
+                &state.presentation.diagnostics
+            } else {
+                &state.presentation.body
+            };
+            let mut lines = vec![Line::from(Span::styled(
+                state.presentation.redact(&state.presentation.heading),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            lines.extend(
+                source
+                    .iter()
+                    .map(|line| Line::from(state.presentation.redact(line))),
+            );
+            Text::from(lines).to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(content)
+                .block(
+                    Block::default()
+                        .title(state.screen.title())
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    }
     let capture = if state.mouse_capture {
         "mouse:on"
     } else {
@@ -1077,6 +1177,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "runner busy".to_owned(),
                 health: Health::Busy,
+                snapshot: None,
             }),
         );
         assert_eq!(state.presentation.health, Health::Busy);
@@ -1582,38 +1683,87 @@ mod tests {
 
     #[test]
     fn render_boundary_redacts_every_sensitive_value() {
-        let token = "ghu_super_secret_token";
-        let jit = "encoded-jit-config";
-        let state = AppState::new(
-            PresentationState {
-                heading: format!("VISIBLE_HEADING {token} {jit}"),
-                body: vec![
-                    format!("VISIBLE_BODY command --token={token}"),
-                    format!("runner --jit {jit}"),
-                ],
-                diagnostics: vec![format!("VISIBLE_DIAGNOSTIC {token} {jit}")],
-                health: Health::Error,
-                access_token: Some(token.to_owned()),
-                jit_configuration: Some(jit.to_owned()),
-            },
-            120,
-            30,
-        );
+        let token = "ghu_1234567890abcdefghijklmnopqrstuvwxyz";
+        let jit =
+            "eyJlbmNvZGVkX2ppdF9jb25maWciOiJ0aGlzLWlzLWEtbGl2ZS1zaG9ydC1saXZlZC1jcmVkZW50aWFsIn0=";
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.open_screen(Screen::Activity);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: screens::Availability::Ready,
+            activity: vec![screens::ActivityRow {
+                id: "sensitive".into(),
+                occurred_at: "now".into(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: format!("VISIBLE_DIAGNOSTIC credential={token}"),
+                remediation: format!("runner --jitconfig={jit}"),
+            }],
+            ..Snapshot::default()
+        });
+        state.open_screen(Screen::Activity);
         let frame = rendered(120, 30, &state);
         assert!(!frame.contains(token));
         assert!(!frame.contains(jit));
-        assert!(frame.contains(REDACTED));
-        assert!(frame.contains("VISIBLE_HEADING"));
-        assert!(frame.contains("VISIBLE_BODY"));
-        let mut activity = state.clone();
-        activity.screen = Screen::Activity;
-        let activity_frame = rendered(120, 30, &activity);
-        assert!(activity_frame.contains("VISIBLE_DIAGNOSTIC"));
-        assert!(!activity_frame.contains(token) && !activity_frame.contains(jit));
+        assert!(frame.contains(runner_manager_platform::logging::REDACTION));
+        assert!(frame.contains("VISIBLE_DIAGNOSTIC"));
         let Effect::Copy(copy) = &reduce(&mut state.clone(), key(KeyCode::Char('c')))[0] else {
             panic!()
         };
         assert!(!copy.contains(token) && !copy.contains(jit));
+    }
+
+    #[test]
+    fn production_shell_routes_navigation_filter_activation_and_render_to_screen_model() {
+        let snapshot = Snapshot {
+            availability: screens::Availability::Ready,
+            repositories: vec![screens::RepositoryRow {
+                id: "wired-repo".into(),
+                target: "acme/production-wiring".into(),
+                in_progress_workflows: 3,
+                mode: screens::PolicyMode::MonitorOnly,
+                max_capacity: None,
+                health: screens::AgentHealth::Healthy,
+            }],
+            ..Snapshot::default()
+        };
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        reduce(
+            &mut state,
+            AppEvent::Agent(AgentEvent {
+                summary: "GitHub inventory refreshed".into(),
+                health: Health::Ready,
+                snapshot: Some(snapshot),
+            }),
+        );
+
+        reduce(&mut state, key(KeyCode::Char('r')));
+        let list = rendered(120, 30, &state);
+        assert!(list.contains("acme/production-wiring"), "{list}");
+        assert!(list.contains("[monitor-only]"), "{list}");
+
+        reduce(&mut state, key(KeyCode::Char('/')));
+        reduce(&mut state, AppEvent::Paste("production-wiring".to_owned()));
+        assert_eq!(state.screen_model.repositories.filter, "production-wiring");
+        reduce(&mut state, key(KeyCode::Enter));
+        reduce(&mut state, key(KeyCode::Enter));
+        let detail = rendered(120, 30, &state);
+        assert!(detail.contains("REPOSITORY DETAIL"), "{detail}");
+        assert!(
+            detail.contains("Target: acme/production-wiring"),
+            "{detail}"
+        );
+
+        let mut mouse_state = AppState::new(PresentationState::default(), 120, 30);
+        mouse_state.screen_model = state.screen_model.clone();
+        mouse_state
+            .screen_model
+            .apply(ScreenAction::CloseRepositoryDetail);
+        reduce(&mut mouse_state, key(KeyCode::Char('r')));
+        reduce(
+            &mut mouse_state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 6),
+        );
+        let mouse_detail = rendered(120, 30, &mouse_state);
+        assert!(mouse_detail.contains("REPOSITORY DETAIL"), "{mouse_detail}");
     }
 
     #[test]
