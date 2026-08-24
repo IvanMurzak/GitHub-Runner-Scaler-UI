@@ -1,0 +1,52 @@
+tests/examples/e2e-host-controller.rs
+  s_e3f2ebf0732f36::t_9be3757c140410 31-32,40-43,84-92,94-95
+  s_e3f2ebf0732f36::t_630c8d085164e4 155-159
+  s_e3f2ebf0732f36::t_3df9c00f074b52 97
+.github/workflows/e2e.yml
+  s_e3f2ebf0732f36::t_eb00f741fd2dba 201
+crates/agent/src/lifecycle.rs
+  s_e3f2ebf0732f36::t_267847ce57e87e 1318-1328,1482-1497
+  s_e3f2ebf0732f36::t_ed940c48c2d651 1317
+tests/tests/e2e_security_acceptance.rs
+  s_e3f2ebf0732f36::t_9229d07a4e99a6 351,357,364,371,380-381,385-389,391-392,405
+  s_e3f2ebf0732f36::t_4efb636221efcd 352,365,390,393-404
+  s_e3f2ebf0732f36::t_2895c83b04630b 502-503,508,518,536,559,564,1341-1345,1367,1379,1384,1390,1395,1402,1407,1412,1419,1424,1430
+  s_e3f2ebf0732f36::t_7602cdd11b798c 1504-1507,1518-1527,1533
+  s_e3f2ebf0732f36::t_ae681ea6925696 1508-1517
+  s_e3f2ebf0732f36::t_3d67fc62f60fca 343-350,353-356,358-363,366-370,372-379,382-384,406-407
+  s_e3f2ebf0732f36::t_1c196cab4b3a07 342
+crates/domain/Cargo.toml
+  s_e3f2ebf0732f36::t_d19399e4e3cd86 19-20
+  s_e3f2ebf0732f36::t_b99a5cf191dd12 21
+crates/domain/src/policy.rs
+  s_e3f2ebf0732f36::t_4091a6e4bef3aa 1182,1187-1195
+crates/domain/src/capacity.rs
+  s_e3f2ebf0732f36::t_6dfc7efb78cd26 199,207,233,237
+  s_e3f2ebf0732f36::t_4596892566de67 197,200-205,208,234-236,238-239
+  s_e3f2ebf0732f36::t_fbb771b42e819b 206
+tests/host-controller.sh
+  s_e3f2ebf0732f36::t_11efb6e506fc90 128-133,138-146,156
+crates/agent/Cargo.toml
+  s_e3f2ebf0732f36::t_d19399e4e3cd86 19-20
+  s_e3f2ebf0732f36::t_ea988a970ee3c2 21
+crates/agent/src/package.rs
+  s_e3f2ebf0732f36::t_39a52de48d58bb 1328-1331,1458-1464
+tests/README.md
+  s_e3f2ebf0732f36::t_9290512ba95584 9-15,29-34,68-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "e43cdcabdaa7ce15bd4643db13f713a7156f5879",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
