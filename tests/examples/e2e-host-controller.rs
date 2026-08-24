@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
