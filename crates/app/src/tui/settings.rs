@@ -6,13 +6,16 @@
 //! capacity/scale changes are translated into the exact command values used by
 //! the CLI, so validation and persistence cannot drift.
 
-#![allow(
-    dead_code,
-    reason = "the shell integration constructs these forms when an editable screen is active"
-)]
-
 use std::io::Write;
 
+use crossterm::event::KeyCode;
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{
@@ -24,8 +27,10 @@ use runner_manager_platform::service::{ServiceError, ServiceOperations};
 
 use crate::cli::{
     self, CliError, Context, Failure, HostSetCapacityArgs, OrgCommand, OrgSetCapacityArgs,
-    OrgSetScaleArgs, RepoCommand, RepoSetCapacityArgs, RepoSetScaleArgs,
+    RepoCommand, RepoSetCapacityArgs,
 };
+#[cfg(test)]
+use crate::cli::{OrgSetScaleArgs, RepoSetScaleArgs};
 
 pub const MAX_FOCUSED_FORM_ACTIONS: u8 = 5;
 pub const FORK_TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
@@ -38,6 +43,7 @@ pub struct HostSettings {
     pub current_refresh_interval: RefreshInterval,
     pub projected_requests_per_hour: u32,
     pub maximum_repository_targets: u32,
+    pub projection_is_floor: bool,
     targets: Vec<ScaleTarget>,
 }
 
@@ -61,6 +67,7 @@ impl HostSettings {
             current_refresh_interval: host.refresh_interval,
             projected_requests_per_hour: budget.requests_per_hour(),
             maximum_repository_targets: budget.max_repository_targets(),
+            projection_is_floor: budget.is_floor(),
             targets,
         })
     }
@@ -72,6 +79,7 @@ impl HostSettings {
             interval,
             projected_requests_per_hour: budget.requests_per_hour(),
             maximum_repository_targets: budget.max_repository_targets(),
+            projection_is_floor: budget.is_floor(),
             over_budget: budget.exceeds_allowance(),
         })
     }
@@ -90,6 +98,15 @@ impl HostSettings {
         context: &Context,
         seconds: u16,
     ) -> Result<HostIntervalPreview, CliError> {
+        let preview = self.accepted_interval_preview(seconds)?;
+        let store = context.store()?;
+        let mut host = cli::host::local_host_or_create(context, &store)?;
+        host.refresh_interval = preview.interval;
+        store.put_host(&host).map_err(store_failure)?;
+        Ok(preview)
+    }
+
+    fn accepted_interval_preview(&self, seconds: u16) -> Result<HostIntervalPreview, CliError> {
         let preview = self.preview_interval(seconds)?;
         if preview.over_budget {
             return Err(CliError::with_remedy(
@@ -102,18 +119,25 @@ impl HostSettings {
                 "choose a longer refresh interval or remove a target",
             ));
         }
-        let store = context.store()?;
-        let mut host = cli::host::local_host_or_create(context, &store)?;
-        host.refresh_interval = preview.interval;
-        store.put_host(&host).map_err(store_failure)?;
         Ok(preview)
     }
 
     /// Switches the existing service registration in place, without reinstalling.
     pub fn set_start_mode(context: &Context, mode: StartMode) -> Result<(), CliError> {
-        ServiceOperations::on_this_host(context.paths().clone())
-            .set_start_mode(mode)
-            .map_err(service_failure)?;
+        Self::set_start_mode_with(context, mode, |mode| {
+            ServiceOperations::on_this_host(context.paths().clone())
+                .set_start_mode(mode)
+                .map(|_| ())
+                .map_err(service_failure)
+        })
+    }
+
+    fn set_start_mode_with(
+        context: &Context,
+        mode: StartMode,
+        switch: impl FnOnce(StartMode) -> Result<(), CliError>,
+    ) -> Result<(), CliError> {
+        switch(mode)?;
         let store = context.store()?;
         let mut host = cli::host::local_host_or_create(context, &store)?;
         host.service_start_mode = mode;
@@ -131,6 +155,7 @@ pub struct HostIntervalPreview {
     pub interval: RefreshInterval,
     pub projected_requests_per_hour: u32,
     pub maximum_repository_targets: u32,
+    pub projection_is_floor: bool,
     pub over_budget: bool,
 }
 
@@ -235,15 +260,35 @@ impl PolicySettings {
                 ),
             ));
         }
+        let apply_scale = |enabled: bool, out: &mut dyn Write| {
+            let confirmation = if !enabled && self.active_runners > 0 {
+                let observed = cli::policy::observe_scale(context, &self.target)?;
+                if observed.active != self.active_runners {
+                    return Err(CliError::new(
+                        Failure::Conflict,
+                        format!(
+                            "active work changed while confirming the drain (was {}, now {}); review and confirm again",
+                            self.active_runners, observed.active
+                        ),
+                    ));
+                }
+                Some(observed)
+            } else {
+                None
+            };
+            cli::policy::apply_scale_confirmed(context, &self.target, enabled, confirmation, out)
+        };
+        // A disable goes first so a stale drain confirmation cannot leave a
+        // capacity/cache edit partially applied. Enablement follows capacity
+        // because a monitor-only policy must be promoted before it can arm.
+        if draft.enabled == Some(false) {
+            apply_scale(false, out)?;
+        }
         if let Some(maximum) = draft.max_capacity {
             dispatch_capacity(context, &self.target, maximum, out)?;
         }
-        if let Some(enabled) = draft.enabled {
-            if !enabled && self.active_runners > 0 {
-                apply_confirmed_disable(context, &self.target, out)?;
-            } else {
-                dispatch_scale(context, &self.target, enabled, out)?;
-            }
+        if draft.enabled == Some(true) {
+            apply_scale(true, out)?;
         }
         if let Some(cache_policy) = draft.cache_policy {
             set_cache_policy(context, &self.target, cache_policy)?;
@@ -287,6 +332,431 @@ pub struct PolicyPreview {
     pub trust_warning: Option<&'static str>,
 }
 
+/// Production state for the two editable screens. It contains no credential
+/// and every mutation is represented by a [`SettingsCommand`] executed by the
+/// shell's effect boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SettingsUi {
+    pub view: SettingsView,
+    pub focus: usize,
+    pub host_capacity: u16,
+    pub host_mode: StartMode,
+    pub host_interval_secs: u16,
+    pub policy_draft: PolicyDraft,
+    pub awaiting_drain_confirmation: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SettingsView {
+    #[default]
+    Empty,
+    Host(HostSettings),
+    Policy(PolicySettings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsCommand {
+    LoadHost,
+    LoadPolicy(String),
+    ApplyHost,
+    ApplyPolicy,
+    Copy(String),
+}
+
+impl SettingsUi {
+    pub fn execute(&mut self, context: &Context, command: SettingsCommand) -> Option<String> {
+        if matches!(
+            &command,
+            SettingsCommand::LoadHost | SettingsCommand::LoadPolicy(_)
+        ) {
+            self.view = SettingsView::Empty;
+            self.message = None;
+        }
+        let result = match command {
+            SettingsCommand::LoadHost => HostSettings::load(context).map(|form| {
+                self.host_capacity = form.current_capacity;
+                self.host_mode = form.current_start_mode;
+                self.host_interval_secs = form.current_refresh_interval.as_secs();
+                self.view = SettingsView::Host(form);
+                self.focus = 0;
+                self.message = None;
+            }),
+            SettingsCommand::LoadPolicy(raw) => ScaleTarget::repository(&raw)
+                .or_else(|_| ScaleTarget::organization(&raw))
+                .map_err(invalid)
+                .and_then(|target| PolicySettings::load(context, &target))
+                .map(|form| {
+                    self.policy_draft = PolicyDraft::default();
+                    self.view = SettingsView::Policy(form);
+                    self.focus = 0;
+                    self.awaiting_drain_confirmation = false;
+                    self.message = None;
+                }),
+            SettingsCommand::ApplyHost => self.apply_host(context),
+            SettingsCommand::ApplyPolicy => self.apply_policy(context),
+            SettingsCommand::Copy(text) => return Some(text),
+        };
+        if let Err(error) = result {
+            self.message = Some(format!("error: {error}"));
+        }
+        None
+    }
+
+    fn apply_host(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Host(form) = &self.view else {
+            return Ok(());
+        };
+        if self.host_capacity == 0 {
+            return Err(CliError::new(
+                Failure::InvalidArgument,
+                "host capacity must be at least 1; nothing was changed",
+            ));
+        }
+        form.accepted_interval_preview(self.host_interval_secs)?;
+        let mut output = Vec::new();
+        if self.host_mode != form.current_start_mode {
+            HostSettings::set_start_mode(context, self.host_mode)?;
+        }
+        if self.host_capacity != form.current_capacity {
+            HostSettings::set_capacity(context, self.host_capacity, &mut output)?;
+        }
+        if self.host_interval_secs != form.current_refresh_interval.as_secs() {
+            form.set_refresh_interval(context, self.host_interval_secs)?;
+        }
+        self.message = Some(if output.is_empty() {
+            "Host settings saved.".to_owned()
+        } else {
+            String::from_utf8_lossy(&output).trim().to_owned()
+        });
+        let refreshed = HostSettings::load(context)?;
+        self.host_capacity = refreshed.current_capacity;
+        self.host_mode = refreshed.current_start_mode;
+        self.host_interval_secs = refreshed.current_refresh_interval.as_secs();
+        self.view = SettingsView::Host(refreshed);
+        Ok(())
+    }
+
+    fn apply_policy(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Policy(form) = &self.view else {
+            return Ok(());
+        };
+        let preview = form.preview(&self.policy_draft);
+        if preview.drain_confirmation_required && !self.awaiting_drain_confirmation {
+            self.awaiting_drain_confirmation = true;
+            self.message = Some(format!(
+                "Confirm drain: {} active runner(s) will be left to finish. Press Enter again.",
+                preview.active_runners
+            ));
+            return Ok(());
+        }
+        let target = form.target.clone();
+        let mut output = Vec::new();
+        form.apply(
+            context,
+            &self.policy_draft,
+            self.awaiting_drain_confirmation,
+            &mut output,
+        )?;
+        self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
+        self.policy_draft = PolicyDraft::default();
+        self.awaiting_drain_confirmation = false;
+        self.view = SettingsView::Policy(PolicySettings::load(context, &target)?);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn key(&mut self, code: KeyCode) -> Option<SettingsCommand> {
+        let controls = self.control_count();
+        match code {
+            KeyCode::Up | KeyCode::BackTab => {
+                self.focus = self.focus.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.focus = (self.focus + 1).min(controls.saturating_sub(1));
+            }
+            KeyCode::Left | KeyCode::Char('-') => self.adjust(false),
+            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char(' ') => self.adjust(true),
+            KeyCode::Enter => return self.activate(),
+            _ => return None,
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn click(&mut self, content_row: u16) -> Option<SettingsCommand> {
+        let row = usize::from(content_row);
+        match &self.view {
+            SettingsView::Host(_) => match row {
+                3 => {
+                    self.focus = 0;
+                    self.adjust(true);
+                    None
+                }
+                4 => {
+                    self.focus = 1;
+                    self.adjust(true);
+                    None
+                }
+                5 => {
+                    self.focus = 2;
+                    self.adjust(true);
+                    None
+                }
+                9 => {
+                    self.focus = 3;
+                    Some(SettingsCommand::ApplyHost)
+                }
+                _ => None,
+            },
+            SettingsView::Policy(form) => {
+                let enabled_row = 5;
+                let maximum_row = if form.exposes_scale_toggle() { 6 } else { 5 };
+                let cache_row = maximum_row + 1;
+                let confirm_row = cache_row + 2;
+                if row == 4 {
+                    return form.copyable_runs_on.clone().map(SettingsCommand::Copy);
+                }
+                if form.exposes_scale_toggle() && row == enabled_row {
+                    self.focus = 0;
+                    self.adjust(true);
+                } else if row == maximum_row {
+                    self.focus = usize::from(form.exposes_scale_toggle());
+                    self.adjust(true);
+                } else if row == cache_row {
+                    self.focus = usize::from(form.exposes_scale_toggle()) + 1;
+                    self.adjust(true);
+                } else if row == confirm_row {
+                    self.focus = self.control_count().saturating_sub(1);
+                    return Some(SettingsCommand::ApplyPolicy);
+                }
+                None
+            }
+            SettingsView::Empty => None,
+        }
+    }
+
+    fn control_count(&self) -> usize {
+        match &self.view {
+            SettingsView::Host(_) => 4,
+            SettingsView::Policy(form) => usize::from(form.exposes_scale_toggle()) + 3,
+            SettingsView::Empty => 0,
+        }
+    }
+
+    fn adjust(&mut self, increase: bool) {
+        match &self.view {
+            SettingsView::Host(_) => match self.focus {
+                0 => {
+                    self.host_capacity = if increase {
+                        self.host_capacity.saturating_add(1)
+                    } else {
+                        self.host_capacity.saturating_sub(1)
+                    }
+                }
+                1 => {
+                    self.host_mode = if self.host_mode == StartMode::Boot {
+                        StartMode::Login
+                    } else {
+                        StartMode::Boot
+                    }
+                }
+                2 => {
+                    self.host_interval_secs = if increase {
+                        self.host_interval_secs.saturating_add(30)
+                    } else {
+                        self.host_interval_secs
+                            .saturating_sub(30)
+                            .max(RefreshInterval::MIN_SECS)
+                    }
+                }
+                _ => {}
+            },
+            SettingsView::Policy(form) => {
+                let mut index = self.focus;
+                if form.exposes_scale_toggle() {
+                    if index == 0 {
+                        self.policy_draft.enabled =
+                            Some(!self.policy_draft.enabled.unwrap_or(form.enabled));
+                        return;
+                    }
+                    index -= 1;
+                }
+                match index {
+                    0 => {
+                        let current = self
+                            .policy_draft
+                            .max_capacity
+                            .or(form.current_max_capacity)
+                            .unwrap_or(1);
+                        self.policy_draft.max_capacity = Some(if increase {
+                            current.saturating_add(1)
+                        } else {
+                            current.saturating_sub(1)
+                        });
+                    }
+                    1 => {
+                        let current = self.policy_draft.cache_policy.unwrap_or(form.cache_policy);
+                        self.policy_draft.cache_policy = Some(match current {
+                            CachePolicy::RetainRunnerPackage => CachePolicy::DiscardRunnerPackage,
+                            CachePolicy::DiscardRunnerPackage => CachePolicy::RetainRunnerPackage,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            SettingsView::Empty => {}
+        }
+    }
+
+    fn activate(&self) -> Option<SettingsCommand> {
+        match &self.view {
+            SettingsView::Host(_) if self.focus == 3 => Some(SettingsCommand::ApplyHost),
+            SettingsView::Policy(form) if self.focus + 1 == self.control_count() => {
+                Some(SettingsCommand::ApplyPolicy)
+            }
+            SettingsView::Policy(form) => form
+                .copyable_runs_on
+                .clone()
+                .filter(|_| self.focus == self.control_count())
+                .map(SettingsCommand::Copy),
+            SettingsView::Empty | SettingsView::Host(_) => None,
+        }
+    }
+}
+
+pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool) {
+    let lines = match &ui.view {
+        SettingsView::Empty => vec![Line::from("Loading settings...")],
+        SettingsView::Host(form) => {
+            let preview = form.preview_interval(ui.host_interval_secs).ok();
+            vec![
+                Line::from("Host settings"),
+                Line::from(format!("Current capacity: {}", form.current_capacity)),
+                Line::from(format!("Currently in use: {}", form.current_in_use)),
+                focus_line(
+                    ui.focus == 0,
+                    format!("Capacity: {}  [-/+ or click]", ui.host_capacity),
+                ),
+                focus_line(
+                    ui.focus == 1,
+                    format!("Service start: {}  [toggle]", ui.host_mode),
+                ),
+                focus_line(
+                    ui.focus == 2,
+                    format!("Refresh interval: {}s  [-/+ 30s]", ui.host_interval_secs),
+                ),
+                Line::from(format!(
+                    "Projected requests/hour: {}{}",
+                    preview.map_or(form.projected_requests_per_hour, |p| p
+                        .projected_requests_per_hour),
+                    if preview.map_or(form.projection_is_floor, |p| p.projection_is_floor) {
+                        " (a floor: organization targets present)"
+                    } else {
+                        ""
+                    }
+                )),
+                Line::from(format!(
+                    "Maximum repository targets: about {}",
+                    preview.map_or(form.maximum_repository_targets, |p| p
+                        .maximum_repository_targets)
+                )),
+                Line::from("30-second floor; over-budget changes are refused."),
+                focus_line(ui.focus == 3, "Save host settings [Enter/click]"),
+                Line::from(format!(
+                    "Focused form actions: {}/{}",
+                    form.focused_action_count(),
+                    MAX_FOCUSED_FORM_ACTIONS
+                )),
+            ]
+        }
+        SettingsView::Policy(form) => {
+            let preview = form.preview(&ui.policy_draft);
+            let mut lines = vec![
+                Line::from(format!("Target: {}", form.target)),
+                Line::from(format!("Mode: {:?}", form.mode)),
+                Line::from(format!("Local host: {}", form.host_identity)),
+                Line::from(format!(
+                    "Current max_capacity: {}",
+                    form.current_max_capacity
+                        .map_or_else(|| "monitor-only".into(), |v| v.to_string())
+                )),
+                Line::from(format!(
+                    "runs-on: {}  [click to copy]",
+                    form.copyable_runs_on
+                        .as_deref()
+                        .unwrap_or("not reserved until promotion")
+                )),
+            ];
+            let mut focus = 0;
+            if form.exposes_scale_toggle() {
+                lines.push(focus_line(
+                    ui.focus == focus,
+                    format!("Scaling enabled: {}  [toggle]", preview.to_enabled),
+                ));
+                focus += 1;
+            }
+            lines.push(focus_line(
+                ui.focus == focus,
+                format!(
+                    "max_capacity: {}  [-/+; setting promotes monitor-only]",
+                    preview
+                        .to_capacity
+                        .map_or_else(|| "unset".into(), |v| v.to_string())
+                ),
+            ));
+            focus += 1;
+            lines.push(focus_line(
+                ui.focus == focus,
+                format!("Cache policy: {:?}  [toggle]", preview.cache_policy),
+            ));
+            if let Some(warning) = preview.trust_warning {
+                lines.push(Line::from(warning));
+            } else if preview.drain_confirmation_required {
+                lines.push(Line::from(format!(
+                    "Disabling means draining {} active runner(s); none will be terminated.",
+                    preview.active_runners
+                )));
+            } else {
+                lines.push(Line::from("Preview: no runner is terminated immediately."));
+            }
+            lines.push(focus_line(
+                ui.focus + 1 == ui.control_count(),
+                "Confirm policy [Enter/click]",
+            ));
+            lines.push(Line::from(format!(
+                "Focused form actions: {}/{}",
+                form.focused_action_count(),
+                MAX_FOCUSED_FORM_ACTIONS
+            )));
+            lines
+        }
+    };
+    let mut lines = if compact {
+        lines.into_iter().take(7).collect::<Vec<_>>()
+    } else {
+        lines
+    };
+    if let Some(message) = &ui.message {
+        lines.push(Line::from(message.clone()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title("Settings").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn focus_line<'a>(focused: bool, text: impl Into<String>) -> Line<'a> {
+    let style = if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(text.into(), style))
+}
+
 fn dispatch_capacity(
     context: &Context,
     target: &ScaleTarget,
@@ -313,6 +783,7 @@ fn dispatch_capacity(
     }
 }
 
+#[cfg(test)]
 fn dispatch_scale(
     context: &Context,
     target: &ScaleTarget,
@@ -337,33 +808,6 @@ fn dispatch_scale(
             out,
         ),
     }
-}
-
-/// The TUI has already collected the second (drain) confirmation, so this is
-/// the same domain transition as `f2` without asking stdin a third time.
-fn apply_confirmed_disable(
-    context: &Context,
-    target: &ScaleTarget,
-    out: &mut dyn Write,
-) -> Result<(), CliError> {
-    let store = context.store()?;
-    let mut policy = find_policy(&store, target)?;
-    let attempts = store
-        .attempts_for_policy(policy.id)
-        .map_err(store_failure)?;
-    let active = active_count_for(policy.id, attempts.iter());
-    let expected = policy.revision();
-    if policy.enabled() {
-        policy.request_disable().map_err(invalid)?;
-        if active == 0 {
-            policy.drain_completed(0).map_err(invalid)?;
-        }
-        store
-            .update_policy(&policy, expected)
-            .map_err(store_failure)?;
-    }
-    writeln!(out, "{} is {} with {active} active runner(s); busy runners were not terminated. Cache and historical diagnostics were preserved.", policy.target, if active == 0 { "disabled" } else { "draining" })
-        .map_err(|source| CliError::new(Failure::Unclassified, format!("cannot write this scale result: {source}")))
 }
 
 fn set_cache_policy(
@@ -428,6 +872,8 @@ mod tests {
     use super::*;
     use std::num::NonZeroU16;
 
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use runner_manager_domain::attempt::RunnerAttempt;
     use runner_manager_domain::model::{Arch, AttemptId, Host, HostId, HostLabel, Os, PolicyId};
     use runner_manager_domain::policy::{PolicyState, RoutingLabels};
@@ -745,5 +1191,154 @@ mod tests {
                 .current_max_capacity,
             Some(2)
         );
+    }
+
+    #[test]
+    fn organization_projection_floor_survives_load_and_live_preview() {
+        let (_dir, context, _) = fixture(false);
+        let store = context.store().unwrap();
+        let host = cli::host::local_host(&store).unwrap().unwrap();
+        let org = ScalePolicy::new_for_host_label(
+            PolicyId::from_u128(30),
+            ScaleTarget::organization("octo-org").unwrap(),
+            8,
+            host.id,
+            HostLabel::new("home").unwrap(),
+            PolicyMode::MonitorOnly,
+            CachePolicy::default(),
+        );
+        store.insert_policy(&org).unwrap();
+        drop(store);
+        let form = HostSettings::load(&context).unwrap();
+        assert!(form.projection_is_floor);
+        assert!(form.preview_interval(90).unwrap().projection_is_floor);
+    }
+
+    #[test]
+    fn over_budget_interval_is_refused_without_mutating_the_host() {
+        let (_dir, context, _) = fixture(false);
+        let store = context.store().unwrap();
+        let host = cli::host::local_host(&store).unwrap().unwrap();
+        for id in 40..70 {
+            let policy = ScalePolicy::new_for_host_label(
+                PolicyId::from_u128(id),
+                ScaleTarget::repository(format!("octo/repo-{id}")).unwrap(),
+                id as u64,
+                host.id,
+                HostLabel::new("home").unwrap(),
+                PolicyMode::MonitorOnly,
+                CachePolicy::default(),
+            );
+            store.insert_policy(&policy).unwrap();
+        }
+        drop(store);
+        let form = HostSettings::load(&context).unwrap();
+        let before = form.current_refresh_interval;
+        let error = form.set_refresh_interval(&context, 30).unwrap_err();
+        assert_eq!(error.class(), Failure::BudgetRefused);
+        assert_eq!(
+            HostSettings::load(&context)
+                .unwrap()
+                .current_refresh_interval,
+            before
+        );
+    }
+
+    #[test]
+    fn inverted_min_max_is_rejected_through_the_production_policy_command() {
+        let (_dir, context, target) = fixture(false);
+        let store = context.store().unwrap();
+        let old = find_policy(&store, &target).unwrap();
+        store.remove_policy(old.id, old.revision()).unwrap();
+        let replacement = ScalePolicy::new_for_host_label(
+            old.id,
+            target.clone(),
+            7,
+            old.host_id,
+            old.requested_host_label,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                5,
+                nz(6),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&replacement).unwrap();
+        drop(store);
+        let form = PolicySettings::load(&context, &target).unwrap();
+        let error = form
+            .apply(
+                &context,
+                &PolicyDraft {
+                    max_capacity: Some(4),
+                    ..PolicyDraft::default()
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert_eq!(
+            PolicySettings::load(&context, &target)
+                .unwrap()
+                .current_max_capacity,
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn service_mode_switch_persists_and_host_show_reads_the_same_mode() {
+        let (_dir, context, _) = fixture(false);
+        HostSettings::set_start_mode_with(&context, StartMode::Login, |_| Ok(())).unwrap();
+        let mut shown = Vec::new();
+        cli::host::show(&context, &mut shown).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains("service start mode        login"), "{shown}");
+        assert_eq!(
+            HostSettings::load(&context).unwrap().current_start_mode,
+            StartMode::Login
+        );
+    }
+
+    #[test]
+    fn cache_policy_survives_a_fresh_context_and_settings_errors_render() {
+        let (dir, context, target) = fixture(false);
+        PolicySettings::load(&context, &target)
+            .unwrap()
+            .apply(
+                &context,
+                &PolicyDraft {
+                    cache_policy: Some(CachePolicy::DiscardRunnerPackage),
+                    ..PolicyDraft::default()
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        drop(context);
+        let restarted = Context::resolve(Some(dir.path()), &mut Vec::new()).unwrap();
+        assert_eq!(
+            PolicySettings::load(&restarted, &target)
+                .unwrap()
+                .cache_policy,
+            CachePolicy::DiscardRunnerPackage
+        );
+
+        let mut ui = SettingsUi::default();
+        ui.execute(&restarted, SettingsCommand::LoadPolicy(String::new()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &ui, false))
+            .unwrap();
+        let text = (0..20)
+            .map(|y| {
+                (0..100)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("error:"), "{text}");
     }
 }

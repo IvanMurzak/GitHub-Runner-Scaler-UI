@@ -452,18 +452,81 @@ fn set_scale(
     enabled: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let store = context.store()?;
-    let policy = find_policy(&store, &target)?;
-    let attempts = store
-        .attempts_for_policy(policy.id)
-        .map_err(store_failure)?;
-    let active = active_count_for(policy.id, attempts.iter());
+    let observation = observe_scale(context, &target)?;
+    let active = observation.active;
+    let mut confirmation = None;
     if !enabled && active > 0 {
         let stdin = io::stdin();
         if !confirm_disable(active, out, &mut stdin.lock())? {
             return Err(CliError::new(
                 Failure::Conflict,
                 "disable cancelled; the policy was not changed",
+            ));
+        }
+        confirmation = Some(observation);
+    }
+    apply_scale_confirmed(context, &target, enabled, confirmation, out)
+}
+
+/// What was observed before asking an operator to drain active work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleObservation {
+    pub active: u16,
+    policy_revision: u64,
+}
+
+/// Re-observes the policy and active work without prompting. TUI code uses
+/// this before displaying its own non-blocking confirmation.
+pub fn observe_scale(
+    context: &Context,
+    target: &ScaleTarget,
+) -> Result<ScaleObservation, CliError> {
+    let store = context.store()?;
+    let policy = find_policy(&store, target)?;
+    let attempts = store
+        .attempts_for_policy(policy.id)
+        .map_err(store_failure)?;
+    Ok(ScaleObservation {
+        active: active_count_for(policy.id, attempts.iter()),
+        policy_revision: policy.revision(),
+    })
+}
+
+/// Shared post-confirmation mutation used by both CLI and TUI.
+///
+/// A disable confirmation is valid only for the exact policy revision and
+/// active count the operator saw. If either changed, no mutation occurs and
+/// the caller must render a fresh confirmation. This closes the stdin/TUI
+/// time-of-check/time-of-use gap without ever reading stdin in the TUI loop.
+pub fn apply_scale_confirmed(
+    context: &Context,
+    target: &ScaleTarget,
+    enabled: bool,
+    confirmation: Option<ScaleObservation>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let store = context.store()?;
+    let policy = find_policy(&store, target)?;
+    let attempts = store
+        .attempts_for_policy(policy.id)
+        .map_err(store_failure)?;
+    let active = active_count_for(policy.id, attempts.iter());
+    if !enabled && active > 0 {
+        let Some(confirmed) = confirmation else {
+            return Err(CliError::new(
+                Failure::Conflict,
+                format!(
+                    "{active} active runner(s) must be confirmed before disabling; nothing was changed"
+                ),
+            ));
+        };
+        if confirmed.active != active || confirmed.policy_revision != policy.revision() {
+            return Err(CliError::new(
+                Failure::Conflict,
+                format!(
+                    "active work changed while confirming the drain (was {}, now {active}); review and confirm again",
+                    confirmed.active
+                ),
             ));
         }
     }
@@ -1112,5 +1175,58 @@ mod tests {
         assert!(prompt.contains("3 active runner(s)"), "{prompt}");
         assert!(prompt.contains("left to finish"), "{prompt}");
         assert!(confirm_disable(3, &mut Vec::new(), &mut io::Cursor::new(b"yes\n")).unwrap());
+    }
+
+    #[test]
+    fn post_confirmation_seam_refuses_when_active_work_changes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        store.insert_policy(&policy).unwrap();
+        drop(store);
+
+        let confirmed = observe_scale(&context, &target).unwrap();
+        assert_eq!(confirmed.active, 0);
+        let store = context.store().unwrap();
+        store
+            .record_attempt(&RunnerAttempt::allocate(
+                AttemptId::new_random(),
+                policy.id,
+                "new-active-work",
+                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+            ))
+            .unwrap();
+        drop(store);
+
+        let error =
+            apply_scale_confirmed(&context, &target, false, Some(confirmed), &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.class(), Failure::Conflict);
+        assert!(
+            find_policy(&context.store().unwrap(), &target)
+                .unwrap()
+                .enabled()
+        );
     }
 }

@@ -42,6 +42,7 @@ use super::screens::{
     self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,
     RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
 };
+use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
 
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
@@ -806,6 +807,7 @@ pub enum Effect {
     Copy(String),
     SetMouseCapture(bool),
     ActivateFocusedControl,
+    Settings(SettingsCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -902,6 +904,7 @@ pub struct AppState {
     pub should_exit: bool,
     pub ticks: u64,
     pub last_tick: Option<Instant>,
+    pub settings: SettingsUi,
     navigation: NavigationLayout,
 }
 
@@ -921,6 +924,7 @@ impl AppState {
             should_exit: false,
             ticks: 0,
             last_tick: None,
+            settings: SettingsUi::default(),
             navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
         }
     }
@@ -1062,12 +1066,39 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
     }
 
+    if matches!(
+        state.screen,
+        Screen::HostSettings | Screen::RepositorySettings
+    ) && matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::BackTab
+            | KeyCode::Enter
+            | KeyCode::Char('-' | '+' | ' ')
+    ) {
+        return state
+            .settings
+            .key(key.code)
+            .map(|command| vec![Effect::Settings(command)])
+            .unwrap_or_default();
+    }
+
     match key.code {
         KeyCode::Char('d') => state.open_screen(Screen::Dashboard),
         KeyCode::Char('r') => state.open_screen(Screen::Repositories),
         KeyCode::Char('n') => state.open_screen(Screen::Runners),
-        KeyCode::Char('s') => state.open_screen(Screen::RepositorySettings),
-        KeyCode::Char('h') => state.open_screen(Screen::HostSettings),
+        KeyCode::Char('s') => {
+            state.open_screen(Screen::RepositorySettings);
+            let target = selected_repository_target(state).unwrap_or_default();
+            return vec![Effect::Settings(SettingsCommand::LoadPolicy(target))];
+        }
+        KeyCode::Char('h') => {
+            state.open_screen(Screen::HostSettings);
+            return vec![Effect::Settings(SettingsCommand::LoadHost)];
+        }
         KeyCode::Char('a') => state.open_screen(Screen::Activity),
         KeyCode::Char('o') => {
             let current = match state.screen_model.screen {
@@ -1093,7 +1124,16 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('?') => state.help_open = !state.help_open,
         KeyCode::Char('q') => state.should_exit = true,
         KeyCode::Char('c') => {
-            let copy = if read_only_screen(state.screen) == Some(ReadOnlyScreen::Activity) {
+            let copy = if state.screen == Screen::RepositorySettings {
+                match &state.settings.view {
+                    SettingsView::Policy(form) => {
+                        form.copyable_runs_on.clone().unwrap_or_else(|| {
+                            "monitor-only: no routing label is reserved until promotion".into()
+                        })
+                    }
+                    _ => "repository settings are not loaded".into(),
+                }
+            } else if read_only_screen(state.screen) == Some(ReadOnlyScreen::Activity) {
                 screens::render_text(&state.screen_model)
             } else {
                 state.presentation.copy_text()
@@ -1157,6 +1197,15 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             if let Some(screen) = state.navigation.hit(mouse.column, mouse.row) {
                 state.open_screen(screen);
                 state.focus = Focus::Navigation;
+                return match screen {
+                    Screen::HostSettings => vec![Effect::Settings(SettingsCommand::LoadHost)],
+                    Screen::RepositorySettings => {
+                        vec![Effect::Settings(SettingsCommand::LoadPolicy(
+                            selected_repository_target(state).unwrap_or_default(),
+                        ))]
+                    }
+                    _ => Vec::new(),
+                };
             } else {
                 state.focus = Focus::Content;
                 if state.screen == Screen::Repositories {
@@ -1173,6 +1222,13 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                             .screen_model
                             .apply(ScreenAction::OpenRepositoryByMouse(id));
                     }
+                } else if matches!(
+                    state.screen,
+                    Screen::HostSettings | Screen::RepositorySettings
+                ) && mouse.row >= 3
+                    && let Some(command) = state.settings.click(mouse.row - 3)
+                {
+                    return vec![Effect::Settings(command)];
                 }
             }
         }
@@ -1181,6 +1237,18 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         _ => {}
     }
     Vec::new()
+}
+
+fn selected_repository_target(state: &AppState) -> Option<String> {
+    let selected = state.screen_model.repositories.selected_id.as_deref();
+    state
+        .screen_model
+        .snapshot
+        .repositories
+        .iter()
+        .find(|row| selected == Some(row.id.as_str()))
+        .or_else(|| state.screen_model.snapshot.repositories.first())
+        .map(|row| row.target.clone())
 }
 
 /// Draw one frame from memory only.
@@ -1225,7 +1293,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         frame.render_widget(Paragraph::new(item.label.as_str()).style(style), item.area);
     }
 
-    if let Some(read_only) = read_only_screen(state.screen) {
+    if matches!(
+        state.screen,
+        Screen::HostSettings | Screen::RepositorySettings
+    ) {
+        settings::render(frame, rows[2], &state.settings, compact);
+    } else if let Some(read_only) = read_only_screen(state.screen) {
         let mut model = state.screen_model.clone();
         model.apply(ScreenAction::Open(read_only));
         screens::render(frame, rows[2], &model);
@@ -1583,6 +1656,7 @@ pub async fn run_loop<B, I>(
     mut input: I,
     mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
     refresh: &impl RefreshRequester,
+    context: Option<&crate::cli::Context>,
 ) -> io::Result<AppState>
 where
     B: Backend,
@@ -1624,7 +1698,19 @@ where
                 Effect::Copy(text) => copy_to_terminal_clipboard(&mut io::stdout(), &text)?,
                 Effect::Refresh => refresh.request_refresh()?,
                 Effect::ActivateFocusedControl => {
-                    // g3 attaches existing CLI command handlers here.
+                    // Read-only controls activate in the reducer.
+                }
+                Effect::Settings(command) => {
+                    if let Some(context) = context {
+                        if let Some(copy) = state.settings.execute(context, command) {
+                            copy_to_terminal_clipboard(&mut io::stdout(), &copy)?;
+                        }
+                    } else {
+                        state.settings.message = Some(
+                            "error: settings mutations require the local application context"
+                                .into(),
+                        );
+                    }
                 }
             }
         }
@@ -1668,6 +1754,7 @@ pub fn run_terminal_with_agent_events(
             EventStream::new(),
             agent_events,
             &NoopRefreshRequester,
+            None,
         ))
         .map(|_| ());
     let _ = terminal.show_cursor();
@@ -1676,7 +1763,8 @@ pub fn run_terminal_with_agent_events(
 
 pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
-    let (source, agent_events) = LocalAgentEventSource::start(context, LOCAL_AGENT_POLL_RATE)?;
+    let (source, agent_events) =
+        LocalAgentEventSource::start(Arc::clone(&context), LOCAL_AGENT_POLL_RATE)?;
     let mut session = TerminalSession::start(CrosstermActions::new(io::stdout(), SystemRawMode))?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -1691,6 +1779,7 @@ pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
             EventStream::new(),
             agent_events,
             &source,
+            Some(context.as_ref()),
         ))
         .map(|_| ());
     let _ = terminal.show_cursor();
@@ -1992,6 +2081,7 @@ mod tests {
                 input,
                 agent_events,
                 &NoopRefreshRequester,
+                None,
             ),
             producer
         );
@@ -2080,7 +2170,14 @@ mod tests {
                 .unwrap();
         };
         let (result, ()) = tokio::join!(
-            run_loop(&mut terminal, &mut session, input, agent_events, &source,),
+            run_loop(
+                &mut terminal,
+                &mut session,
+                input,
+                agent_events,
+                &source,
+                None,
+            ),
             input_producer,
         );
         let final_state = result.unwrap();
@@ -2811,5 +2908,141 @@ mod tests {
                 "render acquired forbidden I/O capability {forbidden_capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn production_settings_keyboard_and_mouse_paths_render_edit_copy_and_persist() {
+        use std::num::NonZeroU16;
+
+        use runner_manager_domain::model::{
+            Arch, CachePolicy, Host, HostId, HostLabel, Os, PolicyId, ScaleTarget,
+        };
+        use runner_manager_domain::policy::{PolicyMode as DomainMode, RoutingLabels, ScalePolicy};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let context = crate::cli::Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let host = Host::new(
+            HostId::from_u128(901),
+            "production-settings-host",
+            Os::Linux,
+            Arch::X64,
+            NonZeroU16::new(4).unwrap(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        store.put_host(&host).unwrap();
+        let target = ScaleTarget::repository("octo/production-settings").unwrap();
+        let policy = ScalePolicy::new_for_host_label(
+            PolicyId::from_u128(902),
+            target.clone(),
+            7,
+            host.id,
+            HostLabel::new("home").unwrap(),
+            DomainMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                0,
+                NonZeroU16::new(2).unwrap(),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&policy).unwrap();
+        drop(store);
+
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            repositories: vec![RepositoryRow {
+                id: "production-settings".into(),
+                target: target.to_string(),
+                in_progress_workflows: 0,
+                mode: PolicyMode::Autoscale,
+                max_capacity: Some(2),
+                health: AgentHealth::Healthy,
+            }],
+            ..Snapshot::default()
+        });
+        state.screen_model.repositories.selected_id = Some("production-settings".into());
+
+        let host_nav = state
+            .navigation
+            .items
+            .iter()
+            .find(|item| item.screen == Screen::HostSettings)
+            .unwrap()
+            .area;
+        let effects = reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                host_nav.x,
+                host_nav.y,
+            ),
+        );
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("host navigation must load the form")
+        };
+        state.settings.execute(&context, command);
+        assert!(rendered(120, 30, &state).contains("Current capacity: 4"));
+
+        // Three mouse actions total for this form: open, edit, confirm.
+        reduce(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 6),
+        );
+        let effects = reduce(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 12),
+        );
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("host confirmation must dispatch")
+        };
+        state.settings.execute(&context, command);
+        assert_eq!(
+            crate::cli::host::local_host(&context.store().unwrap())
+                .unwrap()
+                .unwrap()
+                .host_capacity(),
+            5
+        );
+
+        let effects = reduce(&mut state, key(KeyCode::Char('s')));
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("s must load selected policy settings")
+        };
+        state.settings.execute(&context, command);
+        assert!(rendered(120, 30, &state).contains("runs-on: rm-home-linux-x64"));
+
+        // Four focused actions: enable, capacity, cache, confirm. Arrow moves
+        // only move focus and are not form actions.
+        for code in [
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::Right,
+        ] {
+            reduce(&mut state, key(code));
+        }
+        let warning = rendered(120, 30, &state);
+        assert!(
+            warning.contains("fork and untrusted pull-request"),
+            "{warning}"
+        );
+        let Effect::Copy(copy) = reduce(&mut state, key(KeyCode::Char('c'))).remove(0) else {
+            panic!("c must expose the routing label")
+        };
+        assert_eq!(copy, "rm-home-linux-x64");
+        reduce(&mut state, key(KeyCode::Down));
+        let effects = reduce(&mut state, key(KeyCode::Enter));
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("policy confirmation must dispatch")
+        };
+        state.settings.execute(&context, command);
+        let stored = context.store().unwrap().policies().unwrap().remove(0);
+        assert!(stored.enabled());
+        assert_eq!(stored.max_capacity().unwrap().get(), 3);
+        assert_eq!(stored.cache_policy, CachePolicy::DiscardRunnerPackage);
     }
 }
