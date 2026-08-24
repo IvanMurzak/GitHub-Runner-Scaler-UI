@@ -1263,7 +1263,7 @@ jobs:
             echo "- install script: \`releases/latest/download/install.sh\` and \`install.ps1\`"
             echo "- npm: \`@ivan-murzak/runner-manager@${VERSION}\` plus five platform packages"
             echo "- Homebrew: \`${TAP_REPOSITORY}\` Formula/runner-manager.rb"
-            echo "- cargo: \`cargo install runner-manager\` builds from the published crate"
+            echo "- cargo: NOT published to crates.io by this workflow. \`cargo install runner-manager\` still resolves nothing; building from a checkout is the source path that works."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the rendered channel manifests
