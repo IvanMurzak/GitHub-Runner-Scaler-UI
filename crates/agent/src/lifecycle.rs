@@ -50,6 +50,14 @@ const MAX_POST_SPAWN_STOP_ATTEMPTS: usize = 3;
 #[cfg(test)]
 const TEST_LISTENER_READY: &str = ".test-listener-ready";
 
+/// GitHub Runner v2.336.0 accepts JIT configuration for `run` through its
+/// secret `ACTIONS_RUNNER_INPUT_JITCONFIG` input. The platform spawn boundary
+/// supplies that input from the restrictive handoff; the listener command line
+/// must contain only the supported `run` command.
+fn runner_listener_spec(program: PathBuf, runtime: &Path) -> SpawnSpec {
+    SpawnSpec::new(program).arg("run").working_dir(runtime)
+}
+
 /// Retry bounds for failures that can resolve without operator action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -708,7 +716,6 @@ impl ProcessSupervisor for NativeProcesses {
             SecretString::from(config.expose().to_owned()),
         )
         .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
-        let handoff_path = handoff.path().to_path_buf();
         #[cfg(windows)]
         let program = attempt
             .runtime_path()
@@ -741,20 +748,12 @@ impl ProcessSupervisor for NativeProcesses {
                 )
                 .working_dir(attempt.runtime_path())
         } else {
-            SpawnSpec::new(program)
-                .arg("run")
-                .arg("--jit-config-file")
-                .arg(&handoff_path)
-                .working_dir(attempt.runtime_path())
+            runner_listener_spec(program, attempt.runtime_path())
         };
         #[cfg(not(test))]
-        let spec = SpawnSpec::new(program)
-            .arg("run")
-            .arg("--jit-config-file")
-            .arg(&handoff_path)
-            .working_dir(attempt.runtime_path());
+        let spec = runner_listener_spec(program, attempt.runtime_path());
         let child = spec
-            .spawn_with_handoff(&handoff)
+            .spawn_runner_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
         // The payload is gone before any state saying "starting" is persisted.
         #[cfg(test)]
@@ -2998,8 +2997,8 @@ mod tests {
         let handoff =
             RestrictiveHandoff::create(&runtime, SecretString::from(config.expose().to_owned()))
                 .unwrap();
-        let mut child = native_inspection_spec(handoff.path())
-            .spawn_with_handoff(&handoff)
+        let mut child = native_inspection_spec()
+            .spawn_runner_with_handoff(&handoff)
             .expect("native child starts");
         let pid = child.pid();
         handoff.delete().unwrap();
@@ -3257,25 +3256,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_listener_command_uses_the_supported_jit_contract() {
+        let runtime = Path::new("runtime");
+        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), runtime);
+        let arguments: Vec<_> = spec
+            .arguments()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(arguments, ["run"]);
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--jit-config-file"),
+            "the obsolete file option would be rejected by Runner.Listener 2.336.0"
+        );
+    }
+
     #[cfg(windows)]
-    fn native_inspection_spec(handoff: &Path) -> SpawnSpec {
-        SpawnSpec::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ])
-            .arg("--jit-config-file")
-            .arg(handoff)
+    fn native_inspection_spec() -> SpawnSpec {
+        SpawnSpec::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
     }
 
     #[cfg(unix)]
-    fn native_inspection_spec(handoff: &Path) -> SpawnSpec {
-        SpawnSpec::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .arg("--jit-config-file")
-            .arg(handoff)
+    fn native_inspection_spec() -> SpawnSpec {
+        SpawnSpec::new("/bin/sh").args(["-c", "sleep 30"])
     }
 
     #[cfg(windows)]

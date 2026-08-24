@@ -45,7 +45,11 @@
 //! restrictive file/pipe handoff"*. [`RestrictiveHandoff`] is that file, and
 //! [`SpawnSpec::spawn_with_handoff`] refuses to spawn when the payload appears
 //! in any argument or environment value, so an obvious mistake fails the launch
-//! instead of failing a review.
+//! instead of failing a review. [`SpawnSpec::spawn_runner_with_handoff`] is the
+//! one narrow exception: GitHub Runner's supported JIT intake is the secret
+//! `ACTIONS_RUNNER_INPUT_JITCONFIG` environment input. The value is injected
+//! only while creating the child, is never retained in the public spawn spec,
+//! and Runner masks and removes it as its command parser starts.
 //!
 //! **It is a tripwire, not a proof.** A caller that passes it has not been
 //! shown to be safe. The check looks for the payload as a verbatim substring of
@@ -54,9 +58,10 @@
 //! directory, or environment variable *names*; and anything that re-encodes the
 //! payload — base64 of the base64, URL-escaping, a different Unicode
 //! normalisation — or splits it across two arguments walks straight past it.
-//! The control that actually holds is *"pass the handoff file's path"*; `e3`
-//! must not read a passing `spawn_with_handoff` call as evidence that a
-//! configuration cannot reach a process listing.
+//! The control that actually holds is either *"pass the handoff file's path"*
+//! to a program that supports one or use the dedicated Runner intake above;
+//! `e3` must not read a passing generic check as evidence that a configuration
+//! cannot reach a process listing.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -66,6 +71,13 @@ use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+
+/// GitHub Runner's supported process-safe JIT configuration input.
+///
+/// `actions/runner` v2.336.0 reads every `ACTIONS_RUNNER_INPUT_*` variable in
+/// `CommandSettings`, registers secret inputs with its masker, and removes the
+/// variable from its environment before `Runner.ExecuteCommand` decodes it.
+const RUNNER_JIT_CONFIG_ENV: &str = "ACTIONS_RUNNER_INPUT_JITCONFIG";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -495,9 +507,19 @@ impl SpawnSpec {
     /// read — which would leave an unrecordable process running, so the child
     /// is killed rather than leaked.
     pub fn spawn(&self) -> Result<ChildProcess, ProcessError> {
+        self.spawn_with_extra_env(None)
+    }
+
+    fn spawn_with_extra_env(
+        &self,
+        extra_env: Option<(&OsStr, &OsStr)>,
+    ) -> Result<ChildProcess, ProcessError> {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         for (key, value) in &self.envs {
+            command.env(key, value);
+        }
+        if let Some((key, value)) = extra_env {
             command.env(key, value);
         }
         if let Some(dir) = &self.working_dir {
@@ -554,6 +576,41 @@ impl SpawnSpec {
         &self,
         handoff: &RestrictiveHandoff,
     ) -> Result<ChildProcess, ProcessError> {
+        self.reject_exposed_handoff(handoff)?;
+        self.spawn()
+    }
+
+    /// Launches GitHub Runner using its supported process-safe JIT input.
+    ///
+    /// The encoded configuration is deliberately absent from [`SpawnSpec`]:
+    /// callers cannot render it as an argument or accidentally retain it in a
+    /// reusable specification. It is copied from the restrictive handoff into
+    /// the child's initial environment at the final `Command::spawn` boundary.
+    /// GitHub Runner's `CommandSettings` treats `jitconfig` as a secret and
+    /// removes `ACTIONS_RUNNER_INPUT_JITCONFIG` from the process environment
+    /// before executing the `run` command.
+    ///
+    /// The caller still owns deleting `handoff` immediately after this method
+    /// returns. A failed launch leaves deletion to [`RestrictiveHandoff`]'s
+    /// fail-closed `Drop` implementation.
+    ///
+    /// # Errors
+    ///
+    /// [`ProcessError::SecretInCommandLine`] when the payload was also placed
+    /// in an argument or explicitly configured environment value, plus every
+    /// error returned by [`SpawnSpec::spawn`].
+    pub fn spawn_runner_with_handoff(
+        &self,
+        handoff: &RestrictiveHandoff,
+    ) -> Result<ChildProcess, ProcessError> {
+        self.reject_exposed_handoff(handoff)?;
+        self.spawn_with_extra_env(Some((
+            OsStr::new(RUNNER_JIT_CONFIG_ENV),
+            OsStr::new(handoff.payload.expose_secret()),
+        )))
+    }
+
+    fn reject_exposed_handoff(&self, handoff: &RestrictiveHandoff) -> Result<(), ProcessError> {
         let payload = handoff.payload.expose_secret();
         // An empty payload cannot meaningfully be searched for — every string
         // contains it — and it is not a secret worth protecting either.
@@ -576,7 +633,7 @@ impl SpawnSpec {
             }
         }
 
-        self.spawn()
+        Ok(())
     }
 }
 
@@ -2552,6 +2609,66 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other}"),
         }
+    }
+
+    #[test]
+    fn runner_handoff_injects_the_supported_secret_input_without_an_argument() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let payload = jit_payload();
+        let payload_length = payload.expose_secret().len();
+        let handoff = RestrictiveHandoff::create(directory.path(), payload).expect("created");
+        let spec = runner_jit_input_probe(payload_length);
+
+        let rendered: Vec<String> = spec
+            .arguments()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .all(|argument| !argument.contains(jit_payload().expose_secret())),
+            "the JIT payload reached the command line: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|argument| argument != "--jit-config-file"),
+            "the obsolete listener option returned: {rendered:?}"
+        );
+
+        let mut child = spec
+            .spawn_runner_with_handoff(&handoff)
+            .expect("the probe starts");
+        handoff
+            .delete()
+            .expect("the handoff is deleted immediately");
+        let status = child.wait().expect("the probe exits");
+        assert!(
+            status.success(),
+            "the child did not receive the complete {RUNNER_JIT_CONFIG_ENV} input: {status}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn runner_jit_input_probe(expected_length: usize) -> SpawnSpec {
+        SpawnSpec::new("powershell.exe").args([
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "$value = [Environment]::GetEnvironmentVariable('{RUNNER_JIT_CONFIG_ENV}'); \
+                 if ($null -eq $value -or $value.Length -ne {expected_length}) {{ exit 41 }}"
+            ),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn runner_jit_input_probe(expected_length: usize) -> SpawnSpec {
+        SpawnSpec::new("/bin/sh").args([
+            "-c".to_owned(),
+            format!("test \"${{#{RUNNER_JIT_CONFIG_ENV}}}\" -eq \"{expected_length}\""),
+        ])
     }
 
     #[test]
