@@ -11,6 +11,7 @@
 //! collected [`Snapshot`] and cannot perform filesystem or network I/O.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use ratatui::{
     Frame,
@@ -63,6 +64,13 @@ pub enum Availability {
         last_successful_contact: String,
         retry_after_seconds: u64,
     },
+    Forbidden {
+        message: Option<String>,
+    },
+    Failed {
+        detail: String,
+    },
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +244,8 @@ pub struct ScreenModel {
     pub runners: TableViewState,
     pub activity: TableViewState,
     pub repository_detail: Option<String>,
+    pub runner_detail: Option<String>,
+    pub acknowledged_activity: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +271,8 @@ impl ScreenModel {
             runners: TableViewState::default(),
             activity: TableViewState::default(),
             repository_detail: None,
+            runner_detail: None,
+            acknowledged_activity: HashSet::new(),
         };
         model.reconcile_all(None);
         model
@@ -289,12 +301,24 @@ impl ScreenModel {
                     table.focus = focus
                 }
             }
-            ScreenAction::Activate => {
-                if self.screen == ReadOnlyScreen::Repositories {
-                    self.repository_detail = self.repositories.selected_id.clone()
+            ScreenAction::Activate => match self.screen {
+                ReadOnlyScreen::Repositories => {
+                    self.repository_detail = self.repositories.selected_id.clone();
                 }
+                ReadOnlyScreen::Runners => {
+                    self.runner_detail = self.runners.selected_id.clone();
+                }
+                ReadOnlyScreen::Activity => {
+                    if let Some(id) = &self.activity.selected_id {
+                        self.acknowledged_activity.insert(id.clone());
+                    }
+                }
+                ReadOnlyScreen::Dashboard => {}
+            },
+            ScreenAction::CloseRepositoryDetail => {
+                self.repository_detail = None;
+                self.runner_detail = None;
             }
-            ScreenAction::CloseRepositoryDetail => self.repository_detail = None,
             ScreenAction::OpenRepositoryByMouse(id) => {
                 if self.snapshot.repositories.iter().any(|row| row.id == id) {
                     self.repositories.selected_id = Some(id.clone());
@@ -355,6 +379,15 @@ impl ScreenModel {
         {
             self.repository_detail = None;
         }
+        if self
+            .runner_detail
+            .as_ref()
+            .is_some_and(|id| !self.snapshot.runners.iter().any(|row| &row.id == id))
+        {
+            self.runner_detail = None;
+        }
+        self.acknowledged_activity
+            .retain(|id| self.snapshot.activity.iter().any(|row| &row.id == id));
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -476,10 +509,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel) {
     let border = match model.snapshot.availability {
         Availability::Ready => Style::default(),
         Availability::Loading => Style::default().fg(Color::Cyan),
-        Availability::Unauthorized | Availability::Offline { .. } => {
-            Style::default().fg(Color::Red)
+        Availability::Unauthorized
+        | Availability::Offline { .. }
+        | Availability::Forbidden { .. }
+        | Availability::Failed { .. } => Style::default().fg(Color::Red),
+        Availability::RateLimited { .. } | Availability::Cancelled => {
+            Style::default().fg(Color::Yellow)
         }
-        Availability::RateLimited { .. } => Style::default().fg(Color::Yellow),
     };
     frame.render_widget(
         Paragraph::new(Text::from(text.lines().map(Line::from).collect::<Vec<_>>()))
@@ -530,6 +566,26 @@ pub fn render_text(model: &ScreenModel) -> String {
                 common
             }
         }
+        Availability::Forbidden { message } => state_panel(
+            "FORBIDDEN",
+            &format!(
+                "GitHub is reachable but refused this target: {}",
+                message
+                    .as_deref()
+                    .unwrap_or("required permission is missing")
+            ),
+            "Action: verify repository access and GitHub App/user permissions",
+        ),
+        Availability::Failed { detail } => state_panel(
+            "REFRESH FAILED",
+            &format!("GitHub answered, but inventory could not be collected: {detail}"),
+            "Action: open Activity & errors and retry with F5",
+        ),
+        Availability::Cancelled => state_panel(
+            "REFRESH CANCELLED",
+            "The previous inventory collection was superseded or the TUI is stopping.",
+            "Action: F5 starts one latest refresh",
+        ),
         Availability::Ready => render_ready(model),
     }
 }
@@ -670,6 +726,25 @@ fn render_repositories(model: &ScreenModel) -> String {
     )
 }
 fn render_runners(model: &ScreenModel) -> String {
+    if let Some(detail_id) = model.runner_detail.as_deref()
+        && let Some(row) = model
+            .snapshot
+            .runners
+            .iter()
+            .find(|row| row.id == detail_id)
+    {
+        return format!(
+            "RUNNER INSPECTION\nName: {}\nOwner: {}\nOwnership: {}\nOS: {}\nLabels: {}\nOnline: {}\nBusy: {}\nEphemeral: {}\nAction: Esc returns to the runner list",
+            row.name,
+            row.owner,
+            row.ownership.marker(),
+            row.os,
+            row.labels.join(","),
+            row.online,
+            row.busy,
+            row.ephemeral,
+        );
+    }
     let rows = model
         .visible_runner_ids()
         .into_iter()
@@ -731,6 +806,11 @@ fn render_activity(model: &ScreenModel) -> String {
                     (
                         row.id.clone(),
                         vec![
+                            if model.acknowledged_activity.contains(&row.id) {
+                                "[acknowledged]".into()
+                            } else {
+                                "[new]".into()
+                            },
                             row.occurred_at.clone(),
                             row.outcome.marker().into(),
                             copy_safe(&row.summary),
@@ -743,7 +823,7 @@ fn render_activity(model: &ScreenModel) -> String {
     format!(
         "Diagnostics are redacted and copy-safe. Acknowledge: Enter | Copy: c\n{}",
         render_table(
-            &["When", "Outcome", "Summary", "Remediation"],
+            &["Ack", "When", "Outcome", "Summary", "Remediation"],
             &rows,
             model.activity.selected_id.as_deref(),
             model.activity.scroll,
@@ -959,11 +1039,11 @@ mod tests {
         Runners/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Runners/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         Activity/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Activity/populated: lines=5 bytes=330 fnv=f13dbe25c3c97173 | Diagnostics are redacted and copy-safe. Acknowledge: Enter | Copy: c
+        Activity/populated: lines=5 bytes=358 fnv=a63d2d99b5477752 | Diagnostics are redacted and copy-safe. Acknowledge: Enter | Copy: c
         Activity/empty: lines=3 bytes=76 fnv=fa5e63cedb79d4d2 | EMPTY | Action: F5 refresh
         Activity/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Activity/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
-        Activity/offline: lines=12 bytes=587 fnv=501054be688113b5 | OFFLINE - no new runners will start | Action: a opens Activity & errors
+        Activity/offline: lines=12 bytes=615 fnv=296c39c4d1433810 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         "###);
     }
 

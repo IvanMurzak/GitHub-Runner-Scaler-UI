@@ -4,10 +4,11 @@
 //! Rendering accepts only immutable [`PresentationState`], so a frame has no
 //! filesystem, store, or network capability.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +30,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
+use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
 use runner_manager_domain::model::{Org, OwnerRepo, ScaleTarget, StartMode};
+use runner_manager_domain::store::Store as _;
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, InventoryGateway, RefreshState, RestInventory,
 };
@@ -184,13 +187,10 @@ pub struct AgentEvent {
 /// the product exposes no inbound control surface and `q` owns only this
 /// reader thread.
 struct LocalAgentEventSource {
-    control: std_mpsc::Sender<SourceControl>,
+    refresh: std_mpsc::SyncSender<()>,
+    stopped: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<CancelToken>>>,
     worker: Option<thread::JoinHandle<()>>,
-}
-
-enum SourceControl {
-    Refresh,
-    Stop,
 }
 
 impl LocalAgentEventSource {
@@ -198,34 +198,54 @@ impl LocalAgentEventSource {
         context: Arc<crate::cli::Context>,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
-        Self::start_with(move || local_agent_event(&context), poll_rate)
+        Self::start_with_cancel(move |cancel| local_agent_event(&context, cancel), poll_rate)
     }
 
+    #[cfg(test)]
     fn start_with(
         produce: impl Fn() -> AgentEvent + Send + 'static,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
+        Self::start_with_cancel(move |_| produce(), poll_rate)
+    }
+
+    fn start_with_cancel(
+        produce: impl Fn(&CancelToken) -> AgentEvent + Send + 'static,
+        poll_rate: Duration,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
         let (events, receiver) = mpsc::unbounded_channel();
-        let (control, controls) = std_mpsc::channel();
+        // Capacity one makes F5 latest-wins: one collection may run and at most
+        // one follow-up may be pending, regardless of key-repeat volume.
+        let (refresh, refreshes) = std_mpsc::sync_channel(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let active = Arc::new(Mutex::new(None));
+        let worker_active = Arc::clone(&active);
         let worker = thread::Builder::new()
             .name("runner-manager-tui-events".to_owned())
             .spawn(move || {
-                let _ = events.send(produce());
                 loop {
-                    match controls.recv_timeout(poll_rate) {
-                        Ok(SourceControl::Stop) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                            break;
-                        }
-                        Ok(SourceControl::Refresh) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    if events.send(produce()).is_err() {
+                    if worker_stopped.load(AtomicOrdering::Acquire) {
                         break;
+                    }
+                    let cancel = CancelToken::new();
+                    *worker_active.lock().unwrap() = Some(cancel.clone());
+                    let event = produce(&cancel);
+                    *worker_active.lock().unwrap() = None;
+                    if worker_stopped.load(AtomicOrdering::Acquire) || events.send(event).is_err() {
+                        break;
+                    }
+                    match refreshes.recv_timeout(poll_rate) {
+                        Ok(()) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
             })?;
         Ok((
             Self {
-                control,
+                refresh,
+                stopped,
+                active,
                 worker: Some(worker),
             },
             receiver,
@@ -233,18 +253,25 @@ impl LocalAgentEventSource {
     }
 
     fn request_refresh(&self) -> io::Result<()> {
-        self.control
-            .send(SourceControl::Refresh)
-            .map_err(|_| io::Error::other("the TUI snapshot source stopped"))
+        match self.refresh.try_send(()) {
+            Ok(()) | Err(std_mpsc::TrySendError::Full(())) => Ok(()),
+            Err(std_mpsc::TrySendError::Disconnected(())) => {
+                Err(io::Error::other("the TUI snapshot source stopped"))
+            }
+        }
     }
 }
 
 impl Drop for LocalAgentEventSource {
     fn drop(&mut self) {
-        let _ = self.control.send(SourceControl::Stop);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        self.stopped.store(true, AtomicOrdering::Release);
+        if let Some(cancel) = self.active.lock().unwrap().as_ref() {
+            cancel.cancel();
         }
+        // A GitHub transport outside the cancellable inventory seam must not
+        // hold terminal restoration hostage. Dropping the JoinHandle detaches;
+        // the stop latch prevents any queued refresh from being drained.
+        self.worker.take();
     }
 }
 
@@ -266,7 +293,7 @@ impl RefreshRequester for NoopRefreshRequester {
     }
 }
 
-fn local_agent_event(context: &crate::cli::Context) -> AgentEvent {
+fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> AgentEvent {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -280,10 +307,10 @@ fn local_agent_event(context: &crate::cli::Context) -> AgentEvent {
             };
         }
     };
-    runtime.block_on(production_agent_event(context))
+    runtime.block_on(production_agent_event(context, cancel))
 }
 
-async fn production_agent_event(context: &crate::cli::Context) -> AgentEvent {
+async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> AgentEvent {
     match crate::cli::status::snapshot(context) {
         Ok(local) => {
             let summary = format!(
@@ -291,7 +318,7 @@ async fn production_agent_event(context: &crate::cli::Context) -> AgentEvent {
                 local.host.in_use,
                 local.policies.len()
             );
-            match production_screen_snapshot(context, &local).await {
+            match production_screen_snapshot(context, &local, cancel).await {
                 Ok(snapshot) => AgentEvent {
                     health: if snapshot.metrics.busy_runners > 0 {
                         Health::Busy
@@ -305,6 +332,11 @@ async fn production_agent_event(context: &crate::cli::Context) -> AgentEvent {
                     summary: format!("{summary} GitHub inventory refresh failed: {detail}"),
                     health: Health::Error,
                     snapshot: Some(Snapshot {
+                        activity: production_activity(context)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .chain(std::iter::once(refresh_activity(&availability, &detail)))
+                            .collect(),
                         availability,
                         ..Snapshot::default()
                     }),
@@ -322,7 +354,10 @@ async fn production_agent_event(context: &crate::cli::Context) -> AgentEvent {
 async fn production_screen_snapshot(
     context: &crate::cli::Context,
     local: &crate::cli::status::StatusDocument,
+    cancel: &CancelToken,
 ) -> Result<Snapshot, (Availability, String)> {
+    let activity =
+        production_activity(context).map_err(|detail| offline_failure(context, detail))?;
     let start_mode = StartMode::from_str(&local.host.service_start_mode).map_err(|error| {
         offline_failure(context, format!("invalid service start mode: {error}"))
     })?;
@@ -341,6 +376,7 @@ async fn production_screen_snapshot(
     if local.policies.is_empty() {
         return Ok(Snapshot {
             availability: Availability::Ready,
+            activity,
             ..Snapshot::default()
         });
     }
@@ -407,7 +443,7 @@ async fn production_screen_snapshot(
             )
         };
         let refreshed = inventory
-            .snapshot(&scope, &CancelToken::new())
+            .snapshot(&scope, cancel)
             .await
             .map_err(|error| inventory_failure(context, &clock, error))?;
         let workflow_count = refreshed.activity.total();
@@ -471,8 +507,160 @@ async fn production_screen_snapshot(
         },
         repositories,
         runners,
-        activity: Vec::new(),
+        activity,
     })
+}
+
+fn production_activity(context: &crate::cli::Context) -> Result<Vec<screens::ActivityRow>, String> {
+    let store = context.store().map_err(|error| error.to_string())?;
+    let attempts = store.attempts().map_err(|error| error.to_string())?;
+    let policies = store.policies().map_err(|error| error.to_string())?;
+    let targets = policies
+        .into_iter()
+        .map(|policy| (policy.id, policy.target.slug()))
+        .collect::<HashMap<_, _>>();
+    Ok(activity_rows(&attempts, &targets))
+}
+
+fn activity_rows(
+    attempts: &[RunnerAttempt],
+    targets: &HashMap<runner_manager_domain::model::PolicyId, String>,
+) -> Vec<screens::ActivityRow> {
+    let mut rows = Vec::new();
+    for attempt in attempts {
+        let target = targets
+            .get(&attempt.policy_id)
+            .map_or("removed policy", String::as_str);
+        let attempt_id = attempt.id.to_string();
+        let occurred_at = attempt
+            .terminal_at()
+            .unwrap_or_else(|| attempt.last_state_change_at())
+            .to_rfc3339();
+        match attempt.outcome() {
+            Some(AttemptOutcome::CompletedJob) => rows.push(screens::ActivityRow {
+                id: format!("{attempt_id}:outcome"),
+                occurred_at: occurred_at.clone(),
+                outcome: screens::ActivityOutcome::Info,
+                summary: format!("Runner attempt {attempt_id} for {target} ran one job."),
+                remediation: "No remediation required.".into(),
+            }),
+            Some(AttemptOutcome::ExitedIdleWithoutWork) => rows.push(screens::ActivityRow {
+                id: format!("{attempt_id}:outcome"),
+                occurred_at: occurred_at.clone(),
+                outcome: screens::ActivityOutcome::ExitedIdleWithoutWork,
+                summary: format!(
+                    "Runner attempt {attempt_id} for {target} exited idle without accepting work."
+                ),
+                remediation: "No remediation required; this is a normal surplus-runner exit."
+                    .into(),
+            }),
+            Some(AttemptOutcome::Failed { reason }) => {
+                rows.push(screens::ActivityRow {
+                    id: format!("{attempt_id}:outcome"),
+                    occurred_at: occurred_at.clone(),
+                    outcome: screens::ActivityOutcome::Failed,
+                    summary: format!("Runner attempt {attempt_id} for {target} failed: {reason}."),
+                    remediation: failure_remediation(reason).into(),
+                });
+                rows.push(screens::ActivityRow {
+                    id: format!("{attempt_id}:retry"),
+                    occurred_at: occurred_at.clone(),
+                    outcome: screens::ActivityOutcome::Retry,
+                    summary: format!(
+                        "Attempt {attempt_id} is terminal; a new attempt is retried only while demand remains."
+                    ),
+                    remediation: "Wait for the bounded automatic retry or address the failure above."
+                        .into(),
+                });
+            }
+            Some(AttemptOutcome::Orphaned) => rows.push(screens::ActivityRow {
+                id: format!("{attempt_id}:outcome"),
+                occurred_at: occurred_at.clone(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: format!("Runner attempt {attempt_id} for {target} became orphaned."),
+                remediation:
+                    "Inspect the local runner process and logs, then restart the service if safe."
+                        .into(),
+            }),
+            None => rows.push(screens::ActivityRow {
+                id: format!("{attempt_id}:state"),
+                occurred_at: occurred_at.clone(),
+                outcome: screens::ActivityOutcome::Info,
+                summary: format!(
+                    "Runner attempt {attempt_id} for {target} is {}.",
+                    attempt.state()
+                ),
+                remediation: "No action required while the lifecycle continues.".into(),
+            }),
+        }
+        if attempt.state() == AttemptState::Cleaned {
+            rows.push(screens::ActivityRow {
+                id: format!("{attempt_id}:cleanup"),
+                occurred_at: attempt.last_state_change_at().to_rfc3339(),
+                outcome: screens::ActivityOutcome::CleanupComplete,
+                summary: format!("Runtime cleanup completed for attempt {attempt_id} ({target})."),
+                remediation: "No remediation required; local resources were released.".into(),
+            });
+        }
+    }
+    rows
+}
+
+fn failure_remediation(reason: &FailureReason) -> &'static str {
+    match reason {
+        FailureReason::JitRequestFailed | FailureReason::JitExpired => {
+            "Verify GitHub connectivity and authorization; retry occurs only while demand remains."
+        }
+        FailureReason::RunnerPackageUnverified => {
+            "Purge the runner package cache and verify the published checksum before retrying."
+        }
+        FailureReason::RunnerVersionRejected => {
+            "Install a supported runner version; retrying the rejected version will not help."
+        }
+        FailureReason::ProcessStartFailed | FailureReason::ProcessExitedUnexpectedly => {
+            "Inspect the local runner log, executable permissions, and process exit details."
+        }
+        FailureReason::RegistrationTimedOut | FailureReason::TerminatedAfterRegistrationTimeout => {
+            "Check this host's network, DNS, proxy, firewall, and GitHub authorization."
+        }
+        FailureReason::Other(_) => "Inspect the local runner log and the copy-safe diagnostic.",
+    }
+}
+
+fn refresh_activity(availability: &Availability, detail: &str) -> screens::ActivityRow {
+    let (outcome, remediation) = match availability {
+        Availability::RateLimited { .. } => (
+            screens::ActivityOutcome::RateLimit,
+            "Wait for the displayed retry delay; F5 requests are coalesced.",
+        ),
+        Availability::Cancelled => (
+            screens::ActivityOutcome::Info,
+            "No action is required when a newer refresh superseded this one.",
+        ),
+        Availability::Unauthorized => (
+            screens::ActivityOutcome::Failed,
+            "Run `runner-manager auth login`.",
+        ),
+        Availability::Forbidden { .. } => (
+            screens::ActivityOutcome::Failed,
+            "Verify repository access and GitHub App/user permissions.",
+        ),
+        Availability::Offline { .. } => (
+            screens::ActivityOutcome::Retry,
+            "Check network, DNS, proxy, and system clock; retry is automatic.",
+        ),
+        Availability::Failed { .. } | Availability::Loading | Availability::Ready => (
+            screens::ActivityOutcome::Failed,
+            "Inspect the copy-safe diagnostic and retry with F5.",
+        ),
+    };
+    screens::ActivityRow {
+        id: "github-inventory-refresh".into(),
+        occurred_at: "current refresh".into(),
+        outcome,
+        summary: screens::copy_safe(detail),
+        remediation: remediation.into(),
+    }
 }
 
 fn inventory_failure(
@@ -481,7 +669,16 @@ fn inventory_failure(
     error: InventoryError,
 ) -> (Availability, String) {
     let state = RefreshState::from_error(&error);
-    let availability = match state {
+    let availability = availability_from_refresh_state(context, clock, &state);
+    (availability, error.to_string())
+}
+
+fn availability_from_refresh_state(
+    context: &crate::cli::Context,
+    clock: &Arc<dyn runner_manager_domain::model::Clock>,
+    state: &RefreshState,
+) -> Availability {
+    match state {
         RefreshState::Unauthorized => Availability::Unauthorized,
         RefreshState::RateLimited(_) | RefreshState::LockedOut { .. } => {
             Availability::RateLimited {
@@ -491,9 +688,18 @@ fn inventory_failure(
                     .as_secs(),
             }
         }
-        _ => offline_availability(context),
-    };
-    (availability, error.to_string())
+        RefreshState::Offline => offline_availability(context),
+        RefreshState::Forbidden { message } => Availability::Forbidden {
+            message: message.clone(),
+        },
+        RefreshState::Failed { message, .. } => Availability::Failed {
+            detail: message.clone(),
+        },
+        RefreshState::Cancelled => Availability::Cancelled,
+        RefreshState::Ready(_) => Availability::Failed {
+            detail: "inventory failure unexpectedly mapped to a ready state".into(),
+        },
+    }
 }
 
 fn offline_failure(context: &crate::cli::Context, detail: String) -> (Availability, String) {
@@ -784,6 +990,25 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('s') => state.open_screen(Screen::RepositorySettings),
         KeyCode::Char('h') => state.open_screen(Screen::HostSettings),
         KeyCode::Char('a') => state.open_screen(Screen::Activity),
+        KeyCode::Char('o') => {
+            let current = match state.screen_model.screen {
+                ReadOnlyScreen::Repositories => state.screen_model.repositories.sort_order,
+                ReadOnlyScreen::Runners => state.screen_model.runners.sort_order,
+                ReadOnlyScreen::Activity => state.screen_model.activity.sort_order,
+                ReadOnlyScreen::Dashboard => screens::SortOrder::NameAscending,
+            };
+            let next = match (state.screen_model.screen, current) {
+                (ReadOnlyScreen::Repositories, screens::SortOrder::NameAscending) => {
+                    screens::SortOrder::NameDescending
+                }
+                (ReadOnlyScreen::Repositories, screens::SortOrder::NameDescending) => {
+                    screens::SortOrder::WorkloadDescending
+                }
+                (_, screens::SortOrder::NameAscending) => screens::SortOrder::NameDescending,
+                _ => screens::SortOrder::NameAscending,
+            };
+            state.screen_model.apply(ScreenAction::SetSort(next));
+        }
         KeyCode::Char('/') => state.filtering = true,
         KeyCode::F(5) => return vec![Effect::Refresh],
         KeyCode::Char('?') => state.help_open = !state.help_open,
@@ -803,7 +1028,9 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Esc => {
             if state.help_open {
                 state.help_open = false;
-            } else if state.screen_model.repository_detail.is_some() {
+            } else if state.screen_model.repository_detail.is_some()
+                || state.screen_model.runner_detail.is_some()
+            {
                 state
                     .screen_model
                     .apply(ScreenAction::CloseRepositoryDetail);
@@ -978,7 +1205,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         format!("? help | q quit | {capture}")
     } else {
         format!(
-            "Tab/arrows focus | Enter activate | / filter | F5 refresh | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
+            "Tab/arrows focus | Enter activate | / filter | o sort | F5 refresh | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
         )
     };
     frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[3]);
@@ -1012,9 +1239,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, compact: bool) {
         height,
     );
     let help = if compact {
-        "d Dashboard  r Repositories  n Runners\ns Repo settings  h Host settings  a Activity\n/ Filter F5 Refresh ? Help Esc Back q Quit\nTab Shift-Tab Arrows Focus  Enter Activate\nc Copy diagnostics  m Mouse capture\nKeys mirror every mouse action"
+        "d Dashboard  r Repositories  n Runners\ns Repo settings  h Host settings  a Activity\n/ Filter F5 Refresh ? Help Esc Back q Quit\nTab Shift-Tab Arrows Focus  Enter Activate\nc Copy diagnostics  m Mouse capture  o Sort\nKeys mirror every mouse action"
     } else {
-        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nMouse actions always have the keyboard equivalents above."
+        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   o sort   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nMouse actions always have the keyboard equivalents above."
     };
     frame.render_widget(Clear, popup);
     let title = if compact {
@@ -2151,6 +2378,213 @@ mod tests {
         );
         let mouse_detail = rendered(120, 30, &mouse_state);
         assert!(mouse_detail.contains("REPOSITORY DETAIL"), "{mouse_detail}");
+    }
+
+    #[test]
+    fn production_keys_sort_inspect_runners_and_acknowledge_the_displayed_activity() {
+        let snapshot = Snapshot {
+            availability: Availability::Ready,
+            runners: vec![
+                RunnerRow {
+                    id: "runner-a".into(),
+                    name: "alpha".into(),
+                    owner: "acme/alpha".into(),
+                    os: "linux".into(),
+                    labels: vec!["self-hosted".into()],
+                    online: true,
+                    busy: false,
+                    ephemeral: true,
+                    ownership: RunnerOwnership::Local,
+                },
+                RunnerRow {
+                    id: "runner-z".into(),
+                    name: "zulu".into(),
+                    owner: "acme/zulu".into(),
+                    os: "windows".into(),
+                    labels: vec!["external".into()],
+                    online: false,
+                    busy: false,
+                    ephemeral: false,
+                    ownership: RunnerOwnership::External,
+                },
+            ],
+            activity: vec![screens::ActivityRow {
+                id: "visible-activity".into(),
+                occurred_at: "now".into(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: "visible failure".into(),
+                remediation: "inspect the runner log".into(),
+            }],
+            ..Snapshot::default()
+        };
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        reduce(
+            &mut state,
+            AppEvent::Agent(AgentEvent {
+                summary: "production snapshot".into(),
+                health: Health::Ready,
+                snapshot: Some(snapshot),
+            }),
+        );
+
+        reduce(&mut state, key(KeyCode::Char('n')));
+        reduce(&mut state, key(KeyCode::Char('o')));
+        assert_eq!(
+            state.screen_model.runners.sort_order,
+            screens::SortOrder::NameDescending
+        );
+        let sorted = screens::render_text(&state.screen_model);
+        assert!(
+            sorted.find("zulu").unwrap() < sorted.find("alpha").unwrap(),
+            "{sorted}"
+        );
+        reduce(&mut state, key(KeyCode::Enter));
+        assert!(screens::render_text(&state.screen_model).contains("RUNNER INSPECTION"));
+        assert!(screens::render_text(&state.screen_model).contains("Name: alpha"));
+
+        reduce(&mut state, key(KeyCode::Char('a')));
+        assert!(screens::render_text(&state.screen_model).contains("[new]"));
+        reduce(&mut state, key(KeyCode::Enter));
+        let activity = screens::render_text(&state.screen_model);
+        assert!(activity.contains("[acknowledged]"), "{activity}");
+        assert!(!activity.contains("> [new]"), "{activity}");
+    }
+
+    #[test]
+    fn durable_attempts_render_outcomes_retry_cleanup_and_remediation() {
+        use runner_manager_domain::model::{AttemptId, PolicyId};
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-23T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let policy = PolicyId::from_u128(7);
+        let mut idle = RunnerAttempt::allocate(AttemptId::from_u128(1), policy, "idle", at);
+        idle.jit_received(at).unwrap();
+        idle.started(10, at).unwrap();
+        idle.registered_idle(100, at).unwrap();
+        idle.conclude(AttemptOutcome::ExitedIdleWithoutWork, at)
+            .unwrap();
+        idle.clean(at).unwrap();
+        let mut failed = RunnerAttempt::allocate(AttemptId::from_u128(2), policy, "failed", at);
+        failed
+            .conclude(
+                AttemptOutcome::failed(FailureReason::RegistrationTimedOut),
+                at,
+            )
+            .unwrap();
+        let targets = HashMap::from([(policy, "acme/repo".to_owned())]);
+
+        let rows = activity_rows(&[idle, failed], &targets);
+        assert!(rows.iter().any(|row| {
+            row.outcome == screens::ActivityOutcome::ExitedIdleWithoutWork
+                && row.summary.contains("exited idle without accepting work")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.outcome == screens::ActivityOutcome::Failed
+                && row.remediation.contains("network, DNS, proxy, firewall")
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.outcome == screens::ActivityOutcome::Retry)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.outcome == screens::ActivityOutcome::CleanupComplete)
+        );
+    }
+
+    #[test]
+    fn production_inventory_mapping_preserves_non_transport_meaning() {
+        let root = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        let context = crate::cli::Context::resolve(Some(root.path()), &mut warnings).unwrap();
+        let clock = context.clock();
+        let offline = availability_from_refresh_state(&context, &clock, &RefreshState::Offline);
+        let forbidden = availability_from_refresh_state(
+            &context,
+            &clock,
+            &RefreshState::Forbidden {
+                message: Some("missing administration grant".into()),
+            },
+        );
+        let failed = availability_from_refresh_state(
+            &context,
+            &clock,
+            &RefreshState::Failed {
+                status: Some(500),
+                message: "server error".into(),
+            },
+        );
+        let cancelled = availability_from_refresh_state(&context, &clock, &RefreshState::Cancelled);
+        assert!(matches!(offline, Availability::Offline { .. }));
+        assert_eq!(
+            forbidden,
+            Availability::Forbidden {
+                message: Some("missing administration grant".into())
+            }
+        );
+        assert_eq!(
+            failed,
+            Availability::Failed {
+                detail: "server error".into()
+            }
+        );
+        assert_eq!(cancelled, Availability::Cancelled);
+    }
+
+    #[test]
+    fn repeated_f5_is_coalesced_and_drop_does_not_drain_or_wait_for_collection() {
+        use std::sync::atomic::AtomicUsize;
+
+        let collections = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new((Mutex::new(0_usize), std::sync::Condvar::new()));
+        let worker_collections = Arc::clone(&collections);
+        let worker_releases = Arc::clone(&releases);
+        let (source, _events) = LocalAgentEventSource::start_with(
+            move || {
+                let number = worker_collections.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                let (lock, ready) = &*worker_releases;
+                let mut released = lock.lock().unwrap();
+                while *released < number {
+                    released = ready.wait(released).unwrap();
+                }
+                AgentEvent {
+                    summary: format!("collection {number}"),
+                    health: Health::Ready,
+                    snapshot: None,
+                }
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        while collections.load(AtomicOrdering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        for _ in 0..100 {
+            source.request_refresh().unwrap();
+        }
+        {
+            let (lock, ready) = &*releases;
+            *lock.lock().unwrap() = 1;
+            ready.notify_all();
+        }
+        for _ in 0..1000 {
+            if collections.load(AtomicOrdering::SeqCst) >= 2 {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(collections.load(AtomicOrdering::SeqCst), 2);
+        let before_drop = Instant::now();
+        drop(source);
+        assert!(before_drop.elapsed() < Duration::from_millis(50));
+        {
+            let (lock, ready) = &*releases;
+            *lock.lock().unwrap() = 2;
+            ready.notify_all();
+        }
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(collections.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[test]
