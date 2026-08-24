@@ -203,7 +203,7 @@ jobs:
       tag: v${{ inputs.version }}
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Step 1 - the version input must be X.Y.Z
         env:
@@ -330,7 +330,7 @@ jobs:
       # `release.sh` subcommand, so that `preflight` and `build` cannot drift
       # into asserting two different things.
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Assert this label is a native runner for ${{ matrix.target }}
         env:
@@ -389,7 +389,7 @@ jobs:
           echo "releasing from branch ${REF_NAME}"
 
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install the toolchain pinned by rust-toolchain.toml
         run: |
@@ -507,7 +507,7 @@ jobs:
             archive: tar.gz
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           # The commit the `tag` job created, not the dispatched ref: the
           # artifacts must carry the version that was just written.
@@ -603,7 +603,7 @@ jobs:
           cat "dist/${STEM}.sha256"
 
       - name: Upload this target's archive and checksum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -639,7 +639,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.sha }}
 
@@ -689,7 +689,7 @@ jobs:
           cat "dist/${name}.sha256"
 
       - name: Upload the SBOM and its checksum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-sbom
           path: dist/runner-manager-*
@@ -708,12 +708,12 @@ jobs:
       contents: write
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.sha }}
 
       - name: Collect every build leg's output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: release-*
@@ -891,7 +891,7 @@ jobs:
       contents: write
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.sha }}
 
@@ -1122,7 +1122,7 @@ jobs:
           cat dist-brew/runner-manager.rb
 
       - name: Set up Node with the npm registry configured
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -1210,7 +1210,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the rendered channel manifests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # The `release-` prefix keeps it collectable by the same
           # `download-artifact` pattern every other producer here uses.
