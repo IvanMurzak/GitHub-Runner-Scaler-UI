@@ -401,49 +401,16 @@ fn set_capacity(
     raw_maximum: u16,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let maximum = non_zero_capacity(raw_maximum)?;
-    let store = context.store()?;
-    let mut policy = find_policy(&store, &target)?;
-    let expected = policy.revision();
-    if policy.routing_labels().is_none() {
-        let host = store
-            .host(policy.host_id)
-            .map_err(store_failure)?
-            .ok_or_else(|| {
-                CliError::new(
-                    Failure::LocalState,
-                    format!("policy {target} refers to a missing local host"),
-                )
-            })?;
-        policy
-            .promote_to_autoscale(
-                RoutingLabels::derive(&policy.requested_host_label, host.os, host.architecture),
-                0,
-                maximum,
-            )
-            .map_err(invalid)?;
-    } else {
-        policy.set_max_capacity(maximum).map_err(invalid)?;
-    }
-    store
-        .update_policy(&policy, expected)
-        .map_err(store_failure)?;
-    let failed = write_failed("this capacity result");
-    writeln!(
+    apply_policy_mutation(
+        context,
+        &target,
+        PolicyMutation {
+            max_capacity: Some(raw_maximum),
+            ..PolicyMutation::default()
+        },
+        None,
         out,
-        "{} max capacity is now {maximum}; scaling remains {}.",
-        target,
-        if policy.enabled() {
-            "enabled"
-        } else {
-            "disabled"
-        }
     )
-    .map_err(failed)?;
-    if let Some(labels) = policy.routing_labels() {
-        writeln!(out, "Routing label: {}", labels.host_label()).map_err(failed)?;
-    }
-    Ok(())
 }
 
 fn set_scale(
@@ -452,12 +419,9 @@ fn set_scale(
     enabled: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let store = context.store()?;
-    let policy = find_policy(&store, &target)?;
-    let attempts = store
-        .attempts_for_policy(policy.id)
-        .map_err(store_failure)?;
-    let active = active_count_for(policy.id, attempts.iter());
+    let observation = observe_scale(context, &target)?;
+    let active = observation.active;
+    let mut confirmation = None;
     if !enabled && active > 0 {
         let stdin = io::stdin();
         if !confirm_disable(active, out, &mut stdin.lock())? {
@@ -466,8 +430,212 @@ fn set_scale(
                 "disable cancelled; the policy was not changed",
             ));
         }
+        confirmation = Some(observation);
     }
-    apply_scale(&store, policy, enabled, active, out)
+    apply_scale_confirmed(context, &target, enabled, confirmation, out)
+}
+
+/// What was observed before asking an operator to drain active work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleObservation {
+    pub active: u16,
+    policy_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyMutation {
+    pub max_capacity: Option<u16>,
+    pub enabled: Option<bool>,
+    pub cache_policy: Option<CachePolicy>,
+}
+
+/// Re-observes the policy and active work without prompting. TUI code uses
+/// this before displaying its own non-blocking confirmation.
+pub fn observe_scale(
+    context: &Context,
+    target: &ScaleTarget,
+) -> Result<ScaleObservation, CliError> {
+    let store = context.store()?;
+    let policy = find_policy(&store, target)?;
+    let attempts = store
+        .attempts_for_policy(policy.id)
+        .map_err(store_failure)?;
+    Ok(ScaleObservation {
+        active: active_count_for(policy.id, attempts.iter()),
+        policy_revision: policy.revision(),
+    })
+}
+
+/// Shared post-confirmation mutation used by both CLI and TUI.
+///
+/// A disable confirmation is valid only for the exact policy revision and
+/// active count the operator saw. If either changed, no mutation occurs and
+/// the caller must render a fresh confirmation. This closes the stdin/TUI
+/// time-of-check/time-of-use gap without ever reading stdin in the TUI loop.
+pub fn apply_scale_confirmed(
+    context: &Context,
+    target: &ScaleTarget,
+    enabled: bool,
+    confirmation: Option<ScaleObservation>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    apply_policy_mutation(
+        context,
+        target,
+        PolicyMutation {
+            enabled: Some(enabled),
+            ..PolicyMutation::default()
+        },
+        confirmation,
+        out,
+    )
+}
+
+/// Applies a complete policy form as one optimistic, atomic store update.
+/// Every requested domain transition is validated in memory before the single
+/// write, so a late capacity/cache/confirmation failure leaves every column
+/// unchanged.
+pub fn apply_policy_mutation(
+    context: &Context,
+    target: &ScaleTarget,
+    mutation: PolicyMutation,
+    confirmation: Option<ScaleObservation>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let store = context.store()?;
+    let mut policy = find_policy(&store, target)?;
+    let expected = policy.revision();
+    let attempts = store
+        .attempts_for_policy(policy.id)
+        .map_err(store_failure)?;
+    let observed_active = active_count_for(policy.id, attempts.iter());
+    let mut active = observed_active;
+    let mut guarded_revision = expected;
+    let mut guarded_active = None;
+    if mutation.enabled == Some(false) {
+        if let Some(confirmed) = confirmation {
+            // Use the exact values shown to the operator for both the domain
+            // transition and the transactional predicates below. A newer
+            // preflight read must never silently replace the confirmation.
+            active = confirmed.active;
+            guarded_revision = confirmed.policy_revision;
+            guarded_active = Some(confirmed.active);
+        } else if observed_active > 0 {
+            return Err(CliError::new(
+                Failure::Conflict,
+                format!(
+                    "{observed_active} active runner(s) must be confirmed before disabling; nothing was changed"
+                ),
+            ));
+        } else {
+            // Even an unprompted zero-active disable needs the count predicate:
+            // an allocation racing this command must not slip between the read
+            // and persistence.
+            guarded_active = Some(0);
+        }
+    }
+
+    let maximum = mutation.max_capacity.map(non_zero_capacity).transpose()?;
+    if let Some(maximum) = maximum {
+        if policy.routing_labels().is_none() {
+            let host = store
+                .host(policy.host_id)
+                .map_err(store_failure)?
+                .ok_or_else(|| {
+                    CliError::new(
+                        Failure::LocalState,
+                        format!("policy {target} refers to a missing local host"),
+                    )
+                })?;
+            policy
+                .promote_to_autoscale(
+                    RoutingLabels::derive(&policy.requested_host_label, host.os, host.architecture),
+                    0,
+                    maximum,
+                )
+                .map_err(invalid)?;
+        } else {
+            policy.set_max_capacity(maximum).map_err(invalid)?;
+        }
+    }
+
+    if let Some(enabled) = mutation.enabled {
+        if enabled {
+            if policy.routing_labels().is_none() {
+                return Err(CliError::with_remedy(
+                    Failure::InvalidArgument,
+                    "monitor-only policies cannot be enabled; no routing label or capacity is reserved",
+                    format!(
+                        "runner-manager {} set-capacity {} --max-capacity N",
+                        scope_word(policy.target.scope()),
+                        policy.target
+                    ),
+                ));
+            }
+            if !policy.enabled() {
+                if policy.state() == PolicyState::Disabled {
+                    policy
+                        .transition_to(PolicyState::Pending)
+                        .map_err(invalid)?;
+                }
+                policy.activate().map_err(invalid)?;
+            }
+        } else if policy.enabled() {
+            policy.request_disable().map_err(invalid)?;
+            if active == 0 {
+                policy.drain_completed(0).map_err(invalid)?;
+            }
+        }
+    }
+
+    if let Some(cache_policy) = mutation.cache_policy
+        && policy.cache_policy != cache_policy
+    {
+        let mut fields = policy.to_persisted();
+        fields.cache_policy = cache_policy;
+        fields.revision = fields.revision.saturating_add(1);
+        policy = ScalePolicy::from_persisted(fields).map_err(invalid)?;
+    }
+
+    if policy.revision() != expected {
+        if let Some(expected_active) = guarded_active {
+            store
+                .update_policy_confirming_active_count(&policy, guarded_revision, expected_active)
+                .map_err(store_failure)?;
+        } else {
+            store
+                .update_policy(&policy, expected)
+                .map_err(store_failure)?;
+        }
+    }
+
+    if let Some(maximum) = maximum {
+        let failed = write_failed("this capacity result");
+        writeln!(
+            out,
+            "{} max capacity is now {maximum}; scaling remains {}.",
+            target,
+            if policy.enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )
+        .map_err(failed)?;
+        if let Some(labels) = policy.routing_labels() {
+            writeln!(out, "Routing label: {}", labels.host_label()).map_err(failed)?;
+        }
+    }
+    if let Some(enabled) = mutation.enabled {
+        let failed = write_failed("this scale result");
+        if enabled {
+            writeln!(out, "Scaling enabled for {}.", policy.target).map_err(failed)?;
+            writeln!(out, "{TRUST_WARNING}").map_err(failed)?;
+        } else {
+            writeln!(out, "{} is {} with {active} active runner(s); busy runners were not terminated. Cache and historical diagnostics were preserved.", policy.target, if active == 0 { "disabled" } else { "draining" }).map_err(failed)?;
+        }
+    }
+    Ok(())
 }
 
 fn confirm_disable(
@@ -493,56 +661,6 @@ fn confirm_disable(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-fn apply_scale(
-    store: &dyn Store,
-    mut policy: ScalePolicy,
-    enabled: bool,
-    active: u16,
-    out: &mut dyn Write,
-) -> Result<(), CliError> {
-    let expected = policy.revision();
-    if enabled {
-        if policy.routing_labels().is_none() {
-            return Err(CliError::with_remedy(
-                Failure::InvalidArgument,
-                "monitor-only policies cannot be enabled; no routing label or capacity is reserved",
-                format!(
-                    "runner-manager {} set-capacity {} --max-capacity N",
-                    scope_word(policy.target.scope()),
-                    policy.target
-                ),
-            ));
-        }
-        if !policy.enabled() {
-            if policy.state() == PolicyState::Disabled {
-                policy
-                    .transition_to(PolicyState::Pending)
-                    .map_err(invalid)?;
-            }
-            policy.activate().map_err(invalid)?;
-            store
-                .update_policy(&policy, expected)
-                .map_err(store_failure)?;
-        }
-        let failed = write_failed("this scale result");
-        writeln!(out, "Scaling enabled for {}.", policy.target).map_err(failed)?;
-        writeln!(out, "{TRUST_WARNING}").map_err(failed)?;
-    } else {
-        if policy.enabled() {
-            policy.request_disable().map_err(invalid)?;
-            if active == 0 {
-                policy.drain_completed(0).map_err(invalid)?;
-            }
-            store
-                .update_policy(&policy, expected)
-                .map_err(store_failure)?;
-        }
-        let failed = write_failed("this scale result");
-        writeln!(out, "{} is {} with {active} active runner(s); busy runners were not terminated. Cache and historical diagnostics were preserved.", policy.target, if active == 0 { "disabled" } else { "draining" }).map_err(failed)?;
-    }
-    Ok(())
 }
 
 fn remove(
@@ -721,6 +839,19 @@ mod tests {
             expected_revision: u64,
         ) -> Result<(), StoreError> {
             self.inner.update_policy(policy, expected_revision)
+        }
+
+        fn update_policy_confirming_active_count(
+            &self,
+            policy: &ScalePolicy,
+            expected_revision: u64,
+            expected_active: u16,
+        ) -> Result<(), StoreError> {
+            self.inner.update_policy_confirming_active_count(
+                policy,
+                expected_revision,
+                expected_active,
+            )
         }
 
         fn remove_policy(&self, id: PolicyId, expected_revision: u64) -> Result<(), StoreError> {
@@ -1072,12 +1203,15 @@ mod tests {
 
     #[test]
     fn disabling_with_work_in_flight_drains_without_terminating_it() {
-        let store = SqliteStore::open_in_memory().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
         let local = host("home");
         store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
         let mut policy = ScalePolicy::new(
             PolicyId::new_random(),
-            targets()[0].clone(),
+            target.clone(),
             77,
             local.id,
             PolicyMode::autoscale(
@@ -1094,9 +1228,21 @@ mod tests {
         );
         policy.activate().unwrap();
         store.insert_policy(&policy).unwrap();
+        for id in 1..=2 {
+            store
+                .record_attempt(&RunnerAttempt::allocate(
+                    AttemptId::from_u128(id),
+                    policy.id,
+                    format!("active-{id}"),
+                    chrono::DateTime::from_timestamp(1_700_000_000 + id as i64, 0).unwrap(),
+                ))
+                .unwrap();
+        }
+        drop(store);
+        let observation = observe_scale(&context, &target).unwrap();
         let mut output = Vec::new();
-        apply_scale(&store, policy, false, 2, &mut output).unwrap();
-        let stored = store.policies().unwrap().remove(0);
+        apply_scale_confirmed(&context, &target, false, Some(observation), &mut output).unwrap();
+        let stored = context.store().unwrap().policies().unwrap().remove(0);
         assert_eq!(stored.state(), PolicyState::Draining);
         assert!(!stored.enabled());
         let text = String::from_utf8(output).unwrap();
@@ -1112,5 +1258,174 @@ mod tests {
         assert!(prompt.contains("3 active runner(s)"), "{prompt}");
         assert!(prompt.contains("left to finish"), "{prompt}");
         assert!(confirm_disable(3, &mut Vec::new(), &mut io::Cursor::new(b"yes\n")).unwrap());
+    }
+
+    #[test]
+    fn post_confirmation_seam_refuses_when_active_work_changes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        store.insert_policy(&policy).unwrap();
+        drop(store);
+
+        let confirmed = observe_scale(&context, &target).unwrap();
+        assert_eq!(confirmed.active, 0);
+        let store = context.store().unwrap();
+        store
+            .record_attempt(&RunnerAttempt::allocate(
+                AttemptId::new_random(),
+                policy.id,
+                "new-active-work",
+                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+            ))
+            .unwrap();
+        drop(store);
+
+        let error =
+            apply_scale_confirmed(&context, &target, false, Some(confirmed), &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.class(), Failure::Conflict);
+        assert!(
+            find_policy(&context.store().unwrap(), &target)
+                .unwrap()
+                .enabled()
+        );
+    }
+
+    #[test]
+    fn drain_confirmation_refuses_the_same_active_count_at_a_new_revision() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        store.insert_policy(&policy).unwrap();
+        store
+            .record_attempt(&RunnerAttempt::allocate(
+                AttemptId::new_random(),
+                policy.id,
+                "active-work",
+                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+            ))
+            .unwrap();
+        drop(store);
+
+        let confirmed = observe_scale(&context, &target).unwrap();
+        apply_policy_mutation(
+            &context,
+            &target,
+            PolicyMutation {
+                max_capacity: Some(3),
+                ..PolicyMutation::default()
+            },
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let before = find_policy(&context.store().unwrap(), &target).unwrap();
+        assert_eq!(confirmed.active, 1);
+
+        let error =
+            apply_scale_confirmed(&context, &target, false, Some(confirmed), &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.class(), Failure::Conflict);
+        assert_eq!(
+            find_policy(&context.store().unwrap(), &target).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn drain_confirmation_refuses_when_active_work_falls_to_zero() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        store.insert_policy(&policy).unwrap();
+        let attempt_id = AttemptId::new_random();
+        store
+            .record_attempt(&RunnerAttempt::allocate(
+                attempt_id,
+                policy.id,
+                "active-work",
+                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+            ))
+            .unwrap();
+        drop(store);
+
+        let confirmed = observe_scale(&context, &target).unwrap();
+        assert_eq!(confirmed.active, 1);
+        context.store().unwrap().remove_attempt(attempt_id).unwrap();
+        let before = find_policy(&context.store().unwrap(), &target).unwrap();
+
+        let error =
+            apply_scale_confirmed(&context, &target, false, Some(confirmed), &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.class(), Failure::Conflict);
+        assert_eq!(
+            find_policy(&context.store().unwrap(), &target).unwrap(),
+            before
+        );
+        assert!(before.enabled());
     }
 }
