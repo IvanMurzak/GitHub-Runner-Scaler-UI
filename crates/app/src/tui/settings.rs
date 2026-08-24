@@ -18,19 +18,19 @@ use ratatui::{
 };
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::capacity::HostAllocator;
-use runner_manager_domain::model::{
-    CachePolicy, RefreshInterval, ScaleTarget, StartMode, TargetScope,
-};
+#[cfg(test)]
+use runner_manager_domain::model::TargetScope;
+use runner_manager_domain::model::{CachePolicy, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_platform::service::{ServiceError, ServiceOperations};
 
-use crate::cli::{
-    self, CliError, Context, Failure, HostSetCapacityArgs, OrgCommand, OrgSetCapacityArgs,
-    RepoCommand, RepoSetCapacityArgs,
-};
+use crate::cli::{self, CliError, Context, Failure, HostSetCapacityArgs};
 #[cfg(test)]
-use crate::cli::{OrgSetScaleArgs, RepoSetScaleArgs};
+use crate::cli::{
+    OrgCommand, OrgSetCapacityArgs, OrgSetScaleArgs, RepoCommand, RepoSetCapacityArgs,
+    RepoSetScaleArgs,
+};
 
 pub const MAX_FOCUSED_FORM_ACTIONS: u8 = 5;
 pub const FORK_TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
@@ -248,52 +248,20 @@ impl PolicySettings {
         &self,
         context: &Context,
         draft: &PolicyDraft,
-        drain_confirmed: bool,
+        drain_confirmation: Option<cli::policy::ScaleObservation>,
         out: &mut dyn Write,
     ) -> Result<(), CliError> {
-        if self.preview(draft).drain_confirmation_required && !drain_confirmed {
-            return Err(CliError::new(
-                Failure::Conflict,
-                format!(
-                    "disable cancelled; {} active runner(s) must be left to finish while the policy drains",
-                    self.active_runners
-                ),
-            ));
-        }
-        let apply_scale = |enabled: bool, out: &mut dyn Write| {
-            let confirmation = if !enabled && self.active_runners > 0 {
-                let observed = cli::policy::observe_scale(context, &self.target)?;
-                if observed.active != self.active_runners {
-                    return Err(CliError::new(
-                        Failure::Conflict,
-                        format!(
-                            "active work changed while confirming the drain (was {}, now {}); review and confirm again",
-                            self.active_runners, observed.active
-                        ),
-                    ));
-                }
-                Some(observed)
-            } else {
-                None
-            };
-            cli::policy::apply_scale_confirmed(context, &self.target, enabled, confirmation, out)
-        };
-        // A disable goes first so a stale drain confirmation cannot leave a
-        // capacity/cache edit partially applied. Enablement follows capacity
-        // because a monitor-only policy must be promoted before it can arm.
-        if draft.enabled == Some(false) {
-            apply_scale(false, out)?;
-        }
-        if let Some(maximum) = draft.max_capacity {
-            dispatch_capacity(context, &self.target, maximum, out)?;
-        }
-        if draft.enabled == Some(true) {
-            apply_scale(true, out)?;
-        }
-        if let Some(cache_policy) = draft.cache_policy {
-            set_cache_policy(context, &self.target, cache_policy)?;
-        }
-        Ok(())
+        cli::policy::apply_policy_mutation(
+            context,
+            &self.target,
+            cli::policy::PolicyMutation {
+                max_capacity: draft.max_capacity,
+                enabled: draft.enabled,
+                cache_policy: draft.cache_policy,
+            },
+            drain_confirmation,
+            out,
+        )
     }
 
     #[must_use]
@@ -344,6 +312,7 @@ pub struct SettingsUi {
     pub host_interval_secs: u16,
     pub policy_draft: PolicyDraft,
     pub awaiting_drain_confirmation: bool,
+    pub drain_observation: Option<cli::policy::ScaleObservation>,
     pub message: Option<String>,
 }
 
@@ -391,6 +360,7 @@ impl SettingsUi {
                     self.view = SettingsView::Policy(form);
                     self.focus = 0;
                     self.awaiting_drain_confirmation = false;
+                    self.drain_observation = None;
                     self.message = None;
                 }),
             SettingsCommand::ApplyHost => self.apply_host(context),
@@ -441,26 +411,38 @@ impl SettingsUi {
         let SettingsView::Policy(form) = &self.view else {
             return Ok(());
         };
-        let preview = form.preview(&self.policy_draft);
-        if preview.drain_confirmation_required && !self.awaiting_drain_confirmation {
-            self.awaiting_drain_confirmation = true;
-            self.message = Some(format!(
-                "Confirm drain: {} active runner(s) will be left to finish. Press Enter again.",
-                preview.active_runners
-            ));
-            return Ok(());
+        let form = form.clone();
+        if self.policy_draft.enabled == Some(false) && self.drain_observation.is_none() {
+            let observed = cli::policy::observe_scale(context, &form.target)?;
+            if observed.active > 0 {
+                self.awaiting_drain_confirmation = true;
+                self.drain_observation = Some(observed);
+                self.message = Some(format!(
+                    "Confirm drain: {} active runner(s) will be left to finish. Press Enter again.",
+                    observed.active
+                ));
+                return Ok(());
+            }
+            self.drain_observation = Some(observed);
         }
         let target = form.target.clone();
         let mut output = Vec::new();
-        form.apply(
+        let result = form.apply(
             context,
             &self.policy_draft,
-            self.awaiting_drain_confirmation,
+            self.drain_observation,
             &mut output,
-        )?;
+        );
+        if let Err(error) = result {
+            self.awaiting_drain_confirmation = false;
+            self.drain_observation = None;
+            self.view = SettingsView::Policy(PolicySettings::load(context, &target)?);
+            return Err(error);
+        }
         self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
         self.policy_draft = PolicyDraft::default();
         self.awaiting_drain_confirmation = false;
+        self.drain_observation = None;
         self.view = SettingsView::Policy(PolicySettings::load(context, &target)?);
         Ok(())
     }
@@ -757,6 +739,7 @@ fn focus_line<'a>(focused: bool, text: impl Into<String>) -> Line<'a> {
     Line::from(Span::styled(text.into(), style))
 }
 
+#[cfg(test)]
 fn dispatch_capacity(
     context: &Context,
     target: &ScaleTarget,
@@ -810,30 +793,6 @@ fn dispatch_scale(
     }
 }
 
-fn set_cache_policy(
-    context: &Context,
-    target: &ScaleTarget,
-    cache_policy: CachePolicy,
-) -> Result<(), CliError> {
-    let store = context.store()?;
-    let policy = find_policy(&store, target)?;
-    let expected = policy.revision();
-    if policy.cache_policy != cache_policy {
-        // CachePolicy has no mutator because it is self-validating, but the
-        // optimistic-concurrency revision must still advance. Rebuilding via
-        // the domain's checked persistence constructor preserves the complete
-        // PolicyMode shape invariant while making that advancement explicit.
-        let mut fields = policy.to_persisted();
-        fields.cache_policy = cache_policy;
-        fields.revision = fields.revision.saturating_add(1);
-        let policy = ScalePolicy::from_persisted(fields).map_err(invalid)?;
-        store
-            .update_policy(&policy, expected)
-            .map_err(store_failure)?;
-    }
-    Ok(())
-}
-
 fn find_policy(store: &dyn Store, target: &ScaleTarget) -> Result<ScalePolicy, CliError> {
     store
         .policies()
@@ -870,6 +829,7 @@ fn service_failure(source: ServiceError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::num::NonZeroU16;
 
     use ratatui::Terminal;
@@ -1009,7 +969,7 @@ mod tests {
                 enabled: Some(true),
                 cache_policy: None,
             },
-            false,
+            None,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1027,7 +987,7 @@ mod tests {
                 enabled: Some(false),
                 ..PolicyDraft::default()
             },
-            false,
+            None,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1047,7 +1007,7 @@ mod tests {
                     max_capacity: Some(3),
                     ..PolicyDraft::default()
                 },
-                false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap();
@@ -1069,7 +1029,7 @@ mod tests {
                     max_capacity: Some(5),
                     ..PolicyDraft::default()
                 },
-                false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap();
@@ -1090,7 +1050,7 @@ mod tests {
         };
         assert_eq!(form.preview(&draft).trust_warning, Some(FORK_TRUST_WARNING));
         let mut output = Vec::new();
-        form.apply(&context, &draft, false, &mut output).unwrap();
+        form.apply(&context, &draft, None, &mut output).unwrap();
         assert!(
             String::from_utf8(output)
                 .unwrap()
@@ -1113,8 +1073,7 @@ mod tests {
             ..PolicyDraft::default()
         };
         assert_eq!(form.preview(&draft).state_after_disable, Some("disabled"));
-        form.apply(&context, &draft, false, &mut Vec::new())
-            .unwrap();
+        form.apply(&context, &draft, None, &mut Vec::new()).unwrap();
         assert_eq!(
             find_policy(&context.store().unwrap(), &target)
                 .unwrap()
@@ -1148,13 +1107,15 @@ mod tests {
         assert_eq!(preview.state_after_disable, Some("draining"));
         assert!(preview.drain_confirmation_required);
         assert_eq!(
-            form.apply(&context, &draft, false, &mut Vec::new())
+            form.apply(&context, &draft, None, &mut Vec::new())
                 .unwrap_err()
                 .class(),
             Failure::Conflict
         );
         let mut output = Vec::new();
-        form.apply(&context, &draft, true, &mut output).unwrap();
+        let observation = cli::policy::observe_scale(&context, &target).unwrap();
+        form.apply(&context, &draft, Some(observation), &mut output)
+            .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(
             output.contains("draining with 1 active runner(s)"),
@@ -1180,7 +1141,7 @@ mod tests {
                     max_capacity: Some(0),
                     ..PolicyDraft::default()
                 },
-                false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap_err();
@@ -1190,6 +1151,90 @@ mod tests {
                 .unwrap()
                 .current_max_capacity,
             Some(2)
+        );
+    }
+
+    #[test]
+    fn invalid_combined_draft_persists_none_of_its_fields() {
+        let (_dir, context, target) = fixture(false);
+        let before = find_policy(&context.store().unwrap(), &target).unwrap();
+        let form = PolicySettings::load(&context, &target).unwrap();
+        let error = form
+            .apply(
+                &context,
+                &PolicyDraft {
+                    max_capacity: Some(0),
+                    enabled: Some(true),
+                    cache_policy: Some(CachePolicy::DiscardRunnerPackage),
+                },
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert_eq!(
+            find_policy(&context.store().unwrap(), &target).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn monitor_precondition_failure_persists_no_cache_or_scale_change() {
+        let (_dir, context, target) = fixture(true);
+        let before = find_policy(&context.store().unwrap(), &target).unwrap();
+        let form = PolicySettings::load(&context, &target).unwrap();
+        let error = form
+            .apply(
+                &context,
+                &PolicyDraft {
+                    max_capacity: None,
+                    enabled: Some(true),
+                    cache_policy: Some(CachePolicy::DiscardRunnerPackage),
+                },
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert_eq!(
+            find_policy(&context.store().unwrap(), &target).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn stale_combined_draft_persists_none_of_its_fields() {
+        let (_dir, context, target) = fixture(false);
+        let confirmation = cli::policy::observe_scale(&context, &target).unwrap();
+        cli::policy::apply_policy_mutation(
+            &context,
+            &target,
+            cli::policy::PolicyMutation {
+                max_capacity: Some(3),
+                ..cli::policy::PolicyMutation::default()
+            },
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let before = find_policy(&context.store().unwrap(), &target).unwrap();
+        let form = PolicySettings::load(&context, &target).unwrap();
+        let error = form
+            .apply(
+                &context,
+                &PolicyDraft {
+                    max_capacity: Some(4),
+                    enabled: Some(false),
+                    cache_policy: Some(CachePolicy::DiscardRunnerPackage),
+                },
+                Some(confirmation),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.class(), Failure::Conflict);
+        assert_eq!(
+            find_policy(&context.store().unwrap(), &target).unwrap(),
+            before
         );
     }
 
@@ -1274,7 +1319,7 @@ mod tests {
                     max_capacity: Some(4),
                     ..PolicyDraft::default()
                 },
-                false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap_err();
@@ -1289,8 +1334,25 @@ mod tests {
 
     #[test]
     fn service_mode_switch_persists_and_host_show_reads_the_same_mode() {
+        #[derive(Default)]
+        struct RecordingService {
+            requested_modes: RefCell<Vec<StartMode>>,
+        }
+
+        impl RecordingService {
+            fn switch(&self, mode: StartMode) -> Result<(), CliError> {
+                self.requested_modes.borrow_mut().push(mode);
+                Ok(())
+            }
+        }
+
         let (_dir, context, _) = fixture(false);
-        HostSettings::set_start_mode_with(&context, StartMode::Login, |_| Ok(())).unwrap();
+        let service = RecordingService::default();
+        HostSettings::set_start_mode_with(&context, StartMode::Login, |mode| service.switch(mode))
+            .unwrap();
+        // The injected production seam accepts only an in-place mode switch;
+        // it has no install request or reinstall callback to invoke.
+        assert_eq!(*service.requested_modes.borrow(), [StartMode::Login]);
         let mut shown = Vec::new();
         cli::host::show(&context, &mut shown).unwrap();
         let shown = String::from_utf8(shown).unwrap();
@@ -1312,7 +1374,7 @@ mod tests {
                     cache_policy: Some(CachePolicy::DiscardRunnerPackage),
                     ..PolicyDraft::default()
                 },
-                false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap();
