@@ -1,0 +1,21 @@
+crates/platform/src/service.rs
+  s_e3f2ebf0732f36::t_43a783729c573d 4429
+  s_e3f2ebf0732f36::t_5a7797d72eb91e 4447-4450,4453-4454,4608-4638,4717-4738
+  s_e3f2ebf0732f36::t_ef3366ef70408f 5600-5619
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a9a4bfd1425a37388299961d86977d09a267e1f2",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
