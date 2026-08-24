@@ -194,8 +194,18 @@ impl<'a> HostAllocator<'a> {
     /// [`crate::attempt::active_count`] directly and see what it is asking for
     /// by name.
     pub fn allocate(&mut self, policy: &ScalePolicy, demand: u32) -> Allocation {
-        let active_owned =
+        let measured_active_owned =
             crate::attempt::active_count_for(policy.id, self.attempts.iter().copied());
+        #[cfg(any(test, feature = "test-mutants"))]
+        let active_owned = if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
+            == Ok("ignore_in_flight_attempts")
+        {
+            0
+        } else {
+            measured_active_owned
+        };
+        #[cfg(not(any(test, feature = "test-mutants")))]
+        let active_owned = measured_active_owned;
         let headroom_before = self.headroom();
 
         let refuse = |limiting_factor| Allocation {
@@ -220,7 +230,13 @@ impl<'a> HostAllocator<'a> {
             return refuse(LimitingFactor::MonitorOnly);
         }
         // Precedence rule 4: a user-requested disable beats demand.
-        if !policy.may_start_runners() {
+        #[cfg(any(test, feature = "test-mutants"))]
+        let may_start = std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
+            == Ok("start_with_revoked_credential")
+            || policy.may_start_runners();
+        #[cfg(not(any(test, feature = "test-mutants")))]
+        let may_start = policy.may_start_runners();
+        if !may_start {
             return refuse(LimitingFactor::NotReconciling);
         }
 

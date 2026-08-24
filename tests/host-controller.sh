@@ -125,28 +125,25 @@ JSON
       *) die "unknown native operation: $operation" ;;
     esac
     ;;
-  prepare)
-    source_dir="${2-}"
-    destination="${3-}"
-    os_name="${4-}"
-    [[ -n "$destination" && -n "$os_name" ]] || die "prepare needs SOURCE DESTINATION OS"
+  live-suite)
+    destination="${2-}"
+    os_name="${3-}"
+    [[ -n "$destination" && -n "$os_name" ]] || die "live-suite needs a fresh DESTINATION and OS"
+    [[ ! -e "$destination" ]] || die "refusing imported or pre-existing evidence: $destination"
+    mkdir -p "$destination"
     if [[ "${RUNNER_MANAGER_E2E_PHYSICAL_HOST:-}" != true ]]; then
-      mkdir -p "$destination"
       printf '{"status":"required_manual","os":"%s","reason":"network isolation, reboot, and two-host contention require a provisioned physical host"}\n' "$os_name" > "$destination/manual-required.json"
       die "REQUIRED MANUAL GATE: this runner is not a provisioned physical acceptance host"
     fi
-    [[ -n "$source_dir" && -d "$source_dir" ]] || die "this physical host produced no current controller journal: ${source_dir:-<unset>}"
-    for scenario in successful_jit_job network_outage_recovery jit_expiry_recovery policy_disable_drain boot_start_recovery organization_scoped_job monitor_only_demand two_host_contention; do
-      [[ -f "$source_dir/$scenario.json" ]] || die "missing causal journal for $scenario"
-    done
-    [[ -f "$source_dir/rollback.json" ]] || die "missing ordered rollback journal"
-    [[ -f "$source_dir/security/process-inspection.json" ]] || die "missing live manager/Runner.Listener PID journal"
-    [[ -s "$source_dir/security/jit-marker.txt" ]] || die "missing JIT leak marker"
-    for category in logs database snapshots crash-reports cli-output; do
-      [[ -d "$source_dir/security/secret-scan-root/$category" ]] || die "missing secret-scan category $category"
-    done
-    mkdir -p "$destination"
-    cp -R "$source_dir"/. "$destination"/
+    # A reboot acceptance must be driven from a distinct controller host: a
+    # process running on the managed host cannot reboot itself and then claim
+    # it observed service recovery. The repository currently has no fixture
+    # workflow or remote-host topology contract. Refuse rather than accepting
+    # externally authored facts or turning an arbitrary command into a signing
+    # oracle. The operation verbs above are the executable physical primitives;
+    # this gate becomes runnable only when that topology is repository-defined.
+    printf '{"status":"required_manual","os":"%s","reason":"repository fixture workflow and external reboot/two-host controller topology are not configured"}\n' "$os_name" > "$destination/manual-required.json"
+    die "REQUIRED MANUAL GATE: repository-defined external host topology is absent"
     ;;
   finalize)
     report="${2-}"
@@ -156,6 +153,6 @@ JSON
     cp "$report" "$destination"/
     ;;
   *)
-    die "usage: bash tests/host-controller.sh operation NAME ... | prepare SOURCE DESTINATION OS | finalize REPORT DESTINATION"
+    die "usage: bash tests/host-controller.sh operation NAME ... | live-suite DESTINATION OS | finalize REPORT DESTINATION"
     ;;
 esac

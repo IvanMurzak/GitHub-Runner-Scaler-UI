@@ -6,11 +6,13 @@ fixture inputs absent it prints one `SKIP` line and succeeds.
 
 The suite deliberately does not pretend that a subprocess can reboot its host,
 isolate the host network, or create a second physical machine. The native host
-controller performs those operations. CI imports only a complete controller
-journal through `bash tests/host-controller.sh prepare`; when the four GitHub
-fixture inputs exist, a missing journal is a failure rather than a skip.
-After the native commands finish, the controller runs
-`cargo run -p runner-manager-e2e --example e2e-host-controller -- seal-live-run DIR`.
+controller performs those operations. CI always starts with a nonexistent,
+job-private evidence path and runs
+`cargo run -p runner-manager-e2e --example e2e-host-controller -- run-live-suite DIR`.
+The command rejects an existing directory, so imported journals can never be
+promoted into live evidence. When the four GitHub fixture inputs exist, an
+absent physical topology is a failing `required_manual` gate rather than a
+skip.
 It HMAC-SHA-256 authenticates every scenario and rollback journal with the
 separate `RUNNER_MANAGER_E2E_EVIDENCE_KEY` authority. The GitHub fixture token
 is explicitly rejected as that key. Every seal is bound to the current GitHub
@@ -24,6 +26,12 @@ reboot, and two-host contention. When fixture inputs are present this
 classification fails the E2E job and therefore cannot masquerade as a passing
 live report. Only a host explicitly provisioned with
 `RUNNER_MANAGER_E2E_PHYSICAL_HOST=true` may seal controller output.
+The current repository does not define the disposable fixture workflow inputs,
+a controller host that survives rebooting the managed host, or a second-host
+observation transport. Until those contracts are added, even a physical host
+terminates `required_manual` before any journal is signed. The repository-owned
+operation verbs remain available for that future sequencer; arbitrary external
+JSON is never accepted as a substitute.
 
 The directory contains these schema-1 JSON records:
 
@@ -57,8 +65,12 @@ Security gates are not accepted from prose files. The suite executes exact
 repository negative-control tests for two-job contamination, checksum mismatch
 and absent checksum, revoked-token state/remediation/no-start behavior,
 successful and failed workspace cleanup, duplicate queued polling, and native
-OS process-list inspection. A receipt is valid only when the expected package
-and exact test filter ran successfully and matched one test.
+OS process-list inspection. For the five required product controls it then
+rebuilds the relevant package with the `test-mutants` feature, injects one named
+mutant at the production decision seam, and requires the exact same gate test
+to fail. Release builds do not compile these seams. A receipt is valid only
+when the expected package and exact test filter ran successfully and matched
+one test.
 
 `security/` contains `jit-marker.txt`,
 `secret-scan-root/` (logs, database, snapshots, crash reports and CLI output),

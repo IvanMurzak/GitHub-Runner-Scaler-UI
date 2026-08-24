@@ -28,8 +28,8 @@ const FILES: [&str; 9] = [
 fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
     ensure!(
-        arguments.next().as_deref() == Some(std::ffi::OsStr::new("seal-live-run")),
-        "usage: cargo run -p runner-manager-e2e --example e2e-host-controller -- seal-live-run EVIDENCE_DIR"
+        arguments.next().as_deref() == Some(std::ffi::OsStr::new("run-live-suite")),
+        "usage: cargo run -p runner-manager-e2e --example e2e-host-controller -- run-live-suite EVIDENCE_DIR"
     );
     ensure!(
         std::env::var("RUNNER_MANAGER_E2E_PHYSICAL_HOST").as_deref() == Ok("true"),
@@ -37,6 +37,10 @@ fn main() -> Result<()> {
     );
     let root = PathBuf::from(arguments.next().context("missing EVIDENCE_DIR")?);
     ensure!(arguments.next().is_none(), "unexpected extra argument");
+    ensure!(
+        !root.exists(),
+        "refusing to import or promote an existing evidence directory"
+    );
     let authority = SecretString::from(
         std::env::var("RUNNER_MANAGER_E2E_EVIDENCE_KEY")
             .context("RUNNER_MANAGER_E2E_EVIDENCE_KEY is required and must be distinct from the GitHub fixture token")?,
@@ -77,18 +81,20 @@ fn main() -> Result<()> {
     } else {
         "linux"
     };
-    let runtime_root = data_dir.join("runtime");
-    let runtime_directories: Vec<String> = if runtime_root.is_dir() {
-        fs::read_dir(&runtime_root)?
-            .map(|entry| entry.map(|entry| entry.path().to_string_lossy().into_owned()))
-            .collect::<std::io::Result<_>>()?
-    } else {
-        Vec::new()
-    };
+    let controller_status = Command::new("bash")
+        .args([
+            "tests/host-controller.sh",
+            "live-suite",
+            root.to_str().context("evidence path is not UTF-8")?,
+            os,
+        ])
+        .status()
+        .context("could not start the repository live controller")?;
     ensure!(
-        runtime_directories.is_empty(),
-        "independent local probe found runtime residue"
+        controller_status.success(),
+        "REQUIRED MANUAL GATE: the repository live controller did not complete every physical operation"
     );
+    let runtime_root = data_dir.join("runtime");
     let jit = fs::read_to_string(root.join("security").join("jit-marker.txt"))?;
     for name in FILES {
         let path = root.join(name);
@@ -146,10 +152,11 @@ fn main() -> Result<()> {
             value.get("facts").is_some() || name == "rollback.json",
             "{name} is not controller-observed typed evidence"
         );
-        value["post_condition"]["local_observed_at_ms"] = serde_json::json!(now);
-        value["post_condition"]["runtime_root"] =
-            serde_json::Value::String(runtime_root.to_string_lossy().into_owned());
-        value["post_condition"]["runtime_directories"] = serde_json::json!([]);
+        ensure!(
+            value["post_condition"]["runtime_root"].as_str()
+                == Some(runtime_root.to_string_lossy().as_ref()),
+            "{name} did not probe the configured runtime root"
+        );
         value["controller"] =
             serde_json::Value::String("runner-manager-e2e-host-controller/v1".into());
         value["context"] = serde_json::json!({

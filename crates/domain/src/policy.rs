@@ -1179,8 +1179,18 @@ impl ScalePolicy {
     /// or draining policy takes no new work (`03-control-flows.md`, flow 5), and
     /// a user-requested disable beats demand (precedence rule 4).
     #[must_use]
+    #[cfg(not(feature = "test-mutants"))]
     pub const fn may_start_runners(&self) -> bool {
         self.mode.is_autoscale() && self.enabled && self.state.admits_new_runners()
+    }
+
+    /// Test-only mutation seam for H1. Release builds do not compile it.
+    #[must_use]
+    #[cfg(feature = "test-mutants")]
+    pub fn may_start_runners(&self) -> bool {
+        std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
+            == Ok("start_with_revoked_credential")
+            || (self.mode.is_autoscale() && self.enabled && self.state.admits_new_runners())
     }
 
     /// # Errors

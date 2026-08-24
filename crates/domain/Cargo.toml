@@ -16,6 +16,9 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+test-mutants = []
+
 [dependencies]
 chrono = { workspace = true }
 rusqlite = { workspace = true }

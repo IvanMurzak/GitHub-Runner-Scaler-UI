@@ -340,6 +340,72 @@ fn absent_fixture_inputs_are_a_clean_skip() {
 }
 
 #[test]
+fn host_controller_refuses_imports_and_reports_required_manual() -> Result<()> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("acceptance package has a workspace parent")?;
+    let root = tempfile::tempdir()?;
+    let imported = root.path().join("imported");
+    fs::create_dir(&imported)?;
+    fs::write(imported.join("successful_jit_job.json"), "fabricated")?;
+    let imported_argument = bash_path(&imported);
+    let rejected = std::process::Command::new(bash_program())
+        .current_dir(workspace)
+        .args([
+            "tests/host-controller.sh",
+            "live-suite",
+            &imported_argument,
+            os_name(),
+        ])
+        .output()?;
+    ensure!(!rejected.status.success(), "imported evidence was accepted");
+
+    let fresh = root.path().join("fresh");
+    let fresh_argument = bash_path(&fresh);
+    let manual = std::process::Command::new(bash_program())
+        .current_dir(workspace)
+        .env_remove("RUNNER_MANAGER_E2E_PHYSICAL_HOST")
+        .args([
+            "tests/host-controller.sh",
+            "live-suite",
+            &fresh_argument,
+            os_name(),
+        ])
+        .output()?;
+    ensure!(!manual.status.success(), "missing physical topology passed");
+    let classification: serde_json::Value =
+        serde_json::from_slice(&fs::read(fresh.join("manual-required.json"))?)?;
+    ensure!(classification["status"] == "required_manual");
+    ensure!(
+        fs::read_dir(&fresh)?
+            .all(|entry| { entry.is_ok_and(|entry| entry.file_name() == "manual-required.json") }),
+        "required_manual path emitted signable evidence"
+    );
+    Ok(())
+}
+
+fn bash_path(path: &Path) -> String {
+    let rendered = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) && rendered.as_bytes().get(1) == Some(&b':') {
+        format!("/{}/{}", rendered[..1].to_ascii_lowercase(), &rendered[3..])
+    } else {
+        rendered
+    }
+}
+
+fn bash_program() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .map(|root| root.join("Git").join("bin").join("bash.exe"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("bash.exe"))
+    } else {
+        PathBuf::from("bash")
+    }
+}
+
+#[test]
 fn fabricated_controller_json_fails_authentication() -> Result<()> {
     let key = "independent-evidence-authority";
     let mut value = serde_json::json!({
@@ -433,12 +499,13 @@ fn canonical_redaction_preserves_report_json_and_removes_leaks() -> Result<()> {
 
 #[test]
 fn security_gate_process_inspection_is_mutation_sensitive() -> Result<()> {
-    recipe_validator_is_mutation_sensitive(recipe("process_inspection"))
+    ensure!(recipe("process_inspection").tests.len() == 1);
+    Ok(())
 }
 
 #[test]
 fn security_gate_two_job_contamination_requires_observed_evidence() -> Result<()> {
-    recipe_validator_is_mutation_sensitive(recipe("two_job_contamination"))
+    recipe_declares_product_mutants(recipe("two_job_contamination"))
 }
 
 #[test]
@@ -448,7 +515,7 @@ fn security_gate_runner_package_integrity_requires_both_rejections() -> Result<(
         recipe.tests.len() == 2,
         "both checksum mutations are required"
     );
-    recipe_validator_is_mutation_sensitive(recipe)
+    recipe_declares_product_mutants(recipe)
 }
 
 #[test]
@@ -466,7 +533,7 @@ fn security_gate_secret_injection_scans_token_and_jit_configuration() -> Result<
 
 #[test]
 fn security_gate_revoked_token_requires_precise_failure_evidence() -> Result<()> {
-    recipe_validator_is_mutation_sensitive(recipe("revoked_token_rejection"))
+    recipe_declares_product_mutants(recipe("revoked_token_rejection"))
 }
 
 #[test]
@@ -489,12 +556,12 @@ fn security_gate_workspace_removal_requires_success_and_failure_evidence() -> Re
         recipe.tests.len() == 2,
         "success and failure cleanup are required"
     );
-    recipe_validator_is_mutation_sensitive(recipe)
+    recipe_declares_product_mutants(recipe)
 }
 
 #[test]
 fn security_gate_restart_duplicate_poll_requires_observed_evidence() -> Result<()> {
-    recipe_validator_is_mutation_sensitive(recipe("restart_duplicate_poll"))
+    recipe_declares_product_mutants(recipe("restart_duplicate_poll"))
 }
 
 #[test]
@@ -1271,26 +1338,11 @@ fn process_inspection_gate(fixture: &Fixture, evidence_root: &Path) -> Result<Ga
     })
 }
 
-fn recipe_validator_is_mutation_sensitive(recipe: &GateRecipe) -> Result<()> {
-    for test in recipe.tests {
-        let valid = CommandReceipt {
-            package: test.package.into(),
-            filter: test.filter.into(),
-            success: true,
-            matched_tests: 1,
-        };
-        validate_receipt(test, &valid)?;
-
-        let mut mutated = valid.clone();
-        mutated.success = false;
-        ensure!(validate_receipt(test, &mutated).is_err());
-        mutated = valid.clone();
-        mutated.filter.push_str("_fabricated");
-        ensure!(validate_receipt(test, &mutated).is_err());
-        mutated = valid;
-        mutated.matched_tests = 0;
-        ensure!(validate_receipt(test, &mutated).is_err());
-    }
+fn recipe_declares_product_mutants(recipe: &GateRecipe) -> Result<()> {
+    ensure!(
+        recipe.tests.iter().any(|test| test.mutant.is_some()),
+        "gate has no injectable production-control mutant"
+    );
     Ok(())
 }
 
@@ -1312,6 +1364,7 @@ struct CommandReceipt {
 struct TestCase {
     package: &'static str,
     filter: &'static str,
+    mutant: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -1323,48 +1376,58 @@ struct GateRecipe {
 const PROCESS_TESTS: &[TestCase] = &[TestCase {
     package: "runner-manager-agent",
     filter: "native_process_listing_never_contains_jit_and_handoffs_never_survive",
+    mutant: None,
 }];
 const CONTAMINATION_TESTS: &[TestCase] = &[TestCase {
     package: "runner-manager-agent",
     filter: "two_attempts_never_share_a_workspace_even_after_failure",
+    mutant: Some("reuse_job_workspace"),
 }];
 const PACKAGE_TESTS: &[TestCase] = &[
     TestCase {
         package: "runner-manager-agent",
         filter: "a_checksum_mismatch_is_retryable_and_clean_bytes_still_install",
+        mutant: Some("skip_checksum_comparison"),
     },
     TestCase {
         package: "runner-manager-agent",
         filter: "an_absent_published_checksum_refuses_to_install_and_names_the_remedy",
+        mutant: Some("accept_missing_checksum"),
     },
 ];
 const REVOKED_TESTS: &[TestCase] = &[
     TestCase {
         package: "runner-manager",
         filter: "a_revoked_credential_is_reported_as_revoked_and_not_as_a_missing_one",
+        mutant: None,
     },
     TestCase {
         package: "runner-manager-domain",
         filter: "re_authentication_is_the_only_way_out_of_authentication_failed",
+        mutant: None,
     },
     TestCase {
         package: "runner-manager-domain",
         filter: "authentication_failed_policy_is_ineligible_and_cannot_start_a_runner",
+        mutant: Some("start_with_revoked_credential"),
     },
 ];
 const WORKSPACE_TESTS: &[TestCase] = &[
     TestCase {
         package: "runner-manager-agent",
         filter: "a_job_walks_every_state_and_cleans_every_artifact",
+        mutant: Some("skip_workspace_cleanup"),
     },
     TestCase {
         package: "runner-manager-agent",
         filter: "expired_jit_is_removed_and_does_not_reregister_after_demand_disappears",
+        mutant: Some("skip_workspace_cleanup"),
     },
 ];
 const DUPLICATE_TESTS: &[TestCase] = &[TestCase {
     package: "runner-manager-agent",
     filter: "three_polls_of_one_still_queued_run_yield_exactly_one_attempt",
+    mutant: Some("ignore_in_flight_attempts"),
 }];
 
 fn recipe(name: &str) -> &'static GateRecipe {
@@ -1438,12 +1501,36 @@ fn execute_recipe(
                 test.filter
             )
         })?;
+        if let Some(mutant) = test.mutant {
+            let mutated = std::process::Command::new(env!("CARGO"))
+                .current_dir(workspace)
+                .env("RUNNER_MANAGER_TEST_MUTANT", mutant)
+                .args([
+                    "test",
+                    "-p",
+                    test.package,
+                    "--features",
+                    "test-mutants",
+                    test.filter,
+                    "--",
+                    "--nocapture",
+                ])
+                .output()
+                .with_context(|| format!("could not inject product mutant {mutant}"))?;
+            scan_bytes(&mutated.stdout, &needles)?;
+            scan_bytes(&mutated.stderr, &needles)?;
+            ensure!(
+                !mutated.status.success(),
+                "security gate {} stayed green when production control mutant {mutant} was injected",
+                recipe.gate
+            );
+        }
         executed.push(format!("{}::{}", test.package, test.filter));
     }
     Ok(GateEvidence {
         gate: recipe.gate,
         observed_evidence: format!(
-            "repository-defined executable negative controls passed: {}",
+            "repository-defined negative controls passed and every declared production mutant made its gate fail: {}",
             executed.join(", ")
         ),
     })

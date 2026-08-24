@@ -1314,7 +1314,18 @@ impl LifecycleLauncher {
             .cloned()
             .ok_or(LifecycleError::Transition)?;
         self.preserve_diagnostics(attempt, &outcome)?;
-        match fs::remove_dir_all(attempt.runtime_path()) {
+        #[cfg(test)]
+        let cleanup_result = if matches!(
+            std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref(),
+            Ok("skip_workspace_cleanup" | "reuse_job_workspace")
+        ) {
+            Ok(())
+        } else {
+            fs::remove_dir_all(attempt.runtime_path())
+        };
+        #[cfg(not(test))]
+        let cleanup_result = fs::remove_dir_all(attempt.runtime_path());
+        match cleanup_result {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {
@@ -1468,10 +1479,22 @@ impl LifecycleLauncher {
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
-        let runtime = self
-            .runtime_root
-            .join(policy.id.to_string())
-            .join(id.to_string());
+        let runtime = self.runtime_root.join(policy.id.to_string()).join({
+            #[cfg(test)]
+            {
+                if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
+                    == Ok("reuse_job_workspace")
+                {
+                    "mutant-shared-workspace".to_owned()
+                } else {
+                    id.to_string()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                id.to_string()
+            }
+        });
         fs::create_dir_all(&runtime)
             .map_err(|_| LifecycleError::Failed(FailureReason::ProcessStartFailed))?;
         let mut attempt = RunnerAttempt::allocate(id, policy.id, runtime, self.ports.clock.now());
