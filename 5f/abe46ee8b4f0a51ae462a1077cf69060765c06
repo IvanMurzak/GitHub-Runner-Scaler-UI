@@ -1,0 +1,45 @@
+crates/app/src/tui/shell.rs
+  s_e3f2ebf0732f36::t_31be8ee801aafa 30,360,379,396-412,430-432,487-489,498-500,508-513,518-524,533-539,544,555-560,564-569,579,583-585,592-597
+  s_e3f2ebf0732f36::t_b452a097918b91 1180,1729-1736
+  s_e3f2ebf0732f36::t_07af9db44219c0 164-167,231,236,453-455
+  s_e3f2ebf0732f36::t_5b424c3adeb4b4 31,525,540-542,552-554,586-591,654-665,667-681,683-691,693,1686,1689-1702,1706-1707,1744,1750-1752
+  s_e3f2ebf0732f36::t_7d3576c408f29d 1714-1728,1737-1743,1745-1749
+  s_e3f2ebf0732f36::t_3b2625a3ffff7e 1687-1688,1753-1768
+  s_e3f2ebf0732f36::t_1f698869b399a2 473-481,649-652
+  s_d14c0886a58be6::t_a0ee41167a4c55 561
+crates/app/src/tui/screens.rs
+  s_e3f2ebf0732f36::t_3b2625a3ffff7e 5
+  s_e3f2ebf0732f36::t_9c088fe21f6032 24,541,547-549,551,570-581,609,641-657,667-668,715-716,748-749,763,774
+  s_e3f2ebf0732f36::t_31be8ee801aafa 250,297,395-399
+  s_e3f2ebf0732f36::t_1f698869b399a2 1111
+  s_e3f2ebf0732f36::t_9c80803f488296 582
+  s_e3f2ebf0732f36::t_68f58d63138c2d 400,1112,1114-1115,1118-1127,1132-1133,1138-1188
+  s_e3f2ebf0732f36::t_5b424c3adeb4b4 775,789-795,1116-1117,1128-1131,1134-1137,1189-1192
+  s_e3f2ebf0732f36::t_898d8cc72942d4 1113
+.taskflow/2026-08-21-local-runner-manager/ROADMAP.md
+  s_e3f2ebf0732f36::t_d9aac82225a88d 145,149,323-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "5fabe46ee8b4f0a51ae462a1077cf69060765c06",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
