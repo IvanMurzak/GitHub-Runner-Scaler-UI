@@ -935,6 +935,26 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.sha }}
+          # ------------------------------------------------------------------
+          # WITHOUT THIS, EVERY git CALL BELOW AUTHENTICATES AS THE WRONG USER.
+          # ------------------------------------------------------------------
+          # `actions/checkout` leaves the Actions token in this repository's
+          # git config as `http.https://github.com/.extraheader`, and that
+          # header applies to EVERY github.com request made from the workspace
+          # -- including the ones aimed at the tap, whose credential is in the
+          # URL. A configured Authorization header beats URL userinfo, so the
+          # tap pre-flight ran as `github-actions[bot]`: the read passed
+          # because the tap is public, and the write was refused with
+          # "Permission to IvanMurzak/homebrew-tap.git denied to
+          # github-actions[bot]" while HOMEBREW_TAP_TOKEN was never used at
+          # all. That is how release 0.1.1 failed step 8 the second time.
+          #
+          # This job pushes nothing to THIS repository -- the tag was pushed by
+          # the `tag` job, and `gh release upload` authenticates with GH_TOKEN
+          # rather than through git -- so it needs no persisted credential, and
+          # not having one is what lets the tap's own credential be the one
+          # that counts.
+          persist-credentials: false
 
       - name: Refuse to start without the credentials this job needs
         env:
