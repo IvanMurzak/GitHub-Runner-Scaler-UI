@@ -70,6 +70,8 @@ jobs:
       GIT_CONFIG_COUNT: 1
       GIT_CONFIG_KEY_0: core.longpaths
       GIT_CONFIG_VALUE_0: "true"
+      CARGO_HOME: C:/Users/IvanD/.cargo
+      RUSTUP_HOME: C:/Users/IvanD/.rustup
     strategy:
       # One red leg must not hide the state of the other two.
       fail-fast: false
@@ -90,6 +92,10 @@ jobs:
         # script rather than one script per OS.
         shell: bash
     steps:
+      - name: Expose the pilot host Rust toolchain
+        if: runner.os == 'Windows'
+        run: printf '%s\n' 'C:/Users/IvanD/.cargo/bin' >> "$GITHUB_PATH"
+
       - name: Check out the repository
         uses: actions/checkout@v7
 
