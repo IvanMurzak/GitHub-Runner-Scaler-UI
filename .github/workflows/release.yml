@@ -149,11 +149,11 @@ on:
 #
 # Every job below also names its own scopes, because a job-level block REPLACES
 # this one rather than being bounded by it -- so this line alone constrains only
-# the jobs that forgot to. `id-token: write` and `packages: write` are refused
-# outright by `crates/app/tests/workflow_triggers.rs`: they would let the one
-# workflow holding a publishing credential mint more. Nothing here needs them.
-# Artifact integrity is SHA-256 plus an SBOM, and the macOS signature is the
-# free ad-hoc one the linker applies (D12), so no OIDC identity is involved.
+# the jobs that forgot to. `packages: write` is refused outright by
+# `crates/app/tests/workflow_triggers.rs`, and so is `id-token: write`
+# EVERYWHERE BUT THE `channels` JOB, which needs it to authenticate to npm
+# through trusted publishing and holds no publishing secret of its own. Neither
+# belongs here at the top level, where every job would inherit it.
 permissions:
   contents: write
 
