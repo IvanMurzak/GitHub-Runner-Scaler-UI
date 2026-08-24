@@ -72,6 +72,7 @@ jobs:
       GIT_CONFIG_VALUE_0: "true"
       CARGO_HOME: C:/Users/IvanD/.cargo
       RUSTUP_HOME: C:/Users/IvanD/.rustup
+      CARGO_TARGET_DIR: C:/tmp/rmg4-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       # One red leg must not hide the state of the other two.
       fail-fast: false
@@ -140,6 +141,11 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      - name: Clean the short pilot build directory
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: cargo clean --target-dir "$env:CARGO_TARGET_DIR"
 
   # ---------------------------------------------------------------------------
   # The privileged installer smoke tests (d3).
