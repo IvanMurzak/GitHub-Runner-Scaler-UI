@@ -4,7 +4,9 @@
 //! Rendering accepts only immutable [`PresentationState`], so a frame has no
 //! filesystem, store, or network capability.
 
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
+use std::str::FromStr;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,12 +29,22 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
-use super::screens::{self, ReadOnlyScreen, ScreenAction, ScreenModel, Snapshot};
+use runner_manager_domain::model::{Org, OwnerRepo, ScaleTarget, StartMode};
+use runner_manager_github::rest::{
+    ActivityScope, CancelToken, InventoryError, InventoryGateway, RefreshState, RestInventory,
+};
+use runner_manager_github::{AuthenticatedClient, UserAccessToken};
+use runner_manager_platform::secrets::SecretStore as _;
+
+use super::screens::{
+    self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,
+    RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
+};
 
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const TICK_RATE: Duration = Duration::from_millis(250);
-const LOCAL_AGENT_POLL_RATE: Duration = Duration::from_secs(1);
+const LOCAL_AGENT_POLL_RATE: Duration = Duration::from_secs(60);
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,8 +184,13 @@ pub struct AgentEvent {
 /// the product exposes no inbound control surface and `q` owns only this
 /// reader thread.
 struct LocalAgentEventSource {
-    stop: std_mpsc::Sender<()>,
+    control: std_mpsc::Sender<SourceControl>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+enum SourceControl {
+    Refresh,
+    Stop,
 }
 
 impl LocalAgentEventSource {
@@ -181,60 +198,316 @@ impl LocalAgentEventSource {
         context: Arc<crate::cli::Context>,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
+        Self::start_with(move || local_agent_event(&context), poll_rate)
+    }
+
+    fn start_with(
+        produce: impl Fn() -> AgentEvent + Send + 'static,
+        poll_rate: Duration,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
         let (events, receiver) = mpsc::unbounded_channel();
-        let (stop, stopped) = std_mpsc::channel();
-        // Seed the first frame from real journal state before the terminal is
-        // acquired. Subsequent refreshes happen on the reader thread.
-        let _ = events.send(local_agent_event(&context));
+        let (control, controls) = std_mpsc::channel();
         let worker = thread::Builder::new()
             .name("runner-manager-tui-events".to_owned())
             .spawn(move || {
-                while let Err(std_mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(poll_rate)
-                {
-                    if events.send(local_agent_event(&context)).is_err() {
+                let _ = events.send(produce());
+                loop {
+                    match controls.recv_timeout(poll_rate) {
+                        Ok(SourceControl::Stop) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
+                        Ok(SourceControl::Refresh) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if events.send(produce()).is_err() {
                         break;
                     }
                 }
             })?;
         Ok((
             Self {
-                stop,
+                control,
                 worker: Some(worker),
             },
             receiver,
         ))
     }
+
+    fn request_refresh(&self) -> io::Result<()> {
+        self.control
+            .send(SourceControl::Refresh)
+            .map_err(|_| io::Error::other("the TUI snapshot source stopped"))
+    }
 }
 
 impl Drop for LocalAgentEventSource {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.control.send(SourceControl::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
 }
 
+pub trait RefreshRequester {
+    fn request_refresh(&self) -> io::Result<()>;
+}
+
+impl RefreshRequester for LocalAgentEventSource {
+    fn request_refresh(&self) -> io::Result<()> {
+        LocalAgentEventSource::request_refresh(self)
+    }
+}
+
+#[allow(dead_code, reason = "used by the injected-agent embedding seam")]
+struct NoopRefreshRequester;
+impl RefreshRequester for NoopRefreshRequester {
+    fn request_refresh(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn local_agent_event(context: &crate::cli::Context) -> AgentEvent {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return AgentEvent {
+                summary: format!("GitHub inventory runtime could not start: {error}"),
+                health: Health::Error,
+                snapshot: None,
+            };
+        }
+    };
+    runtime.block_on(production_agent_event(context))
+}
+
+async fn production_agent_event(context: &crate::cli::Context) -> AgentEvent {
     match crate::cli::status::snapshot(context) {
-        Ok(snapshot) => AgentEvent {
-            summary: format!(
+        Ok(local) => {
+            let summary = format!(
                 "Local agent journal: {} active runner attempt(s), {} configured policy/policies.",
-                snapshot.host.in_use,
-                snapshot.policies.len()
-            ),
-            health: if snapshot.host.in_use > 0 {
-                Health::Busy
-            } else {
-                Health::Ready
-            },
-            snapshot: None,
-        },
+                local.host.in_use,
+                local.policies.len()
+            );
+            match production_screen_snapshot(context, &local).await {
+                Ok(snapshot) => AgentEvent {
+                    health: if snapshot.metrics.busy_runners > 0 {
+                        Health::Busy
+                    } else {
+                        Health::Ready
+                    },
+                    summary,
+                    snapshot: Some(snapshot),
+                },
+                Err((availability, detail)) => AgentEvent {
+                    summary: format!("{summary} GitHub inventory refresh failed: {detail}"),
+                    health: Health::Error,
+                    snapshot: Some(Snapshot {
+                        availability,
+                        ..Snapshot::default()
+                    }),
+                },
+            }
+        }
         Err(error) => AgentEvent {
             summary: format!("Local agent journal could not be read: {error}"),
             health: Health::Error,
             snapshot: None,
         },
+    }
+}
+
+async fn production_screen_snapshot(
+    context: &crate::cli::Context,
+    local: &crate::cli::status::StatusDocument,
+) -> Result<Snapshot, (Availability, String)> {
+    let start_mode = StartMode::from_str(&local.host.service_start_mode).map_err(|error| {
+        offline_failure(context, format!("invalid service start mode: {error}"))
+    })?;
+    let secrets = context
+        .secret_store(start_mode)
+        .map_err(|error| offline_failure(context, error.to_string()))?;
+    let Some(secret) = secrets
+        .load()
+        .map_err(|error| offline_failure(context, error.to_string()))?
+    else {
+        return Err((
+            Availability::Unauthorized,
+            "no GitHub credential is stored; run `runner-manager auth login`".into(),
+        ));
+    };
+    if local.policies.is_empty() {
+        return Ok(Snapshot {
+            availability: Availability::Ready,
+            ..Snapshot::default()
+        });
+    }
+
+    let clock = context.clock();
+    let client = Arc::new(
+        AuthenticatedClient::new(
+            context.endpoints().clone(),
+            UserAccessToken::from_stored(secret),
+            Arc::clone(&clock),
+        )
+        .map_err(|error| offline_failure(context, error.to_string()))?,
+    );
+    let inventory = RestInventory::new(Arc::clone(&client), Arc::clone(&clock));
+    let reachable = if local
+        .policies
+        .iter()
+        .any(|policy| policy.scope == "organization")
+    {
+        let app = context
+            .app_registration()
+            .map_err(|error| (Availability::Unauthorized, error.to_string()))?;
+        Some(
+            client
+                .discover_installations(&app)
+                .await
+                .map_err(|error| inventory_failure(context, &clock, InventoryError::from(error)))?,
+        )
+    } else {
+        None
+    };
+    let reachable_repositories = reachable
+        .as_ref()
+        .and_then(|discovery| discovery.targets())
+        .map_or_else(Vec::new, |targets| targets.repositories());
+
+    let mut repositories = Vec::with_capacity(local.policies.len());
+    let mut runners = Vec::new();
+    let mut seen_runners = HashSet::new();
+    let mut in_progress_workflows = 0_u32;
+    let mut busy_runners = 0_u32;
+    let mut assigned_jobs = 0_u32;
+    let mut online_runners = 0_u32;
+
+    for policy in &local.policies {
+        let (target, scope) = if policy.scope == "repository" {
+            let repository = OwnerRepo::from_str(&policy.target)
+                .map_err(|error| offline_failure(context, error.to_string()))?;
+            (
+                ScaleTarget::Repository(repository.clone()),
+                ActivityScope::repository(repository),
+            )
+        } else {
+            let org = Org::from_str(&policy.target)
+                .map_err(|error| offline_failure(context, error.to_string()))?;
+            let repositories: Vec<_> = reachable_repositories
+                .iter()
+                .filter(|repository| repository.owner().eq_ignore_ascii_case(org.as_str()))
+                .cloned()
+                .collect();
+            (
+                ScaleTarget::Organization(org.clone()),
+                ActivityScope::organization(org, repositories),
+            )
+        };
+        let refreshed = inventory
+            .snapshot(&scope, &CancelToken::new())
+            .await
+            .map_err(|error| inventory_failure(context, &clock, error))?;
+        let workflow_count = refreshed.activity.total();
+        in_progress_workflows = in_progress_workflows.saturating_add(workflow_count);
+        repositories.push(RepositoryRow {
+            id: policy.id.clone(),
+            target: policy.target.clone(),
+            in_progress_workflows: workflow_count,
+            mode: if policy.mode == "monitor_only" {
+                PolicyMode::MonitorOnly
+            } else {
+                PolicyMode::Autoscale
+            },
+            max_capacity: policy.max_capacity,
+            health: if policy.enabled && policy.state == "active" {
+                AgentHealth::Healthy
+            } else {
+                AgentHealth::Degraded
+            },
+        });
+        for runner in refreshed.runners.runners() {
+            if !seen_runners.insert(runner.id) {
+                continue;
+            }
+            let locally_owned = policy.mode != "monitor_only"
+                && !policy.routing_labels.is_empty()
+                && policy
+                    .routing_labels
+                    .iter()
+                    .all(|label| runner.has_label(label));
+            busy_runners = busy_runners.saturating_add(u32::from(runner.busy));
+            assigned_jobs = assigned_jobs.saturating_add(u32::from(runner.busy && locally_owned));
+            online_runners = online_runners.saturating_add(u32::from(runner.status.is_online()));
+            runners.push(RunnerRow {
+                id: runner.id.to_string(),
+                name: runner.name.clone(),
+                owner: target.slug(),
+                os: runner.os.clone(),
+                labels: runner.labels.clone(),
+                online: runner.status.is_online(),
+                busy: runner.busy,
+                ephemeral: runner.ephemeral.unwrap_or(false),
+                ownership: if locally_owned {
+                    RunnerOwnership::Local
+                } else {
+                    RunnerOwnership::External
+                },
+            });
+        }
+    }
+
+    Ok(Snapshot {
+        availability: Availability::Ready,
+        metrics: DashboardMetrics {
+            in_progress_workflows,
+            assigned_jobs,
+            busy_runners,
+            online_runners,
+            host_capacity_used: local.host.in_use,
+            host_capacity_total: local.host.capacity,
+        },
+        repositories,
+        runners,
+        activity: Vec::new(),
+    })
+}
+
+fn inventory_failure(
+    context: &crate::cli::Context,
+    clock: &Arc<dyn runner_manager_domain::model::Clock>,
+    error: InventoryError,
+) -> (Availability, String) {
+    let state = RefreshState::from_error(&error);
+    let availability = match state {
+        RefreshState::Unauthorized => Availability::Unauthorized,
+        RefreshState::RateLimited(_) | RefreshState::LockedOut { .. } => {
+            Availability::RateLimited {
+                retry_after_seconds: state
+                    .retry_delay(clock.now())
+                    .unwrap_or(LOCAL_AGENT_POLL_RATE)
+                    .as_secs(),
+            }
+        }
+        _ => offline_availability(context),
+    };
+    (availability, error.to_string())
+}
+
+fn offline_failure(context: &crate::cli::Context, detail: String) -> (Availability, String) {
+    (offline_availability(context), detail)
+}
+
+fn offline_availability(context: &crate::cli::Context) -> Availability {
+    let last = runner_manager_platform::service::last_github_contact(context.paths())
+        .ok()
+        .flatten()
+        .map_or_else(|| "none recorded".into(), |at| at.to_rfc3339());
+    Availability::Offline {
+        last_successful_contact: last,
+        retry_after_seconds: LOCAL_AGENT_POLL_RATE.as_secs(),
     }
 }
 
@@ -1003,6 +1276,7 @@ pub async fn run_loop<B, I>(
     session: &mut impl SessionControl,
     mut input: I,
     mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+    refresh: &impl RefreshRequester,
 ) -> io::Result<AppState>
 where
     B: Backend,
@@ -1042,8 +1316,9 @@ where
             match effect {
                 Effect::SetMouseCapture(enabled) => session.set_mouse_capture(enabled)?,
                 Effect::Copy(text) => copy_to_terminal_clipboard(&mut io::stdout(), &text)?,
-                Effect::Refresh | Effect::ActivateFocusedControl => {
-                    // g2/g3 attach refresh and the existing CLI command handlers here.
+                Effect::Refresh => refresh.request_refresh()?,
+                Effect::ActivateFocusedControl => {
+                    // g3 attaches existing CLI command handlers here.
                 }
             }
         }
@@ -1068,6 +1343,7 @@ fn require_interactive_terminal(
 /// This is the composition seam for an in-process agent. The standalone
 /// `runner-manager tui` process uses [`run_terminal`], while an embedding host
 /// passes its real receiver here; the loop test exercises this exact path.
+#[allow(dead_code, reason = "public embedding seam for an in-process agent")]
 pub fn run_terminal_with_agent_events(
     agent_events: mpsc::UnboundedReceiver<AgentEvent>,
 ) -> io::Result<()> {
@@ -1085,6 +1361,7 @@ pub fn run_terminal_with_agent_events(
             &mut session,
             EventStream::new(),
             agent_events,
+            &NoopRefreshRequester,
         ))
         .map(|_| ());
     let _ = terminal.show_cursor();
@@ -1092,8 +1369,26 @@ pub fn run_terminal_with_agent_events(
 }
 
 pub fn run_terminal(context: Arc<crate::cli::Context>) -> io::Result<()> {
-    let (_source, agent_events) = LocalAgentEventSource::start(context, LOCAL_AGENT_POLL_RATE)?;
-    run_terminal_with_agent_events(agent_events)
+    require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let (source, agent_events) = LocalAgentEventSource::start(context, LOCAL_AGENT_POLL_RATE)?;
+    let mut session = TerminalSession::start(CrosstermActions::new(io::stdout(), SystemRawMode))?;
+    let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    terminal.clear()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime
+        .block_on(run_loop(
+            &mut terminal,
+            &mut session,
+            EventStream::new(),
+            agent_events,
+            &source,
+        ))
+        .map(|_| ());
+    let _ = terminal.show_cursor();
+    result
 }
 
 #[cfg(test)]
@@ -1361,9 +1656,15 @@ mod tests {
             crate::cli::Context::resolve(Some(data_root.path()), &mut warnings)
                 .expect("production TUI context"),
         );
-        let (_source, agent_events) =
+        let (_source, mut produced_events) =
             LocalAgentEventSource::start(context, Duration::from_secs(60))
                 .expect("production local-agent source");
+        let initial_event = tokio::time::timeout(Duration::from_secs(5), produced_events.recv())
+            .await
+            .expect("production snapshot deadline")
+            .expect("production source event");
+        let (event_sender, agent_events) = mpsc::unbounded_channel();
+        event_sender.send(initial_event).unwrap();
         let producer = async move {
             input_sender
                 .unbounded_send(Ok(Event::Mouse(crossterm_mouse(
@@ -1379,12 +1680,22 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(
-            run_loop(&mut terminal, &mut session, input, agent_events),
+            run_loop(
+                &mut terminal,
+                &mut session,
+                input,
+                agent_events,
+                &NoopRefreshRequester,
+            ),
             producer
         );
         let final_state = result.expect("merged loop");
         assert_eq!(final_state.screen, Screen::Activity);
-        assert_eq!(final_state.presentation.health, Health::Ready);
+        assert_ne!(
+            final_state.screen_model.snapshot.availability,
+            Availability::Loading,
+            "the shipped local source must replace the initial Loading snapshot"
+        );
         assert!(
             final_state
                 .presentation
@@ -1399,6 +1710,82 @@ mod tests {
             *capture_log.lock().unwrap(),
             ["mouse:on", "mouse:off"],
             "the same capture controller must pair enable and disable"
+        );
+    }
+
+    #[tokio::test]
+    async fn shipped_source_produces_a_snapshot_and_f5_requests_an_immediate_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let produced = Arc::new(AtomicUsize::new(0));
+        let producer_count = Arc::clone(&produced);
+        let (source, agent_events) = LocalAgentEventSource::start_with(
+            move || {
+                let refresh = producer_count.fetch_add(1, Ordering::SeqCst);
+                let snapshot = if refresh == 0 {
+                    Snapshot::default()
+                } else {
+                    Snapshot {
+                        availability: Availability::Ready,
+                        repositories: vec![RepositoryRow {
+                            id: "f5-repository".into(),
+                            target: "acme/refreshed-by-f5".into(),
+                            in_progress_workflows: 9,
+                            mode: PolicyMode::Autoscale,
+                            max_capacity: Some(4),
+                            health: AgentHealth::Healthy,
+                        }],
+                        ..Snapshot::default()
+                    }
+                };
+                AgentEvent {
+                    summary: format!("production refresh {refresh}"),
+                    health: Health::Ready,
+                    snapshot: Some(snapshot),
+                }
+            },
+            Duration::from_secs(60),
+        )
+        .expect("production source thread");
+
+        let output = SharedWriter::default();
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = TerminalSession::start(CrosstermActions::with_mouse_capture(
+            output,
+            NoopRawMode,
+            RecordingMouseCapture(capture_log),
+        ))
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let (input_sender, input) = futures::channel::mpsc::unbounded::<io::Result<Event>>();
+        let input_count = Arc::clone(&produced);
+        let input_producer = async move {
+            input_sender
+                .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::F(5)))))
+                .unwrap();
+            for _ in 0..100 {
+                if input_count.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            input_sender
+                .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::Char('q')))))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            run_loop(&mut terminal, &mut session, input, agent_events, &source,),
+            input_producer,
+        );
+        let final_state = result.unwrap();
+        assert!(produced.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            final_state.screen_model.snapshot.availability,
+            Availability::Ready
+        );
+        assert_eq!(
+            final_state.screen_model.snapshot.repositories[0].target,
+            "acme/refreshed-by-f5"
         );
     }
 

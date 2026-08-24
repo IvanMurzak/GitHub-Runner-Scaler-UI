@@ -4426,7 +4426,7 @@ mod sys {
     //! logon trigger, and a scheduled task cannot run before a session exists.
 
     use std::ffi::{OsStr, OsString};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use runner_manager_domain::model::StartMode;
     use windows_service::service::{
@@ -4444,8 +4444,14 @@ mod sys {
     /// `ERROR_SERVICE_DOES_NOT_EXIST`. Not an error here: it is the answer to
     /// "is this registered".
     const SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE`. `DeleteService` is asynchronous: the
+    /// registration remains in this state until every open service handle is
+    /// closed, and callers must not mistake that short window for a leak.
+    const SERVICE_MARKED_FOR_DELETE: i32 = 1072;
     /// `ERROR_ACCESS_DENIED`.
     const ACCESS_DENIED: i32 = 5;
+    const DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+    const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
     const ELEVATION_REMEDY: &str = "Run the command from an elevated prompt: right-click Windows Terminal or PowerShell and \
          choose \"Run as administrator\".";
@@ -4599,6 +4605,37 @@ mod sys {
             service
                 .delete()
                 .map_err(|error| scm_error("uninstall", identity.name(), &error))?;
+
+            // `DeleteService` marks a registration for deletion and returns;
+            // SCM removes it only after the last service handle closes. Drop
+            // ours before polling, then wait for the observable postcondition
+            // promised by `uninstall`: an immediate status check must not see
+            // a registration that is merely on its way out. This also keeps a
+            // stop/uninstall/install sequence deterministic on busy hosts.
+            drop(service);
+            let absent = wait_until_scm_absent(DELETE_TIMEOUT, DELETE_POLL_INTERVAL, || {
+                match manager.open_service(identity.name(), ServiceAccess::QUERY_STATUS) {
+                    Ok(service) => {
+                        drop(service);
+                        Ok(false)
+                    }
+                    Err(error) if is_missing(&error) => Ok(true),
+                    Err(error) if is_marked_for_delete(&error) => Ok(false),
+                    Err(error) => Err(scm_error("verify uninstall of", identity.name(), &error)),
+                }
+            })?;
+            if !absent {
+                return Err(ServiceError::Control {
+                    operation: "verify uninstall of",
+                    name: identity.name().to_string(),
+                    manager: "the Windows Service Control Manager",
+                    detail: format!(
+                        "the registration was still visible {} seconds after DeleteService; \
+                         retry `service uninstall` from an elevated prompt",
+                        DELETE_TIMEOUT.as_secs()
+                    ),
+                });
+            }
             Ok(true)
         }
 
@@ -4675,6 +4712,28 @@ mod sys {
     fn is_missing(error: &windows_service::Error) -> bool {
         matches!(error, windows_service::Error::Winapi(io)
             if io.raw_os_error() == Some(SERVICE_DOES_NOT_EXIST))
+    }
+
+    fn is_marked_for_delete(error: &windows_service::Error) -> bool {
+        matches!(error, windows_service::Error::Winapi(io)
+            if io.raw_os_error() == Some(SERVICE_MARKED_FOR_DELETE))
+    }
+
+    pub(super) fn wait_until_scm_absent(
+        timeout: Duration,
+        poll_interval: Duration,
+        mut probe_absent: impl FnMut() -> Result<bool, ServiceError>,
+    ) -> Result<bool, ServiceError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if probe_absent()? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(poll_interval);
+        }
     }
 
     // -- Task Scheduler ------------------------------------------------------
@@ -5536,6 +5595,26 @@ mod tests {
         fn request(&self, mode: StartMode) -> InstallRequest {
             InstallRequest::new(mode).for_binary(&self.binary)
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_uninstall_waits_through_the_marked_for_deletion_window() {
+        let probes = std::cell::Cell::new(0);
+        let absent =
+            super::sys::wait_until_scm_absent(Duration::from_secs(1), Duration::ZERO, || {
+                let next = probes.get() + 1;
+                probes.set(next);
+                Ok(next == 3)
+            })
+            .expect("the simulated SCM probe succeeds");
+
+        assert!(absent);
+        assert_eq!(
+            probes.get(),
+            3,
+            "uninstall must recheck after transient presence instead of treating it as a leak"
+        );
     }
 
     #[test]
