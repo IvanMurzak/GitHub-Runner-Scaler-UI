@@ -1,0 +1,51 @@
+crates/app/src/tui/screens.rs
+  s_e3f2ebf0732f36::t_9c80803f488296 382-384,512-517,577,733-734
+  s_e3f2ebf0732f36::t_a0e48904f8fe1d 304,317,319,385-390,569-576,731-732,809-810,826
+  s_e3f2ebf0732f36::t_9c088fe21f6032 729-730
+  s_e3f2ebf0732f36::t_3416dab34d3334 14,67-73,247-248,274-275,305-309,311-316,578-588,735-747,811-813
+  s_e3f2ebf0732f36::t_97fc1e277cdffb 1042,1046
+  s_e3f2ebf0732f36::t_bb9fa7f2e67d5c 318,320
+crates/app/src/tui/shell.rs
+  s_e3f2ebf0732f36::t_72c8723bb86c2e 7,335-339,514-659,661-664,691-700
+  s_d14c0886a58be6::t_2fff87384a64a4 1242,1244
+  s_e3f2ebf0732f36::t_302f468308d154 10-11,33,35,190-192,201,208-213,217-223,228-229,231-235,246-248,256-261,267-269,271-274,296,310,313,321,357
+  s_e3f2ebf0732f36::t_19727dca4ffb72 2435-2436,2439
+  s_d14c0886a58be6::t_60447d63497ec4 214
+  s_e3f2ebf0732f36::t_e79b721653d6db 672-680,701
+  s_e3f2ebf0732f36::t_79217da1f8ff1a 379
+  s_e3f2ebf0732f36::t_21ecfb59587ca1 660
+  s_d14c0886a58be6::t_9298ff6d806ec9 1011,2588-2589
+  s_d14c0886a58be6::t_8c7a02186165b0 241
+  s_e3f2ebf0732f36::t_d9d093e575b068 359-360,446,665,681,702
+  s_e3f2ebf0732f36::t_10bfd6e86fe235 204,993-1010,1031-1032
+  s_d14c0886a58be6::t_a0ee41167a4c55 1208
+  s_e3f2ebf0732f36::t_31be8ee801aafa 1033
+  s_e3f2ebf0732f36::t_f421b2a682c63a 2383-2434,2437-2438,2440-2587
+  s_e3f2ebf0732f36::t_236b4ce7ab9966 238-240,510
+.taskflow/2026-08-21-local-runner-manager/ROADMAP.md
+  s_e3f2ebf0732f36::t_231b3c29532317 149,326-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "229fdf319c508e5861ba06958d66d31ad71bce34",
+  "prompts": {},
+  "sessions": {
+    "s_d14c0886a58be6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02d41-6f24-7af1-84cb-dd051e6a8a0c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
