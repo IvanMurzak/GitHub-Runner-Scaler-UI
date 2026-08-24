@@ -71,7 +71,7 @@ jobs:
       matrix:
         include:
           - name: windows-x86_64
-            os: windows-latest
+            os: ${{ vars.RUNNER_MANAGER_CI_RUNS_ON_WINDOWS || 'windows-latest' }}
           # macos-latest is Apple Silicon, so the platform the persona actually
           # uses is the platform that is tested. The `uname` assertion below
           # keeps that true if GitHub ever repoints the label.
