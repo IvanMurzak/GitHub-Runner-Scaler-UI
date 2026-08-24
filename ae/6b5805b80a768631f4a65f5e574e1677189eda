@@ -1,0 +1,19 @@
+crates/app/src/tui/shell.rs
+  s_ed79f8843352e6::t_e8f495c88ecd6e 2877-2903,2905-2906
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "ae6b5805b80a768631f4a65f5e574e1677189eda",
+  "prompts": {},
+  "sessions": {
+    "s_ed79f8843352e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dd6444e-46d7-4ff2-8ee2-5baa2bb6a927",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
