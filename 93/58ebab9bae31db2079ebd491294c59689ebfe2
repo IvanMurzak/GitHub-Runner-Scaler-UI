@@ -1,0 +1,35 @@
+tests/README.md
+  s_e3f2ebf0732f36::t_f05c452e139fdc 69-73
+crates/domain/src/capacity.rs
+  s_e3f2ebf0732f36::t_5b1668a410edd8 197,223,469
+  s_e3f2ebf0732f36::t_f4a3811f455312 447-468
+tests/tests/e2e_security_acceptance.rs
+  s_e3f2ebf0732f36::t_626aa278103879 1529
+  s_e3f2ebf0732f36::t_02ddd505a7db28 1412-1417,1433-1435,1509,1513
+.github/workflows/ci.yml
+  s_e3f2ebf0732f36::t_7092f0bb8b2bd6 126-127
+  s_e3f2ebf0732f36::t_9423aa86f34539 125
+crates/domain/src/policy.rs
+  s_e3f2ebf0732f36::t_5b1668a410edd8 2321
+  s_e3f2ebf0732f36::t_f4a3811f455312 2301-2320
+tests/assert-no-shippable-mutants.sh
+  s_e3f2ebf0732f36::t_f9258b0ccb1743 1-25
+.github/workflows/e2e.yml
+  s_e3f2ebf0732f36::t_f9258b0ccb1743 183-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "9358ebab9bae31db2079ebd491294c59689ebfe2",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
