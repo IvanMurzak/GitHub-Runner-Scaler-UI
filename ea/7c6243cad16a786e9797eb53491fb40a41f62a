@@ -1,0 +1,28 @@
+crates/app/tests/workflow_action_versions.rs
+  s_e3f2ebf0732f36::t_64e581ad6a43d4 9,48
+  s_e3f2ebf0732f36::t_9b7c60a5f5ecfa 11,17-39,45-47,49,60
+  s_e3f2ebf0732f36::t_7be8b567be47b5 1-8,10,12-16,40-44,50-59,61-99
+.github/workflows/e2e.yml
+  s_e3f2ebf0732f36::t_860daa922d7979 111-112
+  s_e3f2ebf0732f36::t_7be8b567be47b5 158,168
+.github/workflows/ci.yml
+  s_e3f2ebf0732f36::t_7be8b567be47b5 89,107,165,173
+.github/workflows/release.yml
+  s_e3f2ebf0732f36::t_7be8b567be47b5 206,333,392,510,606,642,692,711,716,894,1125,1213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "ea7c6243cad16a786e9797eb53491fb40a41f62a",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
