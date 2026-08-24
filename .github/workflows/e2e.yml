@@ -186,15 +186,25 @@ jobs:
         if: steps.guard.outputs.enabled == 'true'
         env:
           EVIDENCE_SOURCE: ${{ vars.RUNNER_MANAGER_E2E_EVIDENCE_SOURCE }}
+          RUNNER_MANAGER_E2E_PHYSICAL_HOST: ${{ vars.RUNNER_MANAGER_E2E_PHYSICAL_HOST }}
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+          RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
+          RUNNER_MANAGER_E2E_EVIDENCE_KEY: ${{ secrets.RUNNER_MANAGER_E2E_EVIDENCE_KEY }}
+          RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
+          RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
         run: |
           evidence_dir="$RUNNER_TEMP/runner-manager-e2e-evidence"
           data_dir="$RUNNER_TEMP/runner-manager-e2e-data"
           report_dir="$GITHUB_WORKSPACE/target/e2e-reports"
-          bash tests/host-controller.sh prepare "$EVIDENCE_SOURCE" "$evidence_dir" "${{ runner.os == 'Windows' && 'windows' || runner.os == 'macOS' && 'macos' || 'linux' }}"
+          challenge="$(openssl rand -hex 32)"
           mkdir -p "$data_dir" "$report_dir"
+          bash tests/host-controller.sh prepare "$EVIDENCE_SOURCE" "$evidence_dir" "${{ runner.os == 'Windows' && 'windows' || runner.os == 'macOS' && 'macos' || 'linux' }}"
+          RUNNER_MANAGER_E2E_CHALLENGE="$challenge" RUNNER_MANAGER_E2E_DATA_DIR="$data_dir" \
+            cargo run -p runner-manager-e2e --example e2e-host-controller -- seal-live-run "$evidence_dir"
           {
             echo "RUNNER_MANAGER_E2E_EVIDENCE_DIR=$evidence_dir"
             echo "RUNNER_MANAGER_E2E_DATA_DIR=$data_dir"
+            echo "RUNNER_MANAGER_E2E_CHALLENGE=$challenge"
           } >> "$GITHUB_ENV"
 
       - name: Run the acceptance suite
@@ -228,6 +238,7 @@ jobs:
           RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
           RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
           RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+          RUNNER_MANAGER_E2E_EVIDENCE_KEY: ${{ secrets.RUNNER_MANAGER_E2E_EVIDENCE_KEY }}
         run: cargo test -p runner-manager-e2e -- --ignored
 
       - name: Collect the per-OS human-gate report

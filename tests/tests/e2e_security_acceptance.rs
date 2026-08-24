@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -56,6 +57,8 @@ struct Fixture {
     repository: String,
     organization: String,
     data_dir: PathBuf,
+    evidence_key: SecretString,
+    expected_context: ExpectedContext,
 }
 
 impl Fixture {
@@ -83,8 +86,61 @@ impl Fixture {
                     "RUNNER_MANAGER_E2E_DATA_DIR is required when fixture inputs are present",
                 ),
             ),
+            evidence_key: SecretString::from(
+                std::env::var("RUNNER_MANAGER_E2E_EVIDENCE_KEY")
+                    .expect("a separate RUNNER_MANAGER_E2E_EVIDENCE_KEY is required"),
+            ),
+            expected_context: ExpectedContext::from_environment(),
         })
     }
+}
+
+#[derive(Debug)]
+struct ExpectedContext {
+    run_id: u64,
+    run_attempt: u64,
+    commit_sha: String,
+    architecture: String,
+    challenge: String,
+}
+
+impl ExpectedContext {
+    fn from_environment() -> Self {
+        let required = |name: &str| {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("{name} is required for live evidence binding"))
+        };
+        let challenge = required("RUNNER_MANAGER_E2E_CHALLENGE");
+        assert!(
+            challenge.len() >= 64 && challenge.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "RUNNER_MANAGER_E2E_CHALLENGE must be at least 256 random bits encoded as hex"
+        );
+        Self {
+            run_id: required("GITHUB_RUN_ID")
+                .parse()
+                .expect("GITHUB_RUN_ID is numeric"),
+            run_attempt: required("GITHUB_RUN_ATTEMPT")
+                .parse()
+                .expect("GITHUB_RUN_ATTEMPT is numeric"),
+            commit_sha: required("GITHUB_SHA"),
+            architecture: required("RUNNER_ARCH"),
+            challenge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceContext {
+    run_id: u64,
+    run_attempt: u64,
+    commit_sha: String,
+    os: String,
+    architecture: String,
+    challenge: String,
+    nonce: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +148,7 @@ impl Fixture {
 struct ScenarioEvidence {
     schema: u8,
     authentication_tag: String,
+    context: EvidenceContext,
     controller: String,
     scenario: String,
     os: String,
@@ -111,51 +168,86 @@ enum ScenarioFacts {
     SuccessfulJitJob {
         workflow_run_id: u64,
         job_id: u64,
+        runner_id: u64,
         attempt_id: String,
         conclusion: String,
     },
     NetworkOutageRecovery {
+        workflow_run_id: u64,
+        job_id: u64,
+        runner_id: u64,
+        attempt_id: String,
         outage_started_ms: u64,
         failed_contact_ms: u64,
         recovered_contact_ms: u64,
-        job_id: u64,
+        conclusion: String,
     },
     JitExpiryRecovery {
+        workflow_run_id: u64,
+        job_id: u64,
         expired_attempt_id: String,
+        expired_runner_id: u64,
         expiry_observed_ms: u64,
         replacement_attempt_id: String,
-        job_id: u64,
+        replacement_runner_id: u64,
+        conclusion: String,
     },
     PolicyDisableDrain {
+        workflow_run_id: u64,
+        job_id: u64,
+        attempt_id: String,
         disable_requested_ms: u64,
         busy_observed_ms: u64,
         terminal_observed_ms: u64,
         launches_after_disable: u64,
+        conclusion: String,
     },
     BootStartRecovery {
+        workflow_run_id: u64,
+        job_id: u64,
+        runner_id: u64,
+        attempt_id: String,
         boot_id_before: String,
         boot_id_after: String,
         service_started_ms: u64,
         github_contact_ms: u64,
         interactive_login_observed: bool,
-        job_id: u64,
+        conclusion: String,
     },
     OrganizationScopedJob {
+        workflow_run_id: u64,
         job_id: u64,
         runner_id: u64,
+        attempt_id: String,
         github_scope: String,
+        conclusion: String,
     },
     MonitorOnlyDemand {
-        queued_jobs_observed: u64,
+        workflow_run_id: u64,
+        policy_id: String,
+        queued_job_ids: Vec<u64>,
         runner_attempts_started: u64,
     },
     TwoHostContention {
+        workflow_run_id: u64,
         host_ids: [String; 2],
         attempt_ids: [String; 2],
+        runner_ids: [u64; 2],
         completed_job_ids: Vec<u64>,
         idle_exit_attempt_id: String,
+        idle_exit_reason: String,
         idle_exit_recorded_as_failure: bool,
+        surplus_cleanup: CleanupReceipt,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupReceipt {
+    attempt_id: String,
+    github_removed_at_ms: u64,
+    runtime_removed_at_ms: u64,
+    outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +257,7 @@ struct PostCondition {
     registered_runner_ids: Vec<u64>,
     legacy_label_runner_ids: Vec<u64>,
     local_observed_at_ms: u64,
+    runtime_root: String,
     runtime_directories: Vec<String>,
 }
 
@@ -173,9 +266,13 @@ struct PostCondition {
 struct RollbackEvidence {
     schema: u8,
     authentication_tag: String,
+    context: EvidenceContext,
     controller: String,
     os: String,
     target: String,
+    legacy_runner_id: u64,
+    legacy_label: String,
+    legacy_service: String,
     steps: Vec<RollbackStep>,
     post_condition: PostCondition,
 }
@@ -196,7 +293,23 @@ struct RollbackStep {
     started_at_ms: u64,
     finished_at_ms: u64,
     command: Vec<String>,
+    target: String,
     exit_code: i32,
+    stdout: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessInspectionEvidence {
+    schema: u8,
+    authentication_tag: String,
+    context: EvidenceContext,
+    controller: String,
+    observed_at_ms: u64,
+    manager_pid: u32,
+    listener_pid: u32,
+    manager_command_line: String,
+    listener_command_line: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,7 +341,7 @@ fn absent_fixture_inputs_are_a_clean_skip() {
 
 #[test]
 fn fabricated_controller_json_fails_authentication() -> Result<()> {
-    let key = "product-fixture-token";
+    let key = "independent-evidence-authority";
     let mut value = serde_json::json!({
         "schema": 1,
         "authentication_tag": "",
@@ -242,10 +355,63 @@ fn fabricated_controller_json_fails_authentication() -> Result<()> {
     value["job_id"] = serde_json::json!(43);
     ensure!(verify_signed_json(&serde_json::to_vec(&value)?, key).is_err());
     ensure!(verify_signed_json(&signed, "different-token").is_err());
+    ensure!(
+        validate_authority_separation(key, key).is_err(),
+        "fixture token was accepted as a signing oracle"
+    );
+    validate_authority_separation("product-fixture-token", key)?;
     assert_eq!(
         hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
         "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
         "HMAC-SHA-256 must match RFC 4231 test case 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn wrong_run_expired_and_replayed_evidence_are_rejected() -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let expected = ExpectedContext {
+        run_id: 7,
+        run_attempt: 2,
+        commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+        architecture: "X64".into(),
+        challenge: "cd".repeat(32),
+    };
+    let mut context = EvidenceContext {
+        run_id: 7,
+        run_attempt: 2,
+        commit_sha: expected.commit_sha.clone(),
+        os: os_name().into(),
+        architecture: "X64".into(),
+        challenge: expected.challenge.clone(),
+        nonce: "ab".repeat(16),
+        issued_at_ms: now - 1_000,
+        expires_at_ms: now + 60_000,
+    };
+    validate_evidence_context(&context, &expected)?;
+    context.run_id = 8;
+    ensure!(validate_evidence_context(&context, &expected).is_err());
+    context.run_id = 7;
+    context.run_attempt = 3;
+    ensure!(validate_evidence_context(&context, &expected).is_err());
+    context.run_attempt = 2;
+    context.commit_sha = "wrong-commit".into();
+    ensure!(validate_evidence_context(&context, &expected).is_err());
+    context.commit_sha = expected.commit_sha.clone();
+    context.challenge = "ef".repeat(32);
+    ensure!(validate_evidence_context(&context, &expected).is_err());
+    context.challenge = expected.challenge.clone();
+    context.expires_at_ms = now - 1;
+    ensure!(validate_evidence_context(&context, &expected).is_err());
+    context.expires_at_ms = now + 60_000;
+    let root = tempfile::tempdir()?;
+    consume_nonce(root.path(), &context)?;
+    ensure!(
+        consume_nonce(root.path(), &context).is_err(),
+        "replayed nonce was accepted"
     );
     Ok(())
 }
@@ -341,6 +507,7 @@ fn security_gate_post_condition_rejects_each_residue() {
     let mut evidence = ScenarioEvidence {
         schema: 1,
         authentication_tag: "fixture-tag".into(),
+        context: test_context("scenario-nonce"),
         controller: "runner-manager-e2e-host-controller/v1".into(),
         scenario: "successful_jit_job".into(),
         os: os_name().into(),
@@ -353,6 +520,7 @@ fn security_gate_post_condition_rejects_each_residue() {
         facts: ScenarioFacts::SuccessfulJitJob {
             workflow_run_id: 1,
             job_id: 2,
+            runner_id: 3,
             attempt_id: "attempt-1".into(),
             conclusion: "success".into(),
         },
@@ -361,11 +529,18 @@ fn security_gate_post_condition_rejects_each_residue() {
             registered_runner_ids: vec![],
             legacy_label_runner_ids: vec![],
             local_observed_at_ms: 9,
+            runtime_root: "runtime".into(),
             runtime_directories: vec![],
         },
     };
-    validate_scenario(&evidence, "successful_jit_job", "repository", "owner/repo")
-        .expect("repository-controller evidence is structurally valid");
+    validate_scenario(
+        &evidence,
+        "successful_jit_job",
+        "repository",
+        "owner/repo",
+        "runtime",
+    )
+    .expect("repository-controller evidence is structurally valid");
     assert!(post_condition_holds(&evidence));
     evidence.post_condition.registered_runner_ids.push(1);
     assert!(!post_condition_holds(&evidence));
@@ -381,14 +556,28 @@ fn security_gate_post_condition_rejects_each_residue() {
     evidence.post_condition.legacy_label_runner_ids.clear();
     evidence.controller = "fabricated-prose/v1".into();
     assert!(
-        validate_scenario(&evidence, "successful_jit_job", "repository", "owner/repo").is_err()
+        validate_scenario(
+            &evidence,
+            "successful_jit_job",
+            "repository",
+            "owner/repo",
+            "runtime"
+        )
+        .is_err()
     );
     evidence.controller = "runner-manager-e2e-host-controller/v1".into();
     if let ScenarioFacts::SuccessfulJitJob { conclusion, .. } = &mut evidence.facts {
         *conclusion = "failure".into();
     }
     assert!(
-        validate_scenario(&evidence, "successful_jit_job", "repository", "owner/repo").is_err()
+        validate_scenario(
+            &evidence,
+            "successful_jit_job",
+            "repository",
+            "owner/repo",
+            "runtime"
+        )
+        .is_err()
     );
 }
 
@@ -403,9 +592,13 @@ fn rollback_rejects_reordered_or_failed_controller_commands() {
     let mut evidence = RollbackEvidence {
         schema: 1,
         authentication_tag: "fixture-tag".into(),
+        context: test_context("rollback-nonce"),
         controller: "runner-manager-e2e-host-controller/v1".into(),
         os: os_name().into(),
         target: "owner/repo".into(),
+        legacy_runner_id: 42,
+        legacy_label: "legacy-win".into(),
+        legacy_service: "actions.runner.legacy".into(),
         steps: kinds
             .into_iter()
             .enumerate()
@@ -413,8 +606,45 @@ fn rollback_rejects_reordered_or_failed_controller_commands() {
                 kind,
                 started_at_ms: 10 + (i as u64 * 10),
                 finished_at_ms: 19 + (i as u64 * 10),
-                command: vec!["runner-manager".into(), format!("rollback-{i}")],
+                command: match kind {
+                    RollbackKind::RestoreLabel => vec![
+                        "bash".into(),
+                        "tests/host-controller.sh".into(),
+                        "operation".into(),
+                        "restore-label".into(),
+                        "owner/repo".into(),
+                        "42".into(),
+                        "legacy-win".into(),
+                    ],
+                    RollbackKind::Drain => vec![
+                        "runner-manager".into(),
+                        "repo".into(),
+                        "set-scale".into(),
+                        "owner/repo".into(),
+                        "--enabled".into(),
+                        "false".into(),
+                    ],
+                    RollbackKind::VerifyTerminal => {
+                        vec!["runner-manager".into(), "status".into(), "--json".into()]
+                    }
+                    RollbackKind::ReenableLegacy => vec![
+                        "bash".into(),
+                        "tests/host-controller.sh".into(),
+                        "operation".into(),
+                        "legacy-service-enable".into(),
+                        os_name().into(),
+                        "actions.runner.legacy".into(),
+                    ],
+                },
+                target: "owner/repo".into(),
                 exit_code: 0,
+                stdout: match kind {
+                    RollbackKind::RestoreLabel => "{\"label_restored\":true,\"runner_id\":42}",
+                    RollbackKind::Drain => "{\"state\":\"draining\"}",
+                    RollbackKind::VerifyTerminal => "{\"active_attempts\":0}",
+                    RollbackKind::ReenableLegacy => "{\"legacy_enabled\":true}",
+                }
+                .into(),
             })
             .collect(),
         post_condition: PostCondition {
@@ -422,15 +652,31 @@ fn rollback_rejects_reordered_or_failed_controller_commands() {
             registered_runner_ids: vec![],
             legacy_label_runner_ids: vec![42],
             local_observed_at_ms: 52,
+            runtime_root: "runtime".into(),
             runtime_directories: vec![],
         },
     };
-    validate_rollback(&evidence, "owner/repo").expect("ordered successful rollback passes");
+    validate_rollback(&evidence, "owner/repo", "runtime")
+        .expect("ordered successful rollback passes");
     evidence.steps.swap(0, 1);
-    assert!(validate_rollback(&evidence, "owner/repo").is_err());
+    assert!(validate_rollback(&evidence, "owner/repo", "runtime").is_err());
     evidence.steps.swap(0, 1);
     evidence.steps[2].exit_code = 1;
-    assert!(validate_rollback(&evidence, "owner/repo").is_err());
+    assert!(validate_rollback(&evidence, "owner/repo", "runtime").is_err());
+}
+
+fn test_context(nonce: &str) -> EvidenceContext {
+    EvidenceContext {
+        run_id: 1,
+        run_attempt: 1,
+        commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+        os: os_name().into(),
+        architecture: "X64".into(),
+        challenge: "ab".repeat(32),
+        nonce: nonce.into(),
+        issued_at_ms: 1,
+        expires_at_ms: u64::MAX,
+    }
 }
 
 #[test]
@@ -439,6 +685,10 @@ fn release_acceptance_and_security_report() -> Result<()> {
     let Some(fixture) = Fixture::from_environment() else {
         return Ok(());
     };
+    validate_authority_separation(
+        fixture.product_token.expose_secret(),
+        fixture.evidence_key.expose_secret(),
+    )?;
 
     validate_target(&fixture.repository, "RUNNER_MANAGER_E2E_REPO")?;
     ensure!(
@@ -451,7 +701,12 @@ fn release_acceptance_and_security_report() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(".e2e-evidence").join(os_name()));
     let jit_marker = fs::read_to_string(evidence_dir.join("security").join("jit-marker.txt"))?;
     ensure!(!jit_marker.trim().is_empty(), "encoded-JIT marker is empty");
-    let sensitive = [fixture.product_token.expose_secret(), jit_marker.trim()];
+    let sensitive = [
+        fixture.product_token.expose_secret(),
+        fixture.fixture_token.expose_secret(),
+        fixture.evidence_key.expose_secret(),
+        jit_marker.trim(),
+    ];
     scan_evidence_tree(&evidence_dir, &sensitive)?;
     let scenarios = load_scenarios(&evidence_dir, &fixture)?;
     let rollback = load_rollback(&evidence_dir, &fixture)?;
@@ -460,21 +715,11 @@ fn release_acceptance_and_security_report() -> Result<()> {
     // token is used only for the product-facing inventory proof; the fixture
     // token is used only to prove the test fixture itself is reachable.
     let runtime = tokio::runtime::Runtime::new()?;
-    let (repository_runners, organization_runners) = runtime.block_on(async {
+    runtime.block_on(async {
         ensure_fixture_reachable(&fixture).await?;
-        Ok::<_, anyhow::Error>((
-            runner_count(&fixture.product_token, "repos", &fixture.repository).await?,
-            runner_count(&fixture.product_token, "orgs", &fixture.organization).await?,
-        ))
+        verify_remote_scenarios(&fixture, &scenarios).await?;
+        verify_final_runner_inventory(&fixture, &scenarios, &rollback).await
     })?;
-    ensure!(
-        repository_runners == 0,
-        "fixture repository still has {repository_runners} registered runner(s)"
-    );
-    ensure!(
-        organization_runners == 0,
-        "fixture organization still has {organization_runners} registered runner(s)"
-    );
     let runtime_dir = fixture.data_dir.join("runtime");
     let local_residue = if runtime_dir.is_dir() {
         fs::read_dir(&runtime_dir)?.collect::<std::io::Result<Vec<_>>>()?
@@ -531,17 +776,24 @@ fn load_scenarios(root: &Path, fixture: &Fixture) -> Result<Vec<ScenarioEvidence
                     path.display()
                 )
             })?;
-            verify_signed_json(&bytes, fixture.product_token.expose_secret()).with_context(
+            verify_signed_json(&bytes, fixture.evidence_key.expose_secret()).with_context(
                 || format!("unauthenticated controller journal: {}", path.display()),
             )?;
             let evidence: ScenarioEvidence = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid scenario evidence: {}", path.display()))?;
+            validate_evidence_context(&evidence.context, &fixture.expected_context)?;
+            consume_nonce(&fixture.data_dir, &evidence.context)?;
             let target = if scope == "repository" {
                 &fixture.repository
             } else {
                 &fixture.organization
             };
-            validate_scenario(&evidence, scenario, scope, target)
+            let runtime_root = fixture
+                .data_dir
+                .join("runtime")
+                .to_string_lossy()
+                .into_owned();
+            validate_scenario(&evidence, scenario, scope, target, &runtime_root)
                 .with_context(|| format!("untrustworthy scenario evidence: {}", path.display()))?;
             Ok(evidence)
         })
@@ -553,10 +805,17 @@ fn load_rollback(root: &Path, fixture: &Fixture) -> Result<RollbackEvidence> {
     let value: RollbackEvidence = serde_json::from_slice(&{
         let bytes = fs::read(&path)
             .with_context(|| format!("missing rollback evidence: {}", path.display()))?;
-        verify_signed_json(&bytes, fixture.product_token.expose_secret())?;
+        verify_signed_json(&bytes, fixture.evidence_key.expose_secret())?;
         bytes
     })?;
-    validate_rollback(&value, &fixture.repository)?;
+    validate_evidence_context(&value.context, &fixture.expected_context)?;
+    consume_nonce(&fixture.data_dir, &value.context)?;
+    let runtime_root = fixture
+        .data_dir
+        .join("runtime")
+        .to_string_lossy()
+        .into_owned();
+    validate_rollback(&value, &fixture.repository, &runtime_root)?;
     Ok(value)
 }
 
@@ -565,6 +824,7 @@ fn validate_scenario(
     scenario: &str,
     scope: &str,
     target: &str,
+    runtime_root: &str,
 ) -> Result<()> {
     ensure!(e.schema == 1 && e.controller == "runner-manager-e2e-host-controller/v1");
     ensure!(e.scenario == scenario && e.os == os_name() && e.scope == scope && e.target == target);
@@ -586,11 +846,16 @@ fn validate_scenario(
         post_condition_holds(e),
         "scenario post-condition contains residue"
     );
+    ensure!(
+        e.post_condition.runtime_root == runtime_root,
+        "scenario local probe used a different runtime root"
+    );
     match (&e.facts, scenario) {
         (
             ScenarioFacts::SuccessfulJitJob {
                 workflow_run_id,
                 job_id,
+                runner_id,
                 attempt_id,
                 conclusion,
             },
@@ -598,15 +863,20 @@ fn validate_scenario(
         ) => ensure!(
             *workflow_run_id > 0
                 && *job_id > 0
+                && *runner_id > 0
                 && !attempt_id.is_empty()
                 && conclusion == "success"
         ),
         (
             ScenarioFacts::NetworkOutageRecovery {
+                workflow_run_id,
+                job_id,
+                runner_id,
+                attempt_id,
                 outage_started_ms,
                 failed_contact_ms,
                 recovered_contact_ms,
-                job_id,
+                conclusion,
             },
             "network_outage_recovery",
         ) => ensure!(
@@ -615,13 +885,21 @@ fn validate_scenario(
                 && *failed_contact_ms < *recovered_contact_ms
                 && *recovered_contact_ms <= e.finished_at_ms
                 && *job_id > 0
+                && *workflow_run_id > 0
+                && *runner_id > 0
+                && !attempt_id.is_empty()
+                && conclusion == "success"
         ),
         (
             ScenarioFacts::JitExpiryRecovery {
+                workflow_run_id,
+                job_id,
                 expired_attempt_id,
+                expired_runner_id,
                 expiry_observed_ms,
                 replacement_attempt_id,
-                job_id,
+                replacement_runner_id,
+                conclusion,
             },
             "jit_expiry_recovery",
         ) => ensure!(
@@ -631,13 +909,22 @@ fn validate_scenario(
                 && *expiry_observed_ms >= e.started_at_ms
                 && *expiry_observed_ms <= e.finished_at_ms
                 && *job_id > 0
+                && *workflow_run_id > 0
+                && *expired_runner_id > 0
+                && *replacement_runner_id > 0
+                && expired_runner_id != replacement_runner_id
+                && conclusion == "success"
         ),
         (
             ScenarioFacts::PolicyDisableDrain {
+                workflow_run_id,
+                job_id,
+                attempt_id,
                 disable_requested_ms,
                 busy_observed_ms,
                 terminal_observed_ms,
                 launches_after_disable,
+                conclusion,
             },
             "policy_disable_drain",
         ) => ensure!(
@@ -645,15 +932,23 @@ fn validate_scenario(
                 && *disable_requested_ms < *terminal_observed_ms
                 && *terminal_observed_ms <= e.finished_at_ms
                 && *launches_after_disable == 0
+                && *workflow_run_id > 0
+                && *job_id > 0
+                && !attempt_id.is_empty()
+                && conclusion == "success"
         ),
         (
             ScenarioFacts::BootStartRecovery {
+                workflow_run_id,
+                runner_id,
+                attempt_id,
                 boot_id_before,
                 boot_id_after,
                 service_started_ms,
                 github_contact_ms,
                 interactive_login_observed,
                 job_id,
+                conclusion,
             },
             "boot_start_recovery",
         ) => ensure!(
@@ -663,52 +958,82 @@ fn validate_scenario(
                 && *service_started_ms < *github_contact_ms
                 && !interactive_login_observed
                 && *job_id > 0
+                && *workflow_run_id > 0
+                && *runner_id > 0
+                && !attempt_id.is_empty()
+                && conclusion == "success"
         ),
         (
             ScenarioFacts::OrganizationScopedJob {
+                workflow_run_id,
                 job_id,
                 runner_id,
+                attempt_id,
                 github_scope,
+                conclusion,
             },
             "organization_scoped_job",
         ) => ensure!(
             *job_id > 0
+                && *workflow_run_id > 0
                 && *runner_id > 0
+                && !attempt_id.is_empty()
                 && github_scope == "organization"
                 && scope == "organization"
+                && conclusion == "success"
         ),
         (
             ScenarioFacts::MonitorOnlyDemand {
-                queued_jobs_observed,
+                workflow_run_id,
+                policy_id,
+                queued_job_ids,
                 runner_attempts_started,
             },
             "monitor_only_demand",
-        ) => ensure!(*queued_jobs_observed > 0 && *runner_attempts_started == 0),
+        ) => ensure!(
+            *workflow_run_id > 0
+                && !policy_id.is_empty()
+                && !queued_job_ids.is_empty()
+                && queued_job_ids.iter().all(|id| *id > 0)
+                && *runner_attempts_started == 0
+        ),
         (
             ScenarioFacts::TwoHostContention {
+                workflow_run_id,
                 host_ids,
                 attempt_ids,
+                runner_ids,
                 completed_job_ids,
                 idle_exit_attempt_id,
+                idle_exit_reason,
                 idle_exit_recorded_as_failure,
+                surplus_cleanup,
             },
             "two_host_contention",
         ) => ensure!(
             !host_ids[0].is_empty()
+                && *workflow_run_id > 0
                 && host_ids[0] != host_ids[1]
                 && !attempt_ids[0].is_empty()
                 && attempt_ids[0] != attempt_ids[1]
                 && completed_job_ids.len() == 1
                 && completed_job_ids[0] > 0
                 && attempt_ids.contains(idle_exit_attempt_id)
+                && runner_ids.iter().all(|id| *id > 0)
+                && runner_ids[0] != runner_ids[1]
+                && idle_exit_reason == "idle_timeout"
                 && !idle_exit_recorded_as_failure
+                && surplus_cleanup.attempt_id == *idle_exit_attempt_id
+                && surplus_cleanup.outcome == "cleaned"
+                && surplus_cleanup.github_removed_at_ms > 0
+                && surplus_cleanup.runtime_removed_at_ms > 0
         ),
         _ => bail!("scenario facts do not match scenario name"),
     }
     Ok(())
 }
 
-fn validate_rollback(value: &RollbackEvidence, target: &str) -> Result<()> {
+fn validate_rollback(value: &RollbackEvidence, target: &str, runtime_root: &str) -> Result<()> {
     ensure!(
         value.schema == 1
             && value.controller == "runner-manager-e2e-host-controller/v1"
@@ -719,6 +1044,12 @@ fn validate_rollback(value: &RollbackEvidence, target: &str) -> Result<()> {
         value.steps.len() == 4,
         "rollback must contain exactly four steps"
     );
+    ensure!(
+        value.legacy_runner_id > 0
+            && !value.legacy_label.is_empty()
+            && !value.legacy_service.is_empty(),
+        "rollback omitted the legacy runner target identity"
+    );
     let kinds = [
         RollbackKind::RestoreLabel,
         RollbackKind::Drain,
@@ -726,7 +1057,62 @@ fn validate_rollback(value: &RollbackEvidence, target: &str) -> Result<()> {
         RollbackKind::ReenableLegacy,
     ];
     for (index, (step, kind)) in value.steps.iter().zip(kinds).enumerate() {
-        ensure!(step.kind == kind && step.exit_code == 0 && !step.command.is_empty());
+        ensure!(step.kind == kind && step.exit_code == 0 && step.target == target);
+        let (expected_command, output_fact): (Vec<String>, &str) = match kind {
+            RollbackKind::RestoreLabel => (
+                vec![
+                    "bash".into(),
+                    "tests/host-controller.sh".into(),
+                    "operation".into(),
+                    "restore-label".into(),
+                    target.into(),
+                    value.legacy_runner_id.to_string(),
+                    value.legacy_label.clone(),
+                ],
+                "\"label_restored\":true",
+            ),
+            RollbackKind::Drain => (
+                vec![
+                    "runner-manager".into(),
+                    "repo".into(),
+                    "set-scale".into(),
+                    target.into(),
+                    "--enabled".into(),
+                    "false".into(),
+                ],
+                "\"state\":\"draining\"",
+            ),
+            RollbackKind::VerifyTerminal => (
+                vec!["runner-manager".into(), "status".into(), "--json".into()],
+                "\"active_attempts\":0",
+            ),
+            RollbackKind::ReenableLegacy => (
+                vec![
+                    "bash".into(),
+                    "tests/host-controller.sh".into(),
+                    "operation".into(),
+                    "legacy-service-enable".into(),
+                    os_name().into(),
+                    value.legacy_service.clone(),
+                ],
+                "\"legacy_enabled\":true",
+            ),
+        };
+        ensure!(
+            step.command == expected_command,
+            "rollback command verb/args do not match the required operation"
+        );
+        ensure!(
+            step.stdout.contains(output_fact),
+            "rollback command output omitted its required observed outcome"
+        );
+        if kind == RollbackKind::RestoreLabel {
+            ensure!(
+                step.stdout
+                    .contains(&format!("\"runner_id\":{}", value.legacy_runner_id)),
+                "restore-label output names a different runner"
+            );
+        }
         ensure!(step.finished_at_ms > step.started_at_ms);
         if index > 0 {
             ensure!(
@@ -737,10 +1123,76 @@ fn validate_rollback(value: &RollbackEvidence, target: &str) -> Result<()> {
     }
     ensure!(value.post_condition.registered_runner_ids.is_empty());
     ensure!(value.post_condition.runtime_directories.is_empty());
+    ensure!(value.post_condition.runtime_root == runtime_root);
     ensure!(
-        value.post_condition.legacy_label_runner_ids.len() == 1,
+        value.post_condition.legacy_label_runner_ids == [value.legacy_runner_id],
         "legacy re-enable must be independently visible at GitHub"
     );
+    Ok(())
+}
+
+fn validate_evidence_context(context: &EvidenceContext, expected: &ExpectedContext) -> Result<()> {
+    ensure!(
+        context.run_id == expected.run_id,
+        "evidence belongs to a different GitHub run"
+    );
+    ensure!(
+        context.run_attempt == expected.run_attempt,
+        "evidence belongs to a different run attempt"
+    );
+    ensure!(
+        context.commit_sha == expected.commit_sha,
+        "evidence belongs to a different commit"
+    );
+    ensure!(
+        context.os == os_name(),
+        "evidence belongs to a different OS"
+    );
+    ensure!(
+        context.architecture == expected.architecture,
+        "evidence belongs to a different architecture"
+    );
+    ensure!(
+        context.challenge == expected.challenge,
+        "evidence challenge does not match this job"
+    );
+    ensure!(
+        context.nonce.len() >= 32 && context.nonce.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "evidence nonce is not a cryptographic hex nonce"
+    );
+    ensure!(
+        context.expires_at_ms > context.issued_at_ms
+            && context.expires_at_ms - context.issued_at_ms <= 15 * 60 * 1_000,
+        "evidence lifetime exceeds fifteen minutes"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    ensure!(
+        context.issued_at_ms <= now && now <= context.expires_at_ms,
+        "evidence is not currently valid"
+    );
+    Ok(())
+}
+
+fn consume_nonce(data_dir: &Path, context: &EvidenceContext) -> Result<()> {
+    let directory = data_dir
+        .join("state")
+        .join("evidence-consumed")
+        .join(context.run_id.to_string());
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(&context.nonce);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "evidence nonce was already consumed (replay): {}",
+                context.nonce
+            )
+        })?;
+    writeln!(file, "{} {}", context.run_attempt, context.commit_sha)?;
     Ok(())
 }
 
@@ -750,7 +1202,7 @@ fn run_security_gates(
     scenarios: &[ScenarioEvidence],
 ) -> Result<Vec<GateEvidence>> {
     let mut gates = vec![
-        execute_recipe(recipe("process_inspection"), fixture, evidence_root)?,
+        process_inspection_gate(fixture, evidence_root)?,
         execute_recipe(recipe("two_job_contamination"), fixture, evidence_root)?,
         execute_recipe(recipe("runner_package_integrity"), fixture, evidence_root)?,
         secret_injection_gate(fixture, evidence_root)?,
@@ -769,6 +1221,54 @@ fn run_security_gates(
         "security gates do not match the release roster"
     );
     Ok(gates)
+}
+
+fn process_inspection_gate(fixture: &Fixture, evidence_root: &Path) -> Result<GateEvidence> {
+    // Keep the product-level negative control, then require an observation of
+    // the two shipping processes from the native host controller.
+    execute_recipe(recipe("process_inspection"), fixture, evidence_root)?;
+    let path = evidence_root
+        .join("security")
+        .join("process-inspection.json");
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "native process inspection evidence is required: {}",
+            path.display()
+        )
+    })?;
+    verify_signed_json(&bytes, fixture.evidence_key.expose_secret())?;
+    let evidence: ProcessInspectionEvidence = serde_json::from_slice(&bytes)?;
+    validate_evidence_context(&evidence.context, &fixture.expected_context)?;
+    consume_nonce(&fixture.data_dir, &evidence.context)?;
+    ensure!(
+        evidence.schema == 1
+            && evidence.controller == "runner-manager-e2e-host-controller/v1"
+            && evidence.manager_pid > 0
+            && evidence.listener_pid > 0
+            && evidence.manager_pid != evidence.listener_pid
+    );
+    let manager = evidence.manager_command_line.to_ascii_lowercase();
+    let listener = evidence.listener_command_line.to_ascii_lowercase();
+    ensure!(
+        manager.contains("runner-manager"),
+        "native inspection did not observe the shipping runner-manager"
+    );
+    ensure!(
+        listener.contains("runner.listener"),
+        "native inspection did not observe an Actions Runner.Listener"
+    );
+    ensure!(
+        evidence.observed_at_ms >= evidence.context.issued_at_ms
+            && evidence.observed_at_ms <= evidence.context.expires_at_ms,
+        "native process observation is outside its signed validity window"
+    );
+    Ok(GateEvidence {
+        gate: "process_inspection",
+        observed_evidence: format!(
+            "OS command-line inspection observed shipping manager PID {} and Runner.Listener PID {}",
+            evidence.manager_pid, evidence.listener_pid
+        ),
+    })
 }
 
 fn recipe_validator_is_mutation_sensitive(recipe: &GateRecipe) -> Result<()> {
@@ -906,7 +1406,12 @@ fn execute_recipe(
     evidence_root: &Path,
 ) -> Result<GateEvidence> {
     let jit = fs::read_to_string(evidence_root.join("security").join("jit-marker.txt"))?;
-    let needles = [fixture.product_token.expose_secret(), jit.trim()];
+    let needles = [
+        fixture.product_token.expose_secret(),
+        fixture.fixture_token.expose_secret(),
+        fixture.evidence_key.expose_secret(),
+        jit.trim(),
+    ];
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .context("acceptance package has a workspace parent")?;
@@ -967,7 +1472,12 @@ fn secret_injection_gate(fixture: &Fixture, root: &Path) -> Result<GateEvidence>
     let jit = fs::read_to_string(root.join("security").join("jit-marker.txt"))
         .context("missing encoded-JIT marker used by the secret-injection gate")?;
     ensure!(!jit.trim().is_empty(), "encoded-JIT marker is empty");
-    let needles = [fixture.product_token.expose_secret(), jit.trim()];
+    let needles = [
+        fixture.product_token.expose_secret(),
+        fixture.fixture_token.expose_secret(),
+        fixture.evidence_key.expose_secret(),
+        jit.trim(),
+    ];
     for category in [
         "logs",
         "database",
@@ -1128,6 +1638,15 @@ fn verify_signed_json(bytes: &[u8], key: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_authority_separation(product_token: &str, evidence_key: &str) -> Result<()> {
+    ensure!(!evidence_key.is_empty(), "evidence authority key is empty");
+    ensure!(
+        product_token != evidence_key,
+        "GitHub fixture token cannot act as the evidence signing authority"
+    );
+    Ok(())
+}
+
 fn sign_json_value(value: &mut serde_json::Value, key: &str) -> Result<()> {
     ensure!(value.get("authentication_tag").is_some());
     value["authentication_tag"] = serde_json::Value::String(String::new());
@@ -1194,7 +1713,28 @@ async fn ensure_fixture_reachable(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
-async fn runner_count(token: &SecretString, scope: &str, target: &str) -> Result<u64> {
+#[derive(Debug, Deserialize)]
+struct RunnerInventory {
+    runners: Vec<GitHubRunner>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRunner {
+    id: u64,
+    name: String,
+    labels: Vec<GitHubRunnerLabel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRunnerLabel {
+    name: String,
+}
+
+async fn runner_inventory(
+    token: &SecretString,
+    scope: &str,
+    target: &str,
+) -> Result<RunnerInventory> {
     let url = format!("https://api.github.com/{scope}/{target}/actions/runners?per_page=100");
     let response = github_get(token, &url).await?;
     ensure!(
@@ -1202,10 +1742,214 @@ async fn runner_count(token: &SecretString, scope: &str, target: &str) -> Result
         "cannot inspect {scope}/{target} runners: {}",
         response.status()
     );
-    let value: serde_json::Value = response.json().await?;
-    value["total_count"]
-        .as_u64()
-        .context("runner inventory omitted total_count")
+    response
+        .json()
+        .await
+        .context("runner inventory response has an invalid shape")
+}
+
+async fn verify_final_runner_inventory(
+    fixture: &Fixture,
+    scenarios: &[ScenarioEvidence],
+    rollback: &RollbackEvidence,
+) -> Result<()> {
+    let repository = runner_inventory(&fixture.product_token, "repos", &fixture.repository).await?;
+    let organization =
+        runner_inventory(&fixture.product_token, "orgs", &fixture.organization).await?;
+    let all_runners = repository.runners.iter().chain(&organization.runners);
+    let routing_labels: BTreeSet<_> = scenarios
+        .iter()
+        .map(|scenario| scenario.routing_label.as_str())
+        .collect();
+    let scenario_runner_ids: BTreeSet<_> = scenarios
+        .iter()
+        .flat_map(|scenario| match &scenario.facts {
+            ScenarioFacts::SuccessfulJitJob { runner_id, .. }
+            | ScenarioFacts::NetworkOutageRecovery { runner_id, .. }
+            | ScenarioFacts::BootStartRecovery { runner_id, .. }
+            | ScenarioFacts::OrganizationScopedJob { runner_id, .. } => vec![*runner_id],
+            ScenarioFacts::JitExpiryRecovery {
+                expired_runner_id,
+                replacement_runner_id,
+                ..
+            } => vec![*expired_runner_id, *replacement_runner_id],
+            ScenarioFacts::TwoHostContention { runner_ids, .. } => runner_ids.to_vec(),
+            ScenarioFacts::PolicyDisableDrain { .. } | ScenarioFacts::MonitorOnlyDemand { .. } => {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    for runner in all_runners {
+        ensure!(
+            !scenario_runner_ids.contains(&runner.id),
+            "scenario runner {} ({}) remains registered",
+            runner.id,
+            runner.name
+        );
+        ensure!(
+            !runner
+                .labels
+                .iter()
+                .any(|label| routing_labels.contains(label.name.as_str())),
+            "runner {} ({}) still carries an ephemeral routing label",
+            runner.id,
+            runner.name
+        );
+    }
+
+    let expected_legacy = rollback
+        .post_condition
+        .legacy_label_runner_ids
+        .first()
+        .copied()
+        .context("rollback omitted the restored legacy runner identity")?;
+    let legacy_label = rollback.legacy_label.as_str();
+    ensure!(
+        scenarios
+            .iter()
+            .filter(|scenario| scenario.scope == "repository")
+            .all(|scenario| scenario.legacy_label == legacy_label),
+        "repository scenarios disagree about the legacy label identity"
+    );
+    let legacy_matches: Vec<_> = repository
+        .runners
+        .iter()
+        .filter(|runner| {
+            runner.id == expected_legacy
+                && runner.labels.iter().any(|label| label.name == legacy_label)
+        })
+        .collect();
+    ensure!(
+        legacy_matches.len() == 1,
+        "GitHub does not independently confirm the one restored legacy runner and label"
+    );
+    Ok(())
+}
+
+async fn verify_remote_scenarios(fixture: &Fixture, scenarios: &[ScenarioEvidence]) -> Result<()> {
+    for scenario in scenarios {
+        let (run_id, job_ids, runner_ids, require_success): (u64, Vec<u64>, Vec<u64>, bool) =
+            match &scenario.facts {
+                ScenarioFacts::SuccessfulJitJob {
+                    workflow_run_id,
+                    job_id,
+                    runner_id,
+                    ..
+                } => (*workflow_run_id, vec![*job_id], vec![*runner_id], true),
+                ScenarioFacts::NetworkOutageRecovery {
+                    workflow_run_id,
+                    job_id,
+                    runner_id,
+                    ..
+                } => (*workflow_run_id, vec![*job_id], vec![*runner_id], true),
+                ScenarioFacts::JitExpiryRecovery {
+                    workflow_run_id,
+                    job_id,
+                    replacement_runner_id,
+                    ..
+                } => (
+                    *workflow_run_id,
+                    vec![*job_id],
+                    vec![*replacement_runner_id],
+                    true,
+                ),
+                ScenarioFacts::PolicyDisableDrain {
+                    workflow_run_id,
+                    job_id,
+                    ..
+                } => (*workflow_run_id, vec![*job_id], vec![], true),
+                ScenarioFacts::BootStartRecovery {
+                    workflow_run_id,
+                    job_id,
+                    runner_id,
+                    ..
+                } => (*workflow_run_id, vec![*job_id], vec![*runner_id], true),
+                ScenarioFacts::OrganizationScopedJob {
+                    workflow_run_id,
+                    job_id,
+                    runner_id,
+                    ..
+                } => (*workflow_run_id, vec![*job_id], vec![*runner_id], true),
+                ScenarioFacts::MonitorOnlyDemand {
+                    workflow_run_id,
+                    queued_job_ids,
+                    ..
+                } => (*workflow_run_id, queued_job_ids.clone(), vec![], false),
+                ScenarioFacts::TwoHostContention {
+                    workflow_run_id,
+                    completed_job_ids,
+                    runner_ids,
+                    ..
+                } => (
+                    *workflow_run_id,
+                    completed_job_ids.clone(),
+                    runner_ids.to_vec(),
+                    true,
+                ),
+            };
+        let run_url = format!(
+            "https://api.github.com/repos/{}/actions/runs/{run_id}",
+            fixture.repository
+        );
+        let run_response = github_get(&fixture.fixture_token, &run_url).await?;
+        ensure!(
+            run_response.status().is_success(),
+            "cannot independently inspect workflow run {run_id}: {}",
+            run_response.status()
+        );
+        let run: serde_json::Value = run_response.json().await?;
+        ensure!(
+            run["id"].as_u64() == Some(run_id),
+            "GitHub returned the wrong run identity"
+        );
+        ensure!(
+            run["head_sha"].as_str() == Some(fixture.expected_context.commit_sha.as_str()),
+            "workflow run {run_id} is not bound to the acceptance commit"
+        );
+
+        let url = format!(
+            "https://api.github.com/repos/{}/actions/runs/{run_id}/jobs?per_page=100",
+            fixture.repository
+        );
+        let response = github_get(&fixture.fixture_token, &url).await?;
+        ensure!(
+            response.status().is_success(),
+            "cannot independently inspect workflow run {run_id}: {}",
+            response.status()
+        );
+        let body: serde_json::Value = response.json().await?;
+        let jobs = body["jobs"]
+            .as_array()
+            .context("GitHub jobs response omitted jobs")?;
+        for expected_job in job_ids {
+            let job = jobs
+                .iter()
+                .find(|job| job["id"].as_u64() == Some(expected_job))
+                .with_context(|| {
+                    format!(
+                        "scenario {} cites job {expected_job} absent from GitHub run {run_id}",
+                        scenario.scenario
+                    )
+                })?;
+            if require_success {
+                ensure!(
+                    job["status"] == "completed" && job["conclusion"] == "success",
+                    "GitHub does not confirm successful completion for job {expected_job}"
+                );
+            }
+            if !runner_ids.is_empty() {
+                let observed = job["runner_id"]
+                    .as_u64()
+                    .context("GitHub job omitted runner_id")?;
+                ensure!(
+                    runner_ids.contains(&observed),
+                    "GitHub job runner identity does not match controller facts"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn github_get(token: &SecretString, url: &str) -> Result<reqwest::Response> {

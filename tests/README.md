@@ -10,10 +10,20 @@ controller performs those operations. CI imports only a complete controller
 journal through `bash tests/host-controller.sh prepare`; when the four GitHub
 fixture inputs exist, a missing journal is a failure rather than a skip.
 After the native commands finish, the controller runs
-`cargo run -p runner-manager-e2e --example e2e-host-controller -- sign DIR`.
+`cargo run -p runner-manager-e2e --example e2e-host-controller -- seal-live-run DIR`.
 It HMAC-SHA-256 authenticates every scenario and rollback journal with the
-product fixture credential. The validator verifies the tag before decoding any
-facts, so copied, edited, or fabricated JSON cannot pass.
+separate `RUNNER_MANAGER_E2E_EVIDENCE_KEY` authority. The GitHub fixture token
+is explicitly rejected as that key. Every seal is bound to the current GitHub
+run ID, run attempt, commit SHA, OS, architecture, a fresh 256-bit CI
+challenge, a unique nonce, issue time, and a five-minute expiry. The validator
+checks all bindings before decoding facts and atomically consumes each nonce;
+wrong-run, expired, forged, edited, and replayed journals fail.
+
+Hosted runners are classified as `required_manual` for network isolation,
+reboot, and two-host contention. When fixture inputs are present this
+classification fails the E2E job and therefore cannot masquerade as a passing
+live report. Only a host explicitly provisioned with
+`RUNNER_MANAGER_E2E_PHYSICAL_HOST=true` may seal controller output.
 
 The directory contains these schema-1 JSON records:
 
@@ -26,6 +36,7 @@ The directory contains these schema-1 JSON records:
 - `monitor_only_demand.json`
 - `two_host_contention.json`
 - `rollback.json`
+- `security/process-inspection.json` (live manager and listener PIDs only before sealing)
 
 Each scenario record is a deny-unknown-fields typed causal journal stamped
 `runner-manager-e2e-host-controller/v1`. Scenario-specific facts include real
@@ -38,7 +49,9 @@ controller names, wrong targets, and incomplete postconditions.
 The rollback journal records four successful, non-overlapping timestamped
 commands against the fixture target in this exact order: restore label, drain,
 verify terminal, re-enable legacy. Its independent final observations must see
-one legacy runner, no managed runner, and no runtime directory.
+the same typed legacy runner ID and label, no managed runner, and no runtime
+directory. The recorded commands are the exact repository controller and
+shipping CLI verbs, including target, runner ID, label, OS, and service ID.
 
 Security gates are not accepted from prose files. The suite executes exact
 repository negative-control tests for two-job contamination, checksum mismatch
@@ -51,9 +64,12 @@ and exact test filter ran successfully and matched one test.
 `secret-scan-root/` (logs, database, snapshots, crash reports and CLI output),
 and `config-and-sqlite/`. All five artifact categories, every evidence field,
 command output, and the completed report are scanned with the real product
-token and JIT marker before serialization or printing. The platform canonical
-redactor must also leave the report unchanged; deliberate exact-value and
-credential-shaped leaks prove both controls fail closed.
+token, fixture token, evidence key, and JIT marker before serialization or
+printing. The controller independently re-reads the native command lines for
+the supplied live PIDs and seals only observations containing the shipping
+`runner-manager` and `Runner.Listener` executable names. The platform
+canonical redactor must also leave the report unchanged; deliberate exact-value
+and credential-shaped leaks prove both controls fail closed.
 
 CI sets `RUNNER_MANAGER_E2E_EVIDENCE_DIR` and
 `RUNNER_MANAGER_E2E_DATA_DIR`, runs the suite, finalizes the report through the
