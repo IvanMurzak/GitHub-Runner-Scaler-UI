@@ -108,7 +108,8 @@ jobs:
           #
           # Until such a label is configured, scenario 5 and the rollback drill
           # remain out-of-CI manual gates. That is a fixture decision, not a
-          # workflow change.
+          # workflow change. A configured self-hosted runner must be Actions
+          # Runner 2.327.1 or newer: every external action below uses Node 24.
           - name: windows-x86_64
             os: ${{ vars.RUNNER_MANAGER_E2E_RUNS_ON_WINDOWS || 'windows-latest' }}
           - name: macos-arm64
@@ -154,7 +155,7 @@ jobs:
 
       - name: Check out the repository
         if: steps.guard.outputs.enabled == 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install the toolchain pinned by rust-toolchain.toml
         if: steps.guard.outputs.enabled == 'true'
@@ -164,7 +165,7 @@ jobs:
 
       - name: Cache the cargo registry and build artifacts
         if: steps.guard.outputs.enabled == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index

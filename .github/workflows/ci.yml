@@ -86,7 +86,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Assert the macOS leg is ARM64
         if: runner.os == 'macOS'
@@ -104,7 +104,7 @@ jobs:
           cargo clippy --version
 
       - name: Cache the cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -162,7 +162,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install the toolchain pinned by rust-toolchain.toml
         run: |
@@ -170,7 +170,7 @@ jobs:
           rustup show active-toolchain
 
       - name: Cache the cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
