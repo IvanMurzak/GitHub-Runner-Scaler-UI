@@ -1,0 +1,20 @@
+.github/workflows/ci.yml
+  s_e3f2ebf0732f36::t_cb053627435606 73-74,95-97
+  s_e3f2ebf0732f36::t_846565e03b805e 98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "21905fd2f2601e54738fd73f247127fa718c104a",
+  "prompts": {},
+  "sessions": {
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
