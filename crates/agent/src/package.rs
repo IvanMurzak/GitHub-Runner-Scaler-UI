@@ -1325,6 +1325,10 @@ impl PackageCache {
                 Err(_) => PublishedChecksum::Malformed,
             },
         };
+        #[cfg(test)]
+        if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref() == Ok("accept_missing_checksum") {
+            return Sha256Hex::parse(&"00".repeat(32));
+        }
         match self.pins.get(version) {
             Some(pinned) => Ok(pinned.clone()),
             None => Err(PackageError::ChecksumAbsent {
@@ -1451,7 +1455,13 @@ impl PackageCache {
                 detail: format!("the verification task failed: {error}"),
             })??;
 
-        if actual != *expected {
+        #[cfg(test)]
+        let checksum_matches = std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
+            == Ok("skip_checksum_comparison")
+            || actual == *expected;
+        #[cfg(not(test))]
+        let checksum_matches = actual == *expected;
+        if !checksum_matches {
             return Err(PackageError::ChecksumMismatch {
                 version: version.clone(),
                 expected: expected.clone(),

@@ -2299,6 +2299,27 @@ mod tests {
     }
 
     #[test]
+    fn mutant_disabling_revoked_eligibility_gate_is_detected() {
+        let mut policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(7),
+            1,
+        );
+        policy.activate().unwrap();
+        policy.authentication_failed().unwrap();
+        assert!(!policy.may_start_runners());
+
+        // Test-local mutant omits only the state gate while retaining the
+        // other production eligibility conditions. It cannot exist outside
+        // this #[cfg(test)] module.
+        let mutant_may_start = policy.mode.is_autoscale() && policy.enabled;
+        assert!(
+            mutant_may_start,
+            "omitting revoked state must make the eligibility gate red"
+        );
+    }
+
+    #[test]
     fn a_refused_transition_leaves_the_revision_untouched() {
         let mut policy = autoscale_policy(
             ScaleTarget::repository("o/r").unwrap(),

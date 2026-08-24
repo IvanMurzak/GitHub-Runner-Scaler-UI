@@ -122,7 +122,9 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo build --workspace
-        run: cargo build --workspace
+        run: |
+          cargo build --workspace --all-features
+          bash tests/assert-no-shippable-mutants.sh --scan-only
 
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets -- -D warnings

@@ -180,7 +180,32 @@ jobs:
       # that package, so the binary has to exist first.
       - name: Build the workspace
         if: steps.guard.outputs.enabled == 'true'
-        run: cargo build --workspace
+        run: |
+          cargo build --workspace --all-features
+          bash tests/assert-no-shippable-mutants.sh --scan-only
+
+      - name: Provision native host-controller evidence
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          RUNNER_MANAGER_E2E_PHYSICAL_HOST: ${{ vars.RUNNER_MANAGER_E2E_PHYSICAL_HOST }}
+          RUNNER_MANAGER_E2E_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_TOKEN }}
+          RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
+          RUNNER_MANAGER_E2E_EVIDENCE_KEY: ${{ secrets.RUNNER_MANAGER_E2E_EVIDENCE_KEY }}
+          RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
+          RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+        run: |
+          evidence_dir="$RUNNER_TEMP/runner-manager-e2e-evidence"
+          data_dir="$RUNNER_TEMP/runner-manager-e2e-data"
+          report_dir="$GITHUB_WORKSPACE/target/e2e-reports"
+          challenge="$(openssl rand -hex 32)"
+          mkdir -p "$data_dir" "$report_dir"
+          RUNNER_MANAGER_E2E_CHALLENGE="$challenge" RUNNER_MANAGER_E2E_DATA_DIR="$data_dir" \
+            cargo run -p runner-manager-e2e --example e2e-host-controller -- run-live-suite "$evidence_dir"
+          {
+            echo "RUNNER_MANAGER_E2E_EVIDENCE_DIR=$evidence_dir"
+            echo "RUNNER_MANAGER_E2E_DATA_DIR=$data_dir"
+            echo "RUNNER_MANAGER_E2E_CHALLENGE=$challenge"
+          } >> "$GITHUB_ENV"
 
       - name: Run the acceptance suite
         if: steps.guard.outputs.enabled == 'true'
@@ -213,4 +238,20 @@ jobs:
           RUNNER_MANAGER_E2E_FIXTURE_TOKEN: ${{ secrets.RUNNER_MANAGER_E2E_FIXTURE_TOKEN }}
           RUNNER_MANAGER_E2E_REPO: ${{ vars.RUNNER_MANAGER_E2E_REPO }}
           RUNNER_MANAGER_E2E_ORG: ${{ vars.RUNNER_MANAGER_E2E_ORG }}
+          RUNNER_MANAGER_E2E_EVIDENCE_KEY: ${{ secrets.RUNNER_MANAGER_E2E_EVIDENCE_KEY }}
         run: cargo test -p runner-manager-e2e -- --ignored
+
+      - name: Collect the per-OS human-gate report
+        if: steps.guard.outputs.enabled == 'true' && always()
+        run: |
+          report="target/e2e-reports/${{ runner.os == 'Windows' && 'windows' || runner.os == 'macOS' && 'macos' || 'linux' }}.json"
+          bash tests/host-controller.sh finalize "$report" "$RUNNER_TEMP/runner-manager-e2e-report"
+
+      - name: Upload the per-OS human-gate report
+        if: steps.guard.outputs.enabled == 'true' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-report-${{ matrix.name }}
+          path: ${{ runner.temp }}/runner-manager-e2e-report/*.json
+          if-no-files-found: error
+          retention-days: 30

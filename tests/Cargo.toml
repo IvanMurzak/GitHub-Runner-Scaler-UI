@@ -42,6 +42,8 @@ runner-manager-testkit = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` for the acceptance scenarios that assert on backoff and timeout

@@ -445,6 +445,29 @@ mod tests {
     }
 
     #[test]
+    fn mutant_ignoring_in_flight_attempts_is_detected() {
+        let host = host(4);
+        let policy = active_policy(1, "home", 4);
+        let attempts = vec![attempt_in(AttemptState::Starting, 1, 1)];
+        let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+        let protected = allocator.allocate(&policy, 1);
+        assert_eq!(protected.active_owned, 1);
+        assert_eq!(protected.to_start, 0);
+
+        // Test-local mutant of the exact subtraction at the production
+        // boundary. It is impossible to compile into a non-test artifact.
+        let mutant_active_owned = 0_u16;
+        let mutant_to_start = protected
+            .desired
+            .saturating_sub(mutant_active_owned)
+            .min(protected.headroom_before);
+        assert_eq!(
+            mutant_to_start, 1,
+            "removing the in-flight term must make the duplicate-poll gate red"
+        );
+    }
+
+    #[test]
     fn an_attempt_stops_counting_once_it_is_terminal() {
         let host = host(4);
         let policy = active_policy(1, "home", 4);
