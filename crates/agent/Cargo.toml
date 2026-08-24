@@ -16,9 +16,6 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[features]
-test-mutants = ["runner-manager-domain/test-mutants"]
-
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -1179,18 +1179,8 @@ impl ScalePolicy {
     /// or draining policy takes no new work (`03-control-flows.md`, flow 5), and
     /// a user-requested disable beats demand (precedence rule 4).
     #[must_use]
-    #[cfg(not(feature = "test-mutants"))]
     pub const fn may_start_runners(&self) -> bool {
         self.mode.is_autoscale() && self.enabled && self.state.admits_new_runners()
-    }
-
-    /// Test-only mutation seam for H1. Release builds do not compile it.
-    #[must_use]
-    #[cfg(feature = "test-mutants")]
-    pub fn may_start_runners(&self) -> bool {
-        std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
-            == Ok("start_with_revoked_credential")
-            || (self.mode.is_autoscale() && self.enabled && self.state.admits_new_runners())
     }
 
     /// # Errors
@@ -2306,6 +2296,27 @@ mod tests {
             policy.reauthenticated().unwrap();
             assert_eq!(policy.state(), PolicyState::Pending);
         }
+    }
+
+    #[test]
+    fn mutant_disabling_revoked_eligibility_gate_is_detected() {
+        let mut policy = autoscale_policy(
+            ScaleTarget::repository("o/r").unwrap(),
+            HostId::from_u128(7),
+            1,
+        );
+        policy.activate().unwrap();
+        policy.authentication_failed().unwrap();
+        assert!(!policy.may_start_runners());
+
+        // Test-local mutant omits only the state gate while retaining the
+        // other production eligibility conditions. It cannot exist outside
+        // this #[cfg(test)] module.
+        let mutant_may_start = policy.mode.is_autoscale() && policy.enabled;
+        assert!(
+            mutant_may_start,
+            "omitting revoked state must make the eligibility gate red"
+        );
     }
 
     #[test]

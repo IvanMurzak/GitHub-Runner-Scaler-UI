@@ -180,7 +180,9 @@ jobs:
       # that package, so the binary has to exist first.
       - name: Build the workspace
         if: steps.guard.outputs.enabled == 'true'
-        run: cargo build --workspace
+        run: |
+          cargo build --workspace --all-features
+          bash tests/assert-no-shippable-mutants.sh --scan-only
 
       - name: Provision native host-controller evidence
         if: steps.guard.outputs.enabled == 'true'

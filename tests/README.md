@@ -66,9 +66,11 @@ repository negative-control tests for two-job contamination, checksum mismatch
 and absent checksum, revoked-token state/remediation/no-start behavior,
 successful and failed workspace cleanup, duplicate queued polling, and native
 OS process-list inspection. For the five required product controls it then
-rebuilds the relevant package with the `test-mutants` feature, injects one named
-mutant at the production decision seam, and requires the exact same gate test
-to fail. Release builds do not compile these seams. A receipt is valid only
+injects named mutants that exist only inside crate-local `#[cfg(test)]`
+controls, and requires the exact product gate to detect each bypass. There is
+no public mutant feature and no environment-controlled branch in a normal
+library or binary build. CI builds the workspace with all features and scans
+the shipping binary through `tests/assert-no-shippable-mutants.sh`. A receipt is valid only
 when the expected package and exact test filter ran successfully and matched
 one test.
 

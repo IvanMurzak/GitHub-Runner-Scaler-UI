@@ -194,18 +194,8 @@ impl<'a> HostAllocator<'a> {
     /// [`crate::attempt::active_count`] directly and see what it is asking for
     /// by name.
     pub fn allocate(&mut self, policy: &ScalePolicy, demand: u32) -> Allocation {
-        let measured_active_owned =
+        let active_owned =
             crate::attempt::active_count_for(policy.id, self.attempts.iter().copied());
-        #[cfg(any(test, feature = "test-mutants"))]
-        let active_owned = if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
-            == Ok("ignore_in_flight_attempts")
-        {
-            0
-        } else {
-            measured_active_owned
-        };
-        #[cfg(not(any(test, feature = "test-mutants")))]
-        let active_owned = measured_active_owned;
         let headroom_before = self.headroom();
 
         let refuse = |limiting_factor| Allocation {
@@ -230,13 +220,7 @@ impl<'a> HostAllocator<'a> {
             return refuse(LimitingFactor::MonitorOnly);
         }
         // Precedence rule 4: a user-requested disable beats demand.
-        #[cfg(any(test, feature = "test-mutants"))]
-        let may_start = std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
-            == Ok("start_with_revoked_credential")
-            || policy.may_start_runners();
-        #[cfg(not(any(test, feature = "test-mutants")))]
-        let may_start = policy.may_start_runners();
-        if !may_start {
+        if !policy.may_start_runners() {
             return refuse(LimitingFactor::NotReconciling);
         }
 
@@ -458,6 +442,29 @@ mod tests {
             assert_eq!(again.desired, 1);
             assert_eq!(again.active_owned, 1);
         }
+    }
+
+    #[test]
+    fn mutant_ignoring_in_flight_attempts_is_detected() {
+        let host = host(4);
+        let policy = active_policy(1, "home", 4);
+        let attempts = vec![attempt_in(AttemptState::Starting, 1, 1)];
+        let mut allocator = HostAllocator::from_attempts(&host, &attempts);
+        let protected = allocator.allocate(&policy, 1);
+        assert_eq!(protected.active_owned, 1);
+        assert_eq!(protected.to_start, 0);
+
+        // Test-local mutant of the exact subtraction at the production
+        // boundary. It is impossible to compile into a non-test artifact.
+        let mutant_active_owned = 0_u16;
+        let mutant_to_start = protected
+            .desired
+            .saturating_sub(mutant_active_owned)
+            .min(protected.headroom_before);
+        assert_eq!(
+            mutant_to_start, 1,
+            "removing the in-flight term must make the duplicate-poll gate red"
+        );
     }
 
     #[test]

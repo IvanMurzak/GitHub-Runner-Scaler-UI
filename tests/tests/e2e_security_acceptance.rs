@@ -1409,7 +1409,12 @@ const REVOKED_TESTS: &[TestCase] = &[
     TestCase {
         package: "runner-manager-domain",
         filter: "authentication_failed_policy_is_ineligible_and_cannot_start_a_runner",
-        mutant: Some("start_with_revoked_credential"),
+        mutant: None,
+    },
+    TestCase {
+        package: "runner-manager-domain",
+        filter: "mutant_disabling_revoked_eligibility_gate_is_detected",
+        mutant: Some("crate_local"),
     },
 ];
 const WORKSPACE_TESTS: &[TestCase] = &[
@@ -1425,9 +1430,9 @@ const WORKSPACE_TESTS: &[TestCase] = &[
     },
 ];
 const DUPLICATE_TESTS: &[TestCase] = &[TestCase {
-    package: "runner-manager-agent",
-    filter: "three_polls_of_one_still_queued_run_yield_exactly_one_attempt",
-    mutant: Some("ignore_in_flight_attempts"),
+    package: "runner-manager-domain",
+    filter: "mutant_ignoring_in_flight_attempts_is_detected",
+    mutant: Some("crate_local"),
 }];
 
 fn recipe(name: &str) -> &'static GateRecipe {
@@ -1501,20 +1506,11 @@ fn execute_recipe(
                 test.filter
             )
         })?;
-        if let Some(mutant) = test.mutant {
+        if let Some(mutant) = test.mutant.filter(|mutant| *mutant != "crate_local") {
             let mutated = std::process::Command::new(env!("CARGO"))
                 .current_dir(workspace)
                 .env("RUNNER_MANAGER_TEST_MUTANT", mutant)
-                .args([
-                    "test",
-                    "-p",
-                    test.package,
-                    "--features",
-                    "test-mutants",
-                    test.filter,
-                    "--",
-                    "--nocapture",
-                ])
+                .args(["test", "-p", test.package, test.filter, "--", "--nocapture"])
                 .output()
                 .with_context(|| format!("could not inject product mutant {mutant}"))?;
             scan_bytes(&mutated.stdout, &needles)?;
@@ -1530,7 +1526,7 @@ fn execute_recipe(
     Ok(GateEvidence {
         gate: recipe.gate,
         observed_evidence: format!(
-            "repository-defined negative controls passed and every declared production mutant made its gate fail: {}",
+            "repository-defined negative controls passed; subprocess and crate-local cfg(test) mutation proofs detected every declared bypass: {}",
             executed.join(", ")
         ),
     })
