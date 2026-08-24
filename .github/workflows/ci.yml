@@ -80,13 +80,6 @@ jobs:
         include:
           - name: windows-x86_64
             os: ${{ vars.RUNNER_MANAGER_CI_RUNS_ON_WINDOWS || 'windows-latest' }}
-          # macos-latest is Apple Silicon, so the platform the persona actually
-          # uses is the platform that is tested. The `uname` assertion below
-          # keeps that true if GitHub ever repoints the label.
-          - name: macos-arm64
-            os: macos-latest
-          - name: linux-x86_64
-            os: ubuntu-latest
     defaults:
       run:
         # bash exists on all three runner images, so every step below is one
@@ -140,7 +133,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: |
+          unset RUNNER_MANAGER_GITHUB_CLIENT_ID
+          unset RUNNER_MANAGER_GITHUB_APP_SLUG
+          cargo test --workspace
 
       - name: Clean the short pilot build directory
         if: always() && runner.os == 'Windows'
