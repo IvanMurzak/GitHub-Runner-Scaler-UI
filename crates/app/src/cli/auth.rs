@@ -1498,26 +1498,60 @@ mod tests {
         assert_both_halves_were_seen(&errors, "github_failure");
     }
 
-    /// The third mapper that owes the same guarantee, and the reason
-    /// [`NO_OPERATOR_REMEDY`] lives in `mod.rs` rather than here.
+    /// The registration this build carries, and the failure it no longer takes.
     ///
-    /// A build with no published App registration is a build problem: Phase 0
-    /// of the rollout has not happened, and no command the operator types
-    /// changes that.
+    /// Until Phase 0 of the rollout landed on 2026-08-24 this asserted the
+    /// opposite: that `app_registration` FAILED, because no App existed and a
+    /// build could only say so. Now that one does, the reachable half of the
+    /// property is that a stock build resolves it — a released binary whose
+    /// `auth login` reported `AppNotPublished` would be unusable for everyone
+    /// who is not setting the test-seam overrides.
+    ///
+    /// The other half — that `AppNotPublished` says plainly that no command
+    /// fixes it, which is the reason [`NO_OPERATOR_REMEDY`] lives in `mod.rs`
+    /// rather than here — is exercised below against the error itself, since
+    /// no context can produce it any more.
     #[test]
-    fn a_missing_app_registration_says_that_no_command_fixes_it() {
+    fn a_stock_build_carries_the_published_app_registration() {
         let temporary = tempfile::tempdir().expect("a temporary directory");
         let mut discarded = Vec::new();
         let context = Context::resolve(Some(temporary.path()), &mut discarded)
             .expect("a context rooted at a temporary directory");
 
-        // Only meaningful while this build carries no registration, which is
-        // the state `no_plausible_client_id_is_compiled_in` pins. An override
-        // in the environment would make the call succeed and this test vacuous,
-        // so the `Err` is required rather than assumed.
-        let error = context
+        // The environment overrides are a test seam, and one of them being set
+        // in a developer's shell would make this pass while a shipped binary
+        // failed. Skip rather than assert a value this process did not compile
+        // in: `no_plausible_client_id_is_compiled_in` is what pins the
+        // constants themselves.
+        if std::env::var(crate::cli::CLIENT_ID_VARIABLE).is_ok()
+            || std::env::var(crate::cli::APP_SLUG_VARIABLE).is_ok()
+        {
+            eprintln!(
+                "SKIPPED: {} or {} is set, so this process is not a stock build",
+                crate::cli::CLIENT_ID_VARIABLE,
+                crate::cli::APP_SLUG_VARIABLE
+            );
+            return;
+        }
+
+        let registration = context
             .app_registration()
-            .expect_err("this build carries no published App registration");
+            .expect("a stock build carries the published App registration");
+        assert_eq!(registration.client_id(), crate::cli::PUBLISHED_CLIENT_ID);
+        assert_eq!(registration.slug(), crate::cli::PUBLISHED_APP_SLUG);
+    }
+
+    /// A build with no registration is a build problem, and the message has to
+    /// say so: no command an operator types publishes a GitHub App.
+    #[test]
+    fn a_missing_app_registration_says_that_no_command_fixes_it() {
+        let error = CliError::new(
+            Failure::AppNotPublished,
+            format!(
+                "this build carries no published GitHub App registration, so there is \
+                 nothing to sign in to. {NO_OPERATOR_REMEDY}."
+            ),
+        );
         assert_eq!(error.class(), Failure::AppNotPublished);
         assert_says_what_to_do_next(&error, "Context::app_registration");
         assert!(

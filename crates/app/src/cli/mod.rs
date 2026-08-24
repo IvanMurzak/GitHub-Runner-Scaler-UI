@@ -66,24 +66,31 @@ use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
 
 /// The published GitHub App's OAuth client id.
 ///
-/// **Empty on purpose, and it must stay empty until the App is registered.**
-/// Registering and publishing the App is Phase 0 of `06-migration-rollout.md`
-/// and has not happened. `crates/github` declines to compile a placeholder in
-/// for the same reason and hands the choice here:
+/// Phase 0 of `06-migration-rollout.md` — registering and publishing the App —
+/// landed on 2026-08-24. This is the real client id of `runner-manager-scaler`
+/// (App id 4707028), which declares exactly the permission set the README's
+/// disclosure names, has Device Flow enabled, and holds no webhook URL.
 ///
-/// > "Committing a placeholder that looked real would be worse than requiring
-/// > the caller to pass one."
+/// **It is not a secret.** A device-flow client id is sent to GitHub by every
+/// copy of this program and appears in the request an operator can watch; what
+/// authenticates a user is the code they type on GitHub's own page. The App's
+/// private key is the thing that would matter, and this project never generates
+/// one — which is what makes "the project cannot act on your repositories even
+/// in principle" true rather than a promise.
 ///
-/// A plausible-looking constant would produce a device flow that fails against
-/// GitHub with `incorrect_client_credentials` — a message that reads like a
-/// GitHub outage rather than like an unfinished rollout. Empty produces
-/// [`Failure::AppNotPublished`], which says exactly what is wrong.
-pub const PUBLISHED_CLIENT_ID: &str = "";
+/// It was empty until Phase 0 landed, because a plausible-looking placeholder
+/// would produce a device flow that fails against GitHub with
+/// `incorrect_client_credentials` — a message that reads like a GitHub outage
+/// rather than like an unfinished rollout. Empty produced
+/// [`Failure::AppNotPublished`], which said exactly what was wrong.
+pub const PUBLISHED_CLIENT_ID: &str = "Iv23liUGaKmwt8p3ZxRc";
 
 /// The published App's slug, the `<slug>` in
-/// `github.com/apps/<slug>/installations/new`. Empty for
-/// [`PUBLISHED_CLIENT_ID`]'s reason.
-pub const PUBLISHED_APP_SLUG: &str = "";
+/// `github.com/apps/<slug>/installations/new`.
+///
+/// Renaming the App changes this, and a released binary keeps sending users to
+/// the slug it was built with — so a rename needs a release, not just a setting.
+pub const PUBLISHED_APP_SLUG: &str = "runner-manager-scaler";
 
 /// Overrides the client id, for a test that drives a fake GitHub.
 pub const CLIENT_ID_VARIABLE: &str = "RUNNER_MANAGER_GITHUB_CLIENT_ID";
@@ -1422,11 +1429,34 @@ mod tests {
     /// dies against GitHub with a message about client credentials.
     #[test]
     fn no_plausible_client_id_is_compiled_in() {
+        // Phase 0 of `06-migration-rollout.md` landed on 2026-08-24, which is
+        // what this test was told to record when it did. It used to require
+        // both constants to be EMPTY, because until an App existed any value
+        // here was one somebody invented.
+        //
+        // What replaces that is the same guarantee from the other side: a
+        // device-flow client id GitHub issues is `Iv` followed by 18 more
+        // base62 characters, and a slug is the lowercase, hyphenated name in
+        // `github.com/apps/<slug>`. An invented value -- `TODO`, `changeme`,
+        // a copied example -- fails this, and so does half a rollout that
+        // filled in one constant and not the other.
         assert!(
-            PUBLISHED_CLIENT_ID.is_empty() && PUBLISHED_APP_SLUG.is_empty(),
-            "Phase 0 of `06-migration-rollout.md` registers and publishes the App. Until it \
-             has, a non-empty constant here is a value somebody invented. When Phase 0 does \
-             land, this test is the place to record that it did."
+            PUBLISHED_CLIENT_ID.len() == 20
+                && PUBLISHED_CLIENT_ID.starts_with("Iv")
+                && PUBLISHED_CLIENT_ID
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()),
+            "`{PUBLISHED_CLIENT_ID}` is not shaped like a GitHub device-flow client id"
+        );
+        assert!(
+            !PUBLISHED_APP_SLUG.is_empty()
+                && PUBLISHED_APP_SLUG
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '-'),
+            "`{PUBLISHED_APP_SLUG}` is not a GitHub App slug, and it is what \
+             `github.com/apps/<slug>/installations/new` is built from"
         );
     }
 
