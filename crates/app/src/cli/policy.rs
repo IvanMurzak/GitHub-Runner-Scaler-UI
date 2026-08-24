@@ -508,25 +508,30 @@ pub fn apply_policy_mutation(
     let attempts = store
         .attempts_for_policy(policy.id)
         .map_err(store_failure)?;
-    let active = active_count_for(policy.id, attempts.iter());
+    let observed_active = active_count_for(policy.id, attempts.iter());
+    let mut active = observed_active;
+    let mut guarded_revision = expected;
+    let mut guarded_active = None;
     if mutation.enabled == Some(false) {
         if let Some(confirmed) = confirmation {
-            if confirmed.active != active || confirmed.policy_revision != expected {
-                return Err(CliError::new(
-                    Failure::Conflict,
-                    format!(
-                        "policy or active work changed while confirming the drain (active was {}, now {active}); review and confirm again",
-                        confirmed.active
-                    ),
-                ));
-            }
-        } else if active > 0 {
+            // Use the exact values shown to the operator for both the domain
+            // transition and the transactional predicates below. A newer
+            // preflight read must never silently replace the confirmation.
+            active = confirmed.active;
+            guarded_revision = confirmed.policy_revision;
+            guarded_active = Some(confirmed.active);
+        } else if observed_active > 0 {
             return Err(CliError::new(
                 Failure::Conflict,
                 format!(
-                    "{active} active runner(s) must be confirmed before disabling; nothing was changed"
+                    "{observed_active} active runner(s) must be confirmed before disabling; nothing was changed"
                 ),
             ));
+        } else {
+            // Even an unprompted zero-active disable needs the count predicate:
+            // an allocation racing this command must not slip between the read
+            // and persistence.
+            guarded_active = Some(0);
         }
     }
 
@@ -593,9 +598,15 @@ pub fn apply_policy_mutation(
     }
 
     if policy.revision() != expected {
-        store
-            .update_policy(&policy, expected)
-            .map_err(store_failure)?;
+        if let Some(expected_active) = guarded_active {
+            store
+                .update_policy_confirming_active_count(&policy, guarded_revision, expected_active)
+                .map_err(store_failure)?;
+        } else {
+            store
+                .update_policy(&policy, expected)
+                .map_err(store_failure)?;
+        }
     }
 
     if let Some(maximum) = maximum {
@@ -828,6 +839,19 @@ mod tests {
             expected_revision: u64,
         ) -> Result<(), StoreError> {
             self.inner.update_policy(policy, expected_revision)
+        }
+
+        fn update_policy_confirming_active_count(
+            &self,
+            policy: &ScalePolicy,
+            expected_revision: u64,
+            expected_active: u16,
+        ) -> Result<(), StoreError> {
+            self.inner.update_policy_confirming_active_count(
+                policy,
+                expected_revision,
+                expected_active,
+            )
         }
 
         fn remove_policy(&self, id: PolicyId, expected_revision: u64) -> Result<(), StoreError> {

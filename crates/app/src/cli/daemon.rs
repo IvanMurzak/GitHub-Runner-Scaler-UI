@@ -320,6 +320,16 @@ impl Store for TargetRecoveryStore {
         self.inner.update_policy(policy, expected_revision)
     }
 
+    fn update_policy_confirming_active_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_active: u16,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner
+            .update_policy_confirming_active_count(policy, expected_revision, expected_active)
+    }
+
     fn remove_policy(
         &self,
         id: runner_manager_domain::model::PolicyId,

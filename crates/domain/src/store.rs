@@ -144,6 +144,19 @@ pub enum StoreError {
         found: u64,
     },
 
+    /// Active work changed after an operator observed it for a disable.
+    /// The policy update and this predicate execute under one SQLite write
+    /// transaction, so no attempt journal write can cross the check.
+    #[error(
+        "policy {id} was confirmed with {expected} active runner(s), but now has \
+         {found}; nothing was written"
+    )]
+    ActiveCountChanged {
+        id: PolicyId,
+        expected: u16,
+        found: u16,
+    },
+
     /// The row a write was aimed at is not there.
     #[error("no {what} with id {id} is in the database")]
     NotFound { what: &'static str, id: String },
@@ -239,7 +252,10 @@ impl StoreError {
     /// make it.
     #[must_use]
     pub const fn is_conflict(&self) -> bool {
-        matches!(self, StoreError::StaleRevision { .. })
+        matches!(
+            self,
+            StoreError::StaleRevision { .. } | StoreError::ActiveCountChanged { .. }
+        )
     }
 }
 
@@ -424,6 +440,18 @@ pub trait Store: fmt::Debug + Send + Sync {
     /// rather than retry — or [`StoreError::NotFound`] when the row is gone.
     fn update_policy(&self, policy: &ScalePolicy, expected_revision: u64)
     -> Result<(), StoreError>;
+
+    /// Atomically update a policy only while its revision and active-attempt
+    /// count are exactly the values the caller observed. Implementations must
+    /// evaluate both predicates in the same write transaction as the update;
+    /// composing [`Store::attempts_for_policy`] and [`Store::update_policy`]
+    /// does not satisfy this contract.
+    fn update_policy_confirming_active_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_active: u16,
+    ) -> Result<(), StoreError>;
 
     /// Delete a policy, subject to the same revision check as a write.
     ///
@@ -792,6 +820,78 @@ impl SqliteStore {
         fields
     }
 
+    fn update_policy_confirming_active_count_with(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_active: u16,
+        after_write_fence: impl FnOnce(),
+    ) -> Result<(), StoreError> {
+        let fields = policy.to_persisted();
+        let mut params = policy_params(&fields)?;
+        params.push((
+            ":expected_revision",
+            int(u64_to_sql("the expected revision", expected_revision)?),
+        ));
+        params.push((":expected_active", int(i64::from(expected_active))));
+
+        let mut conn = self.lock();
+        // IMMEDIATE fences every attempt insert/update/delete on every other
+        // connection before the count predicate is evaluated. The count and
+        // revision predicates are part of the UPDATE itself, so there is no
+        // check-to-write interval inside this transaction either.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        after_write_fence();
+        let changed = tx.execute(
+            "UPDATE policies SET
+                 target_scope    = :target_scope,
+                 target_slug     = :target_slug,
+                 installation_id = :installation_id,
+                 host_id         = :host_id,
+                 requested_host_label = :requested_host_label,
+                 routing_labels  = :routing_labels,
+                 min_capacity    = :min_capacity,
+                 max_capacity    = :max_capacity,
+                 enabled         = :enabled,
+                 state           = :state,
+                 cache_policy    = :cache_policy,
+                 revision        = :revision
+             WHERE id = :id
+               AND revision = :expected_revision
+               AND :expected_active = (
+                   SELECT MIN(COUNT(*), 65535) FROM attempts
+                    WHERE policy_id = :id
+                      AND state IN ('allocated', 'jit_received', 'starting', 'idle', 'busy')
+               )",
+            &bind(&params)[..],
+        )?;
+        if changed == 0 {
+            let revision_conflict = conflict_or_missing(&tx, fields.id, expected_revision)?;
+            match revision_conflict {
+                StoreError::StaleRevision {
+                    expected, found, ..
+                } if expected == found => {
+                    let found: i64 = tx.query_row(
+                        "SELECT MIN(COUNT(*), 65535) FROM attempts
+                          WHERE policy_id = :id
+                            AND state IN ('allocated', 'jit_received', 'starting', 'idle', 'busy')",
+                        named_params! { ":id": uuid_text(fields.id.as_uuid()) },
+                        |row| row.get(0),
+                    )?;
+                    let found = u16::try_from(found).unwrap_or(u16::MAX);
+                    return Err(StoreError::ActiveCountChanged {
+                        id: fields.id,
+                        expected: expected_active,
+                        found,
+                    });
+                }
+                other => return Err(other),
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn attempt_from_row(&self, row: &Row<'_>) -> Result<RunnerAttempt, StoreError> {
         let fields = self.normalise(persisted_attempt_from_row(row)?);
         let id = fields.id;
@@ -965,6 +1065,20 @@ impl Store for SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn update_policy_confirming_active_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_active: u16,
+    ) -> Result<(), StoreError> {
+        self.update_policy_confirming_active_count_with(
+            policy,
+            expected_revision,
+            expected_active,
+            || {},
+        )
     }
 
     fn remove_policy(&self, id: PolicyId, expected_revision: u64) -> Result<(), StoreError> {
@@ -1794,7 +1908,9 @@ integer_option_column!(u64_option_column, u64, "a non-negative integer");
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use crate::attempt::FailureReason;
     use crate::model::Label;
@@ -1807,6 +1923,12 @@ mod tests {
     const ATTEMPT_UUID: &str = "00000000-0000-0000-0000-000000000100";
     const LABELS_JSON: &str = r#"{"host_label":"rm-home-win-x64","additional":[]}"#;
     const COMPLETED_JOB: &str = r#"{"outcome":"completed_job"}"#;
+    static ATTEMPT_WRITE_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+    fn mark_attempt_write_blocked(_: i32) -> bool {
+        ATTEMPT_WRITE_BLOCKED.store(true, Ordering::Release);
+        true
+    }
 
     fn host_id() -> HostId {
         HostId::from_u128(0x0000_0001)
@@ -3319,6 +3441,105 @@ mod tests {
     }
 
     // -- optimistic concurrency ---------------------------------------------
+
+    #[test]
+    fn active_count_guard_fences_zero_to_one_and_one_to_zero_attempt_writes() {
+        for starts_active in [false, true] {
+            ATTEMPT_WRITE_BLOCKED.store(false, Ordering::Release);
+            let directory = tempfile::TempDir::new().expect("temporary database directory");
+            let path = directory.path().join("state.sqlite3");
+            let updater = SqliteStore::open(&path).expect("update connection");
+            let writer = Arc::new(SqliteStore::open(&path).expect("attempt connection"));
+            writer
+                .lock()
+                .busy_handler(Some(mark_attempt_write_blocked))
+                .expect("test busy observer");
+
+            let mut policy = ScalePolicy::new(
+                policy_id(),
+                ScaleTarget::repository("o/r").expect("valid"),
+                1,
+                host_id(),
+                PolicyMode::autoscale(
+                    RoutingLabels::from_host_label(Label::new("rm-home-win-x64").expect("valid")),
+                    0,
+                    NonZeroU16::new(2).expect("non-zero"),
+                )
+                .expect("valid"),
+                CachePolicy::default(),
+            );
+            policy.activate().expect("active policy");
+            updater.insert_policy(&policy).expect("inserted");
+            let attempt = RunnerAttempt::allocate(attempt_id(), policy.id, "runner", ts(1_000));
+            if starts_active {
+                updater.record_attempt(&attempt).expect("active attempt");
+            }
+
+            let expected_active = u16::from(starts_active);
+            let mut disabled = policy.clone();
+            disabled.request_disable().expect("disable requested");
+            if !starts_active {
+                disabled
+                    .drain_completed(0)
+                    .expect("zero drains immediately");
+            }
+
+            let (begin_tx, write_attempt) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let writer_thread = Arc::clone(&writer);
+            let attempt_for_thread = attempt.clone();
+            let handle = std::thread::spawn(move || {
+                write_attempt.recv().expect("transaction began");
+                if starts_active {
+                    writer_thread
+                        .remove_attempt(attempt_for_thread.id)
+                        .expect("completion write");
+                } else {
+                    writer_thread
+                        .record_attempt(&attempt_for_thread)
+                        .expect("allocation write");
+                }
+                finished_tx.send(()).expect("completion observed");
+            });
+
+            updater
+                .update_policy_confirming_active_count_with(
+                    &disabled,
+                    policy.revision(),
+                    expected_active,
+                    || {
+                        begin_tx.send(()).expect("release attempt writer");
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !ATTEMPT_WRITE_BLOCKED.load(Ordering::Acquire) {
+                            assert!(
+                                Instant::now() < deadline,
+                                "attempt writer never reached SQLite's allocation fence"
+                            );
+                            std::thread::yield_now();
+                        }
+                        assert!(
+                            matches!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                            "attempt mutation crossed the policy transaction"
+                        );
+                    },
+                )
+                .expect("confirmed count commits while the attempt writer is fenced");
+            handle
+                .join()
+                .expect("attempt writer completed after commit");
+            finished_rx
+                .recv()
+                .expect("attempt mutation eventually commits");
+
+            let stored = updater.policy(policy.id).unwrap().unwrap();
+            assert!(!stored.enabled());
+            assert_eq!(
+                updater.attempt(attempt.id).unwrap().is_some(),
+                !starts_active,
+                "the attempt mutation must occur only after policy persistence"
+            );
+        }
+    }
 
     #[test]
     fn a_stale_revision_write_is_rejected_and_is_not_an_io_error() {
