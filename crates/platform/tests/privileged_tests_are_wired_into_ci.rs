@@ -87,6 +87,12 @@ fn ci_builds_the_fixture_service_host_before_running_the_smoke_tests() {
          than the service host.",
         path.display()
     );
+    assert!(
+        source.contains("cargo build -p runner-manager\n"),
+        "{}'s installer job must build the shipping runner-manager binary before the privileged \
+         regression installs and starts its exact production service entrypoint.",
+        path.display()
+    );
 }
 
 #[test]

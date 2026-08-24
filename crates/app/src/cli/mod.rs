@@ -927,6 +927,19 @@ fn is_loopback_host(host: &str) -> bool {
 pub fn dispatch() -> ExitCode {
     let cli = Cli::parse();
 
+    // A Windows service process is not an ordinary console process. SCM
+    // requires its main thread to enter StartServiceCtrlDispatcher, and kills
+    // a process which merely runs the daemon loop without doing so. The hidden
+    // service directories are the unambiguous marker written by our installer;
+    // interactive `daemon run` therefore keeps its console signal behavior.
+    #[cfg(windows)]
+    if matches!(
+        &cli.command,
+        Command::Daemon(DaemonCommand::Run(args)) if args.service_paths().is_some()
+    ) {
+        return dispatch_windows_service(cli);
+    }
+
     // The terminal UI owns the terminal and owns its own exit code, so it is
     // routed here rather than through `run`: `ExitCode` cannot be inspected, so
     // a TUI that exited non-zero for its own reasons would otherwise be
@@ -966,6 +979,15 @@ pub fn dispatch() -> ExitCode {
 /// # Errors
 /// Whatever the routed command returns.
 pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), CliError> {
+    run_with_shutdown(cli, out, err, None)
+}
+
+fn run_with_shutdown(
+    cli: &Cli,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+) -> Result<(), CliError> {
     let service_paths = match &cli.command {
         Command::Daemon(DaemonCommand::Run(args)) => args.service_paths(),
         _ => None,
@@ -999,11 +1021,34 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Cl
         Command::Status(args) => status::dispatch(&context, args, out),
         Command::Repo(command) => policy::dispatch_repo(&context, command, out),
         Command::Org(command) => policy::dispatch_org(&context, command, out),
-        Command::Daemon(command) => daemon::dispatch(&context, command, out),
+        Command::Daemon(command) => daemon::dispatch(&context, command, out, service_shutdown),
         Command::Service(command) => service::dispatch(&context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),
+    }
+}
+
+#[cfg(windows)]
+fn dispatch_windows_service(cli: Cli) -> ExitCode {
+    match runner_manager_platform::service::run_windows_service_host(move |shutdown| {
+        let mut out = io::sink();
+        let mut err = io::sink();
+        match run_with_shutdown(&cli, &mut out, &mut err, Some(shutdown)) {
+            Ok(()) => 0,
+            Err(failure) => failure.class().code(),
+        }
+    }) {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
+        Err(failure) => {
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            let cli_failure = CliError::new(Failure::LocalState, failure.to_string());
+            let _ = cli_failure.render(&mut err);
+            let _ = err.flush();
+            ExitCode::from(cli_failure.class().code())
+        }
     }
 }
 
