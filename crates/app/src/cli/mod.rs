@@ -48,7 +48,7 @@ pub mod service;
 pub mod status;
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -706,6 +706,8 @@ impl Context {
             )
         })?;
 
+        warn_about_an_app_override(err);
+
         Ok(Self {
             paths,
             data_root: data_dir.map(Path::to_path_buf),
@@ -1063,6 +1065,172 @@ fn dispatch_windows_service(cli: Cli) -> ExitCode {
     }
 }
 
+/// Whether this process may write ANSI styling, and how.
+///
+/// # Why a value rather than a check at the point of writing
+///
+/// Every command here writes through a `&mut dyn Write` that is a terminal in
+/// production and a `Vec<u8>` under test. A styling decision taken by looking at
+/// the process's stdout would therefore depend on how the TEST was run —
+/// `cargo test` captures, `cargo test -- --nocapture` does not — and the same
+/// assertion would pass or fail on escape codes nobody intended to compare.
+/// Passing the decision in keeps it explicit: [`Styling::plain`] in tests,
+/// [`Styling::for_stdout`] once, in `dispatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Styling {
+    enabled: bool,
+}
+
+impl Styling {
+    /// Styling for the real stdout: on when it is a terminal, off when it is a
+    /// pipe, a file, or when `NO_COLOR` is set (<https://no-color.org>).
+    ///
+    /// The pipe case is the one that matters for correctness rather than taste:
+    /// `runner-manager status | grep`, and every integration test that runs this
+    /// binary as a subprocess, must see the same bytes a `Vec<u8>` sink sees.
+    #[must_use]
+    pub fn for_stdout() -> Self {
+        Self {
+            enabled: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
+    /// No styling at all.
+    ///
+    /// `#[cfg(test)]` because production has exactly one way in —
+    /// [`Styling::for_stdout`], which already answers "plain" for every pipe and
+    /// every redirect. A second production constructor would be a second way for
+    /// a command to decide, and the point of passing the decision around is that
+    /// it is taken once.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn plain() -> Self {
+        Self { enabled: false }
+    }
+
+    fn wrap(self, codes: &str, text: &str) -> String {
+        if self.enabled {
+            format!("\u{1b}[{codes}m{text}\u{1b}[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// The one string the operator has to type somewhere else. Bright, bold and
+    /// reversed, because it is the thing they are hunting for on the screen.
+    #[must_use]
+    pub fn code(self, text: &str) -> String {
+        self.wrap("1;7;36", text)
+    }
+
+    /// A URL to open. Underlined, the way a terminal renders a link.
+    #[must_use]
+    pub fn url(self, text: &str) -> String {
+        self.wrap("4;36", text)
+    }
+
+    /// A step label, so the actions stand out from the paragraphs around them.
+    #[must_use]
+    pub fn step(self, text: &str) -> String {
+        self.wrap("1;32", text)
+    }
+
+    /// Styling that is ON, for a test that asserts what a terminal would see.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn styled() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Opens `url` in the operator's browser, best effort.
+///
+/// # Best effort is the whole contract
+///
+/// Returns whether the launcher was started, and nothing more: a browser that
+/// opens on another virtual desktop, a headless server with no handler, an SSH
+/// session — none of those are failures this command should report, let alone
+/// fail on. The URL is printed either way, which is what the caller relies on.
+///
+/// Skipped entirely when stdout is not a terminal, which keeps it out of pipes,
+/// out of CI, and out of the integration tests that drive `auth login` against
+/// a fake GitHub — a test suite that spawned a browser per run would be a bug
+/// nobody would thank us for.
+fn open_in_browser(url: &str, styling: Styling) -> bool {
+    if !styling.enabled {
+        return false;
+    }
+
+    // No `open`/`webbrowser` crate: this is one command per platform, and the
+    // workspace's dependency policy is that a manifest change needs a reason
+    // bigger than three match arms.
+    let mut command = if cfg!(target_os = "windows") {
+        // `start` is a shell builtin rather than an executable, hence `cmd /c`.
+        // The empty string is `start`'s title argument: without it, a quoted URL
+        // is taken AS the title and nothing opens.
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/c", "start", "", url]);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    } else {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Says on stderr when this process is not authenticating as the App this build
+/// publishes.
+///
+/// # An override that does not announce itself is a trap
+///
+/// [`CLIENT_ID_VARIABLE`] and [`APP_SLUG_VARIABLE`] are a test seam, and a
+/// machine-scoped one outlives the development that set it. A released binary
+/// then sends the operator to a DIFFERENT App's consent screen — showing a name
+/// they have never heard of on the page where they are deciding whether to grant
+/// `Administration: Read and write`. That is not hypothetical: a
+/// `runner-manager-d17-spike` override survived at machine scope on a
+/// workstation, and the shipped 0.1.2 asked for authorization as the spike.
+///
+/// [`Context::resolve_endpoints`] already says loudly when it is not talking to
+/// GitHub. This owes the same warning for the same reason. It warns rather than
+/// refuses because driving another App is exactly what the seam is for.
+fn warn_about_an_app_override(err: &mut dyn Write) {
+    let client_id = std::env::var(CLIENT_ID_VARIABLE).ok();
+    let slug = std::env::var(APP_SLUG_VARIABLE).ok();
+    write_app_override_warning(err, client_id.as_deref(), slug.as_deref());
+}
+
+/// The warning itself, as a function of its two inputs.
+///
+/// Split from the environment read so that it can be driven by a test: setting
+/// a process-wide variable would race every other test in this binary, and a
+/// warning nothing exercises is a warning that stops being emitted the first
+/// time somebody refactors around it.
+fn write_app_override_warning(err: &mut dyn Write, client_id: Option<&str>, slug: Option<&str>) {
+    if client_id.is_none() && slug.is_none() {
+        return;
+    }
+
+    let named = slug.unwrap_or("<no slug set>");
+    let _ = writeln!(
+        err,
+        "warning: authenticating as the GitHub App `{named}`, not this build's \
+         `{PUBLISHED_APP_SLUG}`, because {CLIENT_ID_VARIABLE} or {APP_SLUG_VARIABLE} is set. \
+         Unset both to use the published App."
+    );
+}
+
 /// The arm a declared-but-unimplemented command takes.
 ///
 /// It names the task rather than saying "not supported", because the command
@@ -1281,8 +1449,8 @@ mod tests {
         let run_one = |command: &str| -> CliError {
             let out: &mut dyn Write = &mut BrokenPipe;
             let outcome = match command {
-                "auth login" => auth::login(&context, out),
-                "auth status" => auth::status(&context, out),
+                "auth login" => auth::login(&context, Styling::plain(), out),
+                "auth status" => auth::status(&context, Styling::plain(), out),
                 "auth logout" => auth::logout(&context, out),
                 "host set-capacity" => {
                     host::set_capacity(&context, &HostSetCapacityArgs { capacity: 1 }, out)
@@ -1472,5 +1640,83 @@ mod tests {
         let rendered = String::from_utf8(rendered).expect("ASCII");
         assert!(rendered.contains("error: no credential is stored on this host"));
         assert!(rendered.contains("try: runner-manager auth login"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Styling
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn plain_styling_emits_no_escape_sequences() {
+        // The property every piped run and every captured test depends on: a
+        // `Vec<u8>` sink must receive the same bytes a human would read without
+        // colour. An escape leaking into this path is what breaks
+        // `runner-manager status --json | jq` and every exact-match assertion in
+        // the suite at once.
+        let plain = Styling::plain();
+        for rendered in [
+            plain.code("WDJB-MJHT"),
+            plain.url("https://github.com/login/device"),
+            plain.step("Action 2 of 3:"),
+        ] {
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "plain styling wrote an escape sequence: {rendered:?}"
+            );
+        }
+        assert_eq!(plain.code("WDJB-MJHT"), "WDJB-MJHT");
+    }
+
+    #[test]
+    fn styled_output_wraps_the_text_and_resets_afterwards() {
+        // And the other half, or the assertion above passes on a `Styling` that
+        // styles nothing at all: an enabled palette must actually wrap, and must
+        // close what it opens. A missing reset bleeds colour into everything the
+        // terminal prints afterwards, including the shell prompt.
+        let styled = Styling::styled();
+        let rendered = styled.code("WDJB-MJHT");
+        assert!(rendered.contains("WDJB-MJHT"));
+        assert!(rendered.starts_with('\u{1b}'), "not styled: {rendered:?}");
+        assert!(
+            rendered.ends_with("\u{1b}[0m"),
+            "styling must reset: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn an_app_override_is_announced_and_names_the_published_slug() {
+        // The warning is what makes the seam visible. A machine-scoped override
+        // left over from development sent the shipped 0.1.2 to another App's
+        // consent screen, and the operator had nothing on screen to tell them.
+        //
+        // Driven through the formatter rather than the environment: setting a
+        // process-wide variable would race every other test in this binary.
+        let mut written = Vec::new();
+        write_app_override_warning(
+            &mut written,
+            Some("Iv23li39jMQVdEuupmI2"),
+            Some("runner-manager-d17-spike"),
+        );
+        let rendered = String::from_utf8(written).expect("ASCII");
+        assert!(
+            rendered.contains("runner-manager-d17-spike") && rendered.contains(PUBLISHED_APP_SLUG),
+            "the warning must name BOTH the App being used and the one this build \
+             publishes, or it does not tell the operator what is wrong: {rendered}"
+        );
+        assert!(
+            rendered.contains(CLIENT_ID_VARIABLE) || rendered.contains(APP_SLUG_VARIABLE),
+            "and it must name the variable to unset: {rendered}"
+        );
+
+        // Silence is the other half, and it is the common case: a stock build
+        // that printed a warning on every command would train operators to skip
+        // the line that matters.
+        let mut quiet = Vec::new();
+        write_app_override_warning(&mut quiet, None, None);
+        assert!(
+            quiet.is_empty(),
+            "a build with no override must say nothing: {:?}",
+            String::from_utf8_lossy(&quiet)
+        );
     }
 }

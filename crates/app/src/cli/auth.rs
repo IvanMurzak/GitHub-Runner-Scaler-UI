@@ -51,7 +51,10 @@ use runner_manager_github::{
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 
-use super::{AuthCommand, CliError, Context, Failure, NO_OPERATOR_REMEDY, write_failed};
+use super::{
+    AuthCommand, CliError, Context, Failure, NO_OPERATOR_REMEDY, Styling, open_in_browser,
+    write_failed,
+};
 
 // ---------------------------------------------------------------------------
 // The disclosure
@@ -202,28 +205,47 @@ pub const ONBOARDING_ACTIONS: usize = 3;
 /// Counted even though it is done, because D3's budget counts it: the gate is
 /// *three user actions from a clean machine*, and pretending the invocation was
 /// free would let a fourth action in under the same number.
-fn write_action_one(out: &mut dyn Write) -> io::Result<()> {
+fn write_action_one(out: &mut dyn Write, styling: Styling) -> io::Result<()> {
     writeln!(
         out,
-        "Action 1 of {ONBOARDING_ACTIONS} (done): you ran `runner-manager auth login`."
+        "{} you ran `runner-manager auth login`.",
+        styling.step(&format!("Action 1 of {ONBOARDING_ACTIONS} (done):"))
     )
 }
 
 /// Action 2: the code entry, on GitHub's own page.
+///
+/// `opened` reports whether the browser was launched for the operator. The URL
+/// is printed either way — a launcher that silently succeeded onto another
+/// desktop, or one that never ran at all, must both leave the operator with an
+/// address they can open by hand.
 fn write_action_two(
     out: &mut dyn Write,
+    styling: Styling,
     verification_url: &dyn Display,
     user_code: &str,
     expires_in: Duration,
+    opened: bool,
 ) -> io::Result<()> {
+    let url = verification_url.to_string();
     writeln!(out)?;
-    writeln!(
-        out,
-        "Action 2 of {ONBOARDING_ACTIONS}: open {verification_url} in a browser and enter \
-         this code:"
-    )?;
+    if opened {
+        writeln!(
+            out,
+            "{} opened {} in your browser. Enter this code:",
+            styling.step(&format!("Action 2 of {ONBOARDING_ACTIONS}:")),
+            styling.url(&url)
+        )?;
+    } else {
+        writeln!(
+            out,
+            "{} open {} in a browser and enter this code:",
+            styling.step(&format!("Action 2 of {ONBOARDING_ACTIONS}:")),
+            styling.url(&url)
+        )?;
+    }
     writeln!(out)?;
-    writeln!(out, "    {user_code}")?;
+    writeln!(out, "    {}", styling.code(&format!(" {user_code} ")))?;
     writeln!(out)?;
     writeln!(
         out,
@@ -240,11 +262,18 @@ fn write_action_two(
 }
 
 /// Action 3: choosing what the App may reach.
-fn write_action_three(out: &mut dyn Write, install_url: &dyn Display) -> io::Result<()> {
+fn write_action_three(
+    out: &mut dyn Write,
+    styling: Styling,
+    install_url: &dyn Display,
+) -> io::Result<()> {
+    let url = install_url.to_string();
     writeln!(out)?;
     writeln!(
         out,
-        "Action 3 of {ONBOARDING_ACTIONS}: open {install_url} and choose the repositories to"
+        "{} open {} and choose the repositories to",
+        styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
+        styling.url(&url)
     )?;
     writeln!(
         out,
@@ -264,9 +293,13 @@ pub fn dispatch(
     command: &AuthCommand,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    // One styling decision for the whole command, taken from the real stdout
+    // rather than inside each writer, so a piped run and a captured test see the
+    // same bytes.
+    let styling = Styling::for_stdout();
     match command {
-        AuthCommand::Login => login(context, out),
-        AuthCommand::Status => status(context, out),
+        AuthCommand::Login => login(context, styling, out),
+        AuthCommand::Status => status(context, styling, out),
         AuthCommand::Logout => logout(context, out),
     }
 }
@@ -279,7 +312,7 @@ pub fn dispatch(
 ///
 /// # Errors
 /// Every class in [`Failure`] that authentication can reach.
-pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn login(context: &Context, styling: Styling, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("this sign-in");
 
     // ---- the disclosure, before any request is issued --------------------
@@ -294,7 +327,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     let flow = DeviceFlow::new(app.clone(), context.endpoints().clone())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_action_one(out).map_err(failed)?;
+    write_action_one(out, styling).map_err(failed)?;
 
     let runtime = super::runtime()?;
     let store = context.store()?;
@@ -305,7 +338,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(flow.start())
         .map_err(|source| device_flow_failure(&source))?;
 
-    write_login_prompt(out, &flow, &authorization).map_err(failed)?;
+    write_login_prompt(out, styling, &flow, &authorization).map_err(failed)?;
     out.flush().map_err(failed)?;
 
     let token = runtime
@@ -333,7 +366,7 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .block_on(client.discover_installations(&app))
         .map_err(|source| github_failure(&source))?;
 
-    write_discovery(out, &discovery, true).map_err(failed)?;
+    write_discovery(out, styling, &discovery, true).map_err(failed)?;
     Ok(())
 }
 
@@ -349,14 +382,27 @@ pub fn login(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
 /// party's string even if that check is ever loosened.
 fn write_login_prompt(
     out: &mut dyn Write,
+    styling: Styling,
     flow: &DeviceFlow,
     authorization: &DeviceAuthorization,
 ) -> io::Result<()> {
+    // Opened BEFORE the prompt is written, so the line the operator reads
+    // states what already happened rather than what is about to. The launcher
+    // is best effort and the URL is printed either way, so a browser that never
+    // appears costs a copy-paste and nothing else.
+    //
+    // It is also opened AFTER the disclosure has been written and flushed by
+    // the caller, which is the ordering `07-security.md` fixes: "`auth login`
+    // prints the same statement before opening the browser".
+    let url = flow.verification_url().to_string();
+    let opened = open_in_browser(&url, styling);
     write_action_two(
         out,
-        &flow.verification_url(),
+        styling,
+        &url,
         authorization.user_code(),
         authorization.expires_in(),
+        opened,
     )
 }
 
@@ -480,7 +526,7 @@ pub fn credential_state(
 /// # Errors
 /// The state's own [`CredentialState::failure`], plus store and registration
 /// failures.
-pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn status(context: &Context, styling: Styling, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("this credential's status");
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
@@ -489,7 +535,7 @@ pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
 
     writeln!(out, "Credential: {}", state.as_str()).map_err(failed)?;
     writeln!(out, "Store:      {}", secrets.location()).map_err(failed)?;
-    write_state_explanation(out, &state).map_err(failed)?;
+    write_state_explanation(out, styling, &state).map_err(failed)?;
 
     match state.failure() {
         None => Ok(()),
@@ -502,7 +548,11 @@ pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
 }
 
 /// One screenful per state, and never the wrong remedy stated confidently.
-fn write_state_explanation(out: &mut dyn Write, state: &CredentialState) -> io::Result<()> {
+fn write_state_explanation(
+    out: &mut dyn Write,
+    styling: Styling,
+    state: &CredentialState,
+) -> io::Result<()> {
     writeln!(out)?;
     match state {
         CredentialState::NotAuthenticated => {
@@ -516,7 +566,7 @@ fn write_state_explanation(out: &mut dyn Write, state: &CredentialState) -> io::
             )?;
         }
         CredentialState::Authenticated(discovery) => {
-            write_discovery(out, discovery, false)?;
+            write_discovery(out, styling, discovery, false)?;
         }
         CredentialState::Revoked => {
             writeln!(
@@ -566,13 +616,14 @@ fn write_state_explanation(out: &mut dyn Write, state: &CredentialState) -> io::
 ///   which no list of today's names can show.
 fn write_discovery(
     out: &mut dyn Write,
+    styling: Styling,
     discovery: &InstallationDiscovery,
     onboarding: bool,
 ) -> io::Result<()> {
     match discovery {
         InstallationDiscovery::NotInstalled { install_url } => {
             if onboarding {
-                write_action_three(out, install_url)?;
+                write_action_three(out, styling, install_url)?;
             } else {
                 writeln!(out)?;
                 writeln!(
@@ -1027,14 +1078,20 @@ mod tests {
     fn transcript() -> String {
         text(|out| {
             write_disclosure(out)?;
-            write_action_one(out)?;
+            write_action_one(out, Styling::plain())?;
             write_action_two(
                 out,
+                Styling::plain(),
                 &"https://github.com/login/device",
                 "WDJB-MJHT",
                 Duration::from_secs(900),
+                false,
             )?;
-            write_action_three(out, &"https://github.com/apps/example/installations/new")
+            write_action_three(
+                out,
+                Styling::plain(),
+                &"https://github.com/apps/example/installations/new",
+            )
         })
     }
 
@@ -1227,9 +1284,11 @@ mod tests {
         let prompt = text(|out| {
             write_action_two(
                 out,
+                Styling::plain(),
                 &"https://github.com/login/device",
                 "WDJB-MJHT",
                 Duration::from_secs(900),
+                false,
             )
         });
         assert!(prompt.contains("WDJB-MJHT"));
@@ -1298,7 +1357,7 @@ mod tests {
         ];
         let mut seen = std::collections::BTreeSet::new();
         for state in &states {
-            let rendered = text(|out| write_state_explanation(out, state));
+            let rendered = text(|out| write_state_explanation(out, Styling::plain(), state));
             assert!(
                 seen.insert(rendered.clone()),
                 "{} renders the same explanation as an earlier state",
@@ -1309,6 +1368,7 @@ mod tests {
         let unreachable = text(|out| {
             write_state_explanation(
                 out,
+                Styling::plain(),
                 &CredentialState::Unreachable {
                     detail: "GitHub was unreachable".to_string(),
                 },
@@ -1334,7 +1394,7 @@ mod tests {
         );
         assert!(remedy.contains("wait"), "got: {remedy}");
 
-        let explanation = text(|out| write_state_explanation(out, &state));
+        let explanation = text(|out| write_state_explanation(out, Styling::plain(), &state));
         assert!(
             explanation.contains("nothing wrong with the token itself"),
             "got: {explanation}"
