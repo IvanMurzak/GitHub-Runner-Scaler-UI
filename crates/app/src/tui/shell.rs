@@ -1092,7 +1092,27 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('n') => state.open_screen(Screen::Runners),
         KeyCode::Char('s') => {
             state.open_screen(Screen::RepositorySettings);
-            let target = selected_repository_target(state).unwrap_or_default();
+            // ----------------------------------------------------------------
+            // THERE MAY BE NO REPOSITORY TO CONFIGURE, AND THAT IS NOT AN ERROR.
+            // ----------------------------------------------------------------
+            // `unwrap_or_default()` here sent an EMPTY target into the policy
+            // loader, which parsed it and failed with "an organization login
+            // must not be empty" -- a message about a parser, shown to somebody
+            // who pressed `s` on a host that has no policies yet. The screen
+            // then sat on "Loading settings..." forever, because nothing was
+            // ever going to load.
+            //
+            // A host with no policies is the state every new install starts in,
+            // so it gets an answer rather than a diagnostic.
+            let Some(target) = selected_repository_target(state) else {
+                state.settings.show_notice(
+                    "No repository is configured on this host yet.\n\n\
+                     Add one from a terminal:\n  \
+                     runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
+                     Then press [r] to select it and [s] to configure it.",
+                );
+                return Vec::new();
+            };
             return vec![Effect::Settings(SettingsCommand::LoadPolicy(target))];
         }
         KeyCode::Char('h') => {
@@ -2933,6 +2953,44 @@ mod tests {
                 "render acquired forbidden I/O capability {forbidden_capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn pressing_settings_with_no_repository_explains_rather_than_failing_to_parse() {
+        // --------------------------------------------------------------------
+        // THE SCREEN A NEW INSTALL ACTUALLY SEES.
+        // --------------------------------------------------------------------
+        // `s` used to send `unwrap_or_default()` -- an EMPTY target -- into the
+        // policy loader on a host with no policies. The loader parsed it and
+        // failed with "an organization login must not be empty": a parser's
+        // complaint, shown to somebody whose only mistake was pressing a key
+        // before adding a repository, on a screen that then sat on "Loading
+        // settings..." forever because nothing was ever going to load.
+        let mut state = AppState::new(PresentationState::default(), 120, 40);
+        assert!(
+            state.screen_model.snapshot.repositories.is_empty(),
+            "this test is about the empty case, so it must start empty"
+        );
+
+        let effects = reduce(&mut state, key(KeyCode::Char('s')));
+
+        assert!(
+            effects.is_empty(),
+            "nothing may be loaded when there is nothing to load: {effects:?}"
+        );
+        let screen = rendered(120, 30, &state);
+        assert!(
+            !screen.contains("must not be empty"),
+            "a parser error must not reach the screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Loading settings..."),
+            "and it must not claim to be loading something that never will:\n{screen}"
+        );
+        assert!(
+            screen.contains("repo add"),
+            "it must say what to do instead:\n{screen}"
+        );
     }
 
     #[test]

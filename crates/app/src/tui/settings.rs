@@ -318,8 +318,17 @@ pub struct SettingsUi {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SettingsView {
+    /// Nothing loaded yet, and something IS on its way.
     #[default]
     Empty,
+    /// Nothing to load, and the screen says why.
+    ///
+    /// Distinct from [`SettingsView::Empty`] because the two mean opposite
+    /// things to the person reading the screen: one is "wait", the other is
+    /// "this is all there is until you do something". Rendering the second as
+    /// the first is what left a host with no policies sitting on
+    /// "Loading settings..." indefinitely.
+    Notice(String),
     Host(HostSettings),
     Policy(PolicySettings),
 }
@@ -334,6 +343,13 @@ pub enum SettingsCommand {
 }
 
 impl SettingsUi {
+    /// Shows an explanation instead of a form, and clears any pending message.
+    pub fn show_notice(&mut self, notice: impl Into<String>) {
+        self.view = SettingsView::Notice(notice.into());
+        self.message = None;
+        self.focus = 0;
+    }
+
     pub fn execute(&mut self, context: &Context, command: SettingsCommand) -> Option<String> {
         if matches!(
             &command,
@@ -514,7 +530,7 @@ impl SettingsUi {
                 }
                 None
             }
-            SettingsView::Empty => None,
+            SettingsView::Empty | SettingsView::Notice(_) => None,
         }
     }
 
@@ -522,7 +538,9 @@ impl SettingsUi {
         match &self.view {
             SettingsView::Host(_) => 4,
             SettingsView::Policy(form) => usize::from(form.exposes_scale_toggle()) + 3,
-            SettingsView::Empty => 0,
+            // A notice is a screenful of text: nothing to focus, nothing to
+            // adjust, nothing to apply.
+            SettingsView::Empty | SettingsView::Notice(_) => 0,
         }
     }
 
@@ -587,7 +605,7 @@ impl SettingsUi {
                     _ => {}
                 }
             }
-            SettingsView::Empty => {}
+            SettingsView::Empty | SettingsView::Notice(_) => {}
         }
     }
 
@@ -602,7 +620,7 @@ impl SettingsUi {
                 .clone()
                 .filter(|_| self.focus == self.control_count())
                 .map(SettingsCommand::Copy),
-            SettingsView::Empty | SettingsView::Host(_) => None,
+            SettingsView::Empty | SettingsView::Notice(_) | SettingsView::Host(_) => None,
         }
     }
 }
@@ -610,6 +628,7 @@ impl SettingsUi {
 pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool) {
     let lines = match &ui.view {
         SettingsView::Empty => vec![Line::from("Loading settings...")],
+        SettingsView::Notice(notice) => notice.lines().map(Line::from).collect(),
         SettingsView::Host(form) => {
             let preview = form.preview_interval(ui.host_interval_secs).ok();
             vec![
