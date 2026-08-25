@@ -46,6 +46,7 @@ pub mod host;
 pub mod policy;
 pub mod service;
 pub mod status;
+pub mod ui;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -342,11 +343,12 @@ impl CliError {
 
     /// Renders onto stderr in the shape every command uses.
     pub fn render(&self, err: &mut dyn Write) -> io::Result<()> {
-        writeln!(err, "error: {}", self.message)?;
-        if let Some(remedy) = &self.remedy {
-            writeln!(err, "  try: {remedy}")?;
-        }
-        Ok(())
+        // Styled from stderr's own terminal-ness rather than stdout's: a run
+        // whose output is piped to a file still shows its failures to a human,
+        // and that human should get the red label. The plain rendering is
+        // unchanged — `error: `, then `  try: ` — so every exit-code test and
+        // every log that captures stderr reads exactly what it read before.
+        ui::Ui::new(Styling::for_stderr()).error(err, &self.message, self.remedy.as_deref())
     }
 }
 
@@ -1056,14 +1058,80 @@ fn run_with_shutdown(
         }
     };
 
-    match &cli.command {
-        Command::Auth(command) => auth::dispatch(&context, command, out),
-        Command::Host(command) => host::dispatch(&context, command, out),
-        Command::Status(args) => status::dispatch(&context, args, out),
-        Command::Repo(command) => policy::dispatch_repo(&context, command, out),
-        Command::Org(command) => policy::dispatch_org(&context, command, out),
-        Command::Daemon(command) => daemon::dispatch(&context, command, out, service_shutdown),
-        Command::Service(command) => service::dispatch(&context, command, out),
+    // ------------------------------------------------------------------------
+    // A REPORT IS BUFFERED SO IT CAN BE DECORATED; EVERYTHING ELSE STREAMS.
+    // ------------------------------------------------------------------------
+    // `ui::Ui::decorate` aligns a whole block on its widest key, so it has to
+    // see the block. That is right for a report, which is written all at once
+    // and then the command exits — and WRONG for anything the operator waits
+    // in front of. `auth login` prints a code and then blocks on GitHub for
+    // minutes; `daemon run` never ends. Buffering either would show the
+    // operator nothing at all, so they keep the real sink.
+    if is_decorated_report(&cli.command) {
+        let mut buffered = Vec::new();
+        // The command writes PLAIN text into the buffer: decoration is this
+        // layer's job, and a writer that styled its own output would hand the
+        // decorator escape sequences to parse as report structure.
+        let outcome = route(
+            &cli.command,
+            &context,
+            &mut buffered,
+            service_shutdown,
+            Styling::plain_for_buffer(),
+        );
+        // Decorated even when the command failed: a report that got halfway
+        // before erroring is still the operator's best evidence, and dropping
+        // it would leave them with an error and no context.
+        let text = String::from_utf8_lossy(&buffered);
+        ui::Ui::new(Styling::for_stdout())
+            .decorate(out, &text)
+            .map_err(write_failed("this report"))?;
+        return outcome;
+    }
+
+    route(
+        &cli.command,
+        &context,
+        out,
+        service_shutdown,
+        Styling::for_stdout(),
+    )
+}
+
+/// Whether this command's output is a report that may be decorated.
+///
+/// An allow-list, and it has to be. The one output that must never be touched
+/// is `status --json`: it is a schema-stable document, and a decorator that
+/// drew a rule under its opening brace because the line looked like a heading
+/// would corrupt it for every consumer parsing it. Naming the commands that MAY
+/// be decorated means a new command is undecorated until somebody says
+/// otherwise, rather than decorated until somebody notices.
+fn is_decorated_report(command: &Command) -> bool {
+    match command {
+        Command::Status(args) => !args.json,
+        Command::Host(_) | Command::Service(_) | Command::Repo(_) | Command::Org(_) => true,
+        // `auth status` and `auth logout` are reports; `auth login` is a
+        // conversation with a person and streams.
+        Command::Auth(AuthCommand::Status | AuthCommand::Logout) => true,
+        _ => false,
+    }
+}
+
+fn route(
+    command: &Command,
+    context: &Context,
+    out: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+    styling: Styling,
+) -> Result<(), CliError> {
+    match command {
+        Command::Auth(command) => auth::dispatch(context, command, styling, out),
+        Command::Host(command) => host::dispatch(context, command, out),
+        Command::Status(args) => status::dispatch(context, args, out),
+        Command::Repo(command) => policy::dispatch_repo(context, command, out),
+        Command::Org(command) => policy::dispatch_org(context, command, out),
+        Command::Daemon(command) => daemon::dispatch(context, command, out, service_shutdown),
+        Command::Service(command) => service::dispatch(context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),
@@ -1123,6 +1191,18 @@ impl Styling {
         }
     }
 
+    /// Styling for the real stderr, which is where failures and warnings go.
+    ///
+    /// Asked separately from [`Styling::for_stdout`] because the two streams are
+    /// redirected independently: `runner-manager status > report.txt` still
+    /// shows its errors to a person, and that person should get the red label.
+    #[must_use]
+    pub fn for_stderr() -> Self {
+        Self {
+            enabled: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
     /// No styling at all.
     ///
     /// `#[cfg(test)]` because production has exactly one way in —
@@ -1163,11 +1243,70 @@ impl Styling {
         self.wrap("1;32", text)
     }
 
+    /// No styling, for a command whose output is buffered for decoration.
+    ///
+    /// Separate from the `#[cfg(test)]` [`Styling::plain`] because this one has
+    /// a production caller: `route` hands it to every buffered report, so that
+    /// what reaches [`ui::Ui::decorate`] is report structure rather than escape
+    /// sequences that happen to look like it.
+    #[must_use]
+    pub const fn plain_for_buffer() -> Self {
+        Self { enabled: false }
+    }
+
     /// Styling that is ON, for a test that asserts what a terminal would see.
     #[cfg(test)]
     #[must_use]
     pub const fn styled() -> Self {
         Self { enabled: true }
+    }
+
+    /// Whether anything will actually be emitted.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// A report's heading.
+    #[must_use]
+    pub fn heading(self, text: &str) -> String {
+        self.wrap("1", text)
+    }
+
+    /// The rule drawn under a heading. Dim, because it is furniture.
+    #[must_use]
+    pub fn rule(self, text: &str) -> String {
+        self.wrap("2", text)
+    }
+
+    /// The left-hand column of a report.
+    #[must_use]
+    pub fn key(self, text: &str) -> String {
+        self.wrap("2;36", text)
+    }
+
+    /// A value that says the thing is working.
+    #[must_use]
+    pub fn good(self, text: &str) -> String {
+        self.wrap("32", text)
+    }
+
+    /// A value that says something is absent or pending, and a warning label.
+    #[must_use]
+    pub fn caution(self, text: &str) -> String {
+        self.wrap("33", text)
+    }
+
+    /// A value that says something is broken, and an error label.
+    #[must_use]
+    pub fn failure(self, text: &str) -> String {
+        self.wrap("1;31", text)
+    }
+
+    /// A command the operator is meant to type.
+    #[must_use]
+    pub fn command(self, text: &str) -> String {
+        self.wrap("1;36", text)
     }
 }
 
@@ -1261,13 +1400,16 @@ fn write_app_override_warning(
         return;
     }
 
+    let ui = ui::Ui::new(Styling::for_stderr());
     if against_a_fake_github {
         let named = slug.unwrap_or("<no slug set>");
-        let _ = writeln!(
+        let _ = ui.warning(
             err,
-            "warning: authenticating as the GitHub App `{named}`, not this build's \
-             `{PUBLISHED_APP_SLUG}`, because {CLIENT_ID_VARIABLE} or {APP_SLUG_VARIABLE} is set \
-             alongside a {GITHUB_BASE_URL_VARIABLE} that is not GitHub."
+            &format!(
+                "authenticating as the GitHub App `{named}`, not this build's \
+                 `{PUBLISHED_APP_SLUG}`, because {CLIENT_ID_VARIABLE} or {APP_SLUG_VARIABLE} is \
+                 set alongside a {GITHUB_BASE_URL_VARIABLE} that is not GitHub."
+            ),
         );
         return;
     }
@@ -1275,11 +1417,13 @@ fn write_app_override_warning(
     // The dangerous case, and the one that reads as reassurance rather than as
     // an alarm: the variables are set, they are being IGNORED, and sign-in is
     // going to the published App after all.
-    let _ = writeln!(
+    let _ = ui.warning(
         err,
-        "warning: ignoring {CLIENT_ID_VARIABLE}/{APP_SLUG_VARIABLE}: they apply only when \
-         {GITHUB_BASE_URL_VARIABLE} points at a fake GitHub. Signing in as \
-         `{PUBLISHED_APP_SLUG}`. Unset them to silence this."
+        &format!(
+            "ignoring {CLIENT_ID_VARIABLE}/{APP_SLUG_VARIABLE}: they apply only when \
+             {GITHUB_BASE_URL_VARIABLE} points at a fake GitHub. Signing in as \
+             `{PUBLISHED_APP_SLUG}`. Unset them to silence this."
+        ),
     );
 }
 

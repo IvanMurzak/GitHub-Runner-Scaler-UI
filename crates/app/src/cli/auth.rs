@@ -291,12 +291,9 @@ fn write_action_three(
 pub fn dispatch(
     context: &Context,
     command: &AuthCommand,
+    styling: Styling,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    // One styling decision for the whole command, taken from the real stdout
-    // rather than inside each writer, so a piped run and a captured test see the
-    // same bytes.
-    let styling = Styling::for_stdout();
     match command {
         AuthCommand::Login => login(context, styling, out),
         AuthCommand::Status => status(context, styling, out),
