@@ -96,14 +96,20 @@ impl Ui {
             .max()
             .unwrap_or(0);
 
-        for line in text.lines() {
+        // Lookahead, because what makes a line a heading is what FOLLOWS it.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+
             if let Some(widths) = table_widths.as_ref()
                 && line.contains('\t')
             {
                 self.write_table_row(out, line, widths)?;
                 continue;
             }
-            match classify(line) {
+            match classify(line, lines.get(index).copied()) {
                 Line::Blank => writeln!(out)?,
                 Line::Title(title) => {
                     writeln!(out, "{}", self.styling.heading(title))?;
@@ -112,6 +118,12 @@ impl Ui {
                         "{}",
                         self.styling.rule(&"─".repeat(title.chars().count()))
                     )?;
+                    // The block drew its own `====` underline; one rule is
+                    // enough, and printing both is what made the disclosure
+                    // look as though it had been struck twice.
+                    if lines.get(index).copied().is_some_and(is_underline) {
+                        index += 1;
+                    }
                 }
                 Line::Row { key, value } => {
                     let padded = format!("{key:<widest$}");
@@ -234,19 +246,44 @@ enum Line<'a> {
     Prose(&'a str),
 }
 
-fn classify(line: &str) -> Line<'_> {
+fn classify<'a>(line: &'a str, next: Option<&'a str>) -> Line<'a> {
     if line.trim().is_empty() {
         return Line::Blank;
     }
     if let Some((key, value)) = parse_row(line) {
         return Line::Row { key, value };
     }
-    // A heading is unindented and short enough to be one: an unindented
-    // paragraph is prose, and drawing a rule under a sentence looks like a bug.
-    if !line.starts_with(' ') && line.chars().count() <= 60 && !line.ends_with('.') {
+
+    // ------------------------------------------------------------------------
+    // A HEADING IS PROVED BY THE LINE AFTER IT, NOT BY LOOKING SHORT.
+    // ------------------------------------------------------------------------
+    // Guessing from the line alone -- unindented, under sixty characters, no
+    // full stop -- called `===========` a heading and drew a rule under it, and
+    // did the same to `user:`, the last word of a wrapped sentence. Both sat in
+    // the middle of the grant disclosure, which is prose, and the result read
+    // as damage rather than as decoration.
+    //
+    // What actually distinguishes a heading in this tool's output is what
+    // follows it: an underline the writer drew itself, or the indented rows the
+    // heading introduces. Prose is followed by more prose.
+    if line.starts_with(' ') || is_underline(line) {
+        return Line::Prose(line);
+    }
+    let introduces_a_block =
+        next.is_some_and(|next| is_underline(next) || parse_row(next).is_some());
+    if introduces_a_block {
         return Line::Title(line);
     }
     Line::Prose(line)
+}
+
+/// Whether a line is an underline the writer drew: `====`, `----`, `─ ─ ─`.
+fn is_underline(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 3
+        && trimmed
+            .chars()
+            .all(|character| matches!(character, '=' | '-' | '─' | '_' | '~'))
 }
 
 /// Splits `  key    value` into its two halves.
@@ -434,12 +471,21 @@ mod tests {
     #[test]
     fn prose_and_continuations_are_left_alone() {
         assert!(matches!(
-            classify("This is a sentence that explains something at length."),
+            classify(
+                "This is a sentence that explains something at length.",
+                None
+            ),
             Line::Prose(_)
         ));
-        assert!(matches!(classify("    a continuation"), Line::Prose(_)));
         assert!(matches!(
-            classify("Service: runner-manager"),
+            classify("    a continuation", None),
+            Line::Prose(_)
+        ));
+        assert!(matches!(
+            classify(
+                "Service: runner-manager",
+                Some("  installed                 yes")
+            ),
             Line::Title(_)
         ));
     }

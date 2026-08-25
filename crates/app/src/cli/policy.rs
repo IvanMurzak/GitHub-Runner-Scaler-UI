@@ -376,10 +376,15 @@ fn write_add_result(
         }
         None => {
             writeln!(out, "Monitor-only: no routing label is reserved and no runner will ever be started for this policy.").map_err(failed)?;
-            // D21 requires the monitor-only path to repeat the complete grant
-            // consequences, not merely its consent-screen label. Keep one
-            // rendering in auth.rs so sign-in and policy creation cannot drift.
-            super::auth::write_disclosure(out).map_err(failed)?;
+            // D21 requires the monitor-only path to repeat the grant's
+            // CONSEQUENCES, not merely its consent-screen label -- and not the
+            // whole sign-in disclosure either. Reprinting all twenty-five lines
+            // of it after a one-line result buried the two lines that follow,
+            // including the command that promotes the policy, and taught the
+            // reader to scroll past the section that matters. `f2`'s obligation
+            // is the three sentences in `write_grant_consequences`, which is
+            // what an operator adding a second target needs to be reminded of.
+            super::auth::write_grant_consequences(out).map_err(failed)?;
             writeln!(
                 out,
                 "Promote it with: runner-manager {} set-capacity {} --max-capacity N",

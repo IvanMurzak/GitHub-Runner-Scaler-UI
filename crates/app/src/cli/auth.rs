@@ -116,6 +116,45 @@ const PERMISSIONS: [(&str, &str, &str); 4] = [
 ///
 /// # Errors
 /// Whatever `out` fails with.
+/// The consequences of the grant, and nothing else.
+///
+/// # Why a second, shorter rendering exists
+///
+/// `07-security.md` requires the grant to be disclosed at sign-in AND wherever a
+/// monitor-only policy is created, because a reader can reasonably assume that
+/// "this never starts a runner" implies a narrower permission than it does. It
+/// does not require the same twenty-five lines in both places, and printing them
+/// after a one-line `repo add` result buried the two lines the operator actually
+/// needed next — the promotion command among them — under a wall they had
+/// already read during sign-in.
+///
+/// So this is the part that carries the obligation: the permission named, the
+/// three verbs it also authorizes, collaborators, and the fact that watching
+/// grants exactly the same set. `policy_commands.rs` asserts each of those
+/// sentences, so shortening this further reds a test rather than quietly
+/// weakening a disclosure.
+///
+/// # Errors
+/// Whatever `out` fails with.
+pub fn write_grant_consequences(out: &mut dyn Write) -> io::Result<()> {
+    writeln!(out)?;
+    writeln!(
+        out,
+        "`{CRITICAL_PERMISSION}` is NOT a narrow self-hosted-runner permission."
+    )?;
+    writeln!(
+        out,
+        "The same grant also permits DELETING, RENAMING and TRANSFERRING the repository, and"
+    )?;
+    writeln!(
+        out,
+        "adding and removing collaborators. Watching grants exactly the same set."
+    )?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Writes the whole D21 disclosure.
 pub fn write_disclosure(out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "{DISCLOSURE_HEADING}")?;
     writeln!(out, "{}", "=".repeat(DISCLOSURE_HEADING.len()))?;
