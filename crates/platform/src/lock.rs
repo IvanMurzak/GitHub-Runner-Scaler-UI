@@ -714,11 +714,26 @@ mod tests {
 
         // A record naming a process that has come and gone: exactly what a
         // crashed holder leaves behind.
-        let mut child = SpawnSpec::new(if cfg!(windows) { "cmd" } else { "true" })
+        //
+        // THE CHILD HAS TO OUTLIVE ITS OWN IDENTITY LOOKUP.
+        //
+        // `SpawnSpec::spawn` reads `ProcessIdentity::of_child` immediately after
+        // starting the process, because the start token is what stops a reused
+        // pid from being mistaken for the original. A child that exits INSTANTLY
+        // -- `true` did -- can be gone before that read, and the spawn then
+        // fails with `NoSuchProcess` rather than yielding the identity this test
+        // needs. It blocked release 0.1.5 on the macOS leg, where a loaded
+        // runner made the race easy to lose.
+        //
+        // So the child sleeps briefly: long enough to be observed, short enough
+        // that waiting for it costs nothing. What is being tested is unchanged
+        // -- the record is stale by the time it is read, because `wait` below
+        // returns only after the process is gone.
+        let mut child = SpawnSpec::new(if cfg!(windows) { "cmd" } else { "sh" })
             .args(if cfg!(windows) {
                 vec!["/C", "exit", "0"]
             } else {
-                vec![]
+                vec!["-c", "sleep 0.3"]
             })
             .spawn()
             .expect("the child starts");
