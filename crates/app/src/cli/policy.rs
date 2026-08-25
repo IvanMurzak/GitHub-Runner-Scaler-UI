@@ -113,13 +113,44 @@ fn add(
             ));
         }
     };
-    let reachable = discovery.targets().ok_or_else(|| {
-        CliError::with_remedy(
-            Failure::NotFound,
-            format!("the GitHub App is not installed for {target}. No policy was stored."),
-            "runner-manager auth status",
-        )
-    })?;
+    let reachable = match discovery.targets() {
+        Some(reachable) => reachable,
+        None => {
+            // ----------------------------------------------------------------
+            // AUTHORIZED IS NOT INSTALLED, AND THIS IS WHERE THAT BITES.
+            // ----------------------------------------------------------------
+            // `auth login` proves who the operator is. Installing the App is
+            // what grants it access to a repository, and they are two separate
+            // consents on GitHub's side — which is why `auth login` counts the
+            // install as its third action. Somebody who signed in and went
+            // straight to `repo add` has done the first and not the second.
+            //
+            // The page that fixes it is opened here rather than only named,
+            // because this failure has exactly one remedy and it is a URL. The
+            // launcher is skipped when stderr is not a terminal, so a script
+            // gets the message and no browser.
+            let install_url = discovery.install_url().map_or_else(
+                || "your GitHub App's installations page".to_string(),
+                ToString::to_string,
+            );
+            let opened = super::open_in_browser(&install_url, super::Styling::for_stderr());
+            let how = if opened {
+                format!("Its installation page is open in your browser ({install_url})")
+            } else {
+                format!("Install it at {install_url}")
+            };
+            return Err(CliError::with_remedy(
+                Failure::NotFound,
+                format!(
+                    "the GitHub App is not installed for {target}, so this host cannot register \
+                     a runner there. Signing in authorized the App; installing it is the \
+                     separate step that grants access. {how} — choose {target}, then run this \
+                     command again. No policy was stored."
+                ),
+                "runner-manager auth status",
+            ));
+        }
+    };
     let (installation_id, installed_repositories) = installation_for(&target, reachable)?;
 
     let host = super::host::local_host_or_create(context, &store)?;
@@ -290,11 +321,33 @@ fn installation_for(
     reachable.installations().iter().find(|installation| match target {
         ScaleTarget::Repository(repository) => installation.repositories.contains(repository),
         ScaleTarget::Organization(org) => matches!(&installation.account, InstallationAccount::Organization(installed) if installed == org),
-    }).map(|installation| (installation.id, u32::try_from(installation.repositories.len()).unwrap_or(u32::MAX))).ok_or_else(|| CliError::with_remedy(
-        Failure::NotFound,
-        format!("the GitHub App is not installed for {target}. No policy was stored."),
-        "runner-manager auth status",
-    ))
+    }).map(|installation| (installation.id, u32::try_from(installation.repositories.len()).unwrap_or(u32::MAX))).ok_or_else(|| {
+        // The App IS installed somewhere — this branch is only reachable with
+        // at least one installation — just not covering the target asked for.
+        // Naming what it DOES reach is what turns this from a dead end into a
+        // diagnosis: the operator installed it on the wrong repository, or on
+        // an account that does not hold this one.
+        let reaches = reachable
+            .installations()
+            .iter()
+            .flat_map(|installation| installation.repositories.iter())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let reaches = if reaches.is_empty() {
+            "no repositories".to_string()
+        } else {
+            reaches.join(", ")
+        };
+        CliError::with_remedy(
+            Failure::NotFound,
+            format!(
+                "the GitHub App is installed, but not on {target}, so this host cannot register \
+                 a runner there. It currently reaches: {reaches}. Add {target} to the \
+                 installation on GitHub. No policy was stored."
+            ),
+            "runner-manager auth status",
+        )
+    })
 }
 
 fn write_add_result(

@@ -267,18 +267,45 @@ fn write_action_three(
     styling: Styling,
     install_url: &dyn Display,
 ) -> io::Result<()> {
+    // ------------------------------------------------------------------------
+    // THE LAST ACTION GETS A BROWSER TOO, AND NOT BY REDIRECT.
+    // ------------------------------------------------------------------------
+    // A GitHub App can carry a setup URL that the browser is sent to after an
+    // installation, but that is a redirect TO something — it needs this tool to
+    // be listening on an address GitHub can reach. `07-security.md`'s whole
+    // shape is that this product opens no socket of any kind, so the browser is
+    // opened from here instead, the same way the device page is.
+    //
+    // Signing in and installing are two consents on GitHub's side, and an
+    // operator who stops after the first has a working credential that reaches
+    // nothing. That gap is what this step exists to close, so it opens rather
+    // than only printing.
     let url = install_url.to_string();
+    let opened = open_in_browser(&url, styling);
     writeln!(out)?;
-    writeln!(
-        out,
-        "{} open {} and choose the repositories to",
-        styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
-        styling.url(&url)
-    )?;
-    writeln!(
-        out,
-        "install the App on. Choose only the ones you want this host to serve."
-    )?;
+    if opened {
+        writeln!(
+            out,
+            "{} opened {} in your browser. Choose the",
+            styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
+            styling.url(&url)
+        )?;
+        writeln!(
+            out,
+            "repositories to install the App on — only the ones you want this host to serve."
+        )?;
+    } else {
+        writeln!(
+            out,
+            "{} open {} and choose the repositories to",
+            styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
+            styling.url(&url)
+        )?;
+        writeln!(
+            out,
+            "install the App on. Choose only the ones you want this host to serve."
+        )?;
+    }
     Ok(())
 }
 
@@ -330,6 +357,31 @@ pub fn login(context: &Context, styling: Styling, out: &mut dyn Write) -> Result
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
     let secrets = context.secret_store(start_mode)?;
+
+    // ------------------------------------------------------------------------
+    // A HOST THAT IS ALREADY SIGNED IN RESUMES; IT DOES NOT SIGN IN AGAIN.
+    // ------------------------------------------------------------------------
+    // Signing in and installing the App are two consents, and stopping after
+    // the first leaves a working credential that reaches nothing. The operator
+    // who notices and runs `auth login` again does not need a second device
+    // code -- the one they have is fine -- they need the step they missed.
+    //
+    // So a still-valid credential skips straight to it, which also means the
+    // install page opens for them rather than being printed again.
+    //
+    // Only `Authenticated` short-circuits. A revoked credential must go through
+    // the device flow to be replaced, and an unreachable GitHub is not evidence
+    // of anything, so both fall through.
+    if let CredentialState::Authenticated(discovery) = credential_state(context, &secrets)? {
+        writeln!(out).map_err(failed)?;
+        writeln!(
+            out,
+            "This host is already signed in, so no new code is needed."
+        )
+        .map_err(failed)?;
+        write_discovery(out, styling, &discovery, true).map_err(failed)?;
+        return Ok(());
+    }
 
     let authorization = runtime
         .block_on(flow.start())
