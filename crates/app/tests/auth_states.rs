@@ -487,3 +487,63 @@ fn logout_on_a_host_that_was_never_signed_in_succeeds() {
         outcome.stdout
     );
 }
+
+// ----------------------------------------------------------------------------
+// The App override is a seam for a fake GitHub, and cannot hijack a real one.
+// ----------------------------------------------------------------------------
+// A `runner-manager-d17-spike` override left at MACHINE scope after a
+// verification spike survived on a workstation, and the shipped 0.1.2 asked for
+// authorization as the spike: an unfamiliar App name on the page where the
+// operator grants `Administration: Read and write`, with nothing on screen to
+// explain it. The variables now apply only alongside a fake-GitHub endpoint,
+// which is the only thing they were ever for.
+//
+// Driven through the real binary with a real environment rather than through a
+// unit test, because the property is about what a released `auth login` does on
+// an operator's machine, and a unit test that re-implemented the rule would pass
+// while the binary did something else.
+#[test]
+fn an_app_override_without_a_fake_github_is_ignored_and_said_to_be_ignored() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+
+    let outcome = run({
+        // NO `RUNNER_MANAGER_GITHUB_BASE_URL`: this is the shape of an
+        // operator's machine talking to the real github.com, carrying a stale
+        // override.
+        let mut command = runner_manager(data_dir.path());
+        command
+            .env(
+                "RUNNER_MANAGER_GITHUB_CLIENT_ID",
+                support::FIXTURE_CLIENT_ID,
+            )
+            .env("RUNNER_MANAGER_GITHUB_APP_SLUG", support::FIXTURE_APP_SLUG)
+            .args(["auth", "status"]);
+        command
+    });
+
+    assert!(
+        outcome.stderr.contains("ignoring"),
+        "a stale override must be reported as IGNORED rather than obeyed in \
+         silence; stderr:\n{}",
+        outcome.stderr
+    );
+    // The published slug as a literal: `crates/app` is a binary crate, so an
+    // integration test cannot import the constant. Pinning the string here means
+    // renaming the App reds this test, which is correct -- a rename needs a
+    // release, not only a setting change.
+    assert!(
+        outcome.stderr.contains("runner-manager-scaler"),
+        "and the warning must name the App the sign-in will actually use; \
+         stderr:\n{}",
+        outcome.stderr
+    );
+    assert!(
+        !outcome.stderr.contains(&format!(
+            "authenticating as the GitHub App `{}`",
+            support::FIXTURE_APP_SLUG
+        )),
+        "the binary must not report authenticating as the overridden App; \
+         stderr:\n{}",
+        outcome.stderr
+    );
+}

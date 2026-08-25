@@ -789,10 +789,38 @@ impl Context {
     /// no override is set. See that constant for why an empty default is the
     /// honest one.
     pub fn app_registration(&self) -> Result<AppRegistration, CliError> {
-        let client_id =
-            std::env::var(CLIENT_ID_VARIABLE).unwrap_or_else(|_| PUBLISHED_CLIENT_ID.to_string());
-        let slug =
-            std::env::var(APP_SLUG_VARIABLE).unwrap_or_else(|_| PUBLISHED_APP_SLUG.to_string());
+        // --------------------------------------------------------------------
+        // THE OVERRIDE APPLIES TO A FAKE GITHUB, AND ONLY TO A FAKE GITHUB.
+        // --------------------------------------------------------------------
+        // These two variables exist for a test that drives a fake GitHub, and
+        // every such test sets [`GITHUB_BASE_URL_VARIABLE`] alongside them --
+        // which is itself restricted to loopback. Against the real github.com
+        // they have no legitimate use, and one dangerous one: an override left
+        // at machine scope after a spike sends whoever runs `auth login` next to
+        // a DIFFERENT App's consent screen, showing a name they have never heard
+        // of on the page where they grant `Administration: Read and write`.
+        //
+        // That is not hypothetical. A `runner-manager-d17-spike` override
+        // survived on a workstation and the shipped 0.1.2 asked for
+        // authorization as the spike; the operator noticed only because the name
+        // on GitHub's page was wrong.
+        //
+        // So the seam is bound to the thing it is a seam for. Talking to real
+        // GitHub, the published registration wins and the override is announced
+        // as ignored rather than silently obeyed.
+        let against_a_fake_github = std::env::var_os(GITHUB_BASE_URL_VARIABLE).is_some();
+        let (client_id, slug) = if against_a_fake_github {
+            (
+                std::env::var(CLIENT_ID_VARIABLE)
+                    .unwrap_or_else(|_| PUBLISHED_CLIENT_ID.to_string()),
+                std::env::var(APP_SLUG_VARIABLE).unwrap_or_else(|_| PUBLISHED_APP_SLUG.to_string()),
+            )
+        } else {
+            (
+                PUBLISHED_CLIENT_ID.to_string(),
+                PUBLISHED_APP_SLUG.to_string(),
+            )
+        };
         AppRegistration::new(client_id, slug).map_err(|_| {
             CliError::new(
                 Failure::AppNotPublished,
@@ -1208,7 +1236,13 @@ fn open_in_browser(url: &str, styling: Styling) -> bool {
 fn warn_about_an_app_override(err: &mut dyn Write) {
     let client_id = std::env::var(CLIENT_ID_VARIABLE).ok();
     let slug = std::env::var(APP_SLUG_VARIABLE).ok();
-    write_app_override_warning(err, client_id.as_deref(), slug.as_deref());
+    let against_a_fake_github = std::env::var_os(GITHUB_BASE_URL_VARIABLE).is_some();
+    write_app_override_warning(
+        err,
+        client_id.as_deref(),
+        slug.as_deref(),
+        against_a_fake_github,
+    );
 }
 
 /// The warning itself, as a function of its two inputs.
@@ -1217,17 +1251,35 @@ fn warn_about_an_app_override(err: &mut dyn Write) {
 /// a process-wide variable would race every other test in this binary, and a
 /// warning nothing exercises is a warning that stops being emitted the first
 /// time somebody refactors around it.
-fn write_app_override_warning(err: &mut dyn Write, client_id: Option<&str>, slug: Option<&str>) {
+fn write_app_override_warning(
+    err: &mut dyn Write,
+    client_id: Option<&str>,
+    slug: Option<&str>,
+    against_a_fake_github: bool,
+) {
     if client_id.is_none() && slug.is_none() {
         return;
     }
 
-    let named = slug.unwrap_or("<no slug set>");
+    if against_a_fake_github {
+        let named = slug.unwrap_or("<no slug set>");
+        let _ = writeln!(
+            err,
+            "warning: authenticating as the GitHub App `{named}`, not this build's \
+             `{PUBLISHED_APP_SLUG}`, because {CLIENT_ID_VARIABLE} or {APP_SLUG_VARIABLE} is set \
+             alongside a {GITHUB_BASE_URL_VARIABLE} that is not GitHub."
+        );
+        return;
+    }
+
+    // The dangerous case, and the one that reads as reassurance rather than as
+    // an alarm: the variables are set, they are being IGNORED, and sign-in is
+    // going to the published App after all.
     let _ = writeln!(
         err,
-        "warning: authenticating as the GitHub App `{named}`, not this build's \
-         `{PUBLISHED_APP_SLUG}`, because {CLIENT_ID_VARIABLE} or {APP_SLUG_VARIABLE} is set. \
-         Unset both to use the published App."
+        "warning: ignoring {CLIENT_ID_VARIABLE}/{APP_SLUG_VARIABLE}: they apply only when \
+         {GITHUB_BASE_URL_VARIABLE} points at a fake GitHub. Signing in as \
+         `{PUBLISHED_APP_SLUG}`. Unset them to silence this."
     );
 }
 
@@ -1691,17 +1743,37 @@ mod tests {
         //
         // Driven through the formatter rather than the environment: setting a
         // process-wide variable would race every other test in this binary.
-        let mut written = Vec::new();
+        // Against a fake GitHub the override is in force, and the warning says
+        // which App is being used.
+        let mut in_force = Vec::new();
         write_app_override_warning(
-            &mut written,
+            &mut in_force,
             Some("Iv23li39jMQVdEuupmI2"),
             Some("runner-manager-d17-spike"),
+            true,
         );
-        let rendered = String::from_utf8(written).expect("ASCII");
+        let rendered = String::from_utf8(in_force).expect("ASCII");
         assert!(
             rendered.contains("runner-manager-d17-spike") && rendered.contains(PUBLISHED_APP_SLUG),
             "the warning must name BOTH the App being used and the one this build \
              publishes, or it does not tell the operator what is wrong: {rendered}"
+        );
+
+        // Against real GitHub the same variables are IGNORED, and saying so is
+        // the whole point: this is the case that shipped an operator to another
+        // App's consent screen.
+        let mut ignored = Vec::new();
+        write_app_override_warning(
+            &mut ignored,
+            Some("Iv23li39jMQVdEuupmI2"),
+            Some("runner-manager-d17-spike"),
+            false,
+        );
+        let rendered = String::from_utf8(ignored).expect("ASCII");
+        assert!(
+            rendered.contains("ignoring") && rendered.contains(PUBLISHED_APP_SLUG),
+            "against real GitHub the warning must say the override is ignored and \
+             name the App actually used: {rendered}"
         );
         assert!(
             rendered.contains(CLIENT_ID_VARIABLE) || rendered.contains(APP_SLUG_VARIABLE),
@@ -1712,7 +1784,7 @@ mod tests {
         // that printed a warning on every command would train operators to skip
         // the line that matters.
         let mut quiet = Vec::new();
-        write_app_override_warning(&mut quiet, None, None);
+        write_app_override_warning(&mut quiet, None, None, false);
         assert!(
             quiet.is_empty(),
             "a build with no override must say nothing: {:?}",
