@@ -43,15 +43,19 @@ runner-manager auth status
 runner-manager auth logout
 runner-manager host set-capacity N
 runner-manager host show
-runner-manager repo add OWNER/REPO --host-label HOST [--max-capacity N]
+runner-manager repo add OWNER/REPO --host-label HOST [--max-capacity N] [--label LABEL]...
 runner-manager repo list
 runner-manager repo set-capacity OWNER/REPO --max-capacity N
 runner-manager repo set-scale OWNER/REPO --enabled true
+runner-manager repo add-label OWNER/REPO --label LABEL...
+runner-manager repo remove-label OWNER/REPO --label LABEL...
 runner-manager repo remove OWNER/REPO [--purge]
-runner-manager org add ORG --host-label HOST [--max-capacity N]
+runner-manager org add ORG --host-label HOST [--max-capacity N] [--label LABEL]...
 runner-manager org list
 runner-manager org set-capacity ORG --max-capacity N
 runner-manager org set-scale ORG --enabled true
+runner-manager org add-label ORG --label LABEL...
+runner-manager org remove-label ORG --label LABEL...
 runner-manager org remove ORG [--purge]
 runner-manager daemon run
 runner-manager service install [--start-at boot|login] | uninstall | status

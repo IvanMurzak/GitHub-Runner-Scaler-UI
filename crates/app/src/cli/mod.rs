@@ -503,6 +503,10 @@ pub enum RepoCommand {
     SetCapacity(RepoSetCapacityArgs),
     /// Arm or drain a policy.
     SetScale(RepoSetScaleArgs),
+    /// Answer one more `runs-on` label than the derived host label.
+    AddLabel(RepoLabelArgs),
+    /// Stop answering a label. The derived host label cannot be removed.
+    RemoveLabel(RepoLabelArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(RepoRemoveArgs),
 }
@@ -518,6 +522,22 @@ pub struct RepoAddArgs {
     /// Omit for a monitor-only policy that never starts a runner (D19).
     #[arg(long, value_name = "N")]
     pub max_capacity: Option<u16>,
+    /// An extra `runs-on` label this policy's runners answer, repeatable.
+    ///
+    /// GitHub adds none implicitly: a runner answers `runs-on: self-hosted`
+    /// only if `self-hosted` is among its labels. The derived host label is
+    /// always present and is never replaced by these.
+    #[arg(long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoLabelArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    /// The label to add or remove, repeatable.
+    #[arg(long = "label", value_name = "LABEL", required = true)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -555,6 +575,10 @@ pub enum OrgCommand {
     SetCapacity(OrgSetCapacityArgs),
     /// Arm or drain a policy.
     SetScale(OrgSetScaleArgs),
+    /// Answer one more `runs-on` label than the derived host label.
+    AddLabel(OrgLabelArgs),
+    /// Stop answering a label. The derived host label cannot be removed.
+    RemoveLabel(OrgLabelArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(OrgRemoveArgs),
 }
@@ -567,6 +591,18 @@ pub struct OrgAddArgs {
     pub host_label: String,
     #[arg(long, value_name = "N")]
     pub max_capacity: Option<u16>,
+    /// An extra `runs-on` label this policy's runners answer, repeatable.
+    #[arg(long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgLabelArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+    /// The label to add or remove, repeatable.
+    #[arg(long = "label", value_name = "LABEL", required = true)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Args)]
