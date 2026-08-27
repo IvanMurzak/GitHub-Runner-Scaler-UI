@@ -1,26 +1,30 @@
 // owner: f1-cli-auth-host-status
 
-//! `auth login`, `auth status`, `auth logout` — and the D21 disclosure.
+//! `auth login`, `auth status`, `auth logout`.
 //!
-//! # The disclosure is a requirement with a release gate, not copy
+//! # Where the grant is disclosed, and where it is not
 //!
-//! `07-security.md` converts D21's accepted cost into an obligation:
+//! `Administration: Read and write` is a grant whose consequences a consent
+//! dialog does not explain, so this project states them itself. It used to
+//! state them *here*, as twenty-five lines above the device code, on a screen
+//! whose entire job is to carry one code and one URL. The permission table is
+//! the same for every user and never changes between runs, so after the first
+//! sign-in it was a wall the reader had learned to scroll past — which is the
+//! opposite of a disclosure.
 //!
-//! > "`auth login` prints the same statement before opening the browser"
+//! So the text moved to the two places a reader goes *looking* for it, and
+//! `auth login` carries none of it:
 //!
-//! and lists it under *Security release gates*. The word doing the work is
-//! **before**. A user who reads a permission table only on GitHub's consent
-//! screen has been told by GitHub, not by this tool, which is precisely the
-//! outcome D21 rejected — and `Administration: Read and write` is a grant whose
-//! consequences a consent dialog does not explain.
+//! * `README.md`'s `What you are granting` section, before every install
+//!   command — pinned end to end by `crates/app/tests/readme_disclosure.rs`;
+//! * [`write_permissions`], reachable at any time and without signing in as
+//!   `auth status --permissions`.
 //!
-//! So the ordering here is structural rather than incidental:
-//! [`write_disclosure`] runs, and its output is **flushed**, before
-//! `DeviceFlow::start` issues a single request. That makes the property survive
-//! a failure: a login that dies against an unreachable GitHub has still
-//! disclosed. `the_disclosure_is_complete_before_the_browser_step` measures it
-//! the way `a3` measures the README's copy — as byte offsets, with the *whole*
-//! disclosure required to end before the first thing a reader can act on.
+//! The consequence sentences also still print, unprompted, where the grant is
+//! genuinely news: `repo add`/`org add` on a monitor-only policy, whose reader
+//! may reasonably assume that "this never starts a runner" implies a narrower
+//! permission than it does. That is [`write_grant_consequences`], called from
+//! `policy.rs`.
 //!
 //! # Three actions, counted
 //!
@@ -56,30 +60,13 @@ use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 use secrecy::SecretString;
 
 use super::{
-    AuthCommand, CliError, Context, Failure, NO_OPERATOR_REMEDY, Styling, open_in_browser,
-    write_failed,
+    AuthCommand, AuthStatusArgs, CliError, Context, Failure, NO_OPERATOR_REMEDY, Styling,
+    open_in_browser, write_failed,
 };
 
 // ---------------------------------------------------------------------------
-// The disclosure
+// The grant
 // ---------------------------------------------------------------------------
-
-/// The heading that opens the disclosure section.
-///
-/// Named rather than inlined because two independent things look for it: the
-/// renderer writes it, and the copy tests locate the section by it. A heading
-/// edited in one place and not the other would leave the position test scanning
-/// for a string that is no longer there, which is the failure mode a paired
-/// "was it found at all" assertion exists to catch.
-pub const DISCLOSURE_HEADING: &str = "What you are about to grant";
-
-/// The last sentence of the disclosure section.
-///
-/// The position assertion needs the section's **end**, not its start: a reader
-/// who stops at the first thing they can act on must already have passed all of
-/// it, and a disclosure whose heading is early but whose body is interleaved
-/// with the login prompt would satisfy a start-only check.
-pub const DISCLOSURE_CLOSING: &str = "neither of which needs this project's cooperation.";
 
 /// The grant whose consequences D21 requires this tool to spell out.
 pub const CRITICAL_PERMISSION: &str = "Administration: Read and write";
@@ -111,30 +98,20 @@ const PERMISSIONS: [(&str, &str, &str); 4] = [
     ),
 ];
 
-/// Writes the whole D21 disclosure.
-///
-/// Public because `f2` owes the same statement when `repo add` or `org add`
-/// creates a monitor-only policy — `07-security.md`'s release gate names all
-/// three sites — and two renderings of one required statement is how one of
-/// them ends up saying something slightly different.
-///
-/// # Errors
-/// Whatever `out` fails with.
 /// The consequences of the grant, and nothing else.
 ///
-/// # Why a second, shorter rendering exists
+/// # Why the short rendering is the one that prints unprompted
 ///
-/// `07-security.md` requires the grant to be disclosed at sign-in AND wherever a
-/// monitor-only policy is created, because a reader can reasonably assume that
-/// "this never starts a runner" implies a narrower permission than it does. It
-/// does not require the same twenty-five lines in both places, and printing them
-/// after a one-line `repo add` result buried the two lines the operator actually
-/// needed next — the promotion command among them — under a wall they had
-/// already read during sign-in.
-///
-/// So this is the part that carries the obligation: the permission named, the
+/// A permission table is the same on every run, so repeating it is how a
+/// reader learns to skip it. What a reader who has already signed in does not
+/// necessarily know is what `Administration: Read and write` *also* permits —
+/// so that is what prints where the grant is news: the permission named, the
 /// three verbs it also authorizes, collaborators, and the fact that watching
-/// grants exactly the same set. `policy_commands.rs` asserts each of those
+/// grants exactly the same set.
+///
+/// Called from `policy.rs` when a monitor-only policy is created, whose reader
+/// may reasonably assume that "this never starts a runner" implies a narrower
+/// permission than it does. `policy_commands.rs` asserts each of these
 /// sentences, so shortening this further reds a test rather than quietly
 /// weakening a disclosure.
 ///
@@ -158,11 +135,25 @@ pub fn write_grant_consequences(out: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Writes the whole D21 disclosure.
-pub fn write_disclosure(out: &mut dyn Write) -> io::Result<()> {
-    writeln!(out, "{DISCLOSURE_HEADING}")?;
-    writeln!(out, "{}", "=".repeat(DISCLOSURE_HEADING.len()))?;
-    writeln!(out)?;
+/// The whole permission set, on request.
+///
+/// # This is the disclosure `auth login` no longer prints
+///
+/// The obligation was never that these lines appear on the busiest screen in
+/// the product; it is that this tool, and not only GitHub's consent dialog,
+/// states what the grant permits, and that a reader can get at the statement
+/// without signing in to something first. `README.md` carries it before every
+/// install command, and this carries it for anyone already at a prompt —
+/// `auth status --permissions`, which needs no credential and issues no
+/// request.
+///
+/// Rendered from [`PERMISSIONS`], the same constant the README's table is
+/// checked against, and closed by [`write_grant_consequences`] so that the
+/// table and its consequences cannot be shipped apart.
+///
+/// # Errors
+/// Whatever `out` fails with.
+pub fn write_permissions(out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
         "Signing in installs this project's published GitHub App on the repositories or"
@@ -176,63 +167,29 @@ pub fn write_disclosure(out: &mut dyn Write) -> io::Result<()> {
     for (permission, level, why) in PERMISSIONS {
         writeln!(out, "  {permission:<36}  {level:<15}  {why}")?;
     }
+    write_grant_consequences(out)?;
+    writeln!(
+        out,
+        "A monitor-only target grants the same set: an App grants its whole declared set on"
+    )?;
+    writeln!(
+        out,
+        "installation, and there is no per-installation subset. Organization scope is"
+    )?;
+    writeln!(
+        out,
+        "narrower -- registration there is authorized by `Organization -> Self-hosted"
+    )?;
+    writeln!(
+        out,
+        "runners: Read and write` alone -- and is the safer choice where both work."
+    )?;
     writeln!(out)?;
     writeln!(
         out,
-        "`{CRITICAL_PERMISSION}` is NOT a narrow self-hosted-runner permission."
+        "Revoke by uninstalling the App, or by revoking its authorization, in your GitHub"
     )?;
-    writeln!(
-        out,
-        "The same grant also permits DELETING, RENAMING and TRANSFERRING the repository, and"
-    )?;
-    writeln!(
-        out,
-        "adding and removing collaborators. GitHub publishes no narrower permission that"
-    )?;
-    writeln!(
-        out,
-        "authorizes registering a self-hosted runner, so it is unavoidable at repository"
-    )?;
-    writeln!(out, "scope.")?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "It binds you even if you only ever watch. A target added with no capacity is"
-    )?;
-    writeln!(
-        out,
-        "monitor-only: it never starts a runner and only reports what GitHub is doing. It"
-    )?;
-    writeln!(
-        out,
-        "grants exactly the same permissions. A GitHub App grants its whole declared set on"
-    )?;
-    writeln!(
-        out,
-        "installation; there is no per-installation subset and no read-only variant of this"
-    )?;
-    writeln!(out, "App.")?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "Organization scope is materially narrower, and is the safer choice where both are"
-    )?;
-    writeln!(
-        out,
-        "possible: there the registration call is authorized by `Organization -> Self-hosted"
-    )?;
-    writeln!(
-        out,
-        "runners: Read and write` alone, which confers no ability to delete, rename or"
-    )?;
-    writeln!(out, "transfer anything.")?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "You revoke all of it by uninstalling the App, or by revoking the authorization in"
-    )?;
-    writeln!(out, "your GitHub settings -- {DISCLOSURE_CLOSING}")?;
-    writeln!(out)?;
+    writeln!(out, "settings: https://github.com/settings/installations")?;
     Ok(())
 }
 
@@ -290,16 +247,14 @@ fn write_action_two(
     writeln!(out)?;
     writeln!(out, "    {}", styling.code(&format!(" {user_code} ")))?;
     writeln!(out)?;
+    // One sentence, and it keeps the two clauses that are load-bearing: the
+    // code goes nowhere else (the phishing control `07-security.md` names), and
+    // it expires (so a stalled login has an explanation other than a bug).
     writeln!(
         out,
-        "Type it only on that page. This tool never asks for the code anywhere else and"
-    )?;
-    writeln!(
-        out,
-        "never shows a GitHub sign-in form of its own. The code is good for about {} minutes.",
+        "Type it only on that page -- nothing else ever asks for it. Good for about {} minutes.",
         expires_in.as_secs() / 60
     )?;
-    writeln!(out)?;
     writeln!(out, "Waiting for you to approve it...")?;
     Ok(())
 }
@@ -365,8 +320,8 @@ pub fn dispatch(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
-        AuthCommand::Login(a) => login(context, a.start_at.map(Into::into), styling, out),
-        AuthCommand::Status => status(context, styling, out),
+        AuthCommand::Login(a) => login(context, a.start_at.map(Into::into), a.list, styling, out),
+        AuthCommand::Status(a) => status(context, a, styling, out),
         AuthCommand::Logout => logout(context, out),
     }
 }
@@ -390,14 +345,18 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
         StartMode::Boot => "machine-scoped",
         StartMode::Login => "your own",
     };
-    writeln!(
-        out,
-        "Signing in to the {scope} credential store (start mode: {mode})."
-    )?;
+    // Stated as a fact about the store rather than as "signing in to", because
+    // this line is written before the credential is examined and a host that
+    // turns out to be signed in already is not signing in to anything.
+    writeln!(out, "Credential store: {scope} (start mode: {mode}).")?;
     if !chosen {
+        // One line, and it has to fit on one: this is a warning about a
+        // default, printed above the code the operator came here to type. The
+        // paragraph it replaced said the same thing three times and pushed the
+        // code down the screen to do it.
         writeln!(
             out,
-            "warning: this host records no start mode, so `{mode}` was assumed. A service              installed with `--start-at login` reads a different store and would not see this              credential. Pass `auth login --start-at login` if that is where you are heading."
+            "warning: no start mode is recorded; `{mode}` assumed. Pass `--start-at login` for a login-start service."
         )?;
     }
     Ok(())
@@ -451,24 +410,30 @@ impl CredentialRenewal for StoringRenewal {
 pub fn login(
     context: &Context,
     requested_mode: Option<StartMode>,
+    list: bool,
     styling: Styling,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let failed = write_failed("this sign-in");
 
-    // ---- the disclosure, before any request is issued --------------------
+    // ------------------------------------------------------------------------
+    // NO PERMISSION TABLE HERE. IT IS NOT A CUT, IT IS A MOVE.
+    // ------------------------------------------------------------------------
+    // This command used to open with twenty-five lines naming the App's four
+    // permissions and what `Administration: Read and write` also authorizes.
+    // The table is identical on every run and identical for every user, so
+    // after the first sign-in it was something to scroll past to reach the
+    // code -- and a disclosure a reader has been trained to skip is not one.
     //
-    // This ordering is the D21 obligation, and the flush is part of it: a login
-    // that then fails to reach GitHub must still have disclosed, and buffered
-    // output that dies with the process has disclosed nothing.
-    write_disclosure(out).map_err(failed)?;
-    out.flush().map_err(failed)?;
-
+    // The statement still exists, in the two places somebody looking for it
+    // would actually look: `README.md`'s `What you are granting` section,
+    // ahead of every install command, and `auth status --permissions`, which
+    // needs neither a credential nor a network request. `repo add` still
+    // prints the consequence sentences unprompted for a monitor-only policy,
+    // which is the one case where the grant genuinely surprises.
     let app = context.app_registration()?;
     let flow = DeviceFlow::new(app.clone(), context.endpoints().clone())
         .map_err(|source| device_flow_failure(&source))?;
-
-    write_action_one(out, styling).map_err(failed)?;
 
     let runtime = super::runtime()?;
     let store = context.store()?;
@@ -522,15 +487,16 @@ pub fn login(
     // the device flow to be replaced, and an unreachable GitHub is not evidence
     // of anything, so both fall through.
     if let CredentialState::Authenticated(discovery) = credential_state(context, &secrets)? {
-        writeln!(out).map_err(failed)?;
-        writeln!(
-            out,
-            "This host is already signed in, so no new code is needed."
-        )
-        .map_err(failed)?;
-        write_discovery(out, styling, &discovery, true).map_err(failed)?;
+        writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
+        write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
         return Ok(());
     }
+
+    // Counted only once the sign-in is actually going to happen. A host that
+    // short-circuits above prints no `Action 1 of 3`, because actions 2 and 3
+    // are not coming and a budget with two thirds of it missing reads as a
+    // transcript that was cut off.
+    write_action_one(out, styling).map_err(failed)?;
 
     let authorization = runtime
         .block_on(flow.start())
@@ -567,7 +533,7 @@ pub fn login(
         .block_on(client.discover_installations(&app))
         .map_err(|source| github_failure(&source))?;
 
-    write_discovery(out, styling, &discovery, true).map_err(failed)?;
+    write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
     Ok(())
 }
 
@@ -727,8 +693,22 @@ pub fn credential_state(
 /// # Errors
 /// The state's own [`CredentialState::failure`], plus store and registration
 /// failures.
-pub fn status(context: &Context, styling: Styling, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn status(
+    context: &Context,
+    args: &AuthStatusArgs,
+    styling: Styling,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let failed = write_failed("this credential's status");
+
+    // `--permissions` describes the App, not this host's credential, so it is
+    // answered before anything is loaded: an operator deciding whether to sign
+    // in at all can read the grant on a machine that never has.
+    if args.permissions {
+        write_permissions(out).map_err(failed)?;
+        writeln!(out).map_err(failed)?;
+    }
+
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
     let secrets = context.secret_store(start_mode)?;
@@ -736,7 +716,7 @@ pub fn status(context: &Context, styling: Styling, out: &mut dyn Write) -> Resul
 
     writeln!(out, "Credential: {}", state.as_str()).map_err(failed)?;
     writeln!(out, "Store:      {}", secrets.location()).map_err(failed)?;
-    write_state_explanation(out, styling, &state).map_err(failed)?;
+    write_state_explanation(out, styling, &state, args.list).map_err(failed)?;
 
     match state.failure() {
         None => Ok(()),
@@ -753,10 +733,14 @@ fn write_state_explanation(
     out: &mut dyn Write,
     styling: Styling,
     state: &CredentialState,
+    list: bool,
 ) -> io::Result<()> {
-    writeln!(out)?;
+    // The blank line belongs to each arm rather than to the match, because
+    // `write_discovery` opens with one of its own and two in a row read as a
+    // section break that is not there.
     match state {
         CredentialState::NotAuthenticated => {
+            writeln!(out)?;
             writeln!(
                 out,
                 "There is no GitHub credential on this host. Nothing has been revoked and"
@@ -767,9 +751,10 @@ fn write_state_explanation(
             )?;
         }
         CredentialState::Authenticated(discovery) => {
-            write_discovery(out, styling, discovery, false)?;
+            write_discovery(out, styling, discovery, false, list)?;
         }
         CredentialState::Revoked => {
+            writeln!(out)?;
             writeln!(
                 out,
                 "GitHub no longer accepts the stored credential. That happens when the App is"
@@ -781,6 +766,7 @@ fn write_state_explanation(
             writeln!(out, "can undo: obtain a fresh token.")?;
         }
         CredentialState::LockedOut { retry_after_secs } => {
+            writeln!(out)?;
             writeln!(
                 out,
                 "GitHub has temporarily locked out authentication for this credential. There is"
@@ -795,6 +781,7 @@ fn write_state_explanation(
             )?;
         }
         CredentialState::Unreachable { detail } => {
+            writeln!(out)?;
             writeln!(
                 out,
                 "GitHub could not be reached, so nothing was learned about the stored"
@@ -808,18 +795,32 @@ fn write_state_explanation(
 /// Renders what a credential reaches.
 ///
 /// `07-security.md`: *"`auth status` shows which repositories the token can
-/// reach, so an over-broad installation is visible rather than assumed."* Two
-/// things carry that sentence, and neither is optional:
+/// reach, so an over-broad installation is visible rather than assumed."*
 ///
-/// * every reachable repository is listed **by name**, not counted;
-/// * an installation holding `repository_selection: all` is called out,
-///   because it also reaches repositories created on that account *later*,
-///   which no list of today's names can show.
+/// # The roll call is `--list`; the answer is not
+///
+/// An installation on an active account reaches hundreds of repositories, and
+/// one set to `all` reaches every repository created on it from now on. Printing
+/// every name by default cost several screens to say something the count and
+/// the over-broad warning say in three lines -- and it pushed those three lines
+/// off the top of the terminal, so the output that existed to make an
+/// over-broad installation *visible* was the output hiding it.
+///
+/// So what is unconditional is what answers the question:
+///
+/// * the count of reachable repositories and organizations;
+/// * every installation, by account, with its selection;
+/// * the `all`-selection warning, which no list of today's names can carry.
+///
+/// `list` adds the names underneath each installation. Nothing is dropped from
+/// the default output except the roll call itself, and the line that says how to
+/// get it is printed where the roll call used to be.
 fn write_discovery(
     out: &mut dyn Write,
     styling: Styling,
     discovery: &InstallationDiscovery,
     onboarding: bool,
+    list: bool,
 ) -> io::Result<()> {
     match discovery {
         InstallationDiscovery::NotInstalled { install_url } => {
@@ -865,7 +866,7 @@ fn write_discovery(
             )?;
             writeln!(out)?;
             for installation in targets.installations() {
-                write_installation(out, installation)?;
+                write_installation(out, installation, list)?;
             }
             if targets.skipped() > 0 {
                 writeln!(out)?;
@@ -881,16 +882,22 @@ fn write_discovery(
                 writeln!(out)?;
                 writeln!(
                     out,
-                    "  {} installation(s) above are set to ALL repositories on the account.",
+                    "  warning: {} installation(s) above reach ALL repositories on the account,",
                     over_broad.len()
                 )?;
                 writeln!(
                     out,
-                    "  That includes repositories created later, which no list above can show."
+                    "  including ones created later. Narrow it on GitHub to pick individual ones."
                 )?;
+            }
+            // Last, deliberately. This is the least urgent line in the block
+            // and the warning above it is the most, so the hint does not sit
+            // between an operator and the sentence they need to read.
+            if !list && !repositories.is_empty() {
+                writeln!(out)?;
                 writeln!(
                     out,
-                    "  Narrow it on GitHub if you meant to pick individual repositories."
+                    "  Add --list to name every repository the installations above reach."
                 )?;
             }
         }
@@ -898,20 +905,33 @@ fn write_discovery(
     Ok(())
 }
 
-fn write_installation(out: &mut dyn Write, installation: &Installation) -> io::Result<()> {
+/// One installation, and its repositories only when they were asked for.
+///
+/// The count comes along on the installation's own line either way, so the
+/// default output still distinguishes an installation reaching two
+/// repositories from one reaching two hundred -- which is the difference a
+/// reader is scanning for, and the reason the roll call can be optional at all.
+fn write_installation(
+    out: &mut dyn Write,
+    installation: &Installation,
+    list: bool,
+) -> io::Result<()> {
     let selection = match installation.repository_selection {
         RepositorySelection::All => "ALL repositories",
         RepositorySelection::Selected => "selected repositories",
     };
     writeln!(
         out,
-        "  {} ({}, installation {}, {selection})",
+        "  {} ({}, installation {}, {selection}, {} reachable)",
         installation.account,
         installation.account.kind(),
         installation.id,
+        installation.repositories.len(),
     )?;
-    for repository in &installation.repositories {
-        writeln!(out, "      {repository}")?;
+    if list {
+        for repository in &installation.repositories {
+            writeln!(out, "      {repository}")?;
+        }
     }
     Ok(())
 }
@@ -1261,24 +1281,18 @@ mod tests {
     /// ## This is a copy-ordering test, not a product-ordering test
     ///
     /// Read that sentence before trusting anything below it. The order here is
-    /// **hardcoded in this function**, so moving `write_disclosure` below
-    /// `write_login_prompt` inside `login` changes no byte of this transcript
-    /// and fails nothing in this module. `crates/app` is a `[[bin]]` with no
-    /// `[lib]` target and `DeviceAuthorization` has no public constructor, so
-    /// there is no way to drive the real `login` from a unit test.
+    /// **hardcoded in this function**, so reordering the writers inside `login`
+    /// changes no byte of this transcript and fails nothing in this module.
+    /// `crates/app` is a `[[bin]]` with no `[lib]` target and
+    /// `DeviceAuthorization` has no public constructor, so there is no way to
+    /// drive the real `login` from a unit test.
     ///
-    /// What these tests do measure is worth having and is all they claim: that
-    /// the copy says what D21 requires, and that the offset comparison
-    /// discriminates (`the_position_check_can_fail`).
-    ///
-    /// **The control for product ordering is
-    /// `crates/app/tests/auth_onboarding.rs`** — real binary, real stdout, byte
-    /// offsets, plus a case that kills the first HTTP request and requires the
-    /// full disclosure with no `Action 2 of` present. Those are what caught the
-    /// sabotage; these would have passed it.
+    /// **The control for product output is
+    /// `crates/app/tests/auth_onboarding.rs`** — real binary, real stdout,
+    /// which is where the budget and the absence of the permission table are
+    /// measured against what the command actually prints.
     fn transcript() -> String {
         text(|out| {
-            write_disclosure(out)?;
             write_action_one(out, Styling::plain())?;
             write_action_two(
                 out,
@@ -1296,103 +1310,86 @@ mod tests {
         })
     }
 
-    // -- the disclosure ----------------------------------------------------
+    // -- the grant -------------------------------------------------------
 
-    /// The D21 gate, measured as `a3` measures the README's: the **whole**
-    /// disclosure section must end before the first thing a reader can act on.
+    /// The login screen carries no permission table.
     ///
-    /// Every scan is paired with a "was it found at all" assertion, because an
-    /// absence read out of a transcript this test failed to produce is not
-    /// evidence of anything.
+    /// Asserted as an absence, and absences are only worth asserting when the
+    /// thing looked for demonstrably exists somewhere: every needle below is
+    /// checked to be present in [`write_permissions`] first, so a renamed
+    /// permission cannot turn this into a test that scans a transcript for
+    /// strings no renderer produces any more.
     #[test]
-    fn the_disclosure_is_complete_before_the_browser_step() {
+    fn the_login_screen_carries_no_permission_table() {
         let transcript = transcript();
+        let permissions = text(write_permissions);
 
-        let heading = transcript.find(DISCLOSURE_HEADING).expect(
-            "the transcript must carry the disclosure heading; without it every offset \
-             below is measured against nothing",
-        );
-        let closing = transcript.find(DISCLOSURE_CLOSING).expect(
-            "the transcript must carry the disclosure's closing sentence, which is what \
-             marks the END of the section rather than its start",
-        );
-        let browser_step = transcript
-            .find("Action 2 of")
-            .expect("the transcript must carry the browser step it is being compared against");
-        let verification_url = transcript
-            .find("github.com/login/device")
-            .expect("the browser step must carry the canonical verification URL");
-
-        assert!(
-            heading < closing,
-            "the closing sentence must follow the heading, or the section is not being \
-             measured end to end"
-        );
-        assert!(
-            closing < browser_step,
-            "the whole disclosure must end before the browser step begins. A reader who \
-             stops at the first thing they can act on has to have passed all of it -- that \
-             is what `07-security.md`'s word 'before' means, and moving this block below \
-             the code would look like a tidier layout in the diff."
-        );
-        assert!(
-            closing < verification_url,
-            "the disclosure must also precede the URL itself, not merely the label above it"
-        );
+        let mut needles = vec![CRITICAL_PERMISSION, "DELETING", "monitor-only"];
+        for (permission, _, _) in PERMISSIONS {
+            needles.push(permission);
+        }
+        for needle in needles {
+            assert!(
+                permissions.contains(needle),
+                "`{needle}` must be somewhere a reader can reach it, or the assertion below                  passes because nothing renders it at all rather than because `login`                  stopped rendering it"
+            );
+            assert!(
+                !transcript.contains(needle),
+                "`auth login` must not print `{needle}`. The table is identical on every run,                  and it sat above the one code the operator came for:
+{transcript}"
+            );
+        }
     }
 
-    /// Proves the offsets above can be violated. Without it, a renderer that
-    /// emitted the disclosure *after* the code would still satisfy a test that
-    /// only looks for substrings.
+    /// The grant is not gone, only moved: `auth status --permissions` says
+    /// everything the login screen used to, and says it without a credential.
     #[test]
-    fn the_position_check_can_fail() {
-        let inverted = format!(
-            "Action 2 of 3: open https://github.com/login/device ...\n{}",
-            text(write_disclosure)
-        );
-        let closing = inverted
-            .find(DISCLOSURE_CLOSING)
-            .expect("the disclosure is still present, only in the wrong place");
-        let browser_step = inverted.find("Action 2 of").expect("present");
+    fn the_permission_report_states_what_the_administration_grant_actually_permits() {
+        let permissions = text(write_permissions);
         assert!(
-            closing > browser_step,
-            "an inverted transcript must fail the ordering the real one passes, or the \
-             ordering assertion proves nothing"
-        );
-    }
-
-    /// The section is not merely present: it says the specific thing D21 says a
-    /// consent screen will not.
-    #[test]
-    fn the_disclosure_states_what_the_administration_grant_actually_permits() {
-        let disclosure = text(write_disclosure);
-        assert!(
-            disclosure.contains(CRITICAL_PERMISSION),
+            permissions.contains(CRITICAL_PERMISSION),
             "the exact grant must be named"
         );
         for consequence in ["DELETING", "RENAMING", "TRANSFERRING"] {
             assert!(
-                disclosure.contains(consequence),
-                "{consequence} is one of the three consequences `07-security.md` names for \
-                 `{CRITICAL_PERMISSION}`; a table of permission names without them is the \
-                 disclosure GitHub's own consent screen already gives"
+                permissions.contains(consequence),
+                "{consequence} is one of the three consequences `07-security.md` names for                  `{CRITICAL_PERMISSION}`; a table of permission names without them is the                  disclosure GitHub's own consent screen already gives"
             );
         }
         assert!(
-            disclosure.contains("monitor-only"),
-            "D21's accepted cost is that this binds a dashboard-only user too, who is the \
-             user least likely to expect a write grant"
+            permissions.contains("monitor-only"),
+            "D21's accepted cost is that this binds a dashboard-only user too, who is the              user least likely to expect a write grant"
         );
         assert!(
-            disclosure.contains("Organization scope is materially narrower"),
+            permissions.contains("Organization scope is"),
             "`07-security.md` requires the safer scope to be recommended where both work"
+        );
+        assert!(
+            permissions.contains("Revoke"),
+            "and the reader must be told the grant is theirs to withdraw"
         );
         for (permission, level, _) in PERMISSIONS {
             assert!(
-                disclosure.contains(permission),
+                permissions.contains(permission),
                 "the permission table must list {permission}"
             );
-            assert!(disclosure.contains(level));
+            assert!(permissions.contains(level));
+        }
+    }
+
+    /// The three sentences `repo add` prints unprompted are a subset of the
+    /// full report, so the two renderings of one obligation cannot drift into
+    /// saying different things.
+    #[test]
+    fn the_permission_report_contains_the_consequence_sentences_verbatim() {
+        let consequences = text(write_grant_consequences);
+        let permissions = text(write_permissions);
+        for sentence in consequences.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                permissions.contains(sentence),
+                "`write_permissions` must carry `write_grant_consequences` verbatim, or the                  monitor-only warning and the full report are two disclosures that can                  disagree. Missing:
+{sentence}"
+            );
         }
     }
 
@@ -1558,7 +1555,7 @@ mod tests {
         ];
         let mut seen = std::collections::BTreeSet::new();
         for state in &states {
-            let rendered = text(|out| write_state_explanation(out, Styling::plain(), state));
+            let rendered = text(|out| write_state_explanation(out, Styling::plain(), state, false));
             assert!(
                 seen.insert(rendered.clone()),
                 "{} renders the same explanation as an earlier state",
@@ -1573,6 +1570,7 @@ mod tests {
                 &CredentialState::Unreachable {
                     detail: "GitHub was unreachable".to_string(),
                 },
+                false,
             )
         });
         assert!(
@@ -1595,7 +1593,7 @@ mod tests {
         );
         assert!(remedy.contains("wait"), "got: {remedy}");
 
-        let explanation = text(|out| write_state_explanation(out, Styling::plain(), &state));
+        let explanation = text(|out| write_state_explanation(out, Styling::plain(), &state, false));
         assert!(
             explanation.contains("nothing wrong with the token itself"),
             "got: {explanation}"

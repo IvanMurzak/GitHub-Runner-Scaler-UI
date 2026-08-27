@@ -476,7 +476,7 @@ pub enum AuthCommand {
     /// Sign in with GitHub's device flow.
     Login(AuthLoginArgs),
     /// Report the credential's state and what it can reach.
-    Status,
+    Status(AuthStatusArgs),
     /// Purge the local credential.
     Logout,
 }
@@ -492,6 +492,26 @@ pub struct AuthLoginArgs {
     /// service cannot see. Defaults to the mode this host already records.
     #[arg(long, value_name = "WHEN")]
     pub start_at: Option<StartAt>,
+
+    /// Name every repository the credential reaches, instead of counting them.
+    #[arg(long)]
+    pub list: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthStatusArgs {
+    /// Name every repository the credential reaches, instead of counting them.
+    ///
+    /// An installation on a large account reaches hundreds, and printing them
+    /// on every run buries the four lines that answer the question asked. The
+    /// count and the over-broad warning are unconditional; the roll call is
+    /// what this flag adds.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Print the permission set the App declares, and what it permits.
+    #[arg(long)]
+    pub permissions: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1184,7 +1204,7 @@ fn is_decorated_report(command: &Command) -> bool {
         Command::Host(_) | Command::Service(_) | Command::Repo(_) | Command::Org(_) => true,
         // `auth status` and `auth logout` are reports; `auth login` is a
         // conversation with a person and streams.
-        Command::Auth(AuthCommand::Status | AuthCommand::Logout) => true,
+        Command::Auth(AuthCommand::Status(_) | AuthCommand::Logout) => true,
         _ => false,
     }
 }
@@ -1717,8 +1737,16 @@ mod tests {
         let run_one = |command: &str| -> CliError {
             let out: &mut dyn Write = &mut BrokenPipe;
             let outcome = match command {
-                "auth login" => auth::login(&context, None, Styling::plain(), out),
-                "auth status" => auth::status(&context, Styling::plain(), out),
+                "auth login" => auth::login(&context, None, false, Styling::plain(), out),
+                "auth status" => auth::status(
+                    &context,
+                    &AuthStatusArgs {
+                        list: false,
+                        permissions: false,
+                    },
+                    Styling::plain(),
+                    out,
+                ),
                 "auth logout" => auth::logout(&context, out),
                 "host set-capacity" => {
                     host::set_capacity(&context, &HostSetCapacityArgs { capacity: 1 }, out)

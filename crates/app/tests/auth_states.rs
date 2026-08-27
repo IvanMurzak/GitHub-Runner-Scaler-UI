@@ -74,25 +74,32 @@ fn a_machine_with_no_credential_reports_not_authenticated() {
     );
 }
 
-#[test]
-fn an_accepted_credential_reports_what_it_can_reach() {
-    let data_dir = tempfile::tempdir().expect("a temporary directory");
-    let github = FakeGithub::start();
-    signed_in(data_dir.path(), &github);
+/// A fixture with one installation reaching two named repositories, and a
+/// credential already stored for it.
+fn signed_in_with_two_repositories(data_dir: &std::path::Path) -> FakeGithub {
+    let login = FakeGithub::start();
+    signed_in(data_dir, &login);
 
-    // Re-route discovery to a real installation for the status call.
-    let github2 = FakeGithub::start();
-    github2.with_installation(
+    // The credential lives in the data directory, not in the fixture, so a
+    // second fixture is simply a different GitHub for the same host.
+    let github = FakeGithub::start();
+    github.with_installation(
         42,
         "operator",
         "User",
         "selected",
         &["operator/one", "operator/two"],
     );
-    // The credential lives in the data directory, not in the fixture, so a
-    // second fixture is simply a different GitHub for the same host.
+    github
+}
+
+#[test]
+fn an_accepted_credential_reports_what_it_can_reach() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = signed_in_with_two_repositories(data_dir.path());
+
     let outcome = run({
-        let mut command = runner_manager_against(data_dir.path(), &github2);
+        let mut command = runner_manager_against(data_dir.path(), &github);
         command.args(["auth", "status"]);
         command
     });
@@ -103,15 +110,6 @@ fn an_accepted_credential_reports_what_it_can_reach() {
         "{}",
         outcome.stdout
     );
-    for repository in ["operator/one", "operator/two"] {
-        assert!(
-            outcome.stdout.contains(repository),
-            "`07-security.md` requires the reachable repositories to be listed by name, so \
-             that an over-broad installation is visible rather than assumed. Missing \
-             {repository} in:\n{}",
-            outcome.stdout
-        );
-    }
     assert!(
         outcome
             .stdout
@@ -120,8 +118,162 @@ fn an_accepted_credential_reports_what_it_can_reach() {
         outcome.stdout
     );
     assert!(
+        outcome.stdout.contains("operator (user, installation 42"),
+        "every installation is named unconditionally -- it is the account whose grant this \
+         is, and there are few of them:\n{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("2 reachable"),
+        "and each installation carries its own count, so the default output still \
+         distinguishes two repositories from two hundred:\n{}",
+        outcome.stdout
+    );
+    assert!(
         !outcome.stdout.contains("ALL repositories"),
         "a `selected` installation must not be labelled over-broad:\n{}",
+        outcome.stdout
+    );
+}
+
+/// The roll call is `--list`, and the default output says so.
+///
+/// An installation on an active account reaches hundreds of repositories.
+/// Printing them all by default pushed the count and the over-broad warning off
+/// the top of the terminal, so the output that existed to make an over-broad
+/// installation visible was the output hiding it.
+#[test]
+fn the_repository_names_are_behind_list_and_the_default_says_where_they_are() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = signed_in_with_two_repositories(data_dir.path());
+
+    let quiet = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status"]);
+        command
+    });
+    assert_eq!(quiet.code, 0, "stderr: {}", quiet.stderr);
+    for repository in ["operator/one", "operator/two"] {
+        assert!(
+            !quiet.stdout.contains(repository),
+            "{repository} must not be named without --list:\n{}",
+            quiet.stdout
+        );
+    }
+    assert!(
+        quiet.stdout.contains("--list"),
+        "a reader who wants the names must be told the flag that prints them, or the \
+         information is not behind a flag, it is gone:\n{}",
+        quiet.stdout
+    );
+
+    let listed = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status", "--list"]);
+        command
+    });
+    assert_eq!(listed.code, 0, "stderr: {}", listed.stderr);
+    for repository in ["operator/one", "operator/two"] {
+        assert!(
+            listed.stdout.contains(repository),
+            "`07-security.md` requires the reachable repositories to be nameable, so that an \
+             over-broad installation is visible rather than assumed. Missing {repository} \
+             in:\n{}",
+            listed.stdout
+        );
+    }
+}
+
+/// The disclosure `auth login` no longer prints, and the command that does.
+///
+/// The counterpart of
+/// `auth_onboarding.rs::the_login_screen_carries_no_permission_table`: that one
+/// asserts the text is absent from the login screen, this one asserts it still
+/// exists. Either alone would pass for a build that deleted the grant text
+/// altogether.
+#[test]
+fn the_permission_report_carries_the_whole_grant() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = FakeGithub::start();
+
+    let outcome = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status", "--permissions"]);
+        command
+    });
+
+    for needle in [
+        "Administration: Read and write",
+        "DELETING",
+        "RENAMING",
+        "TRANSFERRING",
+        "collaborators",
+        "Repository -> Metadata",
+        "Organization -> Self-hosted runners",
+        "monitor-only",
+    ] {
+        assert!(
+            outcome.stdout.contains(needle),
+            "`auth status --permissions` is where the grant text lives now, and it must \
+             carry `{needle}`:\n{}",
+            outcome.stdout
+        );
+    }
+    assert!(
+        github.seen().is_empty(),
+        "the permission set is a property of the published App, not of this host, so \
+         describing it must cost no request: {:?}",
+        github.seen()
+    );
+}
+
+/// And it is readable on a machine that has never signed in -- which is the
+/// only time somebody is still deciding whether to grant it.
+#[test]
+fn the_permission_report_needs_no_credential() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = FakeGithub::start();
+
+    let outcome = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status", "--permissions"]);
+        command
+    });
+
+    assert_eq!(
+        outcome.code, 3,
+        "the exit code still reports the credential, which is absent here; stdout:\n{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("Administration: Read and write"),
+        "an operator deciding whether to sign in at all must be able to read the grant \
+         first:\n{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("Credential: not_authenticated"),
+        "and the credential answer is still given:\n{}",
+        outcome.stdout
+    );
+}
+
+/// Without the flag, `auth status` says nothing about permissions. The report
+/// is on request precisely so that it is not on every run.
+#[test]
+fn the_permission_table_is_absent_without_the_flag() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = signed_in_with_two_repositories(data_dir.path());
+
+    let outcome = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status"]);
+        command
+    });
+
+    assert!(
+        !outcome.stdout.contains("Administration: Read and write"),
+        "the permission table is `--permissions`, not the default:\n{}",
         outcome.stdout
     );
 }

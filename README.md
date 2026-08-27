@@ -59,7 +59,7 @@ Organizations use the same commands with `org` in place of `repo`.
 
 | Command | What it does |
 |---|---|
-| `auth login`, `auth status`, `auth logout` | Sign in with GitHub's device flow, check the stored credential against GitHub, purge it. |
+| `auth login`, `auth status`, `auth logout` | Sign in with GitHub's device flow, check the stored credential against GitHub, purge it. `auth status --list` names every repository the credential reaches; `auth status --permissions` reprints the grant below. |
 | `host show`, `host set-capacity N` | This machine's runner ceiling, secret store, and projected REST budget. |
 | `repo add`, `repo list`, `repo set-capacity`, `repo set-scale`, `repo remove` | Repository-scoped policies. |
 | `org add`, `org list`, `org set-capacity`, `org set-scale`, `org remove` | The same, organization-scoped. |
@@ -97,6 +97,9 @@ permission set for every user:
   and write` ([verified](docs/spikes/d18-org-jit-verification.md)).
 - Revoke any time in GitHub settings; `runner-manager auth logout` purges the local copy.
   The project generates no private key, and the App declares no webhook URL.
+
+`runner-manager auth status --permissions` prints this same table at a prompt. It needs no
+credential and makes no request, so it can be read before deciding to sign in at all.
 
 ## Install
 
