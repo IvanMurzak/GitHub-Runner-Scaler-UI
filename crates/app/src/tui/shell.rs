@@ -43,6 +43,7 @@ use super::screens::{
     RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
 };
 use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
+use super::table::Skin;
 
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
@@ -905,6 +906,9 @@ pub struct AppState {
     pub ticks: u64,
     pub last_tick: Option<Instant>,
     pub settings: SettingsUi,
+    /// Glyphs and colour, resolved once here so no frame has to ask the
+    /// environment what the terminal can print.
+    pub skin: Skin,
     navigation: NavigationLayout,
 }
 
@@ -925,6 +929,7 @@ impl AppState {
             ticks: 0,
             last_tick: None,
             settings: SettingsUi::default(),
+            skin: Skin::detect(),
             navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
         }
     }
@@ -1229,7 +1234,7 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             } else {
                 state.focus = Focus::Content;
                 if state.screen == Screen::Repositories {
-                    let content_first_row = 6;
+                    let content_first_row = screens::REPOSITORY_ROW_ORIGIN;
                     if mouse.row >= content_first_row
                         && let Some(id) =
                             state
@@ -1321,7 +1326,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     } else if let Some(read_only) = read_only_screen(state.screen) {
         let mut model = state.screen_model.clone();
         model.apply(ScreenAction::Open(read_only));
-        screens::render(frame, rows[2], &model);
+        screens::render(frame, rows[2], &model, &state.skin);
     } else {
         let content = if compact {
             let filter = if state.filtering {
@@ -2570,7 +2575,11 @@ mod tests {
         reduce(&mut mouse_state, key(KeyCode::Char('r')));
         reduce(
             &mut mouse_state,
-            mouse(MouseEventKind::Down(MouseButton::Left), 10, 6),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                screens::REPOSITORY_ROW_ORIGIN,
+            ),
         );
         let mouse_detail = rendered(120, 30, &mouse_state);
         assert!(mouse_detail.contains("REPOSITORY DETAIL"), "{mouse_detail}");

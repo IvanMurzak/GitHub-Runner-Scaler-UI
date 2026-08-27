@@ -1,11 +1,12 @@
 // owner: g1-tui-shell-input
 //
-// g1 owns this module list, `run`, and `shell`; g2 owns `screens`; g3 owns
-// `settings`.
+// g1 owns this module list, `run`, and `shell`; g2 owns `screens` and the
+// `table` grid it draws with; g3 owns `settings`.
 
 pub mod screens;
 pub mod settings;
 pub mod shell;
+pub mod table;
 
 use std::process::ExitCode;
 use std::sync::Arc;

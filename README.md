@@ -76,6 +76,13 @@ Failures name the command that fixes them and exit with a distinct code per fail
 `d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
 `h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
 
+Tables are drawn with box-drawing glyphs and colour, and every distinction they draw is
+also spelled out in words, so nothing is lost without either. `NO_COLOR` removes the
+colour, `TERM=dumb` removes colour and glyphs both, and `RUNNER_MANAGER_TUI_ASCII=1` keeps
+the colour while drawing the frames in ASCII — for a Windows console still on a legacy code
+page. `RUNNER_MANAGER_TUI_LIGHT=1` shades alternate rows for a light colour scheme and
+`RUNNER_MANAGER_TUI_PLAIN_ROWS=1` leaves them unshaded.
+
 ## What you are granting
 
 Signing in installs a GitHub App on the repositories or organizations you pick, with one

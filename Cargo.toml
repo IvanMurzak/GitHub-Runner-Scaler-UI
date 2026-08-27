@@ -150,6 +150,10 @@ secrecy = "0.10.3"
 # alone enables neither (`03-control-flows.md`, flow 6.1).
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"] }
+# The TUI grid measures every cell in terminal COLUMNS, not bytes or chars: a
+# repository or runner name may be wide or combining, and a column that is one
+# cell too wide is exactly the ragged table this dependency exists to prevent.
+unicode-width = "0.2.2"
 
 # --- Command line -----------------------------------------------------------
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
