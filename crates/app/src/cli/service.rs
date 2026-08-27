@@ -4,6 +4,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::PathBuf;
 
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::{Store, StoreError};
@@ -52,6 +53,36 @@ fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
     arguments
 }
 
+/// Copies the running executable to a path this product owns, and answers where.
+///
+/// # Why the copy is replaced rather than reused
+///
+/// `service install` is also how an operator moves to a new version by hand, so
+/// a stale copy left in place would silently keep the old daemon. The previous
+/// copy is renamed aside first rather than deleted: on Windows the file cannot
+/// be removed while a service still runs it, but it *can* be renamed, which is
+/// what makes reinstalling over a running service work at all.
+fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<PathBuf, CliError> {
+    fn failed(what: &'static str) -> impl Fn(std::io::Error) -> CliError {
+        move |source| CliError::new(Failure::LocalState, format!("cannot {what}: {source}"))
+    }
+    let bin_dir = context.paths().state_dir().join("bin");
+    std::fs::create_dir_all(&bin_dir).map_err(failed("create the service binary directory"))?;
+    let owned = bin_dir.join(
+        source
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("runner-manager")),
+    );
+    if owned.exists() {
+        let aside = owned.with_extension("old");
+        let _ = std::fs::remove_file(&aside);
+        std::fs::rename(&owned, &aside)
+            .map_err(failed("move the previous service binary aside"))?;
+    }
+    std::fs::copy(source, &owned).map_err(failed("copy the binary the service will run"))?;
+    Ok(owned)
+}
+
 pub fn install(
     context: &Context,
     args: &ServiceInstallArgs,
@@ -78,7 +109,33 @@ pub fn install(
             "runner-manager --data-dir <ABSOLUTE-DIR> service install",
         ));
     }
-    let request = InstallRequest::new(mode).with_arguments(daemon_arguments(context, mode));
+    // ------------------------------------------------------------------
+    // THE SERVICE RUNS A COPY, NOT THE FILE A PACKAGE MANAGER OWNS.
+    // ------------------------------------------------------------------
+    // Registering `current_exe` directly is the obvious thing and it makes the
+    // service impossible to upgrade on Windows: the running service holds that
+    // file open, `npm i -g` cannot replace it, and what npm does instead is
+    // worse than failing. It rewrites the package metadata, reports success,
+    // and leaves the old executable in place -- so `npm ls -g` says the new
+    // version is installed, `runner-manager --version` says the old one, and
+    // the daemon goes on running code the operator believes they replaced.
+    // That was observed on a real host, twice in a row, before this existed.
+    //
+    // A copy the product owns has neither problem: the package manager's file
+    // is never locked, so an upgrade lands, and the daemon can compare itself
+    // against it. `installed_from` keeps the origin, which is what item 6's
+    // stale-path detection needs and what the upgrade watch reads.
+    let source = std::env::current_exe().map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot resolve this executable's own path: {source}"),
+        )
+    })?;
+    let owned = install_owned_copy(context, &source)?;
+    let request = InstallRequest::new(mode)
+        .for_binary(&owned)
+        .copied_from(&source)
+        .with_arguments(daemon_arguments(context, mode));
     let installed = operations.install(&request).map_err(service_failure)?;
 
     if let Err(source) = persist_mode(&store, &mut host, mode)
@@ -217,6 +274,43 @@ mod tests {
 
     use crate::cli::{Cli, Command, DaemonCommand};
     use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
+
+    /// The copy is what makes an upgrade possible at all: a package manager
+    /// cannot replace a file a running service holds open, and on Windows it
+    /// does not even fail loudly -- it rewrites its metadata, reports success,
+    /// and leaves the old executable running.
+    #[test]
+    fn the_service_binary_is_a_copy_this_product_owns_and_reinstalling_replaces_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
+        let source = temporary.path().join("package-manager-owned.bin");
+        std::fs::write(&source, b"first version").unwrap();
+
+        let owned = install_owned_copy(&context, &source).expect("the copy is made");
+        assert!(owned.starts_with(context.paths().state_dir()), "{owned:?}");
+        assert_ne!(owned, source, "the service must not run the source itself");
+        assert_eq!(std::fs::read(&owned).unwrap(), b"first version");
+
+        // A reinstall moves the old copy aside rather than deleting it: on
+        // Windows the file cannot be unlinked while a service is running it,
+        // but it can be renamed, and that is what lets this run at all.
+        std::fs::write(&source, b"second version").unwrap();
+        let again = install_owned_copy(&context, &source).expect("the copy is replaced");
+        assert_eq!(
+            again, owned,
+            "the registered path must not move between installs"
+        );
+        assert_eq!(
+            std::fs::read(&again).unwrap(),
+            b"second version",
+            "a stale copy would silently keep running the old daemon"
+        );
+        assert_eq!(
+            std::fs::read(owned.with_extension("old")).unwrap(),
+            b"first version",
+            "the previous copy is kept aside, not destroyed"
+        );
+    }
 
     #[test]
     fn installed_daemon_arguments_reproduce_all_four_directories_without_data_dir() {

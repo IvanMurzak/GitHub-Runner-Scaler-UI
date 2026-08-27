@@ -33,7 +33,7 @@ use runner_manager_github::rest::{CancelToken, InventoryError, InventoryGateway,
 use runner_manager_github::{AppRegistration, AuthenticatedClient, GithubError, UserAccessToken};
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
 use runner_manager_platform::secrets::SecretStore as _;
-use runner_manager_platform::service::record_github_contact;
+use runner_manager_platform::service::{InstallRecord, record_github_contact};
 
 use super::{CliError, Context, DaemonCommand, Failure, write_failed};
 
@@ -216,10 +216,16 @@ async fn run(
         ));
     }
 
-    // `current_exe` rather than the path in the service record: it is the file
-    // this process is actually running, which is the one a package manager
-    // replaces, and it is right even for a daemon started by hand.
-    let own_binary = std::env::current_exe().ok();
+    // The *source*, not `current_exe`. A service registered by `service
+    // install` runs a copy this product owns, precisely so that the package
+    // manager's own file stays replaceable while the service runs -- so the
+    // file that changes on an upgrade is the source, and the copy never
+    // changes on its own. `None` for a daemon started by hand, or for a
+    // registration made before copies existed, and then nothing is watched.
+    let own_binary = InstallRecord::read(context.paths())
+        .ok()
+        .flatten()
+        .and_then(|record| record.source_binary);
     let mut upgraded_to = None;
 
     let early = tokio::select! {
@@ -261,6 +267,20 @@ async fn run(
             })??;
         }
         let version = upgraded_to.unwrap_or_default();
+        // The copy is replaced here, by the daemon, because nothing else can:
+        // a package manager updates the source and never touches this path.
+        // The old file is renamed rather than deleted -- Windows refuses to
+        // unlink an executable that is running, which this one still is, but
+        // allows it to be renamed out of the way.
+        if let Some(source) = own_binary.as_deref()
+            && let Err(error) = replace_own_binary(source)
+        {
+            tracing::warn!(
+                %error,
+                "the new binary could not be put in place; the service manager will restart the                  version already there"
+            );
+            writeln!(out, "warning: {error}").map_err(failed)?;
+        }
         writeln!(
             out,
             "every runner finished; stopping so {version} can take over"
@@ -389,6 +409,29 @@ async fn wait_for_upgrade(path: std::path::PathBuf) -> String {
             return version;
         }
     }
+}
+
+/// Puts the source binary in place of the one this process is running.
+///
+/// The running file is renamed aside rather than deleted: Windows refuses to
+/// unlink an executable that is running -- which this one is, right now -- and
+/// permits renaming it. The leftover is removed by the next install or upgrade,
+/// whichever comes first, and is harmless until then because nothing names it.
+fn replace_own_binary(source: &std::path::Path) -> Result<(), String> {
+    let own = std::env::current_exe().map_err(|error| format!("own path unknown: {error}"))?;
+    let aside = own.with_extension("old");
+    let _ = std::fs::remove_file(&aside);
+    std::fs::rename(&own, &aside)
+        .map_err(|error| format!("the running binary could not be moved aside: {error}"))?;
+    if let Err(error) = std::fs::copy(source, &own) {
+        // Put back what was working. A daemon that restarts into nothing is a
+        // machine with no runner manager at all.
+        let _ = std::fs::rename(&aside, &own);
+        return Err(format!(
+            "the new binary could not be copied into place: {error}"
+        ));
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown(
