@@ -61,7 +61,7 @@ fn repository_and_organization_add_share_the_gateway_path_and_emit_label_specifi
             let (output, requests) = add_with_label(scope, target, label);
             let routing = output
                 .lines()
-                .find(|line| line.starts_with("Routing label: "))
+                .find(|line| line.starts_with("Routing labels: "))
                 .unwrap_or_else(|| panic!("{scope} add omitted routing output:\n{output}"));
             assert!(routing.contains(&format!("rm-{label}-")), "{routing}");
             emitted.push(routing.to_string());
@@ -108,7 +108,7 @@ fn scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label
         });
         assert_eq!(outcome.code, 0, "{}", outcome.both());
         if maximum.is_some() {
-            assert!(outcome.stdout.contains("Routing label: rm-office-"));
+            assert!(outcome.stdout.contains("Routing labels: rm-office-"));
         } else {
             assert!(outcome.stdout.contains("Monitor-only"));
             assert!(outcome.stdout.contains(
@@ -141,7 +141,7 @@ fn scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label
         command
     });
     assert_eq!(promote.code, 0, "{}", promote.both());
-    assert!(promote.stdout.contains("Routing label: rm-home-"));
+    assert!(promote.stdout.contains("Routing labels: rm-home-"));
 
     let store = database(data_dir.path());
     let policies = store.policies().unwrap();

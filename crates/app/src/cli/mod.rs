@@ -269,6 +269,18 @@ failure_taxonomy! {
     /// this client cannot accept, or — the security case — it pointed the login
     /// at a verification page that is not GitHub's own.
     UnusableResponse = 20 => "unusable_response",
+    /// A newer binary was installed at this daemon's own path, every runner it
+    /// held has finished, and it stopped so the new one can take over.
+    ///
+    /// **This is not a failure, and it is in this enum because the operating
+    /// system has no other word for it.** All three service managers reinstate
+    /// a service only when it exits non-zero — systemd `Restart=on-failure`,
+    /// launchd `KeepAlive{SuccessfulExit:false}`, and the Windows failure
+    /// actions this product configures. A clean exit is read as "this service
+    /// is done" and nothing restarts it, which for an upgrade would leave the
+    /// machine with no daemon at all. So the restart is bought with a non-zero
+    /// code, and this variant exists to say which one and why.
+    UpgradePending = 21 => "upgrade_pending",
 }
 
 impl Failure {
