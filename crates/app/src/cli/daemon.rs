@@ -28,11 +28,13 @@ use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
+use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::jit::{JitError, JitGateway, JitRunnerRequest, RestJit};
 use runner_manager_github::rest::{CancelToken, InventoryError, InventoryGateway, RestInventory};
-use runner_manager_github::{AppRegistration, AuthenticatedClient, GithubError, UserAccessToken};
+use runner_manager_github::{
+    AppRegistration, AuthenticatedClient, CredentialRenewal, GithubError, UserAccessToken,
+};
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
-use runner_manager_platform::secrets::SecretStore as _;
 use runner_manager_platform::service::{InstallRecord, record_github_contact};
 
 use super::{CliError, Context, DaemonCommand, Failure, write_failed};
@@ -76,7 +78,8 @@ async fn run(
     }
 
     let mode = host.service_start_mode;
-    let secrets = context.secret_store(mode)?;
+    let secrets: Arc<dyn runner_manager_platform::secrets::SecretStore> =
+        Arc::from(context.secret_store(mode)?);
     let secret = secrets
         .load()
         .map_err(|source| {
@@ -93,15 +96,37 @@ async fn run(
                 "runner-manager auth login",
             )
         })?;
+    let app = context.app_registration()?;
+    // ------------------------------------------------------------------
+    // THE DAEMON IS THE REASON RENEWAL EXISTS.
+    // ------------------------------------------------------------------
+    // An access token lives eight hours and this process is meant to run for
+    // months, so without renewal it would need an interactive sign-in every
+    // working day. With it, `auth login` happens once per machine -- and,
+    // because each host renews its own pair rather than re-authorising, two
+    // machines stop evicting each other's credential.
+    //
+    // A credential with no refresh half -- which is every one issued while the
+    // App has expiration switched off -- simply never renews, and this costs it
+    // nothing.
+    let renewal: Arc<dyn CredentialRenewal> = Arc::new(super::auth::StoringRenewal::new(
+        DeviceFlow::new(app.clone(), context.endpoints().clone()).map_err(|source| {
+            CliError::new(
+                Failure::GithubUnavailable,
+                format!("cannot prepare credential renewal: {source}"),
+            )
+        })?,
+        Arc::clone(&secrets),
+    ));
     let client = Arc::new(
         AuthenticatedClient::new(
             context.endpoints().clone(),
             UserAccessToken::from_stored(secret),
             context.clock(),
         )
-        .map_err(github_failure)?,
+        .map_err(github_failure)?
+        .with_renewal(renewal),
     );
-    let app = context.app_registration()?;
     let clock = context.clock();
     let inventory = Arc::new(RestInventory::new(Arc::clone(&client), Arc::clone(&clock)));
     let jit = Arc::new(RestJit::new(Arc::clone(&client)));

@@ -327,6 +327,107 @@ impl DeviceFlow {
         Ok(Self::with_http_client(http, app, endpoints))
     }
 
+    /// Exchange a refresh token for a fresh pair.
+    ///
+    /// # No client secret, and why that is not an oversight
+    ///
+    /// GitHub requires a confidential client credential for this exchange
+    /// *"unless the user access token was generated using the device flow"*,
+    /// and this product's tokens always are. That exemption is what makes
+    /// renewal possible here at all: a published binary cannot carry such a
+    /// credential, because anyone who downloads it has it -- and with it can
+    /// call the App's token-management endpoints and revoke every user's
+    /// access. Verified against live GitHub before this was written: the call
+    /// below returns `200` with `client_id` alone.
+    ///
+    /// # The old pair is dead the instant this succeeds
+    ///
+    /// GitHub rotates: *"Once you use a refresh token, that refresh token and
+    /// the old user access token will no longer work."* Measured, not assumed
+    /// -- the previous access token answered `401` immediately after.
+    ///
+    /// So there is no retry here and there must not be one. A caller that
+    /// re-sends a spent refresh token gets `incorrect_client_credentials`,
+    /// which names the client id and the client secret and is about neither:
+    /// the credential is simply gone, and the machine needs an interactive
+    /// sign-in. **Persist what this returns before using it**, or a response
+    /// lost in flight takes the host's access with it.
+    ///
+    /// # Errors
+    /// [`DeviceFlowError`], as the access-token request.
+    pub async fn refresh(
+        &self,
+        refresh_token: &SecretString,
+    ) -> Result<UserAccessToken, DeviceFlowError> {
+        // In the body for the same reason the device code is: a refresh token
+        // in a query string is written to every proxy log it passes.
+        let body = form_body(&[
+            ("client_id", self.app.client_id()),
+            ("refresh_token", refresh_token.expose_secret()),
+            ("grant_type", "refresh_token"),
+        ]);
+
+        let response = self
+            .http
+            .post(self.endpoints.access_token_url())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(transport)?;
+
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(transport)?;
+        let raw: RawTokenResponse = match serde_json::from_slice(&bytes) {
+            Ok(raw) => raw,
+            Err(source) => {
+                return if status.is_success() {
+                    Err(DeviceFlowError::Decode {
+                        stage: "refresh",
+                        source,
+                    })
+                } else {
+                    Err(DeviceFlowError::Status {
+                        status: status.as_u16(),
+                        stage: "refresh request",
+                    })
+                };
+            }
+        };
+
+        if let Some(code) = raw.error {
+            return Err(DeviceFlowError::Malformed {
+                what: "a refresh response",
+                // The code, not GitHub's sentence: `incorrect_client_credentials`
+                // arrives here for a spent refresh token and its description
+                // blames the client id and secret, which would send an operator
+                // to re-register an App that is perfectly fine.
+                value: code,
+            });
+        }
+        let Some(access_token) = raw.access_token else {
+            return Err(DeviceFlowError::Malformed {
+                what: "a refresh response",
+                value: "neither an access token nor an error".to_string(),
+            });
+        };
+        Ok(UserAccessToken::from_parts(
+            SecretString::from(access_token),
+            raw.token_type.unwrap_or_else(|| "bearer".to_string()),
+            raw.scope.filter(|s| !s.is_empty()),
+        )
+        .with_renewal(
+            raw.refresh_token.map(SecretString::from),
+            raw.expires_in,
+            raw.refresh_token_expires_in,
+        ))
+    }
+
     #[must_use]
     pub fn with_http_client(
         http: reqwest::Client,
@@ -513,6 +614,11 @@ impl DeviceFlow {
             SecretString::from(access_token),
             raw.token_type.unwrap_or_else(|| "bearer".to_string()),
             raw.scope.filter(|s| !s.is_empty()),
+        )
+        .with_renewal(
+            raw.refresh_token.map(SecretString::from),
+            raw.expires_in,
+            raw.refresh_token_expires_in,
         );
 
         // The family prefix, and nothing more. The D17 spike asserted exactly
@@ -699,6 +805,21 @@ struct RawTokenResponse {
     token_type: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+    /// Present only when the App has user-token expiration enabled.
+    ///
+    /// An App with expiration off returns neither this nor `expires_in`, and
+    /// the credential that results is the non-expiring one this product has
+    /// always held. Both shapes are accepted so that turning the setting on --
+    /// or off -- is a decision about the App rather than a release of this
+    /// binary.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Seconds until the access token expires. Always 28800 (8h) today.
+    #[serde(default)]
+    expires_in: Option<u64>,
+    /// Seconds until the refresh token expires. Always 15897600 (6mo) today.
+    #[serde(default)]
+    refresh_token_expires_in: Option<u64>,
     #[serde(default)]
     error: Option<String>,
     /// Present on `slow_down`; the interval GitHub wants from now on.

@@ -42,16 +42,18 @@
 
 use std::fmt::Display;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::Store as _;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
 use runner_manager_github::{
-    AuthenticatedClient, GithubError, Installation, InstallationDiscovery, RepositorySelection,
-    TokioSleeper, UserAccessToken,
+    AuthenticatedClient, CredentialRenewal, GithubError, Installation, InstallationDiscovery,
+    RepositorySelection, TokioSleeper, UserAccessToken,
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
+use secrecy::SecretString;
 
 use super::{
     AuthCommand, CliError, Context, Failure, NO_OPERATOR_REMEDY, Styling, open_in_browser,
@@ -401,6 +403,51 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
     Ok(())
 }
 
+/// Renews a credential and stores it, in that order and no other.
+///
+/// # The ordering is the whole point of this type
+///
+/// GitHub rotates on use: the pair handed back here is live and the pair that
+/// bought it is already dead. A renewal that is used before it is stored leaves
+/// the host running on a credential it has not recorded -- and if the process
+/// stops before it does, the store still holds the dead one and the only way
+/// back is an interactive sign-in.
+///
+/// So the write happens before this returns, and the caller only ever receives
+/// a pair that is already durable. A store failure is reported as a failure
+/// even though the exchange succeeded, because a credential nobody wrote down
+/// is worse than one that was never minted: the old one is dead either way, and
+/// at least the failure says so.
+#[derive(Debug)]
+pub struct StoringRenewal {
+    flow: DeviceFlow,
+    secrets: Arc<dyn SecretStore>,
+}
+
+impl StoringRenewal {
+    #[must_use]
+    pub fn new(flow: DeviceFlow, secrets: Arc<dyn SecretStore>) -> Self {
+        Self { flow, secrets }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialRenewal for StoringRenewal {
+    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+        let fresh = self
+            .flow
+            .refresh(refresh_token)
+            .await
+            .map_err(|source| format!("the refresh exchange failed: {source}"))?;
+        self.secrets
+            .store(&fresh.to_stored_document())
+            .map_err(|source| {
+                format!("the renewed credential could not be stored, so it was not used: {source}")
+            })?;
+        Ok(fresh)
+    }
+}
+
 pub fn login(
     context: &Context,
     requested_mode: Option<StartMode>,
@@ -499,7 +546,10 @@ pub fn login(
     // The value is exposed exactly once, here, as the argument to `store`, and
     // is never bound to a name that could be formatted, logged, or returned.
     secrets
-        .store(token.secret())
+        // The document, not the bare token: it carries the refresh half and
+        // the two expiry instants when the App issues them, and reads back as a
+        // bare token when it does not. See `UserAccessToken::to_stored_document`.
+        .store(&token.to_stored_document())
         .map_err(|source| secret_store_failure(&source))?;
 
     writeln!(
