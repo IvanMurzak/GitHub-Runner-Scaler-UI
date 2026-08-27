@@ -70,8 +70,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ------------------------------------------------------------------
+          # THIS LEG RUNS ON THE MAINTAINER'S OWN WINDOWS MACHINE.
+          # ------------------------------------------------------------------
+          # `rm-ivanpc-win-x64` is a routing label this product's own agent
+          # answers: no runner is registered until a job is queued for it, one
+          # is created on demand, and it is removed when the job ends. So this
+          # repository's Windows CI is served by the thing this repository
+          # builds, which is the most direct test of it there is.
+          #
+          # Two consequences, stated because they are real and were accepted
+          # rather than overlooked:
+          #
+          # * **The release gate depends on that machine.** `release.yml` calls
+          #   this workflow, so a host that is off, or an agent too broken to
+          #   register a runner, blocks publishing — including publishing the
+          #   fix. The recovery is to point this back at `windows-latest` for
+          #   one release.
+          # * **A fork's pull request runs here.** GitHub gates a first-time
+          #   contributor behind an approval and nothing after that, and this
+          #   product's own `set-scale` warning says untrusted pull-request
+          #   workflows should not run on a personal host. Approving a fork PR
+          #   on this repository is therefore a decision about that machine.
           - name: windows-x86_64
-            os: windows-latest
+            os: rm-ivanpc-win-x64
           # macos-latest is Apple Silicon, so the platform the persona actually
           # uses is the platform that is tested. The `uname` assertion below
           # keeps that true if GitHub ever repoints the label.
