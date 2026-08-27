@@ -296,6 +296,13 @@ pub enum FakeCall {
     /// `status=in_progress` — and a consumer that polled the wrong one would
     /// otherwise look identical here.
     QueuedDemand(ScaleTarget),
+    /// A registration deletion, with the runner id that was asked for.
+    ///
+    /// The id travels because that is the whole content of the call, and a
+    /// consumer that deleted the *wrong* runner — another attempt's, or one of
+    /// the operator's own long-lived registrations — would otherwise be
+    /// indistinguishable here from one that deleted the right one.
+    RemoveRunner(ScaleTarget, u64),
     /// A just-in-time registration, with the request that was sent.
     ///
     /// The whole request travels rather than only the target, because the two
@@ -884,6 +891,25 @@ impl InventoryGateway for FakeGithub {
             pages,
             false,
         ))
+    }
+
+    async fn remove_runner(
+        &self,
+        target: &ScaleTarget,
+        runner_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<(), InventoryError> {
+        cancel.check()?;
+        self.begin(FakeCall::RemoveRunner(target.clone(), runner_id), &target.slug())?;
+
+        let mut state = self.lock();
+        state.requests_issued += 1;
+        // Deleting an absent registration is a success, exactly as the real
+        // gateway's `404` arm is; the postcondition is that it is gone.
+        if let Some(runners) = state.runners.get_mut(target) {
+            runners.retain(|runner| runner.id != runner_id);
+        }
+        Ok(())
     }
 
     async fn in_progress_activity(

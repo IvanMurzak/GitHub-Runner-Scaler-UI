@@ -997,8 +997,17 @@ pub struct RecoveryTimeouts {
     /// How long `starting` may last before the runner is assumed not to be
     /// coming up.
     pub startup: Elapsed,
-    /// How long `idle` may last before an exit is read as the surplus case
-    /// rather than a crash.
+    /// How long `idle` may last, in both directions it is read.
+    ///
+    /// For an attempt whose process is already gone it separates the two
+    /// readings of that exit: past this, the surplus case; before it, a crash.
+    ///
+    /// For one whose process is still alive and still registered it is a
+    /// deadline rather than a reading — the point at which the agent stops the
+    /// runner itself. Nothing else does: `Runner.Listener run` long-polls for
+    /// an assignment indefinitely, so this value, and only this value, bounds
+    /// how long a runner that never gets a job holds its capacity slot and its
+    /// entry in the target's runner settings.
     pub idle: Elapsed,
 }
 
@@ -1012,7 +1021,15 @@ impl RecoveryTimeouts {
         }
     }
 
-    /// Placeholder values. Not a product decision — see the type documentation.
+    /// Placeholder values, with one exception — see the type documentation.
+    ///
+    /// `idle` is no longer a placeholder. It stopped being one when it became
+    /// the only thing that bounds a live runner: five minutes is long enough
+    /// that a runner GitHub is about to assign is not stopped out from under
+    /// the assignment, and short enough that a machine does not carry an
+    /// unusable slot, and a repository an unusable runner row, for hours. The
+    /// other two still only separate readings of an event that already
+    /// happened, and nothing here has had to decide what they should be.
     #[must_use]
     pub fn provisional() -> Self {
         Self {
@@ -1094,6 +1111,18 @@ pub enum RecoveryDecision {
     Conclude(AttemptOutcome),
     /// The process is still alive but the attempt cannot go on: **stop the
     /// process, and only once it is gone record this outcome.**
+    ///
+    /// **Two producers, and the payload is what separates them.** `starting`
+    /// past its registration timeout carries
+    /// [`FailureReason::RegistrationTimedOut`]; `idle` past its idle timeout,
+    /// with GitHub still reporting the runner registered and unassigned,
+    /// carries [`AttemptOutcome::ExitedIdleWithoutWork`] — flow 2.7's surplus
+    /// runner, which is a normal outcome and not a failure at all. The two
+    /// share this variant because they need the identical *sequence* — signal,
+    /// confirm the process is gone, then record — and differ only in what is
+    /// recorded at the end. A caller that hardcodes either reason will
+    /// mislabel the other, so the payload is the caller's instruction, not
+    /// decoration.
     ///
     /// **Why this is not a [`Self::Conclude`].** `Conclude` moves the attempt to
     /// a terminal state, and a terminal attempt no longer
@@ -1366,13 +1395,32 @@ pub fn recovery_decision(
             // already dead.
             G::Registered { busy: true } => RecoveryDecision::Observe(S::Busy),
             // GitHub agrees with the journal, so there is no state to move to.
-            // A live process is adopted; a dead one means supervision is lost
-            // while the remote registration outlived it and needs removing.
+            // A dead process means supervision is lost while the remote
+            // registration outlived it and needs removing.
+            //
+            // A *live* one is adopted only while it is still inside the idle
+            // timeout. Past it, this is flow 2.7's surplus runner and the agent
+            // has to end it, because nothing else will: the runner is spawned as
+            // a bare `Runner.Listener run`, and that process has no idle timeout
+            // of its own -- it long-polls for an assignment until something
+            // stops it. This arm used to answer `Adopt` for every elapsed time,
+            // which is why it never was stopped. A registered, unassigned runner
+            // then holds its capacity slot and its entry in the target's runner
+            // settings for as long as the host stays up; one observed in the
+            // field sat here for 27 hours across two restarts of nothing.
+            //
+            // `Terminate`, not `Conclude`: the process is alive, so the slot may
+            // not be returned until it is gone. The caller signals it, re-reads
+            // liveness, and only then applies the payload -- the same sequence
+            // `starting` above relies on, and the reason that decision carries
+            // its outcome rather than the caller deriving one.
             G::Registered { busy: false } => {
-                if observation.process_alive {
-                    RecoveryDecision::Adopt
-                } else {
+                if !observation.process_alive {
                     RecoveryDecision::Conclude(AttemptOutcome::Orphaned)
+                } else if elapsed >= timeouts.idle {
+                    RecoveryDecision::Terminate(AttemptOutcome::ExitedIdleWithoutWork)
+                } else {
+                    RecoveryDecision::Adopt
                 }
             }
             // Nothing at GitHub. A live process is still ours to supervise.
@@ -2848,6 +2896,97 @@ mod tests {
             RecoveryDecision::Conclude(AttemptOutcome::ExitedIdleWithoutWork),
             "which is exactly why the journal must not be left saying `idle`"
         );
+    }
+
+    #[test]
+    fn a_registered_runner_that_never_gets_a_job_is_stopped_at_its_idle_timeout() {
+        // The surplus case of flow 2.7, in the shape it actually occurs in:
+        // GitHub still lists the runner, it is not busy, and the process is
+        // very much alive -- `Runner.Listener run` long-polls for an assignment
+        // and has no idle timeout of its own, so it never leaves on its own.
+        // This arm answered `Adopt` at every elapsed time, which is why a runner
+        // observed in the field held its slot and its row in the target's runner
+        // settings for 27 hours.
+        let timeouts = RecoveryTimeouts::new(
+            Elapsed::seconds(60),
+            Elapsed::seconds(120),
+            Elapsed::seconds(300),
+        );
+        let clock = StubClock::at(1_000);
+        let attempt = attempt_in(AttemptState::Idle, 1_000);
+        let idle_registered = |alive| RecoveryObservation {
+            process_alive: alive,
+            github: GithubRunnerObservation::Registered { busy: false },
+        };
+
+        // Inside the window the runner is still plausibly about to be assigned,
+        // so it is adopted and nothing is disturbed.
+        clock.set(1_299);
+        assert_eq!(
+            recovery_decision(&attempt, idle_registered(true), timeouts, &clock),
+            RecoveryDecision::Adopt,
+            "a runner one second inside its idle timeout may still be given a job"
+        );
+
+        // At the deadline it is surplus, and the agent has to end it.
+        clock.set(1_300);
+        let decision = recovery_decision(&attempt, idle_registered(true), timeouts, &clock);
+        assert_eq!(
+            decision,
+            RecoveryDecision::Terminate(AttemptOutcome::ExitedIdleWithoutWork),
+            "past the idle timeout a registered, unassigned runner is flow 2.7's surplus case"
+        );
+
+        // `Terminate`, not `Conclude`, and the difference is the capacity slot:
+        // the process is alive, so the slot may not come back until it is gone.
+        let mut attempt = attempt;
+        assert!(attempt.counts_against_capacity());
+        let RecoveryDecision::Terminate(outcome) = decision else {
+            unreachable!("asserted above")
+        };
+        assert!(
+            outcome.is_idle_exit(),
+            "the surplus exit is a normal outcome, and `g2` renders it as one -- an operator \
+             sent to hunt a fault here would find nothing"
+        );
+        attempt
+            .conclude(outcome, ts(1_310))
+            .expect("the payload must be applicable to the attempt it was made about");
+        assert!(!attempt.counts_against_capacity());
+
+        // A dead process is the pre-existing reading and is left alone: the
+        // registration outlived supervision, which is what `Orphaned` names.
+        clock.set(1_400);
+        assert_eq!(
+            recovery_decision(
+                &attempt_in(AttemptState::Idle, 1_000),
+                idle_registered(false),
+                timeouts,
+                &clock
+            ),
+            RecoveryDecision::Conclude(AttemptOutcome::Orphaned),
+            "the idle deadline governs a live runner; a dead one is orphaned however long it sat"
+        );
+
+        // And a runner GitHub reports busy is never stopped, at any elapsed
+        // time. This is the assertion that stops the deadline above from ever
+        // being applied to a runner in the middle of a job.
+        for offset in [0, 299, 300, 100_000] {
+            clock.set(1_000 + offset);
+            assert_eq!(
+                recovery_decision(
+                    &attempt_in(AttemptState::Idle, 1_000),
+                    RecoveryObservation {
+                        process_alive: true,
+                        github: GithubRunnerObservation::Registered { busy: true },
+                    },
+                    timeouts,
+                    &clock
+                ),
+                RecoveryDecision::Observe(AttemptState::Busy),
+                "at +{offset}s a runner that took a job was stopped by an idle deadline"
+            );
+        }
     }
 
     #[test]

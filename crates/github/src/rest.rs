@@ -1842,6 +1842,31 @@ pub trait InventoryGateway: fmt::Debug + Send + Sync {
         cancel: &CancelToken,
     ) -> Result<RunnerInventory, InventoryError>;
 
+    /// Delete one runner registration from `target`.
+    ///
+    /// The agent owns the registrations it created, and this is how it gives
+    /// them back. GitHub retires an ephemeral runner promptly once that runner
+    /// *completes a job*. Every other ending is on its own schedule: a
+    /// registration whose runner never got work, or whose process died still
+    /// holding it, lingers in the target's runner settings — one was observed
+    /// listed for **33 hours** after the attempt behind it had concluded. GitHub
+    /// does clear such a registration eventually, so this is not the difference
+    /// between forever and not; it is the difference between an operator seeing
+    /// a runner row that matches reality and one that does not.
+    ///
+    /// A `404` is success: the registration is gone, which is the postcondition
+    /// asked for, and treating GitHub having already removed it as a failure
+    /// would strand every attempt that concluded the ordinary way.
+    ///
+    /// # Errors
+    /// Every variant of [`InventoryError`].
+    async fn remove_runner(
+        &self,
+        target: &ScaleTarget,
+        runner_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<(), InventoryError>;
+
     /// In-progress workflow runs across `scope`.
     ///
     /// # Errors
@@ -2024,7 +2049,7 @@ impl RestInventory {
     /// operator navigated away spends real requests. A mutation test that
     /// disables `check` alone leaves that case still guarded by `run`, which is
     /// what defence in depth is supposed to look like.
-    async fn get(
+    async fn issue(
         &self,
         request: &ApiRequest,
         cancel: &CancelToken,
@@ -2106,9 +2131,9 @@ impl RestInventory {
         let mut next = Some(first);
 
         while let Some(request) = next.take() {
-            // Cancellation is checked at the top of `get`, which is what makes a
+            // Cancellation is checked at the top of `issue`, which is what makes a
             // token flipped after page one stop the walk before page two.
-            let response = self.get(&request, cancel).await?;
+            let response = self.issue(&request, cancel).await?;
             let page: P = response.json()?;
             reported_total = page.reported_total().or(reported_total);
             items.extend(page.into_items());
@@ -2180,7 +2205,7 @@ impl RestInventory {
         .query("status", "in_progress")
         .query("per_page", PER_PAGE);
 
-        let response = self.get(&request, cancel).await?;
+        let response = self.issue(&request, cancel).await?;
         let page: RunsPage = response.json()?;
         if let Some(total) = page.total_count {
             let listed = page.workflow_runs.len() as u64;
@@ -2230,7 +2255,7 @@ impl RestInventory {
                 // the other read model.
                 return Ok(RepositoryActivity::floor(counted));
             }
-            let response = self.get(&request, cancel).await?;
+            let response = self.issue(&request, cancel).await?;
             let page: RunsPage = response.json()?;
             counted += page.workflow_runs.len();
             pages += 1;
@@ -2316,6 +2341,21 @@ impl InventoryGateway for RestInventory {
         Ok(inventory)
     }
 
+    async fn remove_runner(
+        &self,
+        target: &ScaleTarget,
+        runner_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<(), InventoryError> {
+        let path = format!("{}/{runner_id}", Self::runners_path(target));
+        match self.issue(&ApiRequest::delete(path), cancel).await {
+            Ok(_) => Ok(()),
+            // Already gone is the state this asks for. See the trait method.
+            Err(InventoryError::Github(GithubError::Status { status: 404, .. })) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn in_progress_activity(
         &self,
         scope: &ActivityScope,
@@ -2379,7 +2419,7 @@ impl InventoryGateway for RestInventory {
         };
         // Not paginated: GitHub answers this one with a bare JSON array of the
         // packages it publishes, which is a fixed handful.
-        let response = self.get(&ApiRequest::get(path), cancel).await?;
+        let response = self.issue(&ApiRequest::get(path), cancel).await?;
         let raw: Vec<RawDownload> = response.json()?;
         Ok(RunnerDownloads::new(
             raw.into_iter().map(RunnerDownload::from).collect(),
@@ -2784,6 +2824,58 @@ mod tests {
 
         assert_eq!(inventory.len(), 150, "the comma ended pagination at page 1");
         assert_eq!(inventory.pages(), 2);
+    }
+
+    /// The deletion goes to the one runner asked for, under the scope's own
+    /// path, and a registration GitHub has already dropped is a success.
+    #[tokio::test]
+    async fn removing_a_runner_deletes_that_id_and_treats_an_absent_one_as_done() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{REPO_RUNNERS}/73")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{REPO_RUNNERS}/99")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "message": "Not Found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        gateway
+            .remove_runner(&repo_target(), 73, &CancelToken::new())
+            .await
+            .expect("a registration this agent owns is deletable");
+        gateway
+            .remove_runner(&repo_target(), 99, &CancelToken::new())
+            .await
+            .expect(
+                "already gone is the postcondition asked for; failing here would strand every \
+                 attempt GitHub retired on its own",
+            );
+    }
+
+    /// An organization target deletes under `/orgs`, not `/repos`.
+    #[tokio::test]
+    async fn removing_an_organization_runner_uses_the_organization_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{ORG_RUNNERS}/12")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let gateway = gateway(&server, Arc::new(TestClock::default()));
+        gateway
+            .remove_runner(&org_target(), 12, &CancelToken::new())
+            .await
+            .expect("the organization scope deletes under its own path");
     }
 
     /// A collection shorter than GitHub's own `total_count` is reported as
@@ -3469,12 +3561,12 @@ mod tests {
         assert_eq!(requests_seen(&server).await, 2);
     }
 
-    /// `get`'s `cancel.check()` runs **before** the rate-limit gate, and that
+    /// `issue`'s `cancel.check()` runs **before** the rate-limit gate, and that
     /// ordering is the one effect the check does not share with `run`.
     ///
     /// Everywhere else the two overlap: a token flipped before or during a
     /// request is caught by `run`'s biased `select!` whether or not `check` ran
-    /// first. Inside a **latched back-off window** it cannot be, because `get`
+    /// first. Inside a **latched back-off window** it cannot be, because `issue`
     /// returns at the suppression branch without ever reaching `run`. Delete the
     /// `check` and this call is answered [`InventoryError::RateLimited`] — a
     /// caller that has already navigated away is told to wait out a back-off it
@@ -3827,7 +3919,7 @@ mod tests {
     /// tell them apart.
     ///
     /// [`RestInventory::headroom`] is what separates them: it is written only in
-    /// `get`'s `Ok(response)` arm, so it stays `None` here and is `Some` in
+    /// `issue`'s `Ok(response)` arm, so it stays `None` here and is `Some` in
     /// `cancelling_between_pages_stops_the_walk`. The two tests assert opposite
     /// sides of that one observable, and neither can pass as the other.
     struct CancelWhileServingPage {
@@ -3923,7 +4015,7 @@ mod tests {
         assert!(
             gateway.headroom().is_none(),
             "the response carried `x-ratelimit-*` and they were never read, which is what \
-             `abandoned in flight` means: `get` returned `Cancelled` from `run` without \
+             `abandoned in flight` means: `issue` returned `Cancelled` from `run` without \
              reaching its `Ok` arm. `Some` here would mean page one was actually parsed \
              and this test had silently become the between-pages case"
         );
@@ -3939,7 +4031,7 @@ mod tests {
     /// hit the right window on an idle machine and the wrong one on a loaded
     /// one, which is a coin-flip dressed as a test.
     ///
-    /// Parsing is the seam. `collect_pages` calls `into_items` after `get` has
+    /// Parsing is the seam. `collect_pages` calls `into_items` after `issue` has
     /// returned `Ok` for the page in hand — `headroom` already recorded — and
     /// before it reads the `Link` header or issues anything further. There is no
     /// socket open at that instant, so a token flipped here is flipped *exactly*
@@ -3985,7 +4077,7 @@ mod tests {
     ///
     /// The walk begins un-cancelled and fetches page one. Page one is served
     /// completely, parsed, and its `Link: rel="next"` really is in hand — the
-    /// `headroom` assertion below is the proof, since `get` writes it only on
+    /// `headroom` assertion below is the proof, since `issue` writes it only on
     /// the `Ok` path. *Then* the token flips, with nothing in flight. Page two
     /// is therefore a request the walk is in a position to make and **declines**
     /// to, which is the actual property: this is the case `RestInventory::get`'s
@@ -3996,7 +4088,7 @@ mod tests {
     /// seam is the page type, and `list_runners` fixes that to [`RunnersPage`].
     /// The walk under test is the same one either way — `list_runners` is a thin
     /// wrapper over this call — and the between-pages decision lives entirely in
-    /// `collect_pages` and `get`.
+    /// `collect_pages` and `issue`.
     #[tokio::test]
     async fn cancelling_between_pages_stops_the_walk() {
         let server = MockServer::start().await;
@@ -4053,7 +4145,7 @@ mod tests {
         assert!(
             gateway.headroom().is_some(),
             "page one's response must have been parsed for this to be the between-pages \
-             case at all; `headroom` is written only in `get`'s `Ok` arm, so `None` here \
+             case at all; `headroom` is written only in `issue`'s `Ok` arm, so `None` here \
              would mean page one was cancelled in flight and the walk never saw the \
              `Link` header it is supposed to decline to follow"
         );
@@ -4104,7 +4196,7 @@ mod tests {
         // that the server would serve a page and offer a second.
         let first = ApiRequest::get(REPO_RUNNERS).query("per_page", PER_PAGE);
         let response = gateway
-            .get(&first, &cancel)
+            .issue(&first, &cancel)
             .await
             .expect("page one is readable");
         assert!(response.next_page().is_some(), "page two is on offer");

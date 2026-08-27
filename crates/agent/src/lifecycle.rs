@@ -110,6 +110,13 @@ pub enum AttemptEvent {
     Terminated {
         attempt: AttemptId,
     },
+    /// The attempt's GitHub registration was removed by this agent. Carries the
+    /// runner id because that is the identifier an operator sees in the
+    /// target's runner settings, and the attempt id is not shown there.
+    Deregistered {
+        attempt: AttemptId,
+        runner_id: u64,
+    },
     Concluded {
         attempt: AttemptId,
         outcome: OutcomeKind,
@@ -242,6 +249,14 @@ pub trait LifecycleGithub: fmt::Debug + Send + Sync {
         attempt: AttemptId,
         cancel: &CancelToken,
     ) -> LifecycleGithubObservation;
+
+    /// Remove one runner registration this agent created.
+    ///
+    /// Answers whether the registration is gone, and is deliberately not
+    /// fallible in the `Result` sense: no caller may abandon a conclusion
+    /// because GitHub was unreachable. See
+    /// [`LifecycleLauncher::deregister_runner`].
+    async fn deregister(&self, target: &ScaleTarget, runner_id: u64, cancel: &CancelToken) -> bool;
 }
 
 #[async_trait]
@@ -293,6 +308,10 @@ where
                 }),
             Err(_) => LifecycleGithubObservation::unreachable(),
         }
+    }
+
+    async fn deregister(&self, target: &ScaleTarget, runner_id: u64, cancel: &CancelToken) -> bool {
+        self.remove_runner(target, runner_id, cancel).await.is_ok()
     }
 }
 
@@ -1141,6 +1160,7 @@ impl LifecycleLauncher {
         // This durable mark is more authoritative than a later observation
         // which cannot distinguish an agent kill from a crash.
         if self.ports.processes.has_terminate_intent(&attempt) && !process_alive {
+            self.deregister_runner(policy, &attempt).await;
             self.conclude(
                 &mut attempt,
                 AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
@@ -1169,6 +1189,7 @@ impl LifecycleLauncher {
                     .map_err(|_| LifecycleError::Transition)?;
                 self.record(&attempt)?;
             }
+            self.deregister_runner(policy, &attempt).await;
             self.conclude(
                 &mut attempt,
                 AttemptOutcome::failed(FailureReason::JitExpired),
@@ -1230,6 +1251,13 @@ impl LifecycleLauncher {
             }
             RecoveryDecision::Conclude(outcome) => {
                 let replacement = replacement_operation(&outcome);
+                // Only when GitHub still holds one. Every other conclusion here
+                // was reached *because* the observation was `NotRegistered`, and
+                // spending a DELETE to be told so again would put a request per
+                // concluded attempt on a budget `rest.rs` prices to the request.
+                if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
+                    self.deregister_runner(policy, &attempt).await;
+                }
                 self.conclude(&mut attempt, outcome)?;
                 self.clean_attempt(&mut attempt)?;
                 Ok(
@@ -1241,10 +1269,17 @@ impl LifecycleLauncher {
                     }),
                 )
             }
-            RecoveryDecision::Terminate(_payload) => {
-                // The mark is synced first.  Do not use `_payload` to conclude:
-                // Terminate and Conclude carry the same type and doing so would
-                // make an ordering test pass without proving the process died.
+            RecoveryDecision::Terminate(payload) => {
+                // The mark is synced first, and what proves the process died is
+                // the `is_alive` re-read below -- not the outcome recorded after
+                // it. Which outcome that is depends on why the termination was
+                // ordered, and only the payload knows: a `starting` runner that
+                // never registered is a failure this agent then stopped, while
+                // an `idle` one past its timeout is flow 2.7's surplus exit and
+                // no failure at all. Hardcoding the first reason here labelled
+                // the second as a registration timeout and asked the allocator
+                // for a replacement to boot.
+                let idle_exit = payload.is_idle_exit();
                 self.ports
                     .processes
                     .record_terminate_intent(&attempt)
@@ -1267,15 +1302,30 @@ impl LifecycleLauncher {
                 self.ports.events.emit(AttemptEvent::Terminated {
                     attempt: attempt.id,
                 });
-                self.conclude(
-                    &mut attempt,
-                    AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
-                )?;
+                // The registration-timeout path keeps deriving its own reason
+                // rather than applying the payload: on the pass that reads the
+                // journalled mark back the process is dead, and
+                // `TerminatedAfterRegistrationTimeout` is the reason that stays
+                // true of a dead process. See `RecoveryDecision::Terminate`.
+                let outcome = if idle_exit {
+                    AttemptOutcome::ExitedIdleWithoutWork
+                } else {
+                    AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout)
+                };
+                self.deregister_runner(policy, &attempt).await;
+                self.conclude(&mut attempt, outcome)?;
                 self.clean_attempt(&mut attempt)?;
-                Ok(ReconcileProgress::Replacement {
-                    attempt: attempt.id,
-                    operation: "registration_timeout_replacement",
-                })
+                // A surplus runner is not replaced. It was stopped precisely
+                // because the work it was started for went elsewhere; asking the
+                // allocator for another one rebuilds it every idle timeout.
+                if idle_exit {
+                    Ok(ReconcileProgress::Reconciled)
+                } else {
+                    Ok(ReconcileProgress::Replacement {
+                        attempt: attempt.id,
+                        operation: "registration_timeout_replacement",
+                    })
+                }
             }
         }
     }
@@ -1290,6 +1340,53 @@ impl LifecycleLauncher {
             state: attempt.state(),
         });
         Ok(())
+    }
+
+    /// Remove the GitHub registration an attempt is about to leave behind.
+    ///
+    /// # Why this is not fallible, and does not block the conclusion
+    ///
+    /// GitHub retires an ephemeral runner itself once that runner *completes a
+    /// job*, and for the ordinary path that is the whole story. The paths that
+    /// reach here are the ones where it does not: a runner stopped before it
+    /// was ever assigned work, a registration whose process died still holding
+    /// it, a JIT configuration that expired. Nothing else deletes those, and
+    /// before this existed nothing did — they accumulated in the target's
+    /// runner settings, one row per attempt, for the life of the repository.
+    ///
+    /// It returns `()` rather than a `Result` because the alternative is worse
+    /// in both directions. The attempt is over: its process is gone and its
+    /// slot has to come back, so a failed delete may not abort the conclusion
+    /// or the host leaks capacity every time GitHub is unreachable. And a
+    /// registration that outlives this call is not lost — it is exactly the
+    /// `Registered` + dead-process observation that
+    /// [`AttemptOutcome::Orphaned`] already names, which a later pass can still
+    /// see. So a failure is logged and stepped over, deliberately.
+    async fn deregister_runner(&self, policy: &ScalePolicy, attempt: &RunnerAttempt) {
+        let Some(runner_id) = attempt
+            .github_runner_id()
+            .or_else(|| read_runner_id(attempt.runtime_path()))
+        else {
+            return;
+        };
+        if self
+            .ports
+            .github
+            .deregister(&policy.target, runner_id, &self.cancel)
+            .await
+        {
+            self.ports.events.emit(AttemptEvent::Deregistered {
+                attempt: attempt.id,
+                runner_id,
+            });
+        } else {
+            tracing::warn!(
+                attempt = %attempt.id,
+                runner_id,
+                "the runner registration could not be removed from GitHub; it will show in the \
+                 target's runner settings until GitHub retires it or a later pass removes it"
+            );
+        }
     }
 
     fn conclude(
@@ -1735,6 +1832,13 @@ mod tests {
         observations: Mutex<VecDeque<LifecycleGithubObservation>>,
         registrations: AtomicUsize,
         remaining_runners: AtomicUsize,
+        /// Every runner id `deregister` was asked to remove, in order. A count
+        /// would not do: the assertions worth making are that the *right*
+        /// registration was deleted and that it was deleted once.
+        deregistrations: Mutex<Vec<u64>>,
+        /// Set to make `deregister` answer `false`, standing for a GitHub that
+        /// could not be reached at the moment the attempt concluded.
+        deregistration_fails: AtomicBool,
     }
 
     impl FakeGithubLifecycle {
@@ -1811,6 +1915,20 @@ mod tests {
                 self.remaining_runners.store(0, Ordering::SeqCst);
             }
             observation
+        }
+
+        async fn deregister(
+            &self,
+            _target: &ScaleTarget,
+            runner_id: u64,
+            _cancel: &CancelToken,
+        ) -> bool {
+            self.deregistrations.lock().unwrap().push(runner_id);
+            if self.deregistration_fails.load(Ordering::SeqCst) {
+                return false;
+            }
+            self.remaining_runners.store(0, Ordering::SeqCst);
+            true
         }
     }
 
@@ -2331,6 +2449,104 @@ mod tests {
             !second.runtime_path().exists(),
             "failed workspace was retained"
         );
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_never_gets_a_job_is_stopped_deregistered_and_not_replaced() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+
+        // Registered and waiting, which is where it stays: the fake keeps
+        // answering the same observation, exactly as GitHub does for a runner
+        // nobody assigns work to.
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Idle);
+
+        // One second inside the ten-second idle timeout nothing happens, which
+        // is what keeps this from being a test that would pass on any clock.
+        harness.clock.advance_secs(9);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        let none_yet = harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Idle);
+        assert!(none_yet.is_empty());
+        assert_eq!(harness.processes.terminations.load(Ordering::SeqCst), 0);
+
+        // Past it, the agent ends the runner itself.
+        harness.clock.advance_secs(1);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        let concluded = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(
+            concluded.outcome(),
+            Some(&AttemptOutcome::ExitedIdleWithoutWork),
+            "a surplus runner did not fail; recording one as a failure sends an operator \
+             hunting a fault that does not exist"
+        );
+        assert_eq!(concluded.state(), AttemptState::Cleaned);
+        assert_eq!(harness.processes.terminations.load(Ordering::SeqCst), 1);
+        assert!(!attempt.runtime_path().exists());
+
+        // The registration goes with it. Without this the runner stays listed
+        // in the target's runner settings after the process it named is gone.
+        assert_eq!(
+            *harness.github.deregistrations.lock().unwrap(),
+            vec![73],
+            "the attempt's own runner id, deleted exactly once"
+        );
+
+        // And nothing is started in its place: the work it was launched for went
+        // elsewhere, so a replacement would rebuild it every idle timeout.
+        assert!(
+            replacements.is_empty(),
+            "a surplus exit must not request a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_github_will_not_delete_still_concludes_the_attempt() {
+        // The delete is best-effort by construction: the process is gone and the
+        // slot has to come back. Holding the conclusion until GitHub cooperates
+        // would leak a capacity slot on every unreachable moment.
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        harness
+            .github
+            .deregistration_fails
+            .store(true, Ordering::SeqCst);
+        harness.clock.advance_secs(11);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert_eq!(
+            *harness.github.deregistrations.lock().unwrap(),
+            vec![73],
+            "the delete was attempted"
+        );
+        let concluded = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(
+            concluded.outcome(),
+            Some(&AttemptOutcome::ExitedIdleWithoutWork),
+            "the attempt concluded anyway"
+        );
+        assert_eq!(concluded.state(), AttemptState::Cleaned);
+        assert!(!attempt.runtime_path().exists());
     }
 
     #[tokio::test]
