@@ -1,20 +1,24 @@
 // owner: f1-cli-auth-host-status
 //
 // ----------------------------------------------------------------------------
-// TWO RELEASE GATES, MEASURED OVER THE REAL BINARY'S REAL OUTPUT.
+// ONE RELEASE GATE AND ONE DELIBERATE ABSENCE, OVER THE REAL BINARY'S OUTPUT.
 // ----------------------------------------------------------------------------
-// `07-security.md`: "`auth login` prints the same statement before opening the
-//   browser." -- a gate about ORDER, so it is measured as byte offsets.
 // `08-user-workflows.md`: "Onboarding from a clean machine to an authenticated
 //   tool is at most 3 user actions (D3)." -- a gate about a NUMBER, so it is
 //   measured by counting.
 //
-// The unit tests in `crates/app/src/cli/auth.rs` measure the same two things
-// over a transcript built from the product's own writers. They cannot measure
-// the third thing, which is the one that matters most here: that `login`
-// actually calls those writers, in that order, around the network steps. That
-// is what this file adds, and it is why the fixture answers on a socket rather
-// than being substituted in.
+// The absence is the other half. `auth login` used to open with a
+// twenty-five-line permission table, above the one code the operator came to
+// type. The table is the same on every run and for every user, so repeating it
+// there taught the reader to scroll past it -- and a disclosure that is
+// habitually skipped is not one. It moved to `README.md`, which
+// `readme_disclosure.rs` pins ahead of every install command, and to
+// `auth status --permissions`, which needs no credential and no request.
+//
+// So this file asserts that the login screen is SHORT and carries none of that
+// text, and `auth_states.rs` asserts that `auth status --permissions` carries
+// all of it. Neither assertion is safe alone: the first one passing while the
+// second fails is how a disclosure gets deleted by accident.
 //
 // The action parser below is a deliberate second copy of the one in `auth.rs`'s
 // test module. `crates/app` is a `[[bin]]` with no `[lib]` target -- `a1` owns
@@ -29,9 +33,22 @@ use support::{FakeGithub, Outcome, run, runner_manager_against};
 /// D3's budget: one command, one code entry, one repository selection.
 const ONBOARDING_ACTIONS: usize = 3;
 
-const DISCLOSURE_HEADING: &str = "What you are about to grant";
-const DISCLOSURE_CLOSING: &str = "neither of which needs this project's cooperation.";
 const CRITICAL_PERMISSION: &str = "Administration: Read and write";
+
+/// Every line the old disclosure block contributed, and nothing else.
+///
+/// Each of these is asserted to be present in `auth status --permissions` by
+/// `auth_states.rs`, so an absence found here means `login` stopped printing
+/// it, not that the product stopped saying it.
+const GRANT_TEXT: [&str; 7] = [
+    CRITICAL_PERMISSION,
+    "DELETING",
+    "RENAMING",
+    "TRANSFERRING",
+    "collaborators",
+    "Repository -> Metadata",
+    "Organization -> Self-hosted runners",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Action {
@@ -185,58 +202,64 @@ fn the_action_count_would_reject_a_fourth_step() {
 }
 
 // ---------------------------------------------------------------------------
-// The D21 disclosure gate
+// The login screen carries none of the grant text
 // ---------------------------------------------------------------------------
 
-/// Measured the way `a3` measures the README's copy: the **whole** disclosure
-/// section has to end before the first thing a reader can act on.
+/// The permission table is gone from the screen it used to open.
+///
+/// Every needle is one the old block put there, and every one of them is
+/// asserted present in `auth status --permissions` by
+/// `auth_states.rs::the_permission_report_carries_the_whole_grant`. Read the
+/// two together: this one alone would also pass for a build that deleted the
+/// disclosure outright.
 #[test]
-fn the_disclosure_is_complete_before_the_browser_step() {
+fn the_login_screen_carries_no_permission_table() {
+    let (_data_dir, _github, outcome) = clean_machine_login();
+    let everything = outcome.both();
+    for needle in GRANT_TEXT {
+        assert!(
+            !everything.contains(needle),
+            "`auth login` must not print `{needle}`. The table is identical on every run and              for every user, and it sat above the one code the operator came for. It lives in              README.md and in `auth status --permissions` now. Transcript:
+{everything}"
+        );
+    }
+}
+
+/// The point of the removal, stated as a number.
+///
+/// The old transcript on a clean machine ran past forty lines before the code
+/// appeared. A budget stops "just one more paragraph" from arriving one
+/// paragraph at a time, which is how the block being removed here got its
+/// twenty-five lines in the first place.
+#[test]
+fn the_code_is_reached_within_a_dozen_lines() {
     let (_data_dir, _github, outcome) = clean_machine_login();
     let transcript = &outcome.stdout;
-
-    let heading = transcript.find(DISCLOSURE_HEADING).unwrap_or_else(|| {
-        panic!(
-            "`auth login` must print the D21 disclosure. Without it every offset below is \
-             measured against nothing. Transcript:\n{transcript}"
-        )
-    });
-    let closing = transcript.find(DISCLOSURE_CLOSING).unwrap_or_else(|| {
-        panic!(
-            "the disclosure's closing sentence marks the END of the section; a start-only \
-             check would pass for a disclosure interleaved with the login prompt. \
-             Transcript:\n{transcript}"
-        )
-    });
-    let device_page = transcript
-        .find("/login/device")
-        .expect("the browser step must print the device page");
-    let user_code = transcript
-        .find("WDJB-MJHT")
-        .expect("the browser step must print the user code");
-
-    assert!(heading < closing, "the section must be measured end to end");
+    let position = transcript
+        .lines()
+        .position(|line| line.contains("WDJB-MJHT"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the login must print the user code somewhere:
+{transcript}"
+            )
+        });
     assert!(
-        closing < device_page,
-        "the whole disclosure must end before the URL the operator will open. A reader who \
-         stops at the first thing they can act on must already have passed all of it. \
-         Transcript:\n{transcript}"
-    );
-    assert!(
-        closing < user_code,
-        "and before the code they will type. Transcript:\n{transcript}"
+        position <= 12,
+        "the user code is the only thing on this screen the operator has to act on, and it          appeared on line {position}. Everything above it is what they read first.          Transcript:
+{transcript}"
     );
 }
 
-/// The strongest form of "before": the disclosure has to be **emitted and
-/// flushed** before the device-flow request is issued, not merely printed above
-/// it in the same buffer.
+/// A login that dies before reaching GitHub still says which store it was
+/// signing in to, and still counts the command as action 1.
 ///
-/// The fixture answers nothing at all, so the very first request fails. The
-/// disclosure must still be there in full, and the transcript must contain no
-/// browser step to have preceded.
+/// The fixture answers nothing at all, so the very first request fails. What is
+/// being pinned is that the output written before the network is the *useful*
+/// output — the failure names a store the operator can act on — rather than a
+/// disclosure they have read before.
 #[test]
-fn the_disclosure_survives_a_login_that_never_reaches_github() {
+fn a_login_that_never_reaches_github_still_says_where_it_was_signing_in() {
     let data_dir = tempfile::tempdir().expect("a temporary directory");
     let github = FakeGithub::start();
     // Deliberately no routes: every request 404s.
@@ -249,57 +272,25 @@ fn the_disclosure_survives_a_login_that_never_reaches_github() {
 
     assert_ne!(outcome.code, 0, "the login cannot have succeeded");
     assert!(
-        outcome.stdout.contains(DISCLOSURE_HEADING) && outcome.stdout.contains(DISCLOSURE_CLOSING),
-        "a login that dies against GitHub must still have disclosed in full -- that is what \
-         makes the ordering structural rather than cosmetic. Transcript:\n{}\nstderr:\n{}",
+        outcome.stdout.contains("Credential store:"),
+        "the store this sign-in chose is the one thing the operator cannot see for          themselves, so it is written before the first request:
+{}
+stderr:
+{}",
         outcome.stdout,
         outcome.stderr
     );
     assert!(
         !outcome.stdout.contains("Action 2 of"),
-        "and there must be no browser step, since no device code was ever obtained:\n{}",
+        "and there must be no browser step, since no device code was ever obtained:
+{}",
         outcome.stdout
     );
     assert!(
         outcome.stdout.contains("Action 1 of"),
-        "the command the operator already ran is still action 1 of 3:\n{}",
+        "the command the operator already ran is still action 1 of 3:
+{}",
         outcome.stdout
-    );
-}
-
-/// The disclosure is not merely present: it says the thing a consent screen
-/// does not.
-#[test]
-fn the_disclosure_names_the_grant_and_its_consequences() {
-    let (_data_dir, _github, outcome) = clean_machine_login();
-    let transcript = &outcome.stdout;
-    let (start, _) = (
-        transcript
-            .find(DISCLOSURE_HEADING)
-            .expect("the disclosure must be present"),
-        (),
-    );
-    let end = transcript
-        .find(DISCLOSURE_CLOSING)
-        .expect("the disclosure must be present")
-        + DISCLOSURE_CLOSING.len();
-    let section = &transcript[start..end];
-
-    assert!(
-        section.contains(CRITICAL_PERMISSION),
-        "the exact grant must be named inside the section:\n{section}"
-    );
-    for consequence in ["DELETING", "RENAMING", "TRANSFERRING"] {
-        assert!(
-            section.contains(consequence),
-            "`07-security.md` names three consequences of `{CRITICAL_PERMISSION}`, and \
-             {consequence} is one of them. A permission table without them is the \
-             disclosure GitHub's own screen already gives.\n{section}"
-        );
-    }
-    assert!(
-        section.contains("monitor-only"),
-        "D21's accepted cost is that this binds a dashboard-only user too:\n{section}"
     );
 }
 

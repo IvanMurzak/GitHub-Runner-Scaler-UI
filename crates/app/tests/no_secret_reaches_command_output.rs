@@ -350,8 +350,8 @@ fn the_scanned_corpus_contains_what_it_should_contain() {
          mean the login never ran and the whole scan was over nothing"
     );
     assert!(
-        everything.contains("What you are about to grant"),
-        "the disclosure must be in the corpus, for the same reason"
+        everything.contains("Credential store:"),
+        "the login's own output must be in the corpus, for the same reason"
     );
     assert!(
         everything.contains("host_capacity"),

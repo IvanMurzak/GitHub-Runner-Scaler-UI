@@ -9,8 +9,11 @@ two confirmed P0/P1 findings, recorded as `REVISED`. Eight findings applied.
 **Task status:** Derived 2026-08-25 (`/taskflow-tasks`). **11 immutable
 specifications** in [`tasks/`](tasks/), 5 conflict-domain groups, waves 0-5.
 Ready for `/taskflow-execute`.
-**Implementation status:** Not started; nothing in flight.
-**Last updated:** 2026-08-25
+**Implementation status:** Not started, with one exception: **G4 was exercised
+by the owner on 2026-08-27 and D4 superseded**, and the resulting change to
+`auth login`, `auth status` and the grant text shipped on its own. See the
+progress log.
+**Last updated:** 2026-08-27
 
 **Execution isolation:** every task runs in its own git worktree under
 `.claude/worktrees/`, which this repository already uses. Group **A** is a
@@ -193,5 +196,39 @@ resolves a risk the plan flagged:
    directly and cannot name `host set-label` before `d1` writes it. Everything
    else in that file stays group A's.
 
-**Next:** `/taskflow-execute`. Wave 0 is `a1`, `b1` and `c1` in parallel; the
-first owner gate (**G4**) is not reached until wave 4.
+**2026-08-27 — G4 exercised, out of order, and D4 superseded.** The owner read
+a real `auth login` transcript on a host with 202 reachable repositories — over
+240 lines, of which 25 were the permission table and 202 were repository names —
+and decided the disclosure comes off the login screen entirely rather than
+staying on it as `a5` assumed.
+
+That is gate **G4**, granted ahead of wave 4 and granted *wider* than `a5`
+proposed. Landed on `feat/simplify-ux` as a standalone change, because it needs
+none of `a1`-`a4`: it touches `crates/app/src/cli/auth.rs`, the `auth` arm of
+the clap tree, and the three test files that assert on `auth` output.
+
+| Was | Is |
+|---|---|
+| `auth login` opens with `write_disclosure`, 25 lines | `auth login` prints no permission text; `write_disclosure` is deleted |
+| The grant is reachable only by signing in | `auth status --permissions` renders `PERMISSIONS` with no credential and no request |
+| `auth status` names every reachable repository | The count and each installation are unconditional; the roll call is `auth status --list` |
+| — | `auth login --list` does the same for the discovery it prints |
+
+`a5`'s remaining half is unaffected and still worth doing: keying the
+`repo add` disclosure on `policies.installation_id` so that a second policy
+against an acknowledged installation prints the one-line note. **Definition of
+Done items 1 and 7 no longer describe the product** — item 1 required the
+twenty-five lines to survive on `auth login`, and item 7 required `auth status`
+to print the table unconditionally rather than on `--permissions`. Read them as
+superseded by this entry; items 2-6 and 8-11 stand.
+
+The disclosure is not weaker for it, and that is asserted in both directions:
+`auth_onboarding.rs::the_login_screen_carries_no_permission_table` requires the
+text to be absent from the login screen, and
+`auth_states.rs::the_permission_report_carries_the_whole_grant` requires the
+same strings to be present in `auth status --permissions`. Either test alone
+would pass for a build that deleted the grant text outright, which is the
+failure mode a removal like this actually has.
+
+**Next:** `/taskflow-execute`. Wave 0 is `a1`, `b1` and `c1` in parallel; **G4**
+is now granted, so `a5` reaches wave 4 with only its `repo add` half left.
