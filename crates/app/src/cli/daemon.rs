@@ -467,16 +467,50 @@ impl ContactRecorder for FileContactRecorder {
     }
 }
 
+/// How long a drain may run before the daemon stops regardless.
+///
+/// # Why a drain needs a deadline at all
+///
+/// The graceful path below ends when the target reports no owned runners left.
+/// That reading is an `Option`, and the `None` is not a zero: a target GitHub
+/// could not be read contributes no allocation to the report at all
+/// (`reconcile.rs`, the `PollOutcome::Failed` arm), so `active_owned` answers
+/// `None` and the equality against `Some(0)` is false however long the drain
+/// runs. Without a second exit, a daemon whose credential GitHub has rejected
+/// drains **forever** — and since that is precisely the state a daemon sits in
+/// after a token is revoked, the practical effect was a service that could not
+/// be stopped or restarted at all, only killed. It was found that way: seven
+/// minutes of `STOP_PENDING`, still polling, on the machine this was reported
+/// from.
+///
+/// # Why stopping anyway is safe
+///
+/// Nothing is lost by stopping with runners still up. A runner this host owns
+/// survives in the journal, and startup recovery is the thing that reconciles
+/// it on the next run — adopting one still doing its job, concluding one that
+/// is gone. That path is not a fallback added for this; it is how the daemon
+/// already starts after any crash or reboot, which is the same situation.
+///
+/// Sixty seconds is chosen to be longer than a normal poll cycle, so an
+/// ordinary drain still ends the graceful way, and short enough that the
+/// service manager's own stop timeout does not expire first.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+
 async fn run_target_loop<T: TargetReconciler>(
     mut target: T,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     contacts: Arc<dyn ContactRecorder>,
 ) -> Result<(), CliError> {
     let mut draining = *shutdown.borrow();
+    let mut drain_deadline = draining.then(|| tokio::time::Instant::now() + DRAIN_DEADLINE);
     if draining {
         target.begin_drain();
     }
     loop {
+        if drain_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            // Whatever is still running is startup recovery's to adopt.
+            return Ok(());
+        }
         let report = target.reconcile().await;
         if !draining && report.failure.is_none() {
             contacts.record()?;
@@ -484,12 +518,21 @@ async fn run_target_loop<T: TargetReconciler>(
         if draining && target.active_owned(&report) == Some(0) {
             return Ok(());
         }
+        // Capped by the deadline, so a long back-off delay cannot outlast it. A
+        // drain that has run out of time sleeps zero and exits at the top.
+        let delay = drain_deadline.map_or(report.next_poll.delay, |deadline| {
+            report
+                .next_poll
+                .delay
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        });
         tokio::select! {
-            () = tokio::time::sleep(report.next_poll.delay) => {}
+            () = tokio::time::sleep(delay) => {}
             changed = shutdown.changed(), if !draining => {
                 if changed.is_err() || *shutdown.borrow() {
                     target.begin_drain();
                     draining = true;
+                    drain_deadline = Some(tokio::time::Instant::now() + DRAIN_DEADLINE);
                 }
             }
         }
@@ -639,6 +682,26 @@ impl LifecycleGithub for GithubLifecycle {
             }
         })
     }
+
+    fn deregister<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        target: &'life1 ScaleTarget,
+        runner_id: u64,
+        cancel: &'life2 CancelToken,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.inventory
+                .remove_runner(target, runner_id, cancel)
+                .await
+                .is_ok()
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -741,6 +804,25 @@ mod tests {
                 73, false,
             )))
         }
+
+        fn deregister<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            target: &'life1 ScaleTarget,
+            _runner_id: u64,
+            _cancel: &'life2 CancelToken,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            assert_eq!(
+                target, &self.expected,
+                "a target launcher deregistered another target's runner"
+            );
+            Box::pin(std::future::ready(true))
+        }
     }
 
     #[derive(Debug)]
@@ -781,6 +863,9 @@ mod tests {
         active: u16,
         draining: bool,
         busy_was_terminated: Arc<AtomicUsize>,
+        /// Models a target GitHub could not be read: `reconcile` contributes no
+        /// allocation for it, so `active_owned` can only answer "unknown".
+        unreadable: bool,
     }
 
     impl FakeTarget {
@@ -794,6 +879,7 @@ mod tests {
                     active: 0,
                     draining: false,
                     busy_was_terminated: Arc::new(AtomicUsize::new(0)),
+                    unreadable: false,
                 },
                 calls,
             )
@@ -807,6 +893,21 @@ mod tests {
                 active: 1,
                 draining: false,
                 busy_was_terminated: Arc::new(AtomicUsize::new(0)),
+                unreadable: false,
+            }
+        }
+
+        /// A target that never reports a runner count, because GitHub never
+        /// answers for it.
+        fn never_readable(policy: ScalePolicy) -> Self {
+            Self {
+                policy,
+                reports: VecDeque::new(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                active: 1,
+                draining: false,
+                busy_was_terminated: Arc::new(AtomicUsize::new(0)),
+                unreadable: true,
             }
         }
     }
@@ -840,6 +941,9 @@ mod tests {
         }
 
         fn active_owned(&self, _report: &ReconcileReport) -> Option<u16> {
+            if self.unreadable {
+                return None;
+            }
             Some(self.active)
         }
     }
@@ -1069,6 +1173,59 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         healthy_loop.await.unwrap().unwrap();
         offline_loop.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_whose_target_never_reports_a_count_still_ends() {
+        // The state a revoked credential puts every target into: `reconcile`
+        // contributes no allocation, so `active_owned` answers `None` and the
+        // graceful exit's `== Some(0)` is false on every pass, forever. Before
+        // the deadline this loop never returned, and the service could only be
+        // killed.
+        let target = FakeTarget::never_readable(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+        );
+        let calls = Arc::clone(&target.calls);
+        let terminations = Arc::clone(&target.busy_was_terminated);
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            contacts as Arc<dyn ContactRecorder>,
+        ));
+
+        tokio::task::yield_now().await;
+        stop.send(true).unwrap();
+
+        // Well inside the deadline the daemon is still draining, which is what
+        // keeps this from passing on a loop that simply exits at once.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!daemon.is_finished(), "the drain gave up before its deadline");
+
+        // Past it, it stops anyway.
+        for _ in 0..DRAIN_DEADLINE.as_secs() {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("an unreadable target must not hold the daemon open forever")
+            .unwrap()
+            .unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 2, "the drain never polled");
+        assert_eq!(
+            terminations.load(Ordering::SeqCst),
+            0,
+            "the deadline must not terminate a runner; startup recovery adopts it"
+        );
     }
 
     #[tokio::test(start_paused = true)]
