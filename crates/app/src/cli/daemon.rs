@@ -28,11 +28,13 @@ use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
+use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::jit::{JitError, JitGateway, JitRunnerRequest, RestJit};
 use runner_manager_github::rest::{CancelToken, InventoryError, InventoryGateway, RestInventory};
-use runner_manager_github::{AppRegistration, AuthenticatedClient, GithubError, UserAccessToken};
+use runner_manager_github::{
+    AppRegistration, AuthenticatedClient, CredentialRenewal, GithubError, UserAccessToken,
+};
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
-use runner_manager_platform::secrets::SecretStore as _;
 use runner_manager_platform::service::{InstallRecord, record_github_contact};
 
 use super::{CliError, Context, DaemonCommand, Failure, write_failed};
@@ -76,7 +78,8 @@ async fn run(
     }
 
     let mode = host.service_start_mode;
-    let secrets = context.secret_store(mode)?;
+    let secrets: Arc<dyn runner_manager_platform::secrets::SecretStore> =
+        Arc::from(context.secret_store(mode)?);
     let secret = secrets
         .load()
         .map_err(|source| {
@@ -93,15 +96,37 @@ async fn run(
                 "runner-manager auth login",
             )
         })?;
+    let app = context.app_registration()?;
+    // ------------------------------------------------------------------
+    // THE DAEMON IS THE REASON RENEWAL EXISTS.
+    // ------------------------------------------------------------------
+    // An access token lives eight hours and this process is meant to run for
+    // months, so without renewal it would need an interactive sign-in every
+    // working day. With it, `auth login` happens once per machine -- and,
+    // because each host renews its own pair rather than re-authorising, two
+    // machines stop evicting each other's credential.
+    //
+    // A credential with no refresh half -- which is every one issued while the
+    // App has expiration switched off -- simply never renews, and this costs it
+    // nothing.
+    let renewal: Arc<dyn CredentialRenewal> = Arc::new(super::auth::StoringRenewal::new(
+        DeviceFlow::new(app.clone(), context.endpoints().clone()).map_err(|source| {
+            CliError::new(
+                Failure::GithubUnavailable,
+                format!("cannot prepare credential renewal: {source}"),
+            )
+        })?,
+        Arc::clone(&secrets),
+    ));
     let client = Arc::new(
         AuthenticatedClient::new(
             context.endpoints().clone(),
             UserAccessToken::from_stored(secret),
             context.clock(),
         )
-        .map_err(github_failure)?,
+        .map_err(github_failure)?
+        .with_renewal(renewal),
     );
-    let app = context.app_registration()?;
     let clock = context.clock();
     let inventory = Arc::new(RestInventory::new(Arc::clone(&client), Arc::clone(&clock)));
     let jit = Arc::new(RestJit::new(Arc::clone(&client)));
@@ -207,6 +232,13 @@ async fn run(
         clock: Arc::clone(&clock),
         write: Mutex::new(()),
     });
+    // Captured before the targets are moved into their loops: this is the set a
+    // restart is measured against.
+    let served: BTreeSet<String> = managed_targets
+        .iter()
+        .filter_map(|target| target.policies.first())
+        .map(|policy| policy.target.to_string())
+        .collect();
     for target in managed_targets {
         loops.spawn(run_target_loop(
             target,
@@ -227,7 +259,7 @@ async fn run(
         .flatten()
         .and_then(|record| record.source_binary);
     let mut upgraded_to = None;
-
+    let mut restart_reason: Option<&'static str> = None;
     let early = tokio::select! {
         signal = wait_for_shutdown(service_shutdown) => {
             signal.map_err(signal_failure)?;
@@ -252,9 +284,19 @@ async fn run(
             upgraded_to = Some(version);
             None
         }
+        () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, served) => {
+            writeln!(
+                out,
+                "the set of repositories this host serves changed; finishing every running job                  before reloading"
+            )
+            .map_err(failed)?;
+            tracing::info!("the policy set changed; draining before restart");
+            restart_reason = Some("the set of repositories this host serves changed");
+            None
+        }
         result = loops.join_next() => result,
     };
-    if upgraded_to.is_some() {
+    if upgraded_to.is_some() || restart_reason.is_some() {
         let _ = upgrade.send(true);
         // Not `shutdown`: that one is bounded, and an upgrade must outlast any
         // job rather than any deadline.
@@ -266,30 +308,43 @@ async fn run(
                 )
             })??;
         }
-        let version = upgraded_to.unwrap_or_default();
-        // The copy is replaced here, by the daemon, because nothing else can:
-        // a package manager updates the source and never touches this path.
-        // The old file is renamed rather than deleted -- Windows refuses to
-        // unlink an executable that is running, which this one still is, but
-        // allows it to be renamed out of the way.
-        if let Some(source) = own_binary.as_deref()
-            && let Err(error) = replace_own_binary(source)
-        {
-            tracing::warn!(
-                %error,
-                "the new binary could not be put in place; the service manager will restart the                  version already there"
-            );
-            writeln!(out, "warning: {error}").map_err(failed)?;
+        // Only an upgrade replaces the binary. A policy-set reload restarts the
+        // same one, and putting a file in place for it would be a write nobody
+        // asked for.
+        if let Some(version) = upgraded_to {
+            // The copy is replaced here, by the daemon, because nothing else
+            // can: a package manager updates the source and never touches this
+            // path. The old file is renamed rather than deleted -- Windows
+            // refuses to unlink an executable that is running, which this one
+            // still is, but allows it to be renamed out of the way.
+            if let Some(source) = own_binary.as_deref()
+                && let Err(error) = replace_own_binary(source)
+            {
+                tracing::warn!(
+                    %error,
+                    "the new binary could not be put in place; the service manager will restart                      the version already there"
+                );
+                writeln!(out, "warning: {error}").map_err(failed)?;
+            }
+            writeln!(
+                out,
+                "every runner finished; stopping so {version} can take over"
+            )
+            .map_err(failed)?;
+            return Err(CliError::with_remedy(
+                Failure::UpgradePending,
+                format!(
+                    "a newer runner-manager ({version}) is installed and every runner this                      daemon held has finished; stopping so the service manager starts the new one"
+                ),
+                "runner-manager service status",
+            ));
         }
-        writeln!(
-            out,
-            "every runner finished; stopping so {version} can take over"
-        )
-        .map_err(failed)?;
+        let reason = restart_reason.unwrap_or("this daemon was asked to reload");
+        writeln!(out, "every runner finished; reloading").map_err(failed)?;
         return Err(CliError::with_remedy(
             Failure::UpgradePending,
             format!(
-                "a newer runner-manager ({version}) is installed and every runner this daemon                  held has finished; stopping so the service manager starts the new one"
+                "{reason}, and every runner this daemon held has finished; stopping so the                  service manager starts one that reads the new set"
             ),
             "runner-manager service status",
         ));
@@ -433,6 +488,45 @@ fn replace_own_binary(source: &std::path::Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Resolves when the *set* of targets this daemon should serve has changed.
+///
+/// # Why this is separate from re-reading a policy
+///
+/// [`TargetReconciler::refresh_policies`] keeps a running loop honest about its
+/// own policy — armed or drained, what capacity, which labels. It cannot create
+/// a loop that does not exist, and a loop owns a package cache, a launcher and
+/// a startup recovery that ran once. So a repository *added* while the daemon
+/// runs has no loop to refresh, and one *removed* leaves a loop with nothing to
+/// serve.
+///
+/// Both are handled the way an operator handles them today, minus the operator:
+/// finish what is running and let the service manager start a daemon that reads
+/// the whole set afresh. Startup recovery then adopts every runner still up,
+/// which is exactly what it exists for.
+async fn wait_for_policy_set_change(store: Arc<dyn Store>, initial: BTreeSet<String>) {
+    loop {
+        tokio::time::sleep(POLICY_SET_CHECK_INTERVAL).await;
+        let Ok(policies) = store.policies() else {
+            // Unreadable is not changed. Restarting on a transient read error
+            // would turn a blip into a drain.
+            continue;
+        };
+        let current: BTreeSet<String> = active_autoscale_targets(policies)
+            .iter()
+            .map(|group| group[0].target.to_string())
+            .collect();
+        if current != initial {
+            return;
+        }
+    }
+}
+
+/// How often the daemon looks for a repository added or removed under it.
+///
+/// Slower than a poll and faster than an operator notices: this is one local
+/// SQLite read, and it costs GitHub nothing.
+const POLICY_SET_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 async fn wait_for_shutdown(
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
@@ -625,6 +719,22 @@ trait TargetReconciler: Send + 'static {
         active_owned(report, self.policies())
     }
 
+    /// Re-read this target's policies from the journal.
+    ///
+    /// # Why a running daemon has to be told
+    ///
+    /// The policy set was read once, at startup, and never again — so every
+    /// `set-scale`, `set-capacity` and `add-label` reported success to the
+    /// operator and changed nothing until somebody restarted the service. It
+    /// was watched happening: a policy drained by the CLI went on starting
+    /// runners for three more cycles, because the daemon was still holding the
+    /// copy it had loaded minutes earlier.
+    ///
+    /// A read failure leaves the loaded policies alone. Reconciling against a
+    /// set that could not be read would be worse than reconciling against a
+    /// slightly stale one, and the next pass tries again.
+    fn refresh_policies(&mut self);
+
     /// Runners this host still holds for this target, counted from the **local
     /// journal** rather than from GitHub.
     ///
@@ -667,6 +777,29 @@ impl TargetReconciler for ManagedTarget {
 
     fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>> {
         Box::pin(self.reconciler.reconcile(&self.policies))
+    }
+
+    fn refresh_policies(&mut self) {
+        let Some(target) = self.policies.first().map(|policy| policy.target.clone()) else {
+            return;
+        };
+        let Ok(all) = self.store.policies() else {
+            tracing::warn!(
+                %target,
+                "the policy journal could not be read this pass; continuing with the set already                  loaded"
+            );
+            return;
+        };
+        let refreshed: Vec<ScalePolicy> = all
+            .into_iter()
+            .filter(|policy| policy.target == target)
+            .collect();
+        // An empty answer means the policy was removed. The loop keeps its last
+        // known copy so that `local_active` still names something and any runner
+        // still up is supervised; the target-set watch is what ends the loop.
+        if !refreshed.is_empty() {
+            self.policies = refreshed;
+        }
     }
 
     fn local_active(&self) -> Option<u16> {
@@ -775,6 +908,9 @@ async fn run_target_loop<T: TargetReconciler>(
             // Whatever is still running is startup recovery's to adopt.
             return Ok(());
         }
+        // Before deciding anything, so a policy an operator changed a moment
+        // ago governs this pass rather than the next one.
+        target.refresh_policies();
         let report = target.reconcile().await;
         if draining.is_none() && report.failure.is_none() {
             contacts.record()?;
@@ -1161,6 +1297,8 @@ mod tests {
         /// Models a target GitHub could not be read: `reconcile` contributes no
         /// allocation for it, so `active_owned` can only answer "unknown".
         unreadable: bool,
+        /// How many times the loop asked for a fresh policy set.
+        refreshes: Arc<AtomicUsize>,
     }
 
     impl FakeTarget {
@@ -1175,6 +1313,7 @@ mod tests {
                     draining: false,
                     busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                     unreadable: false,
+                    refreshes: Arc::new(AtomicUsize::new(0)),
                 },
                 calls,
             )
@@ -1189,6 +1328,7 @@ mod tests {
                 draining: false,
                 busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                 unreadable: false,
+                refreshes: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1203,6 +1343,7 @@ mod tests {
                 draining: false,
                 busy_was_terminated: Arc::new(AtomicUsize::new(0)),
                 unreadable: true,
+                refreshes: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -1245,6 +1386,10 @@ mod tests {
         /// Deliberately answers even when `unreadable`: that is the whole point
         /// of the local count, and a fake that hid it could not show the
         /// difference the upgrade drain depends on.
+        fn refresh_policies(&mut self) {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn local_active(&self) -> Option<u16> {
             Some(self.active)
         }
@@ -1641,6 +1786,47 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         healthy_loop.await.unwrap().unwrap();
         offline_loop.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_pass_re_reads_the_policy_before_deciding_anything() {
+        // Without this, a policy the operator changed governs nothing until the
+        // service is restarted -- and the CLI has already told them it worked.
+        // Watched on a real host: a drained policy went on starting runners for
+        // three more cycles.
+        let mut report = ReconcileReport::default();
+        report.next_poll.delay = Duration::from_secs(1);
+        let (target, _calls) = FakeTarget::repeating(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+            report,
+        );
+        let refreshes = Arc::clone(&target.refreshes);
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            never_upgraded(),
+            contacts as Arc<dyn ContactRecorder>,
+        ));
+
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let seen = refreshes.load(Ordering::SeqCst);
+        assert!(
+            seen >= 2,
+            "the loop must ask for a fresh policy set on every pass, not once at startup: {seen}"
+        );
+
+        stop.send(true).unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
     }
 
     #[tokio::test(start_paused = true)]

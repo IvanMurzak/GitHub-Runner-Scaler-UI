@@ -70,6 +70,47 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ------------------------------------------------------------------
+          # THIS LEG RUNS ON THE MAINTAINER'S OWN WINDOWS MACHINE.
+          # ------------------------------------------------------------------
+          # `rm-ivanpc-win-x64` is a routing label this product's own agent
+          # answers: no runner is registered until a job is queued for it, one
+          # is created on demand, and it is removed when the job ends. So this
+          # repository's Windows CI is served by the thing this repository
+          # builds, which is the most direct test of it there is.
+          #
+          # Two consequences, stated because they are real and were accepted
+          # rather than overlooked:
+          #
+          # * **The release gate depends on that machine.** `release.yml` calls
+          #   this workflow, so a host that is off, or an agent too broken to
+          #   register a runner, blocks publishing — including publishing the
+          #   fix. The recovery is to point this back at `windows-latest` for
+          #   one release.
+          # * **A fork's pull request runs here.** GitHub gates a first-time
+          #   contributor behind an approval and nothing after that, and this
+          #   product's own `set-scale` warning says untrusted pull-request
+          #   workflows should not run on a personal host. Approving a fork PR
+          #   on this repository is therefore a decision about that machine.
+          # ------------------------------------------------------------------
+          # TEMPORARILY BACK ON A HOSTED RUNNER. RESTORE AFTER 0.1.11 SHIPS.
+          # ------------------------------------------------------------------
+          # This leg belongs on `rm-ivanpc-win-x64` -- see the note below, which
+          # is still the intent. It is parked here to break a loop the note
+          # itself predicted:
+          #
+          #   the local runner serves this leg using the *installed* agent;
+          #   the fix that leg needs is the workspace layout in this branch;
+          #   the release that installs it runs this workflow to get out.
+          #
+          # So the agent could not check out a repository whose path it made too
+          # long, and the fix for that could not ship past the check it was
+          # breaking. One release on a hosted runner is the way out, exactly as
+          # the recovery note said.
+          #
+          # Restore `os: rm-ivanpc-win-x64` once 0.1.11 is installed on that
+          # host. Passing afterwards is the real proof the layout fix works,
+          # which is a better test than this branch could have run.
           - name: windows-x86_64
             os: windows-latest
           # macos-latest is Apple Silicon, so the platform the persona actually

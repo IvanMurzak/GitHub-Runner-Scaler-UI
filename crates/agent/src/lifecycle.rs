@@ -414,6 +414,39 @@ fn package_failure_is_terminal(reason: &FailureReason) -> bool {
     )
 }
 
+/// How many hex characters of the attempt id name its workspace.
+///
+/// # Why this is not the whole identifier, and why the policy is not in the path
+///
+/// Windows refuses a path over `MAX_PATH`, and the runner writes deep inside
+/// this directory: `_work/<repo>/<repo>/.git/objects/pack/pack-<40 hex>.keep`
+/// is 100 characters on its own before the repository is named twice. The
+/// layout used to add two full identifiers -- the policy's and the attempt's,
+/// 74 characters between them -- and that was enough to put a real checkout
+/// over the line. Measured, not guessed: this repository's own CI failed here
+/// three times in a row at 264 characters against a limit of 260, with
+/// `fatal: cannot write keep file ...: Filename too long`. A repository whose
+/// name is ten characters longer would have missed by fourteen.
+///
+/// The policy identifier is simply redundant -- an attempt identifier is
+/// unique on its own, and nothing reads the directory tree to find a policy's
+/// attempts, because [`crate::lifecycle::LifecycleLauncher`] asks the journal.
+/// Twelve hex characters of the attempt is 48 bits, which for the handful of
+/// directories one host holds at once is not a collision anybody will see, and
+/// the journal keeps the full identifier either way.
+///
+/// Together that is 61 characters returned to the repository name.
+const WORKSPACE_NAME_LEN: usize = 12;
+
+/// The directory name for one attempt's workspace.
+fn workspace_name(id: AttemptId) -> String {
+    let full = id.to_string();
+    full.chars()
+        .filter(|c| *c != '-')
+        .take(WORKSPACE_NAME_LEN)
+        .collect()
+}
+
 fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
     match outcome {
         AttemptOutcome::Failed {
@@ -1576,7 +1609,7 @@ impl LifecycleLauncher {
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
-        let runtime = self.runtime_root.join(policy.id.to_string()).join({
+        let runtime = self.runtime_root.join({
             #[cfg(test)]
             {
                 if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
@@ -1584,12 +1617,12 @@ impl LifecycleLauncher {
                 {
                     "mutant-shared-workspace".to_owned()
                 } else {
-                    id.to_string()
+                    workspace_name(id)
                 }
             }
             #[cfg(not(test))]
             {
-                id.to_string()
+                workspace_name(id)
             }
         });
         fs::create_dir_all(&runtime)
@@ -2410,6 +2443,55 @@ mod tests {
         assert_eq!(
             *transient.delay.0.lock().unwrap(),
             vec![Duration::from_millis(10), Duration::from_millis(20)]
+        );
+    }
+
+    /// The layout has to leave room for what the runner writes underneath it.
+    ///
+    /// Windows refuses a path over `MAX_PATH`, and this product's own CI hit
+    /// that: 264 characters against a limit of 260, failing three checkout
+    /// retries with `Filename too long`. The two identifiers in the old layout
+    /// cost 74 characters between them for no benefit -- an attempt id is
+    /// unique on its own.
+    #[test]
+    fn a_workspace_leaves_room_for_the_deepest_path_a_checkout_writes() {
+        const MAX_PATH: usize = 260;
+        // The real root on the machine this was found on.
+        let root = r"C:\Users\IvanD\AppData\Local\IvanMurzak\runner-manager\data\runtime";
+        // What `actions/checkout` writes at its deepest: the work directory,
+        // the repository named twice, and a pack keep-file with a 40-character
+        // object name.
+        let repo = "GitHub-Runner-Scaler-UI";
+        let deepest = format!(
+            r"_work\{repo}\{repo}\.git\objects\pack\pack-{}.keep",
+            "0".repeat(40)
+        );
+
+        let name = workspace_name(AttemptId::new_random());
+        assert_eq!(name.len(), WORKSPACE_NAME_LEN, "{name}");
+        assert!(
+            name.chars().all(|c| c.is_ascii_hexdigit()),
+            "a directory name must not carry the identifier's dashes: {name}"
+        );
+
+        let full = format!(r"{root}\{name}\{deepest}");
+        assert!(
+            full.len() < MAX_PATH,
+            "the deepest path a checkout writes must fit: {} characters, limit {MAX_PATH}",
+            full.len()
+        );
+
+        // The discriminator: the layout this replaced does not fit, so a test
+        // that passed for both would be proving nothing.
+        let old = format!(
+            r"{root}\{}\{}\{deepest}",
+            PolicyId::new_random(),
+            AttemptId::new_random()
+        );
+        assert!(
+            old.len() > MAX_PATH,
+            "the old layout is supposed to be the thing that did not fit: {} characters",
+            old.len()
         );
     }
 

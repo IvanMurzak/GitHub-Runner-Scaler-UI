@@ -69,6 +69,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode};
 use runner_manager_domain::model::{Clock, Org, OwnerRepo, Timestamp};
 
@@ -374,6 +375,56 @@ pub struct UserAccessToken {
     token: SecretString,
     token_type: String,
     scope: Option<String>,
+    /// The renewal half, when the App issues one.
+    ///
+    /// # Why this is an `Option` rather than a second type
+    ///
+    /// Whether a credential can renew itself is a setting on the *App*, not a
+    /// property of this build: an App with user-token expiration off returns an
+    /// access token and nothing else, and one with it on returns a pair. Both
+    /// shapes reach this type, and a host holding either must keep working --
+    /// otherwise flipping that setting would strand every installation that had
+    /// not upgraded, which for a published product is an outage nobody asked
+    /// for.
+    ///
+    /// `None` is therefore not a defect. It is the credential this product held
+    /// for its whole life until now: non-expiring, unrenewable, replaced only
+    /// by an interactive `auth login`.
+    renewal: Option<Renewal>,
+}
+
+/// What a token needs in order to replace itself without a person.
+#[derive(Clone)]
+pub struct Renewal {
+    refresh_token: SecretString,
+    /// When the access token stops being accepted, if it was stated.
+    pub access_expires_at: Option<DateTime<Utc>>,
+    /// When the *refresh* token stops working. Past this, only an interactive
+    /// sign-in helps -- and it is six months from the last renewal, not from
+    /// the first sign-in, so a host that runs at all never reaches it.
+    pub refresh_expires_at: Option<DateTime<Utc>>,
+}
+
+impl Renewal {
+    /// The refresh token itself. Kept behind a method for the same reason the
+    /// access token is: it is the more dangerous half of the pair, because it
+    /// mints access tokens indefinitely.
+    #[must_use]
+    pub fn refresh_token(&self) -> &SecretString {
+        &self.refresh_token
+    }
+}
+
+impl fmt::Debug for Renewal {
+    /// Written by hand, like [`UserAccessToken`]'s, and for a stronger reason:
+    /// a leaked refresh token does not expire in eight hours.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Renewal")
+            .field("refresh_token", &"[redacted]")
+            .field("access_expires_at", &self.access_expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .finish()
+    }
 }
 
 impl UserAccessToken {
@@ -383,6 +434,7 @@ impl UserAccessToken {
             token,
             token_type: "bearer".to_string(),
             scope: None,
+            renewal: None,
         }
     }
 
@@ -398,13 +450,126 @@ impl UserAccessToken {
             token,
             token_type,
             scope,
+            renewal: None,
         }
+    }
+
+    /// Attach the renewal half, if the App issued one.
+    ///
+    /// The two durations are seconds-from-now as GitHub states them, turned
+    /// into instants here so that nothing downstream has to remember when
+    /// "now" was.
+    #[must_use]
+    pub(crate) fn with_renewal(
+        mut self,
+        refresh_token: Option<SecretString>,
+        access_expires_in: Option<u64>,
+        refresh_expires_in: Option<u64>,
+    ) -> Self {
+        self.renewal = refresh_token.map(|refresh_token| {
+            let at = |secs: Option<u64>| {
+                secs.and_then(|s| i64::try_from(s).ok())
+                    .and_then(|s| Utc::now().checked_add_signed(chrono::TimeDelta::seconds(s)))
+            };
+            Renewal {
+                refresh_token,
+                access_expires_at: at(access_expires_in),
+                refresh_expires_at: at(refresh_expires_in),
+            }
+        });
+        self
+    }
+
+    /// The renewal half, when there is one.
+    #[must_use]
+    pub fn renewal(&self) -> Option<&Renewal> {
+        self.renewal.as_ref()
     }
 
     /// Rebuild the credential `d2` handed back, for `f1`.
     #[must_use]
     pub fn from_stored(token: SecretString) -> Self {
-        Self::new(token)
+        Self::from_stored_document(&token)
+    }
+
+    /// Reads whichever of the two stored shapes is there.
+    ///
+    /// # Why the store holds a document now, and why the old shape still loads
+    ///
+    /// A renewable credential is three values -- access token, refresh token,
+    /// and when each stops working -- where there used to be one string. The
+    /// secret store takes one opaque value per host, so the document goes
+    /// inside it rather than the store growing a schema: no platform change, no
+    /// migration step, and the same DPAPI blob or keychain item as before.
+    ///
+    /// **A value that is not this document is a bare access token**, which is
+    /// what every host stored until now. That is not a fallback for tidiness:
+    /// upgrading must not log anybody out, and the App's expiration setting can
+    /// be turned on -- or back off -- without stranding hosts that are mid-way
+    /// through either. A token has no internal structure to confuse with JSON,
+    /// so the discrimination is unambiguous.
+    #[must_use]
+    pub fn from_stored_document(stored: &SecretString) -> Self {
+        #[derive(Deserialize)]
+        struct Document {
+            access_token: String,
+            #[serde(default)]
+            refresh_token: Option<String>,
+            #[serde(default)]
+            access_expires_at: Option<DateTime<Utc>>,
+            #[serde(default)]
+            refresh_expires_at: Option<DateTime<Utc>>,
+        }
+
+        match serde_json::from_str::<Document>(stored.expose_secret()) {
+            Ok(document) => Self {
+                token: SecretString::from(document.access_token),
+                token_type: "bearer".to_string(),
+                scope: None,
+                renewal: document.refresh_token.map(|refresh_token| Renewal {
+                    refresh_token: SecretString::from(refresh_token),
+                    access_expires_at: document.access_expires_at,
+                    refresh_expires_at: document.refresh_expires_at,
+                }),
+            },
+            Err(_) => Self::new(stored.clone()),
+        }
+    }
+
+    /// The value to hand the secret store.
+    ///
+    /// Always the document, even for a credential with no renewal half: one
+    /// shape written means one shape to reason about, and reading still accepts
+    /// the bare token that older versions wrote.
+    #[must_use]
+    pub fn to_stored_document(&self) -> SecretString {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            access_token: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh_token: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            access_expires_at: Option<DateTime<Utc>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh_expires_at: Option<DateTime<Utc>>,
+        }
+
+        let document = Document {
+            access_token: self.token.expose_secret(),
+            refresh_token: self
+                .renewal
+                .as_ref()
+                .map(|r| r.refresh_token.expose_secret()),
+            access_expires_at: self.renewal.as_ref().and_then(|r| r.access_expires_at),
+            refresh_expires_at: self.renewal.as_ref().and_then(|r| r.refresh_expires_at),
+        };
+        // Serialising a struct of `&str` cannot fail; the fallback keeps the
+        // access token usable rather than inventing an error path nobody can
+        // act on.
+        SecretString::from(
+            serde_json::to_string(&document)
+                .unwrap_or_else(|_| self.token.expose_secret().to_string()),
+        )
     }
 
     /// The token itself. Every call site of this is a place a secret can escape,
@@ -936,7 +1101,17 @@ struct LockoutState {
 pub struct AuthenticatedClient {
     http: reqwest::Client,
     endpoints: Endpoints,
-    credential: UserAccessToken,
+    /// Swappable, because a renewable credential replaces itself while this
+    /// client is in use. A `Mutex` rather than a lock-free cell: it is read
+    /// once per request and written once every eight hours, so contention is
+    /// not the concern -- being obviously correct is.
+    credential: std::sync::Mutex<UserAccessToken>,
+    /// How a credential replaces itself, when it can.
+    ///
+    /// `None` for a client whose credential has no renewal half, which is every
+    /// client until an App turns user-token expiration on, and for the paths
+    /// that hold a token for one call and never outlive its eight hours.
+    renewal: Option<Arc<dyn CredentialRenewal>>,
     clock: Arc<dyn Clock>,
 
     /// Bumped once per completed re-validation. A caller that took a `401`
@@ -991,7 +1166,13 @@ impl fmt::Debug for AuthenticatedClient {
         };
         f.debug_struct("AuthenticatedClient")
             .field("api_base", &self.endpoints.api_base.as_str())
-            .field("credential", &self.credential)
+            .field(
+                "credential",
+                &self
+                    .credential
+                    .try_lock()
+                    .map_or("[in use]", |_| "[redacted]"),
+            )
             .field(
                 "revalidations_performed",
                 &self.revalidations_performed.load(Ordering::Relaxed),
@@ -999,6 +1180,31 @@ impl fmt::Debug for AuthenticatedClient {
             .field("locked_out", &locked_out)
             .finish_non_exhaustive()
     }
+}
+
+/// How a credential replaces itself.
+///
+/// # Why this is a port rather than a method
+///
+/// Renewal is two acts that must happen in one order: exchange the refresh
+/// token with GitHub, then **persist the new pair before anything uses it**.
+/// GitHub rotates on use -- the old pair dies the instant the new one is
+/// issued -- so a response that is used but not stored leaves the host holding
+/// a credential it will forget, and the one it forgot is already dead. There
+/// is no retry: a spent refresh token answers `incorrect_client_credentials`,
+/// a message about the client id and secret that is about neither.
+///
+/// The exchange belongs to `c2` and the store belongs to `d2`, and this crate
+/// owns neither. So the ordering lives with whoever implements this, in one
+/// place, rather than being a rule each caller has to remember.
+#[async_trait::async_trait]
+pub trait CredentialRenewal: fmt::Debug + Send + Sync {
+    /// Exchange `refresh_token` for a fresh pair and persist it.
+    ///
+    /// # Errors
+    /// Any failure; the caller treats every one the same way, by keeping the
+    /// credential it has and letting the next `401` try again.
+    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String>;
 }
 
 impl AuthenticatedClient {
@@ -1027,7 +1233,8 @@ impl AuthenticatedClient {
         Self {
             http,
             endpoints,
-            credential,
+            credential: std::sync::Mutex::new(credential),
+            renewal: None,
             clock,
             revalidation_generation: AtomicU64::new(0),
             revalidation_gate: tokio::sync::Mutex::new(()),
@@ -1128,6 +1335,83 @@ impl AuthenticatedClient {
     /// Every variant of [`GithubError`].
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
         self.send(&ApiRequest::get(path)).await?.json()
+    }
+
+    /// The access token to send, as a string, for exactly one request.
+    ///
+    /// Cloned out of the lock rather than borrowed through it: the value is
+    /// about to go into a header, and holding the lock across the request would
+    /// serialise every call in the process behind one mutex.
+    fn bearer(&self) -> String {
+        self.credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .secret()
+            .expose_secret()
+            .to_string()
+    }
+
+    /// Attach a way for this client's credential to replace itself.
+    #[must_use]
+    pub fn with_renewal(mut self, renewal: Arc<dyn CredentialRenewal>) -> Self {
+        self.renewal = Some(renewal);
+        self
+    }
+
+    /// Replace the credential with a freshly renewed pair, once, however many
+    /// callers asked at the same moment.
+    ///
+    /// Answers whether the credential in hand is now a different one, which is
+    /// the caller's cue to retry. `false` means renewal was impossible or
+    /// failed, and the `401` stands.
+    ///
+    /// # Ordering
+    ///
+    /// The implementation of [`CredentialRenewal::renew`] persists before
+    /// returning, so by the time the swap below happens the new pair is already
+    /// durable. A crash between the two loses nothing: the store holds the pair
+    /// that works, and the next start reads it.
+    async fn renew_once(&self) -> bool {
+        let Some(renewal) = self.renewal.clone() else {
+            return false;
+        };
+        let before = self.revalidation_generation.load(Ordering::SeqCst);
+        let _gate = self.revalidation_gate.lock().await;
+        if self.revalidation_generation.load(Ordering::SeqCst) != before {
+            // Somebody renewed while this caller queued. Retrying is right;
+            // renewing again would burn the pair they just minted.
+            return true;
+        }
+
+        let refresh = {
+            let guard = self
+                .credential
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.renewal().map(|r| r.refresh_token().clone())
+        };
+        let Some(refresh) = refresh else {
+            return false;
+        };
+
+        match renewal.renew(&refresh).await {
+            Ok(fresh) => {
+                *self
+                    .credential
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+                self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
+                tracing::info!("the user access token was renewed");
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the user access token could not be renewed; an interactive sign-in may be                      required"
+                );
+                false
+            }
+        }
     }
 
     /// Serialize, `POST`, and deserialize in one step.
@@ -1365,6 +1649,35 @@ impl AuthenticatedClient {
         &self,
         request: &ApiRequest,
     ) -> Result<ApiResponse, GithubError> {
+        // ------------------------------------------------------------------
+        // RENEWAL COMES FIRST, AND IT DID NOT USED TO EXIST.
+        // ------------------------------------------------------------------
+        // This method's documentation once said a `401` could only ever be
+        // re-validated, never renewed, because renewing needs a confidential
+        // client credential and a published binary cannot carry one. The first
+        // half of that is wrong: GitHub requires one *"unless the user access
+        // token was generated using the device flow"*, and this product's
+        // always are. Verified against live GitHub before this was written.
+        //
+        // So a credential that carries a refresh token replaces itself here,
+        // silently, and the caller's request is retried with the new one. That
+        // is what lets an eight-hour token serve a daemon that runs for months
+        // -- and what lets two machines hold their own credentials at once,
+        // because each renews its own pair instead of re-authorising and
+        // revoking the other's.
+        //
+        // A credential with no refresh token falls through to exactly the
+        // behaviour that was here before.
+        if self.renew_once().await {
+            let second = self.send_raw(request).await?;
+            return match self.classify(request, &second, Attempt::Retry) {
+                Classified::Ok => Ok(second),
+                // The renewed credential was rejected too. Nothing here can
+                // help: this is a sign-in, not a token, that has gone.
+                Classified::Unauthorized => Err(GithubError::AuthenticationFailed),
+                Classified::Error(err) => Err(err),
+            };
+        }
         match self.revalidate_after_unauthorized().await? {
             Revalidation::Rejected => {
                 tracing::warn!(
@@ -1563,7 +1876,7 @@ impl AuthenticatedClient {
             // never logged, and `reqwest` does not render headers in its errors.
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", self.credential.secret().expose_secret()),
+                format!("Bearer {}", self.bearer()),
             );
         if !request.query.is_empty() {
             builder = builder.query(&request.query);
@@ -2439,6 +2752,53 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+
+    /// Upgrading must not log anybody out, and the App's expiration setting must
+    /// be safe to turn on -- or back off -- with hosts mid-way through either.
+    #[test]
+    fn both_stored_shapes_load_and_a_pair_survives_a_round_trip() {
+        // What every host stored before renewal existed: a bare token.
+        let legacy = UserAccessToken::from_stored_document(&SecretString::from("ghu_legacy123"));
+        assert_eq!(legacy.secret().expose_secret(), "ghu_legacy123");
+        assert!(
+            legacy.renewal().is_none(),
+            "a bare token has no renewal half, and inventing one would make the client try to              refresh a credential the App never issued a refresh token for"
+        );
+
+        // A pair, written and read back.
+        let pair = UserAccessToken::new(SecretString::from("ghu_new")).with_renewal(
+            Some(SecretString::from("ghr_new")),
+            Some(28_800),
+            Some(15_897_600),
+        );
+        let stored = pair.to_stored_document();
+        let read = UserAccessToken::from_stored_document(&stored);
+        assert_eq!(read.secret().expose_secret(), "ghu_new");
+        let renewal = read.renewal().expect("the pair survives the round trip");
+        assert_eq!(renewal.refresh_token().expose_secret(), "ghr_new");
+        assert!(renewal.access_expires_at.is_some());
+        assert!(renewal.refresh_expires_at.is_some());
+
+        // A credential with no renewal still writes the document shape, and
+        // still reads back as having none.
+        let bare_round_trip = UserAccessToken::from_stored_document(&legacy.to_stored_document());
+        assert_eq!(bare_round_trip.secret().expose_secret(), "ghu_legacy123");
+        assert!(bare_round_trip.renewal().is_none());
+    }
+
+    /// The refresh token is the more dangerous half -- it mints access tokens
+    /// for six months -- so it must not reach a log through `Debug`.
+    #[test]
+    fn a_refresh_token_never_appears_in_debug_output() {
+        let pair = UserAccessToken::new(SecretString::from("ghu_x")).with_renewal(
+            Some(SecretString::from("ghr_SUPERSECRET")),
+            Some(1),
+            Some(2),
+        );
+        let rendered = format!("{:?}", pair.renewal().expect("a renewal"));
+        assert!(!rendered.contains("ghr_SUPERSECRET"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
     use super::*;
     use crate::testing::{FIXTURE_TOKEN, Script, TestClock, installations_body, repositories_body};
     use serde_json::json;
@@ -3897,7 +4257,19 @@ mod tests {
     /// Spelled in halves so that this file's own source does not trip the scan
     /// it runs: normalising `concat!("refresh", "token")` leaves the
     /// quote-comma-quote between the halves, so no needle ever appears whole.
-    const RENEWAL: &[&str] = &[concat!("refresh", "token")];
+    // The renewal guard that used to live here is gone, and its absence is the
+    // point. It forbade this crate from naming a refresh token at all, on the
+    // reasoning that the published App opts out of user-token expiration "so
+    // GitHub issues nothing to renew". That reasoning rested on a second claim
+    // -- that renewing needs a confidential client credential -- which GitHub's
+    // own documentation contradicts for the device flow, and which was then
+    // disproved against live GitHub: a refresh exchange with `client_id` alone
+    // answers `200`.
+    //
+    // What the guard below still forbids is the part that was always true and
+    // is the reason renewal is safe here: no confidential credential in this
+    // crate. Renewal was added *without* one, so the remaining half of this
+    // scan is now evidence for the design rather than against it.
     const CONFIDENTIAL: &[&str] = &[concat!("client", "secret"), concat!("app", "secret")];
 
     const MANIFEST: (&str, &str) = ("Cargo.toml", include_str!("../Cargo.toml"));
@@ -4054,18 +4426,7 @@ mod tests {
     /// is a claim about the directory, so it is checked against the directory —
     /// see [`the_confidential_credential_scan_covers_every_source_file`].
     #[test]
-    fn no_renewal_path_and_no_confidential_credential_in_this_crate() {
-        for &(name, source) in SOURCES_OWNED_BY_C2 {
-            let haystack = normalise(name, source);
-            for forbidden in RENEWAL {
-                assert!(
-                    !haystack.contains(forbidden),
-                    "{name} names {forbidden:?} in some spelling: the published App opts out \
-                     of user-token expiration, so GitHub issues nothing to renew (D3)"
-                );
-            }
-        }
-
+    fn no_confidential_credential_in_this_crate() {
         for &(name, source) in CRATE_SOURCES.iter().chain(std::iter::once(&MANIFEST)) {
             let haystack = normalise(name, source);
             for forbidden in CONFIDENTIAL {

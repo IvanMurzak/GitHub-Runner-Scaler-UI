@@ -25,6 +25,8 @@ name = "runner-manager"
 path = "src/main.rs"
 
 [dependencies]
+# Needed by `StoringRenewal`, which implements `c2`'s `CredentialRenewal`.
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
