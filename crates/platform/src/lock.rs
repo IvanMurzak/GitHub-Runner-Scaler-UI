@@ -159,10 +159,11 @@ impl fmt::Display for LockHolder {
 pub enum LockError {
     /// Somebody else has it.
     #[error(
-        "{kind} ({}) is already held on this host by {}. {}",
+        "{kind} ({}) is already held on this host by {}. {} [refused with {}]",
         path.display(),
-        describe(holder),
-        kind.advice()
+        describe(holder.as_deref()),
+        kind.advice(),
+        describe_refusal(*refused_with)
     )]
     Held {
         /// Which lock.
@@ -173,7 +174,29 @@ pub enum LockError {
         /// Who holds it, when the record could be read. `None` is not the same
         /// as "nobody": it means the holder had not finished identifying
         /// itself, which is a race of microseconds and not a reason to proceed.
-        holder: Option<LockHolder>,
+        ///
+        /// Boxed because this variant travels inside a `Result` that `e1`
+        /// carries across a `spawn_blocking` boundary, and an inline
+        /// `LockHolder` makes that `Err` large enough for clippy's
+        /// `result_large_err` to refuse the build. The indirection costs one
+        /// allocation on a path that has already lost a lock race.
+        holder: Option<Box<LockHolder>>,
+        /// The operating system code the refusal actually carried.
+        ///
+        /// # Why an errno is in a user-facing message
+        ///
+        /// This variant has two causes that look identical once it is
+        /// constructed: the lock is genuinely somebody else's, or the operating
+        /// system said "would block" for a reason this code does not model. The
+        /// second is not hypothetical — a refusal that no reading of this
+        /// module explains has been seen in CI on both Unix platforms, for a
+        /// lock the same process had just released, and there was nothing in
+        /// the message to tell the two apart.
+        ///
+        /// Carrying the raw code costs a few characters and turns the next
+        /// occurrence from a mystery into a report. `None` where the platform
+        /// excluded at the open rather than at the lock call.
+        refused_with: Option<i32>,
     },
 
     /// The lock file could not be opened, read, or written.
@@ -199,7 +222,7 @@ pub enum LockError {
 }
 
 /// Renders the holder half of a [`LockError::Held`] message.
-fn describe(holder: &Option<LockHolder>) -> String {
+fn describe(holder: Option<&LockHolder>) -> String {
     match holder {
         Some(holder) => holder.to_string(),
         None => "a process that has not finished identifying itself".to_string(),
@@ -279,10 +302,11 @@ impl HostLock {
         // Best effort in both contention branches below: an unreadable or
         // half-written record makes the message vaguer, and is never a reason
         // to behave as if the lock were free.
-        let held = |path: &Path| LockError::Held {
+        let held = |path: &Path, refused_with: Option<i32>| LockError::Held {
             kind,
             path: path.to_path_buf(),
-            holder: read_holder(path).ok().flatten(),
+            holder: read_holder(path).ok().flatten().map(Box::new),
+            refused_with,
         };
 
         let file = match open_for_locking(path) {
@@ -290,12 +314,15 @@ impl HostLock {
             // Windows excludes at the open itself, through the share mode, so
             // this is where contention surfaces there. On Unix nothing fails
             // the open for contention and this arm never fires.
-            Err(source) if sys::is_contention(&source) => return Err(held(path)),
+            Err(source) if sys::is_contention(&source) => {
+                return Err(held(path, source.raw_os_error()));
+            }
             Err(source) => return Err(io_error(path, source)),
         };
 
-        if !sys::try_lock(&file).map_err(|source| io_error(path, source))? {
-            return Err(held(path));
+        match sys::try_lock(&file).map_err(|source| io_error(path, source))? {
+            Acquired::Yes => {}
+            Acquired::No { refused_with } => return Err(held(path, refused_with)),
         }
 
         let lock = Self {
@@ -428,6 +455,28 @@ fn io_error(path: &Path, source: std::io::Error) -> LockError {
 /// waiting on the lock is not noticeably delayed.
 const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
+/// What a non-blocking lock attempt answered, and — when it refused — why.
+///
+/// A bare `bool` threw away the one fact that would explain a refusal nobody
+/// can account for. See [`LockError::Held::refused_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Windows excludes at the open, so its `try_lock` can only ever answer `Yes`
+// and the refusal arm is genuinely unreachable there. It is not dead code — it
+// is the whole answer on the two platforms that lock after opening.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) enum Acquired {
+    Yes,
+    No { refused_with: Option<i32> },
+}
+
+/// Renders the refusal code for an operator, without pretending to interpret it.
+fn describe_refusal(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("os error {code}"),
+        None => "the open itself, which is how this platform excludes".to_string(),
+    }
+}
+
 fn open_for_locking(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     // `truncate(false)` is explicit rather than implied: the previous holder's
@@ -493,8 +542,8 @@ mod sys {
     /// this process is the exclusive writer, and when the process ends — for
     /// any reason, including a crash — the kernel closes the handle and the
     /// next acquirer's open succeeds.
-    pub(super) fn try_lock(_file: &File) -> io::Result<bool> {
-        Ok(true)
+    pub(super) fn try_lock(_file: &File) -> io::Result<super::Acquired> {
+        Ok(super::Acquired::Yes)
     }
 
     /// Windows reports a share-mode conflict as `ERROR_SHARING_VIOLATION`, and
@@ -528,17 +577,19 @@ mod sys {
     /// closed by the process, so an unrelated `read_holder` in the same process
     /// would silently release the agent's lock. `flock` locks belong to the
     /// open file description and are immune to that.
-    pub(super) fn try_lock(file: &File) -> io::Result<bool> {
+    pub(super) fn try_lock(file: &File) -> io::Result<super::Acquired> {
         // SAFETY: `flock` takes a file descriptor and a flag word and touches
         // no memory this program owns. The descriptor is valid for the life of
         // `file`, which outlives the call.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
-            return Ok(true);
+            return Ok(super::Acquired::Yes);
         }
         let error = io::Error::last_os_error();
         if is_contention(&error) {
-            return Ok(false);
+            return Ok(super::Acquired::No {
+                refused_with: error.raw_os_error(),
+            });
         }
         Err(error)
     }
@@ -762,7 +813,7 @@ mod tests {
         // The microsecond between taking the lock and writing the record. The
         // message gets vaguer; the exclusion does not, and the wording must not
         // leave a reader thinking the lock might be free.
-        let no_record = describe(&None);
+        let no_record = describe(None);
         assert!(
             no_record.contains("not finished identifying itself"),
             "an unidentified holder must still read as a holder: {no_record}"
@@ -772,11 +823,28 @@ mod tests {
             kind: LockKind::SingleInstance,
             path: PathBuf::from("/var/lib/runner-manager/state/agent.lock"),
             holder: None,
+            refused_with: Some(35),
         };
         let message = error.to_string();
         assert!(message.contains("already held"), "{message}");
         assert!(message.contains("agent.lock"), "{message}");
         assert!(message.contains("Stop the other agent"), "{message}");
+        // The refusal code is in the message because this variant has two
+        // causes that are otherwise indistinguishable once constructed: a lock
+        // that really is somebody else's, and a refusal this module does not
+        // model. Without it, the second reads exactly like the first.
+        assert!(message.contains("os error 35"), "{message}");
+
+        let at_open = LockError::Held {
+            kind: LockKind::SingleInstance,
+            path: PathBuf::from("/var/lib/runner-manager/state/agent.lock"),
+            holder: None,
+            refused_with: None,
+        };
+        assert!(
+            at_open.to_string().contains("the open itself"),
+            "a platform that excludes at the open says so rather than showing a bare `None`: {at_open}"
+        );
     }
 
     #[test]

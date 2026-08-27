@@ -158,6 +158,14 @@ pub struct ProcessIdentity {
     start_token: String,
 }
 
+/// The start token of a child that was gone before its identity could be read.
+///
+/// Deliberately not a value any platform produces: every real token is
+/// `<platform>:<instant>`, so this can never compare equal to a live process
+/// and never claims a start instant that was not observed. See
+/// [`ProcessIdentity::of_child`].
+const EXITED_BEFORE_IDENTIFIED: &str = "exited-before-identified";
+
 /// What a recorded [`ProcessIdentity`] turns out to refer to now.
 ///
 /// # One journal entry can answer differently on different platforms
@@ -241,7 +249,38 @@ impl ProcessIdentity {
     /// holds the child handle, so the PID cannot have been reused underneath
     /// it.
     fn of_child(pid: u32) -> Result<Self, ProcessError> {
-        Self::read(pid, LivenessFilter::IncludeExited)
+        match Self::read(pid, LivenessFilter::IncludeExited) {
+            Ok(identity) => Ok(identity),
+            // ------------------------------------------------------------
+            // THE RACE THIS FUNCTION EXISTS FOR, ON THE ONE PLATFORM WHERE
+            // `IncludeExited` IS NOT ENOUGH TO SURVIVE IT.
+            // ------------------------------------------------------------
+            // The filter above covers a *zombie*: exited, unreaped, still
+            // holding its PID. macOS has a narrower window than that.
+            // `proc_pidinfo(PROC_PIDTBSDINFO)` answers `ESRCH` for a child
+            // that has only just gone, and the filter never gets a say --
+            // so a program that exits fast enough could not be launched at
+            // all, which is the exact failure the documentation above says
+            // this function prevents. It cost two CI runs before it was
+            // recognised as that rather than as noise.
+            //
+            // A start token is a claim about *when a process started*, used
+            // to notice a PID that has since been reused. There is no such
+            // instant to read here, and inventing one would be a lie a later
+            // comparison could believe. This sentinel is the honest value:
+            // it matches nothing, so [`ProcessIdentity::classify`] answers
+            // `Gone` for a PID nobody holds and `PidRecycled` for one
+            // somebody else has taken -- and `PidRecycled` is refused rather
+            // than signalled, which is the safe half of the pair.
+            //
+            // Only the parent reaches this: it holds the child handle, so the
+            // PID cannot already belong to somebody else at this moment.
+            Err(ProcessError::NoSuchProcess { .. }) => Ok(Self {
+                pid,
+                start_token: EXITED_BEFORE_IDENTIFIED.to_string(),
+            }),
+            Err(other) => Err(other),
+        }
     }
 
     fn read(pid: u32, filter: LivenessFilter) -> Result<Self, ProcessError> {
@@ -1689,6 +1728,33 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child can be gone before its parent reads its identity, and launching
+    /// it must still succeed. macOS is where this bites: `proc_pidinfo` answers
+    /// `ESRCH` for a child that has only just exited, so `IncludeExited` -- which
+    /// covers a zombie -- never gets a say, and the spawn failed outright.
+    #[test]
+    fn a_child_that_is_already_gone_is_still_given_an_identity() {
+        let identity = ProcessIdentity::of_child(u32::MAX).expect(
+            "a parent holding the handle must always end up with an identity, even for a              child that has already exited",
+        );
+
+        // The sentinel is a claim about nothing, deliberately: there is no
+        // start instant to read, and inventing one would be a lie that a later
+        // comparison could believe.
+        assert_eq!(
+            identity.classify(None),
+            Adoption::Gone,
+            "a PID nobody holds is gone"
+        );
+        assert!(
+            matches!(
+                identity.classify(Some("macos:1.000000".to_string())),
+                Adoption::PidRecycled { .. }
+            ),
+            "and a PID somebody else has taken is recycled -- which is refused, never signalled"
+        );
+    }
 
     /// A program that exits immediately, on every supported platform.
     fn quick_exit() -> SpawnSpec {

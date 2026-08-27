@@ -474,11 +474,24 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Sign in with GitHub's device flow.
-    Login,
+    Login(AuthLoginArgs),
     /// Report the credential's state and what it can reach.
     Status,
     /// Purge the local credential.
     Logout,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Which start mode's credential store to sign in to.
+    ///
+    /// The credential lives in a store chosen by how the agent will start, and
+    /// the two are different places: `boot` is machine-scoped and needs
+    /// privilege, `login` is your own. A daemon reads only the one its start
+    /// mode names, so signing in to the wrong one leaves a valid credential the
+    /// service cannot see. Defaults to the mode this host already records.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: Option<StartAt>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -541,6 +554,14 @@ pub struct RepoAddArgs {
     /// always present and is never replaced by these.
     #[arg(long = "label", value_name = "LABEL")]
     pub labels: Vec<String>,
+    /// Arm the policy in the same command, instead of a separate `set-scale`.
+    ///
+    /// Creation stays non-arming by default: without this the policy is
+    /// `pending` and starts nothing, which is what makes `repo add` safe to run
+    /// before you have decided. This flag is the same explicit act `set-scale`
+    /// performs, spelled on the line that created the policy.
+    #[arg(long)]
+    pub enable: bool,
 }
 
 #[derive(Debug, Args)]
@@ -606,6 +627,9 @@ pub struct OrgAddArgs {
     /// An extra `runs-on` label this policy's runners answer, repeatable.
     #[arg(long = "label", value_name = "LABEL")]
     pub labels: Vec<String>,
+    /// Arm the policy in the same command, instead of a separate `set-scale`.
+    #[arg(long)]
+    pub enable: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1693,7 +1717,7 @@ mod tests {
         let run_one = |command: &str| -> CliError {
             let out: &mut dyn Write = &mut BrokenPipe;
             let outcome = match command {
-                "auth login" => auth::login(&context, Styling::plain(), out),
+                "auth login" => auth::login(&context, None, Styling::plain(), out),
                 "auth status" => auth::status(&context, Styling::plain(), out),
                 "auth logout" => auth::logout(&context, out),
                 "host set-capacity" => {

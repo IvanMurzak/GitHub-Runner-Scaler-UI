@@ -25,7 +25,7 @@ use runner_manager_agent::reconcile::{
 };
 use runner_manager_domain::attempt::{FailureReason, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget};
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
 use runner_manager_github::jit::{JitError, JitGateway, JitRunnerRequest, RestJit};
@@ -585,8 +585,27 @@ impl Store for TargetRecoveryStore {
     }
 }
 
+/// The policies this daemon supervises, grouped by target.
+///
+/// # Why a draining policy is here, when it may start nothing
+///
+/// `may_start_runners` alone was the filter, and it deadlocked the one state
+/// that exists to be left. `draining` means *a runner this host owns is still
+/// finishing*: the policy stops admitting new ones and waits for the last to
+/// end. Filtering it out left nothing supervising that runner — so it was never
+/// reaped, the active count never reached zero, the drain never completed, and
+/// the policy could not be re-enabled either, because `active` is not a legal
+/// transition from `draining`.
+///
+/// Disabling a policy that held a runner therefore lost it permanently: an
+/// online registration, a live listener process and a runtime directory, with
+/// nothing left that would ever clean any of them up. Observed on a real host.
+///
+/// A draining policy loaded here starts nothing — `Reconciler` checks
+/// `may_start_runners` itself and allocates zero — so what this admits is
+/// supervision, which is exactly what the state is waiting for.
 fn active_autoscale_targets(mut policies: Vec<ScalePolicy>) -> Vec<Vec<ScalePolicy>> {
-    policies.retain(ScalePolicy::may_start_runners);
+    policies.retain(|policy| policy.may_start_runners() || policy.state() == PolicyState::Draining);
     policies.sort_by(|left, right| left.target.to_string().cmp(&right.target.to_string()));
     let mut targets: Vec<Vec<ScalePolicy>> = Vec::new();
     for policy in policies {
@@ -1396,7 +1415,12 @@ mod tests {
             .active()
             .build();
         draining.request_disable().unwrap();
-        let mut disabled = draining.clone();
+        let mut disabled = fixtures::policy()
+            .repository("disabled/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        disabled.request_disable().unwrap();
         disabled.drain_completed(0).unwrap();
 
         let active_a_second = fixtures::policy()
@@ -1417,14 +1441,57 @@ mod tests {
             .iter()
             .map(|policies| policies[0].target.to_string())
             .collect();
-        assert_eq!(targets, ["alpha/repo", "zeta/repo"]);
-        assert_eq!(selected[0].len(), 2, "same-target policies share one loop");
-        assert!(
-            selected
-                .iter()
-                .flatten()
-                .all(ScalePolicy::may_start_runners)
+        assert_eq!(
+            targets,
+            ["alpha/repo", "draining/repo", "zeta/repo"],
+            "a draining policy is supervised until its last runner ends"
         );
+        assert_eq!(selected[0].len(), 2, "same-target policies share one loop");
+
+        // Everything loaded either starts runners or is finishing the ones it
+        // has. Nothing else is here: `pending` has not been armed, `monitor` is
+        // monitor-only, and `disabled` has already drained to zero.
+        assert!(selected.iter().flatten().all(|policy| {
+            policy.may_start_runners() || policy.state() == PolicyState::Draining
+        }));
+        assert!(
+            !targets
+                .iter()
+                .any(|t| t == "pending/repo" || t == "monitor/repo"),
+            "{targets:?}"
+        );
+        assert!(!targets.iter().any(|t| t == "disabled/repo"), "{targets:?}");
+    }
+
+    /// A policy disabled while it still held a runner used to be lost for good.
+    ///
+    /// `draining` was filtered out of the daemon's targets, so nothing
+    /// supervised the runner it was waiting on: it was never reaped, the active
+    /// count never reached zero, the drain never completed — and `active` is not
+    /// a legal transition from `draining`, so it could not be re-enabled either.
+    /// The runner stayed online at GitHub with a live process and a runtime
+    /// directory that nothing would ever clean up.
+    #[test]
+    fn a_draining_policy_is_still_supervised_or_its_last_runner_is_abandoned() {
+        let mut draining = fixtures::policy()
+            .repository("acme/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        draining.request_disable().expect("an active policy drains");
+        assert_eq!(draining.state(), PolicyState::Draining);
+        assert!(
+            !draining.may_start_runners(),
+            "the discriminator: it admits no new runners, which is why the old              filter dropped it"
+        );
+
+        let selected = active_autoscale_targets(vec![draining]);
+        assert_eq!(
+            selected.len(),
+            1,
+            "without this the drain can never finish and the policy is stuck forever"
+        );
+        assert_eq!(selected[0][0].state(), PolicyState::Draining);
     }
 
     #[tokio::test]
