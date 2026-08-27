@@ -1208,7 +1208,10 @@ mod tests {
             tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
         }
-        assert!(!daemon.is_finished(), "the drain gave up before its deadline");
+        assert!(
+            !daemon.is_finished(),
+            "the drain gave up before its deadline"
+        );
 
         // Past it, it stops anyway.
         for _ in 0..DRAIN_DEADLINE.as_secs() {

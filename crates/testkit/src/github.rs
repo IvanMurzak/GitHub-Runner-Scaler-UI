@@ -900,7 +900,10 @@ impl InventoryGateway for FakeGithub {
         cancel: &CancelToken,
     ) -> Result<(), InventoryError> {
         cancel.check()?;
-        self.begin(FakeCall::RemoveRunner(target.clone(), runner_id), &target.slug())?;
+        self.begin(
+            FakeCall::RemoveRunner(target.clone(), runner_id),
+            &target.slug(),
+        )?;
 
         let mut state = self.lock();
         state.requests_issued += 1;
