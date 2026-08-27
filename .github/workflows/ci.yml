@@ -92,8 +92,27 @@ jobs:
           #   product's own `set-scale` warning says untrusted pull-request
           #   workflows should not run on a personal host. Approving a fork PR
           #   on this repository is therefore a decision about that machine.
+          # ------------------------------------------------------------------
+          # TEMPORARILY BACK ON A HOSTED RUNNER. RESTORE AFTER 0.1.11 SHIPS.
+          # ------------------------------------------------------------------
+          # This leg belongs on `rm-ivanpc-win-x64` -- see the note below, which
+          # is still the intent. It is parked here to break a loop the note
+          # itself predicted:
+          #
+          #   the local runner serves this leg using the *installed* agent;
+          #   the fix that leg needs is the workspace layout in this branch;
+          #   the release that installs it runs this workflow to get out.
+          #
+          # So the agent could not check out a repository whose path it made too
+          # long, and the fix for that could not ship past the check it was
+          # breaking. One release on a hosted runner is the way out, exactly as
+          # the recovery note said.
+          #
+          # Restore `os: rm-ivanpc-win-x64` once 0.1.11 is installed on that
+          # host. Passing afterwards is the real proof the layout fix works,
+          # which is a better test than this branch could have run.
           - name: windows-x86_64
-            os: rm-ivanpc-win-x64
+            os: windows-latest
           # macos-latest is Apple Silicon, so the platform the persona actually
           # uses is the platform that is tested. The `uname` assertion below
           # keeps that true if GitHub ever repoints the label.
