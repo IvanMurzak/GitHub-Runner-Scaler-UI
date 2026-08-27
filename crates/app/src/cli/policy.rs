@@ -31,6 +31,7 @@ pub fn dispatch_repo(
             &a.host_label,
             a.max_capacity,
             &a.labels,
+            a.enable,
             out,
         ),
         RepoCommand::List => list(context, TargetScope::Repository, out),
@@ -81,6 +82,7 @@ pub fn dispatch_org(
             &a.host_label,
             a.max_capacity,
             &a.labels,
+            a.enable,
             out,
         ),
         OrgCommand::List => list(context, TargetScope::Organization, out),
@@ -125,6 +127,7 @@ fn add(
     raw_host_label: &str,
     max_capacity: Option<u16>,
     raw_labels: &[String],
+    enable: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let host_label = HostLabel::new(raw_host_label).map_err(invalid)?;
@@ -210,6 +213,7 @@ fn add(
         .iter()
         .map(|policy| cost_for(&policy.target, reachable))
         .collect();
+    let armed = target.clone();
     record_policy(
         &store,
         &host,
@@ -221,7 +225,16 @@ fn add(
         candidate,
         costs,
         out,
-    )
+    )?;
+    // Arming is still a separate decision; `--enable` is the operator making it
+    // here rather than in a second command. It runs *after* the policy exists,
+    // through the same path `set-scale` uses, so the state machine and the
+    // trust warning are the ones that already govern arming rather than a
+    // second, quieter copy of them.
+    if enable {
+        set_scale(context, armed, true, out)?;
+    }
+    Ok(())
 }
 
 /// Whether a label mutation adds or removes.
@@ -1189,6 +1202,40 @@ mod tests {
         assert!(
             stored.routing_labels().is_none(),
             "monitor-only carries no routing labels at all"
+        );
+    }
+
+    /// `--enable` is the operator arming in one line, not creation arming
+    /// itself. The default must stay non-arming: `repo add` is safe to run
+    /// before you have decided anything.
+    #[test]
+    fn adding_without_enable_leaves_the_policy_disarmed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = host("ivanpc");
+        store.put_host(&local).unwrap();
+        record_policy(
+            &store,
+            &local,
+            ScaleTarget::Repository(OwnerRepo::parse("octo/repo").unwrap()),
+            HostLabel::new("ivanpc").unwrap(),
+            Vec::new(),
+            Some(nz(2)),
+            77,
+            TargetCost::repository(),
+            Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let stored = &store.policies().unwrap()[0];
+        assert!(
+            !stored.enabled(),
+            "creation must never arm on its own; that is what makes `repo add` safe to run early"
+        );
+        assert_eq!(stored.state(), PolicyState::Pending);
+        assert!(
+            !stored.may_start_runners(),
+            "a pending policy starts nothing until somebody says so"
         );
     }
 

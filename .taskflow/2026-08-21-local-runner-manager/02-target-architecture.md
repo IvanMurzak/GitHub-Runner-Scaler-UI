@@ -43,14 +43,14 @@ runner-manager auth status
 runner-manager auth logout
 runner-manager host set-capacity N
 runner-manager host show
-runner-manager repo add OWNER/REPO --host-label HOST [--max-capacity N] [--label LABEL]...
+runner-manager repo add OWNER/REPO --host-label HOST [--max-capacity N] [--label LABEL]... [--enable]
 runner-manager repo list
 runner-manager repo set-capacity OWNER/REPO --max-capacity N
 runner-manager repo set-scale OWNER/REPO --enabled true
 runner-manager repo add-label OWNER/REPO --label LABEL...
 runner-manager repo remove-label OWNER/REPO --label LABEL...
 runner-manager repo remove OWNER/REPO [--purge]
-runner-manager org add ORG --host-label HOST [--max-capacity N] [--label LABEL]...
+runner-manager org add ORG --host-label HOST [--max-capacity N] [--label LABEL]... [--enable]
 runner-manager org list
 runner-manager org set-capacity ORG --max-capacity N
 runner-manager org set-scale ORG --enabled true
@@ -67,8 +67,15 @@ runner-manager status --json
 an optional view and editing surface, not a required background process.
 
 `repo add` and `org add` create the policy in the `pending` state and never
-enable scaling; the operator enables it explicitly with `set-scale` (D20). This
-keeps policy creation non-arming, at the cost of one extra command in Journey 1.
+enable scaling by default; the operator enables it explicitly (D20). This keeps
+policy creation non-arming — running `repo add` before you have decided starts
+nothing.
+
+The extra command that cost is now optional rather than mandatory: `--enable`
+performs the same explicit arming, through the same path `set-scale` uses and
+under the same trust warning, on the line that created the policy. What D20
+protects is that nothing arms *unasked*, and a flag the operator typed is
+asking. Omitting it leaves the original two-step behaviour exactly as it was.
 
 Omitting `--max-capacity` creates a **monitor-only** policy (D19): the target
 appears in the dashboard with its runners and in-progress workflow counts, no

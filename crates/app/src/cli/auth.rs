@@ -44,6 +44,8 @@ use std::fmt::Display;
 use std::io::{self, Write};
 use std::time::Duration;
 
+use runner_manager_domain::model::StartMode;
+use runner_manager_domain::store::Store as _;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
 use runner_manager_github::{
     AuthenticatedClient, GithubError, Installation, InstallationDiscovery, RepositorySelection,
@@ -361,7 +363,7 @@ pub fn dispatch(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
-        AuthCommand::Login => login(context, styling, out),
+        AuthCommand::Login(a) => login(context, a.start_at.map(Into::into), styling, out),
         AuthCommand::Status => status(context, styling, out),
         AuthCommand::Logout => logout(context, out),
     }
@@ -375,7 +377,36 @@ pub fn dispatch(
 ///
 /// # Errors
 /// Every class in [`Failure`] that authentication can reach.
-pub fn login(context: &Context, styling: Styling, out: &mut dyn Write) -> Result<(), CliError> {
+/// Names the store this sign-in will write to, before it writes anything.
+///
+/// Printed unconditionally. The case worth catching is the one where the
+/// operator did *not* choose — the default is `boot`, and on macOS that is the
+/// System keychain, which needs privilege and is not where a `--start-at login`
+/// service will ever look.
+fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io::Result<()> {
+    let scope = match mode {
+        StartMode::Boot => "machine-scoped",
+        StartMode::Login => "your own",
+    };
+    writeln!(
+        out,
+        "Signing in to the {scope} credential store (start mode: {mode})."
+    )?;
+    if !chosen {
+        writeln!(
+            out,
+            "warning: this host records no start mode, so `{mode}` was assumed. A service              installed with `--start-at login` reads a different store and would not see this              credential. Pass `auth login --start-at login` if that is where you are heading."
+        )?;
+    }
+    Ok(())
+}
+
+pub fn login(
+    context: &Context,
+    requested_mode: Option<StartMode>,
+    styling: Styling,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let failed = write_failed("this sign-in");
 
     // ---- the disclosure, before any request is issued --------------------
@@ -394,8 +425,40 @@ pub fn login(context: &Context, styling: Styling, out: &mut dyn Write) -> Result
 
     let runtime = super::runtime()?;
     let store = context.store()?;
-    let start_mode = context.recorded_start_mode(&store)?;
+    // ----------------------------------------------------------------------
+    // WHICH STORE, AND WHY IT IS SAID OUT LOUD.
+    // ----------------------------------------------------------------------
+    // The credential goes into a store chosen by how the agent will start, and
+    // the two are genuinely different places -- on macOS, the System keychain
+    // against your own login keychain. A daemon reads only the store its start
+    // mode names, so a sign-in to the other one leaves a valid credential the
+    // service cannot see, and the failure surfaces much later as "no GitHub
+    // credential is stored for this daemon's start mode".
+    //
+    // The default is `boot`, so on a machine that has never installed a service
+    // this used to reach for the privileged store with nothing said -- and an
+    // operator heading for `--start-at login` had no way to say so and no
+    // warning that they were signing in to the wrong half. Hence the flag, and
+    // hence the line printed below whether or not it was passed.
+    let recorded = context.recorded_start_mode(&store)?;
+    let start_mode = requested_mode.unwrap_or(recorded);
     let secrets = context.secret_store(start_mode)?;
+    write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
+    // An explicit choice is recorded, so that `repo add`, `auth status` and the
+    // daemon all agree with the sign-in that just happened rather than with a
+    // default nobody chose.
+    if let Some(mode) = requested_mode
+        && mode != recorded
+    {
+        let mut host = super::host::local_host_or_create(context, &store)?;
+        host.service_start_mode = mode;
+        store.put_host(&host).map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot record the start mode this sign-in used: {source}"),
+            )
+        })?;
+    }
 
     // ------------------------------------------------------------------------
     // A HOST THAT IS ALREADY SIGNED IN RESUMES; IT DOES NOT SIGN IN AGAIN.
