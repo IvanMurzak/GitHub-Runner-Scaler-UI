@@ -7,7 +7,7 @@ use std::num::NonZeroU16;
 
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::model::{
-    CachePolicy, Host, HostLabel, PolicyId, RefreshInterval, ScaleTarget, TargetScope,
+    CachePolicy, Host, HostLabel, Label, PolicyId, RefreshInterval, ScaleTarget, TargetScope,
 };
 use runner_manager_domain::policy::{PolicyMode, PolicyState, RoutingLabels, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
@@ -30,6 +30,7 @@ pub fn dispatch_repo(
             ScaleTarget::repository(&a.repository).map_err(invalid)?,
             &a.host_label,
             a.max_capacity,
+            &a.labels,
             out,
         ),
         RepoCommand::List => list(context, TargetScope::Repository, out),
@@ -43,6 +44,20 @@ pub fn dispatch_repo(
             context,
             ScaleTarget::repository(&a.repository).map_err(invalid)?,
             a.enabled,
+            out,
+        ),
+        RepoCommand::AddLabel(a) => mutate_labels(
+            context,
+            &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            &a.labels,
+            LabelChange::Add,
+            out,
+        ),
+        RepoCommand::RemoveLabel(a) => mutate_labels(
+            context,
+            &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            &a.labels,
+            LabelChange::Remove,
             out,
         ),
         RepoCommand::Remove(a) => remove(
@@ -65,6 +80,7 @@ pub fn dispatch_org(
             ScaleTarget::organization(&a.organization).map_err(invalid)?,
             &a.host_label,
             a.max_capacity,
+            &a.labels,
             out,
         ),
         OrgCommand::List => list(context, TargetScope::Organization, out),
@@ -78,6 +94,20 @@ pub fn dispatch_org(
             context,
             ScaleTarget::organization(&a.organization).map_err(invalid)?,
             a.enabled,
+            out,
+        ),
+        OrgCommand::AddLabel(a) => mutate_labels(
+            context,
+            &ScaleTarget::organization(&a.organization).map_err(invalid)?,
+            &a.labels,
+            LabelChange::Add,
+            out,
+        ),
+        OrgCommand::RemoveLabel(a) => mutate_labels(
+            context,
+            &ScaleTarget::organization(&a.organization).map_err(invalid)?,
+            &a.labels,
+            LabelChange::Remove,
             out,
         ),
         OrgCommand::Remove(a) => remove(
@@ -94,10 +124,26 @@ fn add(
     target: ScaleTarget,
     raw_host_label: &str,
     max_capacity: Option<u16>,
+    raw_labels: &[String],
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let host_label = HostLabel::new(raw_host_label).map_err(invalid)?;
+    let extra = parse_labels(raw_labels)?;
     let maximum = max_capacity.map(non_zero_capacity).transpose()?;
+    // Refused rather than silently dropped: a monitor-only policy has no
+    // routing labels at all, so `--label` on one asks for something the stored
+    // shape cannot hold, and accepting it would report success for a setting
+    // that never existed.
+    if maximum.is_none() && !extra.is_empty() {
+        return Err(CliError::with_remedy(
+            Failure::InvalidArgument,
+            "--label needs a policy that starts runners, and a monitor-only policy never does.              No policy was stored.",
+            format!(
+                "runner-manager {} add {target} --host-label {raw_host_label} --max-capacity N --label ...",
+                scope_word(target.scope())
+            ),
+        ));
+    }
     let store = context.store()?;
     let secrets = context.secret_store(context.recorded_start_mode(&store)?)?;
     let discovery = match super::auth::credential_state(context, &secrets)? {
@@ -169,6 +215,7 @@ fn add(
         &host,
         target,
         host_label,
+        extra,
         maximum,
         installation_id,
         candidate,
@@ -177,12 +224,106 @@ fn add(
     )
 }
 
+/// Whether a label mutation adds or removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelChange {
+    Add,
+    Remove,
+}
+
+/// Parse operator-supplied label strings through `b1`'s own validation.
+///
+/// The CLI does not re-implement what a label may contain: `Label::new` owns
+/// that, so a rule added there reaches this command without an edit here.
+fn parse_labels(raw: &[String]) -> Result<Vec<Label>, CliError> {
+    raw.iter()
+        .map(|label| Label::new(label).map_err(invalid))
+        .collect()
+}
+
+/// Add or remove routing labels on an existing policy.
+///
+/// # Why the host label cannot be removed here
+///
+/// `b1` refuses it ([`runner_manager_domain::policy::ScalePolicy::remove_routing_label`]),
+/// and this command surfaces that refusal rather than pre-empting it. The
+/// reason is the one `RoutingLabels` documents: with no `AcquireJobs`, the host
+/// identity baked into the derived label is the only thing that stops two hosts
+/// racing for the same queued job by default.
+fn mutate_labels(
+    context: &Context,
+    target: &ScaleTarget,
+    raw_labels: &[String],
+    change: LabelChange,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let labels = parse_labels(raw_labels)?;
+    let store = context.store()?;
+    let mut policy = find_policy(&store, target)?;
+    let expected = policy.revision();
+
+    if policy.routing_labels().is_none() {
+        return Err(CliError::with_remedy(
+            Failure::InvalidArgument,
+            format!(
+                "{target} is monitor-only, so it has no routing labels to change. Nothing was changed."
+            ),
+            format!(
+                "runner-manager {} set-capacity {target} --max-capacity N",
+                scope_word(target.scope())
+            ),
+        ));
+    }
+
+    let mut changed = Vec::new();
+    for label in labels {
+        let moved = match change {
+            LabelChange::Add => policy.add_routing_label(label.clone()).map_err(invalid)?,
+            LabelChange::Remove => policy.remove_routing_label(&label).map_err(invalid)?,
+        };
+        if moved {
+            changed.push(label);
+        }
+    }
+
+    if policy.revision() != expected {
+        store
+            .update_policy(&policy, expected)
+            .map_err(store_failure)?;
+    }
+
+    let failed = write_failed("this label result");
+    let verb = match change {
+        LabelChange::Add => "now answers",
+        LabelChange::Remove => "no longer answers",
+    };
+    if changed.is_empty() {
+        writeln!(out, "No label changed; {target} already had them that way.").map_err(failed)?;
+    } else {
+        let list: Vec<&str> = changed.iter().map(Label::as_str).collect();
+        writeln!(out, "{target} {verb}: {}", list.join(", ")).map_err(failed)?;
+    }
+    if let Some(current) = policy.routing_labels() {
+        let all: Vec<&str> = current.iter().map(Label::as_str).collect();
+        writeln!(out, "Routing labels: {}", all.join(", ")).map_err(failed)?;
+        if current.additional().next().is_some() {
+            writeln!(
+                out,
+                "warning: a label another runner also answers is a race this product cannot                  arbitrate. Whichever runner GitHub assigns first takes the job; the loser pays                  a capacity slot and a cold start before it exits."
+            )
+            .map_err(failed)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_policy(
     store: &dyn Store,
     host: &Host,
     target: ScaleTarget,
     host_label: HostLabel,
+    extra: Vec<Label>,
     maximum: Option<NonZeroU16>,
     installation_id: u64,
     candidate: TargetCost,
@@ -194,6 +335,7 @@ fn record_policy(
         host,
         target,
         host_label,
+        extra,
         maximum,
         installation_id,
         candidate,
@@ -209,6 +351,7 @@ fn record_policy_with_id(
     host: &Host,
     target: ScaleTarget,
     host_label: HostLabel,
+    extra: Vec<Label>,
     maximum: Option<NonZeroU16>,
     installation_id: u64,
     candidate: TargetCost,
@@ -237,12 +380,16 @@ fn record_policy_with_id(
         ));
     }
     let mode = match maximum {
-        Some(maximum) => PolicyMode::autoscale(
-            RoutingLabels::derive(&host_label, host.os, host.architecture),
-            0,
-            maximum,
-        )
-        .map_err(invalid)?,
+        Some(maximum) => {
+            let mut labels = RoutingLabels::derive(&host_label, host.os, host.architecture);
+            for label in extra {
+                labels.add(label);
+            }
+            PolicyMode::autoscale(labels, 0, maximum).map_err(invalid)?
+        }
+        // A monitor-only policy starts no runner, so it has no label set to
+        // put these in; `PolicyMode::monitor_only` has no field for them. They
+        // are refused at parse time rather than dropped here -- see `add`.
         None => PolicyMode::monitor_only(),
     };
     if let Some(labels) = mode.routing_labels()
@@ -949,6 +1096,94 @@ mod tests {
         }
     }
 
+    /// The whole point of an extra label: a runner that answers what the
+    /// repository's existing workflows already ask for.
+    #[test]
+    fn extra_labels_join_the_derived_host_label_and_the_host_label_survives_removal() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = host("ivanpc");
+        store.put_host(&local).unwrap();
+        let target = ScaleTarget::Repository(OwnerRepo::parse("octo/repo").unwrap());
+
+        record_policy(
+            &store,
+            &local,
+            target.clone(),
+            HostLabel::new("ivanpc").unwrap(),
+            vec![
+                Label::new("self-hosted").unwrap(),
+                Label::new("windows").unwrap(),
+            ],
+            Some(nz(2)),
+            77,
+            TargetCost::repository(),
+            Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let stored = &store.policies().unwrap()[0];
+        let labels = stored.routing_labels().expect("an autoscale policy");
+        let all: Vec<&str> = labels.iter().map(Label::as_str).collect();
+        assert!(
+            all.contains(&"rm-ivanpc-linux-x64"),
+            "the derived host label must still be there: {all:?}"
+        );
+        assert!(all.contains(&"self-hosted"), "{all:?}");
+        assert!(all.contains(&"windows"), "{all:?}");
+        assert_eq!(
+            labels.as_registration_labels().len(),
+            3,
+            "all three go to `generate-jitconfig`; GitHub adds none of its own"
+        );
+
+        // The derived label is what stops two hosts racing for one job by
+        // default, so removing it is refused -- and the refusal is `b1`'s,
+        // surfaced here rather than re-implemented.
+        let mut policy = stored.clone();
+        assert!(
+            policy
+                .remove_routing_label(&Label::new("rm-ivanpc-linux-x64").unwrap())
+                .is_err(),
+            "the host label must not be removable"
+        );
+        assert!(
+            policy
+                .remove_routing_label(&Label::new("windows").unwrap())
+                .unwrap(),
+            "an added label is removable"
+        );
+    }
+
+    /// A monitor-only policy has no label set to put them in, so asking is an
+    /// error rather than a silent no-op.
+    #[test]
+    fn labels_on_a_monitor_only_policy_are_refused_rather_than_dropped() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = host("ivanpc");
+        store.put_host(&local).unwrap();
+        let target = ScaleTarget::Repository(OwnerRepo::parse("octo/repo").unwrap());
+        record_policy(
+            &store,
+            &local,
+            target.clone(),
+            HostLabel::new("ivanpc").unwrap(),
+            Vec::new(),
+            None,
+            77,
+            TargetCost::repository(),
+            Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let stored = &store.policies().unwrap()[0];
+        assert!(
+            stored.routing_labels().is_none(),
+            "monitor-only carries no routing labels at all"
+        );
+    }
+
     fn nz(value: u16) -> NonZeroU16 {
         NonZeroU16::new(value).unwrap()
     }
@@ -986,6 +1221,7 @@ mod tests {
                 &local,
                 target.clone(),
                 HostLabel::new("home").unwrap(),
+                Vec::new(),
                 Some(nz(2)),
                 77,
                 match target.scope() {
@@ -1039,6 +1275,7 @@ mod tests {
             &local,
             target,
             HostLabel::new("home").unwrap(),
+            Vec::new(),
             None,
             77,
             TargetCost::repository(),
@@ -1097,6 +1334,7 @@ mod tests {
                 &local,
                 target,
                 HostLabel::new(label).unwrap(),
+                Vec::new(),
                 None,
                 77,
                 TargetCost::repository(),
@@ -1136,6 +1374,7 @@ mod tests {
             &local,
             targets()[0].clone(),
             HostLabel::new("home").unwrap(),
+            Vec::new(),
             None,
             77,
             TargetCost::repository(),
@@ -1212,6 +1451,7 @@ mod tests {
                 &local,
                 target,
                 HostLabel::new("home").unwrap(),
+                Vec::new(),
                 Some(nz(2)),
                 77,
                 candidate,
@@ -1241,6 +1481,7 @@ mod tests {
                 &local,
                 target.clone(),
                 HostLabel::new("home").unwrap(),
+                Vec::new(),
                 Some(nz(2)),
                 77,
                 TargetCost::repository(),
