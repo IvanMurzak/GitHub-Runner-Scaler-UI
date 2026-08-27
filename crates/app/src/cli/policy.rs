@@ -137,7 +137,7 @@ fn add(
     if maximum.is_none() && !extra.is_empty() {
         return Err(CliError::with_remedy(
             Failure::InvalidArgument,
-            "--label needs a policy that starts runners, and a monitor-only policy never does.              No policy was stored.",
+            "--label needs a policy that starts runners, and a monitor-only policy never \n             does. No policy was stored.",
             format!(
                 "runner-manager {} add {target} --host-label {raw_host_label} --max-capacity N --label ...",
                 scope_word(target.scope())
@@ -309,7 +309,9 @@ fn mutate_labels(
         if current.additional().next().is_some() {
             writeln!(
                 out,
-                "warning: a label another runner also answers is a race this product cannot                  arbitrate. Whichever runner GitHub assigns first takes the job; the loser pays                  a capacity slot and a cold start before it exits."
+                "warning: a label another runner also answers is a race this product cannot \
+                 arbitrate. Whichever runner GitHub assigns first takes the job; the loser \
+                 pays a capacity slot and a cold start before it exits."
             )
             .map_err(failed)?;
         }
@@ -512,7 +514,12 @@ fn write_add_result(
     .map_err(failed)?;
     match policy.routing_labels() {
         Some(labels) => {
-            writeln!(out, "Routing label: {}", labels.host_label()).map_err(failed)?;
+            // Every label, not just the derived one. `--label` was accepted and
+            // stored, and printing only the host label read as though the rest
+            // had been dropped -- which is the one thing an operator would want
+            // this line to tell them.
+            let all: Vec<&str> = labels.iter().map(Label::as_str).collect();
+            writeln!(out, "Routing labels: {}", all.join(", ")).map_err(failed)?;
             writeln!(
                 out,
                 "Next: runner-manager {} set-scale {} --enabled true",
@@ -828,7 +835,8 @@ pub fn apply_policy_mutation(
         )
         .map_err(failed)?;
         if let Some(labels) = policy.routing_labels() {
-            writeln!(out, "Routing label: {}", labels.host_label()).map_err(failed)?;
+            let all: Vec<&str> = labels.iter().map(Label::as_str).collect();
+            writeln!(out, "Routing labels: {}", all.join(", ")).map_err(failed)?;
         }
     }
     if let Some(enabled) = mutation.enabled {
@@ -1245,7 +1253,7 @@ mod tests {
             );
             let text = String::from_utf8(output).unwrap();
             assert!(text.contains("pending; scaling is disabled"), "{text}");
-            assert!(text.contains("Routing label: rm-home-linux-x64"), "{text}");
+            assert!(text.contains("Routing labels: rm-home-linux-x64"), "{text}");
         }
     }
 

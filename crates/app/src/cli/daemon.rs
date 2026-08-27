@@ -23,7 +23,7 @@ use runner_manager_agent::reconcile::{
     FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts,
     RepositoryDirectory, TeeEvents, TracingEvents,
 };
-use runner_manager_domain::attempt::FailureReason;
+use runner_manager_domain::attempt::{FailureReason, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget};
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store;
@@ -182,6 +182,7 @@ async fn run(
         ));
         managed_targets.push(ManagedTarget {
             policies,
+            store: Arc::clone(&store) as Arc<dyn Store>,
             reconciler: Reconciler::new(
                 host.clone(),
                 ReconcilerPorts {
@@ -199,6 +200,7 @@ async fn run(
     }
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
+    let (upgrade, _) = tokio::sync::watch::channel(false);
     let mut loops = tokio::task::JoinSet::new();
     let contacts: Arc<dyn ContactRecorder> = Arc::new(FileContactRecorder {
         paths: context.paths().clone(),
@@ -209,17 +211,69 @@ async fn run(
         loops.spawn(run_target_loop(
             target,
             shutdown.subscribe(),
+            upgrade.subscribe(),
             Arc::clone(&contacts),
         ));
     }
+
+    // `current_exe` rather than the path in the service record: it is the file
+    // this process is actually running, which is the one a package manager
+    // replaces, and it is right even for a daemon started by hand.
+    let own_binary = std::env::current_exe().ok();
+    let mut upgraded_to = None;
 
     let early = tokio::select! {
         signal = wait_for_shutdown(service_shutdown) => {
             signal.map_err(signal_failure)?;
             None
         }
+        version = async {
+            match own_binary.clone() {
+                Some(path) => wait_for_upgrade(path).await,
+                // Nothing to watch, so never resolve; the other arms decide.
+                None => std::future::pending().await,
+            }
+        } => {
+            writeln!(
+                out,
+                "a newer runner-manager ({version}) was installed; finishing every running                  job before handing over"
+            )
+            .map_err(failed)?;
+            tracing::info!(
+                version = %version,
+                "a newer binary was installed; draining before restart"
+            );
+            upgraded_to = Some(version);
+            None
+        }
         result = loops.join_next() => result,
     };
+    if upgraded_to.is_some() {
+        let _ = upgrade.send(true);
+        // Not `shutdown`: that one is bounded, and an upgrade must outlast any
+        // job rather than any deadline.
+        while let Some(result) = loops.join_next().await {
+            result.map_err(|source| {
+                CliError::new(
+                    Failure::LocalState,
+                    format!("a daemon target loop failed: {source}"),
+                )
+            })??;
+        }
+        let version = upgraded_to.unwrap_or_default();
+        writeln!(
+            out,
+            "every runner finished; stopping so {version} can take over"
+        )
+        .map_err(failed)?;
+        return Err(CliError::with_remedy(
+            Failure::UpgradePending,
+            format!(
+                "a newer runner-manager ({version}) is installed and every runner this daemon                  held has finished; stopping so the service manager starts the new one"
+            ),
+            "runner-manager service status",
+        ));
+    }
     let _ = shutdown.send(true);
     if let Some(result) = early {
         let outcome = result.map_err(|source| {
@@ -244,6 +298,97 @@ async fn run(
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade detection
+// ---------------------------------------------------------------------------
+
+/// How often the daemon looks at its own binary.
+///
+/// Deliberately unrelated to the poll interval: this is two `stat` calls
+/// against a local path and costs nothing GitHub can see, so it is not on the
+/// REST budget and does not need to be.
+const UPGRADE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What a file looked like, in the two fields that change when it is replaced.
+///
+/// Not a hash. Reading 13 MB every thirty seconds to notice a change that a
+/// `stat` already reports would be paying a lot for a stronger answer than the
+/// question needs — and the answer is confirmed by executing the binary anyway
+/// (see [`upgraded_version`]), which is a stronger check than any digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl BinaryStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The version a replaced binary reports, when it is genuinely a different one.
+///
+/// # Why the file is executed rather than trusted
+///
+/// A changed `stat` says the bytes moved, not that they are complete. A package
+/// manager writing 13 MB is momentarily a file of the right name and the wrong
+/// length, and restarting into that leaves the machine in a restart loop with
+/// no daemon — the failure this whole feature exists to avoid, caused by the
+/// feature itself.
+///
+/// Running `--version` settles both halves at once: it exits non-zero or not at
+/// all if the file is partial, and it prints the version if it is not. That is
+/// also the only way to learn the *new* version, since this process can only
+/// ever report the one it was compiled as.
+///
+/// `None` means "nothing to do": unreadable, unrunnable, or the same version
+/// this daemon already is. A same-version rewrite — a reinstall of what is
+/// already there — is deliberately not an upgrade, because restarting for it
+/// would interrupt runners to change nothing.
+fn upgraded_version(path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reported = String::from_utf8(output.stdout).ok()?;
+    // `--version` prints `runner-manager X.Y.Z`; the last token is the version.
+    let reported = reported.split_whitespace().last()?.to_string();
+    (reported != env!("CARGO_PKG_VERSION")).then_some(reported)
+}
+
+/// Resolves when a different, runnable version has replaced this daemon's own
+/// binary. Never resolves otherwise.
+async fn wait_for_upgrade(path: std::path::PathBuf) -> String {
+    // The stamp this daemon started from. A binary replaced *before* the first
+    // look is still caught, because the version comparison below is against
+    // what this process was compiled as rather than against the file.
+    let mut known = BinaryStamp::of(&path);
+    loop {
+        tokio::time::sleep(UPGRADE_CHECK_INTERVAL).await;
+        let current = BinaryStamp::of(&path);
+        if current == known {
+            continue;
+        }
+        // Record the new stamp before validating, so a partial write is not
+        // re-examined every thirty seconds until it happens to finish.
+        known = current;
+        if current.is_none() {
+            continue;
+        }
+        if let Some(version) = upgraded_version(&path) {
+            return version;
+        }
+    }
 }
 
 async fn wait_for_shutdown(
@@ -417,12 +562,35 @@ trait TargetReconciler: Send + 'static {
     fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
         active_owned(report, self.policies())
     }
+
+    /// Runners this host still holds for this target, counted from the **local
+    /// journal** rather than from GitHub.
+    ///
+    /// # Why a second count exists beside [`Self::active_owned`]
+    ///
+    /// They answer different questions and fail differently, and an upgrade
+    /// needs the one that cannot fail. `active_owned` reads the reconcile
+    /// report, and a target GitHub could not be polled contributes no
+    /// allocation to it — so its answer is `None`, meaning "unknown", for as
+    /// long as the credential or the network is bad.
+    ///
+    /// Waiting for `Some(0)` from that is what made shutdown hang forever, and
+    /// an upgrade drain that waits without a deadline would inherit exactly
+    /// that: a revoked token would mean the upgrade never happens, on the one
+    /// machine whose daemon most needs replacing.
+    ///
+    /// Whether *this host* has a runner process alive is a local fact. The
+    /// journal holds it, `d1` keeps it true across a crash, and no network is
+    /// involved. So the upgrade drain waits on this instead, and can then
+    /// afford to wait as long as a job takes.
+    fn local_active(&self) -> Option<u16>;
 }
 
 struct ManagedTarget {
     policies: Vec<ScalePolicy>,
     reconciler: Reconciler,
     cancel: CancelToken,
+    store: Arc<dyn Store>,
 }
 
 impl TargetReconciler for ManagedTarget {
@@ -437,6 +605,18 @@ impl TargetReconciler for ManagedTarget {
 
     fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>> {
         Box::pin(self.reconciler.reconcile(&self.policies))
+    }
+
+    fn local_active(&self) -> Option<u16> {
+        let mut total = 0_u16;
+        for policy in &self.policies {
+            // A journal this pass could not read is `None`, not zero: reporting
+            // an unreadable set as empty would let the upgrade stop a daemon
+            // that is in the middle of somebody's job.
+            let attempts = self.store.attempts_for_policy(policy.id).ok()?;
+            total = total.saturating_add(active_count_for(policy.id, attempts.iter()));
+        }
+        Some(total)
     }
 }
 
@@ -496,14 +676,36 @@ impl ContactRecorder for FileContactRecorder {
 /// service manager's own stop timeout does not expire first.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Why a target loop is draining, which is the whole of what separates the two
+/// drains.
+///
+/// A **shutdown** is an operator or a machine waiting: it is bounded, and past
+/// its deadline the daemon stops with runners still up, because startup
+/// recovery will adopt them on the next run.
+///
+/// An **upgrade** has nobody waiting. Its whole purpose is to replace the
+/// binary without interrupting work, so a deadline would defeat it — the one
+/// thing it must not do is cut a job short to be timely. It waits on the local
+/// journal instead of on GitHub precisely so that waiting forever is safe; see
+/// [`TargetReconciler::local_active`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainKind {
+    Shutdown,
+    Upgrade,
+}
+
 async fn run_target_loop<T: TargetReconciler>(
     mut target: T,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut upgrade: tokio::sync::watch::Receiver<bool>,
     contacts: Arc<dyn ContactRecorder>,
 ) -> Result<(), CliError> {
-    let mut draining = *shutdown.borrow();
-    let mut drain_deadline = draining.then(|| tokio::time::Instant::now() + DRAIN_DEADLINE);
-    if draining {
+    let mut draining = shutdown_kind(&shutdown, &upgrade);
+    let mut drain_deadline = match draining {
+        Some(DrainKind::Shutdown) => Some(tokio::time::Instant::now() + DRAIN_DEADLINE),
+        _ => None,
+    };
+    if draining.is_some() {
         target.begin_drain();
     }
     loop {
@@ -512,11 +714,19 @@ async fn run_target_loop<T: TargetReconciler>(
             return Ok(());
         }
         let report = target.reconcile().await;
-        if !draining && report.failure.is_none() {
+        if draining.is_none() && report.failure.is_none() {
             contacts.record()?;
         }
-        if draining && target.active_owned(&report) == Some(0) {
-            return Ok(());
+        match draining {
+            Some(DrainKind::Shutdown) if target.active_owned(&report) == Some(0) => {
+                return Ok(());
+            }
+            // GitHub is not consulted: an upgrade must complete even when the
+            // credential is the reason the operator is upgrading.
+            Some(DrainKind::Upgrade) if target.local_active() == Some(0) => {
+                return Ok(());
+            }
+            _ => {}
         }
         // Capped by the deadline, so a long back-off delay cannot outlast it. A
         // drain that has run out of time sleeps zero and exits at the top.
@@ -528,14 +738,37 @@ async fn run_target_loop<T: TargetReconciler>(
         });
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
-            changed = shutdown.changed(), if !draining => {
+            changed = shutdown.changed(), if draining != Some(DrainKind::Shutdown) => {
                 if changed.is_err() || *shutdown.borrow() {
+                    // A shutdown arriving mid-upgrade supersedes it, deadline
+                    // and all: the machine is going down either way, and the
+                    // upgrade's patience is no longer anybody's benefit.
                     target.begin_drain();
-                    draining = true;
+                    draining = Some(DrainKind::Shutdown);
                     drain_deadline = Some(tokio::time::Instant::now() + DRAIN_DEADLINE);
                 }
             }
+            changed = upgrade.changed(), if draining.is_none() => {
+                if changed.is_err() || *upgrade.borrow() {
+                    target.begin_drain();
+                    draining = Some(DrainKind::Upgrade);
+                }
+            }
         }
+    }
+}
+
+/// The drain a loop is already in when it starts, if any. Shutdown wins.
+fn shutdown_kind(
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+    upgrade: &tokio::sync::watch::Receiver<bool>,
+) -> Option<DrainKind> {
+    if *shutdown.borrow() {
+        Some(DrainKind::Shutdown)
+    } else if *upgrade.borrow() {
+        Some(DrainKind::Upgrade)
+    } else {
+        None
     }
 }
 
@@ -946,6 +1179,129 @@ mod tests {
             }
             Some(self.active)
         }
+
+        /// Deliberately answers even when `unreadable`: that is the whole point
+        /// of the local count, and a fake that hid it could not show the
+        /// difference the upgrade drain depends on.
+        fn local_active(&self) -> Option<u16> {
+            Some(self.active)
+        }
+    }
+
+    /// An upgrade signal that never fires, for the tests that are about
+    /// shutdown.
+    fn never_upgraded() -> tokio::sync::watch::Receiver<bool> {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        // Kept alive for the receiver's lifetime; a dropped sender would make
+        // `changed()` resolve immediately and read as an upgrade.
+        Box::leak(Box::new(sender));
+        receiver
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upgrade_waits_for_a_running_job_however_long_it_takes() {
+        // The promise this feature makes: a new binary never interrupts work.
+        // `busy_then_finished` holds one runner for the first two passes.
+        let target = FakeTarget::busy_then_finished(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+        );
+        let terminations = Arc::clone(&target.busy_was_terminated);
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let (upgrade, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            upgrade.subscribe(),
+            contacts as Arc<dyn ContactRecorder>,
+        ));
+
+        tokio::task::yield_now().await;
+        upgrade.send(true).unwrap();
+
+        // Far past the shutdown deadline, which must not apply here: an upgrade
+        // that gave up after a minute would cut the job it exists to protect.
+        for _ in 0..DRAIN_DEADLINE.as_secs() {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // The fake releases its runner on the third pass, and only then does
+        // the loop end.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("the upgrade drain ends once the job is done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminations.load(Ordering::SeqCst),
+            0,
+            "an upgrade must never terminate a running job"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upgrade_completes_even_when_github_cannot_be_read() {
+        // The reason the upgrade drain counts locally. `never_readable` answers
+        // `None` from `active_owned` forever -- the revoked-credential state --
+        // while its local count still falls to zero. Waiting on the former
+        // would mean the machine that most needs a new binary never gets one.
+        let mut target = FakeTarget::never_readable(
+            fixtures::policy()
+                .repository("acme/repo")
+                .autoscale("home", 1)
+                .active()
+                .build(),
+        );
+        target.active = 0;
+        let contacts = Arc::new(CountingContacts::default());
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let (upgrade, _) = tokio::sync::watch::channel(false);
+        let daemon = tokio::spawn(run_target_loop(
+            target,
+            stop.subscribe(),
+            upgrade.subscribe(),
+            contacts as Arc<dyn ContactRecorder>,
+        ));
+
+        tokio::task::yield_now().await;
+        upgrade.send(true).unwrap();
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("an unreadable target must not block an upgrade")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A rewrite of the *same* version is not an upgrade: restarting for it
+    /// would interrupt runners to change nothing.
+    #[test]
+    fn the_running_version_is_not_an_upgrade_of_itself() {
+        let own = std::env::current_exe().expect("the test binary's own path");
+        assert!(
+            BinaryStamp::of(&own).is_some(),
+            "a running binary must be stat-able"
+        );
+        assert!(
+            BinaryStamp::of(std::path::Path::new("no-such-binary")).is_none(),
+            "a missing file has no stamp, and is not mistaken for a new one"
+        );
+        assert!(
+            upgraded_version(std::path::Path::new("no-such-binary")).is_none(),
+            "a path that cannot be executed is never reported as an upgrade"
+        );
     }
 
     #[derive(Default)]
@@ -1152,11 +1508,13 @@ mod tests {
         let healthy_loop = tokio::spawn(run_target_loop(
             healthy,
             stop.subscribe(),
+            never_upgraded(),
             Arc::clone(&contacts) as Arc<dyn ContactRecorder>,
         ));
         let offline_loop = tokio::spawn(run_target_loop(
             offline,
             stop.subscribe(),
+            never_upgraded(),
             Arc::clone(&contacts) as Arc<dyn ContactRecorder>,
         ));
 
@@ -1196,6 +1554,7 @@ mod tests {
         let daemon = tokio::spawn(run_target_loop(
             target,
             stop.subscribe(),
+            never_upgraded(),
             contacts as Arc<dyn ContactRecorder>,
         ));
 
@@ -1247,6 +1606,7 @@ mod tests {
         let daemon = tokio::spawn(run_target_loop(
             target,
             stop.subscribe(),
+            never_upgraded(),
             contacts as Arc<dyn ContactRecorder>,
         ));
 
