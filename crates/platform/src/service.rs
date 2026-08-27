@@ -740,6 +740,7 @@ impl ServiceDirectories {
 pub struct InstallRequest {
     start_mode: StartMode,
     binary: Option<PathBuf>,
+    source_binary: Option<PathBuf>,
     arguments: Vec<OsString>,
     restart: RestartPolicy,
     on_demand: bool,
@@ -752,6 +753,7 @@ impl InstallRequest {
         Self {
             start_mode,
             binary: None,
+            source_binary: None,
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
             restart: RestartPolicy::default(),
             on_demand: false,
@@ -782,6 +784,28 @@ impl InstallRequest {
     #[must_use]
     pub fn for_binary(mut self, binary: impl Into<PathBuf>) -> Self {
         self.binary = Some(binary.into());
+        self
+    }
+
+    /// Where the registered binary was copied from.
+    ///
+    /// # Why a registration has a source at all
+    ///
+    /// A service registered directly against a package manager's own file can
+    /// never be upgraded on Windows, because the running service holds that
+    /// file open and `npm i -g` cannot replace it. What it does instead is
+    /// worse than failing: it rewrites the package metadata, reports success,
+    /// and leaves the old executable in place — so the operator is told the new
+    /// version is installed while the old one keeps running. That was observed,
+    /// twice in a row, before this existed.
+    ///
+    /// So the service runs a copy the product owns, and this records where that
+    /// copy came from. The source is what a package manager updates, what
+    /// [`inspect_binary`] watches for item 6's stale-path case, and what the
+    /// daemon compares its own version against to know an upgrade is waiting.
+    #[must_use]
+    pub fn copied_from(mut self, source: impl Into<PathBuf>) -> Self {
+        self.source_binary = Some(source.into());
         self
     }
 
@@ -822,6 +846,7 @@ pub struct InstallPlan {
     identity: ServiceIdentity,
     start_mode: StartMode,
     binary: PathBuf,
+    source_binary: Option<PathBuf>,
     arguments: Vec<OsString>,
     account: ServiceAccount,
     restart: RestartPolicy,
@@ -864,6 +889,7 @@ impl InstallPlan {
             identity,
             start_mode: request.start_mode,
             binary,
+            source_binary: request.source_binary.clone(),
             arguments: request.arguments.clone(),
             account: ServiceAccount::for_start_mode(request.start_mode),
             restart: request.restart,
@@ -890,6 +916,7 @@ impl InstallPlan {
             identity,
             start_mode,
             binary: binary.into(),
+            source_binary: None,
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
             account: ServiceAccount::for_start_mode(start_mode),
             restart: RestartPolicy::default(),
@@ -965,6 +992,16 @@ impl InstallPlan {
     #[must_use]
     pub fn binary(&self) -> &Path {
         &self.binary
+    }
+
+    /// Where [`Self::binary`] was copied from, when it is a copy.
+    ///
+    /// `None` is the legacy layout: the registration names the file a package
+    /// manager owns, and cannot be upgraded while it runs. See
+    /// [`InstallRequest::copied_from`].
+    #[must_use]
+    pub fn source_binary(&self) -> Option<&Path> {
+        self.source_binary.as_deref()
     }
 
     /// The arguments it is registered with.
@@ -2556,6 +2593,15 @@ pub struct InstallRecord {
     pub account: ServiceAccount,
     /// **The resolved absolute path of the binary at install time.** Item 6.
     pub binary: PathBuf,
+    /// Where [`Self::binary`] was copied from, when it is a copy.
+    ///
+    /// `#[serde(default)]` rather than a schema bump: a record written before
+    /// this existed is still readable, and reads as `None`. That is not a
+    /// silent downgrade — `None` means the registration names a package
+    /// manager's own file, which is the layout that cannot be upgraded while
+    /// the service runs, and `service status` says so by name.
+    #[serde(default)]
+    pub source_binary: Option<PathBuf>,
     /// The arguments it was registered with.
     pub arguments: Vec<String>,
     /// The restart-on-failure delay.
@@ -2611,6 +2657,7 @@ impl InstallRecord {
             restart_delay_secs: plan.restart().delay().as_secs(),
             restart_reset_secs: plan.restart().reset_after().as_secs(),
             starts_on_demand: plan.is_on_demand(),
+            source_binary: plan.source_binary().map(Path::to_path_buf),
             log_file: plan.directories().log_file(),
             definition_path: definition.install_path().map(Path::to_path_buf),
             installed_at: at,
@@ -6529,6 +6576,77 @@ mod tests {
         assert_eq!(read, record);
         assert_eq!(read.binary, host.binary);
         assert!(read.binary.is_absolute());
+    }
+
+    /// A record written before the service ran a copy of its own must still
+    /// load. It reads as `None`, which is the truth about it: that registration
+    /// names the package manager's file and cannot be upgraded under itself.
+    #[test]
+    fn a_record_without_a_source_binary_still_reads_and_says_it_has_none() {
+        let host = Host::new();
+        let path = InstallRecord::path(&host.paths);
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {RECORD_SCHEMA_VERSION}
+service_name = \"runner-manager\"
+                 manager = \"systemd\"
+start_mode = \"boot\"
+account = \"root\"
+                 binary = \"/x\"
+arguments = []
+restart_delay_secs = 15
+                 restart_reset_secs = 600
+log_file = \"/x\"
+                 installed_at = \"2026-01-01T00:00:00Z\"
+installed_by_version = \"0.1.0\"
+                 [directories]
+config = \"/a\"
+state = \"/b\"
+runtime = \"/c\"
+logs = \"/d\"
+"
+            ),
+        )
+        .expect("a writable record");
+        let read = InstallRecord::read(&host.paths)
+            .expect("a record missing an optional field is still readable")
+            .expect("a record is there");
+        assert_eq!(
+            read.source_binary, None,
+            "the legacy layout has no source, and must not invent one"
+        );
+    }
+
+    /// The field that makes an upgrade possible survives the write.
+    #[test]
+    fn a_registration_remembers_the_file_it_was_copied_from() {
+        let host = Host::new();
+        let source = host.binary.with_file_name("npm-installed-runner-manager");
+        std::fs::copy(&host.binary, &source).expect("a second file to stand in for the package");
+        let plan = InstallPlan::resolve(
+            ServiceIdentity::product(),
+            &host.request(StartMode::Boot).copied_from(&source),
+            ServiceDirectories::of(&host.paths),
+        )
+        .expect("a resolvable plan");
+        let definition = ServiceDefinition::from_text(
+            DefinitionKind::SystemdUnit,
+            "[Service]
+",
+        );
+        let record = InstallRecord::of(&plan, &definition, Utc::now());
+        record.write(&host.paths).expect("a writable record");
+
+        let read = InstallRecord::read(&host.paths)
+            .expect("a readable record")
+            .expect("a record is there");
+        assert_eq!(read.source_binary.as_deref(), Some(source.as_path()));
+        assert_ne!(
+            read.source_binary.as_deref(),
+            Some(read.binary.as_path()),
+            "the whole point is that the two are different files: one the service holds open,              one the package manager is free to replace"
+        );
     }
 
     #[test]
