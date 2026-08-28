@@ -18,7 +18,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -105,12 +105,11 @@ pub enum AgentHealth {
     Offline,
 }
 impl AgentHealth {
-    const fn marker(self) -> &'static str {
-        match self {
-            Self::Healthy => "OK healthy",
-            Self::Degraded => "! degraded",
-            Self::Offline => "X offline",
-        }
+    /// Spelled out for the inspection views. The table shows the same three
+    /// words through [`Self::badge`], so the vocabulary has one definition and
+    /// renaming a state cannot leave the two screens disagreeing.
+    fn marker(self) -> String {
+        self.badge(&Skin::ASCII).text().into_owned()
     }
     const fn tone(self) -> Tone {
         match self {
@@ -458,7 +457,10 @@ impl ScreenModel {
         table.scroll = next;
     }
 
-    fn visible_repository_ids(&self) -> Vec<String> {
+    /// The repositories a reader can currently see, in the order they appear.
+    /// Callers that want identifiers derive them from this rather than the
+    /// other way round, so no caller has to find a row it already had.
+    fn visible_repositories(&self) -> Vec<&RepositoryRow> {
         let mut rows: Vec<_> = self
             .snapshot
             .repositories
@@ -466,7 +468,11 @@ impl ScreenModel {
             .filter(|row| contains_folded(&row.target, &self.repositories.filter))
             .collect();
         rows.sort_by(|a, b| repository_cmp(a, b, self.repositories.sort_order));
-        rows.into_iter().map(|row| row.id.clone()).collect()
+        rows
+    }
+
+    fn visible_repository_ids(&self) -> Vec<String> {
+        ids(self.visible_repositories().into_iter().map(|row| &row.id))
     }
 
     pub fn repository_id_at_viewport_offset(&self, offset: usize) -> Option<String> {
@@ -474,7 +480,7 @@ impl ScreenModel {
             .get(self.repositories.scroll.saturating_add(offset))
             .cloned()
     }
-    fn visible_runner_ids(&self) -> Vec<String> {
+    fn visible_runners(&self) -> Vec<&RunnerRow> {
         let mut rows: Vec<_> = self
             .snapshot
             .runners
@@ -489,9 +495,14 @@ impl ScreenModel {
             })
             .collect();
         rows.sort_by(|a, b| named_cmp(&a.name, &b.name, self.runners.sort_order));
-        rows.into_iter().map(|row| row.id.clone()).collect()
+        rows
     }
-    fn visible_activity_ids(&self) -> Vec<String> {
+
+    fn visible_runner_ids(&self) -> Vec<String> {
+        ids(self.visible_runners().into_iter().map(|row| &row.id))
+    }
+
+    fn visible_activity(&self) -> Vec<&ActivityRow> {
         let mut rows: Vec<_> = self
             .snapshot
             .activity
@@ -502,8 +513,16 @@ impl ScreenModel {
             })
             .collect();
         rows.sort_by(|a, b| named_cmp(&a.occurred_at, &b.occurred_at, self.activity.sort_order));
-        rows.into_iter().map(|row| row.id.clone()).collect()
+        rows
     }
+
+    fn visible_activity_ids(&self) -> Vec<String> {
+        ids(self.visible_activity().into_iter().map(|row| &row.id))
+    }
+}
+
+fn ids<'a>(rows: impl Iterator<Item = &'a String>) -> Vec<String> {
+    rows.cloned().collect()
 }
 
 fn contains_folded(value: &str, query: &str) -> bool {
@@ -546,8 +565,9 @@ fn reconcile_table(table: &mut TableViewState, ids: &[String], old_len: Option<u
     table.scroll = index;
 }
 
-/// One block of a screen. Prose may be re-wrapped to the terminal; a grid
-/// must not be, because re-wrapping it is precisely what destroys the columns.
+/// One block of a screen. Prose is reflowed to the terminal it lands on; a
+/// grid must not be, because reflowing it is precisely what destroys the
+/// columns.
 enum Section {
     Prose(Vec<Line<'static>>),
     /// One line that always occupies exactly one terminal row. The filter and
@@ -558,26 +578,12 @@ enum Section {
     Grid(Grid),
 }
 
-/// How many body rows each grid on a screen may draw. The dashboard is the
-/// only screen with two, and `secondary` is the runner grid beneath.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Budget {
-    primary: usize,
-    secondary: usize,
-}
-
-impl Budget {
-    /// Hand `excess` rows back, out of the second grid first: on the dashboard
-    /// the repository table is the one the reader came for. A grid never drops
-    /// below one row, so a screen with no room at all still shows what it has
-    /// rather than an empty frame.
-    fn shrunk(self, excess: usize) -> Self {
-        let from_secondary = excess.min(self.secondary.saturating_sub(1));
-        Self {
-            primary: self.primary.saturating_sub(excess - from_secondary).max(1),
-            secondary: self.secondary.saturating_sub(from_secondary),
-        }
-    }
+/// A section that knows what it costs. Prose costs whatever the terminal's
+/// width makes it cost, which is why it is reflowed before the grids are told
+/// how many rows they may have.
+enum Laid {
+    Fixed(Vec<Line<'static>>),
+    Grid(Grid),
 }
 
 const REPOSITORY_COLUMNS: [Column; 5] = [
@@ -590,7 +596,9 @@ const REPOSITORY_COLUMNS: [Column; 5] = [
 
 /// The repository leads, the state follows, and the runner name comes third:
 /// a reader scans down the repository they care about, checks whether anything
-/// is wrong, and only then needs the identity of the individual runner.
+/// is wrong, and only then needs the identity of the individual runner. The
+/// dashboard draws the first three of these, so their order is load-bearing on
+/// two screens.
 const RUNNER_COLUMNS: [Column; 5] = [
     Column::flexible("Repository", 14, 0),
     // The badge is three facts wide, and on a narrow terminal it gives up the
@@ -615,15 +623,13 @@ const ACTIVITY_COLUMNS: [Column; 5] = [
     Column::flexible("Remediation", 14, 1).trimming(Trim::Tail),
 ];
 
-/// Metric lines plus the blank that separates them from the first grid.
-const DASHBOARD_HEADER_LINES: usize = 7;
-
 /// Terminal row the first repository row lands on, which is what a click has
-/// to be measured from. It moved when the grid grew a frame of its own, so it
-/// is derived here rather than left as a literal in the mouse reducer.
+/// to be measured from. Every term is a layout fact somebody could change, so
+/// each one is named and the grid's share is taken from the grid.
 pub const REPOSITORY_ROW_ORIGIN: u16 = 3 // title bar, navigation, content border
-    + 1 // the filter and sort status line
-    + 3; // the grid's own top border, header, and header rule
+    + 1 // the filter and sort status line, which never wraps
+    + table::GRID_CHROME as u16
+    - 1; // the grid's top border, header, and rule
 
 /// Draw into the content area owned by `shell.rs`.
 pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel, skin: &Skin) {
@@ -645,322 +651,366 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel, skin: &Ski
         ))
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .border_type(if skin.unicode {
-            BorderType::Rounded
-        } else {
-            BorderType::Plain
-        })
+        .border_set(skin.border())
         .border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    // Prose costs whatever the terminal makes it cost: a state panel above the
-    // activity table, or a metric line the width forced to wrap, spends rows
-    // `viewport` already promised to a grid. So the frame is measured and, if
-    // it overran, composed again against what the first pass actually drew --
-    // the difference between a table that ends in its own closing border and
-    // one whose last rows and border fall off the bottom of the screen. The
-    // second pass is exact, and the third only ever confirms it.
-    let mut budget = viewport(model, inner.height);
-    let (mut lines, mut drawn) = compose(model, skin, budget, inner.width);
-    for _ in 0..2 {
-        let excess = lines.len().saturating_sub(usize::from(inner.height));
-        if excess == 0 {
-            break;
+    // Layout before content: no grid can show more rows than the screen is
+    // tall, so that is the most any of them is asked to build. The prose is
+    // then measured at the real width -- a state panel above the table, or a
+    // metric line the terminal forced to wrap, costs whatever it costs -- and
+    // only what survives it is divided between the grids. One pass, and the
+    // last row of a table always arrives with its closing border.
+    let height = usize::from(inner.height);
+    let mut laid: Vec<Laid> = sections(model, skin, height)
+        .into_iter()
+        .map(|section| Laid::measured(section, inner.width))
+        .collect();
+    allot(&mut laid, height);
+    let mut y = inner.y;
+    for section in laid {
+        let room = inner.bottom().saturating_sub(y);
+        if room == 0 {
+            return;
         }
-        budget = drawn.shrunk(excess);
-        (lines, drawn) = compose(model, skin, budget, inner.width);
+        let lines = match section {
+            Laid::Fixed(lines) => lines,
+            Laid::Grid(grid) => grid.compose(skin, Some(inner.width)),
+        };
+        // Already laid out to this width, so nothing here may reflow again.
+        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX).min(room);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: rows,
+            },
+        );
+        y += rows;
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// The frame, and the rows each grid actually spent -- which is at most what
-/// the budget offered, and is what a second pass has to shrink from.
-fn compose(
-    model: &ScreenModel,
-    skin: &Skin,
-    budget: Budget,
-    width: u16,
-) -> (Vec<Line<'static>>, Budget) {
-    let mut lines = Vec::new();
-    let mut drawn = Budget {
-        primary: 0,
-        secondary: 0,
-    };
-    let mut grids = 0;
-    for section in sections(model, skin, budget) {
+impl Laid {
+    /// Prose is reflowed here, once, and what comes out is both the
+    /// measurement and the thing drawn -- so the two can never disagree about
+    /// what a line costs.
+    fn measured(section: Section, width: u16) -> Self {
         match section {
-            Section::Prose(prose) => {
-                lines.extend(prose.into_iter().flat_map(|line| wrapped(line, width)));
-            }
-            Section::Status(line) => lines.push(line),
-            Section::Grid(grid) => {
-                if grids == 0 {
-                    drawn.primary = grid.rows.len();
-                } else {
-                    drawn.secondary = grid.rows.len();
-                }
-                grids += 1;
-                lines.extend(grid.compose(skin, Some(width)));
-            }
+            Section::Prose(lines) => Self::Fixed(
+                lines
+                    .into_iter()
+                    .flat_map(|line| wrapped(line, width))
+                    .collect(),
+            ),
+            Section::Status(line) => Self::Fixed(vec![line]),
+            Section::Grid(grid) => Self::Grid(grid),
         }
     }
-    (lines, drawn)
 }
 
-/// Rows each grid may spend, given the height the shell actually granted. The
-/// grid frames and the dashboard's metric block are fixed costs; whatever
-/// survives them is split between the grids on the screen.
-fn viewport(model: &ScreenModel, height: u16) -> Budget {
-    let height = usize::from(height);
-    match model.screen {
-        ReadOnlyScreen::Dashboard => {
-            let rows = height
-                .saturating_sub(DASHBOARD_HEADER_LINES + 1 + 2 * table::GRID_CHROME)
-                .min(2 * TABLE_VIEWPORT_ROWS);
-            let primary = rows.div_ceil(2).max(1);
-            Budget {
-                primary,
-                secondary: rows.saturating_sub(primary).max(1),
+/// Break one prose line to the terminal's width, carrying each word's own span
+/// style across the break -- collapsing the line to a single style would
+/// silently un-tone every wrapped value, and a dashboard metric would keep its
+/// muted label and lose the bold number the reader is here for. Runs of spaces
+/// inside a line are not preserved; that only shows below the width at which
+/// the shell has already switched to its compact layout.
+fn wrapped(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    if width == 0 || line.width() <= width {
+        return vec![line];
+    }
+    let mut pieces: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for span in line.spans {
+        for word in span.content.split_whitespace() {
+            let lead = usize::from(used > 0);
+            if used > 0 && used + lead + word.width() > width {
+                pieces.push(Vec::new());
+                used = 0;
             }
+            let text = if used > 0 {
+                format!(" {word}")
+            } else {
+                word.to_owned()
+            };
+            used += text.width();
+            pieces
+                .last_mut()
+                .expect("a piece is always open")
+                .push(Span::styled(text, span.style));
         }
-        _ => Budget {
-            primary: height.saturating_sub(1 + table::GRID_CHROME).max(1),
-            secondary: 0,
-        },
+    }
+    pieces.into_iter().map(Line::from).collect()
+}
+
+/// Divide the rows the prose left over between the grids on the screen. The
+/// first grid is the one the reader came for, so it takes the larger share; a
+/// table with fewer rows than its share hands the surplus to the next one.
+fn allot(laid: &mut [Laid], height: usize) {
+    let mut grids = laid
+        .iter()
+        .filter(|section| matches!(section, Laid::Grid(_)))
+        .count();
+    if grids == 0 {
+        return;
+    }
+    let fixed: usize = laid
+        .iter()
+        .map(|section| match section {
+            Laid::Fixed(lines) => lines.len(),
+            Laid::Grid(_) => 0,
+        })
+        .sum();
+    let mut rows = height.saturating_sub(fixed + grids * table::GRID_CHROME);
+    for section in laid {
+        let Laid::Grid(grid) = section else { continue };
+        // A grid never drops below one row: a screen with no room at all still
+        // shows what it has rather than an empty frame.
+        grid.rows.truncate(rows.div_ceil(grids).max(1));
+        rows = rows.saturating_sub(grid.rows.len());
+        grids -= 1;
     }
 }
 
 /// Stable colour-independent rendering, also used by the snapshot harness and
 /// by the clipboard. ASCII at natural width: no glyph a legacy console cannot
-/// print, and no diagnostic shortened away from somebody about to paste it.
+/// print, and no cell shortened away from somebody about to paste it. The row
+/// window is the one on screen, so what is copied is what was read.
 pub fn render_text(model: &ScreenModel) -> String {
-    let budget = Budget {
-        primary: TABLE_VIEWPORT_ROWS,
-        secondary: TABLE_VIEWPORT_ROWS,
-    };
-    sections(model, &Skin::ASCII, budget)
+    sections(model, &Skin::ASCII, TABLE_VIEWPORT_ROWS)
         .iter()
         .map(|section| match section {
-            Section::Prose(lines) => lines.iter().map(flatten).collect::<Vec<_>>().join("\n"),
-            Section::Status(line) => flatten(line),
+            Section::Prose(lines) => table::text_of(lines),
+            Section::Status(line) => line.to_string(),
             Section::Grid(grid) => grid.to_text(&Skin::ASCII),
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn flatten(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
-}
-
-fn sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
-    match &model.snapshot.availability {
-        Availability::Loading => vec![state_panel(
-            skin,
-            Tone::Busy,
-            "LOADING",
-            "Waiting for the first GitHub inventory snapshot.",
-            "Action: F5 refresh now",
-        )],
-        Availability::Unauthorized => with_activity_details(
-            model,
-            skin,
-            budget,
-            vec![state_panel(
+/// Build a screen. `rows` is the most any one grid on it may draw.
+fn sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
+    let plain = |message: String| vec![(message, Tone::Plain)];
+    let (tone, title, body, action) = match &model.snapshot.availability {
+        Availability::Ready => return ready(model, skin, rows),
+        Availability::Loading => {
+            return vec![state_panel(
                 skin,
-                Tone::Bad,
-                "UNAUTHORIZED",
-                "GitHub authorization is missing or no longer valid.",
-                "Action: runner-manager auth login",
-            )],
+                Tone::Busy,
+                "LOADING",
+                plain("Waiting for the first GitHub inventory snapshot.".to_owned()),
+                "Action: F5 refresh now",
+            )];
+        }
+        Availability::Unauthorized => (
+            Tone::Bad,
+            "UNAUTHORIZED",
+            plain("GitHub authorization is missing or no longer valid.".to_owned()),
+            "Action: runner-manager auth login",
         ),
         Availability::RateLimited {
             retry_after_seconds,
-        } => with_activity_details(
-            model,
-            skin,
-            budget,
-            vec![state_panel(
-                skin,
-                Tone::Warn,
-                "RATE LIMITED",
-                &format!("GitHub asked this host to wait {retry_after_seconds}s."),
-                "Action: a opens rate-limit details; retry is automatic",
-            )],
+        } => (
+            Tone::Warn,
+            "RATE LIMITED",
+            plain(format!(
+                "GitHub asked this host to wait {retry_after_seconds}s."
+            )),
+            "Action: a opens rate-limit details; retry is automatic",
         ),
         Availability::Offline {
             last_successful_contact,
             retry_after_seconds,
-        } => {
-            let panel = Section::Prose(
-                [
-                    (
-                        "OFFLINE - no new runners will start".to_owned(),
-                        skin.style(Tone::Bad).add_modifier(Modifier::BOLD),
-                    ),
-                    (
-                        format!("Last successful GitHub contact: {last_successful_contact}"),
-                        skin.style(Tone::Plain),
-                    ),
-                    (
-                        format!("Retry in: {retry_after_seconds}s"),
-                        skin.style(Tone::Plain),
-                    ),
-                    (
-                        "Local remediation: check this host's network, DNS, proxy, and system clock."
-                            .to_owned(),
-                        skin.style(Tone::Muted),
-                    ),
-                    (
-                        QUEUE_CANCELLATION_WARNING.to_owned(),
-                        skin.style(Tone::Warn),
-                    ),
-                    (
-                        "Action: a opens Activity & errors".to_owned(),
-                        skin.style(Tone::Accent),
-                    ),
-                ]
-                .into_iter()
-                .map(|(text, style)| Line::from(Span::styled(text, style)))
-                .collect(),
-            );
-            with_activity_details(model, skin, budget, vec![panel])
-        }
-        Availability::Forbidden { message } => with_activity_details(
-            model,
-            skin,
-            budget,
-            vec![state_panel(
-                skin,
-                Tone::Bad,
-                "FORBIDDEN",
-                &format!(
-                    "GitHub is reachable but refused this target: {}",
-                    message
-                        .as_deref()
-                        .unwrap_or("required permission is missing")
+        } => (
+            Tone::Bad,
+            "OFFLINE - no new runners will start",
+            vec![
+                (
+                    format!("Last successful GitHub contact: {last_successful_contact}"),
+                    Tone::Plain,
                 ),
-                "Action: verify repository access and GitHub App/user permissions",
-            )],
+                (format!("Retry in: {retry_after_seconds}s"), Tone::Plain),
+                (
+                    "Local remediation: check this host's network, DNS, proxy, and system clock."
+                        .to_owned(),
+                    Tone::Muted,
+                ),
+                (QUEUE_CANCELLATION_WARNING.to_owned(), Tone::Warn),
+            ],
+            "Action: a opens Activity & errors",
         ),
-        Availability::Failed { detail } => with_activity_details(
-            model,
-            skin,
-            budget,
-            vec![state_panel(
-                skin,
-                Tone::Bad,
-                "REFRESH FAILED",
-                &format!("GitHub answered, but inventory could not be collected: {detail}"),
-                "Action: open Activity & errors and retry with F5",
-            )],
+        Availability::Forbidden { message } => (
+            Tone::Bad,
+            "FORBIDDEN",
+            plain(format!(
+                "GitHub is reachable but refused this target: {}",
+                message
+                    .as_deref()
+                    .unwrap_or("required permission is missing")
+            )),
+            "Action: verify repository access and GitHub App/user permissions",
         ),
-        Availability::Cancelled => with_activity_details(
-            model,
-            skin,
-            budget,
-            vec![state_panel(
-                skin,
-                Tone::Warn,
-                "REFRESH CANCELLED",
-                "The previous inventory collection was superseded or the TUI is stopping.",
-                "Action: F5 starts one latest refresh",
-            )],
+        Availability::Failed { detail } => (
+            Tone::Bad,
+            "REFRESH FAILED",
+            plain(format!(
+                "GitHub answered, but inventory could not be collected: {detail}"
+            )),
+            "Action: open Activity & errors and retry with F5",
         ),
-        Availability::Ready => ready(model, skin, budget),
-    }
+        Availability::Cancelled => (
+            Tone::Warn,
+            "REFRESH CANCELLED",
+            plain(
+                "The previous inventory collection was superseded or the TUI is stopping."
+                    .to_owned(),
+            ),
+            "Action: F5 starts one latest refresh",
+        ),
+    };
+    with_activity_details(
+        model,
+        skin,
+        rows,
+        state_panel(skin, tone, title, body, action),
+    )
 }
 
 fn with_activity_details(
     model: &ScreenModel,
     skin: &Skin,
-    budget: Budget,
-    mut summary: Vec<Section>,
+    rows: usize,
+    panel: Section,
 ) -> Vec<Section> {
+    let mut screen = vec![panel];
     if model.screen == ReadOnlyScreen::Activity && !model.snapshot.activity.is_empty() {
-        summary.push(Section::Prose(vec![Line::default()]));
-        summary.extend(activity_sections(model, skin, budget));
+        screen.push(Section::Prose(vec![Line::default()]));
+        screen.extend(activity_sections(
+            model,
+            skin,
+            &model.visible_activity(),
+            rows,
+        ));
     }
-    summary
+    screen
 }
 
-fn state_panel(skin: &Skin, tone: Tone, title: &str, message: &str, action: &str) -> Section {
-    Section::Prose(vec![
-        Line::from(Span::styled(
-            title.to_owned(),
-            skin.style(tone).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(message.to_owned(), skin.style(Tone::Plain))),
-        Line::from(Span::styled(action.to_owned(), skin.style(Tone::Accent))),
-    ])
+fn state_panel(
+    skin: &Skin,
+    tone: Tone,
+    title: &str,
+    body: Vec<(String, Tone)>,
+    action: &str,
+) -> Section {
+    let mut lines = vec![Line::from(Span::styled(
+        title.to_owned(),
+        skin.style(tone).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(
+        body.into_iter()
+            .map(|(text, tone)| Line::from(Span::styled(text, skin.style(tone)))),
+    );
+    lines.push(Line::from(Span::styled(
+        action.to_owned(),
+        skin.style(Tone::Accent),
+    )));
+    Section::Prose(lines)
 }
 
-fn ready(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
-    let globally_empty = match model.screen {
+/// Every screen's list is built exactly once here, and handed to the builder
+/// that needs it -- deriving it is a filter, a sort and a clone of the whole
+/// collection, and the suite keeps a ten-thousand repository case honest.
+fn ready(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
+    match model.screen {
         ReadOnlyScreen::Dashboard => {
-            model.snapshot.repositories.is_empty()
+            if model.snapshot.repositories.is_empty()
                 && model.snapshot.runners.is_empty()
                 && model.snapshot.metrics == DashboardMetrics::default()
+            {
+                return vec![empty_panel(skin, model.screen)];
+            }
+            dashboard_sections(model, skin, rows)
         }
-        ReadOnlyScreen::Repositories => model.snapshot.repositories.is_empty(),
-        ReadOnlyScreen::Runners => model.snapshot.runners.is_empty(),
-        ReadOnlyScreen::Activity => model.snapshot.activity.is_empty(),
-    };
-    if globally_empty {
-        return vec![match model.screen {
-            ReadOnlyScreen::Dashboard | ReadOnlyScreen::Repositories => state_panel(
-                skin,
-                Tone::Warn,
-                "EMPTY",
-                "No authorized targets are configured; workload is unknown, not zero.",
-                "Action: runner-manager repo add OWNER/REPO",
-            ),
-            ReadOnlyScreen::Runners => state_panel(
-                skin,
-                Tone::Warn,
-                "EMPTY",
-                "No authorized GitHub runners are visible.",
-                "Action: F5 refresh or open Repositories",
-            ),
-            ReadOnlyScreen::Activity => state_panel(
-                skin,
-                Tone::Ok,
-                "EMPTY",
-                "No lifecycle activity or errors have been recorded.",
-                "Action: F5 refresh",
-            ),
-        }];
-    }
-    let no_matches = match model.screen {
-        ReadOnlyScreen::Dashboard => false,
-        ReadOnlyScreen::Repositories => model.visible_repository_ids().is_empty(),
-        ReadOnlyScreen::Runners => model.visible_runner_ids().is_empty(),
-        ReadOnlyScreen::Activity => model.visible_activity_ids().is_empty(),
-    };
-    if no_matches {
-        return vec![state_panel(
-            skin,
-            Tone::Warn,
-            "NO MATCHES",
-            "Rows exist, but none match the current filter.",
-            "Action: Esc clears the filter",
-        )];
-    }
-    match model.screen {
-        ReadOnlyScreen::Dashboard => dashboard_sections(model, skin, budget),
-        ReadOnlyScreen::Repositories => repository_sections(model, skin, budget),
-        ReadOnlyScreen::Runners => runner_sections(model, skin, budget),
-        ReadOnlyScreen::Activity => activity_sections(model, skin, budget),
+        ReadOnlyScreen::Repositories => {
+            if model.snapshot.repositories.is_empty() {
+                return vec![empty_panel(skin, model.screen)];
+            }
+            let visible = model.visible_repositories();
+            if visible.is_empty() {
+                return vec![no_matches(skin)];
+            }
+            repository_sections(model, skin, &visible, rows)
+        }
+        ReadOnlyScreen::Runners => {
+            if model.snapshot.runners.is_empty() {
+                return vec![empty_panel(skin, model.screen)];
+            }
+            let visible = model.visible_runners();
+            if visible.is_empty() {
+                return vec![no_matches(skin)];
+            }
+            runner_sections(model, skin, &visible, rows)
+        }
+        ReadOnlyScreen::Activity => {
+            if model.snapshot.activity.is_empty() {
+                return vec![empty_panel(skin, model.screen)];
+            }
+            let visible = model.visible_activity();
+            if visible.is_empty() {
+                return vec![no_matches(skin)];
+            }
+            activity_sections(model, skin, &visible, rows)
+        }
     }
 }
 
-fn dashboard_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
+/// Nothing is configured, which is not the same as nothing being busy.
+fn empty_panel(skin: &Skin, screen: ReadOnlyScreen) -> Section {
+    let (tone, message, action) = match screen {
+        ReadOnlyScreen::Dashboard | ReadOnlyScreen::Repositories => (
+            Tone::Warn,
+            "No authorized targets are configured; workload is unknown, not zero.",
+            "Action: runner-manager repo add OWNER/REPO",
+        ),
+        ReadOnlyScreen::Runners => (
+            Tone::Warn,
+            "No authorized GitHub runners are visible.",
+            "Action: F5 refresh or open Repositories",
+        ),
+        ReadOnlyScreen::Activity => (
+            Tone::Ok,
+            "No lifecycle activity or errors have been recorded.",
+            "Action: F5 refresh",
+        ),
+    };
+    state_panel(
+        skin,
+        tone,
+        "EMPTY",
+        vec![(message.to_owned(), Tone::Plain)],
+        action,
+    )
+}
+
+fn no_matches(skin: &Skin) -> Section {
+    state_panel(
+        skin,
+        Tone::Warn,
+        "NO MATCHES",
+        vec![(
+            "Rows exist, but none match the current filter.".to_owned(),
+            Tone::Plain,
+        )],
+        "Action: Esc clears the filter",
+    )
+}
+
+fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
     let m = &model.snapshot.metrics;
     let metric = |label: &str, value: String, tone: Tone| {
         Line::from(vec![
@@ -1002,13 +1052,20 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<S
     ]);
     vec![
         head,
-        Section::Grid(repository_grid(model, skin, "Repositories", budget.primary)),
+        Section::Grid(repository_grid(
+            model,
+            skin,
+            "Repositories",
+            &model.visible_repositories(),
+            rows,
+        )),
         Section::Prose(vec![Line::default()]),
         Section::Grid(runner_grid(
             model,
             skin,
             "Runners",
-            budget.secondary,
+            &model.visible_runners(),
+            rows,
             &RUNNER_COLUMNS[..3],
         )),
     ]
@@ -1018,7 +1075,12 @@ const fn workload_tone(value: u32) -> Tone {
     if value == 0 { Tone::Muted } else { Tone::Busy }
 }
 
-fn repository_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
+fn repository_sections(
+    model: &ScreenModel,
+    skin: &Skin,
+    visible: &[&RepositoryRow],
+    rows: usize,
+) -> Vec<Section> {
     if let Some(detail_id) = model.repository_detail.as_deref()
         && let Some(row) = model
             .snapshot
@@ -1043,22 +1105,23 @@ fn repository_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<
                         .map_or_else(|| "n/a".into(), |capacity| capacity.to_string()),
                     Tone::Plain,
                 ),
-                (
-                    "Agent health: ",
-                    row.health.marker().to_owned(),
-                    row.health.tone(),
-                ),
+                ("Agent health: ", row.health.marker(), row.health.tone()),
             ],
             "Action: Esc returns to the repository list",
         )];
     }
     vec![
         table_status(skin, &model.repositories),
-        Section::Grid(repository_grid(model, skin, "", budget.primary)),
+        Section::Grid(repository_grid(model, skin, "", visible, rows)),
     ]
 }
 
-fn runner_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
+fn runner_sections(
+    model: &ScreenModel,
+    skin: &Skin,
+    visible: &[&RunnerRow],
+    rows: usize,
+) -> Vec<Section> {
     if let Some(detail_id) = model.runner_detail.as_deref()
         && let Some(row) = model
             .snapshot
@@ -1088,13 +1151,7 @@ fn runner_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Sect
     }
     vec![
         table_status(skin, &model.runners),
-        Section::Grid(runner_grid(
-            model,
-            skin,
-            "",
-            budget.primary,
-            &RUNNER_COLUMNS,
-        )),
+        Section::Grid(runner_grid(model, skin, "", visible, rows, &RUNNER_COLUMNS)),
     ]
 }
 
@@ -1102,55 +1159,49 @@ const fn online_tone(online: bool) -> Tone {
     if online { Tone::Ok } else { Tone::Bad }
 }
 
-fn activity_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
+fn activity_sections(
+    model: &ScreenModel,
+    skin: &Skin,
+    visible: &[&ActivityRow],
+    rows: usize,
+) -> Vec<Section> {
     let notice = Section::Status(Line::from(Span::styled(
         "Diagnostics are redacted and copy-safe. Acknowledge: Enter | Copy: c".to_owned(),
         skin.style(Tone::Muted),
     )));
-    let rows = viewport_rows(
-        &model.visible_activity_ids(),
-        model.activity.scroll,
-        budget.primary,
-    )
-    .into_iter()
-    .filter_map(|id| {
-        model
-            .snapshot
-            .activity
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| {
-                let acknowledged = model.acknowledged_activity.contains(&row.id);
-                GridRow {
-                    selected: model.activity.selected_id.as_deref() == Some(row.id.as_str()),
-                    cells: vec![
-                        Cell::new(
-                            if acknowledged {
-                                "[acknowledged]"
-                            } else {
-                                "[new]"
-                            },
-                            if acknowledged {
-                                Tone::Muted
-                            } else {
-                                Tone::Warn
-                            },
-                        ),
-                        Cell::new(row.occurred_at.clone(), Tone::Muted),
-                        Cell::new(row.outcome.marker(), row.outcome.tone()),
-                        Cell::plain(copy_safe(&row.summary)),
-                        Cell::new(copy_safe(&row.remediation), Tone::Muted),
-                    ],
-                }
-            })
-    })
-    .collect();
+    let body = window(visible, model.activity.scroll, rows)
+        .iter()
+        .map(|row| {
+            let acknowledged = model.acknowledged_activity.contains(&row.id);
+            GridRow {
+                selected: model.activity.selected_id.as_deref() == Some(row.id.as_str()),
+                cells: vec![
+                    Cell::new(
+                        if acknowledged {
+                            "[acknowledged]"
+                        } else {
+                            "[new]"
+                        },
+                        if acknowledged {
+                            Tone::Muted
+                        } else {
+                            Tone::Warn
+                        },
+                    ),
+                    Cell::new(row.occurred_at.clone(), Tone::Muted),
+                    Cell::new(row.outcome.marker(), row.outcome.tone()),
+                    Cell::plain(copy_safe(&row.summary)),
+                    Cell::new(copy_safe(&row.remediation), Tone::Muted),
+                ],
+            }
+        })
+        .collect();
     vec![
         notice,
         Section::Grid(Grid {
             caption: String::new(),
             columns: ACTIVITY_COLUMNS.to_vec(),
-            rows,
+            rows: body,
             sorted: Some((1, model.activity.sort_order != SortOrder::NameAscending)),
         }),
     ]
@@ -1191,39 +1242,36 @@ fn table_status(skin: &Skin, state: &TableViewState) -> Section {
     )))
 }
 
-fn repository_grid(model: &ScreenModel, skin: &Skin, caption: &str, rows: usize) -> Grid {
-    let ids = model.visible_repository_ids();
-    let body = viewport_rows(&ids, model.repositories.scroll, rows)
-        .into_iter()
-        .filter_map(|id| {
-            model
-                .snapshot
-                .repositories
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| {
-                    let selected =
-                        model.repositories.selected_id.as_deref() == Some(row.id.as_str());
-                    GridRow {
-                        selected,
-                        cells: vec![
-                            Cell::new(
-                                format!("{}{}", skin.marker(selected), row.target),
-                                Tone::Accent,
-                            ),
-                            Cell::new(
-                                row.in_progress_workflows.to_string(),
-                                workload_tone(row.in_progress_workflows),
-                            ),
-                            Cell::new(row.mode.marker(), row.mode.tone()),
-                            row.max_capacity.map_or_else(
-                                || Cell::new("n/a", Tone::Muted),
-                                |capacity| Cell::plain(capacity.to_string()),
-                            ),
-                            row.health.badge(skin),
-                        ],
-                    }
-                })
+fn repository_grid(
+    model: &ScreenModel,
+    skin: &Skin,
+    caption: &str,
+    visible: &[&RepositoryRow],
+    rows: usize,
+) -> Grid {
+    let body = window(visible, model.repositories.scroll, rows)
+        .iter()
+        .map(|row| {
+            let selected = model.repositories.selected_id.as_deref() == Some(row.id.as_str());
+            GridRow {
+                selected,
+                cells: vec![
+                    Cell::new(
+                        format!("{}{}", skin.marker(selected), row.target),
+                        Tone::Accent,
+                    ),
+                    Cell::new(
+                        row.in_progress_workflows.to_string(),
+                        workload_tone(row.in_progress_workflows),
+                    ),
+                    Cell::new(row.mode.marker(), row.mode.tone()),
+                    row.max_capacity.map_or_else(
+                        || Cell::new("n/a", Tone::Muted),
+                        |capacity| Cell::plain(capacity.to_string()),
+                    ),
+                    row.health.badge(skin),
+                ],
+            }
         })
         .collect();
     Grid {
@@ -1242,42 +1290,34 @@ fn runner_grid(
     model: &ScreenModel,
     skin: &Skin,
     caption: &str,
+    visible: &[&RunnerRow],
     rows: usize,
     columns: &[Column],
 ) -> Grid {
-    let ids = model.visible_runner_ids();
-    let body = viewport_rows(&ids, model.runners.scroll, rows)
-        .into_iter()
-        .filter_map(|id| {
-            model
-                .snapshot
-                .runners
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| {
-                    let selected = model.runners.selected_id.as_deref() == Some(row.id.as_str());
-                    GridRow {
-                        selected,
-                        cells: vec![
-                            Cell::new(
-                                format!("{}{}", skin.marker(selected), row.owner),
-                                Tone::Accent,
-                            ),
-                            runner_status(row, skin),
-                            Cell::plain(row.name.clone()),
-                            Cell::new(row.os.clone(), Tone::Muted),
-                            Cell::new(row.labels.join(","), Tone::Muted),
-                        ],
-                    }
-                })
+    let body = window(visible, model.runners.scroll, rows)
+        .iter()
+        .map(|row| {
+            let selected = model.runners.selected_id.as_deref() == Some(row.id.as_str());
+            GridRow {
+                selected,
+                cells: vec![
+                    Cell::new(
+                        format!("{}{}", skin.marker(selected), row.owner),
+                        Tone::Accent,
+                    ),
+                    runner_status(row, skin),
+                    Cell::plain(row.name.clone()),
+                    Cell::new(row.os.clone(), Tone::Muted),
+                    Cell::new(row.labels.join(","), Tone::Muted),
+                ],
+            }
         })
         .collect();
     Grid {
         caption: caption.to_owned(),
         columns: columns.to_vec(),
         rows: body,
-        sorted: Some((2, model.runners.sort_order != SortOrder::NameAscending))
-            .filter(|_| columns.len() > 2),
+        sorted: Some((2, model.runners.sort_order != SortOrder::NameAscending)),
     }
 }
 
@@ -1294,10 +1334,10 @@ fn runner_status(row: &RunnerRow, skin: &Skin) -> Cell {
     } else {
         (skin.pick("\u{25cb}", "o"), "offline", Tone::Bad)
     };
-    let lifetime = if row.ephemeral {
-        format!("{}ephemeral ", skin.pick("\u{25c7}", ""))
+    let (mark, lifetime) = if row.ephemeral {
+        (skin.pick("\u{25c7}", ""), "ephemeral")
     } else {
-        format!("{}persistent", skin.pick("\u{25c6}", ""))
+        (skin.pick("\u{25c6}", ""), "persistent")
     };
     let ownership = match row.ownership {
         RunnerOwnership::Local => "local",
@@ -1305,50 +1345,16 @@ fn runner_status(row: &RunnerRow, skin: &Skin) -> Cell {
     };
     Cell::compound(vec![
         (format!("{glyph} {word:<7}"), tone),
-        (format!("  {lifetime}"), Tone::Muted),
+        (format!("  {mark}{lifetime:<10}"), Tone::Muted),
         (format!("  {ownership}"), Tone::Muted),
     ])
 }
 
-/// The window of rows a grid may draw, starting where the table is scrolled to.
-fn viewport_rows(ids: &[String], scroll: usize, rows: usize) -> Vec<String> {
-    let start = scroll.min(ids.len().saturating_sub(1));
-    ids.iter().skip(start).take(rows).cloned().collect()
-}
-
-/// Prose is the only thing the content area may reflow; a grid already fits.
-fn wrapped(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-    let text = flatten(&line);
-    let width = usize::from(width);
-    if width == 0 || text.width() <= width {
-        return vec![line];
-    }
-    // Each word keeps the style of the span it came from. Collapsing the line
-    // to the first span's style instead would silently un-tone every wrapped
-    // value -- a dashboard metric would keep its muted label and lose the bold
-    // number, which is the half of the line the reader is here for.
-    let mut pieces: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used = 0;
-    for span in line.spans {
-        for word in span.content.split_whitespace() {
-            let lead = usize::from(used > 0);
-            if used > 0 && used + lead + word.width() > width {
-                pieces.push(Vec::new());
-                used = 0;
-            }
-            let text = if used > 0 {
-                format!(" {word}")
-            } else {
-                word.to_owned()
-            };
-            used += text.width();
-            pieces
-                .last_mut()
-                .expect("a piece is always open")
-                .push(Span::styled(text, span.style));
-        }
-    }
-    pieces.into_iter().map(Line::from).collect()
+/// The rows a grid may draw, starting where the table is scrolled to.
+fn window<T>(rows: &[T], scroll: usize, budget: usize) -> &[T] {
+    let start = scroll.min(rows.len().saturating_sub(1));
+    let end = start.saturating_add(budget).min(rows.len());
+    &rows[start..end]
 }
 
 /// Defensive final boundary for persisted diagnostics.
@@ -1536,21 +1542,17 @@ mod tests {
 
     /// One frame, exactly as the terminal receives it.
     fn drawn(width: u16, height: u16, model: &ScreenModel) -> String {
+        skinned(width, height, model, &Skin::RICH)
+    }
+
+    fn skinned(width: u16, height: u16, model: &ScreenModel, skin: &Skin) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(frame, frame.area(), model, &Skin::RICH))
+            .draw(|frame| render(frame, frame.area(), model, skin))
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        super::super::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
@@ -1654,6 +1656,20 @@ mod tests {
                 row.contains('\u{25b8}'),
                 "width {width}: the selected first row is not at the click origin:\n{frame}"
             );
+        }
+    }
+
+    #[test]
+    fn the_ascii_skin_draws_a_frame_a_legacy_console_can_print() {
+        // The README promises that `TERM=dumb` and `RUNNER_MANAGER_TUI_ASCII`
+        // remove the glyphs. The grid honoured that from the start; the block
+        // around it did not, because Ratatui's `BorderType::Plain` is still
+        // box drawing. Both now take their glyphs from the same skin.
+        for screen in ReadOnlyScreen::ALL {
+            let mut model = ScreenModel::new(populated());
+            model.screen = screen;
+            let frame = skinned(100, 24, &model, &Skin::ASCII);
+            assert!(frame.is_ascii(), "{screen:?} kept a glyph:\n{frame}");
         }
     }
 

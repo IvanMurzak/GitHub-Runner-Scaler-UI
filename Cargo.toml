@@ -153,7 +153,11 @@ crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"]
 # The TUI grid measures every cell in terminal COLUMNS, not bytes or chars: a
 # repository or runner name may be wide or combining, and a column that is one
 # cell too wide is exactly the ragged table this dependency exists to prevent.
+# `unicode-truncate` does the cutting and padding at that same measure, and is
+# grapheme-aware where hand-written character arithmetic is not. Ratatui already
+# builds both, so neither is a new crate in the tree.
 unicode-width = "0.2.2"
+unicode-truncate = "2.0.1"
 
 # --- Command line -----------------------------------------------------------
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }

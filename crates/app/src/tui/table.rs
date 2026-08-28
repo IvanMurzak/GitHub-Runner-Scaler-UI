@@ -17,9 +17,11 @@
 
 use ratatui::{
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    symbols::{border, line},
+    text::{Line, Span, Text},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_truncate::{Alignment, UnicodeTruncateStr};
+use unicode_width::UnicodeWidthStr;
 
 /// Lines of chrome a grid spends on its frame: top, header, rule, bottom.
 pub const GRID_CHROME: usize = 4;
@@ -42,6 +44,15 @@ pub enum Tone {
 pub enum Align {
     Left,
     Right,
+}
+
+impl Align {
+    const fn padding(self) -> Alignment {
+        match self {
+            Self::Left => Alignment::Left,
+            Self::Right => Alignment::Right,
+        }
+    }
 }
 
 /// Where an over-long cell loses its middle. Identifiers keep both ends,
@@ -153,8 +164,13 @@ impl Cell {
         }
     }
 
-    fn text(&self) -> String {
-        self.parts.iter().map(|part| part.text.as_str()).collect()
+    /// The whole cell as one string. Single-fragment cells -- almost all of
+    /// them -- hand back what they already hold rather than rebuilding it.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self.parts.as_slice() {
+            [only] => std::borrow::Cow::Borrowed(only.text.as_str()),
+            parts => parts.iter().map(|part| part.text.as_str()).collect(),
+        }
     }
 
     fn width(&self) -> usize {
@@ -176,6 +192,53 @@ pub struct Grid {
     /// Column carrying the sort marker, and whether it descends.
     pub sorted: Option<(usize, bool)>,
 }
+
+/// One column's place in a solved grid: which column it is, and how wide it
+/// came out. One value rather than two positionally-paired `Vec`s, so no
+/// consumer has to re-thread a position back through an index to reach the
+/// column it is already looking at.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    index: usize,
+    column: Column,
+    width: u16,
+}
+
+/// Which of a grid's three rules is being drawn. The glyphs differ; nothing
+/// else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Top,
+    Header,
+    Bottom,
+}
+
+/// ASCII stand-ins for Ratatui's box-drawing sets, for a console that cannot
+/// print the real ones.
+const ASCII_LINES: line::Set<'static> = line::Set {
+    vertical: "|",
+    horizontal: "-",
+    top_right: "+",
+    top_left: "+",
+    bottom_right: "+",
+    bottom_left: "+",
+    vertical_left: "+",
+    vertical_right: "+",
+    horizontal_down: "+",
+    horizontal_up: "+",
+    cross: "+",
+};
+
+const ASCII_BORDER: border::Set<'static> = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
 
 /// Glyphs and colour, resolved once per process. Everything a skin decides is
 /// decoration: the same grid says the same thing through either one.
@@ -233,47 +296,36 @@ impl Skin {
         if self.unicode { rich } else { plain }
     }
 
-    const fn top_left(self) -> &'static str {
-        self.pick("\u{256d}", "+")
+    /// The grid's own rules and column separators.
+    const fn lines(self) -> line::Set<'static> {
+        if self.unicode {
+            line::ROUNDED
+        } else {
+            ASCII_LINES
+        }
     }
-    const fn top_right(self) -> &'static str {
-        self.pick("\u{256e}", "+")
+
+    /// The frame a screen draws around its content. Shares the grid's glyph
+    /// vocabulary, so an ASCII terminal never gets a Unicode box around an
+    /// ASCII table.
+    pub const fn border(self) -> border::Set<'static> {
+        if self.unicode {
+            border::ROUNDED
+        } else {
+            ASCII_BORDER
+        }
     }
-    const fn bottom_left(self) -> &'static str {
-        self.pick("\u{2570}", "+")
-    }
-    const fn bottom_right(self) -> &'static str {
-        self.pick("\u{256f}", "+")
-    }
-    const fn horizontal(self) -> &'static str {
-        self.pick("\u{2500}", "-")
-    }
-    const fn vertical(self) -> &'static str {
-        self.pick("\u{2502}", "|")
-    }
-    const fn tee_down(self) -> &'static str {
-        self.pick("\u{252c}", "+")
-    }
-    const fn tee_up(self) -> &'static str {
-        self.pick("\u{2534}", "+")
-    }
-    const fn tee_left(self) -> &'static str {
-        self.pick("\u{251c}", "+")
-    }
-    const fn tee_right(self) -> &'static str {
-        self.pick("\u{2524}", "+")
-    }
-    const fn cross(self) -> &'static str {
-        self.pick("\u{253c}", "+")
-    }
+
     const fn ellipsis(self) -> &'static str {
         self.pick("\u{2026}", "..")
     }
-    const fn ascending(self) -> &'static str {
-        self.pick(" \u{25b2}", " ^")
-    }
-    const fn descending(self) -> &'static str {
-        self.pick(" \u{25bc}", " v")
+
+    const fn sort_marker(self, descending: bool) -> &'static str {
+        if descending {
+            self.pick(" \u{25bc}", " v")
+        } else {
+            self.pick(" \u{25b2}", " ^")
+        }
     }
 
     /// The marker a row carries inside its first cell, so a selection survives
@@ -330,58 +382,34 @@ fn utf8_capable() -> bool {
         })
 }
 
+/// Every span of every line, concatenated. `Line` and `Text` already know how
+/// to do this; this is the one place that asks them.
+pub fn text_of(lines: &[Line<'_>]) -> String {
+    Text::from(lines.to_vec()).to_string()
+}
+
 impl Grid {
     /// Plain text at natural width: nothing is dropped and nothing is
     /// shortened, which is what makes this safe to put on the clipboard.
     pub fn to_text(&self, skin: &Skin) -> String {
-        self.compose(skin, None)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        text_of(&self.compose(skin, None))
     }
 
     /// Styled lines occupying exactly `width` columns, or -- when `width` is
     /// `None` -- exactly as many as the widest value needs.
     pub fn compose(&self, skin: &Skin, width: Option<u16>) -> Vec<Line<'static>> {
-        let (kept, widths) = self.solve(width);
-        if kept.is_empty() {
+        let fits = self.solve(width);
+        if fits.is_empty() {
             return Vec::new();
         }
         let mut lines = Vec::with_capacity(self.rows.len() + GRID_CHROME);
-        lines.push(self.rule(
-            skin,
-            &widths,
-            skin.top_left(),
-            skin.tee_down(),
-            skin.top_right(),
-            Some(self.caption.as_str()),
-        ));
-        lines.push(self.header(skin, &kept, &widths));
-        lines.push(self.rule(
-            skin,
-            &widths,
-            skin.tee_left(),
-            skin.cross(),
-            skin.tee_right(),
-            None,
-        ));
+        lines.push(self.rule(skin, &fits, Edge::Top, Some(self.caption.as_str())));
+        lines.push(self.header(skin, &fits));
+        lines.push(self.rule(skin, &fits, Edge::Header, None));
         for (ordinal, row) in self.rows.iter().enumerate() {
-            lines.push(self.body(skin, &kept, &widths, row, ordinal));
+            lines.push(self.body(skin, &fits, row, ordinal));
         }
-        lines.push(self.rule(
-            skin,
-            &widths,
-            skin.bottom_left(),
-            skin.tee_up(),
-            skin.bottom_right(),
-            None,
-        ));
+        lines.push(self.rule(skin, &fits, Edge::Bottom, None));
         lines
     }
 
@@ -395,20 +423,14 @@ impl Grid {
             .map(Cell::width)
             .max()
             .unwrap_or(0);
-        clamp(header.max(widest))
+        narrow(header.max(widest))
     }
 
     fn header_text(&self, index: usize) -> String {
         // The rich marker is never wider than the ASCII one, so measuring the
         // ASCII form gives one width that holds for both skins.
         let marker = match self.sorted {
-            Some((sorted, descending)) if sorted == index => {
-                if descending {
-                    Skin::ASCII.descending()
-                } else {
-                    Skin::ASCII.ascending()
-                }
-            }
+            Some((sorted, descending)) if sorted == index => Skin::ASCII.sort_marker(descending),
             _ => "",
         };
         format!("{}{marker}", self.columns[index].header)
@@ -417,195 +439,151 @@ impl Grid {
     /// Decide which columns survive and how wide each one is. Flexible columns
     /// give up width first; only when they are all at their minimum does a
     /// column leave, lowest rank first.
-    fn solve(&self, width: Option<u16>) -> (Vec<usize>, Vec<u16>) {
-        let mut kept: Vec<usize> = (0..self.columns.len()).collect();
+    fn solve(&self, width: Option<u16>) -> Vec<Fit> {
+        // Natural widths depend on the rows and the headers, neither of which
+        // changes while columns are leaving -- so they are measured once, not
+        // once per surviving column per dropped column.
+        let mut fits: Vec<Fit> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, &column)| Fit {
+                index,
+                column,
+                width: self.natural(index),
+            })
+            .collect();
+        let Some(total) = width else {
+            return fits;
+        };
         loop {
-            let natural: Vec<u16> = kept.iter().map(|&index| self.natural(index)).collect();
-            let Some(total) = width else {
-                return (kept, natural);
-            };
-            if kept.is_empty() {
-                return (kept, natural);
+            if fits.is_empty() {
+                return fits;
             }
-            let body = total.saturating_sub(chrome_width(kept.len()));
+            let body = total.saturating_sub(chrome_width(fits.len()));
             // Summed in `u32` and narrowed back: a single pathological cell --
             // a multi-kilobyte diagnostic, say -- makes a `u16` sum wrap, and a
             // wrapped total reads as "everything fits" at the widest moment it
             // does not.
-            let wanted = narrow(natural.iter().map(|&width| u32::from(width)).sum());
+            let wanted = sum(fits.iter().map(|fit| fit.width));
             if wanted <= body {
-                let widths = self.grow(&kept, natural, body - wanted);
-                return (kept, widths);
+                grow(&mut fits, body - wanted);
+                return fits;
             }
-            let rigid = narrow(
-                kept.iter()
-                    .zip(&natural)
-                    .filter(|(index, _)| !self.columns[**index].flex)
-                    .map(|(_, &width)| u32::from(width))
-                    .sum(),
-            );
-            let floor = narrow(
-                kept.iter()
-                    .filter(|&&index| self.columns[index].flex)
-                    .map(|&index| u32::from(self.columns[index].min_width))
-                    .sum(),
-            );
-            let flexible = kept.iter().any(|&index| self.columns[index].flex);
+            let rigid = sum(fits
+                .iter()
+                .filter(|fit| !fit.column.flex)
+                .map(|fit| fit.width));
+            let floor = sum(fits
+                .iter()
+                .filter(|fit| fit.column.flex)
+                .map(|fit| fit.column.min_width));
+            let flexible = fits.iter().any(|fit| fit.column.flex);
             if flexible && rigid.saturating_add(floor) <= body {
-                let widths = self.shrink(&kept, &natural, body.saturating_sub(rigid));
-                return (kept, widths);
+                shrink(&mut fits, body.saturating_sub(rigid));
+                return fits;
             }
-            match self.expendable(&kept) {
+            match expendable(&fits) {
                 Some(position) => {
-                    kept.remove(position);
+                    fits.remove(position);
                 }
                 None => {
-                    let widths = squeeze(&natural, body);
-                    return (kept, widths);
+                    squeeze(&mut fits, body);
+                    return fits;
                 }
             }
         }
     }
 
-    /// Slack goes to the flexible columns, so the frame closes on the terminal
-    /// edge instead of leaving a ragged gap beside it.
-    fn grow(&self, kept: &[usize], mut widths: Vec<u16>, slack: u16) -> Vec<u16> {
-        let flexible: Vec<usize> = (0..kept.len())
-            .filter(|&position| self.columns[kept[position]].flex)
-            .collect();
-        let targets = if flexible.is_empty() {
-            vec![kept.len() - 1]
-        } else {
-            flexible
+    fn rule(&self, skin: &Skin, fits: &[Fit], edge: Edge, caption: Option<&str>) -> Line<'static> {
+        let set = skin.lines();
+        let (left, joint, right) = match edge {
+            Edge::Top => (set.top_left, set.horizontal_down, set.top_right),
+            Edge::Header => (set.vertical_right, set.cross, set.vertical_left),
+            Edge::Bottom => (set.bottom_left, set.horizontal_up, set.bottom_right),
         };
-        let count = clamp(targets.len());
-        for (step, &position) in targets.iter().enumerate() {
-            let share = slack / count + u16::from(clamp(step) < slack % count);
-            widths[position] = widths[position].saturating_add(share);
-        }
-        widths
-    }
-
-    /// Bring the flexible columns down to `budget`. Eager columns give up
-    /// their slack first, in proportion to how much each has; only when they
-    /// are all at their minimum is a reluctant column asked for anything.
-    fn shrink(&self, kept: &[usize], natural: &[u16], budget: u16) -> Vec<u16> {
-        let mut widths = natural.to_vec();
-        let flexible: Vec<usize> = (0..kept.len())
-            .filter(|&position| self.columns[kept[position]].flex)
-            .collect();
-        let minimum = |position: usize| self.columns[kept[position]].min_width;
-        let wanted = narrow(
-            flexible
-                .iter()
-                .map(|&position| u32::from(natural[position]))
-                .sum(),
-        );
-        let mut deficit = wanted.saturating_sub(budget);
-        for reluctant in [false, true] {
-            if deficit == 0 {
-                break;
-            }
-            let group: Vec<usize> = flexible
-                .iter()
-                .copied()
-                .filter(|&position| self.columns[kept[position]].reluctant == reluctant)
-                .collect();
-            deficit = take_width(&mut widths, &group, &minimum, deficit);
-        }
-        widths
-    }
-
-    /// The next column to leave: lowest rank above zero, rightmost on a tie.
-    fn expendable(&self, kept: &[usize]) -> Option<usize> {
-        kept.iter()
-            .enumerate()
-            .filter(|(_, index)| self.columns[**index].rank > 0)
-            .min_by_key(|(position, index)| (self.columns[**index].rank, usize::MAX - *position))
-            .map(|(position, _)| position)
-    }
-
-    fn rule(
-        &self,
-        skin: &Skin,
-        widths: &[u16],
-        left: &'static str,
-        joint: &'static str,
-        right: &'static str,
-        caption: Option<&str>,
-    ) -> Line<'static> {
-        let mut inner: Vec<&'static str> = Vec::new();
-        for (position, &width) in widths.iter().enumerate() {
+        // Column positions, within the rule's interior, that carry a joint
+        // rather than a plain horizontal.
+        let mut joints = Vec::with_capacity(fits.len());
+        let mut inner_width = 0;
+        for (position, fit) in fits.iter().enumerate() {
             if position > 0 {
-                inner.push(joint);
+                joints.push(inner_width);
+                inner_width += 1;
             }
-            for _ in 0..usize::from(width) + 2 {
-                inner.push(skin.horizontal());
-            }
+            inner_width += usize::from(fit.width) + 2;
         }
-        let painted = |glyphs: &[&'static str]| Span::styled(glyphs.concat(), skin.chrome());
+        let segment = |range: std::ops::Range<usize>| -> String {
+            range
+                .map(|column| {
+                    if joints.contains(&column) {
+                        joint
+                    } else {
+                        set.horizontal
+                    }
+                })
+                .collect()
+        };
+        let painted = |glyphs: String| Span::styled(glyphs, skin.chrome());
         // The caption is painted over the first column's own stretch of rule.
         // Letting it run past that column's joint would paint over the joint,
         // and the top rule would stop agreeing with every row beneath it --
         // exactly the boundary this grid exists to hold. So the caption is
         // shortened to the room the first column actually has.
-        let room = if widths.len() > 1 {
-            usize::from(widths[0]).saturating_sub(1)
+        let room = if fits.len() > 1 {
+            usize::from(fits[0].width).saturating_sub(1)
         } else {
-            inner.len().saturating_sub(4)
+            inner_width.saturating_sub(4)
         };
         let caption = caption
             .filter(|text| !text.is_empty())
             .map(|text| shorten(text, room, Trim::Tail, skin.ellipsis()))
-            .filter(|text| !text.is_empty());
-        match caption.as_deref() {
-            Some(caption) if caption.width() + 4 <= inner.len() => {
-                let start = 1;
-                let end = start + caption.width() + 2;
+            .filter(|text| !text.is_empty() && text.width() + 4 <= inner_width);
+        match caption {
+            Some(caption) => {
+                let end = 1 + caption.width() + 2;
                 Line::from(vec![
-                    painted(&[left]),
-                    painted(&inner[..start]),
+                    painted(left.to_owned()),
+                    painted(segment(0..1)),
                     Span::styled(
                         format!(" {caption} "),
                         skin.style(Tone::Accent).add_modifier(Modifier::BOLD),
                     ),
-                    painted(&inner[end..]),
-                    painted(&[right]),
+                    painted(segment(end..inner_width)),
+                    painted(right.to_owned()),
                 ])
             }
-            _ => Line::from(vec![painted(&[left]), painted(&inner), painted(&[right])]),
+            None => Line::from(vec![
+                painted(left.to_owned()),
+                painted(segment(0..inner_width)),
+                painted(right.to_owned()),
+            ]),
         }
     }
 
-    fn header(&self, skin: &Skin, kept: &[usize], widths: &[u16]) -> Line<'static> {
-        let mut spans = vec![Span::styled(skin.vertical(), skin.chrome())];
-        for (position, &index) in kept.iter().enumerate() {
-            let column = self.columns[index];
+    fn header(&self, skin: &Skin, fits: &[Fit]) -> Line<'static> {
+        let separator = skin.lines().vertical;
+        let mut spans = vec![Span::styled(separator, skin.chrome())];
+        let bold = skin.style(Tone::Plain).add_modifier(Modifier::BOLD);
+        for fit in fits {
             spans.push(Span::styled(" ", skin.chrome()));
             spans.push(Span::styled(
                 lay(
-                    &self.header_text(index),
-                    widths[position],
-                    column.align,
+                    &self.header_text(fit.index),
+                    fit.width,
+                    fit.column.align,
                     Trim::Tail,
                     skin.ellipsis(),
                 ),
-                skin.style(Tone::Plain).add_modifier(Modifier::BOLD),
+                bold,
             ));
             spans.push(Span::styled(" ", skin.chrome()));
-            spans.push(Span::styled(skin.vertical(), skin.chrome()));
+            spans.push(Span::styled(separator, skin.chrome()));
         }
         Line::from(spans)
     }
 
-    fn body(
-        &self,
-        skin: &Skin,
-        kept: &[usize],
-        widths: &[u16],
-        row: &Row,
-        ordinal: usize,
-    ) -> Line<'static> {
+    fn body(&self, skin: &Skin, fits: &[Fit], row: &Row, ordinal: usize) -> Line<'static> {
         let background = match skin.zebra {
             Some(colour) if !row.selected && ordinal % 2 == 1 => Some(colour),
             _ => None,
@@ -625,201 +603,217 @@ impl Grid {
                 None => style,
             }
         };
+        let separator = skin.lines().vertical;
+        let chrome = decorate(skin.chrome());
         let blank = Cell::plain("");
-        let mut spans = vec![Span::styled(skin.vertical(), decorate(skin.chrome()))];
-        for (position, &index) in kept.iter().enumerate() {
-            let column = self.columns[index];
-            let width = widths[position];
-            let cell = row.cells.get(index).unwrap_or(&blank);
-            spans.push(Span::styled(" ", decorate(skin.chrome())));
-            if cell.parts.len() > 1 && cell.width() <= usize::from(width) {
+        let mut spans = vec![Span::styled(separator, chrome)];
+        for fit in fits {
+            let cell = row.cells.get(fit.index).unwrap_or(&blank);
+            let used = cell.width();
+            spans.push(Span::styled(" ", chrome));
+            if cell.parts.len() > 1 && used <= usize::from(fit.width) {
                 // Every fragment keeps its own tone; padding closes the cell.
-                let pad = usize::from(width) - cell.width();
-                if column.align == Align::Right {
-                    spans.push(Span::styled(" ".repeat(pad), decorate(Style::default())));
-                }
+                let (before, after) = pad(usize::from(fit.width) - used, fit.column.align);
+                spans.push(Span::styled(before, decorate(Style::default())));
                 for part in &cell.parts {
                     spans.push(Span::styled(
                         part.text.clone(),
                         decorate(skin.style(part.tone)),
                     ));
                 }
-                if column.align == Align::Left {
-                    spans.push(Span::styled(" ".repeat(pad), decorate(Style::default())));
-                }
+                spans.push(Span::styled(after, decorate(Style::default())));
             } else {
                 let tone = cell.parts.first().map_or(Tone::Plain, |part| part.tone);
                 spans.push(Span::styled(
                     lay(
                         &cell.text(),
-                        width,
-                        column.align,
-                        column.trim,
+                        fit.width,
+                        fit.column.align,
+                        fit.column.trim,
                         skin.ellipsis(),
                     ),
                     decorate(skin.style(tone)),
                 ));
             }
-            spans.push(Span::styled(" ", decorate(skin.chrome())));
-            spans.push(Span::styled(skin.vertical(), decorate(skin.chrome())));
+            spans.push(Span::styled(" ", chrome));
+            spans.push(Span::styled(separator, chrome));
         }
         Line::from(spans)
     }
+}
+
+/// Slack goes to the flexible columns, so the frame closes on the terminal
+/// edge instead of leaving a ragged gap beside it.
+fn grow(fits: &mut [Fit], slack: u16) {
+    let mut targets: Vec<usize> = (0..fits.len()).filter(|&at| fits[at].column.flex).collect();
+    if targets.is_empty() {
+        targets = vec![fits.len() - 1];
+    }
+    let count = narrow(targets.len());
+    for (step, &at) in targets.iter().enumerate() {
+        let share = slack / count + u16::from(narrow(step) < slack % count);
+        fits[at].width = fits[at].width.saturating_add(share);
+    }
+}
+
+/// Bring the flexible columns down to `budget`. Eager columns give up their
+/// slack first, in proportion to how much each has; only when they are all at
+/// their minimum is a reluctant column asked for anything.
+fn shrink(fits: &mut [Fit], budget: u16) {
+    let flexible: Vec<usize> = (0..fits.len()).filter(|&at| fits[at].column.flex).collect();
+    let wanted = sum(flexible.iter().map(|&at| fits[at].width));
+    let mut deficit = wanted.saturating_sub(budget);
+    for reluctant in [false, true] {
+        if deficit == 0 {
+            break;
+        }
+        let group: Vec<usize> = flexible
+            .iter()
+            .copied()
+            .filter(|&at| fits[at].column.reluctant == reluctant)
+            .collect();
+        deficit = take_width(fits, &group, deficit);
+    }
+}
+
+/// The next column to leave: lowest rank above zero, rightmost on a tie.
+fn expendable(fits: &[Fit]) -> Option<usize> {
+    fits.iter()
+        .enumerate()
+        .filter(|(_, fit)| fit.column.rank > 0)
+        .min_by_key(|(position, fit)| (fit.column.rank, usize::MAX - *position))
+        .map(|(position, _)| position)
 }
 
 /// Take up to `deficit` columns of width from `group`, in proportion to the
 /// slack each column has above its minimum, and answer what could not be
 /// taken. Integer division always leaves a remainder, and a grid that is one
 /// column too wide overruns the terminal, so the remainder is collected too.
-fn take_width(
-    widths: &mut [u16],
-    group: &[usize],
-    minimum: &impl Fn(usize) -> u16,
-    deficit: u16,
-) -> u16 {
-    let slack: u32 = group
-        .iter()
-        .map(|&position| u32::from(widths[position].saturating_sub(minimum(position))))
-        .sum();
-    if slack == 0 {
+fn take_width(fits: &mut [Fit], group: &[usize], deficit: u16) -> u16 {
+    let slack = |fit: &Fit| u32::from(fit.width.saturating_sub(fit.column.min_width));
+    let total: u32 = group.iter().map(|&at| slack(&fits[at])).sum();
+    if total == 0 {
         return deficit;
     }
-    let take = u32::from(deficit).min(slack);
+    let take = u32::from(deficit).min(total);
     let mut taken = 0;
-    for &position in group {
-        let own = u32::from(widths[position].saturating_sub(minimum(position)));
-        let share = (take * own / slack).min(own);
-        widths[position] -= narrow(share);
+    for &at in group {
+        let own = slack(&fits[at]);
+        let share = (take * own / total).min(own);
+        fits[at].width -= narrow_u32(share);
         taken += share;
     }
     let mut rest = take - taken;
-    for &position in group {
+    for &at in group {
         if rest == 0 {
             break;
         }
-        let bite = u32::from(widths[position].saturating_sub(minimum(position))).min(rest);
-        widths[position] -= narrow(bite);
+        let bite = slack(&fits[at]).min(rest);
+        fits[at].width -= narrow_u32(bite);
         rest -= bite;
     }
-    deficit - narrow(take)
-}
-
-/// Borders and padding: one glyph between every pair of columns, one at each
-/// end, and one space either side of every body.
-fn chrome_width(columns: usize) -> u16 {
-    clamp(columns * 3 + 1)
-}
-
-fn clamp(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
-}
-
-fn narrow(value: u32) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
+    deficit - narrow_u32(take)
 }
 
 /// Last resort: nothing may leave and nothing fits, so every column is scaled
 /// down together rather than one of them being starved.
-fn squeeze(natural: &[u16], budget: u16) -> Vec<u16> {
-    let wanted: u32 = natural.iter().map(|&width| u32::from(width)).sum();
+fn squeeze(fits: &mut [Fit], budget: u16) {
+    let wanted: u32 = fits.iter().map(|fit| u32::from(fit.width)).sum();
     if wanted == 0 {
-        return natural.to_vec();
+        return;
     }
-    let mut widths: Vec<u16> = natural
-        .iter()
-        .map(|&width| narrow(u32::from(width) * u32::from(budget) / wanted))
-        .collect();
+    for fit in fits.iter_mut() {
+        fit.width = narrow_u32(u32::from(fit.width) * u32::from(budget) / wanted);
+    }
     // Integer division always rounds down, and a grid that stops one column
     // short of the terminal edge is the ragged frame this module exists to
     // prevent, so the remainder is handed back out. It goes first to the
     // columns that rounded down to nothing -- a column only vanishes when the
     // budget genuinely cannot pay for it -- and never exceeds the budget,
     // because a grid one column too wide overruns the terminal instead.
-    let mut spare = budget.saturating_sub(widths.iter().copied().sum());
-    for width in widths.iter_mut().filter(|width| **width == 0) {
-        if spare == 0 {
-            break;
+    let mut spare = budget.saturating_sub(sum(fits.iter().map(|fit| fit.width)));
+    for pass in [true, false] {
+        for fit in fits.iter_mut() {
+            if spare == 0 {
+                return;
+            }
+            if pass == (fit.width == 0) {
+                fit.width += 1;
+                spare -= 1;
+            }
         }
-        *width += 1;
-        spare -= 1;
     }
-    for width in &mut widths {
-        if spare == 0 {
-            break;
-        }
-        *width = width.saturating_add(1);
-        spare -= 1;
+}
+
+/// Borders and padding: one glyph between every pair of columns, one at each
+/// end, and one space either side of every body.
+fn chrome_width(columns: usize) -> u16 {
+    narrow(columns * 3 + 1)
+}
+
+/// Widths are summed in `u32` so a pathological cell cannot wrap the total.
+fn sum(widths: impl Iterator<Item = u16>) -> u16 {
+    narrow_u32(widths.map(u32::from).sum())
+}
+
+fn narrow(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn narrow_u32(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+/// The spaces that close a cell whose content is narrower than its column.
+fn pad(width: usize, align: Align) -> (String, String) {
+    let spaces = " ".repeat(width);
+    match align {
+        Align::Left => (String::new(), spaces),
+        Align::Right => (spaces, String::new()),
     }
-    widths
 }
 
 /// Shorten to `width`, then pad to exactly `width`.
-pub fn lay(text: &str, width: u16, align: Align, trim: Trim, ellipsis: &str) -> String {
+fn lay(text: &str, width: u16, align: Align, trim: Trim, ellipsis: &str) -> String {
     let width = usize::from(width);
-    let short = shorten(text, width, trim, ellipsis);
-    let pad = width.saturating_sub(short.width());
-    match align {
-        Align::Left => format!("{short}{}", " ".repeat(pad)),
-        Align::Right => format!("{}{short}", " ".repeat(pad)),
-    }
+    shorten(text, width, trim, ellipsis)
+        .unicode_pad(width, align.padding(), false)
+        .into_owned()
 }
 
 /// Drop the middle of an identifier, or the tail of prose. Both ends of a
 /// runner name matter -- the routing label leads it and the unique suffix ends
 /// it -- so a middle trim is the only one that keeps a name recognisable.
-pub fn shorten(text: &str, width: usize, trim: Trim, ellipsis: &str) -> String {
+fn shorten(text: &str, width: usize, trim: Trim, ellipsis: &str) -> String {
     if text.width() <= width {
         return text.to_owned();
     }
     let marker = ellipsis.width();
     if width <= marker {
-        return prefix(text, width);
+        return text.unicode_truncate(width).0.to_owned();
     }
     let keep = width - marker;
     match trim {
-        Trim::Tail => format!("{}{ellipsis}", prefix(text, keep)),
+        Trim::Tail => format!("{}{ellipsis}", text.unicode_truncate(keep).0),
         Trim::Middle => {
             let head = keep.div_ceil(2);
             format!(
                 "{}{ellipsis}{}",
-                prefix(text, head),
-                suffix(text, keep - head)
+                text.unicode_truncate(head).0,
+                text.unicode_truncate_start(keep - head).0
             )
         }
     }
 }
 
-fn prefix(text: &str, width: usize) -> String {
-    let mut taken = String::new();
-    let mut used = 0;
-    for character in text.chars() {
-        let step = character.width().unwrap_or(0);
-        if used + step > width {
-            break;
-        }
-        used += step;
-        taken.push(character);
-    }
-    taken
-}
-
-fn suffix(text: &str, width: usize) -> String {
-    let mut taken = std::collections::VecDeque::new();
-    let mut used = 0;
-    for character in text.chars().rev() {
-        let step = character.width().unwrap_or(0);
-        if used + step > width {
-            break;
-        }
-        used += step;
-        taken.push_front(character);
-    }
-    taken.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grid as the terminal would show it, at a chosen width.
+    fn drawn(grid: &Grid, skin: &Skin, width: u16) -> String {
+        text_of(&grid.compose(skin, Some(width)))
+    }
 
     fn column_widths(text: &str) -> Vec<usize> {
         text.lines()
@@ -879,17 +873,7 @@ mod tests {
         // to hold at every terminal width, not just the comfortable ones.
         // ----------------------------------------------------------------
         for width in [10_u16, 13, 16, 20, 24, 40, 60, 80, 100, 120, 200] {
-            let composed = grid().compose(&Skin::ASCII, Some(width));
-            let rendered = composed
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let rendered = drawn(&grid(), &Skin::ASCII, width);
             let widths = column_widths(&rendered);
             assert!(
                 widths.windows(2).all(|pair| pair[0] == pair[1]),
@@ -925,7 +909,7 @@ mod tests {
 
     #[test]
     fn columns_leave_in_rank_order_and_the_named_three_never_do() {
-        let narrow = grid().to_text_at(&Skin::ASCII, 46);
+        let narrow = drawn(&grid(), &Skin::ASCII, 46);
         assert!(!narrow.contains("Labels"), "rank 1 leaves first:\n{narrow}");
         assert!(!narrow.contains("OS"), "rank 2 leaves next:\n{narrow}");
         for survivor in ["Repository", "Status", "Runner"] {
@@ -973,7 +957,7 @@ mod tests {
                 "overran at {width}"
             );
             assert_eq!(
-                lay(wide, clamp(width), Align::Left, Trim::Middle, "..").width(),
+                lay(wide, narrow(width), Align::Left, Trim::Middle, "..").width(),
                 width
             );
         }
@@ -1002,7 +986,7 @@ mod tests {
         reluctant.columns[1] = Column::flexible("Status", 9, 0)
             .trimming(Trim::Tail)
             .reluctant();
-        let rendered = reluctant.to_text_at(&Skin::ASCII, 86);
+        let rendered = drawn(&reluctant, &Skin::ASCII, 86);
         assert!(
             rendered.contains("offline persistent"),
             "the badge paid before the names did:\n{rendered}"
@@ -1015,7 +999,7 @@ mod tests {
         // Eager by default, and then the badge is shortened alongside the rest.
         let mut plain = grid();
         plain.columns[1] = Column::flexible("Status", 9, 0).trimming(Trim::Tail);
-        assert_ne!(rendered, plain.to_text_at(&Skin::ASCII, 86));
+        assert_ne!(rendered, drawn(&plain, &Skin::ASCII, 86));
     }
 
     #[test]
@@ -1025,7 +1009,7 @@ mod tests {
         // joint, so the top rule declared one set of boundaries and every row
         // beneath it drew another -- the ragged grid, back again, one line up.
         for width in [20_u16, 24, 30, 40, 60, 90] {
-            let rendered = grid().to_text_at(&Skin::ASCII, width);
+            let rendered = drawn(&grid(), &Skin::ASCII, width);
             let lines: Vec<Vec<char>> = rendered.lines().map(|l| l.chars().collect()).collect();
             let separators: Vec<usize> = lines[1]
                 .iter()
@@ -1048,7 +1032,7 @@ mod tests {
     #[test]
     fn a_grid_with_no_room_left_still_renders_something_rectangular() {
         for width in [0_u16, 1, 4, 8, 12] {
-            let rendered = grid().to_text_at(&Skin::ASCII, width);
+            let rendered = drawn(&grid(), &Skin::ASCII, width);
             let widths = column_widths(&rendered);
             assert!(
                 widths.windows(2).all(|pair| pair[0] == pair[1]),
@@ -1070,21 +1054,6 @@ mod tests {
         let production = source.split_once("mod tests {").unwrap().0;
         for forbidden in ["std::fs", "std::net", "reqwest", ".await", "block_on"] {
             assert!(!production.contains(forbidden), "grid acquired {forbidden}");
-        }
-    }
-
-    impl Grid {
-        fn to_text_at(&self, skin: &Skin, width: u16) -> String {
-            self.compose(skin, Some(width))
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
         }
     }
 }

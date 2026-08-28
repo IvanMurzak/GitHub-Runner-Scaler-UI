@@ -1845,15 +1845,7 @@ mod tests {
     fn rendered(width: u16, height: u16, state: &AppState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        super::super::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
@@ -2903,6 +2895,29 @@ mod tests {
     fn in_memory_frame_meets_budget_and_render_has_no_io_capability() {
         let mut state = AppState::new(PresentationState::default(), 120, 40);
         state.presentation.body = (0..100).map(|n| format!("row {n}")).collect();
+        // --------------------------------------------------------------------
+        // THE FRAME A USER ACTUALLY GETS, NOT THE EMPTY ONE.
+        // --------------------------------------------------------------------
+        // A default `AppState` is still `Loading`, which draws a three-line
+        // panel and touches none of the table code -- the column solver, the
+        // per-cell layout, and the sort behind every visible row -- that the
+        // per-frame cost now lives in. Measuring that frame would have said
+        // nothing about any of it.
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            repositories: (0..1_000)
+                .map(|ordinal| RepositoryRow {
+                    id: format!("repo-{ordinal}"),
+                    target: format!("acme/repository-{ordinal:05}"),
+                    in_progress_workflows: ordinal % 7,
+                    mode: PolicyMode::Autoscale,
+                    max_capacity: Some(4),
+                    health: AgentHealth::Healthy,
+                })
+                .collect(),
+            ..Snapshot::default()
+        });
+        state.open_screen(Screen::Repositories);
 
         // --------------------------------------------------------------------
         // THE FASTEST OF SEVERAL RENDERS, NOT THE FIRST ONE.
