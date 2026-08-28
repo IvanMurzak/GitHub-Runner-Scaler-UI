@@ -428,22 +428,28 @@ impl Grid {
                 return (kept, natural);
             }
             let body = total.saturating_sub(chrome_width(kept.len()));
-            let wanted: u16 = natural.iter().copied().sum();
+            // Summed in `u32` and narrowed back: a single pathological cell --
+            // a multi-kilobyte diagnostic, say -- makes a `u16` sum wrap, and a
+            // wrapped total reads as "everything fits" at the widest moment it
+            // does not.
+            let wanted = narrow(natural.iter().map(|&width| u32::from(width)).sum());
             if wanted <= body {
                 let widths = self.grow(&kept, natural, body - wanted);
                 return (kept, widths);
             }
-            let rigid: u16 = kept
-                .iter()
-                .zip(&natural)
-                .filter(|(index, _)| !self.columns[**index].flex)
-                .map(|(_, &width)| width)
-                .sum();
-            let floor: u16 = kept
-                .iter()
-                .filter(|&&index| self.columns[index].flex)
-                .map(|&index| self.columns[index].min_width)
-                .sum();
+            let rigid = narrow(
+                kept.iter()
+                    .zip(&natural)
+                    .filter(|(index, _)| !self.columns[**index].flex)
+                    .map(|(_, &width)| u32::from(width))
+                    .sum(),
+            );
+            let floor = narrow(
+                kept.iter()
+                    .filter(|&&index| self.columns[index].flex)
+                    .map(|&index| u32::from(self.columns[index].min_width))
+                    .sum(),
+            );
             let flexible = kept.iter().any(|&index| self.columns[index].flex);
             if flexible && rigid.saturating_add(floor) <= body {
                 let widths = self.shrink(&kept, &natural, body.saturating_sub(rigid));
@@ -489,7 +495,12 @@ impl Grid {
             .filter(|&position| self.columns[kept[position]].flex)
             .collect();
         let minimum = |position: usize| self.columns[kept[position]].min_width;
-        let wanted: u16 = flexible.iter().map(|&position| natural[position]).sum();
+        let wanted = narrow(
+            flexible
+                .iter()
+                .map(|&position| u32::from(natural[position]))
+                .sum(),
+        );
         let mut deficit = wanted.saturating_sub(budget);
         for reluctant in [false, true] {
             if deficit == 0 {
@@ -533,8 +544,21 @@ impl Grid {
             }
         }
         let painted = |glyphs: &[&'static str]| Span::styled(glyphs.concat(), skin.chrome());
-        let caption = caption.filter(|text| !text.is_empty());
-        match caption {
+        // The caption is painted over the first column's own stretch of rule.
+        // Letting it run past that column's joint would paint over the joint,
+        // and the top rule would stop agreeing with every row beneath it --
+        // exactly the boundary this grid exists to hold. So the caption is
+        // shortened to the room the first column actually has.
+        let room = if widths.len() > 1 {
+            usize::from(widths[0]).saturating_sub(1)
+        } else {
+            inner.len().saturating_sub(4)
+        };
+        let caption = caption
+            .filter(|text| !text.is_empty())
+            .map(|text| shorten(text, room, Trim::Tail, skin.ellipsis()))
+            .filter(|text| !text.is_empty());
+        match caption.as_deref() {
             Some(caption) if caption.width() + 4 <= inner.len() => {
                 let start = 1;
                 let end = start + caption.width() + 2;
@@ -587,14 +611,18 @@ impl Grid {
             _ => None,
         };
         let decorate = |style: Style| {
-            let style = match background {
+            if row.selected {
+                // One highlight for the whole row, not one per tone. `REVERSED`
+                // turns a foreground colour into a background, so keeping the
+                // tones here would paint the selected row as a patchwork of
+                // cyan, green and grey blocks instead of a single bar. Nothing
+                // is lost: every tone on this row is also spelled out in words,
+                // and the row still carries its `marker`.
+                return Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            }
+            match background {
                 Some(colour) => style.bg(colour),
                 None => style,
-            };
-            if row.selected {
-                style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                style
             }
         };
         let blank = Cell::plain("");
@@ -699,12 +727,22 @@ fn squeeze(natural: &[u16], budget: u16) -> Vec<u16> {
     }
     let mut widths: Vec<u16> = natural
         .iter()
-        .map(|&width| narrow(u32::from(width) * u32::from(budget) / wanted).max(1))
+        .map(|&width| narrow(u32::from(width) * u32::from(budget) / wanted))
         .collect();
     // Integer division always rounds down, and a grid that stops one column
     // short of the terminal edge is the ragged frame this module exists to
-    // prevent, so the remainder is handed back out.
+    // prevent, so the remainder is handed back out. It goes first to the
+    // columns that rounded down to nothing -- a column only vanishes when the
+    // budget genuinely cannot pay for it -- and never exceeds the budget,
+    // because a grid one column too wide overruns the terminal instead.
     let mut spare = budget.saturating_sub(widths.iter().copied().sum());
+    for width in widths.iter_mut().filter(|width| **width == 0) {
+        if spare == 0 {
+            break;
+        }
+        *width += 1;
+        spare -= 1;
+    }
     for width in &mut widths {
         if spare == 0 {
             break;
@@ -840,7 +878,7 @@ mod tests {
         // to the header, the rules, and every row, is the fix -- and it has
         // to hold at every terminal width, not just the comfortable ones.
         // ----------------------------------------------------------------
-        for width in [24_u16, 40, 60, 80, 100, 120, 200] {
+        for width in [10_u16, 13, 16, 20, 24, 40, 60, 80, 100, 120, 200] {
             let composed = grid().compose(&Skin::ASCII, Some(width));
             let rendered = composed
                 .iter()
@@ -975,10 +1013,36 @@ mod tests {
         );
 
         // Eager by default, and then the badge is shortened alongside the rest.
-        let eager = reluctant.to_text_at(&Skin::ASCII, 86);
         let mut plain = grid();
         plain.columns[1] = Column::flexible("Status", 9, 0).trimming(Trim::Tail);
-        assert_ne!(eager, plain.to_text_at(&Skin::ASCII, 86));
+        assert_ne!(rendered, plain.to_text_at(&Skin::ASCII, 86));
+    }
+
+    #[test]
+    fn a_caption_never_paints_over_the_boundary_the_rows_beneath_it_keep() {
+        // The caption sits on the first column's own stretch of the top rule.
+        // When it was allowed to run past that column it painted over the
+        // joint, so the top rule declared one set of boundaries and every row
+        // beneath it drew another -- the ragged grid, back again, one line up.
+        for width in [20_u16, 24, 30, 40, 60, 90] {
+            let rendered = grid().to_text_at(&Skin::ASCII, width);
+            let lines: Vec<Vec<char>> = rendered.lines().map(|l| l.chars().collect()).collect();
+            let separators: Vec<usize> = lines[1]
+                .iter()
+                .enumerate()
+                .filter(|(column, glyph)| {
+                    **glyph == '|' && *column > 0 && *column + 1 < width.into()
+                })
+                .map(|(column, _)| column)
+                .collect();
+            for &column in &separators {
+                assert_eq!(
+                    lines[0].get(column),
+                    Some(&'+'),
+                    "caption ate the joint at {column}, width {width}:\n{rendered}"
+                );
+            }
+        }
     }
 
     #[test]

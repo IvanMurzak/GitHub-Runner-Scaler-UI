@@ -550,6 +550,11 @@ fn reconcile_table(table: &mut TableViewState, ids: &[String], old_len: Option<u
 /// must not be, because re-wrapping it is precisely what destroys the columns.
 enum Section {
     Prose(Vec<Line<'static>>),
+    /// One line that always occupies exactly one terminal row. The filter and
+    /// sort status line is this: [`REPOSITORY_ROW_ORIGIN`] counts it as a
+    /// single row, so a wrap here would slide every table row down and a click
+    /// would open the repository below the one the reader aimed at.
+    Status(Line<'static>),
     Grid(Grid),
 }
 
@@ -559,6 +564,20 @@ enum Section {
 struct Budget {
     primary: usize,
     secondary: usize,
+}
+
+impl Budget {
+    /// Hand `excess` rows back, out of the second grid first: on the dashboard
+    /// the repository table is the one the reader came for. A grid never drops
+    /// below one row, so a screen with no room at all still shows what it has
+    /// rather than an empty frame.
+    fn shrunk(self, excess: usize) -> Self {
+        let from_secondary = excess.min(self.secondary.saturating_sub(1));
+        Self {
+            primary: self.primary.saturating_sub(excess - from_secondary).max(1),
+            secondary: self.secondary.saturating_sub(from_secondary),
+        }
+    }
 }
 
 const REPOSITORY_COLUMNS: [Column; 5] = [
@@ -637,18 +656,58 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel, skin: &Ski
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let mut lines = Vec::new();
-    for section in sections(model, skin, viewport(model, inner.height)) {
-        match section {
-            Section::Prose(prose) => lines.extend(
-                prose
-                    .into_iter()
-                    .flat_map(|line| wrapped(line, inner.width)),
-            ),
-            Section::Grid(grid) => lines.extend(grid.compose(skin, Some(inner.width))),
+    // Prose costs whatever the terminal makes it cost: a state panel above the
+    // activity table, or a metric line the width forced to wrap, spends rows
+    // `viewport` already promised to a grid. So the frame is measured and, if
+    // it overran, composed again against what the first pass actually drew --
+    // the difference between a table that ends in its own closing border and
+    // one whose last rows and border fall off the bottom of the screen. The
+    // second pass is exact, and the third only ever confirms it.
+    let mut budget = viewport(model, inner.height);
+    let (mut lines, mut drawn) = compose(model, skin, budget, inner.width);
+    for _ in 0..2 {
+        let excess = lines.len().saturating_sub(usize::from(inner.height));
+        if excess == 0 {
+            break;
         }
+        budget = drawn.shrunk(excess);
+        (lines, drawn) = compose(model, skin, budget, inner.width);
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The frame, and the rows each grid actually spent -- which is at most what
+/// the budget offered, and is what a second pass has to shrink from.
+fn compose(
+    model: &ScreenModel,
+    skin: &Skin,
+    budget: Budget,
+    width: u16,
+) -> (Vec<Line<'static>>, Budget) {
+    let mut lines = Vec::new();
+    let mut drawn = Budget {
+        primary: 0,
+        secondary: 0,
+    };
+    let mut grids = 0;
+    for section in sections(model, skin, budget) {
+        match section {
+            Section::Prose(prose) => {
+                lines.extend(prose.into_iter().flat_map(|line| wrapped(line, width)));
+            }
+            Section::Status(line) => lines.push(line),
+            Section::Grid(grid) => {
+                if grids == 0 {
+                    drawn.primary = grid.rows.len();
+                } else {
+                    drawn.secondary = grid.rows.len();
+                }
+                grids += 1;
+                lines.extend(grid.compose(skin, Some(width)));
+            }
+        }
+    }
+    (lines, drawn)
 }
 
 /// Rows each grid may spend, given the height the shell actually granted. The
@@ -686,6 +745,7 @@ pub fn render_text(model: &ScreenModel) -> String {
         .iter()
         .map(|section| match section {
             Section::Prose(lines) => lines.iter().map(flatten).collect::<Vec<_>>().join("\n"),
+            Section::Status(line) => flatten(line),
             Section::Grid(grid) => grid.to_text(&Skin::ASCII),
         })
         .collect::<Vec<_>>()
@@ -1043,10 +1103,10 @@ const fn online_tone(online: bool) -> Tone {
 }
 
 fn activity_sections(model: &ScreenModel, skin: &Skin, budget: Budget) -> Vec<Section> {
-    let notice = Section::Prose(vec![Line::from(Span::styled(
+    let notice = Section::Status(Line::from(Span::styled(
         "Diagnostics are redacted and copy-safe. Acknowledge: Enter | Copy: c".to_owned(),
         skin.style(Tone::Muted),
-    ))]);
+    )));
     let rows = viewport_rows(
         &model.visible_activity_ids(),
         model.activity.scroll,
@@ -1119,7 +1179,7 @@ fn visible_filter(filter: &str) -> &str {
 }
 
 fn table_status(skin: &Skin, state: &TableViewState) -> Section {
-    Section::Prose(vec![Line::from(Span::styled(
+    Section::Status(Line::from(Span::styled(
         format!(
             "Filter: {} | Sort: {:?} | Focus: {:?} | Scroll: {}",
             visible_filter(&state.filter),
@@ -1128,7 +1188,7 @@ fn table_status(skin: &Skin, state: &TableViewState) -> Section {
             state.scroll,
         ),
         skin.style(Tone::Muted),
-    ))])
+    )))
 }
 
 fn repository_grid(model: &ScreenModel, skin: &Skin, caption: &str, rows: usize) -> Grid {
@@ -1263,24 +1323,32 @@ fn wrapped(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
     if width == 0 || text.width() <= width {
         return vec![line];
     }
-    let style = line
-        .spans
-        .first()
-        .map_or_else(Style::default, |span| span.style);
-    let mut pieces: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
-        match pieces.last_mut() {
-            Some(last) if last.width() + 1 + word.width() <= width => {
-                last.push(' ');
-                last.push_str(word);
+    // Each word keeps the style of the span it came from. Collapsing the line
+    // to the first span's style instead would silently un-tone every wrapped
+    // value -- a dashboard metric would keep its muted label and lose the bold
+    // number, which is the half of the line the reader is here for.
+    let mut pieces: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for span in line.spans {
+        for word in span.content.split_whitespace() {
+            let lead = usize::from(used > 0);
+            if used > 0 && used + lead + word.width() > width {
+                pieces.push(Vec::new());
+                used = 0;
             }
-            _ => pieces.push(word.to_owned()),
+            let text = if used > 0 {
+                format!(" {word}")
+            } else {
+                word.to_owned()
+            };
+            used += text.width();
+            pieces
+                .last_mut()
+                .expect("a piece is always open")
+                .push(Span::styled(text, span.style));
         }
     }
-    pieces
-        .into_iter()
-        .map(|piece| Line::from(Span::styled(piece, style)))
-        .collect()
+    pieces.into_iter().map(Line::from).collect()
 }
 
 /// Defensive final boundary for persisted diagnostics.
@@ -1537,6 +1605,55 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_state_panel_never_pushes_the_table_off_the_bottom_of_the_screen() {
+        // The panel above an offline activity table is prose the grid's row
+        // budget never spent, so the grid was drawn taller than the room left
+        // and its last rows -- closing border and all -- fell off the screen,
+        // with nothing left to say the table had been cut.
+        let mut snapshot = populated();
+        let template = snapshot.activity[0].clone();
+        for ordinal in 0..10 {
+            let mut row = template.clone();
+            row.id = format!("filler-{ordinal}");
+            snapshot.activity.push(row);
+        }
+        snapshot.availability = Availability::Offline {
+            last_successful_contact: "2026-08-27T10:00:00Z".into(),
+            retry_after_seconds: 30,
+        };
+        let mut model = ScreenModel::new(snapshot);
+        model.screen = ReadOnlyScreen::Activity;
+        for height in [18_u16, 20, 24, 30] {
+            let frame = drawn(100, height, &model);
+            assert!(
+                frame.contains('\u{2534}'),
+                "the table lost its closing border at height {height}:\n{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_repository_row_lands_where_a_click_is_measured_from() {
+        // `shell.rs` turns a click into a row index by subtracting
+        // `REPOSITORY_ROW_ORIGIN`. If the status line above the table ever
+        // takes two rows, every row slides down and a click opens the
+        // repository below the one the reader aimed at.
+        let mut model = ScreenModel::new(populated());
+        model.screen = ReadOnlyScreen::Repositories;
+        // The drawn frame here is the content area alone; the real origin also
+        // counts the title bar and the navigation row above it.
+        let offset = usize::from(REPOSITORY_ROW_ORIGIN) - 2;
+        for width in [30_u16, 40, 56, 80, 120] {
+            let frame = drawn(width, 20, &model);
+            let row = frame.lines().nth(offset).expect("a first table row");
+            assert!(
+                row.contains('\u{25b8}'),
+                "width {width}: the selected first row is not at the click origin:\n{frame}"
+            );
         }
     }
 
