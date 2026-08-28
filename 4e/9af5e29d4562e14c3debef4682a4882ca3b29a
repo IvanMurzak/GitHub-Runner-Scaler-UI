@@ -1,0 +1,19 @@
+docs/open/token-renewal-across-the-eight-hour-boundary.md
+  s_85d9ac5d33d9be::t_c2c86eca207d3e 3,8-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4e9af5e29d4562e14c3debef4682a4882ca3b29a",
+  "prompts": {},
+  "sessions": {
+    "s_85d9ac5d33d9be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d3f13fe-302d-47f0-9d10-273cbb49779c",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
