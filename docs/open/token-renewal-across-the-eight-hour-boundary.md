@@ -99,6 +99,17 @@ Found while confirming the above, all still open:
   reads first to decide whether to resume, and aborts if that read fails — so
   the one action that would fix an unreadable store is the one it will not
   take. Seen on macOS after a binary upgrade changed the keychain item's ACL.
+- **Self-upgrade breaks the credential on macOS, and only there.** The upgrade
+  works: the daemon drains, replaces its copy, exits `21`, and launchd restarts
+  it. But the replacement is a *different binary*, and a macOS keychain grants
+  access per application -- so the restarted daemon reads `-25293` from its own
+  credential, exits `13`, and loops. Seen on 2026-08-28 upgrading 0.1.11 to
+  0.1.12: `state/bin/runner-manager` became 0.1.12, `.old` held 0.1.11, the
+  keychain item was intact, and the daemon could not read it. Windows is
+  unaffected, because DPAPI binds to the account rather than to the executable.
+  Recovery is `auth login` from a GUI Terminal and **Always Allow** on the
+  prompt. The feature is worse than useless on macOS until this is fixed: it
+  upgrades a working host into a broken one.
 - **The start-mode warning fires when it should not.** It says the host records
   no start mode whenever `--start-at` was not passed, which is not the same
   thing.
