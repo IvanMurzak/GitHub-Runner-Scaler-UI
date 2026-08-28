@@ -1,13 +1,20 @@
 # Does a credential survive its eighth hour?
 
-**Open since:** 2026-08-27. **Answerable from:** 2026-08-28 ~06:30 UTC.
+**Open since:** 2026-08-27. **Answerable from:** 2026-08-28 ~18:45 UTC.
 **Answered by:** looking at two hosts. **Fixed in:** 0.1.11.
 
 ## The check
 
-Two hosts signed in at about `2026-08-27T22:29Z`. Their access tokens expire
-eight hours later, at about `06:29Z`. If renewal works, neither needs a person
-and neither stops.
+Both hosts hold a renewable pair for the first time as of `2026-08-28`: macOS
+signed in at `10:34Z`, Windows at about `10:45Z`. Their access tokens expire
+eight hours later, at about `18:34Z` and `18:45Z`. If renewal works, neither
+needs a person and neither stops.
+
+An earlier attempt at this check was void: both hosts still held bare tokens,
+because `auth login` had resumed rather than signed in (see below). The tell is
+the store -- on Windows the DPAPI blob went from 262 bytes to 486 when a pair
+was finally written. A blob that does not grow means no refresh half was
+stored, and nothing will renew.
 
 Windows:
 
