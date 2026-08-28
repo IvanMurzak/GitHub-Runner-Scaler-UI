@@ -86,6 +86,26 @@ both, and the message says `revoked` either way. So:
    at its next sign-in, because they would get no refresh token and this
    product no longer expects to need one twice.
 
+## Two things that hid this for half a day
+
+**`auth login` resumes instead of signing in, and says nothing useful about
+it.** A still-valid credential short-circuits the device flow -- reasonable, and
+it means that upgrading to a version which stores a *pair* changes nothing until
+the old token dies. A host told to sign in again, which did, and which then
+failed eight hours later anyway, is this: the sign-in never happened. Watched on
+2026-08-27, where a login at 22:29 left the 17:58 credential in place and the
+host expired on the original schedule at 01:58.
+
+The tell is the store: a bare token and a pair are different sizes, and the
+blob did not change. `auth login` should say which of the two it did.
+
+**`last GitHub contact` is recorded even when every target answered `401`.**
+`contacts.record()` runs when `report.failure.is_none()`, and an unauthorized
+target goes to `report.unreadable`, not to `failure`. So a daemon that can reach
+nothing keeps a fresh contact record and `service status` keeps saying
+`healthy`. Both of those readings were used as evidence during this
+investigation, twice, and both were wrong.
+
 ## Known, unfixed, and related
 
 Found while confirming the above, all still open:
