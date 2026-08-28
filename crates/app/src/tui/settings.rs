@@ -1412,14 +1412,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, frame.area(), &ui, false))
             .unwrap();
-        let text = (0..20)
-            .map(|y| {
-                (0..100)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = super::super::buffer_text(terminal.backend().buffer());
         assert!(text.contains("error:"), "{text}");
     }
 }

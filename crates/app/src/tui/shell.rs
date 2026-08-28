@@ -43,6 +43,7 @@ use super::screens::{
     RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
 };
 use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
+use super::table::Skin;
 
 #[cfg(test)]
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
@@ -905,6 +906,9 @@ pub struct AppState {
     pub ticks: u64,
     pub last_tick: Option<Instant>,
     pub settings: SettingsUi,
+    /// Glyphs and colour, resolved once here so no frame has to ask the
+    /// environment what the terminal can print.
+    pub skin: Skin,
     navigation: NavigationLayout,
 }
 
@@ -925,6 +929,7 @@ impl AppState {
             ticks: 0,
             last_tick: None,
             settings: SettingsUi::default(),
+            skin: Skin::detect(),
             navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
         }
     }
@@ -1229,7 +1234,7 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             } else {
                 state.focus = Focus::Content;
                 if state.screen == Screen::Repositories {
-                    let content_first_row = 6;
+                    let content_first_row = screens::REPOSITORY_ROW_ORIGIN;
                     if mouse.row >= content_first_row
                         && let Some(id) =
                             state
@@ -1321,7 +1326,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     } else if let Some(read_only) = read_only_screen(state.screen) {
         let mut model = state.screen_model.clone();
         model.apply(ScreenAction::Open(read_only));
-        screens::render(frame, rows[2], &model);
+        screens::render(frame, rows[2], &model, &state.skin);
     } else {
         let content = if compact {
             let filter = if state.filtering {
@@ -1840,15 +1845,7 @@ mod tests {
     fn rendered(width: u16, height: u16, state: &AppState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        super::super::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
@@ -2570,7 +2567,11 @@ mod tests {
         reduce(&mut mouse_state, key(KeyCode::Char('r')));
         reduce(
             &mut mouse_state,
-            mouse(MouseEventKind::Down(MouseButton::Left), 10, 6),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                screens::REPOSITORY_ROW_ORIGIN,
+            ),
         );
         let mouse_detail = rendered(120, 30, &mouse_state);
         assert!(mouse_detail.contains("REPOSITORY DETAIL"), "{mouse_detail}");
@@ -2894,6 +2895,29 @@ mod tests {
     fn in_memory_frame_meets_budget_and_render_has_no_io_capability() {
         let mut state = AppState::new(PresentationState::default(), 120, 40);
         state.presentation.body = (0..100).map(|n| format!("row {n}")).collect();
+        // --------------------------------------------------------------------
+        // THE FRAME A USER ACTUALLY GETS, NOT THE EMPTY ONE.
+        // --------------------------------------------------------------------
+        // A default `AppState` is still `Loading`, which draws a three-line
+        // panel and touches none of the table code -- the column solver, the
+        // per-cell layout, and the sort behind every visible row -- that the
+        // per-frame cost now lives in. Measuring that frame would have said
+        // nothing about any of it.
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            repositories: (0..1_000)
+                .map(|ordinal| RepositoryRow {
+                    id: format!("repo-{ordinal}"),
+                    target: format!("acme/repository-{ordinal:05}"),
+                    in_progress_workflows: ordinal % 7,
+                    mode: PolicyMode::Autoscale,
+                    max_capacity: Some(4),
+                    health: AgentHealth::Healthy,
+                })
+                .collect(),
+            ..Snapshot::default()
+        });
+        state.open_screen(Screen::Repositories);
 
         // --------------------------------------------------------------------
         // THE FASTEST OF SEVERAL RENDERS, NOT THE FIRST ONE.
