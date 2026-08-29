@@ -699,3 +699,58 @@ fn an_app_override_without_a_fake_github_is_ignored_and_said_to_be_ignored() {
         outcome.stderr
     );
 }
+
+// ----------------------------------------------------------------------------
+// THE STORE THAT COULD NOT BE READ, AND THE REPAIR THAT REFUSED TO RUN.
+// ----------------------------------------------------------------------------
+// `auth login` reads the existing credential to decide whether to resume rather
+// than start a device flow. That read used to be fatal, so the one command that
+// repairs an unreadable store was the one command that would not run against
+// one.
+//
+// Both ways in are real and both were seen on real hosts. On macOS a keychain
+// item is granted per application, so a self-upgrade leaves the new binary
+// reading `-25293` from its own credential. On Windows the store's DACL grants
+// OWNER RIGHTS, and a daemon renewing under `LocalSystem` becomes the owner, so
+// the operator loses access to what they stored. Either way the operator is
+// told to run `auth login`, does, and is refused.
+//
+// Corrupt bytes stand in for both here: they reach the same `Err` from
+// `SecretStore::load`, without needing a second account or a keychain.
+
+/// The repair must run against the thing it repairs.
+#[test]
+fn a_sign_in_is_not_refused_by_a_store_it_cannot_read() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = FakeGithub::start();
+    signed_in(data_dir.path(), &github);
+
+    let store = files_under(data_dir.path())
+        .into_iter()
+        .find(|path| support::is_the_secret_store(path))
+        .expect("the sign-in above wrote a credential somewhere under the store");
+    std::fs::write(&store, b"not a credential this build can read")
+        .expect("the store file is writable");
+
+    github.with_device_code();
+    github.with_approval();
+    github.with_no_installations();
+    let outcome = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "login"]);
+        command
+    });
+
+    assert_eq!(
+        outcome.code, 0,
+        "an unreadable credential is the ordinary condition of a host about to sign in, not a \
+         reason to refuse. stdout:\n{}\nstderr:\n{}",
+        outcome.stdout, outcome.stderr
+    );
+    assert!(
+        outcome.stdout.contains("could not be read"),
+        "the operator is told which of the two things happened -- resumed, or replaced. \
+         stdout:\n{}",
+        outcome.stdout
+    );
+}

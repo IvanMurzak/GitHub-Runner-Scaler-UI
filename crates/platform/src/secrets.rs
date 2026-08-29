@@ -971,6 +971,13 @@ mod sys {
     //! without opening a process token, without a `TOKEN_USER` buffer, and
     //! without a second copy of the SID lookup `process.rs` already carries.
     //!
+    //! **That sentence held only while `auth login` was the sole writer.** Token
+    //! renewal made the daemon a second writer under a different account, and
+    //! because every write creates a new file, the owner moved with it and `OW`
+    //! stopped meaning the operator. [`replacement_sddl`] is what keeps the
+    //! grant `OW` describes from evaporating; it carries the previous owner's
+    //! SID onto the replacement explicitly.
+    //!
     //! # One store per host, and what a second operator actually gets
     //!
     //! An earlier version of this paragraph said that ownership moves with the
@@ -1031,20 +1038,23 @@ mod sys {
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
 
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Security::{
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    };
     use windows::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_NONE,
     };
-    use windows::core::PCWSTR;
+    use windows::core::{PCWSTR, PWSTR};
 
     use super::{
         APPLICATION, DIRECTORY, ITEM, ORGANIZATION, QUALIFIER, SecretScope, TEMP_PREFIX, overwrite,
@@ -1134,6 +1144,110 @@ mod sys {
             SecretScope::Machine => "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)",
             SecretScope::User => "D:P(A;;FA;;;BA)(A;;FA;;;OW)",
         }
+    }
+
+    /// The DACL a *replacement* gets: [`sddl`], plus the account that owned
+    /// what is being replaced.
+    ///
+    /// # Why `OW` alone stopped being enough
+    ///
+    /// `OW` is OWNER RIGHTS, and the owner of a file is whoever created it.
+    /// That made `OW` an exact statement of *"the account that ran `auth login`
+    /// keeps access to what it stored"* for as long as `auth login` was the
+    /// only writer.
+    ///
+    /// Token renewal made the daemon a second writer with a different
+    /// identity. [`store`] finishes by renaming a temporary over the target, so
+    /// every write creates a new file, and the new file's owner is whoever
+    /// created it — `LocalSystem` for a daemon installed at boot. `OW` then
+    /// resolves to `LocalSystem`, the operator matches none of the three ACEs,
+    /// and an unelevated `auth status` cannot read the store or even its ACL.
+    ///
+    /// Observed on 2026-08-29: a store readable at `07:50Z` and unreadable at
+    /// `07:58Z`, with nothing between the two but the daemon renewing its
+    /// eight-hour token. See `docs/spikes/token-expiry-and-renewal.md`.
+    ///
+    /// # Why the previous owner, rather than preserving ownership
+    ///
+    /// Setting a new file's owner to an account that is not the caller's needs
+    /// `SE_RESTORE_NAME`, which `LocalSystem` holds but a least-privilege
+    /// service account — which `service install` can register — does not. An
+    /// ACE needs nothing: the writer created the file and so may say who else
+    /// reaches it. This works the same for both, which is why it is the
+    /// mechanism rather than the fallback.
+    ///
+    /// This widens nothing. The previous owner already had full control
+    /// through `OW`; carrying the SID forward is what keeps a grant that
+    /// already existed from evaporating when somebody else writes. Only the
+    /// immediately previous owner is carried, so the DACL cannot accumulate
+    /// one ACE per write.
+    pub(super) fn replacement_sddl(scope: SecretScope, previous_owner: Option<&str>) -> String {
+        let base = sddl(scope);
+        match previous_owner {
+            // The SID goes in where a two-letter alias usually does; SDDL takes
+            // either.
+            Some(sid) => format!("{base}(A;;FA;;;{sid})"),
+            None => base.to_owned(),
+        }
+    }
+
+    /// The SID of the account that owns the file already there, as a string.
+    ///
+    /// `None` when there is no file, when its owner cannot be read, or when the
+    /// SID will not convert — all of which mean the same thing to the caller:
+    /// there is no previous grant to carry forward, so write [`sddl`] as it
+    /// stands. A first write reaches this with nothing on disk and takes that
+    /// path.
+    ///
+    /// Deliberately infallible. A store that refused to write because it could
+    /// not read a security descriptor would trade a working credential for a
+    /// tidier ACL.
+    fn previous_owner(path: &Path) -> Option<String> {
+        if !path.exists() {
+            return None;
+        }
+        let wide = to_wide(path);
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: `wide` is NUL-terminated and outlives the call. `descriptor`
+        // receives a LocalAlloc'd descriptor freed below on every path, and
+        // `owner` points into it rather than owning anything itself.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+
+        let mut sid_string = PWSTR::null();
+        // SAFETY: `owner` points into the descriptor, which is still live.
+        let converted = unsafe { ConvertSidToStringSidW(owner, &mut sid_string) };
+        let text = match converted {
+            // SAFETY: the conversion succeeded, so `sid_string` is a
+            // LocalAlloc'd NUL-terminated string, freed immediately after.
+            Ok(()) => {
+                let text = unsafe { sid_string.to_string() }.ok();
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(sid_string.0.cast())));
+                }
+                text
+            }
+            Err(_) => None,
+        };
+        // SAFETY: LocalAlloc'd by `GetNamedSecurityInfoW`, freed exactly once.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+        text
     }
 
     /// The access right a replacing rename needs on the file it replaces.
@@ -1228,9 +1342,15 @@ mod sys {
 
         let blob = protect(plaintext, scope)?;
 
+        // Read before the temporary exists, from the file about to be replaced.
+        // A renewal writes as the daemon's account and would otherwise take
+        // `OW` away from the operator who signed in; see `replacement_sddl`.
+        let carried = previous_owner(&site.file);
+        let descriptor = replacement_sddl(scope, carried.as_deref());
+
         let temporary = directory.join(format!("{TEMP_PREFIX}{}.tmp", uuid::Uuid::new_v4()));
         let written = (|| -> io::Result<()> {
-            let mut file = create_protected_file(&temporary, scope)?;
+            let mut file = create_protected_file(&temporary, &descriptor)?;
             file.write_all(&blob)?;
             file.flush()?;
             file.sync_all()
@@ -1506,9 +1626,14 @@ mod sys {
             .collect()
     }
 
-    /// Creates a new file carrying [`sddl`] from the moment it exists.
-    fn create_protected_file(path: &Path, scope: SecretScope) -> io::Result<File> {
-        let sddl_wide: Vec<u16> = sddl(scope)
+    /// Creates a new file carrying `descriptor` from the moment it exists.
+    ///
+    /// Takes the SDDL rather than the scope because a replacement's DACL is
+    /// [`sddl`] plus the previous owner — see [`replacement_sddl`] — and a file
+    /// that is created and then widened is unreadable to the account it is
+    /// being widened for for however long the gap lasts.
+    fn create_protected_file(path: &Path, descriptor: &str) -> io::Result<File> {
+        let sddl_wide: Vec<u16> = descriptor
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -3013,6 +3138,7 @@ mod tests {
     #[cfg(windows)]
     mod windows {
         use super::*;
+        use crate::secrets::sys::{replacement_sddl, sddl};
 
         /// How much a [`DeniedReplace`] takes away.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3136,6 +3262,92 @@ mod tests {
                 "icacls {arguments:?} failed: {}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// This account's SID, which is what the store should be carrying
+        /// forward when it replaces a file this account owns.
+        fn current_sid() -> String {
+            let output = std::process::Command::new("whoami.exe")
+                .args(["/user", "/fo", "csv", "/nh"])
+                .output()
+                .expect("whoami is present on every Windows");
+            assert!(output.status.success(), "whoami failed");
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.rsplit(',')
+                .next()
+                .expect("a CSV row has a last field")
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        }
+
+        /// The DACL string alone, with no OS in the way.
+        #[test]
+        fn a_replacement_carries_the_previous_owner_and_a_first_write_does_not() {
+            for scope in [SecretScope::Machine, SecretScope::User] {
+                assert_eq!(
+                    replacement_sddl(scope, None),
+                    sddl(scope),
+                    "a first write has no previous owner to carry, so it gets the constant                      DACL and nothing else"
+                );
+                assert_eq!(
+                    replacement_sddl(scope, Some("S-1-5-21-1-2-3-1001")),
+                    format!("{}(A;;FA;;;S-1-5-21-1-2-3-1001)", sddl(scope)),
+                    "a replacement appends one ACE, so the DACL cannot grow by one per write"
+                );
+            }
+        }
+
+        /// The lockout, as a test: renewal writes as a different account, and
+        /// the operator who signed in must still be able to read the store.
+        ///
+        /// # What this can and cannot reproduce
+        ///
+        /// A test process is one account, so it cannot *become* `LocalSystem`
+        /// and take ownership the way a daemon does. What it pins is the
+        /// mechanism that makes that survivable: after a replacement, the
+        /// previous owner is named in the DACL by SID rather than left to
+        /// `OW` — so when the owner does move, the grant does not move with it.
+        ///
+        /// Un-fixed, the second description equals the first: `OW` and nothing
+        /// else, which is exactly the state that locked an operator out of
+        /// their own credential on 2026-08-29.
+        #[test]
+        fn replacing_a_stored_credential_names_the_previous_owner_by_sid() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+
+            store.store(&fixture_token()).expect("the first write");
+            let first = store
+                .protection()
+                .expect("the first file's DACL is readable")
+                .description()
+                .to_string();
+            assert!(
+                !first.contains("S-1-5-21"),
+                "a first write has nothing to carry forward: {first}"
+            );
+
+            store.store(&other_token()).expect("the replacement");
+            let second = store
+                .protection()
+                .expect("the replacement's DACL is readable")
+                .description()
+                .to_string();
+
+            let sid = current_sid();
+            assert!(
+                second.contains(&sid),
+                "the account that owned what was replaced must be named explicitly, because a                  writer under another account takes `OW` with it. Wanted {sid} in: {second}"
+            );
+            assert_eq!(
+                store
+                    .load()
+                    .expect("the replacement is readable")
+                    .map(|secret| secret.expose_secret().to_string()),
+                Some(other_token().expose_secret().to_string()),
+                "carrying an ACE forward must not disturb what the store holds"
             );
         }
 

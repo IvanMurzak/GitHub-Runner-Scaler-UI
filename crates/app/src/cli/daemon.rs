@@ -125,7 +125,20 @@ async fn run(
             context.clock(),
         )
         .map_err(github_failure)?
-        .with_renewal(renewal),
+        .with_renewal(renewal)
+        // ------------------------------------------------------------------
+        // AND A WAY TO NOTICE A SIGN-IN THAT ALREADY HAPPENED.
+        // ------------------------------------------------------------------
+        // The credential above was read once, just now. Renewal keeps it
+        // current for as long as it is renewable -- but a daemon that starts
+        // holding a credential already past saving has no refresh half to
+        // spend, and without this it never reads the store again, so the
+        // `auth login` an operator runs to fix it changes nothing until
+        // somebody restarts the service. That cost this project 28 hours on
+        // one host; see `docs/spikes/token-expiry-and-renewal.md`.
+        .with_credential_source(Arc::new(super::auth::StoredCredential::new(Arc::clone(
+            &secrets,
+        )))),
     );
     let clock = context.clock();
     let inventory = Arc::new(RestInventory::new(Arc::clone(&client), Arc::clone(&clock)));
@@ -912,7 +925,11 @@ async fn run_target_loop<T: TargetReconciler>(
         // ago governs this pass rather than the next one.
         target.refresh_policies();
         let report = target.reconcile().await;
-        if draining.is_none() && report.failure.is_none() {
+        // `reached_github` and not just `failure.is_none()`: an unauthorized
+        // target is unreadable rather than a failure, so without it a daemon
+        // that reached nothing at all kept a fresh contact record and
+        // `service status` kept answering `healthy`.
+        if draining.is_none() && report.failure.is_none() && report.reached_github() {
             contacts.record()?;
         }
         match draining {

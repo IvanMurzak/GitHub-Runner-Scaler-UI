@@ -1561,6 +1561,14 @@ pub struct ReconcileReport {
     pub monitor_only: Vec<PolicyId>,
     /// Policies whose target could not be polled this pass.
     pub unreadable: Vec<PolicyId>,
+    /// Policies whose target GitHub actually answered for this pass.
+    ///
+    /// The counterpart to [`Self::unreadable`], and the only honest evidence
+    /// that this host reached GitHub at all. [`Self::allocations`] is not: a
+    /// policy this host does not own is allocated for with no demand and
+    /// without any target being polled, so a pass where every poll failed can
+    /// still end with allocations in it.
+    pub targets_read: u16,
     /// Runners actually started.
     pub started: u16,
     /// Pre-acceptance attempts routed back through this pass's ordinary
@@ -1612,6 +1620,33 @@ pub struct ReconcileReport {
     pub next_poll: NextPoll,
     /// Demand requests this pass projected against the shared hourly ceiling.
     pub demand_requests: u32,
+}
+
+impl ReconcileReport {
+    /// Whether this pass has any business claiming the host reached GitHub.
+    ///
+    /// # What this exists to stop
+    ///
+    /// `last GitHub contact` used to be recorded whenever
+    /// [`Self::failure`] was `None` — and an unauthorized target is not a
+    /// failure, it is an entry in [`Self::unreadable`]. So a daemon whose
+    /// credential every single target rejected kept writing a fresh contact
+    /// record, and `service status` kept answering `healthy`. It said `healthy`
+    /// for 28 hours while logging 180 refusals an hour, and both readings were
+    /// used as evidence during the investigation that eventually found the real
+    /// fault. See `docs/spikes/token-expiry-and-renewal.md`.
+    ///
+    /// # Why `unreadable.is_empty()` is the second half
+    ///
+    /// A pass that polled nothing — every policy monitor-only, or none
+    /// configured yet — reads zero targets and fails on none. That is not a
+    /// host out of contact with GitHub; it is a host with nothing to ask. It
+    /// keeps the behaviour it had, which is what leaves this change about the
+    /// lie and nothing else.
+    #[must_use]
+    pub fn reached_github(&self) -> bool {
+        self.targets_read > 0 || self.unreadable.is_empty()
+    }
 }
 
 impl Default for NextPoll {
@@ -1856,6 +1891,7 @@ impl Reconciler {
                     });
                 }
                 PollOutcome::Ready(demand) => {
+                    report.targets_read = report.targets_read.saturating_add(1);
                     let count = demand_for(&policy.target, demand);
                     self.events.emit(LifecycleEvent::DemandObserved {
                         policy: policy.id,
@@ -2357,6 +2393,54 @@ const fn unreadable_reason(state: &RefreshState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reading that said `healthy` for 28 hours while nothing worked.
+    ///
+    /// A daemon every one of whose targets answered `401` kept writing a fresh
+    /// `last GitHub contact`, because an unauthorized target is `unreadable`
+    /// rather than a `failure`. Both that record and the `service status` built
+    /// on it were used as evidence during the investigation, and both were
+    /// wrong; see `docs/spikes/token-expiry-and-renewal.md`.
+    #[test]
+    fn a_pass_that_reached_no_target_does_not_claim_it_reached_github() {
+        let mut report = ReconcileReport::default();
+        assert!(
+            report.reached_github(),
+            "a pass with nothing to poll -- no policies, or every one monitor-only -- is a host \
+             with nothing to ask, not a host out of contact"
+        );
+
+        report.unreadable.push(PolicyId::from_u128(1));
+        assert!(
+            !report.reached_github(),
+            "every target this pass tried was unreadable, so there is no contact to record"
+        );
+
+        report.targets_read = 1;
+        assert!(
+            report.reached_github(),
+            "one target answering is contact, whatever else failed alongside it"
+        );
+
+        // `allocations` deliberately does not count: a policy this host does
+        // not own is allocated for with no demand and without polling anything,
+        // so a pass where every poll failed can still carry allocations.
+        let mut unowned = ReconcileReport::default();
+        unowned.unreadable.push(PolicyId::from_u128(2));
+        unowned.allocations.push(Allocation {
+            policy_id: PolicyId::from_u128(2),
+            demand: 0,
+            desired: 0,
+            active_owned: 0,
+            headroom_before: 0,
+            to_start: 0,
+            limiting_factor: LimitingFactor::Demand,
+        });
+        assert!(
+            !unowned.reached_github(),
+            "an allocation is not evidence that GitHub answered"
+        );
+    }
 
     use std::sync::atomic::AtomicUsize;
 
