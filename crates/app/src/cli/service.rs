@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_platform::service::{
-    InstallRequest, ServiceError, ServiceOperations, WINDOWS_SCM_HOST_ARGUMENT,
+    HostControls, InstallRequest, ServiceError, ServiceIdentity, ServiceOperations,
+    WINDOWS_SCM_HOST_ARGUMENT,
 };
 
 use super::{CliError, Context, Failure, ServiceCommand, ServiceInstallArgs, write_failed};
@@ -27,8 +28,50 @@ pub fn dispatch(
     }
 }
 
+/// The variable that lets a test drive these commands without meeting the
+/// service this machine actually has installed.
+///
+/// See [`identity`].
+pub(super) const SERVICE_TAG_VARIABLE: &str = "RUNNER_MANAGER_SERVICE_NAME_TAG";
+
 fn operations(context: &Context) -> ServiceOperations {
-    ServiceOperations::on_this_host(context.paths().clone())
+    ServiceOperations::with_controls(
+        context.paths().clone(),
+        identity(),
+        std::sync::Arc::new(HostControls),
+    )
+}
+
+/// Which registration these commands operate on.
+///
+/// # Why this is not always the product's
+///
+/// `--data-dir` moves the directories but not the service manager, which has
+/// exactly one registration per machine under one constant name. So a test
+/// pointed at a temporary directory still meets whatever is really installed
+/// here, and `service status` correctly reports a registration with no install
+/// record behind it -- a true statement about the machine, and a failure for
+/// every developer who has the product installed. Four tests failed that way,
+/// on `main`, for exactly as long as somebody had run `service install`.
+///
+/// [`ServiceIdentity::fixture`] already exists for the privileged installer
+/// tests, which register real services under names that cannot collide with the
+/// product's. This lets the CLI reach it too, so a test gets a machine that is
+/// clean *for the name it is asking about* rather than a machine nobody has
+/// used.
+///
+/// # Why it is safe to read in a shipped binary
+///
+/// A fixture name is always `runner-manager-selftest-<tag>`, so this cannot
+/// point at, hide, or replace a real registration whatever it is set to -- the
+/// worst it can do is describe a service that does not exist. [`status`] says
+/// so out loud when it is in effect, which is what keeps a stray variable in a
+/// shell profile from reading as "the service vanished".
+fn identity() -> ServiceIdentity {
+    match std::env::var(SERVICE_TAG_VARIABLE) {
+        Ok(tag) if !tag.trim().is_empty() => ServiceIdentity::fixture(tag.trim()),
+        _ => ServiceIdentity::product(),
+    }
 }
 
 fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
@@ -192,6 +235,19 @@ pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
 }
 
 fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<(), CliError> {
+    // Said before the report rather than after it, because a fixture name
+    // describes a service the operator has almost certainly never installed,
+    // and `installed: no` is the one answer that would look alarming rather
+    // than beside the point.
+    if operations.identity().is_fixture() {
+        writeln!(
+            out,
+            "note: {SERVICE_TAG_VARIABLE} is set, so this reports the test registration \
+             `{}` and not the installed service.",
+            operations.identity().name()
+        )
+        .map_err(write_failed("this service status"))?;
+    }
     let status = operations.status().map_err(service_failure)?;
     writeln!(out, "{status}").map_err(write_failed("this service status"))?;
     if status.last_github_contact().is_none() {

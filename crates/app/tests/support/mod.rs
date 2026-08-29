@@ -78,6 +78,18 @@ pub const FIXTURE_APP_SLUG: &str = "runner-manager-test";
 /// one exported does not silently change what the suite measures. `--data-dir`
 /// is passed as a flag rather than through its environment variable for the
 /// same reason: a flag cannot be overridden by the environment.
+///
+/// # The service name is disposable too, and that is not cosmetic
+///
+/// `--data-dir` moves the directories. It does not move the service manager,
+/// which holds one registration per machine under one constant name. So a suite
+/// pointed at a temporary directory still met whatever this developer really
+/// has installed, and `service status` reported -- correctly -- a registration
+/// with no install record behind it. Four tests failed that way for anybody who
+/// had ever run `service install`, and passed for everybody who had not.
+///
+/// [`ServiceIdentity::fixture`] names cannot collide with the product's, so
+/// what this buys is a machine that is clean *for the name being asked about*.
 #[must_use]
 pub fn runner_manager(data_dir: &Path) -> Command {
     let mut command = Command::cargo_bin("runner-manager").expect("the binary must be built");
@@ -101,6 +113,14 @@ pub fn runner_manager(data_dir: &Path) -> Command {
         command.env_remove(variable);
     }
     command.env("NO_PROXY", "127.0.0.1,localhost,::1");
+    // The data directory's own name, which `tempfile` already made unique, so
+    // tests running side by side do not describe each other's registration.
+    command.env(
+        "RUNNER_MANAGER_SERVICE_NAME_TAG",
+        data_dir
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("suite")),
+    );
     command.arg("--data-dir").arg(data_dir);
     command
 }
