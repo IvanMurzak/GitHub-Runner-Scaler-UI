@@ -1204,12 +1204,13 @@ mod sys {
         text
     }
 
-    /// Well-known SIDs the constant DACL already names by alias.
+    /// Trustees the constant DACL already grants, in both spellings.
     ///
-    /// Carrying these forward would be harmless but noisy: `LocalSystem` writes
-    /// most of these files, so without this every replacement would append an
-    /// `S-1-5-18` ACE beside the `SY` that already grants it.
-    const ALREADY_GRANTED: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
+    /// The aliases are what [`sddl`] itself writes, so re-emitting them would
+    /// double every ACE in the base. The two SIDs are the same accounts as
+    /// `SY` and `BA`, which is the spelling [`previous_owner`] hands back:
+    /// `ConvertSidToStringSidW` always answers `S-1-…`, never an alias.
+    const ALREADY_GRANTED: [&str; 5] = ["SY", "BA", "OW", "S-1-5-18", "S-1-5-32-544"];
 
     /// Every account the value being replaced was readable by, so that
     /// replacing it does not quietly take the store away from one of them.
@@ -1247,19 +1248,34 @@ mod sys {
         if let Some(owner) = previous_owner {
             add(owner);
         }
-        for sid in explicit_sids(previous_dacl) {
-            add(&sid);
+        for trustee in trustees(previous_dacl) {
+            add(&trustee);
         }
         carried
     }
 
-    /// The trustees an SDDL DACL names by SID rather than by alias.
+    /// Every trustee an SDDL DACL names, in whatever spelling it names them.
     ///
     /// An ACE is `(type;flags;rights;object;inherit;trustee)`, so the trustee is
-    /// what follows the last `;` before the closing parenthesis. Aliases like
-    /// `SY` fail the `S-1-` test, which is the whole filter needed here: the
-    /// constant part of the DACL is aliases and the carried part is SIDs.
-    pub(super) fn explicit_sids(sddl: &str) -> Vec<String> {
+    /// what follows the last `;` before the closing parenthesis.
+    ///
+    /// # Why not "the ones written as `S-1-…`"
+    ///
+    /// Because Windows does not read back what was written. A DACL built with
+    /// `S-1-5-21-…-500` comes out of
+    /// `ConvertSecurityDescriptorToStringSecurityDescriptorW` as `(A;;FA;;;LA)`
+    /// — the alias for the built-in Administrator — and any other well-known
+    /// account behaves the same way. Filtering on the `S-1-` prefix therefore
+    /// dropped exactly the accounts whose grant had already been rescued once,
+    /// so the carry survived one write and undid itself on the next, which is
+    /// the bug it exists to prevent.
+    ///
+    /// Found by CI, whose Windows runner signs in as that account. It passes on
+    /// an ordinary developer machine, where the operator has a plain
+    /// `S-1-5-21-…-1001` that survives the round trip unchanged.
+    ///
+    /// [`ALREADY_GRANTED`] is what keeps the base DACL's own aliases out.
+    pub(super) fn trustees(sddl: &str) -> Vec<String> {
         let mut found = Vec::new();
         for ace in sddl.split('(').skip(1) {
             let Some(body) = ace.split(')').next() else {
@@ -1268,7 +1284,7 @@ mod sys {
             let Some(trustee) = body.rsplit(';').next() else {
                 continue;
             };
-            if trustee.starts_with("S-1-") && !found.iter().any(|seen| seen == trustee) {
+            if !trustee.is_empty() && !found.iter().any(|seen| seen == trustee) {
                 found.push(trustee.to_owned());
             }
         }
@@ -3218,7 +3234,7 @@ mod tests {
     #[cfg(windows)]
     mod windows {
         use super::*;
-        use crate::secrets::sys::{explicit_sids, merge_grants, replacement_sddl, sddl};
+        use crate::secrets::sys::{merge_grants, replacement_sddl, sddl, trustees};
 
         /// How much a [`DeniedReplace`] takes away.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3345,23 +3361,6 @@ mod tests {
             );
         }
 
-        /// This account's SID, which is what the store should be carrying
-        /// forward when it replaces a file this account owns.
-        fn current_sid() -> String {
-            let output = std::process::Command::new("whoami.exe")
-                .args(["/user", "/fo", "csv", "/nh"])
-                .output()
-                .expect("whoami is present on every Windows");
-            assert!(output.status.success(), "whoami failed");
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.rsplit(',')
-                .next()
-                .expect("a CSV row has a last field")
-                .trim()
-                .trim_matches('"')
-                .to_string()
-        }
-
         /// The DACL string alone, with no OS in the way.
         #[test]
         fn a_replacement_carries_the_previous_owner_and_a_first_write_does_not() {
@@ -3421,23 +3420,48 @@ mod tests {
                 "an account reachable both ways is named once, so the DACL cannot grow by an \
                  ACE per write"
             );
+
+            // The CI runner's own case, which an ordinary developer machine
+            // does not reach: Windows renders a well-known account's ACE by
+            // alias, so what the previous renewal wrote as `S-1-5-21-...-500`
+            // reads back as `LA`. Carrying only trustees spelled `S-1-` drops
+            // it and the operator is locked out one renewal later.
+            let after_a_renewal_for_a_builtin =
+                format!("{}(A;;FA;;;LA)", sddl(SecretScope::Machine));
+            assert_eq!(
+                merge_grants(Some("S-1-5-18"), &after_a_renewal_for_a_builtin),
+                vec!["LA".to_owned()],
+                "a grant is a grant whichever spelling the DACL reads back in"
+            );
+
+            assert!(
+                merge_grants(None, sddl(SecretScope::Machine)).is_empty(),
+                "and the constant DACL's own aliases are not carried, or every write would \
+                 double the base"
+            );
         }
 
-        /// The trustees a DACL names by SID are what
-        /// [`carried_grants`] has to find in it, because after the first
-        /// replacement they are where the operator's access lives.
+        /// Every trustee, because after the first replacement one of them is
+        /// where the operator's access lives — and Windows chooses the
+        /// spelling, not this code.
         #[test]
-        fn the_sid_scan_reads_trustees_and_ignores_aliases() {
+        fn the_trustee_scan_reads_both_spellings() {
             assert_eq!(
-                explicit_sids(
-                    "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FA;;;S-1-5-21-9-8-7-1001)"
-                ),
-                vec!["S-1-5-21-9-8-7-1001".to_owned()],
-                "aliases are the constant part of the DACL; only the carried part is SIDs"
+                trustees("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FA;;;S-1-5-21-9-8-7-1001)"),
+                vec![
+                    "SY".to_owned(),
+                    "BA".to_owned(),
+                    "OW".to_owned(),
+                    "S-1-5-21-9-8-7-1001".to_owned(),
+                ],
+                "the scan reads trustees; deciding which of them are already granted is \
+                 `merge_grants`'s job and not this one's"
             );
-            assert!(
-                explicit_sids(sddl(SecretScope::Machine)).is_empty(),
-                "the constant DACL names nobody by SID"
+            assert_eq!(
+                trustees("D:P(A;;FA;;;LA)"),
+                vec!["LA".to_owned()],
+                "an alias is a trustee too, which is what CI's built-in Administrator account \
+                 reads back as"
             );
         }
 
@@ -3456,18 +3480,25 @@ mod tests {
         /// else, which is exactly the state that locked an operator out of
         /// their own credential on 2026-08-29.
         ///
-        /// # Why it writes three times
+        /// # What it asserts, and why not the SID
         ///
-        /// Because carrying only the *owner* passes at two and fails at three.
-        /// After one replacement the DACL names the operator by SID and the
-        /// owner is the writer; a mechanism that rebuilds the DACL from the
-        /// owner alone then drops that SID on the next write, and the operator
-        /// is locked out again one renewal later. Two writes cannot see that.
+        /// That the DACL gains something at the first replacement and then
+        /// stops changing. Growth would be an ACE per write; a return to the
+        /// constant would be the operator dropped, which is the lockout.
+        ///
+        /// It deliberately does not name the account. Windows chooses the
+        /// spelling: this machine's operator reads back as
+        /// `S-1-5-21-…-1001`, and CI's, being the built-in Administrator,
+        /// reads back as the alias `LA`. An earlier version of this test
+        /// asserted the SID and failed on CI for that reason alone —
+        /// and the same assumption was in the code, where it was a real
+        /// defect. The spelling-sensitive rule is pinned in
+        /// [`the_trustee_scan_reads_both_spellings`] instead.
         #[test]
-        fn replacing_a_stored_credential_names_the_previous_owner_by_sid() {
+        fn replacing_a_stored_credential_keeps_the_previous_owners_grant() {
             let root = TempDir::new().expect("a temporary directory");
             let store = rooted(SecretScope::Machine, &root);
-            let sid = current_sid();
+            let base = sddl(SecretScope::Machine);
 
             store.store(&fixture_token()).expect("the first write");
             let first = store
@@ -3475,11 +3506,12 @@ mod tests {
                 .expect("the first file's DACL is readable")
                 .description()
                 .to_string();
-            assert!(
-                !first.contains("S-1-5-21"),
-                "a first write has nothing to carry forward: {first}"
+            assert_eq!(
+                first, base,
+                "a first write has nothing to carry forward, so it gets the constant DACL"
             );
 
+            let mut previous: Option<String> = None;
             for round in 1..=3 {
                 store.store(&other_token()).expect("the replacement");
                 let dacl = store
@@ -3487,17 +3519,20 @@ mod tests {
                     .expect("the replacement's DACL is readable")
                     .description()
                     .to_string();
-                assert!(
-                    dacl.contains(&sid),
-                    "write {round}: the account that owned what was replaced must stay named \
-                     explicitly, because a writer under another account takes `OW` with it. \
-                     Wanted {sid} in: {dacl}"
+                assert_ne!(
+                    dacl, base,
+                    "write {round}: the account that owned what was replaced must stay granted \
+                     explicitly, because a writer under another account takes `OW` with it"
                 );
-                assert_eq!(
-                    dacl.matches(&sid).count(),
-                    1,
-                    "write {round}: and it must be named once, not once per write: {dacl}"
-                );
+                if let Some(previous) = &previous {
+                    assert_eq!(
+                        &dacl, previous,
+                        "write {round}: and the set must settle -- a DACL that keeps growing is \
+                         an ACE per renewal, and one that shrinks back to the constant is the \
+                         lockout returning"
+                    );
+                }
+                previous = Some(dacl);
             }
 
             assert_eq!(

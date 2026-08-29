@@ -21,8 +21,8 @@
 mod support;
 
 use support::{
-    FakeGithub, Reply, file_contains, files_under, fixture_token, run, runner_manager,
-    runner_manager_against,
+    FIXTURE_USER_CODE, FakeGithub, Reply, file_contains, files_under, fixture_token, run,
+    runner_manager, runner_manager_against,
 };
 
 /// Signs in for real, so the following command reads a credential this suite
@@ -716,7 +716,12 @@ fn an_app_override_without_a_fake_github_is_ignored_and_said_to_be_ignored() {
 // told to run `auth login`, does, and is refused.
 //
 // Corrupt bytes stand in for both here: they reach the same `Err` from
-// `SecretStore::load`, without needing a second account or a keychain.
+// `SecretStore::load`, without needing a second account or a keychain. They
+// must be invalid UTF-8 rather than merely wrong. The Linux machine store is a
+// `0600` file whose contents *are* the token, so any readable string is a
+// readable credential and a plausible-looking one sails through to the fake
+// GitHub, which accepts it -- the sign-in then resumes and this test measures
+// nothing. Only bytes that cannot decode reach the failure it is about.
 
 /// The repair must run against the thing it repairs.
 #[test]
@@ -729,8 +734,7 @@ fn a_sign_in_is_not_refused_by_a_store_it_cannot_read() {
         .into_iter()
         .find(|path| support::is_the_secret_store(path))
         .expect("the sign-in above wrote a credential somewhere under the store");
-    std::fs::write(&store, b"not a credential this build can read")
-        .expect("the store file is writable");
+    std::fs::write(&store, [0xff_u8, 0xfe, 0x00, 0xff]).expect("the store file is writable");
 
     github.with_device_code();
     github.with_approval();
@@ -741,16 +745,30 @@ fn a_sign_in_is_not_refused_by_a_store_it_cannot_read() {
         command
     });
 
-    assert_eq!(
-        outcome.code, 0,
-        "an unreadable credential is the ordinary condition of a host about to sign in, not a \
-         reason to refuse. stdout:\n{}\nstderr:\n{}",
-        outcome.stdout, outcome.stderr
-    );
     assert!(
         outcome.stdout.contains("could not be read"),
         "the operator is told which of the two things happened -- resumed, or replaced. \
          stdout:\n{}",
         outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains(FIXTURE_USER_CODE),
+        "an unreadable credential is the ordinary condition of a host about to sign in, not a \
+         reason to refuse, so the device flow must be reached. Before the fix this command \
+         ended on the read and printed no code at all. stdout:\n{}\nstderr:\n{}",
+        outcome.stdout,
+        outcome.stderr
+    );
+    // Not asserted on macOS, and the reason is the fixture rather than the
+    // product: there the machine store is a keychain and the file overwritten
+    // above is its *container*, so the sign-in that follows cannot write the
+    // replacement either and ends non-zero. The real macOS failure this stands
+    // for -- an item whose ACL no longer names the running binary -- leaves the
+    // container intact and writable, and does finish.
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        outcome.code, 0,
+        "and it finishes. stdout:\n{}\nstderr:\n{}",
+        outcome.stdout, outcome.stderr
     );
 }
