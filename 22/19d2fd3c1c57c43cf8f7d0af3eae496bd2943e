@@ -1,0 +1,58 @@
+docs/spikes/token-expiry-and-renewal.md
+  s_85d9ac5d33d9be::t_6546a30f871621 122-139
+crates/app/tests/support/mod.rs
+  s_85d9ac5d33d9be::t_406c9602967201 116-122,125-130
+  s_85d9ac5d33d9be::t_d2b0dbf2812bac 33
+crates/app/src/cli/service.rs
+  s_85d9ac5d33d9be::t_1418275e429099 283
+  s_85d9ac5d33d9be::t_c903280992c6d1 175-178
+  s_85d9ac5d33d9be::t_055e459634fa50 37-44
+  s_85d9ac5d33d9be::t_c87b5acfe69651 268-270
+  s_85d9ac5d33d9be::t_2caa342768e414 73-79,87-109
+  s_7b2854368302f3::t_816afae4f83c7a 110-111
+crates/app/src/cli/daemon.rs
+  s_85d9ac5d33d9be::t_60f8e0a5a3c28e 1770-1775
+  s_85d9ac5d33d9be::t_ead71cb99835ab 928-942
+crates/app/src/cli/auth.rs
+  s_85d9ac5d33d9be::t_90998fd1ea6ae2 548-549,558,560-566
+crates/app/src/tui/settings.rs
+  s_85d9ac5d33d9be::t_88187c0da62838 26
+  s_85d9ac5d33d9be::t_6063482e85da14 128-135
+crates/github/src/lib.rs
+  s_85d9ac5d33d9be::t_8f686ae920c62f 1119,1121-1123,1125-1126
+  s_85d9ac5d33d9be::t_a749e16c9a2721 1419-1426,1428-1434,1438-1445,1449-1451,1455,1469,1473,1475-1488,1493,1500-1523
+  s_85d9ac5d33d9be::t_572f31c6debda2 2995
+crates/agent/src/reconcile.rs
+  s_85d9ac5d33d9be::t_b446db27e2de16 2414-2417,2452-2466
+  s_85d9ac5d33d9be::t_fdaa99a755769d 1626-1627,1629,1631-1637,1639-1643,1645-1651,1653-1654,2467-2469
+crates/platform/src/secrets.rs
+  s_85d9ac5d33d9be::t_243dbfd6b87b31 3397,3432-3434
+  s_85d9ac5d33d9be::t_400347995e70e0 3383-3396,3398-3425
+  s_85d9ac5d33d9be::t_2ba09f6ca67687 1223-1240,1242-1244,1247,1250-1251
+  s_85d9ac5d33d9be::t_a6442f729acff1 3221
+  s_85d9ac5d33d9be::t_97acd1a846e9ca 1181-1197,1200-1202,1204-1222,1241,1245-1246,1248-1249,1252-1275,1429,3370,3372-3373,3376,3378,3426-3431,3435-3443,3458-3465,3470,3483-3501
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2219d2fd3c1c57c43cf8f7d0af3eae496bd2943e",
+  "prompts": {},
+  "sessions": {
+    "s_7b2854368302f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "099f6f0a-9cbe-4dea-b36d-40f90ef7646d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_85d9ac5d33d9be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d3f13fe-302d-47f0-9d10-273cbb49779c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
