@@ -53,8 +53,8 @@ use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::Store as _;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
 use runner_manager_github::{
-    AuthenticatedClient, CredentialRenewal, GithubError, Installation, InstallationDiscovery,
-    RepositorySelection, TokioSleeper, UserAccessToken,
+    AuthenticatedClient, CredentialRenewal, CredentialSource, GithubError, Installation,
+    InstallationDiscovery, RepositorySelection, TokioSleeper, UserAccessToken,
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 use secrecy::SecretString;
@@ -407,6 +407,48 @@ impl CredentialRenewal for StoringRenewal {
     }
 }
 
+/// Reads whatever the store holds now, for a client that has been running long
+/// enough for the answer to have changed.
+///
+/// # Why this is not just the store
+///
+/// The store deals in bytes; this turns them into the credential document,
+/// which is the shape [`CredentialSource`] promises and the shape that carries
+/// a refresh half. A credential written before 0.1.11 reads back as a bare
+/// token from the same bytes, which is why
+/// [`UserAccessToken::from_stored_document`] rather than a parse that could
+/// fail.
+///
+/// Every failure collapses to `None`. A daemon consults this while already
+/// handling a `401`, and a store it cannot read leaves it exactly where it was
+/// -- with a rejection to report and no better credential to report it against.
+/// Logging is deliberate and at `debug`: on a genuinely revoked credential this
+/// runs on every poll, and a warning per poll is how a log stops being read.
+#[derive(Debug)]
+pub struct StoredCredential {
+    secrets: Arc<dyn SecretStore>,
+}
+
+impl StoredCredential {
+    #[must_use]
+    pub fn new(secrets: Arc<dyn SecretStore>) -> Self {
+        Self { secrets }
+    }
+}
+
+impl CredentialSource for StoredCredential {
+    fn reload(&self) -> Option<UserAccessToken> {
+        match self.secrets.load() {
+            Ok(Some(secret)) => Some(UserAccessToken::from_stored(secret)),
+            Ok(None) => None,
+            Err(source) => {
+                tracing::debug!(%source, "the credential store could not be re-read");
+                None
+            }
+        }
+    }
+}
+
 pub fn login(
     context: &Context,
     requested_mode: Option<StartMode>,
@@ -486,7 +528,39 @@ pub fn login(
     // Only `Authenticated` short-circuits. A revoked credential must go through
     // the device flow to be replaced, and an unreachable GitHub is not evidence
     // of anything, so both fall through.
-    if let CredentialState::Authenticated(discovery) = credential_state(context, &secrets)? {
+    //
+    // ------------------------------------------------------------------------
+    // AN UNREADABLE STORE IS NOT A REASON TO REFUSE TO SIGN IN.
+    // ------------------------------------------------------------------------
+    // This read used to be `credential_state(context, &secrets)?`, so a store
+    // that could not be read ended the command -- which meant the one action
+    // that repairs an unreadable store was the one action that would not run
+    // against one. Two real failures reach it: a macOS keychain item whose ACL
+    // no longer names this binary after a self-upgrade (`-25293`), and a
+    // Windows blob whose owner moved to the service account when the daemon
+    // renewed. Both leave an operator holding the correct instructions and a
+    // command that refuses them.
+    //
+    // Nothing is lost by continuing. A value that cannot be read cannot be
+    // resumed, which is the only question being asked here, and the sign-in
+    // that follows replaces it. What the operator gets instead of a dead end is
+    // a line saying so.
+    let resumable = match secrets.load() {
+        Ok(existing) => existing,
+        Err(source) => {
+            writeln!(
+                out,
+                "\nThe credential already in the {} could not be read, so this sign-in \n\
+                 replaces it rather than resuming it. The reason was: {source}",
+                secrets.location()
+            )
+            .map_err(failed)?;
+            None
+        }
+    };
+    if let Some(secret) = resumable
+        && let CredentialState::Authenticated(discovery) = credential_state_of(context, secret)?
+    {
         writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
         write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
         return Ok(());
@@ -667,7 +741,24 @@ pub fn credential_state(
     else {
         return Ok(CredentialState::NotAuthenticated);
     };
+    credential_state_of(context, secret)
+}
 
+/// What GitHub makes of a credential already in hand.
+///
+/// Split out of [`credential_state`] so that `login` can decide for itself what
+/// an unreadable store means. To `status` it is an error worth reporting; to
+/// `login` it is the ordinary condition of a host that is about to sign in
+/// anyway, and treating it as fatal there is what made the store's own repair
+/// refuse to run against a store that needed repairing.
+///
+/// # Errors
+/// [`Failure::AppNotPublished`] when this build has no registration. Every
+/// authentication outcome is a [`CredentialState`].
+pub fn credential_state_of(
+    context: &Context,
+    secret: SecretString,
+) -> Result<CredentialState, CliError> {
     let app = context.app_registration()?;
     let client = AuthenticatedClient::new(
         context.endpoints().clone(),

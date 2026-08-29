@@ -971,6 +971,13 @@ mod sys {
     //! without opening a process token, without a `TOKEN_USER` buffer, and
     //! without a second copy of the SID lookup `process.rs` already carries.
     //!
+    //! **That sentence held only while `auth login` was the sole writer.** Token
+    //! renewal made the daemon a second writer under a different account, and
+    //! because every write creates a new file, the owner moved with it and `OW`
+    //! stopped meaning the operator. [`replacement_sddl`] is what keeps the
+    //! grant `OW` describes from evaporating; it carries the previous owner's
+    //! SID onto the replacement explicitly.
+    //!
     //! # One store per host, and what a second operator actually gets
     //!
     //! An earlier version of this paragraph said that ownership moves with the
@@ -1031,20 +1038,23 @@ mod sys {
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
 
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Security::{
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    };
     use windows::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_NONE,
     };
-    use windows::core::PCWSTR;
+    use windows::core::{PCWSTR, PWSTR};
 
     use super::{
         APPLICATION, DIRECTORY, ITEM, ORGANIZATION, QUALIFIER, SecretScope, TEMP_PREFIX, overwrite,
@@ -1134,6 +1144,207 @@ mod sys {
             SecretScope::Machine => "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)",
             SecretScope::User => "D:P(A;;FA;;;BA)(A;;FA;;;OW)",
         }
+    }
+
+    /// The DACL a *replacement* gets: [`sddl`], plus the account that owned
+    /// what is being replaced.
+    ///
+    /// # Why `OW` alone stopped being enough
+    ///
+    /// `OW` is OWNER RIGHTS, and the owner of a file is whoever created it.
+    /// That made `OW` an exact statement of *"the account that ran `auth login`
+    /// keeps access to what it stored"* for as long as `auth login` was the
+    /// only writer.
+    ///
+    /// Token renewal made the daemon a second writer with a different
+    /// identity. [`store`] finishes by renaming a temporary over the target, so
+    /// every write creates a new file, and the new file's owner is whoever
+    /// created it — `LocalSystem` for a daemon installed at boot. `OW` then
+    /// resolves to `LocalSystem`, the operator matches none of the three ACEs,
+    /// and an unelevated `auth status` cannot read the store or even its ACL.
+    ///
+    /// Observed on 2026-08-29: a store readable at `07:50Z` and unreadable at
+    /// `07:58Z`, with nothing between the two but the daemon renewing its
+    /// eight-hour token. See `docs/spikes/token-expiry-and-renewal.md`.
+    ///
+    /// # Why the previous owner, rather than preserving ownership
+    ///
+    /// Setting a new file's owner to an account that is not the caller's needs
+    /// `SE_RESTORE_NAME`, which `LocalSystem` holds but a least-privilege
+    /// service account — which `service install` can register — does not. An
+    /// ACE needs nothing: the writer created the file and so may say who else
+    /// reaches it. This works the same for both, which is why it is the
+    /// mechanism rather than the fallback.
+    ///
+    /// This widens nothing. The previous owner already had full control
+    /// through `OW`; carrying the SID forward is what keeps a grant that
+    /// already existed from evaporating when somebody else writes.
+    ///
+    /// # Why the previous *grants* and not just the previous owner
+    ///
+    /// Carrying the owner alone survives exactly one write and then undoes
+    /// itself. After the first renewal the owner is the daemon and the operator
+    /// is named by an ACE; at the second renewal the owner read back is the
+    /// *daemon's*, so a DACL rebuilt from the owner drops the operator and
+    /// locks them out again — the same failure, deferred by eight hours. What
+    /// is carried is therefore every SID the previous DACL granted, which
+    /// includes the ACE the previous write added.
+    ///
+    /// [`carried_grants`] reads that set and drops the SIDs the constant
+    /// already covers, so the DACL cannot grow by one ACE per write.
+    pub(super) fn replacement_sddl(scope: SecretScope, carried: &[String]) -> String {
+        let mut text = sddl(scope).to_owned();
+        for sid in carried {
+            // The SID goes in where a two-letter alias usually does; SDDL takes
+            // either.
+            text.push_str("(A;;FA;;;");
+            text.push_str(sid);
+            text.push(')');
+        }
+        text
+    }
+
+    /// Trustees the constant DACL already grants, in both spellings.
+    ///
+    /// The aliases are what [`sddl`] itself writes, so re-emitting them would
+    /// double every ACE in the base. The two SIDs are the same accounts as
+    /// `SY` and `BA`, which is the spelling [`previous_owner`] hands back:
+    /// `ConvertSidToStringSidW` always answers `S-1-…`, never an alias.
+    const ALREADY_GRANTED: [&str; 5] = ["SY", "BA", "OW", "S-1-5-18", "S-1-5-32-544"];
+
+    /// Every account the value being replaced was readable by, so that
+    /// replacing it does not quietly take the store away from one of them.
+    ///
+    /// The owner, because `OW` granted it; plus the SIDs already named
+    /// explicitly, because those are the owners of earlier writes that this
+    /// mechanism already rescued. Bounded by [`ALREADY_GRANTED`] and by
+    /// deduplication: in practice the set is the one operator who signed in.
+    ///
+    /// Deliberately infallible, for the reason [`previous_owner`] gives.
+    fn carried_grants(path: &Path) -> Vec<String> {
+        // The reader `protection` already goes through, rather than a second
+        // descriptor round trip of this module's own.
+        let dacl = crate::process::permissions_summary(path)
+            .map(|summary| summary.description)
+            .unwrap_or_default();
+        merge_grants(previous_owner(path).as_deref(), &dacl)
+    }
+
+    /// [`carried_grants`] without the two reads, which is where its one rule
+    /// lives and the only part a test can drive.
+    ///
+    /// A test process is one account: it cannot become `LocalSystem`, so it
+    /// cannot make the owner move between writes, so driving [`store`] can
+    /// never reach the case this rule exists for. Passing the owner and the
+    /// DACL in is what makes "the writer is not the previous owner" reachable
+    /// at all.
+    pub(super) fn merge_grants(previous_owner: Option<&str>, previous_dacl: &str) -> Vec<String> {
+        let mut carried: Vec<String> = Vec::new();
+        let mut add = |sid: &str| {
+            if !ALREADY_GRANTED.contains(&sid) && !carried.iter().any(|seen| seen == sid) {
+                carried.push(sid.to_owned());
+            }
+        };
+        if let Some(owner) = previous_owner {
+            add(owner);
+        }
+        for trustee in trustees(previous_dacl) {
+            add(&trustee);
+        }
+        carried
+    }
+
+    /// Every trustee an SDDL DACL names, in whatever spelling it names them.
+    ///
+    /// An ACE is `(type;flags;rights;object;inherit;trustee)`, so the trustee is
+    /// what follows the last `;` before the closing parenthesis.
+    ///
+    /// # Why not "the ones written as `S-1-…`"
+    ///
+    /// Because Windows does not read back what was written. A DACL built with
+    /// `S-1-5-21-…-500` comes out of
+    /// `ConvertSecurityDescriptorToStringSecurityDescriptorW` as `(A;;FA;;;LA)`
+    /// — the alias for the built-in Administrator — and any other well-known
+    /// account behaves the same way. Filtering on the `S-1-` prefix therefore
+    /// dropped exactly the accounts whose grant had already been rescued once,
+    /// so the carry survived one write and undid itself on the next, which is
+    /// the bug it exists to prevent.
+    ///
+    /// Found by CI, whose Windows runner signs in as that account. It passes on
+    /// an ordinary developer machine, where the operator has a plain
+    /// `S-1-5-21-…-1001` that survives the round trip unchanged.
+    ///
+    /// [`ALREADY_GRANTED`] is what keeps the base DACL's own aliases out.
+    pub(super) fn trustees(sddl: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for ace in sddl.split('(').skip(1) {
+            let Some(body) = ace.split(')').next() else {
+                continue;
+            };
+            let Some(trustee) = body.rsplit(';').next() else {
+                continue;
+            };
+            if !trustee.is_empty() && !found.iter().any(|seen| seen == trustee) {
+                found.push(trustee.to_owned());
+            }
+        }
+        found
+    }
+
+    /// The SID of the account that owns the file already there, as a string.
+    ///
+    /// `None` when there is no file, when its owner cannot be read, or when the
+    /// SID will not convert — all of which mean the same thing to the caller:
+    /// there is no previous grant to carry forward, so write [`sddl`] as it
+    /// stands. A first write reaches this with nothing on disk and takes that
+    /// path.
+    ///
+    /// Deliberately infallible. A store that refused to write because it could
+    /// not read a security descriptor would trade a working credential for a
+    /// tidier ACL.
+    fn previous_owner(path: &Path) -> Option<String> {
+        let wide = to_wide(path);
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: `wide` is NUL-terminated and outlives the call. `descriptor`
+        // receives a LocalAlloc'd descriptor freed below on every path, and
+        // `owner` points into it rather than owning anything itself.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+
+        let mut sid_string = PWSTR::null();
+        // SAFETY: `owner` points into the descriptor, which is still live.
+        let converted = unsafe { ConvertSidToStringSidW(owner, &mut sid_string) };
+        let text = match converted {
+            // SAFETY: the conversion succeeded, so `sid_string` is a
+            // LocalAlloc'd NUL-terminated string, freed immediately after.
+            Ok(()) => {
+                let text = unsafe { sid_string.to_string() }.ok();
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(sid_string.0.cast())));
+                }
+                text
+            }
+            Err(_) => None,
+        };
+        // SAFETY: LocalAlloc'd by `GetNamedSecurityInfoW`, freed exactly once.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+        text
     }
 
     /// The access right a replacing rename needs on the file it replaces.
@@ -1228,9 +1439,14 @@ mod sys {
 
         let blob = protect(plaintext, scope)?;
 
+        // Read before the temporary exists, from the file about to be replaced.
+        // A renewal writes as the daemon's account and would otherwise take
+        // `OW` away from the operator who signed in; see `replacement_sddl`.
+        let descriptor = replacement_sddl(scope, &carried_grants(&site.file));
+
         let temporary = directory.join(format!("{TEMP_PREFIX}{}.tmp", uuid::Uuid::new_v4()));
         let written = (|| -> io::Result<()> {
-            let mut file = create_protected_file(&temporary, scope)?;
+            let mut file = create_protected_file(&temporary, &descriptor)?;
             file.write_all(&blob)?;
             file.flush()?;
             file.sync_all()
@@ -1506,9 +1722,14 @@ mod sys {
             .collect()
     }
 
-    /// Creates a new file carrying [`sddl`] from the moment it exists.
-    fn create_protected_file(path: &Path, scope: SecretScope) -> io::Result<File> {
-        let sddl_wide: Vec<u16> = sddl(scope)
+    /// Creates a new file carrying `descriptor` from the moment it exists.
+    ///
+    /// Takes the SDDL rather than the scope because a replacement's DACL is
+    /// [`sddl`] plus the previous owner — see [`replacement_sddl`] — and a file
+    /// that is created and then widened is unreadable to the account it is
+    /// being widened for for however long the gap lasts.
+    fn create_protected_file(path: &Path, descriptor: &str) -> io::Result<File> {
+        let sddl_wide: Vec<u16> = descriptor
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -3013,6 +3234,7 @@ mod tests {
     #[cfg(windows)]
     mod windows {
         use super::*;
+        use crate::secrets::sys::{merge_grants, replacement_sddl, sddl, trustees};
 
         /// How much a [`DeniedReplace`] takes away.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3136,6 +3358,190 @@ mod tests {
                 "icacls {arguments:?} failed: {}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// The DACL string alone, with no OS in the way.
+        #[test]
+        fn a_replacement_carries_the_previous_owner_and_a_first_write_does_not() {
+            for scope in [SecretScope::Machine, SecretScope::User] {
+                assert_eq!(
+                    replacement_sddl(scope, &[]),
+                    sddl(scope),
+                    "a first write has nothing to carry, so it gets the constant DACL and \
+                     nothing else"
+                );
+                assert_eq!(
+                    replacement_sddl(scope, &["S-1-5-21-1-2-3-1001".to_owned()]),
+                    format!("{}(A;;FA;;;S-1-5-21-1-2-3-1001)", sddl(scope)),
+                    "one carried grant is one appended ACE"
+                );
+            }
+        }
+
+        /// The second renewal, which is where carrying only the owner undoes
+        /// itself.
+        ///
+        /// After one renewal the file is owned by `LocalSystem` and the
+        /// operator is named by the ACE that renewal carried. A mechanism that
+        /// rebuilds the DACL from the owner alone reads `S-1-5-18` here, drops
+        /// the operator, and locks them out again eight hours after the fix
+        /// appeared to work.
+        ///
+        /// Driving `store` cannot reach this: a test process is one account and
+        /// cannot make the owner move. So the rule is tested where it lives.
+        #[test]
+        fn a_grant_survives_a_renewal_by_an_account_that_is_not_the_previous_owner() {
+            let operator = "S-1-5-21-9-8-7-1001";
+            let after_one_renewal = format!("{}(A;;FA;;;{operator})", sddl(SecretScope::Machine));
+
+            assert_eq!(
+                merge_grants(Some("S-1-5-18"), &after_one_renewal),
+                vec![operator.to_owned()],
+                "the owner is now LocalSystem, which `SY` already grants; what must survive is \
+                 the operator named in the DACL the previous renewal wrote"
+            );
+
+            assert_eq!(
+                merge_grants(Some(operator), sddl(SecretScope::Machine)),
+                vec![operator.to_owned()],
+                "and the first renewal, where the operator is still the owner and the DACL \
+                 names nobody, carries the same one account"
+            );
+
+            assert!(
+                merge_grants(None, "").is_empty(),
+                "a first write has no owner and no DACL to read, and carries nothing"
+            );
+
+            assert_eq!(
+                merge_grants(Some(operator), &after_one_renewal),
+                vec![operator.to_owned()],
+                "an account reachable both ways is named once, so the DACL cannot grow by an \
+                 ACE per write"
+            );
+
+            // The CI runner's own case, which an ordinary developer machine
+            // does not reach: Windows renders a well-known account's ACE by
+            // alias, so what the previous renewal wrote as `S-1-5-21-...-500`
+            // reads back as `LA`. Carrying only trustees spelled `S-1-` drops
+            // it and the operator is locked out one renewal later.
+            let after_a_renewal_for_a_builtin =
+                format!("{}(A;;FA;;;LA)", sddl(SecretScope::Machine));
+            assert_eq!(
+                merge_grants(Some("S-1-5-18"), &after_a_renewal_for_a_builtin),
+                vec!["LA".to_owned()],
+                "a grant is a grant whichever spelling the DACL reads back in"
+            );
+
+            assert!(
+                merge_grants(None, sddl(SecretScope::Machine)).is_empty(),
+                "and the constant DACL's own aliases are not carried, or every write would \
+                 double the base"
+            );
+        }
+
+        /// Every trustee, because after the first replacement one of them is
+        /// where the operator's access lives — and Windows chooses the
+        /// spelling, not this code.
+        #[test]
+        fn the_trustee_scan_reads_both_spellings() {
+            assert_eq!(
+                trustees("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FA;;;S-1-5-21-9-8-7-1001)"),
+                vec![
+                    "SY".to_owned(),
+                    "BA".to_owned(),
+                    "OW".to_owned(),
+                    "S-1-5-21-9-8-7-1001".to_owned(),
+                ],
+                "the scan reads trustees; deciding which of them are already granted is \
+                 `merge_grants`'s job and not this one's"
+            );
+            assert_eq!(
+                trustees("D:P(A;;FA;;;LA)"),
+                vec!["LA".to_owned()],
+                "an alias is a trustee too, which is what CI's built-in Administrator account \
+                 reads back as"
+            );
+        }
+
+        /// The lockout, as a test: renewal writes as a different account, and
+        /// the operator who signed in must still be able to read the store.
+        ///
+        /// # What this can and cannot reproduce
+        ///
+        /// A test process is one account, so it cannot *become* `LocalSystem`
+        /// and take ownership the way a daemon does. What it pins is the
+        /// mechanism that makes that survivable: after a replacement, the
+        /// previous owner is named in the DACL by SID rather than left to
+        /// `OW` — so when the owner does move, the grant does not move with it.
+        ///
+        /// Un-fixed, the second description equals the first: `OW` and nothing
+        /// else, which is exactly the state that locked an operator out of
+        /// their own credential on 2026-08-29.
+        ///
+        /// # What it asserts, and why not the SID
+        ///
+        /// That the DACL gains something at the first replacement and then
+        /// stops changing. Growth would be an ACE per write; a return to the
+        /// constant would be the operator dropped, which is the lockout.
+        ///
+        /// It deliberately does not name the account. Windows chooses the
+        /// spelling: this machine's operator reads back as
+        /// `S-1-5-21-…-1001`, and CI's, being the built-in Administrator,
+        /// reads back as the alias `LA`. An earlier version of this test
+        /// asserted the SID and failed on CI for that reason alone —
+        /// and the same assumption was in the code, where it was a real
+        /// defect. The spelling-sensitive rule is pinned in
+        /// [`the_trustee_scan_reads_both_spellings`] instead.
+        #[test]
+        fn replacing_a_stored_credential_keeps_the_previous_owners_grant() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+            let base = sddl(SecretScope::Machine);
+
+            store.store(&fixture_token()).expect("the first write");
+            let first = store
+                .protection()
+                .expect("the first file's DACL is readable")
+                .description()
+                .to_string();
+            assert_eq!(
+                first, base,
+                "a first write has nothing to carry forward, so it gets the constant DACL"
+            );
+
+            let mut previous: Option<String> = None;
+            for round in 1..=3 {
+                store.store(&other_token()).expect("the replacement");
+                let dacl = store
+                    .protection()
+                    .expect("the replacement's DACL is readable")
+                    .description()
+                    .to_string();
+                assert_ne!(
+                    dacl, base,
+                    "write {round}: the account that owned what was replaced must stay granted \
+                     explicitly, because a writer under another account takes `OW` with it"
+                );
+                if let Some(previous) = &previous {
+                    assert_eq!(
+                        &dacl, previous,
+                        "write {round}: and the set must settle -- a DACL that keeps growing is \
+                         an ACE per renewal, and one that shrinks back to the constant is the \
+                         lockout returning"
+                    );
+                }
+                previous = Some(dacl);
+            }
+
+            assert_eq!(
+                store
+                    .load()
+                    .expect("the replacement is readable")
+                    .map(|secret| secret.expose_secret().to_string()),
+                Some(other_token().expose_secret().to_string()),
+                "carrying an ACE forward must not disturb what the store holds"
             );
         }
 

@@ -1561,6 +1561,14 @@ pub struct ReconcileReport {
     pub monitor_only: Vec<PolicyId>,
     /// Policies whose target could not be polled this pass.
     pub unreadable: Vec<PolicyId>,
+    /// Policies whose target GitHub actually answered for this pass.
+    ///
+    /// The counterpart to [`Self::unreadable`], and the only honest evidence
+    /// that this host reached GitHub at all. [`Self::allocations`] is not: a
+    /// policy this host does not own is allocated for with no demand and
+    /// without any target being polled, so a pass where every poll failed can
+    /// still end with allocations in it.
+    pub targets_read: u16,
     /// Runners actually started.
     pub started: u16,
     /// Pre-acceptance attempts routed back through this pass's ordinary
@@ -1612,6 +1620,39 @@ pub struct ReconcileReport {
     pub next_poll: NextPoll,
     /// Demand requests this pass projected against the shared hourly ceiling.
     pub demand_requests: u32,
+}
+
+impl ReconcileReport {
+    /// Whether this pass actually reached GitHub, which is the only thing that
+    /// entitles it to write a `last GitHub contact`.
+    ///
+    /// # Positive evidence, because the absence of a failure is not evidence
+    ///
+    /// The record used to be written whenever [`Self::failure`] was `None`, on
+    /// the belief that an unauthorized target lands in [`Self::unreadable`]
+    /// rather than in `failure`. **That belief is wrong.** `unreadable` is
+    /// pushed only from the `PollOutcome::Failed` arm, `failure` is the maximum
+    /// over every `Failed` reading, and `RefreshState::Unauthorized` scores 2 —
+    /// so a non-empty `unreadable` always implies `failure.is_some()`, and
+    /// guarding on both would have changed nothing at all.
+    ///
+    /// The path that really writes a contact record without touching GitHub is
+    /// a pass that polls **nothing**: every policy draining, owned by another
+    /// host, or monitor-only. `pollable` is then empty, no reading exists, no
+    /// failure is computed, and the old guard passed. That is how
+    /// `service status` can answer `healthy` on a host doing nothing at all.
+    ///
+    /// So this asks for evidence rather than for the absence of a complaint. A
+    /// pass with nothing to ask reaches nobody and records nothing, which is
+    /// what `never` in `service status` is for.
+    ///
+    /// Conservative on purpose: `repositories.scope_for` is a real request that
+    /// can succeed before a demand poll fails, and it is not counted. Contact
+    /// that cannot be proven is not claimed.
+    #[must_use]
+    pub const fn reached_github(&self) -> bool {
+        self.targets_read > 0
+    }
 }
 
 impl Default for NextPoll {
@@ -1856,6 +1897,7 @@ impl Reconciler {
                     });
                 }
                 PollOutcome::Ready(demand) => {
+                    report.targets_read = report.targets_read.saturating_add(1);
                     let count = demand_for(&policy.target, demand);
                     self.events.emit(LifecycleEvent::DemandObserved {
                         policy: policy.id,
@@ -2357,6 +2399,73 @@ const fn unreadable_reason(state: &RefreshState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reading that said `healthy` for 28 hours while nothing worked.
+    ///
+    /// A daemon every one of whose targets answered `401` kept writing a fresh
+    /// `last GitHub contact`, because an unauthorized target is `unreadable`
+    /// rather than a `failure`. Both that record and the `service status` built
+    /// on it were used as evidence during the investigation, and both were
+    /// wrong; see `docs/spikes/token-expiry-and-renewal.md`.
+    #[test]
+    fn a_pass_that_reached_no_target_does_not_claim_it_reached_github() {
+        let mut report = ReconcileReport::default();
+        assert!(
+            !report.reached_github(),
+            "a pass that polled nothing -- every policy draining, owned elsewhere, or \
+             monitor-only -- reached nobody. This is the case the old guard let through, and \
+             the only one it ever let through."
+        );
+
+        report.unreadable.push(PolicyId::from_u128(1));
+        assert!(
+            !report.reached_github(),
+            "every target this pass tried was unreadable, so there is no contact to record"
+        );
+
+        report.targets_read = 1;
+        assert!(
+            report.reached_github(),
+            "one target answering is contact, whatever else failed alongside it"
+        );
+
+        // `allocations` deliberately does not count: a policy this host does
+        // not own is allocated for with no demand and without polling anything,
+        // so a pass where every poll failed can still carry allocations.
+        let mut unowned = ReconcileReport::default();
+        unowned.unreadable.push(PolicyId::from_u128(2));
+        unowned.allocations.push(Allocation {
+            policy_id: PolicyId::from_u128(2),
+            demand: 0,
+            desired: 0,
+            active_owned: 0,
+            headroom_before: 0,
+            to_start: 0,
+            limiting_factor: LimitingFactor::Demand,
+        });
+        assert!(
+            !unowned.reached_github(),
+            "an allocation is not evidence that GitHub answered"
+        );
+    }
+
+    /// The claim the old guard rested on, checked rather than assumed.
+    ///
+    /// `report.failure.is_none()` was believed to be compatible with an
+    /// all-unauthorized pass. It is not: `unreadable` is pushed only from the
+    /// `Failed` arm and `failure` is the maximum over every `Failed` reading,
+    /// so guarding on `failure.is_none() && reached_github()` would have been
+    /// `failure.is_none()` with extra words. This pins the severity that makes
+    /// it so, because a future `severity(Unauthorized) == 0` would quietly
+    /// restore the belief.
+    #[test]
+    fn an_unauthorized_target_is_a_failure_and_not_merely_unreadable() {
+        assert!(
+            severity(&RefreshState::Unauthorized) > 0,
+            "an unauthorized reading must survive `max_by_key(severity)` into `report.failure`, \
+             or a pass where every target was refused would report no failure at all"
+        );
+    }
 
     use std::sync::atomic::AtomicUsize;
 

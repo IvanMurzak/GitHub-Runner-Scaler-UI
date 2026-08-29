@@ -23,7 +23,7 @@ use runner_manager_domain::model::TargetScope;
 use runner_manager_domain::model::{CachePolicy, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
-use runner_manager_platform::service::{ServiceError, ServiceOperations};
+use runner_manager_platform::service::ServiceError;
 
 use crate::cli::{self, CliError, Context, Failure, HostSetCapacityArgs};
 #[cfg(test)]
@@ -125,7 +125,14 @@ impl HostSettings {
     /// Switches the existing service registration in place, without reinstalling.
     pub fn set_start_mode(context: &Context, mode: StartMode) -> Result<(), CliError> {
         Self::set_start_mode_with(context, mode, |mode| {
-            ServiceOperations::on_this_host(context.paths().clone())
+            // Through `cli::service::operations` rather than
+            // `ServiceOperations::on_this_host`, so the screen switches the
+            // start mode of the registration `service status` reports on. Built
+            // here the other way, this was the one code path that *wrote* to
+            // the service manager while still resolving the product's constant
+            // name -- which under the test harness means a suite that changed
+            // the developer's own installed service.
+            cli::service::operations(context)
                 .set_start_mode(mode)
                 .map(|_| ())
                 .map_err(service_failure)

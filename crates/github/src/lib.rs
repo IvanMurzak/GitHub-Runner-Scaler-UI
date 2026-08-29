@@ -20,14 +20,24 @@
 //!
 //! # Three properties this crate is required to keep
 //!
-//! **It holds no client secret and has no token-renewal path.** The published
-//! App opts out of user-token expiration, so the user access token does not
-//! expire and no renewal token is ever issued. Renewing a user token would
-//! require the client secret, and a public client cannot hold one — that is the
-//! whole reason this design has no server in it
-//! (`01-current-architecture.md`, "User-to-server token expiration";
-//! `07-security.md`, "Authentication model"). See
-//! [`AuthenticatedClient::revalidate`] for what happens on a `401` instead.
+//! **It holds no client secret, and it renews without one.** This paragraph
+//! used to say the opposite — that the App opts out of user-token expiration,
+//! that no renewal token is ever issued, and that renewing would require a
+//! client secret a public client cannot hold. All three were wrong, and a test
+//! in this crate enforced the error by forbidding the word "refresh token".
+//!
+//! The published App has user-token expiration **on**: a device-flow exchange
+//! returns `expires_in: 28800` and a `refresh_token`. GitHub requires the
+//! client secret to refresh *"unless the user access token was generated using
+//! the device flow"*, and every one of this product's is. So the credential
+//! renews itself, no server appears in the design, and the eight-hour life of
+//! an access token is invisible to a daemon that runs for months. See
+//! [`AuthenticatedClient::renew_once`], and
+//! `docs/spikes/token-expiry-and-renewal.md` for the two renewals that
+//! confirmed it on real hosts.
+//!
+//! [`AuthenticatedClient::revalidate`] is what still happens on a `401` for a
+//! credential with no refresh half — every one issued before 0.1.11.
 //!
 //! **It persists nothing.** [`device_flow::DeviceFlow::complete`] *returns* the
 //! token; it never writes it anywhere. The machine-scoped secret store is `d2`
@@ -1106,6 +1116,12 @@ pub struct AuthenticatedClient {
     /// once per request and written once every eight hours, so contention is
     /// not the concern -- being obviously correct is.
     credential: std::sync::Mutex<UserAccessToken>,
+    /// Where to re-read the credential when a `401` outlives renewal.
+    ///
+    /// `None` for a short-lived client, which is every one that is not the
+    /// daemon's: a command that runs for a second cannot be outlived by a
+    /// sign-in.
+    source: Option<Arc<dyn CredentialSource>>,
     /// How a credential replaces itself, when it can.
     ///
     /// `None` for a client whose credential has no renewal half, which is every
@@ -1207,6 +1223,38 @@ pub trait CredentialRenewal: fmt::Debug + Send + Sync {
     async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String>;
 }
 
+/// Where a client can go to find out that the stored credential changed under
+/// it.
+///
+/// # Why a long-running client needs this
+///
+/// A daemon reads the store once, at startup, and holds the result for as long
+/// as it runs. That was invisible while the only way to change the store was to
+/// stop the daemon — but `auth login` does not stop anything, so a host whose
+/// credential died before its daemon started stays dead through every sign-in
+/// meant to fix it. The operator does the right thing, watches it not work, and
+/// has nothing to tell them why.
+///
+/// Watched on 2026-08-29: a Windows daemon started at `04:08Z` holding an
+/// already-expired token, a sign-in at `10:43Z` that wrote a good pair, and 180
+/// `unauthorized` events an hour for 28 hours without a single minute's pause
+/// across the sign-in. See `docs/spikes/token-expiry-and-renewal.md`.
+///
+/// # Why it is not a file watch
+///
+/// This is consulted on `401` and nowhere else, so a store that never changes
+/// costs nothing and a daemon that is working never reads the disk. It also
+/// covers the case a watch would miss on macOS, where the credential lives in a
+/// keychain rather than at a path.
+pub trait CredentialSource: fmt::Debug + Send + Sync {
+    /// The credential the store holds *now*, or `None` if it cannot be read.
+    ///
+    /// Infallible by design: every failure — missing, unreadable, corrupt —
+    /// means the same thing to the caller, which is that there is nothing new
+    /// to try and the `401` stands.
+    fn reload(&self) -> Option<UserAccessToken>;
+}
+
 impl AuthenticatedClient {
     /// # Errors
     /// The HTTP client failing to build — a TLS backend that will not
@@ -1234,6 +1282,7 @@ impl AuthenticatedClient {
             http,
             endpoints,
             credential: std::sync::Mutex::new(credential),
+            source: None,
             renewal: None,
             clock,
             revalidation_generation: AtomicU64::new(0),
@@ -1358,60 +1407,120 @@ impl AuthenticatedClient {
         self
     }
 
-    /// Replace the credential with a freshly renewed pair, once, however many
+    /// Attach the store this client's credential came from, so a `401` it
+    /// cannot renew its way out of can still notice a sign-in that already
+    /// happened.
+    #[must_use]
+    pub fn with_credential_source(mut self, source: Arc<dyn CredentialSource>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Replace the credential with whatever `produce` finds, once, however many
     /// callers asked at the same moment.
     ///
-    /// Answers whether the credential in hand is now a different one, which is
-    /// the caller's cue to retry. `false` means renewal was impossible or
-    /// failed, and the `401` stands.
+    /// Answers whether the credential in hand is now a *different* one, which
+    /// is the caller's cue to retry. `false` means there was nothing new, and
+    /// the `401` stands.
+    ///
+    /// # Why both ways in share this
+    ///
+    /// [`Self::renew_once`] and [`Self::reload_once`] ask one question —
+    /// *can this `401` be retried with something else* — and differ only in
+    /// where the something else comes from. Written separately they were two
+    /// copies of the same `SeqCst` generation protocol, and the copies had
+    /// already drifted: the equality check below existed in one of them and not
+    /// the other, so a renewal that handed back an identical token reported a
+    /// change that had not happened.
+    ///
+    /// # Why the comparison, and not just a swap
+    ///
+    /// A swap on every `401` would answer `true` forever and turn the one retry
+    /// into an endless pair of requests against a credential that is genuinely
+    /// dead. Only a different token is evidence that retrying might go
+    /// differently.
+    async fn swap_credential_once<F>(&self, produce: F, note: &'static str) -> bool
+    where
+        F: AsyncFnOnce(&Self) -> Option<UserAccessToken>,
+    {
+        let before = self.revalidation_generation.load(Ordering::SeqCst);
+        let _gate = self.revalidation_gate.lock().await;
+        if self.revalidation_generation.load(Ordering::SeqCst) != before {
+            // Somebody swapped while this caller queued, so there is already
+            // something new to retry with. Producing again would be wasted at
+            // best and, for a renewal, would burn the pair they just minted.
+            return true;
+        }
+
+        let Some(fresh) = produce(self).await else {
+            return false;
+        };
+        {
+            let mut guard = self
+                .credential
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.secret().expose_secret() == fresh.secret().expose_secret() {
+                return false;
+            }
+            *guard = fresh;
+        }
+        self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
+        tracing::info!("{note}");
+        true
+    }
+
+    /// Pick up a credential somebody else stored.
+    ///
+    /// `false` when there is no source, the store cannot be read, or what it
+    /// holds is the token that just failed.
+    async fn reload_once(&self) -> bool {
+        let Some(source) = self.source.clone() else {
+            return false;
+        };
+        self.swap_credential_once(
+            async |_| source.reload(),
+            "the stored credential changed and was picked up without a restart",
+        )
+        .await
+    }
+
+    /// Spend the refresh half for a fresh pair.
     ///
     /// # Ordering
     ///
     /// The implementation of [`CredentialRenewal::renew`] persists before
-    /// returning, so by the time the swap below happens the new pair is already
+    /// returning, so by the time the swap happens the new pair is already
     /// durable. A crash between the two loses nothing: the store holds the pair
     /// that works, and the next start reads it.
     async fn renew_once(&self) -> bool {
         let Some(renewal) = self.renewal.clone() else {
             return false;
         };
-        let before = self.revalidation_generation.load(Ordering::SeqCst);
-        let _gate = self.revalidation_gate.lock().await;
-        if self.revalidation_generation.load(Ordering::SeqCst) != before {
-            // Somebody renewed while this caller queued. Retrying is right;
-            // renewing again would burn the pair they just minted.
-            return true;
-        }
-
-        let refresh = {
-            let guard = self
-                .credential
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.renewal().map(|r| r.refresh_token().clone())
-        };
-        let Some(refresh) = refresh else {
-            return false;
-        };
-
-        match renewal.renew(&refresh).await {
-            Ok(fresh) => {
-                *self
-                    .credential
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
-                self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
-                tracing::info!("the user access token was renewed");
-                true
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "the user access token could not be renewed; an interactive sign-in may be                      required"
-                );
-                false
-            }
-        }
+        self.swap_credential_once(
+            async |client: &Self| {
+                let refresh = {
+                    let guard = client
+                        .credential
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.renewal().map(|r| r.refresh_token().clone())
+                }?;
+                match renewal.renew(&refresh).await {
+                    Ok(fresh) => Some(fresh),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "the user access token could not be renewed; an interactive \
+                             sign-in may be required"
+                        );
+                        None
+                    }
+                }
+            },
+            "the user access token was renewed",
+        )
+        .await
     }
 
     /// Serialize, `POST`, and deserialize in one step.
@@ -1428,19 +1537,19 @@ impl AuthenticatedClient {
 
     /// Re-validate the credential once, no matter how many callers ask at once.
     ///
-    /// # This is not a token renewal, and it cannot be
+    /// # This is not a token renewal — renewal is [`Self::renew_once`]
     ///
-    /// `03-control-flows.md` flow 4.3 and this task's specification both say a
-    /// `401` "triggers one refresh under a single-flight mutex, then one retry".
-    /// The *structure* of that sentence is right and is implemented here
+    /// `03-control-flows.md` flow 4.3 says a `401` "triggers one refresh under
+    /// a single-flight mutex, then one retry", and that is implemented
     /// literally: one attempt shared by every concurrent caller, then one retry
-    /// each. The word is not, and cannot be — the same documents remove the
-    /// means. Renewing a user access token requires the client secret
-    /// (`01-current-architecture.md`: "The client secret is required when
-    /// refreshing user access tokens"), the published App opts out of user-token
-    /// expiration so GitHub issues no renewal token at all, and holding a client
-    /// secret would put a server back into a design whose entire point is not
-    /// having one (D3).
+    /// each.
+    ///
+    /// This method used to claim the word "refresh" could not be meant, because
+    /// renewing needs a client secret and the App issues no renewal token. Both
+    /// halves were false; see this module's header. Renewal exists, it runs
+    /// first in [`Self::revalidate_and_retry_once`], and what is left here is
+    /// the path for a credential that has no refresh half to spend — one stored
+    /// before 0.1.11, or issued while the App had expiration switched off.
     ///
     /// So the single thing that happens under the mutex is a re-validation of
     /// the credential already held: one `GET /user/installations` with the same
@@ -1548,7 +1657,7 @@ impl AuthenticatedClient {
             self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
             tracing::info!(
                 outcome = ?fresh,
-                "re-validated the stored credential (no token renewal exists in this design)"
+                "re-validated the stored credential; it carries no refresh half to renew"
             );
             fresh
         };
@@ -1668,7 +1777,21 @@ impl AuthenticatedClient {
         //
         // A credential with no refresh token falls through to exactly the
         // behaviour that was here before.
-        if self.renew_once().await {
+        //
+        // ------------------------------------------------------------------
+        // THEN THE STORE, FOR THE 401 RENEWAL CANNOT ANSWER.
+        // ------------------------------------------------------------------
+        // Renewal covers a token that expired under a daemon holding a
+        // *renewable* pair. It cannot cover a daemon that started holding a
+        // dead bare token, because there is no refresh half to spend -- and
+        // that daemon will not recover on its own no matter how many times an
+        // operator runs `auth login`, because it never looks at the store
+        // again. Consulting it here is what makes the obvious remedy work.
+        //
+        // Second, not first: renewal is this client's own pair and costs no
+        // disk, while a reload is a keychain or DPAPI read that would run on
+        // every 401 of a genuinely revoked credential.
+        if self.renew_once().await || self.reload_once().await {
             let second = self.send_raw(request).await?;
             return match self.classify(request, &second, Attempt::Retry) {
                 Classified::Ok => Ok(second),
@@ -2818,6 +2941,136 @@ mod tests {
 
     fn app() -> AppRegistration {
         AppRegistration::new("Iv23liTESTCLIENTID", "runner-manager").unwrap()
+    }
+
+    // -- picking up a credential somebody else stored -------------------------
+
+    /// A [`CredentialSource`] over a fixed answer, which is what a store looks
+    /// like from here.
+    #[derive(Debug)]
+    struct StoreHolding(Option<&'static str>);
+
+    impl CredentialSource for StoreHolding {
+        fn reload(&self) -> Option<UserAccessToken> {
+            self.0
+                .map(|token| UserAccessToken::new(SecretString::from(token)))
+        }
+    }
+
+    /// The 28-hour failure, as a test: a daemon holding a dead bare token, an
+    /// operator who signs in, and nothing that tells the daemon.
+    ///
+    /// Bare on purpose. A pair would renew and never reach the store at all,
+    /// which is why renewal alone did not cover this.
+    #[tokio::test]
+    async fn a_daemon_picks_up_a_sign_in_that_happened_after_it_started() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer ghu_dead"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer ghu_freshly_signed_in"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AuthenticatedClient::new(
+            Endpoints::for_test_server(&server.uri()).unwrap(),
+            UserAccessToken::new(SecretString::from("ghu_dead")),
+            Arc::new(TestClock::default()),
+        )
+        .unwrap()
+        .with_credential_source(Arc::new(StoreHolding(Some("ghu_freshly_signed_in"))));
+
+        client
+            .send(&ApiRequest::get("/repos/acme/app"))
+            .await
+            .expect(
+                "the 401 is retried with what the store holds now, without anybody \n                 restarting the daemon",
+            );
+    }
+
+    /// The other half, and the reason for the comparison in `reload_once`: a
+    /// store that still holds the token that just failed is not news.
+    ///
+    /// Without the check, every `401` would answer "something changed, retry"
+    /// and a genuinely revoked credential would spend two requests per poll
+    /// forever instead of being reported.
+    #[tokio::test]
+    async fn a_store_holding_the_same_dead_token_is_not_worth_a_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The re-validation probe that runs once reload declines.
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AuthenticatedClient::new(
+            Endpoints::for_test_server(&server.uri()).unwrap(),
+            UserAccessToken::new(SecretString::from("ghu_revoked")),
+            Arc::new(TestClock::default()),
+        )
+        .unwrap()
+        .with_credential_source(Arc::new(StoreHolding(Some("ghu_revoked"))));
+
+        let failure = client
+            .send(&ApiRequest::get("/repos/acme/app"))
+            .await
+            .expect_err("a revoked credential is still revoked when the store agrees");
+        assert!(
+            matches!(failure, GithubError::AuthenticationFailed),
+            "{failure:?}"
+        );
+    }
+
+    /// An unreadable store leaves the `401` exactly where it was, rather than
+    /// turning a rejection into a different kind of error.
+    #[tokio::test]
+    async fn an_unreadable_store_changes_nothing_about_the_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AuthenticatedClient::new(
+            Endpoints::for_test_server(&server.uri()).unwrap(),
+            UserAccessToken::new(SecretString::from("ghu_revoked")),
+            Arc::new(TestClock::default()),
+        )
+        .unwrap()
+        .with_credential_source(Arc::new(StoreHolding(None)));
+
+        let failure = client
+            .send(&ApiRequest::get("/repos/acme/app"))
+            .await
+            .expect_err("nothing to pick up means the rejection stands");
+        assert!(
+            matches!(failure, GithubError::AuthenticationFailed),
+            "{failure:?}"
+        );
     }
 
     // -- headers ------------------------------------------------------------

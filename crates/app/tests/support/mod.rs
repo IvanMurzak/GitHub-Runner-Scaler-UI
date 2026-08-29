@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,6 +78,18 @@ pub const FIXTURE_APP_SLUG: &str = "runner-manager-test";
 /// one exported does not silently change what the suite measures. `--data-dir`
 /// is passed as a flag rather than through its environment variable for the
 /// same reason: a flag cannot be overridden by the environment.
+///
+/// # The service name is disposable too, and that is not cosmetic
+///
+/// `--data-dir` moves the directories. It does not move the service manager,
+/// which holds one registration per machine under one constant name. So a suite
+/// pointed at a temporary directory still met whatever this developer really
+/// has installed, and `service status` reported -- correctly -- a registration
+/// with no install record behind it. Four tests failed that way for anybody who
+/// had ever run `service install`, and passed for everybody who had not.
+///
+/// [`ServiceIdentity::fixture`] names cannot collide with the product's, so
+/// what this buys is a machine that is clean *for the name being asked about*.
 #[must_use]
 pub fn runner_manager(data_dir: &Path) -> Command {
     let mut command = Command::cargo_bin("runner-manager").expect("the binary must be built");
@@ -101,6 +113,22 @@ pub fn runner_manager(data_dir: &Path) -> Command {
         command.env_remove(variable);
     }
     command.env("NO_PROXY", "127.0.0.1,localhost,::1");
+    // The data directory's own name, so a failure names the test it came from,
+    // plus the pid and a counter, so the tag is unique whatever the caller
+    // passed. Deriving it from the leaf name alone would hand every caller that
+    // passes a fixed name -- `temporary.path().join("data")`, or a `data_dir`
+    // with no leaf at all -- the *same* registration to describe, which is the
+    // cross-talk this variable exists to prevent.
+    static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
+    command.env(
+        "RUNNER_MANAGER_SERVICE_NAME_TAG",
+        format!(
+            "{}-{}-{}",
+            data_dir.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            NEXT_TAG.fetch_add(1, Ordering::Relaxed)
+        ),
+    );
     command.arg("--data-dir").arg(data_dir);
     command
 }

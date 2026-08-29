@@ -320,3 +320,75 @@ fn a_non_loopback_github_override_is_refused_by_the_binary() {
         outcome.stderr
     );
 }
+
+// ----------------------------------------------------------------------------
+// THE SUITE MUST NOT MEET THE SERVICE THIS DEVELOPER ACTUALLY INSTALLED.
+// ----------------------------------------------------------------------------
+// `--data-dir` moves the directories. It does not move the service manager,
+// which holds one registration per machine under one constant name. So every
+// test that ran `service status` against a temporary directory was really
+// asking about this machine's own installation, and got a true answer that the
+// test did not expect: a registration with no install record behind it.
+//
+// `service_status_runs_unattended_and_reports_offline_honestly` and three tests
+// in `no_secret_reaches_command_output` failed that way -- on `main`, for
+// anybody who had ever run `service install`, and for nobody who had not. This
+// pins the isolation that fixed them, because a harness change is exactly the
+// kind of thing that comes back silently.
+
+/// The isolation is real, and it says so rather than quietly describing a
+/// service the operator never installed.
+#[test]
+fn the_suite_asks_about_a_disposable_registration_and_says_which_one() {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.args(["service", "status"]);
+        command
+    });
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("runner-manager-selftest-"),
+        "the name asked about must be a fixture, which cannot collide with the product's: {}",
+        outcome.stdout
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("RUNNER_MANAGER_SERVICE_NAME_TAG is set"),
+        "a report about a registration nobody installed must say that is what it is: {}",
+        outcome.stdout
+    );
+}
+
+/// The other half: with no tag, the product's own name is what is reported.
+///
+/// Without this, a harness that stopped setting the variable would leave the
+/// test above passing against the wrong thing.
+#[test]
+fn without_the_tag_the_product_registration_is_the_one_reported() {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.env_remove("RUNNER_MANAGER_SERVICE_NAME_TAG");
+        command.args(["service", "status"]);
+        command
+    });
+
+    assert!(
+        outcome.stdout.contains("Service: runner-manager\n"),
+        "the shipped default is the product registration: {}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome
+            .stdout
+            .contains("RUNNER_MANAGER_SERVICE_NAME_TAG is set"),
+        "and it does not claim to be a fixture: {}",
+        outcome.stdout
+    );
+    // Deliberately no assertion on the exit code. Whether this machine has the
+    // product installed is not this suite's business, and asserting either way
+    // is what made four tests depend on it.
+}
