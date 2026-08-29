@@ -34,7 +34,14 @@ pub fn dispatch(
 /// See [`identity`].
 pub(super) const SERVICE_TAG_VARIABLE: &str = "RUNNER_MANAGER_SERVICE_NAME_TAG";
 
-fn operations(context: &Context) -> ServiceOperations {
+/// The one place that decides which registration this process acts on.
+///
+/// `pub(crate)` so that the TUI's settings screen switches the start mode of
+/// the *same* registration these commands report on. Building
+/// [`ServiceOperations::on_this_host`] there instead would leave one code path
+/// -- the only one that **writes** -- still pointed at the product's name while
+/// everything else was pointed at a fixture.
+pub(crate) fn operations(context: &Context) -> ServiceOperations {
     ServiceOperations::with_controls(
         context.paths().clone(),
         identity(),
@@ -63,15 +70,43 @@ fn operations(context: &Context) -> ServiceOperations {
 /// # Why it is safe to read in a shipped binary
 ///
 /// A fixture name is always `runner-manager-selftest-<tag>`, so this cannot
-/// point at, hide, or replace a real registration whatever it is set to -- the
-/// worst it can do is describe a service that does not exist. [`status`] says
-/// so out loud when it is in effect, which is what keeps a stray variable in a
-/// shell profile from reading as "the service vanished".
+/// point at, hide, or replace a real registration whatever it is set to. It can
+/// still *create* one: `service install` under a stray variable registers a
+/// real service under a fixture name and writes an ordinary install record, and
+/// once the variable is gone `service uninstall` no longer finds it. So
+/// [`announce_fixture`] is called by every command that touches the identity --
+/// not only [`status`] -- which is what keeps a stray variable in a shell
+/// profile from reading as "the service vanished" or as a successful install.
 fn identity() -> ServiceIdentity {
     match std::env::var(SERVICE_TAG_VARIABLE) {
         Ok(tag) if !tag.trim().is_empty() => ServiceIdentity::fixture(tag.trim()),
         _ => ServiceIdentity::product(),
     }
+}
+
+/// Says out loud that this command is pointed at a test registration.
+///
+/// Announced by `install` and `uninstall` as well as [`status`], because the
+/// write paths are the ones with a lasting consequence: an operator who is not
+/// told cannot tell `service install` under a stray [`SERVICE_TAG_VARIABLE`]
+/// apart from a real install, and is left with a boot-start service that the
+/// product's own `service uninstall` will not remove.
+fn announce_fixture(
+    operations: &ServiceOperations,
+    verb: &str,
+    subject: &'static str,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    if !operations.identity().is_fixture() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "note: {SERVICE_TAG_VARIABLE} is set, so this {verb} the test registration \
+         `{}` and not the installed service.",
+        operations.identity().name()
+    )
+    .map_err(write_failed(subject))
 }
 
 fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
@@ -137,6 +172,10 @@ pub fn install(
     let mut host = super::host::local_host_or_create(context, &store)?;
     let previous = host.service_start_mode;
     let operations = operations(context);
+    // Said before anything is registered, so that an operator with a stray
+    // variable is told which name is about to appear in their service manager
+    // rather than discovering it when `service uninstall` cannot find it.
+    announce_fixture(&operations, "installs", "this service installation", out)?;
     if let Some((purpose, path)) = context
         .paths()
         .all()
@@ -226,7 +265,9 @@ pub fn install(
 }
 
 pub fn uninstall(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
-    let result = operations(context).uninstall().map_err(service_failure)?;
+    let operations = operations(context);
+    announce_fixture(&operations, "removes", "this service removal", out)?;
+    let result = operations.uninstall().map_err(service_failure)?;
     writeln!(out, "{result}").map_err(write_failed("this service removal"))
 }
 
@@ -239,15 +280,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
     // describes a service the operator has almost certainly never installed,
     // and `installed: no` is the one answer that would look alarming rather
     // than beside the point.
-    if operations.identity().is_fixture() {
-        writeln!(
-            out,
-            "note: {SERVICE_TAG_VARIABLE} is set, so this reports the test registration \
-             `{}` and not the installed service.",
-            operations.identity().name()
-        )
-        .map_err(write_failed("this service status"))?;
-    }
+    announce_fixture(operations, "reports", "this service status", out)?;
     let status = operations.status().map_err(service_failure)?;
     writeln!(out, "{status}").map_err(write_failed("this service status"))?;
     if status.last_github_contact().is_none() {

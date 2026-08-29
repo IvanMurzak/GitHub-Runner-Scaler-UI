@@ -1116,11 +1116,14 @@ pub struct AuthenticatedClient {
     /// once per request and written once every eight hours, so contention is
     /// not the concern -- being obviously correct is.
     credential: std::sync::Mutex<UserAccessToken>,
+    /// Where to re-read the credential when a `401` outlives renewal.
+    ///
+    /// `None` for a short-lived client, which is every one that is not the
+    /// daemon's: a command that runs for a second cannot be outlived by a
+    /// sign-in.
+    source: Option<Arc<dyn CredentialSource>>,
     /// How a credential replaces itself, when it can.
     ///
-    /// Where to re-read the credential when a `401` outlives renewal. `None`
-    /// for a short-lived client, which is every one that is not the daemon's.
-    source: Option<Arc<dyn CredentialSource>>,
     /// `None` for a client whose credential has no renewal half, which is every
     /// client until an App turns user-token expiration on, and for the paths
     /// that hold a token for one call and never outlive its eight hours.
@@ -1413,33 +1416,43 @@ impl AuthenticatedClient {
         self
     }
 
-    /// Pick up a credential somebody else stored, once, however many callers
-    /// asked at the same moment.
+    /// Replace the credential with whatever `produce` finds, once, however many
+    /// callers asked at the same moment.
     ///
-    /// Answers the same question [`Self::renew_once`] does — *is the credential
-    /// in hand now a different one* — so the two compose as alternatives in the
-    /// `401` path. `false` means there is no source, the store cannot be read,
-    /// or what it holds is the token that just failed.
+    /// Answers whether the credential in hand is now a *different* one, which
+    /// is the caller's cue to retry. `false` means there was nothing new, and
+    /// the `401` stands.
+    ///
+    /// # Why both ways in share this
+    ///
+    /// [`Self::renew_once`] and [`Self::reload_once`] ask one question —
+    /// *can this `401` be retried with something else* — and differ only in
+    /// where the something else comes from. Written separately they were two
+    /// copies of the same `SeqCst` generation protocol, and the copies had
+    /// already drifted: the equality check below existed in one of them and not
+    /// the other, so a renewal that handed back an identical token reported a
+    /// change that had not happened.
     ///
     /// # Why the comparison, and not just a swap
     ///
-    /// A swap on every `401` would answer `true` forever and turn the one
-    /// retry into an endless pair of requests against a credential that is
-    /// genuinely dead. Only a *different* token is evidence that retrying might
-    /// go differently.
-    async fn reload_once(&self) -> bool {
-        let Some(source) = self.source.clone() else {
-            return false;
-        };
+    /// A swap on every `401` would answer `true` forever and turn the one retry
+    /// into an endless pair of requests against a credential that is genuinely
+    /// dead. Only a different token is evidence that retrying might go
+    /// differently.
+    async fn swap_credential_once<F>(&self, produce: F, note: &'static str) -> bool
+    where
+        F: AsyncFnOnce(&Self) -> Option<UserAccessToken>,
+    {
         let before = self.revalidation_generation.load(Ordering::SeqCst);
         let _gate = self.revalidation_gate.lock().await;
         if self.revalidation_generation.load(Ordering::SeqCst) != before {
-            // Somebody swapped the credential while this caller queued, so
-            // there is already something new to retry with.
+            // Somebody swapped while this caller queued, so there is already
+            // something new to retry with. Producing again would be wasted at
+            // best and, for a renewal, would burn the pair they just minted.
             return true;
         }
 
-        let Some(fresh) = source.reload() else {
+        let Some(fresh) = produce(self).await else {
             return false;
         };
         {
@@ -1453,64 +1466,61 @@ impl AuthenticatedClient {
             *guard = fresh;
         }
         self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
-        tracing::info!("the stored credential changed and was picked up without a restart");
+        tracing::info!("{note}");
         true
     }
 
-    /// Replace the credential with a freshly renewed pair, once, however many
-    /// callers asked at the same moment.
+    /// Pick up a credential somebody else stored.
     ///
-    /// Answers whether the credential in hand is now a different one, which is
-    /// the caller's cue to retry. `false` means renewal was impossible or
-    /// failed, and the `401` stands.
+    /// `false` when there is no source, the store cannot be read, or what it
+    /// holds is the token that just failed.
+    async fn reload_once(&self) -> bool {
+        let Some(source) = self.source.clone() else {
+            return false;
+        };
+        self.swap_credential_once(
+            async |_| source.reload(),
+            "the stored credential changed and was picked up without a restart",
+        )
+        .await
+    }
+
+    /// Spend the refresh half for a fresh pair.
     ///
     /// # Ordering
     ///
     /// The implementation of [`CredentialRenewal::renew`] persists before
-    /// returning, so by the time the swap below happens the new pair is already
+    /// returning, so by the time the swap happens the new pair is already
     /// durable. A crash between the two loses nothing: the store holds the pair
     /// that works, and the next start reads it.
     async fn renew_once(&self) -> bool {
         let Some(renewal) = self.renewal.clone() else {
             return false;
         };
-        let before = self.revalidation_generation.load(Ordering::SeqCst);
-        let _gate = self.revalidation_gate.lock().await;
-        if self.revalidation_generation.load(Ordering::SeqCst) != before {
-            // Somebody renewed while this caller queued. Retrying is right;
-            // renewing again would burn the pair they just minted.
-            return true;
-        }
-
-        let refresh = {
-            let guard = self
-                .credential
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.renewal().map(|r| r.refresh_token().clone())
-        };
-        let Some(refresh) = refresh else {
-            return false;
-        };
-
-        match renewal.renew(&refresh).await {
-            Ok(fresh) => {
-                *self
-                    .credential
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
-                self.revalidation_generation.fetch_add(1, Ordering::SeqCst);
-                tracing::info!("the user access token was renewed");
-                true
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "the user access token could not be renewed; an interactive sign-in may be                      required"
-                );
-                false
-            }
-        }
+        self.swap_credential_once(
+            async |client: &Self| {
+                let refresh = {
+                    let guard = client
+                        .credential
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.renewal().map(|r| r.refresh_token().clone())
+                }?;
+                match renewal.renew(&refresh).await {
+                    Ok(fresh) => Some(fresh),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "the user access token could not be renewed; an interactive \
+                             sign-in may be required"
+                        );
+                        None
+                    }
+                }
+            },
+            "the user access token was renewed",
+        )
+        .await
     }
 
     /// Serialize, `POST`, and deserialize in one step.
@@ -2982,7 +2992,7 @@ mod tests {
             .send(&ApiRequest::get("/repos/acme/app"))
             .await
             .expect(
-                "the 401 is retried with what the store holds now, without anybody restarting                  the daemon",
+                "the 401 is retried with what the store holds now, without anybody \n                 restarting the daemon",
             );
     }
 

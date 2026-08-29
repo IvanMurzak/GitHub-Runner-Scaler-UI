@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,13 +113,21 @@ pub fn runner_manager(data_dir: &Path) -> Command {
         command.env_remove(variable);
     }
     command.env("NO_PROXY", "127.0.0.1,localhost,::1");
-    // The data directory's own name, which `tempfile` already made unique, so
-    // tests running side by side do not describe each other's registration.
+    // The data directory's own name, so a failure names the test it came from,
+    // plus the pid and a counter, so the tag is unique whatever the caller
+    // passed. Deriving it from the leaf name alone would hand every caller that
+    // passes a fixed name -- `temporary.path().join("data")`, or a `data_dir`
+    // with no leaf at all -- the *same* registration to describe, which is the
+    // cross-talk this variable exists to prevent.
+    static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
     command.env(
         "RUNNER_MANAGER_SERVICE_NAME_TAG",
-        data_dir
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("suite")),
+        format!(
+            "{}-{}-{}",
+            data_dir.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            NEXT_TAG.fetch_add(1, Ordering::Relaxed)
+        ),
     );
     command.arg("--data-dir").arg(data_dir);
     command

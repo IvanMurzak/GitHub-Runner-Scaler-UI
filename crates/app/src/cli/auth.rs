@@ -545,16 +545,8 @@ pub fn login(
     // resumed, which is the only question being asked here, and the sign-in
     // that follows replaces it. What the operator gets instead of a dead end is
     // a line saying so.
-    match secrets.load() {
-        Ok(Some(secret)) => {
-            if let CredentialState::Authenticated(discovery) = credential_state_of(context, secret)?
-            {
-                writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
-                write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
-                return Ok(());
-            }
-        }
-        Ok(None) => {}
+    let resumable = match secrets.load() {
+        Ok(existing) => existing,
         Err(source) => {
             writeln!(
                 out,
@@ -563,7 +555,15 @@ pub fn login(
                 secrets.location()
             )
             .map_err(failed)?;
+            None
         }
+    };
+    if let Some(secret) = resumable
+        && let CredentialState::Authenticated(discovery) = credential_state_of(context, secret)?
+    {
+        writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
+        write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
+        return Ok(());
     }
 
     // Counted only once the sign-in is actually going to happen. A host that

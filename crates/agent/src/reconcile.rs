@@ -1623,29 +1623,35 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
-    /// Whether this pass has any business claiming the host reached GitHub.
+    /// Whether this pass actually reached GitHub, which is the only thing that
+    /// entitles it to write a `last GitHub contact`.
     ///
-    /// # What this exists to stop
+    /// # Positive evidence, because the absence of a failure is not evidence
     ///
-    /// `last GitHub contact` used to be recorded whenever
-    /// [`Self::failure`] was `None` — and an unauthorized target is not a
-    /// failure, it is an entry in [`Self::unreadable`]. So a daemon whose
-    /// credential every single target rejected kept writing a fresh contact
-    /// record, and `service status` kept answering `healthy`. It said `healthy`
-    /// for 28 hours while logging 180 refusals an hour, and both readings were
-    /// used as evidence during the investigation that eventually found the real
-    /// fault. See `docs/spikes/token-expiry-and-renewal.md`.
+    /// The record used to be written whenever [`Self::failure`] was `None`, on
+    /// the belief that an unauthorized target lands in [`Self::unreadable`]
+    /// rather than in `failure`. **That belief is wrong.** `unreadable` is
+    /// pushed only from the `PollOutcome::Failed` arm, `failure` is the maximum
+    /// over every `Failed` reading, and `RefreshState::Unauthorized` scores 2 —
+    /// so a non-empty `unreadable` always implies `failure.is_some()`, and
+    /// guarding on both would have changed nothing at all.
     ///
-    /// # Why `unreadable.is_empty()` is the second half
+    /// The path that really writes a contact record without touching GitHub is
+    /// a pass that polls **nothing**: every policy draining, owned by another
+    /// host, or monitor-only. `pollable` is then empty, no reading exists, no
+    /// failure is computed, and the old guard passed. That is how
+    /// `service status` can answer `healthy` on a host doing nothing at all.
     ///
-    /// A pass that polled nothing — every policy monitor-only, or none
-    /// configured yet — reads zero targets and fails on none. That is not a
-    /// host out of contact with GitHub; it is a host with nothing to ask. It
-    /// keeps the behaviour it had, which is what leaves this change about the
-    /// lie and nothing else.
+    /// So this asks for evidence rather than for the absence of a complaint. A
+    /// pass with nothing to ask reaches nobody and records nothing, which is
+    /// what `never` in `service status` is for.
+    ///
+    /// Conservative on purpose: `repositories.scope_for` is a real request that
+    /// can succeed before a demand poll fails, and it is not counted. Contact
+    /// that cannot be proven is not claimed.
     #[must_use]
-    pub fn reached_github(&self) -> bool {
-        self.targets_read > 0 || self.unreadable.is_empty()
+    pub const fn reached_github(&self) -> bool {
+        self.targets_read > 0
     }
 }
 
@@ -2405,9 +2411,10 @@ mod tests {
     fn a_pass_that_reached_no_target_does_not_claim_it_reached_github() {
         let mut report = ReconcileReport::default();
         assert!(
-            report.reached_github(),
-            "a pass with nothing to poll -- no policies, or every one monitor-only -- is a host \
-             with nothing to ask, not a host out of contact"
+            !report.reached_github(),
+            "a pass that polled nothing -- every policy draining, owned elsewhere, or \
+             monitor-only -- reached nobody. This is the case the old guard let through, and \
+             the only one it ever let through."
         );
 
         report.unreadable.push(PolicyId::from_u128(1));
@@ -2439,6 +2446,24 @@ mod tests {
         assert!(
             !unowned.reached_github(),
             "an allocation is not evidence that GitHub answered"
+        );
+    }
+
+    /// The claim the old guard rested on, checked rather than assumed.
+    ///
+    /// `report.failure.is_none()` was believed to be compatible with an
+    /// all-unauthorized pass. It is not: `unreadable` is pushed only from the
+    /// `Failed` arm and `failure` is the maximum over every `Failed` reading,
+    /// so guarding on `failure.is_none() && reached_github()` would have been
+    /// `failure.is_none()` with extra words. This pins the severity that makes
+    /// it so, because a future `severity(Unauthorized) == 0` would quietly
+    /// restore the belief.
+    #[test]
+    fn an_unauthorized_target_is_a_failure_and_not_merely_unreadable() {
+        assert!(
+            severity(&RefreshState::Unauthorized) > 0,
+            "an unauthorized reading must survive `max_by_key(severity)` into `report.failure`, \
+             or a pass where every target was refused would report no failure at all"
         );
     }
 

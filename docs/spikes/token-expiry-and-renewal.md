@@ -119,13 +119,24 @@ recoverable**, on both platforms, including ones not yet found.
 both and the message says `revoked` either way. It said `revoked` throughout
 the 28 hours when the truth was `expired, and renewable`.
 
-**`last GitHub contact` is recorded even when every target answered `401`.**
-`contacts.record()` runs when `report.failure.is_none()`, and an unauthorized
-target lands in `report.unreadable`, not in `failure`. So a daemon that can
-reach nothing keeps a fresh contact record and `service status` keeps saying
-`healthy`. It said `healthy` for 28 hours while logging 180 refusals an hour.
-Both readings were used as evidence during this investigation and both were
-wrong.
+**`service status` said `healthy` for 28 hours while nothing worked.** It was
+used as evidence twice during this investigation, and it was wrong twice.
+
+The first explanation for it was also wrong, and is recorded here because it
+survived into a fix before anybody checked it: *"`contacts.record()` runs when
+`report.failure.is_none()`, and an unauthorized target lands in
+`report.unreadable`, not in `failure`."* The second half is false.
+`report.unreadable` is pushed only from the `PollOutcome::Failed` arm,
+`report.failure` is the maximum over every `Failed` reading, and
+`RefreshState::Unauthorized` scores 2 — so a non-empty `unreadable` always
+implies `failure.is_some()`. Guarding on both would have changed nothing.
+
+What actually writes a contact record without touching GitHub is a pass that
+polls **nothing**: every policy draining, owned by another host, or
+monitor-only. No reading exists, no failure is computed, and the old guard
+passed. The fix is to ask for positive evidence — `ReconcileReport::
+reached_github`, which counts targets GitHub answered for — rather than for the
+absence of a complaint.
 
 ## The App setting this all rests on
 

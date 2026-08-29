@@ -925,11 +925,21 @@ async fn run_target_loop<T: TargetReconciler>(
         // ago governs this pass rather than the next one.
         target.refresh_policies();
         let report = target.reconcile().await;
-        // `reached_github` and not just `failure.is_none()`: an unauthorized
-        // target is unreadable rather than a failure, so without it a daemon
-        // that reached nothing at all kept a fresh contact record and
-        // `service status` kept answering `healthy`.
-        if draining.is_none() && report.failure.is_none() && report.reached_github() {
+        // `reached_github()` alone, and not `failure.is_none()`. Two changes in
+        // one line, both deliberate.
+        //
+        // The conjunction of the two is a tautology: an unauthorized reading
+        // *is* a failure, so a non-empty `unreadable` already implies
+        // `failure.is_some()`. See `ReconcileReport::reached_github`, which
+        // records how long that was believed otherwise.
+        //
+        // And `failure.is_none()` was the wrong question anyway. It asks
+        // whether anything went wrong; what a *last successful contact* needs
+        // to know is whether anything went right. A pass that read two targets
+        // and lost a third did reach GitHub, and a pass that polled nothing at
+        // all did not -- which is the case that really let a host report
+        // `healthy` while doing nothing.
+        if draining.is_none() && report.reached_github() {
             contacts.record()?;
         }
         match draining {
@@ -1757,6 +1767,12 @@ mod tests {
                 .build()
         };
         let healthy_report = ReconcileReport {
+            // What makes this target healthy rather than merely uncomplaining.
+            // The default report reads nothing and fails on nothing, which is
+            // what a pass with no policy to poll looks like -- and such a pass
+            // reaches GitHub not at all, so it records no contact. Saying so
+            // here is the fixture describing the thing it is named for.
+            targets_read: 1,
             next_poll: runner_manager_agent::reconcile::NextPoll {
                 delay: Duration::from_secs(1),
                 ..Default::default()
