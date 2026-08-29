@@ -1,0 +1,36 @@
+crates/platform/src/secrets.rs
+  s_85d9ac5d33d9be::t_b5b72ac470a1a3 3141
+  s_85d9ac5d33d9be::t_8721f962db2855 974-980,1041,1043-1044,1050-1052,1057,1149-1252,1345-1350,1353,1629-1636,3268-3353
+crates/agent/src/reconcile.rs
+  s_85d9ac5d33d9be::t_fc447e142b0cf6 1894
+  s_85d9ac5d33d9be::t_bcf2ee65bb5874 1564-1571
+  s_85d9ac5d33d9be::t_debb4af6a93eb8 1625-1651
+  s_85d9ac5d33d9be::t_afa6650d708036 2397-2429,2439-2444
+  s_85d9ac5d33d9be::t_2d7cea3151831f 2430-2438
+crates/app/src/cli/auth.rs
+  s_85d9ac5d33d9be::t_98078aa5e67665 56-57,410-451,531-566,744-745,747-761
+crates/app/tests/auth_states.rs
+  s_85d9ac5d33d9be::t_fbc6ea3d43517f 702-753
+  s_85d9ac5d33d9be::t_f7a725baecfcb0 754-756
+crates/app/src/cli/daemon.rs
+  s_85d9ac5d33d9be::t_29aca92ef7673f 128-141
+  s_85d9ac5d33d9be::t_4a88a404bce488 928-932
+crates/github/src/lib.rs
+  s_85d9ac5d33d9be::t_98078aa5e67665 23-40,1121-1123,1223-1254,1282,1407-1459,1530,1532-1533,1535-1542,1650,1770-1784,2936-3065
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "13e9e5e057c190f04312e1729b5bd71ebace3fbd",
+  "prompts": {},
+  "sessions": {
+    "s_85d9ac5d33d9be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d3f13fe-302d-47f0-9d10-273cbb49779c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
