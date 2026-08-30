@@ -2062,6 +2062,64 @@ mod sys {
         )
     }
 
+    /// `errSecDuplicateItem`, which this store only ever meets in one
+    /// situation. See [`replace_unreadable`].
+    const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
+
+    /// `errSecAuthFailed`, which a keychain answers when the item is there and
+    /// the ACL does not name the program asking.
+    const ERR_SEC_AUTH_FAILED: i32 = -25293;
+
+    fn is_duplicate(error: &security_framework::base::Error) -> bool {
+        error.code() == ERR_SEC_DUPLICATE_ITEM
+    }
+
+    /// Removes the item without reading it, so that a value this program may
+    /// not read can still be replaced.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// A keychain grants access per *application*, and the daemon runs a copy
+    /// of the binary that `service install` makes. Replacing that copy — which
+    /// is what an upgrade is — produces a program the item's ACL does not name,
+    /// and it reads `-25293` from the credential it is supposed to own.
+    ///
+    /// `auth login` is the remedy, and before this it could not be: the
+    /// crate's `set_generic_password` is
+    ///
+    /// ```text
+    /// match self.find_generic_password(service, account) {
+    ///     Ok((_, mut item)) => item.set_password(password),
+    ///     _ => self.add_generic_password(service, account, password),
+    /// }
+    /// ```
+    ///
+    /// so a `find` refused by the ACL falls through to `add`, and `add` meets
+    /// the item that is already there: **`-25299`**. Update refused because the
+    /// item cannot be read, add refused because it exists. A device flow that
+    /// had already completed then had nowhere to put the token it obtained,
+    /// and the refresh half went with it.
+    ///
+    /// Watched on 2026-08-30, upgrading a real host from 0.1.12 to 0.1.15.
+    ///
+    /// # Why deleting works where updating does not
+    ///
+    /// `SecItemDelete` matches on the query — class, keychain, service,
+    /// account — and never asks for the data, so the ACL that guards *reading*
+    /// does not apply. The value is being replaced either way, which is the
+    /// only reason destroying it is the right move here.
+    fn replace_unreadable(keychain: &SecKeychain) -> io::Result<()> {
+        use security_framework::item::{ItemClass, ItemSearchOptions};
+
+        ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .keychains(std::slice::from_ref(keychain))
+            .service(service())
+            .account(ITEM)
+            .delete()
+            .map_err(|error| sec_error(&error))
+    }
+
     /// Suppresses keychain UI for as long as the returned guard lives.
     ///
     /// Best effort: a platform that refuses the call is not a reason to fail
@@ -2189,9 +2247,19 @@ mod sys {
             )
         })?;
 
-        keychain
-            .set_generic_password(service(), ITEM, plaintext)
-            .map_err(|error| sec_error(&error))?;
+        match keychain.set_generic_password(service(), ITEM, plaintext) {
+            Ok(()) => {}
+            // The item is there and this program may not read it, so the
+            // crate's update-or-add could do neither. Take it away and write a
+            // fresh one, which is what replacing a credential means anyway.
+            Err(error) if is_duplicate(&error) => {
+                replace_unreadable(&keychain)?;
+                keychain
+                    .set_generic_password(service(), ITEM, plaintext)
+                    .map_err(|error| sec_error(&error))?;
+            }
+            Err(error) => return Err(sec_error(&error)),
+        }
 
         restrict(site)
     }
@@ -2205,8 +2273,44 @@ mod sys {
         match keychain.find_generic_password(service(), ITEM) {
             Ok((password, _item)) => Ok(Some(password.as_ref().to_vec())),
             Err(error) if is_absence(&error) => Ok(None),
+            // The one refusal an operator can act on, and the one they cannot
+            // guess. See `locked_out`.
+            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => Err(locked_out(&error)),
             Err(error) => Err(sec_error(&error)),
         }
+    }
+
+    /// Why a keychain refuses a program its own credential, and what ends it.
+    ///
+    /// # The state this diagnoses
+    ///
+    /// A keychain grants access per *application*. The daemon runs a copy of
+    /// the binary that `service install` makes, and replacing that copy — which
+    /// is what an upgrade is — produces a program the item's ACL does not name.
+    /// It then reads `-25293` from the credential it is supposed to own, exits
+    /// `13`, and launchd restarts it every fifteen seconds forever.
+    ///
+    /// Watched on 2026-08-30 upgrading a real host from 0.1.12 to 0.1.15:
+    /// `runs` climbing, `last exit code = 13` each time, and a stderr log
+    /// growing by the same four lines.
+    ///
+    /// # Which binary has to sign in
+    ///
+    /// The one that will read it. Signing in with the copy on `PATH` grants
+    /// that copy and leaves the daemon exactly as stuck, which is the part an
+    /// operator has no way to know — so the message says it rather than
+    /// leaving `-25293` to be interpreted.
+    fn locked_out(error: &security_framework::base::Error) -> io::Error {
+        io::Error::other(format!(
+            "Security.framework returned {} ({error}). The item is there and this keychain \
+             does not grant it to the program asking: access is granted per application, and \
+             this program is not the one that stored it -- which is what replacing the \
+             binary during an upgrade does. Sign in again **with the binary that will read \
+             it**: for the service that is the copy `service install` made under \
+             `state/bin`, not the one on PATH, and it must be run from a graphical terminal \
+             so the keychain can prompt. Answer `Always Allow`.",
+            error.code()
+        ))
     }
 
     pub(super) fn delete(site: &Site) -> io::Result<bool> {
@@ -2232,6 +2336,15 @@ mod sys {
                     )),
                     Err(error) => Err(sec_error(&error)),
                 }
+            }
+            // `auth logout` is one of the remedies this store hands out, and
+            // before this it could not run against the state that most needs
+            // it: `find` is refused by the ACL, so the item this program may
+            // not read was also an item it could not remove. The query-based
+            // delete never asks for the data. See `replace_unreadable`.
+            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => {
+                replace_unreadable(&keychain)?;
+                Ok(true)
             }
             Err(error) if is_absence(&error) => Ok(false),
             Err(error) => Err(sec_error(&error)),
