@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 rust-version = "1.94.0"
 license = "MIT"
@@ -52,10 +52,10 @@ homepage = "https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI"
 # --- Workspace members ------------------------------------------------------
 # Each carries a `version` as well as a `path` so the published `runner-manager`
 # crate (D11, `cargo install`) can resolve them from the registry.
-runner-manager-agent = { path = "crates/agent", version = "0.1.13" }
-runner-manager-domain = { path = "crates/domain", version = "0.1.13" }
-runner-manager-github = { path = "crates/github", version = "0.1.13" }
-runner-manager-platform = { path = "crates/platform", version = "0.1.13" }
+runner-manager-agent = { path = "crates/agent", version = "0.1.14" }
+runner-manager-domain = { path = "crates/domain", version = "0.1.14" }
+runner-manager-github = { path = "crates/github", version = "0.1.14" }
+runner-manager-platform = { path = "crates/platform", version = "0.1.14" }
 # `testkit` is never published; it is a dev-dependency everywhere and therefore
 # carries no `version`, which is what lets `cargo publish` strip it.
 runner-manager-testkit = { path = "crates/testkit" }
