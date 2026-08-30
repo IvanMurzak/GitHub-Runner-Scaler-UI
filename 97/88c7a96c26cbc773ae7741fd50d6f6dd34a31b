@@ -1,0 +1,19 @@
+crates/app/src/cli/daemon.rs
+  s_01dfa2fa4db529::t_089394b0a6efe8 1018-1047,1049-1052,1054-1064,1596-1647
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9788c7a96c26cbc773ae7741fd50d6f6dd34a31b",
+  "prompts": {},
+  "sessions": {
+    "s_01dfa2fa4db529": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5ad9e6d8-7c08-4919-97a6-bd2acb6d41f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
