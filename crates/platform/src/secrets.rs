@@ -2113,7 +2113,7 @@ mod sys {
 
         ItemSearchOptions::new()
             .class(ItemClass::generic_password())
-            .keychains(&[keychain.clone()])
+            .keychains(std::slice::from_ref(keychain))
             .service(service())
             .account(ITEM)
             .delete()
