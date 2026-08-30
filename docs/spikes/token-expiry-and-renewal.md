@@ -101,6 +101,66 @@ macOS has the same shape by a different mechanism — a keychain ACL is granted
 per application, so replacing the binary during self-upgrade costs the new one
 access and it reads `-25293`.
 
+### A host already locked out never heals itself
+
+Carrying the previous owner onto every replacement stops the lockout
+*starting*; it cannot end one that already happened. Such a file grants `SY`,
+`BA` and `OW` and nothing else, its owner is the service account, and its DACL
+has nothing left to carry -- so every renewal rebuilds the same DACL, forever.
+
+Watched on 2026-08-30, on 0.1.13. `auth login` from an elevated prompt reported
+`Already signed in` and wrote nothing: with `BA` it could read the credential,
+found it valid, and resumed. The blob's mtime did not move, and an unelevated
+`auth status` still answered `Access is denied`.
+
+The repair is an **explicit grant**, from an elevated prompt:
+
+```powershell
+icacls "C:\ProgramData\IvanMurzak\runner-manager\secrets\user-access-token.dpapi" /grant "%USERNAME%:(F)"
+```
+
+Access returns immediately and stays: the next renewal reads that ACE and
+carries it forward.
+
+### `takeown` is not the repair, and it makes the damage permanent
+
+It was offered as one, on this host, and it appeared to work. It does not.
+
+**Changing an object's owner makes Windows delete its OWNER RIGHTS ACE.** So
+taking ownership removes the one thing that would have granted the new owner
+access. What is left is an account that owns a file it cannot read, holding
+`READ_CONTROL` and `WRITE_DAC` and nothing else -- enough to read the ACL,
+which is exactly what made this look repaired.
+
+Two readings hid it for an hour. The `auth status` that answered
+`Credential: authenticated` ran in the **same elevated prompt** as the
+`takeown`, so it succeeded through `BA` and said nothing about ownership. And
+`(Get-Acl).Owner` answered `IVANPC\IvanD` from an unelevated session -- because
+an owner always holds `READ_CONTROL`. Both were true and neither meant what
+they were taken to mean.
+
+The store afterwards, which is the whole proof:
+
+```text
+O:S-1-5-21-...-1001 G:SY D:P(A;;FA;;;SY)(A;;FA;;;BA)
+```
+
+The operator owns it. `OW` is gone. No renewal brings it back.
+
+### `OW` is no longer load-bearing
+
+The module chose `OW` to say *"the account that wrote this keeps access"*
+without a SID lookup. The sentence is true until anybody changes the owner, and
+then the system silently deletes the ACE that carried it -- so the guarantee
+rested on nobody ever running a command that Windows documents as the way to
+regain access to a file.
+
+Every write now names its writer by SID as well, from the first one. `OW`
+stays, because it costs nothing and still covers the ordinary case, but nothing
+depends on it. `ALREADY_GRANTED` keeps the service accounts out, so a daemon
+renewing under `LocalSystem` adds no ACE and the set stays at the one operator
+who signed in.
+
 ### `auth login` refuses to run when the old credential is unreadable
 
 It reads the existing credential first, to decide whether to resume rather than

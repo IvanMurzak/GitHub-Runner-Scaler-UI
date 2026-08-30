@@ -885,6 +885,20 @@ pub struct PermissionsSummary {
 /// # Errors
 ///
 /// [`HandoffError::Inspect`] when the permissions cannot be read.
+/// This account's SID, in the string form an SDDL trustee takes.
+///
+/// Windows only, because a SID is. The secret store names the account that
+/// wrote a value explicitly rather than describing it as `OW`: OWNER RIGHTS is
+/// deleted by the system whenever an object's owner changes, so a DACL that
+/// leans on it loses the grant the moment anybody runs `takeown`.
+///
+/// # Errors
+/// Whatever reading this process's own token reported.
+#[cfg(windows)]
+pub(crate) fn current_user_sid() -> std::io::Result<String> {
+    sys::current_user_sid()
+}
+
 pub fn permissions_summary(path: &Path) -> Result<PermissionsSummary, HandoffError> {
     sys::describe_permissions(path)
         .map(
@@ -1272,7 +1286,11 @@ mod sys {
     }
 
     /// The current account's SID in string form, for the DACL below.
-    fn current_user_sid() -> io::Result<String> {
+    ///
+    /// `pub(crate)` because the secret store needs the same answer for the same
+    /// reason: a DACL that names the account explicitly, rather than one that
+    /// describes it and hopes the description still fits later.
+    pub(crate) fn current_user_sid() -> io::Result<String> {
         let mut token = HANDLE(std::ptr::null_mut());
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
             .map_err(|error| io_error(&error))?;
