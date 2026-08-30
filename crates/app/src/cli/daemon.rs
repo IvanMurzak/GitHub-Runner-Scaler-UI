@@ -1015,20 +1015,53 @@ fn begin_drain(policies: &mut [runner_manager_domain::policy::ScalePolicy]) {
     }
 }
 
+/// How long a refusal of the single-instance lock has to persist before it is
+/// believed.
+///
+/// # A refusal that means nothing
+///
+/// `flock` belongs to the open file description, and `fork` copies every
+/// descriptor the parent holds. `FD_CLOEXEC` closes the copy at `exec` — but
+/// not before it, so between the two the child holds the parent's lock. Any
+/// process this daemon spawns opens that window: `upgraded_version` runs the
+/// candidate binary to read its version, and every runner is a child too.
+///
+/// A daemon starting inside somebody's fork window is therefore refused by a
+/// lock nobody actually wants, and reports `another daemon already owns this
+/// host` about a child that has already gone.
+///
+/// # Why waiting distinguishes the two
+///
+/// The window is bounded by one `exec`; a real second daemon holds the lock for
+/// as long as it runs. So a refusal that survives a few retries is the real
+/// thing and a refusal that does not was never a conflict. This does not make a
+/// genuine conflict quieter -- it still fails, with the same message -- which
+/// is the objection [`HostLock::acquire`]'s own documentation raises against
+/// waiting on this lock.
+///
+/// Measured rather than guessed: with this at zero the daemon's own test for
+/// the conflict path failed 33 times in 40 runs of the suite under Linux, and
+/// never once with the suite serialised. See
+/// `a_second_daemon_names_the_holder_and_uses_the_conflict_exit_class`.
+const SINGLE_INSTANCE_SETTLE: Duration = Duration::from_millis(250);
+
 fn acquire_instance(context: &Context) -> Result<HostLock, CliError> {
-    HostLock::try_acquire(context.paths(), LockKind::SingleInstance).map_err(
-        |source| match source {
-            held @ LockError::Held { .. } => CliError::with_remedy(
-                Failure::Conflict,
-                format!("another daemon already owns this host: {held}"),
-                "runner-manager service status",
-            ),
-            other => CliError::new(
-                Failure::LocalState,
-                format!("cannot acquire the daemon's single-instance lock: {other}"),
-            ),
-        },
+    HostLock::acquire(
+        context.paths(),
+        LockKind::SingleInstance,
+        SINGLE_INSTANCE_SETTLE,
     )
+    .map_err(|source| match source {
+        held @ LockError::Held { .. } => CliError::with_remedy(
+            Failure::Conflict,
+            format!("another daemon already owns this host: {held}"),
+            "runner-manager service status",
+        ),
+        other => CliError::new(
+            Failure::LocalState,
+            format!("cannot acquire the daemon's single-instance lock: {other}"),
+        ),
+    })
 }
 
 fn local_store_failure(source: runner_manager_domain::store::StoreError) -> CliError {
@@ -1558,6 +1591,58 @@ mod tests {
         assert!(error.message().contains(&std::process::id().to_string()));
         drop(held);
         acquire_instance(&context).expect("dropping the daemon releases the lock");
+    }
+
+    /// The other half of [`SINGLE_INSTANCE_SETTLE`]: a refusal that does not
+    /// persist was never a conflict.
+    ///
+    /// # What this stands for
+    ///
+    /// A process this daemon spawns, in the moment between `fork` and `exec`.
+    /// The child holds a copy of every descriptor the parent had, `FD_CLOEXEC`
+    /// closes it only at the `exec`, and `flock` belongs to the open file
+    /// description — so for that instant the child holds this host's
+    /// single-instance lock without wanting it or knowing about it.
+    ///
+    /// The test above is what caught it, from the other side: with no settle
+    /// window it failed 33 times in 40 runs of this suite under Linux, always
+    /// on its last line, and never once with the suite serialised. The holder
+    /// in the refusal was a process id *higher* than the test's own — a child
+    /// spawned by a neighbouring test, which by then had already exited.
+    ///
+    /// # Why this measures a floor and not a race
+    ///
+    /// Two earlier versions of this test staged a transient holder — a thread
+    /// that took the lock and released it again — and asserted that
+    /// `acquire_instance` rode it out. Both flaked: 2 in 100, then 4 in 150.
+    /// Releasing needs the holder to be *scheduled*, and a thread competing
+    /// with 155 others on eight cores is not scheduled on any deadline, so both
+    /// versions were really asserting "the scheduler will get to it within
+    /// 250ms". Asserting an upper bound on someone else's timing is exactly the
+    /// mistake that produced the flake this whole change is about, written a
+    /// second and third time while fixing it.
+    ///
+    /// So this asserts a *lower* bound instead, which load can only make more
+    /// true: a refusal is not believed until it has been retried across the
+    /// settle window. That is the property that makes a fork window survivable,
+    /// and it is the property `try_acquire` did not have.
+    #[test]
+    fn a_refused_lock_is_retried_before_the_refusal_is_believed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
+        let _held = acquire_instance(&context).expect("first daemon acquires the lock");
+
+        let started = std::time::Instant::now();
+        let error = acquire_instance(&context).expect_err("a lock still held is still a conflict");
+        let waited = started.elapsed();
+
+        assert_eq!(error.class(), Failure::Conflict);
+        assert!(
+            waited >= SINGLE_INSTANCE_SETTLE,
+            "a refusal must be retried across the settle window before it is believed, or a \
+             child's fork window reads as a second daemon. Gave up after {waited:?}, which is \
+             less than {SINGLE_INSTANCE_SETTLE:?}"
+        );
     }
 
     #[test]
