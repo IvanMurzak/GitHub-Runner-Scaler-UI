@@ -1227,7 +1227,35 @@ mod sys {
         let dacl = crate::process::permissions_summary(path)
             .map(|summary| summary.description)
             .unwrap_or_default();
-        merge_grants(previous_owner(path).as_deref(), &dacl)
+        let mut grants = merge_grants(previous_owner(path).as_deref(), &dacl);
+
+        // ------------------------------------------------------------------
+        // AND THIS WRITER, BY NAME, BECAUSE `OW` DOES NOT SURVIVE.
+        // ------------------------------------------------------------------
+        // `OW` was chosen to mean "the account that wrote this keeps access",
+        // and it does -- until anybody changes the owner, at which point
+        // Windows **deletes the OWNER RIGHTS ACE**. Taking ownership of the
+        // file therefore removes the only thing granting the new owner access:
+        // they end up owning a file they cannot read, holding `READ_CONTROL`
+        // and `WRITE_DAC` and nothing else. Read back from a real host on
+        // 2026-08-30, after `takeown` had been offered as the repair:
+        //
+        //     O:S-1-5-21-...-1001 G:SY D:P(A;;FA;;;SY)(A;;FA;;;BA)
+        //
+        // -- the owner is the operator, and `OW` is simply gone.
+        //
+        // So the writer is named by SID as well. `OW` stays because it costs
+        // nothing and still covers the ordinary case, but nothing depends on
+        // it any more. `ALREADY_GRANTED` drops the service accounts, so a
+        // daemon writing under `LocalSystem` adds no ACE at all and the set
+        // stays at the one operator who signed in.
+        if let Ok(writer) = crate::process::current_user_sid()
+            && !ALREADY_GRANTED.contains(&&*writer)
+            && !grants.contains(&writer)
+        {
+            grants.push(writer);
+        }
+        grants
     }
 
     /// [`carried_grants`] without the two reads, which is where its one rule
@@ -1513,35 +1541,48 @@ mod sys {
     /// is whoever wrote last. A daemon under `LocalSystem` renewing the token
     /// became that owner, so `OW` stopped meaning the operator.
     ///
+    /// # Why it names `icacls` and not `takeown`
+    ///
+    /// **Because `takeown` makes it permanent.** Changing an object's owner
+    /// makes Windows delete its OWNER RIGHTS ACE, so taking ownership removes
+    /// the one thing that would have granted the new owner access: they end up
+    /// owning a file they cannot read, holding `READ_CONTROL` and `WRITE_DAC`
+    /// and nothing else.
+    ///
+    /// This was offered as the repair on 2026-08-30 and appeared to work,
+    /// because the `auth status` that followed ran in the same elevated prompt
+    /// and succeeded through `BA`. The store read back:
+    ///
+    /// ```text
+    /// O:S-1-5-21-...-1001 G:SY D:P(A;;FA;;;SY)(A;;FA;;;BA)
+    /// ```
+    ///
+    /// The operator owns it. `OW` is gone. An unelevated read is still denied,
+    /// and no renewal will ever bring it back.
+    ///
+    /// An explicit grant has none of that: it adds an ACE, changes no owner,
+    /// deletes nothing, and is exactly the shape [`carried_grants`] then
+    /// preserves on every later write.
+    ///
     /// # Why a message and not a repair
     ///
-    /// Later versions carry the previous owner onto every replacement, so this
-    /// cannot start. It does not *end* on a host where it already happened:
-    /// the file on disk grants nobody but the service, and there is nothing in
-    /// its DACL left to carry, so every renewal reproduces the same DACL and
-    /// the operator is locked out for good. Taking ownership back is what
-    /// seeds the grant that then propagates by itself.
-    ///
-    /// The product will not do that silently. Ownership of the file holding
-    /// this host's credential is not something a status command should change
-    /// under an operator, and the account that must run it is an
-    /// administrator, which this process may not be. So it says exactly what to
-    /// run.
-    ///
-    /// Watched on 2026-08-30: `auth status` unreadable at every attempt,
-    /// `takeown` on the guard, and `Credential: authenticated` from an
-    /// unelevated prompt immediately after.
+    /// Naming an account in the DACL of the file holding this host's
+    /// credential is not something a status command should do under an
+    /// operator, and the account that can is an administrator, which this
+    /// process may not be. So it says exactly what to run.
     fn locked_out(site: &Site, source: &io::Error) -> io::Error {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "{source}. The file exists but this account may not read it, which on this \
                  store means its owner changed: the service renews the token under its own \
-                 account, and the credential is granted to whoever owns the file. Take \
-                 ownership back from an elevated prompt and the access returns immediately, \
-                 and stays -- every later renewal carries the grant forward:\n    takeown /f \
-                 \"{}\"\nAn `auth logout` followed by `auth login`, also elevated, is the \
-                 heavier alternative and costs a fresh sign-in.",
+                 account. Grant this account access explicitly from an elevated prompt -- it \
+                 returns immediately, and stays, because every later renewal carries the \
+                 grant forward:\n    icacls \"{}\" /grant \"%USERNAME%:(F)\"\nDo NOT use \
+                 `takeown`: changing the owner makes Windows delete the OWNER RIGHTS ACE, \
+                 which leaves this account owning a file it still cannot read. An `auth \
+                 logout` followed by `auth login`, also elevated, is the heavier alternative \
+                 and costs a fresh sign-in.",
                 site.file.display()
             ),
         )
@@ -3533,9 +3574,15 @@ mod tests {
         ///
         /// # What it asserts, and why not the SID
         ///
-        /// That the DACL gains something at the first replacement and then
-        /// stops changing. Growth would be an ACE per write; a return to the
-        /// constant would be the operator dropped, which is the lockout.
+        /// That the very first write already names somebody beyond the
+        /// constant, and that the DACL then stops changing. Growth would be an
+        /// ACE per write; a return to the constant would be the account
+        /// dropped, which is the lockout.
+        ///
+        /// The first write counts because `OW` is not enough on its own: the
+        /// system deletes the OWNER RIGHTS ACE whenever an owner changes, so a
+        /// store that leans on it loses the grant to a single `takeown`. The
+        /// writer is named by SID from the start.
         ///
         /// It deliberately does not name the account. Windows chooses the
         /// spelling: this machine's operator reads back as
@@ -3557,12 +3604,13 @@ mod tests {
                 .expect("the first file's DACL is readable")
                 .description()
                 .to_string();
-            assert_eq!(
+            assert_ne!(
                 first, base,
-                "a first write has nothing to carry forward, so it gets the constant DACL"
+                "even a first write names the account that made it, because `OW` alone does \
+                 not survive a change of owner"
             );
 
-            let mut previous: Option<String> = None;
+            let mut previous: Option<String> = Some(first);
             for round in 1..=3 {
                 store.store(&other_token()).expect("the replacement");
                 let dacl = store
@@ -3671,7 +3719,7 @@ mod tests {
                 .expect_err("a store this account may not read is not a store it can load");
             let rendered = error.to_string();
 
-            for expected in ["takeown", &guard.display().to_string(), "elevated"] {
+            for expected in ["icacls", "/grant", &guard.display().to_string(), "elevated"] {
                 assert!(
                     rendered.contains(expected),
                     "the refusal must name the remedy and the file it applies to. Wanted \
@@ -3681,6 +3729,14 @@ mod tests {
             assert!(
                 !rendered.contains(fixture_token().expose_secret()),
                 "and it must not carry the value it could not read"
+            );
+            assert!(
+                rendered.contains("Do NOT use `takeown`"),
+                "and it must warn off the repair that looks right and is not. Changing the \
+                 owner makes Windows delete the OWNER RIGHTS ACE, so the account ends up \
+                 owning a file it still cannot read -- permanently. Offered on a real host on \
+                 2026-08-30, where it appeared to work only because the check that followed \
+                 ran in the same elevated prompt. Got: {rendered}"
             );
         }
 

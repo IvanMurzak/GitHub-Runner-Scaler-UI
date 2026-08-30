@@ -103,33 +103,63 @@ access and it reads `-25293`.
 
 ### A host already locked out never heals itself
 
-Fixed in 0.1.13, and the fix does not reach backwards. Carrying the previous
-owner onto every replacement stops the lockout *starting*; it cannot end one
-that already happened. The file on such a host grants `SY`, `BA` and `OW` and
-nothing else, its owner is the service account, and there is nothing left in
-its DACL to carry -- so every renewal rebuilds exactly the same DACL, forever.
+Carrying the previous owner onto every replacement stops the lockout
+*starting*; it cannot end one that already happened. Such a file grants `SY`,
+`BA` and `OW` and nothing else, its owner is the service account, and its DACL
+has nothing left to carry -- so every renewal rebuilds the same DACL, forever.
 
-Watched on 2026-08-30. The host was upgraded to 0.1.13, `auth login` was run
-from an elevated prompt, and it reported `Already signed in` and wrote nothing:
-with `BA` it could read the credential, found it valid, and resumed. The blob's
-mtime did not move. An unelevated `auth status` still answered `Access is
-denied`.
+Watched on 2026-08-30, on 0.1.13. `auth login` from an elevated prompt reported
+`Already signed in` and wrote nothing: with `BA` it could read the credential,
+found it valid, and resumed. The blob's mtime did not move, and an unelevated
+`auth status` still answered `Access is denied`.
 
-One elevated command ends it, and the grant then propagates by itself:
+The repair is an **explicit grant**, from an elevated prompt:
 
 ```powershell
-takeown /f "C:\ProgramData\IvanMurzak\runner-manager\secrets\user-access-token.dpapi"
+icacls "C:\ProgramData\IvanMurzak\runner-manager\secrets\user-access-token.dpapi" /grant "%USERNAME%:(F)"
 ```
 
-`OW` resolves to the operator again immediately, and the next renewal writes
-their SID as an explicit ACE. `auth logout` followed by `auth login`, both
-elevated, is the heavier alternative and costs a fresh sign-in.
+Access returns immediately and stays: the next renewal reads that ACE and
+carries it forward.
 
-The store now says this itself on any read it is refused -- see
-`sys::locked_out`. It says it rather than doing it: ownership of the file
-holding a host's credential is not something a status command should change
-under an operator, and the account that can is an administrator, which the
-process asking may not be.
+### `takeown` is not the repair, and it makes the damage permanent
+
+It was offered as one, on this host, and it appeared to work. It does not.
+
+**Changing an object's owner makes Windows delete its OWNER RIGHTS ACE.** So
+taking ownership removes the one thing that would have granted the new owner
+access. What is left is an account that owns a file it cannot read, holding
+`READ_CONTROL` and `WRITE_DAC` and nothing else -- enough to read the ACL,
+which is exactly what made this look repaired.
+
+Two readings hid it for an hour. The `auth status` that answered
+`Credential: authenticated` ran in the **same elevated prompt** as the
+`takeown`, so it succeeded through `BA` and said nothing about ownership. And
+`(Get-Acl).Owner` answered `IVANPC\IvanD` from an unelevated session -- because
+an owner always holds `READ_CONTROL`. Both were true and neither meant what
+they were taken to mean.
+
+The store afterwards, which is the whole proof:
+
+```text
+O:S-1-5-21-...-1001 G:SY D:P(A;;FA;;;SY)(A;;FA;;;BA)
+```
+
+The operator owns it. `OW` is gone. No renewal brings it back.
+
+### `OW` is no longer load-bearing
+
+The module chose `OW` to say *"the account that wrote this keeps access"*
+without a SID lookup. The sentence is true until anybody changes the owner, and
+then the system silently deletes the ACE that carried it -- so the guarantee
+rested on nobody ever running a command that Windows documents as the way to
+regain access to a file.
+
+Every write now names its writer by SID as well, from the first one. `OW`
+stays, because it costs nothing and still covers the ordinary case, but nothing
+depends on it. `ALREADY_GRANTED` keeps the service accounts out, so a daemon
+renewing under `LocalSystem` adds no ACE and the set stays at the one operator
+who signed in.
 
 ### `auth login` refuses to run when the old credential is unreadable
 
