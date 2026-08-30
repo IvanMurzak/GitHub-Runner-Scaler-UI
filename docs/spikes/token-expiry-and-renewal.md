@@ -101,6 +101,36 @@ macOS has the same shape by a different mechanism — a keychain ACL is granted
 per application, so replacing the binary during self-upgrade costs the new one
 access and it reads `-25293`.
 
+### A host already locked out never heals itself
+
+Fixed in 0.1.13, and the fix does not reach backwards. Carrying the previous
+owner onto every replacement stops the lockout *starting*; it cannot end one
+that already happened. The file on such a host grants `SY`, `BA` and `OW` and
+nothing else, its owner is the service account, and there is nothing left in
+its DACL to carry -- so every renewal rebuilds exactly the same DACL, forever.
+
+Watched on 2026-08-30. The host was upgraded to 0.1.13, `auth login` was run
+from an elevated prompt, and it reported `Already signed in` and wrote nothing:
+with `BA` it could read the credential, found it valid, and resumed. The blob's
+mtime did not move. An unelevated `auth status` still answered `Access is
+denied`.
+
+One elevated command ends it, and the grant then propagates by itself:
+
+```powershell
+takeown /f "C:\ProgramData\IvanMurzak\runner-manager\secrets\user-access-token.dpapi"
+```
+
+`OW` resolves to the operator again immediately, and the next renewal writes
+their SID as an explicit ACE. `auth logout` followed by `auth login`, both
+elevated, is the heavier alternative and costs a fresh sign-in.
+
+The store now says this itself on any read it is refused -- see
+`sys::locked_out`. It says it rather than doing it: ownership of the file
+holding a host's credential is not something a status command should change
+under an operator, and the account that can is an administrator, which the
+process asking may not be.
+
 ### `auth login` refuses to run when the old credential is unreadable
 
 It reads the existing credential first, to decide whether to resume rather than

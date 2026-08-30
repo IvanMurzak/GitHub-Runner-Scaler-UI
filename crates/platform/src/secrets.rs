@@ -1503,10 +1503,61 @@ mod sys {
         }
     }
 
+    /// Why an operator cannot read a store that is theirs, and the one command
+    /// that gives it back.
+    ///
+    /// # The state this diagnoses
+    ///
+    /// A file that exists and that this account may not read. On this store
+    /// that has one cause: the DACL grants `SY`, `BA` and `OW`, and the owner
+    /// is whoever wrote last. A daemon under `LocalSystem` renewing the token
+    /// became that owner, so `OW` stopped meaning the operator.
+    ///
+    /// # Why a message and not a repair
+    ///
+    /// Later versions carry the previous owner onto every replacement, so this
+    /// cannot start. It does not *end* on a host where it already happened:
+    /// the file on disk grants nobody but the service, and there is nothing in
+    /// its DACL left to carry, so every renewal reproduces the same DACL and
+    /// the operator is locked out for good. Taking ownership back is what
+    /// seeds the grant that then propagates by itself.
+    ///
+    /// The product will not do that silently. Ownership of the file holding
+    /// this host's credential is not something a status command should change
+    /// under an operator, and the account that must run it is an
+    /// administrator, which this process may not be. So it says exactly what to
+    /// run.
+    ///
+    /// Watched on 2026-08-30: `auth status` unreadable at every attempt,
+    /// `takeown` on the guard, and `Credential: authenticated` from an
+    /// unelevated prompt immediately after.
+    fn locked_out(site: &Site, source: &io::Error) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{source}. The file exists but this account may not read it, which on this \
+                 store means its owner changed: the service renews the token under its own \
+                 account, and the credential is granted to whoever owns the file. Take \
+                 ownership back from an elevated prompt and the access returns immediately, \
+                 and stays -- every later renewal carries the grant forward:\n    takeown /f \
+                 \"{}\"\nAn `auth logout` followed by `auth login`, also elevated, is the \
+                 heavier alternative and costs a fresh sign-in.",
+                site.file.display()
+            ),
+        )
+    }
+
     pub(super) fn load(site: &Site, _scope: SecretScope) -> io::Result<Option<Vec<u8>>> {
         let blob = match std::fs::read(&site.file) {
             Ok(blob) => blob,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            // Asked before the bare denial is returned, for the same reason
+            // `cannot_replace` exists on the write path: `Access is denied` on
+            // a file the operator owns the machine of is a true statement that
+            // helps nobody.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(locked_out(site, &error));
+            }
             Err(error) => return Err(error),
         };
         if blob.is_empty() {
@@ -3542,6 +3593,94 @@ mod tests {
                     .map(|secret| secret.expose_secret().to_string()),
                 Some(other_token().expose_secret().to_string()),
                 "carrying an ACE forward must not disturb what the store holds"
+            );
+        }
+
+        /// Denies *reading* the store, which is the state a renewal under a
+        /// service account leaves an operator in, and puts the right back on
+        /// every path out including an unwind.
+        ///
+        /// A deny ACE for `Everyone` binds administrators too, which is what
+        /// makes this reproducible on CI's elevated runner as well as on an
+        /// ordinary developer machine.
+        struct DeniedRead {
+            file: std::path::PathBuf,
+            restored: bool,
+        }
+
+        impl DeniedRead {
+            fn new(file: &std::path::Path) -> Self {
+                let denied = Self {
+                    file: file.to_path_buf(),
+                    restored: false,
+                };
+                icacls(&[&denied.file.display().to_string(), "/deny", "*S-1-1-0:(R)"]);
+                denied
+            }
+
+            fn restore(&mut self) {
+                if self.restored {
+                    return;
+                }
+                self.restored = true;
+                let arguments = [
+                    self.file.display().to_string(),
+                    "/remove:d".into(),
+                    "*S-1-1-0".into(),
+                ];
+                // Not asserted: this runs on the unwind path, where a panic
+                // would replace a readable failure with an aborted process.
+                match run_icacls(&arguments.each_ref().map(String::as_str)) {
+                    Ok(output) if output.status.success() => {}
+                    other => eprintln!(
+                        "could not restore the ACL on {}: {other:?}",
+                        self.file.display()
+                    ),
+                }
+            }
+        }
+
+        impl Drop for DeniedRead {
+            fn drop(&mut self) {
+                self.restore();
+            }
+        }
+
+        /// A store the operator may not read says how to get it back.
+        ///
+        /// Carrying the previous owner keeps this from *starting*, but it
+        /// cannot end it on a host where it already happened: the file grants
+        /// nobody but the service and has nothing left in its DACL to carry, so
+        /// every renewal rebuilds the same DACL. Without a message the operator
+        /// is told `Access is denied` by every command, forever, with no way to
+        /// find out that one elevated `takeown` ends it.
+        ///
+        /// Watched on a real host on 2026-08-30, on 0.1.13, which had the carry
+        /// and still could not read its own credential.
+        #[test]
+        fn a_store_this_account_may_not_read_names_the_command_that_gives_it_back() {
+            let root = TempDir::new().expect("a temporary directory");
+            let store = rooted(SecretScope::Machine, &root);
+            store.store(&fixture_token()).expect("the first write");
+
+            let guard = store.guard();
+            let _denied = DeniedRead::new(&guard);
+
+            let error = store
+                .load()
+                .expect_err("a store this account may not read is not a store it can load");
+            let rendered = error.to_string();
+
+            for expected in ["takeown", &guard.display().to_string(), "elevated"] {
+                assert!(
+                    rendered.contains(expected),
+                    "the refusal must name the remedy and the file it applies to. Wanted \
+                     {expected:?} in: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains(fixture_token().expose_secret()),
+                "and it must not carry the value it could not read"
             );
         }
 
