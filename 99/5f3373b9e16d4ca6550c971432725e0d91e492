@@ -1,0 +1,31 @@
+README.md
+  s_11a4c61ec36669::t_162491180b30b4 137-151,154-160,162-164,239,244-247
+  s_11a4c61ec36669::t_525f49304733cf 14-20,175,183,193
+  s_11a4c61ec36669::t_1f1a17fbf70927 240-243,248-251,290
+  s_11a4c61ec36669::t_c37d884c505511 165,252-279
+  s_11a4c61ec36669::t_72b2ef762e4964 63,68,81
+  s_11a4c61ec36669::t_0b290aa5f1a878 182,192
+  s_11a4c61ec36669::t_b67b159444b640 134-136,152-153,161,167-169,174,176-181,184-191,194-206,208-238
+  s_11a4c61ec36669::t_8a192e03faade9 5-8,10
+  s_11a4c61ec36669::t_ca5e46d3ba5a41 24,30-35,41-43,49,55,131-133,171-173,207
+  s_11a4c61ec36669::t_a05401ae4cefd8 166
+  s_11a4c61ec36669::t_e2e887c168f288 170
+crates/app/tests/readme_disclosure.rs
+  s_11a4c61ec36669::t_e246dadf9f0602 13-16,143-144,155,157-160,163-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "995f3373b9e16d4ca6550c971432725e0d91e492",
+  "prompts": {},
+  "sessions": {
+    "s_11a4c61ec36669": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a059a3-279d-78a3-afe4-a75dc48bc6c9",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
