@@ -1,0 +1,34 @@
+schema: 2
+
+name: implement-task
+description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish once and squash-merge into main only after the full PR check rollup is green.
+
+execution: sequential
+isolation: run
+base_branch: main
+
+steps:
+  - name: implement
+    body:
+      - _shared/worktree-preamble.md
+      - steps/implement.md
+    self_improve: false
+
+  - name: code-review
+    body:
+      - _shared/worktree-preamble.md
+      - steps/code-review.md
+    self_improve: false
+
+  - name: simplify
+    body:
+      - _shared/worktree-preamble.md
+      - steps/simplify.md
+    self_improve: false
+
+  - name: land
+    body:
+      - _shared/worktree-preamble.md
+      - steps/land.md
+    model: sonnet
+    self_improve: false
