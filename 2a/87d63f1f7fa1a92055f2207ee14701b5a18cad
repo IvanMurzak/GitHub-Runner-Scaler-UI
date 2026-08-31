@@ -1,0 +1,45 @@
+.taskflow/2026-08-31-runner-workspace-locations/tasks/g1-readme-workspace-guidance.md
+  s_11a4c61ec36669::t_b7feb515a2d625 1-51
+.taskflow/2026-08-31-runner-workspace-locations/tasks/README.md
+  s_11a4c61ec36669::t_c1ef01fcfd9d7e 1-15,18-35
+  s_11a4c61ec36669::t_e6d6bfb8ab6813 16-17,36
+.taskflow/2026-08-31-runner-workspace-locations/tasks/b1-runner-path-platform.md
+  s_11a4c61ec36669::t_c1ef01fcfd9d7e 1-50
+.taskflow/2026-08-31-runner-workspace-locations/tasks/a1-workspace-domain.md
+  s_11a4c61ec36669::t_c1ef01fcfd9d7e 1-49
+.taskflow/2026-08-31-runner-workspace-locations/tasks/c1-effective-runtime-root.md
+  s_11a4c61ec36669::t_514b40888c302d 1-49
+.taskflow/2026-08-31-runner-workspace-locations/tasks/c2-persistent-slot-allocation.md
+  s_11a4c61ec36669::t_514b40888c302d 1-52
+.taskflow/2026-08-31-runner-workspace-locations/tasks/c3-persistent-cleanup-recovery.md
+  s_11a4c61ec36669::t_514b40888c302d 1-52
+.taskflow/2026-08-31-runner-workspace-locations/tasks/b2-windows-root-acl.md
+  s_11a4c61ec36669::t_c1ef01fcfd9d7e 1-49
+.taskflow/2026-08-31-runner-workspace-locations/tasks/a2-workspace-store.md
+  s_11a4c61ec36669::t_c1ef01fcfd9d7e 1-54
+.taskflow/2026-08-31-runner-workspace-locations/tasks/e1-workspace-tui.md
+  s_11a4c61ec36669::t_514b40888c302d 1-50
+.taskflow/2026-08-31-runner-workspace-locations/tasks/f1-workspace-security-acceptance.md
+  s_11a4c61ec36669::t_3770d5dd6ffc40 1-54
+.taskflow/2026-08-31-runner-workspace-locations/tasks/d1-workspace-cli-read-models.md
+  s_11a4c61ec36669::t_514b40888c302d 1-53
+.taskflow/2026-08-31-runner-workspace-locations/ROADMAP.md
+  s_11a4c61ec36669::t_e6d6bfb8ab6813 9-10,14-15,35-40,47-50,52,55-60,67,128-130
+  s_11a4c61ec36669::t_3dac18efa02e4c 68-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2a87d63f1f7fa1a92055f2207ee14701b5a18cad",
+  "prompts": {},
+  "sessions": {
+    "s_11a4c61ec36669": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a059a3-279d-78a3-afe4-a75dc48bc6c9",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
