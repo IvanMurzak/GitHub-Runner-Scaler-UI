@@ -2,139 +2,57 @@
 
 **Local-first autoscaling for ephemeral GitHub Actions self-hosted runners.**
 
-Point `runner-manager` at the repositories or organizations you own. When a job is queued,
-it registers a just-in-time runner on your machine, lets it take the job, and removes it
-when the job ends. Nothing idles between jobs, and nothing on your machine listens on the
-network.
+Use your own Windows, macOS or Linux machine to pick up GitHub Actions jobs only when work
+is waiting. `runner-manager` registers a just-in-time runner, lets it complete one job and
+removes it afterwards. You get local compute without an idle runner or an inbound network
+service.
 
-One binary, two faces: a CLI for setup and scripting, and a full-screen terminal UI
-(`runner-manager tui`) for watching it work.
+<!-- GIF placeholder: overview of the runner-manager terminal UI and a job lifecycle. -->
 
 ## Features
 
-- ✅ **No inbound port, webhook, or server** — the agent polls GitHub over HTTPS.
-- ✅ **Ephemeral runners** — a fresh just-in-time runner and workspace per job.
-- ✅ **Boot-start service** on Windows, macOS and Linux.
-- ✅ **Capacity ceilings** per machine and per policy.
-- ✅ **Monitor-only mode** — watch a repository without ever starting a runner.
-- ✅ **Terminal UI** — live dashboard, runners, activity, and settings.
-- ✅ **Credentials in the OS secret store** — never in config, the database, or logs.
-
-## Quick start
-
-Not installed yet? See [Install](#install).
-
-```sh
-# 1. Sign in. Prints a code to enter on GitHub, then the URL to install the App.
-runner-manager auth login
-
-# 2. Point a repository at this machine. Omit --max-capacity for monitor-only.
-runner-manager repo add OWNER/REPO --host-label home --max-capacity 1
-
-# 3. Arm it.
-runner-manager repo set-scale OWNER/REPO --enabled true
-
-# 4. Keep it running across reboots.
-runner-manager service install
-```
-
-Step 2 prints the routing label it reserved — `rm-home-win-x64` for host label `home` on a
-Windows x64 machine. Send jobs to it:
-
-```yaml
-jobs:
-  build:
-    runs-on: rm-home-win-x64
-```
-
-Then watch it work:
-
-```sh
-runner-manager tui
-```
-
-Organizations use the same commands with `org` in place of `repo`.
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `auth login`, `auth status`, `auth logout` | Sign in with GitHub's device flow, check the stored credential against GitHub, purge it. `auth status --list` names every repository the credential reaches; `auth status --permissions` reprints the grant below. |
-| `host show`, `host set-capacity N` | This machine's runner ceiling, secret store, and projected REST budget. |
-| `repo add`, `repo list`, `repo set-capacity`, `repo set-scale`, `repo remove` | Repository-scoped policies. |
-| `org add`, `org list`, `org set-capacity`, `org set-scale`, `org remove` | The same, organization-scoped. |
-| `status`, `status --json` | One snapshot of this host, for a human or for a script. |
-| `daemon run` | Run the agent in the foreground — what the service runs, and useful for watching it. |
-| `service install`, `service status`, `service uninstall` | Register the agent with the OS service manager, `--start-at boot` (default) or `login`. |
-| `tui` | Open the terminal UI. |
-
-Every command accepts `--data-dir DIR` to use a different config, state and runtime root.
-Failures name the command that fixes them and exit with a distinct code per failure class.
-
-## Terminal UI
-
-`d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
-`h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
-
-Tables are drawn with box-drawing glyphs and colour, and every distinction they draw is
-also spelled out in words, so nothing is lost without either. `NO_COLOR` removes the
-colour, `TERM=dumb` removes colour and glyphs both, and `RUNNER_MANAGER_TUI_ASCII=1` keeps
-the colour while drawing the frames in ASCII — for a Windows console still on a legacy code
-page. `RUNNER_MANAGER_TUI_LIGHT=1` shades alternate rows for a light colour scheme and
-`RUNNER_MANAGER_TUI_PLAIN_ROWS=1` leaves them unshaded.
-
-## What you are granting
-
-Signing in installs a GitHub App on the repositories or organizations you pick, with one
-permission set for every user:
-
-| Permission | Level | Why it is needed |
-|---|---|---|
-| Repository → Administration | **Read and write** | Registering a just-in-time runner at repository scope. |
-| Repository → Actions | Read | Counting in-progress workflow runs, the demand signal. |
-| Repository → Metadata | Read | Mandatory for any repository access. |
-| Organization → Self-hosted runners | Read and write | Registering a just-in-time runner at organization scope. |
-
-- `Administration: Read and write` is the only permission that authorizes runner
-  registration, and the same grant permits deleting, renaming and transferring the
-  repository, and adding or removing collaborators.
-- A monitor-only dashboard grants the same permissions — an App grants its whole declared
-  set on installation.
-- Organization scope is narrower: registration there needs only `Self-hosted runners: Read
-  and write` ([verified](docs/spikes/d18-org-jit-verification.md)).
-- Revoke any time in GitHub settings; `runner-manager auth logout` purges the local copy.
-  The project generates no private key, and the App declares no webhook URL.
-
-`runner-manager auth status --permissions` prints this same table at a prompt. It needs no
-credential and makes no request, so it can be read before deciding to sign in at all.
+- ✅ **Works behind NAT:** no inbound ports, webhooks or servers.
+- ✅ **Starts clean:** every job gets a fresh runner and workspace.
+- ✅ **Survives reboots:** auto-starts on Windows, macOS or Linux.
+- ✅ **Protects hardware:** set concurrency limits for every target.
+- ✅ **Tests safely:** monitor demand before enabling automation.
+- ✅ **Shows live activity:** inspect runners, jobs and errors in the TUI.
+- ✅ **Secures credentials:** secrets stay in the operating system store.
 
 ## Install
 
-**npm** — any OS with Node 18+:
+Install on any OS with Node.js 18 or newer:
 
 ```sh
 npm i -g @ivan-murzak/runner-manager
 ```
 
-**Homebrew** — macOS, Linux:
+<details>
+<summary>Other installation methods and details</summary>
+
+### Homebrew
+
+On macOS or Linux:
 
 ```sh
 brew install IvanMurzak/tap/runner-manager
 ```
 
-**Install script** — macOS, Linux, no Node needed:
+### Install script
+
+On macOS or Linux, with no Node.js installation required:
 
 ```sh
 curl -fsSL https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.sh | sh
 ```
 
-**Install script** — Windows, PowerShell 5.1 or 7, no Node needed:
+On Windows with PowerShell 5.1 or 7, with no Node.js installation required:
 
 ```powershell
 irm https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.ps1 | iex
 ```
 
-Then check it:
+Then check the installation:
 
 ```sh
 runner-manager --version
@@ -142,12 +60,12 @@ runner-manager --version
 
 Every path above is a terminal command, deliberately: Gatekeeper on macOS and SmartScreen
 on Windows act on the quarantine flag a *browser* sets, and `curl`, `irm`, `tar`, `brew`,
-`npm` and `cargo` do not set one — so no install here raises a security prompt.
+`npm` and `cargo` do not set one, so no install here raises a security prompt.
 
 ### Which one to pick
 
 The **install script** is the one to use for a boot-start service. It installs to a fixed
-location — `~/.local/bin`, or `%LOCALAPPDATA%\Programs\runner-manager` on Windows — that
+location (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\runner-manager` on Windows) that
 does not move when a toolchain moves, and `service install` records the binary's absolute
 path.
 
@@ -160,7 +78,7 @@ scoped: plain `runner-manager` on npmjs.com is an unrelated project.
 
 Both scripts detect your OS and CPU, verify the archive's SHA-256 against the release's
 published `SHA256SUMS`, and abort without installing anything if it does not match. To pin a
-version — a piped script gets no arguments of its own, hence the separator:
+version. A piped script gets no arguments of its own, hence the separator:
 
 ```sh
 curl -fsSL https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases/latest/download/install.sh | sh -s -- --version 1.2.3
@@ -210,6 +128,155 @@ If `runner-manager --version` is not found after installing, the installer print
 line that adds its directory to your `PATH`. Neither script edits a shell profile or the
 registry on your behalf.
 
+</details>
+
+## Quick start
+
+These four commands connect one repository, allow one concurrent job and keep the agent
+running after a reboot:
+
+```sh
+# 1. Sign in. Prints a code to enter on GitHub, then the URL to install the App.
+runner-manager auth login
+
+# 2. Point a repository at this machine. Omit --max-capacity for monitor-only.
+runner-manager repo add OWNER/REPO --host-label home --max-capacity 1
+
+# 3. Arm it.
+runner-manager repo set-scale OWNER/REPO --enabled true
+
+# 4. Keep it running across reboots.
+runner-manager service install
+```
+
+The `repo add` command prints the routing label it reserved, such as `rm-home-win-x64` for
+host label `home` on a Windows x64 machine. Use that label in the repository workflow:
+
+```yaml
+jobs:
+  build:
+    runs-on: rm-home-win-x64
+```
+
+Queue a workflow, then watch the runner start and complete the job:
+
+```sh
+runner-manager tui
+```
+
+Organizations use the same commands with `org` in place of `repo`.
+
+<!-- GIF placeholder: adding a repository, enabling scaling and watching its first job. -->
+
+## Commands
+
+```bash
+runner-manager auth login                                      # Sign in with GitHub's device flow
+runner-manager auth status [--list] [--permissions]            # Inspect access and App permissions
+runner-manager auth logout                                     # Purge the local credential
+
+runner-manager host show                                       # Show capacity, secret store and REST budget
+runner-manager host set-capacity N                             # Limit concurrent runners on this machine
+
+runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
+runner-manager repo add OWNER/REPO --host-label HOST \
+  --max-capacity N [--label LABEL] [--enable]                  # Allow runners for a repository
+runner-manager repo list                                       # List repository policies
+runner-manager repo set-capacity OWNER/REPO --max-capacity N   # Change repository capacity
+runner-manager repo set-scale OWNER/REPO --enabled BOOL        # Enable scaling or drain runners
+runner-manager repo add-label OWNER/REPO --label LABEL         # Add a runs-on label
+runner-manager repo remove-label OWNER/REPO --label LABEL      # Remove a runs-on label
+runner-manager repo remove OWNER/REPO [--purge]                # Remove a policy and optional retained data
+
+runner-manager org add ORG --host-label HOST                   # Add an organization in monitor-only mode
+runner-manager org add ORG --host-label HOST \
+  --max-capacity N [--label LABEL] [--enable]                  # Allow runners for an organization
+runner-manager org list                                        # List organization policies
+runner-manager org set-capacity ORG --max-capacity N           # Change organization capacity
+runner-manager org set-scale ORG --enabled BOOL                # Enable scaling or drain runners
+runner-manager org add-label ORG --label LABEL                 # Add a runs-on label
+runner-manager org remove-label ORG --label LABEL              # Remove a runs-on label
+runner-manager org remove ORG [--purge]                        # Remove a policy and optional retained data
+
+runner-manager status [--json]                                 # Print a host snapshot
+runner-manager daemon run                                      # Run the agent in the foreground
+runner-manager service install [--start-at boot|login]         # Start the agent automatically
+runner-manager service status                                  # Check service health
+runner-manager service uninstall                               # Remove the service but keep local state
+runner-manager tui                                             # Open the terminal dashboard
+```
+
+Add `--help` to any command to see every option. Failures name the command that fixes them
+and use a distinct exit code for each failure class.
+
+## Customize your setup
+
+### Keep ignored build files during checkout
+
+Want an existing checkout to keep Git-ignored build artifacts or local caches? Disable
+cleanup in `actions/checkout`:
+
+```yaml
+- uses: actions/checkout@v7
+  with:
+    clean: false
+```
+
+This does not yet persist files between jobs. `runner-manager` still creates and removes a
+fresh workspace for every runner attempt.
+
+### Store runner data somewhere else
+
+Add `--data-dir DIR` to any command to place config, state, logs and workspaces under your
+chosen root. Set `RUNNER_MANAGER_DATA_DIR` to make it the default. Re-run
+`runner-manager service install` after changing the root.
+
+### Adapt the dashboard to your terminal
+
+Set `NO_COLOR` to remove colour, `TERM=dumb` to remove glyphs too, or
+`RUNNER_MANAGER_TUI_ASCII=1` for ASCII frames. Use `RUNNER_MANAGER_TUI_LIGHT=1` for light
+rows and `RUNNER_MANAGER_TUI_PLAIN_ROWS=1` for unshaded rows.
+
+## Use the terminal dashboard
+
+Open the live dashboard with `runner-manager tui`. Use these shortcuts to reach the view or
+action you need:
+
+`d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
+`h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
+
+Every status is also written in words, so the dashboard remains usable without colour or
+box-drawing characters.
+
+<!-- GIF placeholder: navigating repositories, runners, activity and settings in the TUI. -->
+
+## What you are granting
+
+Before signing in, review the GitHub App permissions that every installation receives:
+
+| Permission | Level | Used for |
+|---|---|---|
+| Repository → Administration | **Read and write** | Registering a just-in-time runner for a repository. |
+| Repository → Actions | Read | Detecting queued and in-progress workflow runs. |
+| Repository → Metadata | Read | Accessing the repository identity required by GitHub. |
+| Organization → Self-hosted runners | Read and write | Registering runners at organization scope. |
+
+`Administration: Read and write` also permits deleting, renaming and transferring the
+repository, and adding or removing collaborators. GitHub does not offer a narrower
+repository permission for registering runners. A user who only monitors jobs grants the
+same permissions because a GitHub App grants its complete permission set on installation.
+
+Prefer organization scope when it fits your setup: it uses the narrower
+`Organization → Self-hosted runners` grant ([verified](docs/spikes/d18-org-jit-verification.md)).
+You can revoke the App in GitHub settings at any time and run `runner-manager auth logout`
+to purge the local credential. The project creates no private key and declares no webhook.
+
+To review this information from the terminal before signing in, run:
+
+```sh
+runner-manager auth status --permissions
+```
+
 ## Supported platforms
 
 | OS | Architectures |
@@ -220,4 +287,4 @@ registry on your behalf.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

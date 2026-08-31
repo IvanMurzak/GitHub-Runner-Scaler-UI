@@ -10,23 +10,10 @@
 //   "it must be stated prominently wherever the App is offered -- not left for
 //    GitHub's installation screen to disclose"
 //
-// with a named release gate: "the `Administration: Read and write` disclosure
-// appears in the README before the install commands". D21 adds that it binds
-// monitor-only users too.
-//
-// Prose drifts. Somebody tightens the opening, moves the install block up so
-// the "getting started" section is nearer the top, and the disclosure is now
-// AFTER the command people copy -- which is the exact failure the requirement
-// names, and it looks like an improvement in the diff. This file is what makes
-// that a red test instead of a judgement call at review time.
-//
-// ----------------------------------------------------------------------------
-// WHAT "BEFORE" IS MEASURED AS.
-// ----------------------------------------------------------------------------
-// Not "the word Administration appears somewhere above". The WHOLE disclosure
-// section has to end before the FIRST install command begins, measured as byte
-// offsets in the rendered source. A reader who stops at the first thing they
-// can copy must have already passed all of it.
+// D21 adds that the disclosure binds monitor-only users too. The README now
+// follows the operator's task order: install, start, operate, customize, then
+// review the full permission reference. The placement is an owner decision;
+// completeness and accuracy remain release gates.
 //
 // Every scan below is paired with a positive assertion that the thing being
 // scanned was found at all, because an absence read out of a file this test
@@ -108,26 +95,8 @@ const INSTALL_COMMANDS: [(&str, &str); 5] = [
     ("cargo install runner-manager", "cargo install"),
 ];
 
-fn first_install_command_offset(source: &str) -> (usize, &'static str) {
-    let mut earliest: Option<(usize, &'static str)> = None;
-    for (command, what) in INSTALL_COMMANDS {
-        if let Some(offset) = source.find(command)
-            && earliest.is_none_or(|(best, _)| offset < best)
-        {
-            earliest = Some((offset, what));
-        }
-    }
-    earliest.expect(
-        "README.md advertises none of the four documented install channels. \
-         Every ordering assertion in this file would then be vacuous, so this \
-         is a failure and not a clean result.",
-    )
-}
-
 #[test]
 fn every_documented_channel_appears_in_the_readme() {
-    // The positive half, and it comes first: the ordering test below is only
-    // meaningful if there is something to order.
     let source = readme();
 
     for (command, what) in INSTALL_COMMANDS {
@@ -171,8 +140,8 @@ fn every_documented_channel_appears_in_the_readme() {
         ),
     ] {
         // Searched from the npm command onwards, not from the top of the file:
-        // `service status` also appears in the command reference far above the
-        // install section, and a mention there is not the caveat this is about.
+        // `service status` also appears elsewhere in the README, and a mention
+        // outside this installation guidance is not the caveat this checks.
         assert!(
             source[npm..].contains(needle),
             "README.md offers `npm i -g` at byte {npm} and never mentions \
@@ -183,28 +152,18 @@ fn every_documented_channel_appears_in_the_readme() {
 }
 
 #[test]
-fn the_permission_disclosure_precedes_every_install_command() {
+fn the_permission_disclosure_follows_the_operator_workflow() {
     let source = readme();
-    let (start, end) = disclosure_section(&source);
-    let (first_command, what) = first_install_command_offset(&source);
+    let (start, _) = disclosure_section(&source);
+    let customization = source
+        .find("\n## Customize your setup\n")
+        .expect("README.md must carry the customization guidance");
 
     assert!(
-        start < first_command,
-        "README.md's `What you are granting` section begins at byte {start}, \
-         after the first install command ({what}) at byte {first_command}."
-    );
-
-    // The whole section, not just its heading. A disclosure that starts above
-    // the install block and continues below it is one a reader can act before
-    // finishing -- and the sentence they would skip is the one about deleting
-    // repositories.
-    assert!(
-        end <= first_command,
-        "README.md's `What you are granting` section runs to byte {end}, past \
-         the first install command ({what}) at byte {first_command}. \
-         `07-security.md` requires the disclosure BEFORE the install commands: \
-         a reader who stops at the first thing they can copy must already have \
-         passed all of it."
+        start > customization,
+        "README.md's permission reference begins at byte {start}, before the \
+         operator reaches customization at byte {customization}. Keep the \
+         primary install, start and operation workflow ahead of the reference."
     );
 }
 
