@@ -1,0 +1,22 @@
+crates/app/src/tui/shell.rs
+  s_d7514f3a56b1f9::t_55392ed8e88084 3300-3327,3347,3350,3407-3408,3455-3456
+crates/app/src/tui/settings.rs
+  s_d7514f3a56b1f9::t_e85155da227f58 2766
+  s_d7514f3a56b1f9::t_086f810875836e 1279-1284,1286,1650
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1f4a9bc6daa4e0c050d2065f5d43772d8fc4a195",
+  "prompts": {},
+  "sessions": {
+    "s_d7514f3a56b1f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f31fe2ea-97a0-4e0e-8329-c066371f1833",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
