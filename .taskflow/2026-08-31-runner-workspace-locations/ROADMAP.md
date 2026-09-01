@@ -199,6 +199,17 @@ directory untouched.
 - Both cross-platform escapes share one cause: the pipeline local gate runs
   only on the Windows development host, so a Linux or macOS difference
   cannot be caught before CI.
+- The `b2` repair pass fixed both failures on the branch: `e36f1be` keeps the
+  runner-root module off non-Windows builds and stops asserting a
+  host-dependent outcome, verified by cross-compiling
+  `cargo clippy -p runner-manager-platform --lib --target
+  x86_64-unknown-linux-gnu -- -D warnings`, and `686872f` unified one
+  fail-closed fallback. `land` then halted without pushing either commit and
+  waited on the previous head’s stale checks, so execution pushed the branch
+  itself and left the merge for gate 2.
+- `land` also runs `gh pr ready` when it finds a draft PR, so a draft is not a
+  durable hold while a run is driving `land`. The hold now rests on no run
+  driving `land` for `b2` until the owner records gate 2 GO.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
