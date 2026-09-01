@@ -499,17 +499,17 @@ fn arguments_for(line: &str, path_value: &str) -> Vec<String> {
         .map(|token| token.replace(['[', ']'], ""))
         .filter(|token| !token.is_empty())
         .map(|token| {
-            let chosen = token.split('|').next().unwrap_or_default().to_string();
-            match chosen.as_str() {
-                "OWNER/REPO" => "owner/repo".to_string(),
-                "ORG" => "acme".to_string(),
-                "HOST" => "home".to_string(),
-                "LABEL" => "gpu".to_string(),
-                "BOOL" => "true".to_string(),
-                "N" => "1".to_string(),
-                "PATH" | "DIR" => path_value.to_string(),
-                _ => chosen,
+            match token.split('|').next().unwrap_or(&token) {
+                "OWNER/REPO" => "owner/repo",
+                "ORG" => "acme",
+                "HOST" => "home",
+                "LABEL" => "gpu",
+                "BOOL" => "true",
+                "N" => "1",
+                "PATH" | "DIR" => path_value,
+                literal => literal,
             }
+            .to_string()
         })
         .collect()
 }

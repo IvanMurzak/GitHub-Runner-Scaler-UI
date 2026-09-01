@@ -483,8 +483,8 @@ fn the_install_instructions_state_the_properties_the_scripts_actually_have() {
 // customization section rather than anywhere in the file, so a sentence that
 // happens to appear in the install guidance cannot satisfy one of them.
 
-/// Byte range of `## Customize your setup`, from its heading to the next `## `.
-fn customization_section(source: &str) -> (usize, usize) {
+/// `## Customize your setup`, from its heading to the next `## `.
+fn customization_section(source: &str) -> &str {
     const HEADING: &str = "\n## Customize your setup\n";
     let start = source.find(HEADING).unwrap_or_else(|| {
         panic!(
@@ -499,7 +499,7 @@ fn customization_section(source: &str) -> (usize, usize) {
         .find("\n## ")
         .map(|offset| after + offset)
         .unwrap_or(source.len());
-    (start, end)
+    &source[start..end]
 }
 
 /// A section with runs of whitespace collapsed, so that an assertion about a
@@ -511,8 +511,7 @@ fn flattened(section: &str) -> String {
 #[test]
 fn the_customization_section_states_the_platform_runner_root_defaults() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let flat = flattened(&source[start..end]);
+    let flat = flattened(customization_section(&source));
 
     // `02-target-architecture.md`, "Platform defaults": the Windows root is a
     // short path off the SYSTEM DRIVE, and `C:` is an example of that drive
@@ -561,8 +560,7 @@ fn the_customization_section_states_the_platform_runner_root_defaults() {
 #[test]
 fn the_customization_section_carries_every_complete_workspace_command() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let flat = flattened(&source[start..end]);
+    let flat = flattened(customization_section(&source));
 
     // ------------------------------------------------------------------------
     // COMPLETE COMMANDS WITH PLACEHOLDERS, NOT PROSE ABOUT A FLAG.
@@ -611,8 +609,7 @@ fn the_customization_section_carries_every_complete_workspace_command() {
 #[test]
 fn the_checkout_tip_stands_next_to_persistence_and_does_not_claim_to_be_it() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let section = &source[start..end];
+    let section = customization_section(&source);
     let flat = flattened(section);
 
     // Journey 5 puts the two together on purpose: the repository command is
@@ -667,8 +664,7 @@ fn the_checkout_tip_stands_next_to_persistence_and_does_not_claim_to_be_it() {
 #[test]
 fn the_persistent_guidance_states_the_trust_boundary_it_gives_up() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let flat = flattened(&source[start..end]).to_lowercase();
+    let flat = flattened(customization_section(&source)).to_lowercase();
 
     // `04-security-recovery.md` § Operator-visible warnings, clause by clause.
     // The CLI prints these as `PERSISTENT_TRUST_WARNING` when the change is
@@ -721,8 +717,7 @@ fn the_persistent_guidance_states_the_trust_boundary_it_gives_up() {
 #[test]
 fn the_customization_section_promises_no_directory_is_deleted_on_a_change() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let flat = flattened(&source[start..end]).to_lowercase();
+    let flat = flattened(customization_section(&source)).to_lowercase();
 
     // `02-target-architecture.md`: "old directories are reported but never
     // copied or removed". It is asserted TWICE, once per root, because the two
@@ -751,8 +746,7 @@ fn the_customization_section_promises_no_directory_is_deleted_on_a_change() {
 #[test]
 fn data_dir_is_no_longer_offered_as_the_runner_placement_control() {
     let source = readme();
-    let (start, end) = customization_section(&source);
-    let section = &source[start..end];
+    let section = customization_section(&source);
 
     // ------------------------------------------------------------------------
     // THIS IS A CORRECTION, NOT A PREFERENCE, WHICH IS WHY IT IS PINNED.
