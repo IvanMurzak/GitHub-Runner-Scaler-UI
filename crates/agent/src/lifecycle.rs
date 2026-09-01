@@ -8,12 +8,14 @@
 //! process is signalled.  Recovery uses the same code as ordinary supervision;
 //! startup merely supplies the first observation.
 
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::Write;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,14 +26,19 @@ use runner_manager_domain::attempt::{
     RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize, recovery_decision,
 };
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
+use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_domain::policy::ScalePolicy;
-use runner_manager_domain::store::Store;
+use runner_manager_domain::store::{Store, StoreError};
+use runner_manager_domain::workspace::{AttemptWorkspace, WorkspacePolicy};
 use runner_manager_github::jit::{
-    EncodedJitConfig, JitError, JitGateway, JitRegistration, JitRunnerRequest,
+    DEFAULT_WORK_FOLDER, EncodedJitConfig, JitError, JitGateway, JitRegistration, JitRunnerRequest,
 };
 use runner_manager_github::rest::{CancelToken, InventoryGateway};
 use runner_manager_platform::process::{
     Adoption, ChildProcess, ProcessIdentity, RestrictiveHandoff, SpawnSpec, Termination,
+};
+use runner_manager_platform::runner_root::{
+    self, RootOwner, RootPreflight, RunnerRootError, default_runner_root,
 };
 use secrecy::SecretString;
 
@@ -373,7 +380,10 @@ impl RuntimePackages for CachedRuntimePackages {
         copy_package_tree(installed.root(), attempt.runtime_path())
             .map_err(|_| FailureReason::ProcessStartFailed)?;
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
-            let _ = fs::remove_dir_all(attempt.runtime_path());
+            // Undoing the copy must not undo the *job* workspace: a persistent
+            // slot's `_work` is retained across attempts, and this rollback
+            // runs before the attempt that would have owned it ever started.
+            let _ = remove_materialized_package(attempt);
             return Err(package_failure(error));
         }
         Ok(installed.version().clone())
@@ -447,6 +457,189 @@ fn workspace_name(id: AttemptId) -> String {
         .collect()
 }
 
+/// Where one attempt's files go, and which cleanup algorithm they are owed.
+///
+/// The pair travels together because journalling them apart is exactly the bug
+/// `AttemptWorkspace` exists to prevent: a `runtime_path` under a persistent
+/// root recorded as ephemeral would be removed whole, taking the retained job
+/// workspace with it.
+#[derive(Debug, Clone)]
+struct Placement {
+    runtime: PathBuf,
+    workspace: AttemptWorkspace,
+}
+
+/// A runner-root refusal, rendered for the operator who has to fix it.
+///
+/// `RunnerRootError`'s `Display` already names the path, the relation and the
+/// remediation command, and none of its variants can carry a credential — they
+/// are paths, and `03-migration-rollout.md` requires the remediation command to
+/// reach the operator verbatim.
+fn root_failure(error: RunnerRootError) -> LifecycleError {
+    LifecycleError::Failed(FailureReason::Other(error.to_string()))
+}
+
+/// The lowest positive slot inside `ceiling` that no uncleaned attempt holds.
+///
+/// `leases` is the journal's answer to "which slots are leased"
+/// (`Store::slot_leases_for_policy`), which deliberately includes a terminal
+/// attempt whose cleanup has not finished: that attempt still owns its
+/// directory, so its slot is not free even though it no longer counts against
+/// host capacity. `None` means the ceiling is reached, which is a refusal and
+/// not a reason to allocate `s(ceiling + 1)`.
+fn lowest_free_slot(leases: &[RunnerAttempt], ceiling: NonZeroU16) -> Option<NonZeroU16> {
+    let held: BTreeSet<u16> = leases
+        .iter()
+        .filter_map(|attempt| attempt.workspace().slot_number())
+        .collect();
+    (1..=ceiling.get())
+        .find(|slot| !held.contains(slot))
+        .and_then(NonZeroU16::new)
+}
+
+/// Create `<root>/sN`, or prove that what is already there is a real directory.
+///
+/// A symlink, junction or reparse point standing where the slot should be is
+/// refused rather than followed: it is the one thing that could put an attempt's
+/// files outside the root the operator configured, and
+/// `04-security-recovery.md` requires that case to fail closed rather than to
+/// be repaired here.
+fn create_or_validate_slot(slot: &Path) -> Result<(), LifecycleError> {
+    match fs::symlink_metadata(slot) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(slot_refusal(
+            slot,
+            "is a symbolic link, junction or other reparse point, which could place runner \
+             files outside the configured root",
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(slot_refusal(slot, "is not a directory")),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(slot)
+            .map_err(|source| slot_refusal(slot, format!("could not be created: {source}"))),
+        Err(source) => Err(slot_refusal(
+            slot,
+            format!("could not be inspected: {source}"),
+        )),
+    }
+}
+
+/// Accept a slot for reuse only when it is empty or holds one real `_work`.
+///
+/// `02-target-architecture.md`: "Before materialization, a reusable slot must
+/// contain only a valid real `_work` directory or be empty." Everything else —
+/// a leftover `bin/`, a link-shaped `_work`, a stray file — is refused here
+/// rather than cleaned, because deciding whether those bytes are safe is
+/// cleanup's and recovery's job (`c3`), and quietly reusing them would hand one
+/// repository's retained state to the next attempt without anybody choosing to.
+///
+/// The inspection is one level deep and uses `symlink_metadata`, so nothing is
+/// followed while it is being judged.
+fn accept_reusable_slot(slot: &Path) -> Result<(), LifecycleError> {
+    let unreadable =
+        |source: std::io::Error| slot_refusal(slot, format!("could not be read: {source}"));
+    let entries = fs::read_dir(slot).map_err(unreadable)?;
+    let mut refused: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unreadable)?;
+        let name = entry.file_name();
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+            slot_refusal(
+                slot,
+                format!("entry {name:?} could not be inspected: {source}"),
+            )
+        })?;
+        // `symlink_metadata` reports a link as a link, so `is_dir` here is
+        // already "a real directory" and the link test is the message, not the
+        // rule.
+        if is_work_folder(&name) && metadata.is_dir() {
+            continue;
+        }
+        refused.push(name.to_string_lossy().into_owned());
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    refused.sort();
+    Err(slot_refusal(
+        slot,
+        format!(
+            "holds {} that this attempt may not reuse: [{}]. A reusable slot is empty or holds \
+             one real `{DEFAULT_WORK_FOLDER}` directory and nothing else; remove or move the \
+             entries listed, or let cleanup and recovery resolve them",
+            if refused.len() == 1 {
+                "an entry"
+            } else {
+                "entries"
+            },
+            refused.join(", ")
+        ),
+    ))
+}
+
+fn slot_refusal(slot: &Path, detail: impl fmt::Display) -> LifecycleError {
+    LifecycleError::Failed(FailureReason::Other(format!(
+        "the persistent slot {} {detail}",
+        slot.display()
+    )))
+}
+
+/// Whether a directory entry names the retained job workspace.
+///
+/// The comparison folds case on Windows because the filesystem does: there
+/// `_Work` and `_work` are one directory, so a case-sensitive test would let
+/// [`remove_slot_entries_except_work`] delete the very directory it exists to
+/// keep, let [`accept_reusable_slot`] refuse a slot that holds nothing but a
+/// valid job workspace, and let a package's top-level `_Work` merge itself into
+/// the previous attempt's `_work`. Elsewhere the two names really are two
+/// directories and only the exact one is the job workspace.
+fn is_work_folder(name: &OsStr) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(DEFAULT_WORK_FOLDER)
+    } else {
+        name == OsStr::new(DEFAULT_WORK_FOLDER)
+    }
+}
+
+/// Undo one package materialization, dispatching on the journalled workspace.
+///
+/// The ephemeral half is what this always did: the directory is the attempt's
+/// alone, so it goes whole. The persistent half removes the copy and nothing
+/// else, because the slot's `_work` predates this attempt and outlives it
+/// (`02-target-architecture.md`, "Persistent repository").
+fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
+    match attempt.workspace() {
+        AttemptWorkspace::Ephemeral => fs::remove_dir_all(attempt.runtime_path()),
+        AttemptWorkspace::PersistentSlot { .. } => {
+            remove_slot_entries_except_work(attempt.runtime_path())
+        }
+    }
+}
+
+/// Every direct child of a slot except the retained job workspace.
+///
+/// A link-shaped entry is unlinked rather than followed, so removal cannot
+/// reach outside the slot even though `accept_reusable_slot` already refused to
+/// allocate into a slot holding one.
+fn remove_slot_entries_except_work(slot: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(slot)? {
+        let entry = entry?;
+        if is_work_folder(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = fs::symlink_metadata(&path)?.file_type();
+        if file_type.is_symlink() {
+            // A file symlink unlinks with `remove_file`; a directory symlink or
+            // a Windows junction needs `remove_dir`. Neither follows the link.
+            fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
+        } else if file_type.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
     match outcome {
         AttemptOutcome::Failed {
@@ -459,13 +652,40 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
     }
 }
 
+/// Lay the verified runner package out *around* whatever the slot retains.
+///
+/// `02-target-architecture.md`: "The verified runner package is copied into the
+/// slot for the attempt", beside a `_work` that survives every attempt. Two
+/// properties make that safe, and both are structural rather than documented:
+///
+/// * the walk is of the **source** tree, so a retained `_work` in the
+///   destination is never opened, never descended into, and cannot be followed
+///   wherever it might point;
+/// * a top-level source entry named `_work` is refused rather than copied, so a
+///   package that ever grew one could not merge itself into, or replace, the
+///   job workspace of the attempt before it. The refusal is top-level only,
+///   because the retained directory is a direct child of the slot; a `_work`
+///   nested inside the package's own tree is an ordinary name.
 fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    copy_package_entries(source, destination, true)
+}
+
+fn copy_package_entries(source: &Path, destination: &Path, top_level: bool) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        if top_level && is_work_folder(&entry.file_name()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the runner package holds a top-level `{DEFAULT_WORK_FOLDER}`; copying \
+                     it would overwrite the job workspace a persistent slot retains"
+                ),
+            ));
+        }
         let target = destination.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_package_tree(&entry.path(), &target)?;
+            copy_package_entries(&entry.path(), &target, false)?;
         } else {
             fs::copy(entry.path(), target)?;
         }
@@ -1593,43 +1813,61 @@ impl LifecycleLauncher {
         }
     }
 
-    async fn launch_attempt(
+    /// Where one attempt's files go, decided while the host allocation lock is
+    /// held and before anything external happens.
+    ///
+    /// The branch is on the *repository's configured* workspace policy, so an
+    /// organization policy and an ephemeral repository never reach slot
+    /// selection at all: a persistent policy is unrepresentable for an
+    /// organization target (D7, refused by `WorkspacePolicy::permitted_for` in
+    /// both the constructor and the loader), and an ephemeral repository takes
+    /// the disposable arm that existed before slots did.
+    fn allocate_workspace(
         &self,
         policy: &ScalePolicy,
-        allocation_guard: &AllocationGuard,
-    ) -> Result<RunnerAttempt, LifecycleError> {
-        if !*self
-            .recovery_complete
-            .lock()
-            .map_err(|_| LifecycleError::Journal)?
-        {
-            return Err(LifecycleError::RecoveryIncomplete);
+        id: AttemptId,
+    ) -> Result<Placement, LifecycleError> {
+        match policy.workspace_policy() {
+            // Precedence (`02-target-architecture.md`): the repository's
+            // persistent root is selected *before* the host root, which is why
+            // this arm is first and why it never makes resolving the host
+            // default a precondition of its own success.
+            WorkspacePolicy::Persistent { root } => self.allocate_persistent_slot(policy, root),
+            WorkspacePolicy::Ephemeral => self.allocate_disposable(id),
         }
+    }
+
+    /// `Host.runner_root_override`, read from the journal.
+    ///
+    /// Separated from [`Self::effective_host_root`] so that the two failures it
+    /// folds together stay apart: an unreadable or missing host row is a journal
+    /// problem and is always fatal, while an unresolvable *platform default* is
+    /// only fatal to a placement that actually needs the host root.
+    fn configured_host_root(&self) -> Result<Option<LocalAbsolutePath>, LifecycleError> {
         let host = self
             .ports
             .store
             .host(self.host_id)
             .map_err(|_| LifecycleError::Journal)?
             .ok_or_else(|| LifecycleError::Failed(FailureReason::Other("host not found".into())))?;
+        Ok(host.runner_root_override.clone())
+    }
 
-        let effective_root = if let Some(override_root) = &host.runner_root_override {
-            override_root.clone()
-        } else {
-            runner_manager_platform::runner_root::default_runner_root(&self.app_paths)
-                .map_err(|e| LifecycleError::Failed(FailureReason::Other(e.to_string())))?
-        };
+    /// `Host.runner_root_override`, or the platform default standing in for it.
+    fn effective_host_root(&self) -> Result<LocalAbsolutePath, LifecycleError> {
+        match self.configured_host_root()? {
+            Some(configured) => Ok(configured),
+            None => default_runner_root(&self.app_paths).map_err(root_failure),
+        }
+    }
 
-        runner_manager_platform::runner_root::RootPreflight::new(&self.app_paths)
-            .check(
-                &runner_manager_platform::runner_root::RootOwner::Host,
-                &effective_root,
-            )
-            .map_err(|e| LifecycleError::Failed(FailureReason::Other(e.to_string())))?;
-
-        let labels = policy
-            .routing_labels()
-            .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
-        let id = AttemptId::new_random();
+    /// D3's disposable placement: a unique child of the effective host root,
+    /// removed whole on cleanup. `c1`'s behaviour, moved behind the branch.
+    fn allocate_disposable(&self, id: AttemptId) -> Result<Placement, LifecycleError> {
+        let effective_root = self.effective_host_root()?;
+        RootPreflight::new(&self.app_paths)
+            .check(&RootOwner::Host, &effective_root)
+            .map_err(root_failure)?;
         let runtime = effective_root.as_path().join({
             #[cfg(test)]
             {
@@ -1648,9 +1886,153 @@ impl LifecycleLauncher {
         });
         fs::create_dir_all(&runtime)
             .map_err(|_| LifecycleError::Failed(FailureReason::ProcessStartFailed))?;
-        let mut attempt = RunnerAttempt::allocate(id, policy.id, runtime, self.ports.clock.now());
-        // This is deliberately the first effect after directory allocation.
-        self.record(&attempt)?;
+        Ok(Placement {
+            runtime,
+            workspace: AttemptWorkspace::Ephemeral,
+        })
+    }
+
+    /// D4/D5's persistent placement: the lowest free `sN` under the repository's
+    /// configured root.
+    ///
+    /// Steps 1 to 6 of `02-target-architecture.md`, "Slot allocation", in order;
+    /// step 7 is the journal write [`Self::record_allocation`] owns. All of them
+    /// run under the host allocation lock, because [`Self::launch_attempt`] is
+    /// reachable only through a `LaunchRequest` and that carries the guard.
+    ///
+    /// **The filesystem is never consulted to decide which slots are taken**
+    /// (invariant 6). The leases come from the journal; the directory is
+    /// inspected only to decide whether *this* slot is safe to reuse.
+    fn allocate_persistent_slot(
+        &self,
+        policy: &ScalePolicy,
+        root: &LocalAbsolutePath,
+    ) -> Result<Placement, LifecycleError> {
+        // 1-4. The lowest positive slot no uncleaned attempt holds, refused
+        // above the policy ceiling.
+        let ceiling = policy.max_capacity().ok_or_else(|| {
+            LifecycleError::Failed(FailureReason::Other(
+                "a persistent workspace needs the policy's max_capacity to bound its slots"
+                    .to_string(),
+            ))
+        })?;
+        let leases = self
+            .ports
+            .store
+            .slot_leases_for_policy(policy.id)
+            .map_err(|_| LifecycleError::Journal)?;
+        let slot = lowest_free_slot(&leases, ceiling).ok_or_else(|| {
+            LifecycleError::Failed(FailureReason::Other(format!(
+                "every persistent slot s1 to s{ceiling} for {} is leased by an attempt that has \
+                 not been cleaned, so no slot is free; raise the repository's max capacity, or \
+                 finish cleaning a concluded attempt",
+                policy.target
+            )))
+        })?;
+        let workspace = AttemptWorkspace::persistent_slot(slot);
+        let name = workspace
+            .slot_directory_name()
+            .expect("a persistent allocation names its slot directory");
+
+        // The operational preflight, for the reasons the host root gets one: a
+        // root that is remote, unwritable, or overlapping application data has
+        // to fail before a directory is created rather than after. The host
+        // root is registered only as something *not* to overlap; a host default
+        // that cannot be resolved is a host-root problem and does not block a
+        // repository that configured a root of its own.
+        //
+        // Only *that* failure is tolerated. An unreadable host row is a journal
+        // failure and propagates, because silently continuing would drop the
+        // overlap check entirely and accept a repository root that sits inside
+        // the host root — the pair `RootPreflight` exists to refuse.
+        let host_root = self
+            .configured_host_root()?
+            .or_else(|| default_runner_root(&self.app_paths).ok());
+        let mut preflight = RootPreflight::new(&self.app_paths);
+        if let Some(host_root) = host_root {
+            preflight = preflight.against(RootOwner::Host, host_root);
+        }
+        let checked = preflight
+            .check(&RootOwner::Repository(policy.target.to_string()), root)
+            .map_err(root_failure)?;
+        if let Some(leaf) = checked.leaf_to_create() {
+            fs::create_dir(leaf).map_err(|source| {
+                LifecycleError::Failed(FailureReason::Other(format!(
+                    "the persistent workspace root {} could not be created: {source}",
+                    leaf.display()
+                )))
+            })?;
+        }
+
+        // 5-6. `<root>/sN`, contained lexically by construction, then created or
+        // validated, then contained canonically now that it resolves, and only
+        // then accepted for reuse.
+        let slot_path = runner_root::derive_child(root, &name).map_err(root_failure)?;
+        create_or_validate_slot(slot_path.as_path())?;
+        runner_root::verify_containment(root, &slot_path).map_err(root_failure)?;
+        accept_reusable_slot(slot_path.as_path())?;
+        Ok(Placement {
+            runtime: slot_path.as_path().to_path_buf(),
+            workspace,
+        })
+    }
+
+    /// The first journal write of an attempt, where a duplicate slot lease is
+    /// still possible and has to be reported as itself.
+    ///
+    /// [`Self::record`] flattens every store failure into
+    /// [`LifecycleError::Journal`], which is right for a state transition and
+    /// wrong here: the partial unique index
+    /// `one_uncleaned_persistent_attempt_per_slot` is the final race fence
+    /// (`04-security-recovery.md`, "two attempts use one slot concurrently"),
+    /// and an operator who reaches it needs to read that rather than "attempt
+    /// journal operation failed". Nothing was written, so the caller returns
+    /// without concluding an attempt that is not in the journal.
+    fn record_allocation(&self, attempt: &RunnerAttempt) -> Result<(), LifecycleError> {
+        match self.ports.store.record_attempt(attempt) {
+            Ok(()) => {
+                self.ports.events.emit(AttemptEvent::State {
+                    attempt: attempt.id,
+                    state: attempt.state(),
+                });
+                Ok(())
+            }
+            Err(error @ StoreError::SlotAlreadyLeased { .. }) => Err(LifecycleError::Failed(
+                FailureReason::Other(error.to_string()),
+            )),
+            Err(_) => Err(LifecycleError::Journal),
+        }
+    }
+
+    async fn launch_attempt(
+        &self,
+        policy: &ScalePolicy,
+        allocation_guard: &AllocationGuard,
+    ) -> Result<RunnerAttempt, LifecycleError> {
+        if !*self
+            .recovery_complete
+            .lock()
+            .map_err(|_| LifecycleError::Journal)?
+        {
+            return Err(LifecycleError::RecoveryIncomplete);
+        }
+        let labels = policy
+            .routing_labels()
+            .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
+        let id = AttemptId::new_random();
+        let placement = self.allocate_workspace(policy, id)?;
+        let mut attempt = RunnerAttempt::allocate_in(
+            id,
+            policy.id,
+            placement.runtime,
+            placement.workspace,
+            self.ports.clock.now(),
+        );
+        // This is deliberately the first effect after directory allocation, and
+        // for a persistent attempt it is also what makes the slot lease durable
+        // before any package or GitHub effect
+        // (`02-target-architecture.md`, "Slot allocation", step 7).
+        self.record_allocation(&attempt)?;
 
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
@@ -1872,11 +2254,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::reconcile::{AllocationLock, InProcessAllocationLock};
-    use runner_manager_domain::model::Elapsed;
+    use runner_manager_domain::model::{Elapsed, TargetScope};
     use runner_manager_domain::store::SqliteStore;
     use runner_manager_github::jit::JitRunner;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    /// A slot number, for the tests that name one.
+    fn nz(slot: u16) -> NonZeroU16 {
+        NonZeroU16::new(slot).expect("a positive slot")
+    }
 
     const JIT: &str = "eyJzZWNyZXQiOiJnaHBfRE9fTk9UX0xFQUsifQ==";
 
@@ -1893,6 +2280,30 @@ mod tests {
         /// Set to make `deregister` answer `false`, standing for a GitHub that
         /// could not be reached at the moment the attempt concluded.
         deregistration_fails: AtomicBool,
+        /// The journal to read *during* a registration, for the ordering
+        /// assertion `02-target-architecture.md` makes: the slot lease is
+        /// written "before package or GitHub effects". Reading it afterwards
+        /// would pass even if the write happened second.
+        journal: Mutex<Option<Arc<SqliteStore>>>,
+        /// One entry per registration, in order.
+        registration_facts: Mutex<Vec<RegistrationFact>>,
+    }
+
+    /// What one JIT registration saw of the world at the moment it was issued.
+    ///
+    /// `runner_name` is what ties the other two fields to *one* attempt: with
+    /// two allocators racing, "some slot was journalled" is a much weaker claim
+    /// than "the slot this very request belongs to was journalled", and only the
+    /// name distinguishes them.
+    #[derive(Debug, Clone)]
+    struct RegistrationFact {
+        /// The persistent slots the journal already held.
+        leased_slots: Vec<u16>,
+        /// The `work_folder` the request carried.
+        work_folder: String,
+        /// The runner name the request carried, i.e. [`runner_name`] of the
+        /// registering attempt.
+        runner_name: String,
     }
 
     impl FakeGithubLifecycle {
@@ -1902,6 +2313,14 @@ mod tests {
                 .expect("unpoisoned")
                 .push_back(terminal);
             self
+        }
+
+        fn watch_journal(&self, store: Arc<SqliteStore>) {
+            *self.journal.lock().unwrap() = Some(store);
+        }
+
+        fn registration_facts(&self) -> Vec<RegistrationFact> {
+            self.registration_facts.lock().unwrap().clone()
         }
 
         fn observe(&self, observation: GithubRunnerObservation) {
@@ -1927,6 +2346,22 @@ mod tests {
             _cancel: &CancelToken,
         ) -> Result<JitRegistration, JitRequestFailure> {
             self.registrations.fetch_add(1, Ordering::SeqCst);
+            if let Some(store) = self.journal.lock().unwrap().as_ref() {
+                let slots = store
+                    .attempts()
+                    .expect("the journal is readable")
+                    .iter()
+                    .filter_map(|attempt| attempt.workspace().slot_number())
+                    .collect();
+                self.registration_facts
+                    .lock()
+                    .unwrap()
+                    .push(RegistrationFact {
+                        leased_slots: slots,
+                        work_folder: request.work_folder().to_string(),
+                        runner_name: request.name().to_string(),
+                    });
+            }
             if let Some(terminal) = self.registration_failures.lock().unwrap().pop_front() {
                 return Err(JitRequestFailure {
                     terminal,
@@ -2218,6 +2653,8 @@ mod tests {
         host: runner_manager_domain::model::Host,
         policy: ScalePolicy,
         allocation_lock: InProcessAllocationLock,
+        /// The repository persistent root, once one is configured.
+        workspace_root: Option<LocalAbsolutePath>,
     }
 
     impl Harness {
@@ -2278,7 +2715,82 @@ mod tests {
                 host,
                 policy,
                 allocation_lock: InProcessAllocationLock::new(),
+                workspace_root: None,
             }
+        }
+
+        /// Put disposable attempts under a host root of this harness's own.
+        ///
+        /// Without it the launcher resolves the *platform* default, which on
+        /// Windows is `%SystemDrive%\rman` — a real directory on the machine
+        /// running the suite. Every test added by `c2` places its files inside
+        /// its own temporary directory instead.
+        fn with_host_runner_root(mut self) -> Self {
+            let host_root = self.host_root();
+            fs::create_dir_all(&host_root).unwrap();
+            self.host.runner_root_override = Some(
+                LocalAbsolutePath::new(host_root.to_str().expect("a UTF-8 temporary path"))
+                    .expect("a local absolute host root"),
+            );
+            self.store.put_host(&self.host).unwrap();
+            self
+        }
+
+        /// Opt this harness's repository into a persistent workspace (D4).
+        fn with_persistent_workspace(mut self, capacity: u16) -> Self {
+            self = self.with_host_runner_root();
+            let root = self._root.path().join("persist");
+            let root = LocalAbsolutePath::new(root.to_str().expect("a UTF-8 temporary path"))
+                .expect("a local absolute workspace root");
+            self.policy = fixtures::policy()
+                .repository("octo/repo")
+                .autoscale("home", capacity)
+                .active()
+                .build();
+            self.policy
+                .set_workspace_policy(
+                    WorkspacePolicy::persistent(root.clone(), TargetScope::Repository)
+                        .expect("a repository may be persistent"),
+                )
+                .expect("a repository may be persistent");
+            self.workspace_root = Some(root);
+            self
+        }
+
+        fn workspace_root(&self) -> &LocalAbsolutePath {
+            self.workspace_root
+                .as_ref()
+                .expect("this harness configured a persistent workspace")
+        }
+
+        fn slot_path(&self, slot: u16) -> PathBuf {
+            self.workspace_root().as_path().join(format!("s{slot}"))
+        }
+
+        fn host_root(&self) -> PathBuf {
+            self._root.path().join("host-root")
+        }
+
+        fn attempt(&self, id: AttemptId) -> RunnerAttempt {
+            self.store
+                .attempt(id)
+                .unwrap()
+                .expect("the attempt is journalled")
+        }
+
+        /// Stand in for `c3`'s persistent cleanup, which this task does not own:
+        /// the lease is released by the journal and everything but `_work` goes.
+        fn cleanup_retaining_work(&self, id: AttemptId) {
+            let mut attempt = self.attempt(id);
+            attempt
+                .conclude(
+                    AttemptOutcome::failed(FailureReason::ProcessExitedUnexpectedly),
+                    self.clock.now(),
+                )
+                .unwrap();
+            attempt.clean(self.clock.now()).unwrap();
+            self.store.record_attempt(&attempt).unwrap();
+            remove_slot_entries_except_work(attempt.runtime_path()).unwrap();
         }
 
         async fn ready(&self) {
@@ -3694,5 +4206,466 @@ mod tests {
             .expect("ps can inspect the native child");
         assert!(output.status.success(), "native process inspection failed");
         String::from_utf8(output.stdout).expect("the command line is UTF-8")
+    }
+
+    // -- c2: persistent slot allocation -------------------------------------
+
+    #[tokio::test]
+    async fn a_persistent_repository_leases_s1_and_journals_it_before_any_github_effect() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.github.watch_journal(Arc::clone(&harness.store));
+        harness.ready().await;
+
+        let attempt = harness.launch().await;
+
+        assert_eq!(
+            attempt.workspace(),
+            AttemptWorkspace::persistent_slot(nz(1)),
+            "the lowest free slot is leased"
+        );
+        assert_eq!(attempt.runtime_path(), harness.slot_path(1));
+        assert!(attempt.holds_slot_lease());
+        // The exact runtime path is journalled, not re-derived later.
+        assert_eq!(
+            harness.attempt(attempt.id).runtime_path(),
+            harness.slot_path(1)
+        );
+
+        // Step 7 of "Slot allocation": the lease exists before GitHub is asked
+        // for anything, and the runner's work folder stays the relative `_work`
+        // the slot root is laid out around.
+        let facts = harness.github.registration_facts();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].leased_slots,
+            vec![1],
+            "the lease was journalled first"
+        );
+        assert_eq!(facts[0].work_folder, DEFAULT_WORK_FOLDER);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_but_uncleaned_attempt_keeps_its_slot_without_holding_capacity() {
+        let harness = Harness::new(
+            FakeGithubLifecycle::default().fail(true),
+            Arc::new(PersistentDemand),
+        )
+        .with_persistent_workspace(2);
+        harness.ready().await;
+
+        // A terminal JIT refusal concludes the attempt without cleaning it.
+        harness.launch_result().await.unwrap_err();
+        let first = harness.store.attempts().unwrap().remove(0);
+        assert_eq!(first.state(), AttemptState::Failed);
+        assert!(
+            !first.state().counts_against_capacity(),
+            "a concluded attempt is invisible to host capacity"
+        );
+        assert!(
+            first.holds_slot_lease(),
+            "and still owns its directory, so its slot is not free"
+        );
+
+        let second = harness.launch().await;
+        assert_eq!(second.workspace(), AttemptWorkspace::persistent_slot(nz(2)));
+        assert_eq!(second.runtime_path(), harness.slot_path(2));
+        assert_eq!(
+            harness
+                .store
+                .slot_leases_for_policy(harness.policy.id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sequential_allocations_at_capacity_one_reuse_s1_and_its_retained_work() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+
+        let first = harness.launch().await;
+        assert_eq!(first.runtime_path(), harness.slot_path(1));
+
+        // What a job leaves behind, at the path the runner writes it to.
+        let checkout = harness.slot_path(1).join(DEFAULT_WORK_FOLDER).join("repo");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("checkout.txt"), b"from the first job").unwrap();
+
+        harness.cleanup_retaining_work(first.id);
+
+        let second = harness.launch().await;
+        assert_ne!(second.id, first.id);
+        assert_eq!(
+            second.workspace(),
+            AttemptWorkspace::persistent_slot(nz(1)),
+            "a released slot is leased again rather than skipped"
+        );
+        assert_eq!(
+            second.runtime_path(),
+            first.runtime_path(),
+            "the same slot is the same exact path"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("checkout.txt")).unwrap(),
+            "from the first job",
+            "the retained job workspace survived the second allocation"
+        );
+        // The attempt's own runner material was recreated for this attempt.
+        assert!(harness.slot_path(1).join("runner-package").exists());
+    }
+
+    #[tokio::test]
+    async fn lowering_capacity_leaves_higher_slots_alone_and_raising_it_permits_them_again() {
+        let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.ready().await;
+
+        let first = harness.launch().await;
+        let second = harness.launch().await;
+        assert_eq!(second.runtime_path(), harness.slot_path(2));
+        let kept = harness
+            .slot_path(2)
+            .join(DEFAULT_WORK_FOLDER)
+            .join("kept.txt");
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(&kept, b"s2 was here").unwrap();
+        harness.cleanup_retaining_work(second.id);
+
+        // The operator lowers the ceiling while s1 is still leased.
+        harness.policy.set_max_capacity(nz(1)).unwrap();
+        let refusal = harness.launch_result().await.unwrap_err().to_string();
+        assert!(
+            refusal.contains("s1 to s1"),
+            "the refusal names the ceiling it reached: {refusal}"
+        );
+        assert!(
+            harness.slot_path(2).exists() && kept.exists(),
+            "lowering capacity deletes nothing; the higher slot is merely unusable"
+        );
+
+        // Raising it again makes the free higher slot available.
+        harness.policy.set_max_capacity(nz(2)).unwrap();
+        let third = harness.launch().await;
+        assert_eq!(third.workspace(), AttemptWorkspace::persistent_slot(nz(2)));
+        assert_eq!(third.runtime_path(), harness.slot_path(2));
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "s2 was here");
+        assert!(first.holds_slot_lease(), "s1 was never disturbed");
+    }
+
+    #[tokio::test]
+    async fn organization_and_ephemeral_policies_never_enter_slot_allocation() {
+        for policy in [
+            fixtures::policy()
+                .organization("octo")
+                .autoscale("home", 2)
+                .active()
+                .build(),
+            fixtures::policy()
+                .repository("octo/repo")
+                .autoscale("home", 2)
+                .active()
+                .build(),
+        ] {
+            let mut harness =
+                Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+                    .with_host_runner_root();
+            assert_eq!(policy.workspace_policy(), &WorkspacePolicy::Ephemeral);
+            harness.policy = policy;
+            harness.ready().await;
+
+            let attempt = harness.launch().await;
+            assert_eq!(attempt.workspace(), AttemptWorkspace::Ephemeral);
+            assert_eq!(attempt.workspace().slot_number(), None);
+            assert!(!attempt.holds_slot_lease());
+            assert_eq!(
+                attempt.runtime_path().parent().unwrap(),
+                harness.host_root(),
+                "a disposable attempt is a child of the host root, never of a slot"
+            );
+            assert!(
+                harness
+                    .store
+                    .slot_leases_for_policy(harness.policy.id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_allocations_never_share_a_slot() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.github.watch_journal(Arc::clone(&harness.store));
+        harness.ready().await;
+
+        // Both allocators race for the same host allocation lock, which is what
+        // orders slot *selection*; each one then journals its lease before it
+        // asks GitHub for anything.
+        let (first, second) = tokio::join!(harness.launch_result(), harness.launch_result());
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        let slots: BTreeSet<u16> = [&first, &second]
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .workspace()
+                    .slot_number()
+                    .expect("a persistent attempt leases a slot")
+            })
+            .collect();
+        assert_eq!(slots, BTreeSet::from([1, 2]), "one slot each, never shared");
+        assert_ne!(first.runtime_path(), second.runtime_path());
+        assert_eq!(
+            harness
+                .store
+                .slot_leases_for_policy(harness.policy.id)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Every registration saw *its own* lease already in the journal. Reading
+        // the whole journal and asking only that it be non-empty would pass on
+        // the other allocator's lease, which is precisely the ordering bug this
+        // test exists to exclude.
+        let facts = harness.github.registration_facts();
+        assert_eq!(facts.len(), 2);
+        for fact in facts {
+            let attempt = [&first, &second]
+                .into_iter()
+                .find(|attempt| runner_name(attempt.id) == fact.runner_name)
+                .expect("every registration belongs to one of the two attempts");
+            let slot = attempt
+                .workspace()
+                .slot_number()
+                .expect("a persistent attempt leases a slot");
+            assert!(
+                fact.leased_slots.contains(&slot),
+                "a JIT request never precedes its own lease: s{slot} not in {:?}",
+                fact.leased_slots
+            );
+            assert_eq!(fact.work_folder, DEFAULT_WORK_FOLDER);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_database_is_the_final_fence_against_two_attempts_in_one_slot() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.ready().await;
+        let first = harness.launch().await;
+
+        // What a second allocator that lost the race would write: the lock
+        // orders selection, and this index is what catches a writer the lock
+        // could not see.
+        let clash = RunnerAttempt::allocate_in(
+            AttemptId::new_random(),
+            harness.policy.id,
+            first.runtime_path(),
+            AttemptWorkspace::persistent_slot(nz(1)),
+            harness.clock.now(),
+        );
+        assert!(matches!(
+            harness.store.record_attempt(&clash).unwrap_err(),
+            StoreError::SlotAlreadyLeased { slot: 1, .. }
+        ));
+
+        // And the launcher reports it as itself rather than as a generic
+        // journal failure, so the operator reads what actually happened.
+        let error = harness.launcher.record_allocation(&clash).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("slot s1"), "{rendered}");
+        assert!(rendered.contains("nothing was written"), "{rendered}");
+        assert_eq!(
+            harness.store.attempts().unwrap().len(),
+            1,
+            "the losing allocator journalled nothing"
+        );
+    }
+
+    #[test]
+    fn slot_selection_fills_the_lowest_gap_and_stops_at_the_ceiling() {
+        let leased = |slots: &[u16]| -> Vec<RunnerAttempt> {
+            slots
+                .iter()
+                .map(|slot| {
+                    RunnerAttempt::allocate_in(
+                        AttemptId::new_random(),
+                        fixtures::POLICY_ID,
+                        format!("/srv/rman/acme/s{slot}"),
+                        AttemptWorkspace::persistent_slot(nz(*slot)),
+                        fixtures::created_at(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(lowest_free_slot(&[], nz(1)), Some(nz(1)));
+        assert_eq!(lowest_free_slot(&leased(&[1]), nz(4)), Some(nz(2)));
+        // The gap a released middle slot leaves is filled before the tail.
+        assert_eq!(lowest_free_slot(&leased(&[1, 3]), nz(4)), Some(nz(2)));
+        // The ceiling is a refusal, never a reason to allocate past it.
+        assert_eq!(lowest_free_slot(&leased(&[1]), nz(1)), None);
+        assert_eq!(lowest_free_slot(&leased(&[1, 2]), nz(2)), None);
+        // An ephemeral attempt holds no slot and cannot block one.
+        let ephemeral = vec![RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            fixtures::POLICY_ID,
+            "/srv/rman/host/abc",
+            fixtures::created_at(),
+        )];
+        assert_eq!(lowest_free_slot(&ephemeral, nz(1)), Some(nz(1)));
+    }
+
+    #[test]
+    fn a_slot_is_reusable_only_when_it_is_empty_or_holds_one_real_work_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        accept_reusable_slot(&slot).expect("an empty slot is reusable");
+
+        fs::create_dir(slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+        accept_reusable_slot(&slot).expect("a retained job workspace is reusable");
+
+        // Runner material a previous attempt left behind is refused rather than
+        // reused or removed: deciding those bytes are safe is cleanup's job.
+        fs::create_dir(slot.join("bin")).unwrap();
+        fs::write(slot.join(".github-runner-id"), b"73").unwrap();
+        let refusal = accept_reusable_slot(&slot).unwrap_err().to_string();
+        assert!(refusal.contains("bin"), "{refusal}");
+        assert!(refusal.contains(".github-runner-id"), "{refusal}");
+
+        // A `_work` that is not a real directory is not a job workspace.
+        let file_work = root.path().join("s2");
+        fs::create_dir(&file_work).unwrap();
+        fs::write(file_work.join(DEFAULT_WORK_FOLDER), b"not a directory").unwrap();
+        assert!(accept_reusable_slot(&file_work).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_shaped_work_directory_is_refused_rather_than_followed() {
+        // Windows needs a privilege to create either kind of link, so the
+        // link-shaped cases are asserted here; the rule itself is
+        // platform-independent because it is `symlink_metadata`'s answer.
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+        assert!(accept_reusable_slot(&slot).is_err());
+
+        let linked_slot = root.path().join("s2");
+        std::os::unix::fs::symlink(&elsewhere, &linked_slot).unwrap();
+        assert!(create_or_validate_slot(&linked_slot).is_err());
+    }
+
+    #[test]
+    fn a_slot_standing_where_a_file_is_refuses_rather_than_replacing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let occupied = root.path().join("s1");
+        fs::write(&occupied, b"an operator's file").unwrap();
+        let refusal = create_or_validate_slot(&occupied).unwrap_err().to_string();
+        assert!(refusal.contains("is not a directory"), "{refusal}");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "an operator's file");
+
+        let fresh = root.path().join("s2");
+        create_or_validate_slot(&fresh).expect("a missing slot is created");
+        assert!(fresh.is_dir());
+        create_or_validate_slot(&fresh).expect("an existing directory is accepted");
+    }
+
+    #[test]
+    fn the_retained_work_directory_is_matched_the_way_the_filesystem_matches_it() {
+        assert!(is_work_folder(OsStr::new(DEFAULT_WORK_FOLDER)));
+        assert!(!is_work_folder(OsStr::new("_work2")));
+        // A Windows filesystem is case-insensitive, so `_Work` *is* the retained
+        // job workspace there and must never be removed as a leftover; on a
+        // case-sensitive filesystem it is a different directory entirely.
+        assert_eq!(is_work_folder(OsStr::new("_Work")), cfg!(windows));
+    }
+
+    #[test]
+    fn package_materialization_never_overwrites_or_follows_a_retained_work_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        fs::create_dir_all(package.join("bin")).unwrap();
+        fs::write(package.join("bin").join("Runner.Listener"), b"binary").unwrap();
+        // A nested `_work` inside the package's own tree is an ordinary name.
+        fs::create_dir_all(package.join("externals").join(DEFAULT_WORK_FOLDER)).unwrap();
+
+        let slot = root.path().join("s1");
+        let retained = slot.join(DEFAULT_WORK_FOLDER).join("repo");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("checkout.txt"), b"from the first job").unwrap();
+
+        copy_package_tree(&package, &slot).expect("the package lays out around `_work`");
+        assert!(slot.join("bin").join("Runner.Listener").exists());
+        assert!(
+            slot.join("externals").join(DEFAULT_WORK_FOLDER).is_dir(),
+            "the guard is top-level only"
+        );
+        assert_eq!(
+            fs::read_to_string(retained.join("checkout.txt")).unwrap(),
+            "from the first job"
+        );
+
+        // A package that ever grew a top-level `_work` is refused, not merged.
+        fs::create_dir(package.join(DEFAULT_WORK_FOLDER)).unwrap();
+        let error = copy_package_tree(&package, &slot).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(retained.join("checkout.txt")).unwrap(),
+            "from the first job"
+        );
+    }
+
+    #[test]
+    fn rolling_back_a_materialization_keeps_a_slot_but_removes_a_disposable_directory() {
+        let root = tempfile::tempdir().unwrap();
+
+        let slot = root.path().join("s1");
+        let retained = slot.join(DEFAULT_WORK_FOLDER);
+        fs::create_dir_all(retained.join("repo")).unwrap();
+        fs::write(retained.join("repo").join("checkout.txt"), b"kept").unwrap();
+        fs::create_dir_all(slot.join("bin")).unwrap();
+        fs::write(slot.join(".github-runner-id"), b"73").unwrap();
+        let persistent = RunnerAttempt::allocate_in(
+            AttemptId::new_random(),
+            fixtures::POLICY_ID,
+            &slot,
+            AttemptWorkspace::persistent_slot(nz(1)),
+            fixtures::created_at(),
+        );
+
+        remove_materialized_package(&persistent).unwrap();
+        assert!(slot.is_dir(), "the slot itself is not removed");
+        assert!(!slot.join("bin").exists());
+        assert!(!slot.join(".github-runner-id").exists());
+        assert_eq!(
+            fs::read_to_string(retained.join("repo").join("checkout.txt")).unwrap(),
+            "kept"
+        );
+
+        let disposable_path = root.path().join("abcdef012345");
+        fs::create_dir_all(disposable_path.join(DEFAULT_WORK_FOLDER)).unwrap();
+        let disposable = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            fixtures::POLICY_ID,
+            &disposable_path,
+            fixtures::created_at(),
+        );
+        remove_materialized_package(&disposable).unwrap();
+        assert!(
+            !disposable_path.exists(),
+            "a disposable directory is still removed whole"
+        );
     }
 }
