@@ -1263,10 +1263,24 @@ impl SettingsUi {
     /// The rows one frame draws, already wrapped and already filtered for a
     /// constrained terminal.
     fn rows(&self, width: usize, compact: bool) -> Vec<FormLine> {
-        let mut logical = self.form_lines(width);
+        Self::lay_out(self.form_lines(width), width, compact, self.focus)
+    }
+
+    /// The second half of [`Self::rows`]: drop what a constrained terminal has
+    /// no room for, then wrap what is left.
+    ///
+    /// Split from the lines themselves because layout is a function of the
+    /// text's *length*, so anything that rewrites a line has to do it before
+    /// this runs. The snapshot test is the caller that needs the seam: it
+    /// substitutes the two paths that differ on every host -- a temporary
+    /// directory, and the platform default the fixture's own data directory
+    /// resolves to -- and a substitution made after the wrap would pin the
+    /// characters while leaving the wrap points machine-specific.
+    fn lay_out(logical: Vec<FormLine>, width: usize, compact: bool, focus: usize) -> Vec<FormLine> {
+        let mut logical = logical;
         if compact {
             logical.retain(|line| {
-                line.essential || (line.control.is_some() && line.control == Some(self.focus))
+                line.essential || (line.control.is_some() && line.control == Some(focus))
             });
         }
         let mut physical = Vec::with_capacity(logical.len());
@@ -2351,9 +2365,21 @@ mod tests {
     /// the data directory, so a root inside it would be refused for a reason
     /// that has nothing to do with the case under test.
     struct Workspaces {
-        _data: TempDir,
+        data: TempDir,
         roots: TempDir,
         context: Context,
+        /// The platform default host runner root **this** fixture resolves,
+        /// captured before anything configures an override.
+        ///
+        /// It is a property of the fixture, not of the process. Decision `D1`
+        /// keeps `<system-drive>\rman` as the Windows default and the
+        /// platform-standard [`AppPaths::runtime_dir`] on macOS and Linux, and
+        /// that directory is derived from the data directory — so two fixtures
+        /// with two private data directories resolve two different default
+        /// strings on those platforms, and the same one on Windows. A test
+        /// that substitutes one fixture's default into another's output is
+        /// therefore a test that can only pass on Windows.
+        platform_default: String,
         target: ScaleTarget,
     }
 
@@ -2369,10 +2395,15 @@ mod tests {
         /// different paths can settle.
         fn sharing(roots: TempDir) -> Self {
             let (data, context, target) = fixture(false);
+            let platform_default = HostSettings::load(&context)
+                .expect("the host row loads")
+                .runner_root
+                .rendered();
             Self {
-                _data: data,
+                data,
                 roots,
                 context,
+                platform_default,
                 target,
             }
         }
@@ -2386,6 +2417,24 @@ mod tests {
                 .to_str()
                 .expect("a temporary path must be UTF-8")
                 .to_owned()
+        }
+
+        /// The two temporary directory names every host-specific path this
+        /// fixture can render contains: the workspace roots, and the data
+        /// directory the platform default is derived from.
+        ///
+        /// Used as a tripwire. A substitution that missed — because a path
+        /// control scrolled horizontally and only a window of the value was
+        /// ever drawn — leaves one of these behind, and saying so is far more
+        /// useful than a snapshot diff of two temporary directory names.
+        fn volatile_markers(&self) -> [String; 2] {
+            [self.roots.path(), self.data.path()].map(|path| {
+                path.file_name()
+                    .expect("a temporary directory has a name")
+                    .to_str()
+                    .expect("a temporary path must be UTF-8")
+                    .to_owned()
+            })
         }
 
         fn host_screen(&self) -> SettingsUi {
@@ -2539,6 +2588,63 @@ mod tests {
             .join("\n")
     }
 
+    /// The rows one frame draws, with every host-specific path substituted
+    /// **before** the layout runs.
+    ///
+    /// Layout is a function of the text's length: [`wrap`] breaks a sentence
+    /// at whatever column it reaches, and both paths a settings screen shows
+    /// are a different number of columns on every machine — a `TempDir` name
+    /// is generated per run, and the platform default is `<drive>\rman` on
+    /// Windows against the fixture's own runtime directory on macOS and Linux
+    /// (decision `D1`). Substituting into the *drawn* rows, as this snapshot
+    /// first did, pins the characters and leaves the wrap points machine
+    /// specific, which is a snapshot that passes only on the host that
+    /// recorded it. Substituting into the logical line makes the placeholder
+    /// the thing that gets wrapped, and a placeholder is the same everywhere.
+    fn stable_rows(ui: &SettingsUi, width: usize, compact: bool, fixture: &Workspaces) -> String {
+        let redact = |text: &str| {
+            text.replace(&fixture.root("slots"), "<SLOTS>")
+                .replace(&fixture.root("configured"), "<CONFIGURED>")
+                .replace(&fixture.root("elsewhere"), "<ELSEWHERE>")
+                .replace(&fixture.platform_default, "<DEFAULT>")
+        };
+
+        // Substituted in the *controls* as well, and before the line that
+        // holds one is built. A path control scrolls horizontally: a value
+        // wider than the column it is given is drawn as a window onto itself,
+        // and a window has no whole path left in it to replace. Putting the
+        // placeholder in the field is what keeps that window from ever
+        // opening, whatever a host's temporary directory happens to be named.
+        let mut ui = ui.clone();
+        let host_root = redact(&ui.host_root.text());
+        ui.host_root.reset_to(&host_root);
+        let workspace_path = redact(&ui.workspace_path.text());
+        ui.workspace_path.reset_to(&workspace_path);
+
+        let logical = ui
+            .form_lines(width)
+            .into_iter()
+            .map(|line| FormLine {
+                text: redact(&line.text),
+                ..line
+            })
+            .collect();
+        let text = SettingsUi::lay_out(logical, width, compact, ui.focus)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for marker in fixture.volatile_markers() {
+            assert!(
+                !text.contains(&marker),
+                "a host path outlived the substitution -- a path control \
+                 scrolled it, so only a window of the value was ever drawn and \
+                 there was no whole path left to replace:\n{text}"
+            );
+        }
+        text
+    }
+
     #[test]
     fn every_screen_task_stays_inside_the_five_action_budget() {
         let fixture = Workspaces::new();
@@ -2653,6 +2759,30 @@ mod tests {
         let through_tui = Workspaces::sharing(TempDir::new().unwrap());
         let through_cli = Workspaces::sharing(TempDir::new().unwrap());
 
+        // The one string two independent stores cannot be asked to agree on.
+        //
+        // Decision `D1` makes the Windows default `<system-drive>man` -- one
+        // constant for every store on the machine -- while macOS and Linux keep
+        // the platform-standard runtime directory, which is derived from the
+        // data directory. These two surfaces must have *separate* stores,
+        // because "byte-identical stored values" is not a claim one store can
+        // settle, so on those two platforms they resolve two different
+        // defaults; and every success block names the effective root, which is
+        // that default whenever nothing overrides it. The two messages
+        // therefore differed for a reason that is production's intended
+        // asymmetry rather than a difference between the screen and the
+        // command. Rewriting the command's default to the screen's leaves the
+        // rest of the block compared character for character, and asserting
+        // that the rewrite had something to rewrite keeps it from quietly
+        // absorbing a real difference.
+        let rewrote_a_default = std::cell::Cell::new(false);
+        let one_surface = |rendered: Vec<u8>| {
+            let text = String::from_utf8(rendered).unwrap().trim().to_owned();
+            rewrote_a_default
+                .set(rewrote_a_default.get() || text.contains(&through_cli.platform_default));
+            text.replace(&through_cli.platform_default, &through_tui.platform_default)
+        };
+
         // -- host: configure ------------------------------------------------
         let mut ui = through_tui.host_screen();
         edit_path(
@@ -2675,10 +2805,7 @@ mod tests {
             through_tui.stored_host().runner_root_override,
             through_cli.stored_host().runner_root_override,
         );
-        assert_eq!(
-            ui.message.as_deref().unwrap(),
-            String::from_utf8(cli_out).unwrap().trim(),
-        );
+        assert_eq!(ui.message.as_deref().unwrap(), one_surface(cli_out));
 
         // -- host: reset ----------------------------------------------------
         activate(&mut ui, &through_tui.context, Control::HostRootReset);
@@ -2691,10 +2818,7 @@ mod tests {
         .unwrap();
         assert_eq!(through_tui.stored_host().runner_root_override, None);
         assert_eq!(through_cli.stored_host().runner_root_override, None);
-        assert_eq!(
-            ui.message.as_deref().unwrap(),
-            String::from_utf8(cli_out).unwrap().trim(),
-        );
+        assert_eq!(ui.message.as_deref().unwrap(), one_surface(cli_out));
 
         // -- repository: persistent -----------------------------------------
         let mut ui = through_tui.policy_screen();
@@ -2723,10 +2847,7 @@ mod tests {
             through_cli.stored_policy(),
             "one mutation from two surfaces must persist one policy, revision included"
         );
-        assert_eq!(
-            ui.message.as_deref().unwrap(),
-            String::from_utf8(cli_out).unwrap().trim(),
-        );
+        assert_eq!(ui.message.as_deref().unwrap(), one_surface(cli_out));
 
         // -- repository: back to ephemeral ----------------------------------
         focus_by_keyboard(&mut ui, Control::WorkspaceMode);
@@ -2744,9 +2865,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(through_tui.stored_policy(), through_cli.stored_policy());
-        assert_eq!(
-            ui.message.as_deref().unwrap(),
-            String::from_utf8(cli_out).unwrap().trim(),
+        assert_eq!(ui.message.as_deref().unwrap(), one_surface(cli_out));
+
+        // The rewrite above has to have had something to rewrite. Without this
+        // the two surfaces could stop naming the effective root at all and the
+        // normalisation would quietly become dead code that no longer proves
+        // the two blocks agree about the one value it touches.
+        assert!(
+            rewrote_a_default.get(),
+            "no success block named the platform default, so nothing checked \
+             that the two surfaces render it the same way"
         );
     }
 
@@ -3575,8 +3703,8 @@ mod tests {
           - changing or disabling persistence does not delete old directories;
           - `actions/checkout` still cleans the workspace, including Git-ignored files,
             unless the workflow sets `clean: false`.
-        Left in place: every slot under <SLOTS> remains on disk,
-        including its _work directory. Nothing is moved or deleted.
+        Left in place: every slot under <SLOTS> remains on disk, including its _work directory. Nothing is
+        moved or deleted.
         Save workspace [Enter/click]
         Focused form actions: 4/5 scaling, 3/5 workspace
         "###);
@@ -3586,19 +3714,10 @@ mod tests {
         let mut sections: Vec<(&str, String)> = Vec::new();
 
         let default = Workspaces::new();
-        let effective = match &default.host_screen().view {
-            SettingsView::Host(form) => form.runner_root.rendered(),
-            _ => unreachable!(),
-        };
-        let stable = |text: String, fixture: &Workspaces| {
-            text.replace(&fixture.root("slots"), "<SLOTS>")
-                .replace(&fixture.root("configured"), "<CONFIGURED>")
-                .replace(&effective, "<DEFAULT>")
-        };
 
         sections.push((
             "host/default",
-            stable(rows_text(&default.host_screen(), 100, false), &default),
+            stable_rows(&default.host_screen(), 100, false, &default),
         ));
 
         let configured = Workspaces::new();
@@ -3612,10 +3731,7 @@ mod tests {
         activate(&mut ui, &configured.context, Control::HostRootSave);
         sections.push((
             "host/configured",
-            stable(
-                rows_text(&configured.host_screen(), 100, false),
-                &configured,
-            ),
+            stable_rows(&configured.host_screen(), 100, false, &configured),
         ));
 
         let invalid = Workspaces::new();
@@ -3626,7 +3742,7 @@ mod tests {
             Control::HostRunnerRoot,
             "build/runners",
         );
-        sections.push(("host/invalid", stable(rows_text(&ui, 100, false), &invalid)));
+        sections.push(("host/invalid", stable_rows(&ui, 100, false, &invalid)));
 
         let active = Workspaces::new();
         active.attempt(0x81, false);
@@ -3637,10 +3753,7 @@ mod tests {
             Control::HostRunnerRoot,
             &active.root("configured"),
         );
-        sections.push((
-            "host/active-refusal",
-            stable(rows_text(&ui, 100, false), &active),
-        ));
+        sections.push(("host/active-refusal", stable_rows(&ui, 100, false, &active)));
 
         // The compact section reuses the *invalid* draft rather than a
         // temporary path: at 56 columns a path control scrolls horizontally,
@@ -3654,15 +3767,12 @@ mod tests {
             Control::HostRunnerRoot,
             "build/runners",
         );
-        sections.push(("host/compact", stable(rows_text(&ui, 56, true), &invalid)));
+        sections.push(("host/compact", stable_rows(&ui, 56, true, &invalid)));
 
         let repository = Workspaces::new();
         sections.push((
             "repository/ephemeral",
-            stable(
-                rows_text(&repository.policy_screen(), 100, false),
-                &repository,
-            ),
+            stable_rows(&repository.policy_screen(), 100, false, &repository),
         ));
 
         let mut ui = repository.policy_screen();
@@ -3676,7 +3786,7 @@ mod tests {
         );
         sections.push((
             "repository/persistent-warning",
-            stable(rows_text(&ui, 100, false), &repository),
+            stable_rows(&ui, 100, false, &repository),
         ));
 
         let blocked = Workspaces::new();
@@ -3700,8 +3810,7 @@ mod tests {
         );
         sections.push((
             "repository/cleanup-blocked",
-            stable(rows_text(&ui, 100, false), &blocked)
-                .replace(&blocked.root("elsewhere"), "<ELSEWHERE>"),
+            stable_rows(&ui, 100, false, &blocked),
         ));
 
         sections
