@@ -564,7 +564,7 @@ fn accept_reusable_slot(slot: &Path) -> Result<(), LifecycleError> {
         // `symlink_metadata` reports a link as a link, so `is_dir` here is
         // already "a real directory" and the link test is the message, not the
         // rule.
-        if name == OsStr::new(DEFAULT_WORK_FOLDER) && metadata.is_dir() {
+        if is_work_folder(&name) && metadata.is_dir() {
             continue;
         }
         refused.push(name.to_string_lossy().into_owned());
@@ -596,6 +596,23 @@ fn slot_refusal(slot: &Path, detail: impl fmt::Display) -> LifecycleError {
     )))
 }
 
+/// Whether a directory entry names the retained job workspace.
+///
+/// The comparison folds case on Windows because the filesystem does: there
+/// `_Work` and `_work` are one directory, so a case-sensitive test would let
+/// [`remove_slot_entries_except_work`] delete the very directory it exists to
+/// keep, let [`accept_reusable_slot`] refuse a slot that holds nothing but a
+/// valid job workspace, and let a package's top-level `_Work` merge itself into
+/// the previous attempt's `_work`. Elsewhere the two names really are two
+/// directories and only the exact one is the job workspace.
+fn is_work_folder(name: &OsStr) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(DEFAULT_WORK_FOLDER)
+    } else {
+        name == OsStr::new(DEFAULT_WORK_FOLDER)
+    }
+}
+
 /// Undo one package materialization, dispatching on the journalled workspace.
 ///
 /// The ephemeral half is what this always did: the directory is the attempt's
@@ -619,7 +636,7 @@ fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
 fn remove_slot_entries_except_work(slot: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(slot)? {
         let entry = entry?;
-        if entry.file_name() == OsStr::new(DEFAULT_WORK_FOLDER) {
+        if is_work_folder(&entry.file_name()) {
             continue;
         }
         let path = entry.path();
@@ -671,7 +688,7 @@ fn copy_package_entries(source: &Path, destination: &Path, top_level: bool) -> s
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        if top_level && entry.file_name() == OsStr::new(DEFAULT_WORK_FOLDER) {
+        if top_level && is_work_folder(&entry.file_name()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -1834,16 +1851,26 @@ impl LifecycleLauncher {
         }
     }
 
-    /// `Host.runner_root_override`, or the platform default standing in for it.
-    fn effective_host_root(&self) -> Result<LocalAbsolutePath, LifecycleError> {
+    /// `Host.runner_root_override`, read from the journal.
+    ///
+    /// Separated from [`Self::effective_host_root`] so that the two failures it
+    /// folds together stay apart: an unreadable or missing host row is a journal
+    /// problem and is always fatal, while an unresolvable *platform default* is
+    /// only fatal to a placement that actually needs the host root.
+    fn configured_host_root(&self) -> Result<Option<LocalAbsolutePath>, LifecycleError> {
         let host = self
             .ports
             .store
             .host(self.host_id)
             .map_err(|_| LifecycleError::Journal)?
             .ok_or_else(|| LifecycleError::Failed(FailureReason::Other("host not found".into())))?;
-        match &host.runner_root_override {
-            Some(configured) => Ok(configured.clone()),
+        Ok(host.runner_root_override.clone())
+    }
+
+    /// `Host.runner_root_override`, or the platform default standing in for it.
+    fn effective_host_root(&self) -> Result<LocalAbsolutePath, LifecycleError> {
+        match self.configured_host_root()? {
+            Some(configured) => Ok(configured),
             None => default_runner_root(&self.app_paths).map_err(root_failure),
         }
     }
@@ -1927,8 +1954,16 @@ impl LifecycleLauncher {
         // root is registered only as something *not* to overlap; a host default
         // that cannot be resolved is a host-root problem and does not block a
         // repository that configured a root of its own.
+        //
+        // Only *that* failure is tolerated. An unreadable host row is a journal
+        // failure and propagates, because silently continuing would drop the
+        // overlap check entirely and accept a repository root that sits inside
+        // the host root — the pair `RootPreflight` exists to refuse.
+        let host_root = self
+            .configured_host_root()?
+            .or_else(|| default_runner_root(&self.app_paths).ok());
         let mut preflight = RootPreflight::new(&self.app_paths);
-        if let Ok(host_root) = self.effective_host_root() {
+        if let Some(host_root) = host_root {
             preflight = preflight.against(RootOwner::Host, host_root);
         }
         let checked = preflight
@@ -2264,9 +2299,25 @@ mod tests {
         /// written "before package or GitHub effects". Reading it afterwards
         /// would pass even if the write happened second.
         journal: Mutex<Option<Arc<SqliteStore>>>,
-        /// One entry per registration: the persistent slots the journal already
-        /// held, and the `work_folder` the request carried.
-        registration_facts: Mutex<Vec<(Vec<u16>, String)>>,
+        /// One entry per registration, in order.
+        registration_facts: Mutex<Vec<RegistrationFact>>,
+    }
+
+    /// What one JIT registration saw of the world at the moment it was issued.
+    ///
+    /// `runner_name` is what ties the other two fields to *one* attempt: with
+    /// two allocators racing, "some slot was journalled" is a much weaker claim
+    /// than "the slot this very request belongs to was journalled", and only the
+    /// name distinguishes them.
+    #[derive(Debug, Clone)]
+    struct RegistrationFact {
+        /// The persistent slots the journal already held.
+        leased_slots: Vec<u16>,
+        /// The `work_folder` the request carried.
+        work_folder: String,
+        /// The runner name the request carried, i.e. [`runner_name`] of the
+        /// registering attempt.
+        runner_name: String,
     }
 
     impl FakeGithubLifecycle {
@@ -2282,7 +2333,7 @@ mod tests {
             *self.journal.lock().unwrap() = Some(store);
         }
 
-        fn registration_facts(&self) -> Vec<(Vec<u16>, String)> {
+        fn registration_facts(&self) -> Vec<RegistrationFact> {
             self.registration_facts.lock().unwrap().clone()
         }
 
@@ -2319,7 +2370,11 @@ mod tests {
                 self.registration_facts
                     .lock()
                     .unwrap()
-                    .push((slots, request.work_folder().to_string()));
+                    .push(RegistrationFact {
+                        leased_slots: slots,
+                        work_folder: request.work_folder().to_string(),
+                        runner_name: request.name().to_string(),
+                    });
             }
             if let Some(terminal) = self.registration_failures.lock().unwrap().pop_front() {
                 return Err(JitRequestFailure {
@@ -4196,8 +4251,12 @@ mod tests {
         // the slot root is laid out around.
         let facts = harness.github.registration_facts();
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].0, vec![1], "the lease was journalled first");
-        assert_eq!(facts[0].1, DEFAULT_WORK_FOLDER);
+        assert_eq!(
+            facts[0].leased_slots,
+            vec![1],
+            "the lease was journalled first"
+        );
+        assert_eq!(facts[0].work_folder, DEFAULT_WORK_FOLDER);
     }
 
     #[tokio::test]
@@ -4384,12 +4443,27 @@ mod tests {
             2
         );
 
-        // Every registration saw its own lease already in the journal.
+        // Every registration saw *its own* lease already in the journal. Reading
+        // the whole journal and asking only that it be non-empty would pass on
+        // the other allocator's lease, which is precisely the ordering bug this
+        // test exists to exclude.
         let facts = harness.github.registration_facts();
         assert_eq!(facts.len(), 2);
-        for (leased, work_folder) in facts {
-            assert!(!leased.is_empty(), "a JIT request never precedes its lease");
-            assert_eq!(work_folder, DEFAULT_WORK_FOLDER);
+        for fact in facts {
+            let attempt = [&first, &second]
+                .into_iter()
+                .find(|attempt| runner_name(attempt.id) == fact.runner_name)
+                .expect("every registration belongs to one of the two attempts");
+            let slot = attempt
+                .workspace()
+                .slot_number()
+                .expect("a persistent attempt leases a slot");
+            assert!(
+                fact.leased_slots.contains(&slot),
+                "a JIT request never precedes its own lease: s{slot} not in {:?}",
+                fact.leased_slots
+            );
+            assert_eq!(fact.work_folder, DEFAULT_WORK_FOLDER);
         }
     }
 
@@ -4520,6 +4594,16 @@ mod tests {
         create_or_validate_slot(&fresh).expect("a missing slot is created");
         assert!(fresh.is_dir());
         create_or_validate_slot(&fresh).expect("an existing directory is accepted");
+    }
+
+    #[test]
+    fn the_retained_work_directory_is_matched_the_way_the_filesystem_matches_it() {
+        assert!(is_work_folder(OsStr::new(DEFAULT_WORK_FOLDER)));
+        assert!(!is_work_folder(OsStr::new("_work2")));
+        // A Windows filesystem is case-insensitive, so `_Work` *is* the retained
+        // job workspace there and must never be removed as a leftover; on a
+        // case-sensitive filesystem it is a different directory entirely.
+        assert_eq!(is_work_folder(OsStr::new("_Work")), cfg!(windows));
     }
 
     #[test]
