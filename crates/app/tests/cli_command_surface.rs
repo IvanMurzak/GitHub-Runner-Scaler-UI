@@ -532,9 +532,13 @@ fn every_command_the_readme_documents_is_accepted_by_the_real_parser() {
          which would make every assertion below vacuous"
     );
 
+    // One disposable root for the whole loop: `--help` short-circuits before the
+    // binary reads or creates anything under it, so a directory per documented
+    // line would buy nothing and cost two dozen filesystem round trips.
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let path_value = temporary.path().join("root").display().to_string();
+
     for line in &lines {
-        let temporary = tempfile::tempdir().expect("a temporary directory");
-        let path_value = temporary.path().join("root").display().to_string();
         let arguments = arguments_for(line, &path_value);
         let (binary, arguments) = arguments
             .split_first()

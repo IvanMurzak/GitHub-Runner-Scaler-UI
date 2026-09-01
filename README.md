@@ -12,7 +12,7 @@ service.
 ## Features
 
 - ✅ **Works behind NAT:** no inbound ports, webhooks or servers.
-- ✅ **Starts clean:** every job gets a fresh runner and workspace.
+- ✅ **Starts clean:** every job gets a fresh runner, and a fresh workspace by default.
 - ✅ **Survives reboots:** auto-starts on Windows, macOS or Linux.
 - ✅ **Protects hardware:** set concurrency limits for every target.
 - ✅ **Tests safely:** monitor demand before enabling automation.
@@ -219,9 +219,9 @@ and use a distinct exit code for each failure class.
 
 ### Choose where runners work
 
-Every job runs in a disposable workspace under this machine's runner root. On Windows that
-root is `%SystemDrive%\rman`, normally `C:\rman`, so build paths stay short. macOS and Linux
-keep using the platform runtime directory, exactly as before. `runner-manager host show`
+By default every job runs in a disposable workspace under this machine's runner root. On Windows
+that root is `%SystemDrive%\rman`, normally `C:\rman`, so build paths stay short. macOS and
+Linux keep using the platform runtime directory, exactly as before. `runner-manager host show`
 prints the effective path and whether it is `platform-default` or `configured`.
 
 Put runners somewhere else, such as a faster disk:
@@ -236,8 +236,10 @@ Go back to the platform default:
 runner-manager host reset-runtime-root
 ```
 
-Both apply to the next runner, not to a running one. No existing directory is moved or
-deleted.
+Both take effect for the next runner and never relocate a running one. Both are also refused
+while this host still has runner attempts it has not cleaned up, naming how many are active and
+how many are awaiting cleanup, so run them once the host is idle. No existing directory is moved
+or deleted.
 
 ### Keep a build cache between jobs
 
@@ -273,21 +275,25 @@ cross branch and job boundaries. Keep untrusted fork and pull-request workflows 
 default mode. Persistence is repository-scoped for the same reason: an organization policy
 can accept jobs from many repositories, so it always uses fresh workspaces.
 
-Go back to a fresh workspace for every job whenever you want:
+Go back to a fresh workspace for every job:
 
 ```powershell
 runner-manager repo set-workspace OWNER/REPO --mode ephemeral
 ```
 
-Switching off persistence, or moving it to another directory, keeps every slot you already
-have: no old directory is moved or deleted. Remove the ones you no longer want yourself.
+Like the host commands, this one is refused while the repository still has a runner attempt
+awaiting cleanup, so run it once that repository is idle. Switching off persistence, or moving
+it to another directory, keeps every slot you already have: no old directory is moved or
+deleted. Remove the ones you no longer want yourself.
 
 ### Store application data somewhere else
 
 Add `--data-dir DIR` to any command to place config, state, logs and the package cache under
-your chosen root. Set `RUNNER_MANAGER_DATA_DIR` to make it the default. It does not decide
-where runners work: `host set-runtime-root` does that. Re-run
-`runner-manager service install` after changing the root.
+your chosen root. Set `RUNNER_MANAGER_DATA_DIR` to make it the default. On macOS and Linux it
+also moves the platform-default runner root, which lives inside that tree; on Windows it does
+not. Either way it is not how you choose runner placement: `host set-runtime-root` decides that,
+and it wins over the platform default everywhere. Re-run `runner-manager service install` after
+changing the root.
 
 ### Adapt the dashboard to your terminal
 
