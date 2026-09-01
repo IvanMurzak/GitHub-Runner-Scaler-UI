@@ -517,12 +517,13 @@ fn canonical_trustee(trustee: &str) -> String {
 /// renders `FRFWFXSD` back as `0x1301bf`.
 #[must_use]
 pub fn admits_exactly(descriptor: &str, admission: &RootAdmission) -> bool {
-    let Some(full_control) = rights_mask("FA") else {
-        return false;
-    };
     if !is_protected(descriptor) {
         return false;
     }
+    // Both constants are spellings `rights_mask` recognises, so neither
+    // fallback is reachable; they are the same fail-closed one `write_grants`
+    // documents, so an unreadable expectation could only ever cost a rewrite.
+    let full_control = rights_mask("FA").unwrap_or(u32::MAX);
     let mut expected: BTreeMap<String, u32> = [
         (SID_LOCAL_SYSTEM.to_owned(), full_control),
         (SID_ADMINISTRATORS.to_owned(), full_control),
