@@ -978,7 +978,7 @@ impl LifecycleError {
 #[derive(Debug)]
 pub struct LifecycleLauncher {
     host_id: HostId,
-    runtime_root: PathBuf,
+    app_paths: runner_manager_platform::paths::AppPaths,
     diagnostics_root: PathBuf,
     runner_group_id: u64,
     timeouts: RecoveryTimeouts,
@@ -1004,7 +1004,7 @@ impl LifecycleLauncher {
     #[must_use]
     pub fn new(
         host_id: HostId,
-        runtime_root: impl Into<PathBuf>,
+        app_paths: runner_manager_platform::paths::AppPaths,
         diagnostics_root: impl Into<PathBuf>,
         runner_group_id: u64,
         timeouts: RecoveryTimeouts,
@@ -1013,7 +1013,7 @@ impl LifecycleLauncher {
     ) -> Self {
         Self {
             host_id,
-            runtime_root: runtime_root.into(),
+            app_paths,
             diagnostics_root: diagnostics_root.into(),
             runner_group_id,
             timeouts,
@@ -1605,11 +1605,29 @@ impl LifecycleLauncher {
         {
             return Err(LifecycleError::RecoveryIncomplete);
         }
+        let host = self
+            .ports
+            .store
+            .host(self.host_id)
+            .map_err(|_| LifecycleError::Journal)?
+            .ok_or_else(|| LifecycleError::Failed(FailureReason::Other("host not found".into())))?;
+
+        let effective_root = if let Some(override_root) = &host.runner_root_override {
+            override_root.clone()
+        } else {
+            runner_manager_platform::runner_root::default_runner_root(&self.app_paths)
+                .map_err(|e| LifecycleError::Failed(FailureReason::Other(e.to_string())))?
+        };
+
+        runner_manager_platform::runner_root::RootPreflight::new(&self.app_paths)
+            .check(&runner_manager_platform::runner_root::RootOwner::Host, &effective_root)
+            .map_err(|e| LifecycleError::Failed(FailureReason::Other(e.to_string())))?;
+
         let labels = policy
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
-        let runtime = self.runtime_root.join({
+        let runtime = effective_root.as_path().join({
             #[cfg(test)]
             {
                 if std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref()
@@ -2211,6 +2229,7 @@ mod tests {
                 .build();
             let host = fixtures::host().build();
             let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+            store.put_host(&host).unwrap();
             let github = Arc::new(github);
             let packages = Arc::new(FakePackages::default());
             let processes = Arc::new(FakeProcesses::default());
@@ -2231,7 +2250,7 @@ mod tests {
             };
             let launcher = LifecycleLauncher::new(
                 policy.host_id,
-                paths.runtime_dir(),
+                paths.clone(),
                 paths.logs_dir(),
                 1,
                 RecoveryTimeouts::new(
@@ -2673,7 +2692,7 @@ mod tests {
         let id = AttemptId::new_random();
         let runtime = harness
             .launcher
-            .runtime_root
+            .app_paths.runtime_dir()
             .join(harness.policy.id.to_string())
             .join(id.to_string());
         fs::create_dir_all(&runtime).unwrap();
@@ -2713,7 +2732,7 @@ mod tests {
     async fn expired_jit_returns_intent_but_never_launches_inside_lifecycle() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("expired-with-demand");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("expired-with-demand");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -2840,7 +2859,7 @@ mod tests {
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
 
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("adopt");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("adopt");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
@@ -2870,7 +2889,7 @@ mod tests {
     async fn spawn_before_starting_crash_recovers_pid_then_completes_and_cleans() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("spawn-before-starting");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("spawn-before-starting");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -2957,7 +2976,7 @@ mod tests {
             let id = AttemptId::new_random();
             let runtime = harness
                 .launcher
-                .runtime_root
+                .app_paths.runtime_dir()
                 .join(if sidecar_already_present {
                     "after-id-sidecar"
                 } else {
@@ -3022,12 +3041,12 @@ mod tests {
         let unknown_attempt = RunnerAttempt::allocate(
             AttemptId::new_random(),
             PolicyId::from_u128(0xfeed),
-            unknown.launcher.runtime_root.join("unknown-policy"),
+            unknown.launcher.app_paths.runtime_dir().join("unknown-policy"),
             unknown.clock.now(),
         );
         unknown.store.record_attempt(&unknown_attempt).unwrap();
         let expired_id = AttemptId::new_random();
-        let expired_runtime = unknown.launcher.runtime_root.join("expired-beside-unknown");
+        let expired_runtime = unknown.launcher.app_paths.runtime_dir().join("expired-beside-unknown");
         fs::create_dir_all(&expired_runtime).unwrap();
         let mut expired = RunnerAttempt::allocate(
             expired_id,
@@ -3070,7 +3089,7 @@ mod tests {
 
         let unreachable = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = unreachable.launcher.runtime_root.join("unreachable");
+        let runtime = unreachable.launcher.app_paths.runtime_dir().join("unreachable");
         fs::create_dir_all(&runtime).unwrap();
         unreachable
             .store
@@ -3099,7 +3118,7 @@ mod tests {
     async fn a_dead_busy_process_unknown_to_github_is_orphaned_and_cleaned() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("orphan");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("orphan");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -3127,7 +3146,7 @@ mod tests {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         harness.ready().await;
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("timeout");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("timeout");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
@@ -3192,7 +3211,7 @@ mod tests {
     async fn timeout_crash_recovery_returns_the_same_replacement_intent() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("timeout-after-crash");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("timeout-after-crash");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
@@ -3241,7 +3260,7 @@ mod tests {
     async fn terminate_intent_sync_failure_prevents_signal_and_conclusion() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.runtime_root.join("timeout-sync-failure");
+        let runtime = harness.launcher.app_paths.runtime_dir().join("timeout-sync-failure");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
