@@ -143,7 +143,18 @@ pub fn dispatch_org(
 /// was well-formed for clap and wrong for the domain". Silently ignoring the
 /// path is the one option `02-target-architecture.md` rules out: "`ephemeral`
 /// rejects `--path` so an ignored argument cannot mislead".
-fn set_workspace(
+///
+/// `pub` because `e1`'s Repository Settings screen saves through this function
+/// rather than through a second copy of it: the two `--path` rules, the parse
+/// and the render below are then literally the same code on both surfaces.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a malformed target, a path this host cannot
+/// hold, or `--path` alongside `ephemeral`; [`Failure::NotFound`] when no policy
+/// for the target exists; [`Failure::Conflict`] for affected attempts or a lost
+/// optimistic race; and [`Failure::LocalState`] for a journal or filesystem
+/// failure.
+pub fn set_workspace(
     context: &Context,
     args: &RepoSetWorkspaceArgs,
     out: &mut dyn Write,

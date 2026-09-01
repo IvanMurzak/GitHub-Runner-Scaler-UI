@@ -406,13 +406,18 @@ pub fn dispatch(
 /// Nothing but argument parsing and rendering happens here: the ordering, the
 /// preflight, the two refusal counts and the fenced write are
 /// [`workspace::set_host_runner_root`], because `e1`'s Host Settings screen has
-/// to reach exactly the same decisions.
+/// to reach exactly the same decisions — and it reaches them by calling *this*
+/// function with the text the operator typed, rather than by repeating it.
 ///
 /// # Errors
 /// [`Failure::InvalidArgument`] for a path this host cannot hold,
 /// [`Failure::Conflict`] for affected attempts or a lost race, and
 /// [`Failure::LocalState`] for a journal or filesystem failure.
-fn runtime_root(context: &Context, raw: Option<&str>, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn runtime_root(
+    context: &Context,
+    raw: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let store = context.store()?;
     let root = raw
         .map(|raw| workspace::parse_root(raw, &RootOwner::Host))

@@ -890,6 +890,43 @@ fn navigation_area(size: Rect) -> Rect {
     Rect::new(size.x, size.y.saturating_add(1), size.width, 1)
 }
 
+/// The first terminal row a settings form draws on: one status row, one
+/// navigation row, and the block's own top border.
+const SETTINGS_FIRST_ROW: u16 = 3;
+
+/// Whether this frame is drawn in the constrained layout.
+///
+/// One definition, because [`render`] and [`reduce_mouse`] have to agree: the
+/// compact frame drops rows, so a click resolved against the full layout lands
+/// on a control the operator was not shown.
+const fn compact_layout(area: Rect) -> bool {
+    area.width < 60 || area.height < 18
+}
+
+/// Whether the frame is too small to draw at all.
+///
+/// One definition for the same reason [`compact_layout`] is one: below this
+/// [`render`] draws a one-line fallback instead of a screen, so there is no
+/// form on it and no row for a click to reach.
+const fn below_minimum_frame(area: Rect) -> bool {
+    area.width < 12 || area.height < 5
+}
+
+/// How many form rows a settings frame of this size actually puts on screen.
+///
+/// The pane keeps a status row, a navigation row, its own two borders and the
+/// footer, and `Paragraph` clips whatever does not fit rather than scrolling.
+/// A click below the last drawn row — on the footer, or anywhere on a form
+/// taller than the pane — must therefore reach nothing: resolved against the
+/// unclipped row list it would activate a control the operator never saw, which
+/// on these screens means *Save* instead of *Reset*.
+const fn settings_content_rows(size: Rect) -> u16 {
+    if below_minimum_frame(size) {
+        return 0;
+    }
+    size.height.saturating_sub(SETTINGS_FIRST_ROW + 2)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
     pub screen: Screen,
@@ -939,6 +976,11 @@ impl AppState {
     }
 
     fn open_screen(&mut self, screen: Screen) {
+        // A path control captures the keyboard, and only a settings screen
+        // draws one. Leaving by mouse is the one navigation an open editor
+        // cannot swallow, so the editor is closed here rather than left to eat
+        // every key pressed on the screen the operator went to.
+        self.settings.cancel_editing();
         self.screen = screen;
         if let Some(read_only) = read_only_screen(screen) {
             self.screen_model.apply(ScreenAction::Open(read_only));
@@ -969,11 +1011,18 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             Vec::new()
         }
         AppEvent::Paste(text) => {
+            // Redacted on the way in, not on the way out: a path is not a
+            // secret, but a token pasted into a path control by accident would
+            // otherwise be drawn on screen and copied out of it. Any value that
+            // needed redacting was never a usable runner root anyway.
+            let safe = state.presentation.redact(&text);
             if state.filtering {
-                state.filter.push_str(&state.presentation.redact(&text));
+                state.filter.push_str(&safe);
                 state
                     .screen_model
                     .apply(ScreenAction::Filter(state.filter.clone()));
+            } else if state.settings.is_editing() {
+                state.settings.paste(&safe);
             }
             Vec::new()
         }
@@ -1071,6 +1120,27 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // A PATH CONTROL BEING EDITED OWNS THE WHOLE KEYBOARD.
+    // ------------------------------------------------------------------------
+    // Before this, every letter was a screen shortcut, so typing `C:\home\rman`
+    // would have jumped to Host Settings on the `h` and quit on a `q`. Modified
+    // chords are dropped rather than typed: Ctrl-C is not the letter `c`.
+    if state.settings.is_editing() {
+        if matches!(key.code, KeyCode::Char(_))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
+        return state
+            .settings
+            .key(key.code)
+            .map(|command| vec![Effect::Settings(command)])
+            .unwrap_or_default();
+    }
+
     if matches!(
         state.screen,
         Screen::HostSettings | Screen::RepositorySettings
@@ -1109,16 +1179,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             //
             // A host with no policies is the state every new install starts in,
             // so it gets an answer rather than a diagnostic.
-            let Some(target) = selected_repository_target(state) else {
-                state.settings.show_notice(
-                    "No repository is configured on this host yet.\n\n\
-                     Add one from a terminal:\n  \
-                     runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
-                     Then press [r] to select it and [s] to configure it.",
-                );
-                return Vec::new();
-            };
-            return vec![Effect::Settings(SettingsCommand::LoadPolicy(target))];
+            return open_repository_settings(state);
         }
         KeyCode::Char('h') => {
             state.open_screen(Screen::HostSettings);
@@ -1149,6 +1210,14 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('?') => state.help_open = !state.help_open,
         KeyCode::Char('q') => state.should_exit = true,
         KeyCode::Char('c') => {
+            // `05-user-workflows.md`: paths are "copyable from detail view".
+            if matches!(
+                state.screen,
+                Screen::HostSettings | Screen::RepositorySettings
+            ) && let Some(path) = state.settings.copy_text()
+            {
+                return vec![Effect::Copy(path)];
+            }
             let copy = if state.screen == Screen::RepositorySettings {
                 match &state.settings.view {
                     SettingsView::Policy(form) => {
@@ -1224,11 +1293,7 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 state.focus = Focus::Navigation;
                 return match screen {
                     Screen::HostSettings => vec![Effect::Settings(SettingsCommand::LoadHost)],
-                    Screen::RepositorySettings => {
-                        vec![Effect::Settings(SettingsCommand::LoadPolicy(
-                            selected_repository_target(state).unwrap_or_default(),
-                        ))]
-                    }
+                    Screen::RepositorySettings => open_repository_settings(state),
                     _ => Vec::new(),
                 };
             } else {
@@ -1250,8 +1315,13 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 } else if matches!(
                     state.screen,
                     Screen::HostSettings | Screen::RepositorySettings
-                ) && mouse.row >= 3
-                    && let Some(command) = state.settings.click(mouse.row - 3)
+                ) && mouse.row >= SETTINGS_FIRST_ROW
+                    && mouse.row - SETTINGS_FIRST_ROW < settings_content_rows(state.size)
+                    && let Some(command) = state.settings.click(
+                        mouse.row - SETTINGS_FIRST_ROW,
+                        settings::content_width(state.size.width),
+                        compact_layout(state.size),
+                    )
                 {
                     return vec![Effect::Settings(command)];
                 }
@@ -1262,6 +1332,33 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         _ => {}
     }
     Vec::new()
+}
+
+/// What Repository Settings loads, whichever way the operator asked for it.
+///
+/// -------------------------------------------------------------------------
+/// THERE MAY BE NO REPOSITORY TO CONFIGURE, AND THAT IS NOT AN ERROR.
+/// -------------------------------------------------------------------------
+/// `unwrap_or_default()` here sent an EMPTY target into the policy loader,
+/// which parsed it and failed with "an organization login must not be empty" —
+/// a message about a parser, shown to somebody who opened the screen on a host
+/// that has no policies yet. The screen then sat on "Loading settings..."
+/// forever, because nothing was ever going to load.
+///
+/// A host with no policies is the state every new install starts in, so it gets
+/// an answer rather than a diagnostic — and it gets the same answer from the
+/// `s` key and from the navigation bar, which is why both go through here.
+fn open_repository_settings(state: &mut AppState) -> Vec<Effect> {
+    let Some(target) = selected_repository_target(state) else {
+        state.settings.show_notice(
+            "No repository is configured on this host yet.\n\n\
+             Add one from a terminal:\n  \
+             runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
+             Then press [r] to select it and [s] to configure it.",
+        );
+        return Vec::new();
+    };
+    vec![Effect::Settings(SettingsCommand::LoadPolicy(target))]
 }
 
 fn selected_repository_target(state: &AppState) -> Option<String> {
@@ -1279,14 +1376,14 @@ fn selected_repository_target(state: &AppState) -> Option<String> {
 /// Draw one frame from memory only.
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
-    if area.width < 12 || area.height < 5 {
+    if below_minimum_frame(area) {
         frame.render_widget(
             Paragraph::new("runner-manager\n? help").wrap(Wrap { trim: true }),
             area,
         );
         return;
     }
-    let compact = area.width < 60 || area.height < 18;
+    let compact = compact_layout(area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1418,7 +1515,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, compact: bool) {
     let help = if compact {
         "d Dashboard  r Repositories  n Runners\ns Repo settings  h Host settings  a Activity\n/ Filter F5 Refresh ? Help Esc Back q Quit\nTab Shift-Tab Arrows Focus  Enter Activate\nc Copy diagnostics  m Mouse capture  o Sort\nKeys mirror every mouse action"
     } else {
-        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   o sort   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nMouse actions always have the keyboard equivalents above."
+        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   o sort   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nPath fields: Enter edit   type or paste   Esc cancel   Enter accept\nMouse actions always have the keyboard equivalents above."
     };
     frame.render_widget(Clear, popup);
     let title = if compact {
@@ -3151,5 +3248,265 @@ mod tests {
         assert!(stored.enabled());
         assert_eq!(stored.max_capacity().unwrap().get(), 3);
         assert_eq!(stored.cache_policy, CachePolicy::DiscardRunnerPackage);
+    }
+
+    // -----------------------------------------------------------------------
+    // e1-workspace-tui
+    // -----------------------------------------------------------------------
+
+    /// A host and one repository policy, on a disposable data directory.
+    fn workspace_context() -> (tempfile::TempDir, crate::cli::Context, ScaleTarget) {
+        use std::num::NonZeroU16;
+
+        use runner_manager_domain::model::{
+            Arch, CachePolicy, Host, HostId, HostLabel, Os, PolicyId,
+        };
+        use runner_manager_domain::policy::{PolicyMode as DomainMode, RoutingLabels, ScalePolicy};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let context = crate::cli::Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let host = Host::new(
+            HostId::from_u128(801),
+            "workspace-host",
+            Os::Linux,
+            Arch::X64,
+            NonZeroU16::new(4).unwrap(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        store.put_host(&host).unwrap();
+        let target = ScaleTarget::repository("octo/workspace").unwrap();
+        store
+            .insert_policy(&ScalePolicy::new_for_host_label(
+                PolicyId::from_u128(802),
+                target.clone(),
+                7,
+                host.id,
+                HostLabel::new("home").unwrap(),
+                DomainMode::autoscale(
+                    RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                    0,
+                    NonZeroU16::new(2).unwrap(),
+                )
+                .unwrap(),
+                CachePolicy::default(),
+            ))
+            .unwrap();
+        drop(store);
+        (root, context, target)
+    }
+
+    /// Opens Host Settings the way an operator does — the `h` key, then the
+    /// load the shell's effect boundary hands back.
+    fn open_host_settings(state: &mut AppState, context: &crate::cli::Context) {
+        let effects = reduce(state, key(KeyCode::Char('h')));
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("h must load the host form")
+        };
+        state.settings.execute(context, command);
+    }
+
+    /// Walks the focus to one control with the arrow keys alone.
+    ///
+    /// Deliberately not `state.settings.focus = n`: a control that cannot be
+    /// reached from the keyboard is an accessibility defect, and assigning the
+    /// index would hide it.
+    fn focus_control(state: &mut AppState, control: settings::Control) {
+        let index = state
+            .settings
+            .controls()
+            .iter()
+            .position(|candidate| *candidate == control)
+            .unwrap_or_else(|| panic!("{control:?} is not on this screen"));
+        for _ in 0..index {
+            reduce(state, key(KeyCode::Down));
+        }
+        assert_eq!(state.settings.focused(), Some(control));
+    }
+
+    /// The reducer's half of `05-user-workflows.md`'s interaction rules.
+    ///
+    /// A path control that did not own the keyboard was the whole risk here:
+    /// every letter on these screens is a navigation shortcut, so typing
+    /// `C:\home\rman` would have jumped to Host Settings on the `h`, opened
+    /// Repositories on the `r`, and quit on nothing at all — while the field
+    /// stayed empty.
+    #[test]
+    fn typing_a_path_owns_the_keyboard_and_a_pasted_secret_is_redacted_first() {
+        let (_root, context, _target) = workspace_context();
+        let mut state = AppState::new(
+            PresentationState {
+                access_token: Some("ghu_this_must_not_escape".into()),
+                ..PresentationState::default()
+            },
+            120,
+            30,
+        );
+
+        open_host_settings(&mut state, &context);
+
+        // Open the path editor with the keyboard alone.
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
+        reduce(&mut state, key(KeyCode::Enter));
+        assert!(state.settings.is_editing());
+
+        for character in "C:/home/rman".chars() {
+            reduce(&mut state, key(KeyCode::Char(character)));
+        }
+        assert_eq!(state.settings.host_root.text(), "C:/home/rman");
+        assert_eq!(
+            state.screen,
+            Screen::HostSettings,
+            "no letter typed into a path may navigate"
+        );
+        assert!(!state.should_exit, "and none of them may quit");
+
+        // A modified chord is a command, not a character.
+        reduce(
+            &mut state,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }),
+        );
+        assert_eq!(state.settings.host_root.text(), "C:/home/rman");
+
+        // Bracketed paste reaches the field, and a credential in it does not.
+        reduce(
+            &mut state,
+            AppEvent::Paste("/srv/ghu_this_must_not_escape".into()),
+        );
+        let typed = state.settings.host_root.text();
+        assert!(typed.contains(REDACTED), "{typed}");
+        assert!(!typed.contains("ghu_this_must_not_escape"), "{typed}");
+        assert!(
+            !rendered(120, 30, &state).contains("ghu_this_must_not_escape"),
+            "a pasted credential must never be drawn"
+        );
+
+        // Escape leaves the editor without leaving the screen.
+        reduce(&mut state, key(KeyCode::Esc));
+        assert!(!state.settings.is_editing());
+        assert_eq!(state.screen, Screen::HostSettings);
+    }
+
+    /// Navigating away with the mouse closes the editor that owns the keyboard.
+    ///
+    /// The editor swallows every key, so the navigation bar is the one way out
+    /// of a settings screen it cannot intercept. Left open, it went on
+    /// swallowing keys on the screen the operator had moved to: `q` typed a `q`
+    /// into a field nothing was drawing any more, and the TUI could not be
+    /// quit.
+    #[test]
+    fn leaving_a_settings_screen_by_mouse_closes_the_path_editor() {
+        let (_root, context, _target) = workspace_context();
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        open_host_settings(&mut state, &context);
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
+        reduce(&mut state, key(KeyCode::Enter));
+        assert!(state.settings.is_editing());
+
+        let dashboard = state
+            .navigation
+            .items
+            .iter()
+            .find(|item| item.screen == Screen::Dashboard)
+            .expect("the navigation bar always offers the dashboard")
+            .area;
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                dashboard.x,
+                dashboard.y,
+            ),
+        );
+        assert_eq!(state.screen, Screen::Dashboard);
+        assert!(
+            !state.settings.is_editing(),
+            "a field no frame draws may not keep the keyboard"
+        );
+
+        reduce(&mut state, key(KeyCode::Char('q')));
+        assert!(state.should_exit, "q must still quit");
+    }
+
+    /// The key help names the path-control keys, because a control whose only
+    /// documentation is that it happens to respond to Enter is not discoverable.
+    #[test]
+    fn the_key_help_names_the_path_control_keys() {
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.help_open = true;
+        let help = rendered(120, 30, &state);
+        for control in ["Path fields", "Enter edit", "Esc cancel", "Enter accept"] {
+            assert!(help.contains(control), "{control} missing from {help}");
+        }
+    }
+
+    /// `c` copies the path the operator is looking at rather than the
+    /// diagnostics buffer.
+    #[test]
+    fn c_copies_the_focused_path_control_on_a_settings_screen() {
+        let (_root, context, _target) = workspace_context();
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        open_host_settings(&mut state, &context);
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
+        let Effect::Copy(copied) = reduce(&mut state, key(KeyCode::Char('c'))).remove(0) else {
+            panic!("c must copy the focused path")
+        };
+        let SettingsView::Host(form) = &state.settings.view else {
+            unreachable!()
+        };
+        assert_eq!(copied, form.runner_root.rendered());
+    }
+
+    /// The mouse map and the keyboard walk resolve to the same control, at the
+    /// same row, in both layouts.
+    ///
+    /// This is the assertion the old hard-coded row table could not make: it
+    /// listed row numbers, so adding a control above one of them moved a click
+    /// from *Save* to *Reset* with nothing to catch it.
+    #[test]
+    fn a_click_reaches_the_control_the_frame_drew_on_that_row() {
+        let (_root, context, target) = workspace_context();
+        for (width, height) in [(120u16, 30u16), (58, 20)] {
+            let mut state = AppState::new(PresentationState::default(), width, height);
+            state.size = Rect::new(0, 0, width, height);
+            state.screen = Screen::RepositorySettings;
+            state
+                .settings
+                .execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+            let compact = compact_layout(state.size);
+            let content_width = settings::content_width(width);
+            let rows = state.settings.control_rows(content_width, compact);
+            let (offset, expected) = rows
+                .iter()
+                .enumerate()
+                .find_map(|(index, control)| {
+                    control.map(|control| (u16::try_from(index).unwrap(), control))
+                })
+                .expect("a settings frame always draws at least one control");
+
+            let effects = reduce(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    4,
+                    SETTINGS_FIRST_ROW + offset,
+                ),
+            );
+            assert_eq!(
+                state.settings.focus, expected,
+                "width={width}: a click must focus the control drawn on that row"
+            );
+            assert!(
+                effects.len() <= 1,
+                "one click is at most one effect: {effects:?}"
+            );
+        }
     }
 }
