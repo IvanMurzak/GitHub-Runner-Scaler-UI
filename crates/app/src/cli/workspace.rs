@@ -420,18 +420,24 @@ impl RepositoryWorkspace {
 
 /// Assembles the read model for one policy.
 ///
+/// The host root is *passed in* rather than resolved here, and that is the same
+/// rule [`host_root`] states one paragraph up: a caller rendering a table asks
+/// once and hands the answer to every row, so two rows of one table cannot
+/// describe two different hosts. Resolving it per policy would also re-ask the
+/// operating system for the system directory once per repository, for a value
+/// that cannot legitimately change inside one command.
+///
 /// # Errors
 /// [`Failure::LocalState`] when the journal cannot be read.
 pub fn repository_workspace(
-    app_paths: &AppPaths,
     store: &dyn Store,
-    host: Option<&Host>,
+    host_root: &HostRoot,
     policy: &ScalePolicy,
 ) -> Result<RepositoryWorkspace, CliError> {
     Ok(RepositoryWorkspace {
         target: policy.target.clone(),
         policy: policy.workspace_policy().clone(),
-        host_root: host_root(app_paths, host),
+        host_root: host_root.clone(),
         attempts: policy_affected_attempts(store, policy)?,
         leases: slot_leases(store, policy)?,
     })
@@ -468,6 +474,22 @@ fn preflight_against_everything<'a>(
         }
     }
     preflight
+}
+
+/// The refusal an ephemeral workspace answers a path with, stated once.
+///
+/// `02-target-architecture.md`: "`ephemeral` rejects `--path` so an ignored
+/// argument cannot mislead". Both the command boundary — which refuses before
+/// the store is opened at all — and [`set_repository_workspace`], which is what
+/// `e1` saves through, raise *this* error rather than two paraphrases of it.
+#[must_use]
+pub fn ephemeral_rejects_a_path(target: &ScaleTarget) -> CliError {
+    CliError::with_remedy(
+        Failure::InvalidArgument,
+        "--path names where persistent slots live, and an ephemeral workspace has none; \
+         nothing was changed",
+        format!("runner-manager repo set-workspace {target} --mode ephemeral"),
+    )
 }
 
 /// Parses an operator's `--path` into the type the store and the preflight both
@@ -656,7 +678,16 @@ pub fn set_repository_workspace(
 
     let owner = RootOwner::Repository(target.slug());
     let requested = match (kind, path) {
-        (WorkspaceKind::Ephemeral, _) => WorkspacePolicy::Ephemeral,
+        (WorkspaceKind::Ephemeral, None) => WorkspacePolicy::Ephemeral,
+        // The mirror of the `Persistent, None` arm below, and refused for the
+        // same reason. `repo set-workspace` already refuses it at the command
+        // boundary, but this function is the handler `e1` saves through, and a
+        // screen that passed a path alongside `ephemeral` would otherwise have
+        // it silently dropped — the one outcome
+        // `02-target-architecture.md` rules out.
+        (WorkspaceKind::Ephemeral, Some(_)) => {
+            return Err(ephemeral_rejects_a_path(target));
+        }
         (WorkspaceKind::Persistent, Some(root)) => {
             WorkspacePolicy::persistent(root, target.scope()).map_err(|source| {
                 CliError::with_remedy(
@@ -1650,6 +1681,57 @@ mod race {
             after.max_capacity().map(std::num::NonZeroU16::get),
             Some(4),
             "and the concurrent ceiling change was not rolled back either"
+        );
+    }
+
+    /// The `ephemeral` mode refuses a path *in the shared handler*, not only at
+    /// the command boundary.
+    ///
+    /// It lives beside the race tests because they are what already builds a
+    /// `Context` over a real store, which is the whole fixture this needs.
+    /// `repo set-workspace` refuses the combination before it ever gets here,
+    /// so a caller that is not clap — the settings screen, which saves through
+    /// this same function — is the only one that can reach the arm. Dropping
+    /// the path silently is the outcome `02-target-architecture.md` rules out:
+    /// "`ephemeral` rejects `--path` so an ignored argument cannot mislead".
+    #[test]
+    fn the_shared_handler_refuses_a_path_for_an_ephemeral_workspace() {
+        let data_dir = tempfile::tempdir().expect("a temporary directory");
+        let roots = tempfile::tempdir().expect("a temporary directory");
+        let context = a_context(data_dir.path());
+        let store = SqliteStore::open_in_memory().expect("an in-memory database");
+        let host = a_host();
+        store.put_host(&host).expect("a fresh host");
+        let policy = a_policy(host.id);
+        store.insert_policy(&policy).expect("a fresh policy");
+
+        let target = ScaleTarget::repository("octo/repo").expect("a valid slug");
+        let root = a_root(&roots, "ci-cache");
+        let refused = set_repository_workspace(
+            &context,
+            &store,
+            &target,
+            WorkspaceKind::Ephemeral,
+            Some(root.clone()),
+        )
+        .expect_err("an ephemeral workspace has no slots to place");
+        assert_eq!(refused.class(), Failure::InvalidArgument);
+        assert!(
+            refused.message().contains("nothing was changed"),
+            "the refusal must say the setting is untouched: {}",
+            refused.message()
+        );
+        assert!(
+            !root.as_path().exists(),
+            "and a refused mutation creates no directory"
+        );
+        assert_eq!(
+            store
+                .policy(policy.id)
+                .expect("readable")
+                .expect("still there")
+                .workspace_policy(),
+            &WorkspacePolicy::Ephemeral,
         );
     }
 }

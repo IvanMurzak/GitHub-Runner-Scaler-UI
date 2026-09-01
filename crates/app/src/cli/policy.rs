@@ -153,12 +153,7 @@ fn set_workspace(
     let owner = RootOwner::Repository(target.slug());
     let path = match (kind, args.path.as_deref()) {
         (WorkspaceKind::Ephemeral, Some(_)) => {
-            return Err(CliError::with_remedy(
-                Failure::InvalidArgument,
-                "--path names where persistent slots live, and an ephemeral workspace has \
-                 none; nothing was changed",
-                format!("runner-manager repo set-workspace {target} --mode ephemeral"),
-            ));
+            return Err(workspace::ephemeral_rejects_a_path(&target));
         }
         (WorkspaceKind::Ephemeral, None) => None,
         (WorkspaceKind::Persistent, Some(raw)) => Some(workspace::parse_root(raw, &owner)?),
@@ -631,10 +626,11 @@ fn write_add_result(
 fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("this policy list");
     let store = context.store()?;
-    // Read once for the whole list: every row's ephemeral fallback is the same
-    // host row, and re-reading it per policy would let two rows of one table
-    // describe two different hosts.
+    // Resolved once for the whole list: every row's ephemeral fallback is the
+    // same host root, and re-resolving it per policy would let two rows of one
+    // table describe two different hosts.
     let host = super::host::local_host(&store)?;
+    let host_root = workspace::host_root(context.paths(), host.as_ref());
     let mut count = 0;
     for policy in store.policies().map_err(store_failure)? {
         if policy.target.scope() != scope {
@@ -670,8 +666,7 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
         // Assembled from the same read model `status --json` and `e1`'s screens
         // use, so the three cannot answer "where does this repository's next
         // attempt go" differently.
-        let view =
-            workspace::repository_workspace(context.paths(), &store, host.as_ref(), &policy)?;
+        let view = workspace::repository_workspace(&store, &host_root, &policy)?;
         let blocked = view
             .leases
             .iter()

@@ -380,11 +380,12 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
 
     let runner_root = workspace::host_root(context.paths(), host.as_ref());
     let ephemeral = workspace::host_affected_attempts(&store)?;
+    // The same `runner_root` every policy's ephemeral fallback reports, so the
+    // host block and the policy block of one document cannot disagree about
+    // where the next disposable attempt goes.
     let workspaces = policies
         .iter()
-        .map(|policy| {
-            workspace::repository_workspace(context.paths(), &store, host.as_ref(), policy)
-        })
+        .map(|policy| workspace::repository_workspace(&store, &runner_root, policy))
         .collect::<Result<Vec<_>, CliError>>()?;
 
     Ok(StatusDocument {
