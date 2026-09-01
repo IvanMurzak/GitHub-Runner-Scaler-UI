@@ -683,8 +683,35 @@ impl SettingsUi {
                 }),
                 _ => None,
             },
-            Control::WorkspacePath => Some(self.workspace_path.text()),
+            // As above: an untouched draft copies the value the row *shows*,
+            // which for an ephemeral-to-persistent switch is the effective
+            // root and not the empty string the field happens to hold.
+            Control::WorkspacePath => match &self.view {
+                SettingsView::Policy(form) if self.workspace_path.is_blank() => {
+                    form.workspace.effective_root().map(ToOwned::to_owned)
+                }
+                SettingsView::Policy(_) => Some(self.workspace_path.text()),
+                _ => None,
+            },
             _ => None,
+        }
+    }
+
+    /// Ends any edit in progress, discarding the draft.
+    ///
+    /// A path control owns the whole keyboard while it is being typed into
+    /// ([`Self::is_editing`]), and nothing but this screen draws it. Navigating
+    /// away with the mouse — the one route out that the keyboard capture does
+    /// not intercept — would otherwise leave every subsequent keystroke going
+    /// into a field the operator can no longer see.
+    pub fn cancel_editing(&mut self) {
+        if self.host_root.is_editing() {
+            self.host_root.cancel();
+            self.host_root_notice = None;
+        }
+        if self.workspace_path.is_editing() {
+            self.workspace_path.cancel();
+            self.workspace_notice = None;
         }
     }
 

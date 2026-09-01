@@ -903,6 +903,22 @@ const fn compact_layout(area: Rect) -> bool {
     area.width < 60 || area.height < 18
 }
 
+/// How many form rows a settings frame of this size actually puts on screen.
+///
+/// The pane keeps a status row, a navigation row, its own two borders and the
+/// footer, and `Paragraph` clips whatever does not fit rather than scrolling.
+/// A click below the last drawn row — on the footer, or anywhere on a form
+/// taller than the pane — must therefore reach nothing: resolved against the
+/// unclipped row list it would activate a control the operator never saw, which
+/// on these screens means *Save* instead of *Reset*.
+const fn settings_content_rows(size: Rect) -> u16 {
+    if size.width < 12 || size.height < 5 {
+        // `render` draws the one-line fallback instead of a form.
+        return 0;
+    }
+    size.height.saturating_sub(SETTINGS_FIRST_ROW + 2)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
     pub screen: Screen,
@@ -952,6 +968,11 @@ impl AppState {
     }
 
     fn open_screen(&mut self, screen: Screen) {
+        // A path control captures the keyboard, and only a settings screen
+        // draws one. Leaving by mouse is the one navigation an open editor
+        // cannot swallow, so the editor is closed here rather than left to eat
+        // every key pressed on the screen the operator went to.
+        self.settings.cancel_editing();
         self.screen = screen;
         if let Some(read_only) = read_only_screen(screen) {
             self.screen_model.apply(ScreenAction::Open(read_only));
@@ -1150,16 +1171,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             //
             // A host with no policies is the state every new install starts in,
             // so it gets an answer rather than a diagnostic.
-            let Some(target) = selected_repository_target(state) else {
-                state.settings.show_notice(
-                    "No repository is configured on this host yet.\n\n\
-                     Add one from a terminal:\n  \
-                     runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
-                     Then press [r] to select it and [s] to configure it.",
-                );
-                return Vec::new();
-            };
-            return vec![Effect::Settings(SettingsCommand::LoadPolicy(target))];
+            return open_repository_settings(state);
         }
         KeyCode::Char('h') => {
             state.open_screen(Screen::HostSettings);
@@ -1273,11 +1285,7 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 state.focus = Focus::Navigation;
                 return match screen {
                     Screen::HostSettings => vec![Effect::Settings(SettingsCommand::LoadHost)],
-                    Screen::RepositorySettings => {
-                        vec![Effect::Settings(SettingsCommand::LoadPolicy(
-                            selected_repository_target(state).unwrap_or_default(),
-                        ))]
-                    }
+                    Screen::RepositorySettings => open_repository_settings(state),
                     _ => Vec::new(),
                 };
             } else {
@@ -1300,6 +1308,7 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                     state.screen,
                     Screen::HostSettings | Screen::RepositorySettings
                 ) && mouse.row >= SETTINGS_FIRST_ROW
+                    && mouse.row - SETTINGS_FIRST_ROW < settings_content_rows(state.size)
                     && let Some(command) = state.settings.click(
                         mouse.row - SETTINGS_FIRST_ROW,
                         settings::content_width(state.size.width),
@@ -1315,6 +1324,33 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         _ => {}
     }
     Vec::new()
+}
+
+/// What Repository Settings loads, whichever way the operator asked for it.
+///
+/// -------------------------------------------------------------------------
+/// THERE MAY BE NO REPOSITORY TO CONFIGURE, AND THAT IS NOT AN ERROR.
+/// -------------------------------------------------------------------------
+/// `unwrap_or_default()` here sent an EMPTY target into the policy loader,
+/// which parsed it and failed with "an organization login must not be empty" —
+/// a message about a parser, shown to somebody who opened the screen on a host
+/// that has no policies yet. The screen then sat on "Loading settings..."
+/// forever, because nothing was ever going to load.
+///
+/// A host with no policies is the state every new install starts in, so it gets
+/// an answer rather than a diagnostic — and it gets the same answer from the
+/// `s` key and from the navigation bar, which is why both go through here.
+fn open_repository_settings(state: &mut AppState) -> Vec<Effect> {
+    let Some(target) = selected_repository_target(state) else {
+        state.settings.show_notice(
+            "No repository is configured on this host yet.\n\n\
+             Add one from a terminal:\n  \
+             runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
+             Then press [r] to select it and [s] to configure it.",
+        );
+        return Vec::new();
+    };
+    vec![Effect::Settings(SettingsCommand::LoadPolicy(target))]
 }
 
 fn selected_repository_target(state: &AppState) -> Option<String> {
@@ -3335,6 +3371,59 @@ mod tests {
         reduce(&mut state, key(KeyCode::Esc));
         assert!(!state.settings.is_editing());
         assert_eq!(state.screen, Screen::HostSettings);
+    }
+
+    /// Navigating away with the mouse closes the editor that owns the keyboard.
+    ///
+    /// The editor swallows every key, so the navigation bar is the one way out
+    /// of a settings screen it cannot intercept. Left open, it went on
+    /// swallowing keys on the screen the operator had moved to: `q` typed a `q`
+    /// into a field nothing was drawing any more, and the TUI could not be
+    /// quit.
+    #[test]
+    fn leaving_a_settings_screen_by_mouse_closes_the_path_editor() {
+        let (_root, context, _target) = workspace_context();
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        let effects = reduce(&mut state, key(KeyCode::Char('h')));
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("h must load the host form")
+        };
+        state.settings.execute(&context, command);
+        let control = state
+            .settings
+            .controls()
+            .iter()
+            .position(|control| *control == settings::Control::HostRunnerRoot)
+            .unwrap();
+        for _ in 0..control {
+            reduce(&mut state, key(KeyCode::Down));
+        }
+        reduce(&mut state, key(KeyCode::Enter));
+        assert!(state.settings.is_editing());
+
+        let dashboard = state
+            .navigation
+            .items
+            .iter()
+            .find(|item| item.screen == Screen::Dashboard)
+            .expect("the navigation bar always offers the dashboard")
+            .area;
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                dashboard.x,
+                dashboard.y,
+            ),
+        );
+        assert_eq!(state.screen, Screen::Dashboard);
+        assert!(
+            !state.settings.is_editing(),
+            "a field no frame draws may not keep the keyboard"
+        );
+
+        reduce(&mut state, key(KeyCode::Char('q')));
+        assert!(state.should_exit, "q must still quit");
     }
 
     /// The key help names the path-control keys, because a control whose only
