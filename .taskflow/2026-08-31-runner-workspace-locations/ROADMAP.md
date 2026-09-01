@@ -72,7 +72,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🟣 | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40) open, held for gate 2 | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
-| [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | 🔵 | run `01a05d10-6cea-703f-bb33-6bdbe8c86ab7` | 2026-09-01 |
+| [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | ✅ | [PR #41](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/41), merge `bb30b7f` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | ✅ | [PR #39](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/39), merge `1ece70c` | 2026-09-01 |
 | [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | 🔵 | run `01a05d2e-d03f-70b8-80fd-523601830504` | 2026-09-01 |
 | [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
@@ -176,6 +176,10 @@ directory untouched.
 - `b2-windows-root-acl` reached `land` and opened PR #40. The pre-merge guard
   halted the run before the squash-merge, so the pull request stays open for
   human gate 2. The run resumes at `land` once the owner records GO.
+- `c3-persistent-cleanup-recovery` landed as PR #41 / `bb30b7f` with all seven
+  required checks green; retention, link/junction fail-closed, quarantine
+  across restart, journal-only recovery, and untouched old slots each have a
+  named test in `crates/agent/src/lifecycle.rs`.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
