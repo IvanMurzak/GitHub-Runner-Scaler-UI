@@ -1075,19 +1075,31 @@ fn retained_runner_root(change: &RootAccessChange) -> Option<String> {
     matches!(reversal, Reversal::Retained { .. }).then(|| reversal.to_string())
 }
 
-/// [`retained_runner_root`], folded into the error a failed operation returns.
+/// The error a failed step returns once both of its rollbacks have been
+/// attempted.
+///
+/// `retained` is [`retained_runner_root`]'s answer and `rollback` is what
+/// undoing the *registration* reported — whatever it reports on success, which
+/// a failure has no use for. Both arrive already evaluated, because each may be
+/// attempted exactly once and the order is the caller's to choose.
 ///
 /// A complete rollback leaves `cause` exactly as it was: the operator's problem
 /// is what failed, not the tidying up afterwards. An incomplete one is promoted
 /// to [`ServiceError::Rollback`], which is the variant that exists to say "this
-/// failed *and* something is left behind".
-fn undo_runner_root(
-    change: &RootAccessChange,
+/// failed *and* something is left behind" — and it names everything that did.
+fn rolled_back<T>(
+    retained: Option<String>,
+    rollback: Result<T, ServiceError>,
     operation: &'static str,
     identity: &ServiceIdentity,
     cause: ServiceError,
 ) -> ServiceError {
-    match retained_runner_root(change) {
+    let left_behind = match (rollback.err(), retained) {
+        (Some(rollback), Some(retained)) => Some(format!("{rollback}; {retained}")),
+        (Some(rollback), None) => Some(rollback.to_string()),
+        (None, retained) => retained,
+    };
+    match left_behind {
         Some(rollback) => ServiceError::Rollback {
             operation,
             name: identity.name().to_string(),
@@ -1096,6 +1108,23 @@ fn undo_runner_root(
         },
         None => cause,
     }
+}
+
+/// [`rolled_back`] for a failure with nothing registered yet, where the runner
+/// root is the only thing there is to undo.
+fn undo_runner_root(
+    change: &RootAccessChange,
+    operation: &'static str,
+    identity: &ServiceIdentity,
+    cause: ServiceError,
+) -> ServiceError {
+    rolled_back(
+        retained_runner_root(change),
+        Ok(()),
+        operation,
+        identity,
+        cause,
+    )
 }
 
 /// Makes a path absolute without resolving symlinks.
@@ -3425,27 +3454,13 @@ impl ServiceOperations {
         let review = review_least_privilege(&definition, &plan);
         let record = InstallRecord::of(&plan, &definition, Utc::now());
         if let Err(cause) = record.write(&self.paths) {
-            let retained = retained_runner_root(&root);
-            if let Err(rollback) = control.uninstall(&self.identity) {
-                return Err(ServiceError::Rollback {
-                    operation: "install",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback: match retained {
-                        Some(note) => format!("{rollback}; {note}"),
-                        None => rollback.to_string(),
-                    },
-                });
-            }
-            return Err(match retained {
-                Some(rollback) => ServiceError::Rollback {
-                    operation: "install",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback,
-                },
-                None => cause,
-            });
+            return Err(rolled_back(
+                retained_runner_root(&root),
+                control.uninstall(&self.identity),
+                "install",
+                &self.identity,
+                cause,
+            ));
         }
         Ok(Installed {
             plan,
@@ -3595,27 +3610,13 @@ impl ServiceOperations {
         };
         let next_record = InstallRecord::of(&plan, &definition, record.installed_at);
         if let Err(cause) = next_record.write(&self.paths) {
-            let retained = retained_runner_root(&root);
-            if let Err(rollback) = target.uninstall(&self.identity) {
-                return Err(ServiceError::Rollback {
-                    operation: "switch start mode",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback: match retained {
-                        Some(note) => format!("{rollback}; {note}"),
-                        None => rollback.to_string(),
-                    },
-                });
-            }
-            return Err(match retained {
-                Some(rollback) => ServiceError::Rollback {
-                    operation: "switch start mode",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback,
-                },
-                None => cause,
-            });
+            return Err(rolled_back(
+                retained_runner_root(&root),
+                target.uninstall(&self.identity),
+                "switch start mode",
+                &self.identity,
+                cause,
+            ));
         }
 
         // Only after the target registration and its durable record exist is
@@ -3624,27 +3625,13 @@ impl ServiceOperations {
         if let Err(cause) = self.controls.control(from)?.uninstall(&self.identity) {
             let target_rollback = target.uninstall(&self.identity);
             let record_rollback = record.write(&self.paths);
-            let retained = retained_runner_root(&root);
-            if let Err(rollback) = target_rollback.and(record_rollback) {
-                return Err(ServiceError::Rollback {
-                    operation: "switch start mode",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback: match retained {
-                        Some(note) => format!("{rollback}; {note}"),
-                        None => rollback.to_string(),
-                    },
-                });
-            }
-            return Err(match retained {
-                Some(rollback) => ServiceError::Rollback {
-                    operation: "switch start mode",
-                    name: self.identity.name().to_string(),
-                    cause: cause.to_string(),
-                    rollback,
-                },
-                None => cause,
-            });
+            return Err(rolled_back(
+                retained_runner_root(&root),
+                target_rollback.and(record_rollback),
+                "switch start mode",
+                &self.identity,
+                cause,
+            ));
         }
         Ok(StartModeChange {
             from,

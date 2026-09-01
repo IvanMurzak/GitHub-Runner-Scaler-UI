@@ -74,22 +74,21 @@ fn record_start(path: &std::path::Path) {
 /// Flags are skipped rather than counted past. A boot registration also carries
 /// `--windows-service-host`, and where the installer chooses to put it is not
 /// something this fixture should have an opinion about.
-fn path_arguments() -> Vec<PathBuf> {
+fn path_arguments() -> impl Iterator<Item = PathBuf> {
     std::env::args_os()
         .skip(1)
         .filter(|argument| !argument.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
-        .collect()
 }
 
 /// The heartbeat file this instance was registered with.
 fn heartbeat_path() -> Option<PathBuf> {
-    path_arguments().into_iter().next()
+    path_arguments().next()
 }
 
 /// The runner root this instance was asked to exercise, when it was asked to.
 fn runner_root() -> Option<PathBuf> {
-    path_arguments().into_iter().nth(1)
+    path_arguments().nth(1)
 }
 
 /// Where the outcome of that exercise is written.
