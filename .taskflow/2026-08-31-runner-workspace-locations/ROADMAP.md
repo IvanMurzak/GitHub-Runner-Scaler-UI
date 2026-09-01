@@ -69,7 +69,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ✅ | [PR #34](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/34), merge `66ba5a8` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | ✅ | run `01a05ac7-b731-704b-8753-5aa75b0b4fdb` | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
-| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🔵 | run `01a05ca7-d5be-7000-829f-53ec8b04614e` | 2026-09-01 |
+| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🟣 | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40) open, held for gate 2 | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | 🔵 | run `01a05d10-6cea-703f-bb33-6bdbe8c86ab7` | 2026-09-01 |
@@ -173,6 +173,9 @@ directory untouched.
   named test in `crates/app/tests/workspace_commands.rs`.
 - Started `e1-workspace-tui` as run
   `01a05d2e-d03f-70b8-80fd-523601830504`.
+- `b2-windows-root-acl` reached `land` and opened PR #40. The pre-merge guard
+  halted the run before the squash-merge, so the pull request stays open for
+  human gate 2. The run resumes at `land` once the owner records GO.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
