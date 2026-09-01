@@ -38,6 +38,7 @@ use runner_manager_platform::secrets::SecretStore;
 use serde::Serialize;
 
 use super::host::{FALLBACK_COST_MULTIPLE, HostBudget, local_host, max_repository_targets};
+use super::workspace;
 use super::{CliError, Context, Failure, StatusArgs, write_failed};
 
 /// The version of the `status --json` document.
@@ -51,7 +52,61 @@ use super::{CliError, Context, Failure, StatusArgs, write_failed};
 /// happened before v1 was ever released — see [`Credential`] for why it went.
 /// A field removed after release would be exactly the case this number exists
 /// for.
+///
+/// # And still `1` after `d1` added the workspace fields
+///
+/// `03-migration-rollout.md` asks for "a schema version update or additive
+/// compatibility contract, whichever the existing status schema tests require",
+/// and the existing contract is the one written two paragraphs up: adding a
+/// field is compatible, so the version does not move. Every workspace field is
+/// an addition — `host.runner_root`, `host.runner_root_source`,
+/// `host.configured_runner_root`, the two ephemeral counts, and the five
+/// per-policy workspace fields. Nothing was removed, renamed, or given a new
+/// meaning, so a consumer written against v1 reads exactly what it read before
+/// and ignores the rest.
+///
+/// The claim is not left to a reading of the diff:
+/// `the_workspace_fields_are_additive_so_the_version_does_not_move` asserts both
+/// halves — that every v1 field is still present under its old name, and that
+/// the number is still `1`. A future change that renames one of them fails there
+/// and has to bump this constant.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The keys `status --json` emitted at v1, before `d1` added anything.
+///
+/// The other half of the additive contract above: a *pinned* list of what a v1
+/// consumer was promised, so "we only added fields" is measured rather than
+/// asserted. It is not the current schema — that is
+/// `the_documented_schema_is_the_one_that_is_emitted`, which grows — and it must
+/// never be edited to match a rename. A rename is a version bump.
+#[cfg(test)]
+const SCHEMA_V1_HOST_FIELDS: &[&str] = &[
+    "architecture",
+    "capacity",
+    "configured",
+    "display_name",
+    "headroom",
+    "id",
+    "in_use",
+    "os",
+    "refresh_interval_secs",
+    "service_start_mode",
+];
+
+/// As [`SCHEMA_V1_HOST_FIELDS`], for one policy.
+#[cfg(test)]
+const SCHEMA_V1_POLICY_FIELDS: &[&str] = &[
+    "active_attempts",
+    "enabled",
+    "id",
+    "max_capacity",
+    "min_capacity",
+    "mode",
+    "routing_labels",
+    "scope",
+    "state",
+    "target",
+];
 
 // ---------------------------------------------------------------------------
 // The document
@@ -126,6 +181,27 @@ pub struct HostSnapshot {
     pub headroom: u16,
     pub service_start_mode: String,
     pub refresh_interval_secs: u16,
+    /// Where disposable runner attempts are created, resolved.
+    ///
+    /// `null` only when the platform default could not be resolved at all; see
+    /// [`workspace::HostRoot`]. A consumer that needs the reason reads
+    /// `runner_root_unavailable`.
+    pub runner_root: Option<String>,
+    /// `platform_default` or `configured` — a structured field rather than a
+    /// display string, which is what `05-user-workflows.md`'s "Status JSON uses
+    /// structured mode, source, root, slot, and lease fields" asks for.
+    pub runner_root_source: String,
+    /// The stored override, or `null` when the platform default is in force.
+    /// Emitted beside the effective path so a consumer can tell "the operator
+    /// chose this" from "this is what the platform happens to give".
+    pub configured_runner_root: Option<String>,
+    /// Why `runner_root` is `null`, when it is.
+    pub runner_root_unavailable: Option<String>,
+    /// Uncleaned ephemeral attempts that still occupy host capacity.
+    pub active_ephemeral_attempts: u16,
+    /// Uncleaned ephemeral attempts that are terminal: they hold no capacity
+    /// and still own their directory, so they block a root change.
+    pub cleanup_blocked_ephemeral_attempts: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,18 +234,62 @@ pub struct PolicySnapshot {
     pub max_capacity: Option<u16>,
     pub routing_labels: Vec<String>,
     pub active_attempts: u16,
+    /// Terminal attempts of this policy that have not been cleaned. They hold
+    /// no capacity, still own their directory, and — if persistent — still hold
+    /// a slot lease, which is why they are counted apart from
+    /// [`Self::active_attempts`] rather than folded into it.
+    pub cleanup_blocked_attempts: u16,
+    /// `ephemeral` or `persistent`.
+    pub workspace_mode: String,
+    /// The configured persistent root, or `null` for an ephemeral policy.
+    pub workspace_root: Option<String>,
+    /// The directory this policy's next attempt is created under: its own root
+    /// when persistent, the effective host root when not.
+    pub workspace_effective_root: Option<String>,
+    /// Which of the three settings decided `workspace_effective_root`:
+    /// `repository`, `configured`, or `platform_default`. `d1` requires every
+    /// surface to "identify platform-default, configured, and
+    /// repository-specific sources", and naming it is cheaper for a consumer
+    /// than inferring it from whether `workspace_root` is null.
+    pub workspace_root_source: String,
+    /// Every slot this policy still leases. Empty for an ephemeral policy, and
+    /// never a file listing: `d1` requires these surfaces to identify a
+    /// workspace "without enumerating workspace files".
+    pub workspace_slots: Vec<SlotSnapshot>,
+}
+
+/// One durable slot lease.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotSnapshot {
+    pub slot: u16,
+    pub attempt: String,
+    pub state: String,
+    /// The attempt is terminal and uncleaned, so the slot is quarantined rather
+    /// than merely busy.
+    pub cleanup_blocked: bool,
+}
+
+impl From<&workspace::SlotLease> for SlotSnapshot {
+    fn from(lease: &workspace::SlotLease) -> Self {
+        Self {
+            slot: lease.slot,
+            attempt: lease.attempt.clone(),
+            state: lease.state.clone(),
+            cleanup_blocked: lease.cleanup_blocked,
+        }
+    }
 }
 
 impl PolicySnapshot {
-    fn of(policy: &ScalePolicy, active_attempts: u16) -> Self {
+    fn of(
+        policy: &ScalePolicy,
+        active_attempts: u16,
+        workspace: &workspace::RepositoryWorkspace,
+    ) -> Self {
         Self {
             id: policy.id.to_string(),
             target: policy.target.slug(),
-            scope: match policy.target.scope() {
-                runner_manager_domain::model::TargetScope::Repository => "repository",
-                runner_manager_domain::model::TargetScope::Organization => "organization",
-            }
-            .to_string(),
+            scope: workspace::scope_token(policy.target.scope()).to_string(),
             mode: match policy.mode() {
                 PolicyMode::MonitorOnly => "monitor_only",
                 PolicyMode::Autoscale(_) => "autoscale",
@@ -184,6 +304,15 @@ impl PolicySnapshot {
                 .map(registration_labels)
                 .unwrap_or_default(),
             active_attempts,
+            cleanup_blocked_attempts: workspace.attempts.cleanup_blocked,
+            workspace_mode: workspace.kind().to_string(),
+            workspace_root: workspace
+                .policy
+                .root()
+                .map(|root| root.as_str().to_string()),
+            workspace_effective_root: workspace.effective_root().map(str::to_string),
+            workspace_root_source: workspace.root_source().to_string(),
+            workspace_slots: workspace.leases.iter().map(SlotSnapshot::from).collect(),
         }
     }
 }
@@ -249,6 +378,16 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
 
+    let runner_root = workspace::host_root(context.paths(), host.as_ref());
+    let ephemeral = workspace::host_affected_attempts(&store)?;
+    // The same `runner_root` every policy's ephemeral fallback reports, so the
+    // host block and the policy block of one document cannot disagree about
+    // where the next disposable attempt goes.
+    let workspaces = policies
+        .iter()
+        .map(|policy| workspace::repository_workspace(&store, &runner_root, policy))
+        .collect::<Result<Vec<_>, CliError>>()?;
+
     Ok(StatusDocument {
         schema_version: SCHEMA_VERSION,
         generated_at: context.clock().now(),
@@ -273,6 +412,15 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
             headroom: capacity.saturating_sub(in_use),
             service_start_mode: start_mode.to_string(),
             refresh_interval_secs: interval.as_secs(),
+            runner_root: runner_root.effective_text().map(str::to_string),
+            runner_root_source: runner_root.source().as_token().to_string(),
+            configured_runner_root: runner_root
+                .configured
+                .as_ref()
+                .map(|root| root.as_str().to_string()),
+            runner_root_unavailable: runner_root.unavailable.clone(),
+            active_ephemeral_attempts: ephemeral.active,
+            cleanup_blocked_ephemeral_attempts: ephemeral.cleanup_blocked,
         },
         budget: BudgetSnapshot {
             interval_secs: interval.as_secs(),
@@ -288,7 +436,14 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         },
         policies: policies
             .iter()
-            .map(|policy| PolicySnapshot::of(policy, active_count_for(policy.id, attempts.iter())))
+            .zip(workspaces.iter())
+            .map(|(policy, workspace)| {
+                PolicySnapshot::of(
+                    policy,
+                    active_count_for(policy.id, attempts.iter()),
+                    workspace,
+                )
+            })
             .collect(),
     })
 }
@@ -358,6 +513,24 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     )?;
     writeln!(
         out,
+        "  runner root               {} ({})",
+        document
+            .host
+            .runner_root
+            .as_deref()
+            .unwrap_or("unavailable"),
+        document.host.runner_root_source.replace('_', "-"),
+    )?;
+    if let Some(reason) = &document.host.runner_root_unavailable {
+        writeln!(out, "  runner root problem       {reason}")?;
+    }
+    writeln!(
+        out,
+        "  ephemeral paths           {} active, {} awaiting cleanup",
+        document.host.active_ephemeral_attempts, document.host.cleanup_blocked_ephemeral_attempts
+    )?;
+    writeln!(
+        out,
         "  credential                {} in the {}-scoped store",
         if document.credential.present {
             "present"
@@ -382,6 +555,32 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
             "  {:<40} {:<13} {:<10} {} active",
             policy.target, policy.mode, policy.state, policy.active_attempts
         )?;
+        // `05-user-workflows.md`, "Status and activity": the two attempt shapes
+        // are distinguished by their workspace, and a blocked slot says so
+        // rather than being read as an ordinary busy one.
+        writeln!(
+            out,
+            "  {:<40} {} attempt in {}",
+            "",
+            policy.workspace_mode,
+            policy
+                .workspace_effective_root
+                .as_deref()
+                .unwrap_or("an unresolved root"),
+        )?;
+        for slot in &policy.workspace_slots {
+            writeln!(
+                out,
+                "  {:<40} slot s{} {}",
+                "",
+                slot.slot,
+                if slot.cleanup_blocked {
+                    "cleanup blocked; quarantined until remediation"
+                } else {
+                    "leased by a live attempt"
+                }
+            )?;
+        }
     }
     writeln!(out)?;
 
@@ -434,6 +633,12 @@ mod tests {
                 headroom: 1,
                 service_start_mode: "boot".to_string(),
                 refresh_interval_secs: 60,
+                runner_root: Some("C:/rman".to_string()),
+                runner_root_source: "platform_default".to_string(),
+                configured_runner_root: None,
+                runner_root_unavailable: None,
+                active_ephemeral_attempts: 1,
+                cleanup_blocked_ephemeral_attempts: 0,
             },
             budget: BudgetSnapshot {
                 interval_secs: 60,
@@ -458,6 +663,17 @@ mod tests {
                 max_capacity: Some(1),
                 routing_labels: vec!["rm-home-win-x64".to_string()],
                 active_attempts: 1,
+                cleanup_blocked_attempts: 0,
+                workspace_mode: "persistent".to_string(),
+                workspace_root: Some("D:/ci-cache/project".to_string()),
+                workspace_effective_root: Some("D:/ci-cache/project".to_string()),
+                workspace_root_source: "repository".to_string(),
+                workspace_slots: vec![SlotSnapshot {
+                    slot: 2,
+                    attempt: "00000000-0000-0000-0000-000000000020".to_string(),
+                    state: "busy".to_string(),
+                    cleanup_blocked: false,
+                }],
             }],
         }
     }
@@ -510,15 +726,21 @@ mod tests {
         assert_eq!(
             keys(&emitted, "/host"),
             [
+                "active_ephemeral_attempts",
                 "architecture",
                 "capacity",
+                "cleanup_blocked_ephemeral_attempts",
                 "configured",
+                "configured_runner_root",
                 "display_name",
                 "headroom",
                 "id",
                 "in_use",
                 "os",
                 "refresh_interval_secs",
+                "runner_root",
+                "runner_root_source",
+                "runner_root_unavailable",
                 "service_start_mode",
             ]
         );
@@ -541,6 +763,7 @@ mod tests {
             keys(&emitted, "/policies/0"),
             [
                 "active_attempts",
+                "cleanup_blocked_attempts",
                 "enabled",
                 "id",
                 "max_capacity",
@@ -550,7 +773,136 @@ mod tests {
                 "scope",
                 "state",
                 "target",
+                "workspace_effective_root",
+                "workspace_mode",
+                "workspace_root",
+                "workspace_root_source",
+                "workspace_slots",
             ]
+        );
+        assert_eq!(
+            keys(&emitted, "/policies/0/workspace_slots/0"),
+            ["attempt", "cleanup_blocked", "slot", "state"]
+        );
+    }
+
+    /// The additive compatibility contract [`SCHEMA_VERSION`] documents,
+    /// measured in both directions.
+    ///
+    /// `03-migration-rollout.md` allows "a schema version update **or** an
+    /// additive compatibility contract, whichever the existing status schema
+    /// tests require". This is that contract: every field a v1 consumer was
+    /// promised is still there under its old name, so the version does not move
+    /// — and if one of them is ever renamed, this fails and the rename has to
+    /// buy itself a version bump.
+    #[test]
+    fn the_workspace_fields_are_additive_so_the_version_does_not_move() {
+        let emitted = emitted();
+        let host = keys(&emitted, "/host");
+        for field in SCHEMA_V1_HOST_FIELDS {
+            assert!(
+                host.iter().any(|name| name == field),
+                "host.{field} was promised at schema v1 and is gone; that is a breaking \
+                 change and needs SCHEMA_VERSION bumped, not this list edited"
+            );
+        }
+        let policy = keys(&emitted, "/policies/0");
+        for field in SCHEMA_V1_POLICY_FIELDS {
+            assert!(
+                policy.iter().any(|name| name == field),
+                "policies[].{field} was promised at schema v1 and is gone"
+            );
+        }
+        assert_eq!(
+            SCHEMA_VERSION, 1,
+            "the workspace fields are additions, and an addition is compatible: a consumer \
+             reading only the fields it knows is unaffected"
+        );
+    }
+
+    /// The workspace surface is structured, not a display string a consumer has
+    /// to re-parse — `05-user-workflows.md`, "Status and activity".
+    #[test]
+    fn the_workspace_fields_are_structured_rather_than_rendered() {
+        let emitted = emitted();
+
+        assert_eq!(
+            emitted["host"]["runner_root_source"],
+            Value::from("platform_default"),
+            "the source is a token, not the hyphenated badge `host show` prints"
+        );
+        assert_eq!(emitted["host"]["configured_runner_root"], Value::Null);
+        assert!(emitted["host"]["active_ephemeral_attempts"].is_u64());
+        assert!(emitted["host"]["cleanup_blocked_ephemeral_attempts"].is_u64());
+
+        let policy = &emitted["policies"][0];
+        assert_eq!(policy["workspace_mode"], Value::from("persistent"));
+        assert_eq!(
+            policy["workspace_root_source"],
+            Value::from("repository"),
+            "the third source `d1` names: this repository's own setting, not the host's"
+        );
+        assert_eq!(
+            policy["workspace_root"],
+            Value::from("D:/ci-cache/project"),
+            "a persistent policy's root is its own, not the host's"
+        );
+        let slots = policy["workspace_slots"].as_array().expect("an array");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            slots[0]["slot"],
+            Value::from(2),
+            "the slot is a number, so a consumer never parses `s2`"
+        );
+        assert!(
+            slots[0]["cleanup_blocked"].as_bool().is_some(),
+            "quarantine is a boolean, not a state string a consumer has to know the \
+             vocabulary of"
+        );
+
+        // An ephemeral policy answers with the host root and no slots, so the
+        // two shapes are distinguishable without reading a display line.
+        let mut ephemeral = document();
+        ephemeral.policies[0].workspace_mode = "ephemeral".to_string();
+        ephemeral.policies[0].workspace_root = None;
+        ephemeral.policies[0].workspace_effective_root = ephemeral.host.runner_root.clone();
+        ephemeral.policies[0].workspace_root_source = "platform_default".to_string();
+        ephemeral.policies[0].workspace_slots.clear();
+        let mut buffer = Vec::new();
+        write_json(&mut buffer, &ephemeral).unwrap();
+        let value: Value = serde_json::from_slice(&buffer).unwrap();
+        assert_eq!(value["policies"][0]["workspace_root"], Value::Null);
+        assert_eq!(
+            value["policies"][0]["workspace_root_source"], value["host"]["runner_root_source"],
+            "an ephemeral policy inherits the host's source, and says which one it is"
+        );
+        assert_eq!(
+            value["policies"][0]["workspace_effective_root"],
+            value["host"]["runner_root"]
+        );
+        assert!(
+            value["policies"][0]["workspace_slots"]
+                .as_array()
+                .expect("an array")
+                .is_empty()
+        );
+    }
+
+    /// No surface lists what is inside a workspace — `d1`: the sources
+    /// "identify … without enumerating workspace files".
+    #[test]
+    fn no_rendering_enumerates_what_is_inside_a_workspace() {
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document()).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("persistent attempt in D:/ci-cache/project"),
+            "the human rendering names the root: {text}"
+        );
+        assert!(
+            !text.contains("_work"),
+            "a status line that named the retained directory would be one step from \
+             listing it: {text}"
         );
     }
 

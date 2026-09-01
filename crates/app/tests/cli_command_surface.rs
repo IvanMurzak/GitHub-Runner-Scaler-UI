@@ -25,7 +25,15 @@ use support::{run, runner_manager};
 /// Top-level commands, and for each family the subcommands under it.
 const SURFACE: [(&str, &[&str]); 8] = [
     ("auth", &["login", "status", "logout"]),
-    ("host", &["set-capacity", "show"]),
+    (
+        "host",
+        &[
+            "set-capacity",
+            "set-runtime-root",
+            "reset-runtime-root",
+            "show",
+        ],
+    ),
     (
         "repo",
         &[
@@ -35,6 +43,7 @@ const SURFACE: [(&str, &[&str]); 8] = [
             "set-scale",
             "add-label",
             "remove-label",
+            "set-workspace",
             "remove",
         ],
     ),

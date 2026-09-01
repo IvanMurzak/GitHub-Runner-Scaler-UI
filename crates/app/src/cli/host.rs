@@ -65,8 +65,10 @@ use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
 use runner_manager_github::rest::{
     BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
 };
+use runner_manager_platform::runner_root::RootOwner;
 use runner_manager_platform::secrets::SecretStore;
 
+use super::workspace;
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, write_failed};
 
 // ---------------------------------------------------------------------------
@@ -387,8 +389,36 @@ pub fn dispatch(
 ) -> Result<(), CliError> {
     match command {
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
+        HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), out),
+        HostCommand::ResetRuntimeRoot => runtime_root(context, None, out),
         HostCommand::Show => show(context, out),
     }
+}
+
+// ---------------------------------------------------------------------------
+// host set-runtime-root / host reset-runtime-root
+// ---------------------------------------------------------------------------
+
+/// `host set-runtime-root --path PATH` and `host reset-runtime-root` (D2/D11),
+/// which differ only in whether a path was given: `Some` configures a root,
+/// `None` returns to the platform default.
+///
+/// Nothing but argument parsing and rendering happens here: the ordering, the
+/// preflight, the two refusal counts and the fenced write are
+/// [`workspace::set_host_runner_root`], because `e1`'s Host Settings screen has
+/// to reach exactly the same decisions.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a path this host cannot hold,
+/// [`Failure::Conflict`] for affected attempts or a lost race, and
+/// [`Failure::LocalState`] for a journal or filesystem failure.
+fn runtime_root(context: &Context, raw: Option<&str>, out: &mut dyn Write) -> Result<(), CliError> {
+    let store = context.store()?;
+    let root = raw
+        .map(|raw| workspace::parse_root(raw, &RootOwner::Host))
+        .transpose()?;
+    let change = workspace::set_host_runner_root(context, &store, root)?;
+    workspace::write_root_change(out, &change)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +536,30 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     )
     .map_err(failed)?;
     writeln!(out, "  service start mode        {start_mode}").map_err(failed)?;
+
+    // -- where disposable runner attempts are created ---------------------
+    //
+    // Journey 1's three rows, in its order. The counts are the two a path
+    // change is refused behind, printed unconditionally so that an operator who
+    // is about to run `host set-runtime-root` already knows whether it will be
+    // accepted. No directory is listed: `d1` requires these surfaces to
+    // identify a workspace "without enumerating workspace files".
+    let runner_root = workspace::host_root(context.paths(), host.as_ref());
+    let affected = workspace::host_affected_attempts(&store)?;
+    writeln!(
+        out,
+        "  runner root               {}",
+        runner_root.rendered()
+    )
+    .map_err(failed)?;
+    writeln!(out, "  runner root source        {}", runner_root.source()).map_err(failed)?;
+    writeln!(out, "  active ephemeral paths    {}", affected.active).map_err(failed)?;
+    writeln!(
+        out,
+        "  cleanup-blocked paths     {}",
+        affected.cleanup_blocked
+    )
+    .map_err(failed)?;
 
     // -- the secret store ------------------------------------------------
     let secrets = context.secret_store(start_mode)?;

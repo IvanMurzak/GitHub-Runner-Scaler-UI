@@ -89,6 +89,12 @@ const COMMANDS: &[&[&str]] = &[
     &["--help"],
     &["auth", "status"],
     &["host", "set-capacity", "2"],
+    // `d1`'s two host-root commands. `reset-runtime-root` is the pair member
+    // that needs no argument: `set-runtime-root --path` would need a directory
+    // that exists on every CI leg and overlaps no application data, which is a
+    // per-run temporary path and cannot be written in a `const`. Its output is
+    // scanned by `workspace_commands.rs` instead, where a `TempDir` is in scope.
+    &["host", "reset-runtime-root"],
     &["host", "show"],
     &[
         "repo",
@@ -102,6 +108,9 @@ const COMMANDS: &[&[&str]] = &[
     &["repo", "list"],
     &["repo", "set-capacity", "acme/repo", "--max-capacity", "2"],
     &["repo", "set-scale", "acme/repo", "--enabled", "true"],
+    // The ephemeral half of `repo set-workspace`, for the same reason as
+    // `reset-runtime-root` above: it is the spelling that takes no path.
+    &["repo", "set-workspace", "acme/repo", "--mode", "ephemeral"],
     &["repo", "remove", "acme/repo"],
     &[
         "org",
