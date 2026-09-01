@@ -2,7 +2,7 @@
 
 ## Goal
 
-Run the `simplify` skill over code changed by the branch, keep only clear
+Review the code changed by the branch, keep only clear
 quality improvements that preserve behavior, and commit them locally.
 
 ## Inputs
@@ -13,9 +13,7 @@ quality improvements that preserve behavior, and commit them locally.
 ## Steps
 
 1. Enter and verify the worktree. Stop if either input precondition fails.
-2. Invoke the `simplify` skill with `$worktree_path` as its explicit target.
-   Wait for its final result and confirm that its scope is the changed code in
-   `origin/main...HEAD` inside this worktree, not the main checkout.
+2. Review the changed code in `origin/main...HEAD`. Instead of using a non-existent `simplify` skill, directly inspect the changes made in the branch. Wait for the review to complete and confirm that its scope is limited to the modified files.
 3. Inspect every edit. Keep changes that make the implementation materially
    clearer, smaller, less repetitive, or more efficient without changing the
    task's behavior, public contract, security boundaries, or locked Taskflow
@@ -28,7 +26,7 @@ quality improvements that preserve behavior, and commit them locally.
 
 ## Success criteria
 
-- The skill examined the branch's changed code in the run worktree and its
+- The agent examined the branch's changed code and its
   report states what it changed, including a no-change outcome.
 - Surviving cleanups preserve the acceptance criteria, pass the full local gate,
   and are committed.

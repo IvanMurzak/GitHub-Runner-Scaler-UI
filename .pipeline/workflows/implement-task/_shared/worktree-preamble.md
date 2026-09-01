@@ -1,8 +1,8 @@
 # Worktree and repository discipline — binds every step
 
-This run uses `isolation: run`. The pipeline CLI provisions one external git
+This run may use `isolation: run`, where the pipeline CLI provisions one external git
 worktree before `implement`; every step shares that checkout and its local
-`worktree-<run>` branch. The dispatch provides:
+`worktree-<run>` branch. If isolated, the dispatch provides:
 
 - `$worktree_path` — absolute path to the run checkout.
 - `$worktree_env_file` — dotenv file containing `WORKTREE_PATH`,
@@ -10,7 +10,7 @@ worktree before `implement`; every step shares that checkout and its local
 
 Rules for every step:
 
-1. **Enter and verify the worktree first.** Start the first shell call with:
+1. **Enter and verify the worktree first (if isolated).** If `$worktree_path` and `$worktree_env_file` are provided, start the first shell call with:
 
    ```bash
    cd "$worktree_path" && set -a && source "$worktree_env_file" && set +a
@@ -18,7 +18,7 @@ Rules for every step:
 
    Before writing, verify that `git rev-parse --show-toplevel` is the worktree,
    the current branch equals `$WORKTREE_BRANCH`, and that branch starts with
-   `worktree-`. Never edit the main checkout at `$PROJECT_ROOT`.
+   `worktree-`. Never edit the main checkout at `$PROJECT_ROOT` if isolated. If isolation variables are not provided, operate directly in the current repository.
 
 2. **Keep GitHub writes in `land`.** `implement`, `code-review`, and `simplify`
    may read an explicitly referenced issue, but must not push, create/update a
