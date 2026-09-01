@@ -600,6 +600,17 @@ impl Store for TargetRecoveryStore {
         self.inner.hosts()
     }
 
+    fn set_runner_root_override(
+        &self,
+        id: runner_manager_domain::model::HostId,
+        expected: Option<&runner_manager_domain::path::LocalAbsolutePath>,
+        new_root: Option<&runner_manager_domain::path::LocalAbsolutePath>,
+        expected_uncleaned: u16,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner
+            .set_runner_root_override(id, expected, new_root, expected_uncleaned)
+    }
+
     fn insert_policy(
         &self,
         policy: &ScalePolicy,
@@ -623,6 +634,19 @@ impl Store for TargetRecoveryStore {
     ) -> Result<(), runner_manager_domain::store::StoreError> {
         self.inner
             .update_policy_confirming_active_count(policy, expected_revision, expected_active)
+    }
+
+    fn update_policy_confirming_uncleaned_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_uncleaned: u16,
+    ) -> Result<(), runner_manager_domain::store::StoreError> {
+        self.inner.update_policy_confirming_uncleaned_count(
+            policy,
+            expected_revision,
+            expected_uncleaned,
+        )
     }
 
     fn remove_policy(
@@ -682,6 +706,50 @@ impl Store for TargetRecoveryStore {
         runner_manager_domain::store::StoreError,
     > {
         self.inner.attempts_for_policy(policy_id)
+    }
+
+    // The four workspace reads below are per-policy or host-wide *facts*, not
+    // the host-wide capacity view `attempts` narrows during recovery, so they
+    // delegate unchanged. Narrowing a slot-lease read would be actively wrong:
+    // a lease held by a policy this launcher is not recovering still excludes
+    // its slot, and hiding it would let a second attempt take the same `sN`.
+    fn active_attempts_for_policy(
+        &self,
+        policy_id: runner_manager_domain::model::PolicyId,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.active_attempts_for_policy(policy_id)
+    }
+
+    fn uncleaned_attempts_for_policy(
+        &self,
+        policy_id: runner_manager_domain::model::PolicyId,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.uncleaned_attempts_for_policy(policy_id)
+    }
+
+    fn slot_leases_for_policy(
+        &self,
+        policy_id: runner_manager_domain::model::PolicyId,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.slot_leases_for_policy(policy_id)
+    }
+
+    fn uncleaned_ephemeral_attempts(
+        &self,
+    ) -> Result<
+        Vec<runner_manager_domain::attempt::RunnerAttempt>,
+        runner_manager_domain::store::StoreError,
+    > {
+        self.inner.uncleaned_ephemeral_attempts()
     }
 
     fn remove_attempt(
