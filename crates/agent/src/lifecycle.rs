@@ -1620,7 +1620,10 @@ impl LifecycleLauncher {
         };
 
         runner_manager_platform::runner_root::RootPreflight::new(&self.app_paths)
-            .check(&runner_manager_platform::runner_root::RootOwner::Host, &effective_root)
+            .check(
+                &runner_manager_platform::runner_root::RootOwner::Host,
+                &effective_root,
+            )
             .map_err(|e| LifecycleError::Failed(FailureReason::Other(e.to_string())))?;
 
         let labels = policy
@@ -2692,7 +2695,8 @@ mod tests {
         let id = AttemptId::new_random();
         let runtime = harness
             .launcher
-            .app_paths.runtime_dir()
+            .app_paths
+            .runtime_dir()
             .join(harness.policy.id.to_string())
             .join(id.to_string());
         fs::create_dir_all(&runtime).unwrap();
@@ -2732,7 +2736,11 @@ mod tests {
     async fn expired_jit_returns_intent_but_never_launches_inside_lifecycle() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.app_paths.runtime_dir().join("expired-with-demand");
+        let runtime = harness
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("expired-with-demand");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -2889,7 +2897,11 @@ mod tests {
     async fn spawn_before_starting_crash_recovers_pid_then_completes_and_cleans() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.app_paths.runtime_dir().join("spawn-before-starting");
+        let runtime = harness
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("spawn-before-starting");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -2974,14 +2986,16 @@ mod tests {
                 Arc::new(FakeDemand::answering([false])),
             );
             let id = AttemptId::new_random();
-            let runtime = harness
-                .launcher
-                .app_paths.runtime_dir()
-                .join(if sidecar_already_present {
-                    "after-id-sidecar"
-                } else {
-                    "before-id-sidecar"
-                });
+            let runtime =
+                harness
+                    .launcher
+                    .app_paths
+                    .runtime_dir()
+                    .join(if sidecar_already_present {
+                        "after-id-sidecar"
+                    } else {
+                        "before-id-sidecar"
+                    });
             fs::create_dir_all(&runtime).unwrap();
             let mut attempt =
                 RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
@@ -3041,12 +3055,20 @@ mod tests {
         let unknown_attempt = RunnerAttempt::allocate(
             AttemptId::new_random(),
             PolicyId::from_u128(0xfeed),
-            unknown.launcher.app_paths.runtime_dir().join("unknown-policy"),
+            unknown
+                .launcher
+                .app_paths
+                .runtime_dir()
+                .join("unknown-policy"),
             unknown.clock.now(),
         );
         unknown.store.record_attempt(&unknown_attempt).unwrap();
         let expired_id = AttemptId::new_random();
-        let expired_runtime = unknown.launcher.app_paths.runtime_dir().join("expired-beside-unknown");
+        let expired_runtime = unknown
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("expired-beside-unknown");
         fs::create_dir_all(&expired_runtime).unwrap();
         let mut expired = RunnerAttempt::allocate(
             expired_id,
@@ -3089,7 +3111,11 @@ mod tests {
 
         let unreachable = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = unreachable.launcher.app_paths.runtime_dir().join("unreachable");
+        let runtime = unreachable
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("unreachable");
         fs::create_dir_all(&runtime).unwrap();
         unreachable
             .store
@@ -3211,7 +3237,11 @@ mod tests {
     async fn timeout_crash_recovery_returns_the_same_replacement_intent() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.app_paths.runtime_dir().join("timeout-after-crash");
+        let runtime = harness
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("timeout-after-crash");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
@@ -3260,7 +3290,11 @@ mod tests {
     async fn terminate_intent_sync_failure_prevents_signal_and_conclusion() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
         let id = AttemptId::new_random();
-        let runtime = harness.launcher.app_paths.runtime_dir().join("timeout-sync-failure");
+        let runtime = harness
+            .launcher
+            .app_paths
+            .runtime_dir()
+            .join("timeout-sync-failure");
         fs::create_dir_all(&runtime).unwrap();
         let mut attempt =
             RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
