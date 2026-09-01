@@ -1,0 +1,33 @@
+crates/domain/src/store.rs
+  s_a7897dea0ee60a::t_53d0fc7ac1a887 2595-2597,3119,3177,3208,3222,3225,3246,3249,3254
+  s_a7897dea0ee60a::t_d3023c182b308a 1317-1335
+  s_a7897dea0ee60a::t_df72e6b95207b9 5051-5057,5071-5080
+  s_a7897dea0ee60a::t_7fac381a76d6db 2354-2360,2365-2368
+  s_a7897dea0ee60a::t_87aba26c53566a 1437
+  s_a7897dea0ee60a::t_aafb69776c5f08 1705
+  s_a7897dea0ee60a::t_cdbd1f8fc22d73 813-845
+  s_a7897dea0ee60a::t_fcbf0fa4fdef2b 1495
+  s_a7897dea0ee60a::t_8cfaad61ea0254 1731,1738,1745,1752-1754
+  s_a7897dea0ee60a::t_dfd915ac5baf4c 5139
+  s_a7897dea0ee60a::t_a1f009cf27c65f 1274-1278
+  s_a7897dea0ee60a::t_39cfff6cba603a 2361-2364
+  s_a7897dea0ee60a::t_ec2174444ad8dd 863-864,870
+crates/domain/tests/store_journal.rs
+  s_a7897dea0ee60a::t_e728c0e35ae929 321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6df9fbfce8411863516fa757bb120bd7aef78b7b",
+  "prompts": {},
+  "sessions": {
+    "s_a7897dea0ee60a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "84286347-8ebd-48e3-8d49-c45c0e9f0b7f",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
