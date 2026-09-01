@@ -7,11 +7,10 @@
 defects were corrected; no unresolved P0 or P1 review finding remains.
 
 **Task status:** Eleven immutable task specifications derived 2026-08-31 with
-dependency-safe groups and execution waves. Wave 0 is blocked by pipeline
-worktree provisioning.
+dependency-safe groups and execution waves. Wave 0 retry is in progress.
 
-**Implementation status:** `a1-workspace-domain` halted before implementation:
-the `implement-task` pipeline requires missing consumer worktree hooks.
+**Implementation status:** `a1-workspace-domain` is retrying through the
+`implement-task` pipeline after local worktree-hook validation.
 
 **Repository/base:** `C:\Projects\AI\GitHub-Runner-Scaler-UI`; reviewed task
 derivation base `ce7945d` on `main`.
@@ -66,7 +65,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 
 | Task (spec) | needs | repo/base | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|---|
-| [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ⛔ | pipeline `01a05a32-9a13-7038-ae8e-1c1627317abf`: missing `.pipeline/.hooks/worktree-create.*` | 2026-08-31 |
+| [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | 🔵 | pipeline `01a05a53-1114-7064-b583-443a34020101` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | planned | none | 2026-08-31 |
 | [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | planned | none | 2026-08-31 |
@@ -135,3 +134,6 @@ directory untouched.
 - The run halted before creating a worktree because the installed Pipeline CLI
   requires `.pipeline/.hooks/worktree-create.*` for `isolation: run`; no task
   implementation step ran.
+- Validated the locally supplied hooks with an isolated create/destroy smoke
+  test and started retry run `01a05a53-1114-7064-b583-443a34020101`; the
+  original halted run remains diagnostic history.
