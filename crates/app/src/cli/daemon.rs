@@ -183,7 +183,7 @@ async fn run(
         ));
         let launcher = Arc::new(LifecycleLauncher::new(
             host.id,
-            context.paths().runtime_dir(),
+            context.paths().clone(),
             context.paths().logs_dir(),
             1,
             runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
@@ -1857,9 +1857,10 @@ mod tests {
                 Arc::clone(&store) as Arc<dyn Store>,
                 std::slice::from_ref(policy),
             ));
+            let app_paths = runner_manager_platform::paths::AppPaths::rooted_at(temporary.path());
             let launcher = LifecycleLauncher::new(
                 policy.to_persisted().host_id,
-                temporary.path().join("runtime"),
+                app_paths,
                 temporary.path().join("logs"),
                 1,
                 runner_manager_domain::attempt::RecoveryTimeouts::provisional(),
