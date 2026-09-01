@@ -1,0 +1,19 @@
+.pipeline/workflows/implement-task/pipeline.yml
+  s_47736fc0b3bef4::t_8e25b9cb195721 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "30f88e0194a1d94183ec4ec01915696ce73153d0",
+  "prompts": {},
+  "sessions": {
+    "s_47736fc0b3bef4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "506ce015-7c30-4aad-90d9-387028af6c8e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
