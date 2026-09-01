@@ -4,6 +4,7 @@ name: implement-task
 description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish once and squash-merge into main only after the full PR check rollup is green.
 
 execution: sequential
+runner: manager
 isolation: run
 base_branch: main
 
