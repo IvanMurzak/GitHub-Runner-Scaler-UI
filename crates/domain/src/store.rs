@@ -76,6 +76,7 @@ use crate::model::{
     ScaleTarget, StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
 };
 use crate::policy::{PersistedPolicy, PolicyError, PolicyState, RoutingLabels, ScalePolicy};
+use crate::workspace::WorkspaceKind;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1396,6 +1397,11 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
         enabled: bool_column(row, TABLE, "enabled", &key)?,
         state: token_column::<PolicyState>(row, TABLE, "state", &key)?,
         cache_policy: token_column::<CachePolicy>(row, TABLE, "cache_policy", &key)?,
+        // Schema 2 has no workspace columns, so every row loaded by this build
+        // is ephemeral — which is also what `a2`'s migration must produce for
+        // every historical row. It reads them from the schema-3 columns.
+        workspace_kind: WorkspaceKind::Ephemeral,
+        workspace_root: None,
         revision: u64_column(row, TABLE, "revision", &key)?,
     };
 
@@ -1417,6 +1423,11 @@ fn persisted_attempt_from_row(row: &Row<'_>) -> Result<PersistedAttempt, StoreEr
         outcome: json_column::<AttemptOutcome>(row, TABLE, "outcome", &key, "an attempt outcome")?,
         process_id: u32_option_column(row, TABLE, "process_id", &key)?,
         runtime_path: PathBuf::from(runtime_path),
+        // As for policies: schema 2 journals no workspace, so every attempt this
+        // build loads is ephemeral and keeps its exact stored path. `a2` reads
+        // the schema-3 columns here.
+        workspace_kind: WorkspaceKind::Ephemeral,
+        workspace_slot: None,
         created_at: timestamp_column(row, TABLE, "created_at", &key)?,
         terminal_at: timestamp_option_column(row, TABLE, "terminal_at", &key)?,
         last_state_change_at: timestamp_column(row, TABLE, "last_state_change_at", &key)?,

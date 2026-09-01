@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{AttemptId, Clock, Elapsed, HostId, PolicyId, Timestamp};
 use crate::policy::ScalePolicy;
+use crate::workspace::{AttemptWorkspace, WorkspaceError, WorkspaceKind};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -41,6 +42,11 @@ pub enum AttemptError {
         from: AttemptState,
         to: AttemptState,
     },
+
+    /// A stored workspace kind and slot that cannot describe one allocation, so
+    /// the legal cleanup algorithm for the journalled path is undecidable.
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
 
     #[error(
         "a busy attempt must not be cleaned; capacity is reclaimed only when an \
@@ -596,6 +602,16 @@ pub struct RunnerAttempt {
     outcome: Option<AttemptOutcome>,
     process_id: Option<u32>,
     runtime_path: PathBuf,
+    /// Which cleanup algorithm this attempt's directory is entitled to, and the
+    /// slot it leases if any.
+    ///
+    /// Immutable after allocation, by `02-target-architecture.md`: "The
+    /// workspace kind and slot number tell recovery which cleanup algorithm is
+    /// legal. Neither may change after allocation." Private with no setter is
+    /// how that is enforced — a mutable kind would let a running attempt convert
+    /// a disposable directory into a retained one, which is exactly the
+    /// two-job contamination path `04-security-recovery.md` measures.
+    workspace: AttemptWorkspace,
     pub created_at: Timestamp,
     terminal_at: Option<Timestamp>,
     last_state_change_at: Timestamp,
@@ -635,6 +651,14 @@ pub struct PersistedAttempt {
     pub outcome: Option<AttemptOutcome>,
     pub process_id: Option<u32>,
     pub runtime_path: PathBuf,
+    /// `ephemeral` or `persistent`, stored beside the slot below.
+    pub workspace_kind: WorkspaceKind,
+    /// The leased slot: `Some` exactly when `workspace_kind` is `persistent`,
+    /// and positive. It is a raw `u16` here rather than a `NonZeroU16` so that
+    /// the `0` a hand-edited row can hold is refused by
+    /// [`AttemptWorkspace::from_persisted`] instead of being unrepresentable at
+    /// the column boundary and panicking somewhere else.
+    pub workspace_slot: Option<u16>,
     /// When the runtime directory was allocated. Never moves.
     pub created_at: Timestamp,
     /// Set when, and only when, the attempt concluded.
@@ -660,6 +684,8 @@ impl RunnerAttempt {
             outcome: self.outcome.clone(),
             process_id: self.process_id,
             runtime_path: self.runtime_path.clone(),
+            workspace_kind: self.workspace.kind(),
+            workspace_slot: self.workspace.slot_number(),
             created_at: self.created_at,
             terminal_at: self.terminal_at,
             last_state_change_at: self.last_state_change_at,
@@ -669,11 +695,38 @@ impl RunnerAttempt {
     /// The first step of `e3`'s per-attempt flow: a runtime directory is
     /// allocated and journalled **before** anything remote happens, so a crash
     /// leaves a recoverable trace rather than an invisible one.
+    /// D3 keeps this the disposable path: an attempt allocated through it is
+    /// [`AttemptWorkspace::Ephemeral`], so every existing caller and test goes on
+    /// producing the behaviour it produced before persistent slots existed.
+    /// [`Self::allocate_in`] is the one that leases a slot.
     #[must_use]
     pub fn allocate(
         id: AttemptId,
         policy_id: PolicyId,
         runtime_path: impl Into<PathBuf>,
+        now: Timestamp,
+    ) -> Self {
+        Self::allocate_in(
+            id,
+            policy_id,
+            runtime_path,
+            AttemptWorkspace::Ephemeral,
+            now,
+        )
+    }
+
+    /// The same first step, recording which workspace the directory came from.
+    ///
+    /// `c2` calls this with [`AttemptWorkspace::PersistentSlot`] while holding
+    /// the host allocation lock, so the slot lease is journalled "before package
+    /// or GitHub effects" and a crash between the two leaves a recoverable trace
+    /// rather than an orphaned slot.
+    #[must_use]
+    pub fn allocate_in(
+        id: AttemptId,
+        policy_id: PolicyId,
+        runtime_path: impl Into<PathBuf>,
+        workspace: AttemptWorkspace,
         now: Timestamp,
     ) -> Self {
         Self {
@@ -684,6 +737,7 @@ impl RunnerAttempt {
             outcome: None,
             process_id: None,
             runtime_path: runtime_path.into(),
+            workspace,
             created_at: now,
             terminal_at: None,
             last_state_change_at: now,
@@ -706,10 +760,20 @@ impl RunnerAttempt {
             outcome,
             process_id,
             runtime_path,
+            workspace_kind,
+            workspace_slot,
             created_at,
             terminal_at,
             last_state_change_at,
         } = fields;
+
+        // The workspace pair is checked first because it decides which cleanup
+        // algorithm recovery is allowed to run on `runtime_path`. A row that
+        // claims `persistent` with no slot, or `ephemeral` with one, names a
+        // directory whose safe cleanup is undecidable, and
+        // `04-security-recovery.md` requires that to fail closed rather than to
+        // fall back to the destructive branch.
+        let workspace = AttemptWorkspace::from_persisted(workspace_kind, workspace_slot)?;
 
         match (&outcome, state.is_terminal()) {
             (None, true) => return Err(AttemptError::TerminalWithoutOutcome { state }),
@@ -781,6 +845,7 @@ impl RunnerAttempt {
             outcome,
             process_id,
             runtime_path,
+            workspace,
             created_at,
             terminal_at,
             last_state_change_at,
@@ -810,6 +875,27 @@ impl RunnerAttempt {
     #[must_use]
     pub fn runtime_path(&self) -> &Path {
         &self.runtime_path
+    }
+
+    /// The immutable allocation fact: disposable, or the persistent slot leased.
+    ///
+    /// There is no setter. Cleanup and recovery dispatch on this
+    /// (`02-target-architecture.md`, "Cleanup and recovery"), so a value that
+    /// could be changed after allocation would let the algorithm chosen for a
+    /// directory disagree with the one it was created under.
+    #[must_use]
+    pub const fn workspace(&self) -> AttemptWorkspace {
+        self.workspace
+    }
+
+    /// Whether this attempt holds a persistent slot lease.
+    ///
+    /// Every uncleaned persistent attempt is a lease, including a terminal one
+    /// whose cleanup failed — which is why this asks about the workspace and not
+    /// about the state.
+    #[must_use]
+    pub const fn holds_slot_lease(&self) -> bool {
+        self.workspace.is_persistent() && !matches!(self.state, AttemptState::Cleaned)
     }
 
     #[must_use]
@@ -2125,6 +2211,193 @@ mod tests {
     }
 
     // =======================================================================
+    // Workspace allocation (D3, D5, D6)
+    // =======================================================================
+
+    fn slot(n: u16) -> AttemptWorkspace {
+        AttemptWorkspace::persistent_slot(std::num::NonZeroU16::new(n).expect("a positive slot"))
+    }
+
+    /// The unremarkable outcome for a terminal state, so a fixture does not have
+    /// to restate the state/outcome pairing the loader enforces.
+    fn terminal_outcome(state: AttemptState) -> AttemptOutcome {
+        match state {
+            AttemptState::Failed => {
+                AttemptOutcome::failed(FailureReason::ProcessExitedUnexpectedly)
+            }
+            AttemptState::Orphaned => AttemptOutcome::Orphaned,
+            _ => AttemptOutcome::CompletedJob,
+        }
+    }
+
+    #[test]
+    fn the_ordinary_constructor_still_allocates_a_disposable_workspace() {
+        // D3: disposable mode remains the default, so every existing caller of
+        // `allocate` keeps the cleanup behaviour it had.
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "runtime/p/a",
+            ts(0),
+        );
+        assert_eq!(attempt.workspace(), AttemptWorkspace::Ephemeral);
+        assert_eq!(attempt.workspace().slot(), None);
+        assert!(!attempt.holds_slot_lease());
+        assert_eq!(
+            attempt.to_persisted().workspace_kind,
+            WorkspaceKind::Ephemeral
+        );
+        assert_eq!(attempt.to_persisted().workspace_slot, None);
+    }
+
+    #[test]
+    fn a_persistent_attempt_journals_the_slot_it_leased() {
+        let attempt = RunnerAttempt::allocate_in(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "/srv/rman/acme/s2",
+            slot(2),
+            ts(0),
+        );
+        assert_eq!(attempt.workspace(), slot(2));
+        assert_eq!(attempt.workspace().slot_number(), Some(2));
+        assert_eq!(
+            attempt.workspace().slot_directory_name().as_deref(),
+            Some("s2")
+        );
+        assert_eq!(attempt.runtime_path(), Path::new("/srv/rman/acme/s2"));
+        assert!(attempt.holds_slot_lease());
+    }
+
+    #[test]
+    fn the_workspace_kind_and_slot_do_not_change_after_allocation() {
+        // `02-target-architecture.md`: "Neither may change after allocation."
+        // There is no setter, so the property is proved by driving the whole
+        // lifecycle and reading the value back at every step.
+        let mut attempt = RunnerAttempt::allocate_in(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "/srv/rman/acme/s1",
+            slot(1),
+            ts(0),
+        );
+        attempt
+            .jit_received(ts(1))
+            .expect("allocated -> jit_received");
+        assert_eq!(attempt.workspace(), slot(1));
+        attempt
+            .started(4242, ts(2))
+            .expect("jit_received -> starting");
+        assert_eq!(attempt.workspace(), slot(1));
+        attempt
+            .registered_idle(73, ts(3))
+            .expect("starting -> idle");
+        assert_eq!(attempt.workspace(), slot(1));
+        attempt.assigned_job(73, ts(4)).expect("idle -> busy");
+        assert_eq!(attempt.workspace(), slot(1));
+        attempt
+            .conclude(AttemptOutcome::CompletedJob, ts(5))
+            .expect("busy -> finished");
+        assert_eq!(attempt.workspace(), slot(1));
+        assert!(
+            attempt.holds_slot_lease(),
+            "a terminal attempt still holds its slot until cleanup succeeds"
+        );
+
+        attempt.clean(ts(6)).expect("finished -> cleaned");
+        assert_eq!(attempt.workspace(), slot(1));
+        assert!(
+            !attempt.holds_slot_lease(),
+            "a cleaned attempt releases the slot for reuse"
+        );
+    }
+
+    #[test]
+    fn an_uncleaned_terminal_attempt_keeps_its_lease() {
+        // `04-security-recovery.md`: "Attempt remains not-cleaned and continues
+        // to hold the slot through the unique lease index".
+        for state in [
+            AttemptState::Finished,
+            AttemptState::Failed,
+            AttemptState::Orphaned,
+        ] {
+            let mut fields = row(state, Some(terminal_outcome(state)));
+            fields.workspace_kind = WorkspaceKind::Persistent;
+            fields.workspace_slot = Some(3);
+            let attempt = RunnerAttempt::from_persisted(fields).expect("a row the domain accepts");
+            assert!(attempt.holds_slot_lease(), "state {state}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_allocation_round_trips_through_the_journal() {
+        for workspace in [AttemptWorkspace::Ephemeral, slot(1), slot(u16::MAX)] {
+            let attempt = RunnerAttempt::allocate_in(
+                AttemptId::from_u128(1),
+                PolicyId::from_u128(1),
+                "runtime/p/a",
+                workspace,
+                ts(0),
+            );
+            let restored = RunnerAttempt::from_persisted(attempt.to_persisted())
+                .expect("a row this crate wrote must load");
+            assert_eq!(restored, attempt);
+            assert_eq!(restored.workspace(), workspace);
+        }
+    }
+
+    #[test]
+    fn a_journal_row_whose_workspace_columns_disagree_is_rejected() {
+        // The kind decides which cleanup algorithm is legal, so an undecidable
+        // pair must fail closed rather than fall back to the destructive branch.
+        let mut persistent_without_slot = row(AttemptState::Allocated, None);
+        persistent_without_slot.workspace_kind = WorkspaceKind::Persistent;
+        assert_eq!(
+            RunnerAttempt::from_persisted(persistent_without_slot),
+            Err(AttemptError::Workspace(
+                WorkspaceError::PersistentWithoutSlot
+            ))
+        );
+
+        let mut zero_slot = row(AttemptState::Allocated, None);
+        zero_slot.workspace_kind = WorkspaceKind::Persistent;
+        zero_slot.workspace_slot = Some(0);
+        assert_eq!(
+            RunnerAttempt::from_persisted(zero_slot),
+            Err(AttemptError::Workspace(WorkspaceError::SlotNotPositive))
+        );
+
+        let mut ephemeral_with_slot = row(AttemptState::Allocated, None);
+        ephemeral_with_slot.workspace_slot = Some(1);
+        assert_eq!(
+            RunnerAttempt::from_persisted(ephemeral_with_slot),
+            Err(AttemptError::Workspace(WorkspaceError::EphemeralWithSlot {
+                slot: 1
+            }))
+        );
+    }
+
+    #[test]
+    fn an_attempt_serialises_its_workspace_without_credentials() {
+        let attempt = RunnerAttempt::allocate_in(
+            AttemptId::from_u128(1),
+            PolicyId::from_u128(1),
+            "/srv/rman/acme/s2",
+            slot(2),
+            ts(0),
+        );
+        let encoded = serde_json::to_string(&attempt).expect("serialisable");
+        let decoded: RunnerAttempt = serde_json::from_str(&encoded).expect("deserialisable");
+        assert_eq!(decoded, attempt);
+        for needle in ["token", "secret", "jitconfig", "password"] {
+            assert!(
+                !encoded.to_ascii_lowercase().contains(needle),
+                "an attempt leaked {needle:?}: {encoded}"
+            );
+        }
+    }
+
+    // =======================================================================
     // Persistence gate
     // =======================================================================
 
@@ -2138,6 +2411,8 @@ mod tests {
             outcome,
             process_id: Some(9),
             runtime_path: "runtime/p/a".into(),
+            workspace_kind: WorkspaceKind::Ephemeral,
+            workspace_slot: None,
             created_at: ts(0),
             terminal_at: state.is_terminal().then(|| ts(9)),
             last_state_change_at: ts(9),

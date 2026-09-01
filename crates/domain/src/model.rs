@@ -28,6 +28,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::path::LocalAbsolutePath;
+
 /// Every timestamp in the domain is UTC.
 ///
 /// The domain never reads this from the operating system. Decisions that depend
@@ -368,7 +370,15 @@ impl CachePolicy {
         matches!(self, CachePolicy::RetainRunnerPackage)
     }
 
-    /// Always `false` in v1, by construction rather than by policy.
+    /// Always `false`, by construction rather than by policy.
+    ///
+    /// D4 is the deliberate addition the type comment anticipated, and it was
+    /// made **on another type**: job-workspace retention is
+    /// [`crate::workspace::WorkspacePolicy`], repository-scoped, opt-in, and
+    /// carrying its own root. Nothing was added here, so a caller reading a
+    /// `CachePolicy` still cannot conclude anything about the job workspace —
+    /// which is the point of keeping them apart
+    /// (`02-target-architecture.md`, "Repository policy").
     #[must_use]
     pub const fn retains_job_workspace(self) -> bool {
         false
@@ -1053,6 +1063,20 @@ pub struct Host {
     pub host_capacity: NonZeroU16,
     pub service_start_mode: StartMode,
     pub refresh_interval: RefreshInterval,
+    /// Where disposable runner attempts are created, when the operator has said
+    /// (D2).
+    ///
+    /// `None` means "use the platform default", which is resolved at runtime by
+    /// `b1` and shown as `platform-default` rather than baked into the row.
+    /// `02-target-architecture.md`: "Storing only the override allows a future
+    /// platform-default correction without rewriting every database" — a stored
+    /// `C:\rman` would silently become the operator's explicit choice the day
+    /// the default moves.
+    ///
+    /// This is **runner** placement and not application data: config, SQLite,
+    /// logs, diagnostics and the verified package cache stay under `AppPaths`,
+    /// and `--data-dir` continues to move those and only those (invariant 1).
+    pub runner_root_override: Option<LocalAbsolutePath>,
     pub created_at: Timestamp,
 }
 
@@ -1081,6 +1105,10 @@ impl Host {
             host_capacity,
             service_start_mode: StartMode::default(),
             refresh_interval: RefreshInterval::default(),
+            // D3: a newly registered host places attempts under the platform
+            // default. Nothing but an explicit `host set-runtime-root` fills
+            // this in.
+            runner_root_override: None,
             created_at,
         })
     }
@@ -1088,6 +1116,16 @@ impl Host {
     #[must_use]
     pub fn host_capacity(&self) -> u16 {
         self.host_capacity.get()
+    }
+
+    /// Whether the runner root came from the operator rather than the platform.
+    ///
+    /// D11 requires CLI and TUI to show "the effective path \[and] configured
+    /// source"; the effective path needs `b1`'s platform default, but which of
+    /// the two sources produced it is decidable here, with no I/O.
+    #[must_use]
+    pub const fn has_configured_runner_root(&self) -> bool {
+        self.runner_root_override.is_some()
     }
 }
 
@@ -1434,6 +1472,71 @@ mod tests {
         assert_eq!(host.host_capacity(), 2);
         assert_eq!(host.service_start_mode, StartMode::Boot);
         assert_eq!(host.refresh_interval.as_secs(), 60);
+    }
+
+    // -- runner root --------------------------------------------------------
+
+    fn a_host() -> Host {
+        Host::new(
+            HostId::from_u128(1),
+            "home-pc",
+            Os::Windows,
+            Arch::X64,
+            NonZeroU16::new(2).unwrap(),
+            ts(0),
+        )
+        .expect("a valid host")
+    }
+
+    #[test]
+    fn a_new_host_uses_the_platform_default_runner_root() {
+        // D3: nothing but an explicit `host set-runtime-root` configures one, so
+        // a host registered by this build behaves exactly as it did before the
+        // setting existed.
+        let host = a_host();
+        assert_eq!(host.runner_root_override, None);
+        assert!(!host.has_configured_runner_root());
+    }
+
+    #[test]
+    fn a_configured_runner_root_round_trips_through_serde() {
+        let root = LocalAbsolutePath::new(if cfg!(windows) {
+            "C:\\rman"
+        } else {
+            "/srv/rman"
+        })
+        .expect("a valid native root");
+        let mut host = a_host();
+        host.runner_root_override = Some(root.clone());
+        assert!(host.has_configured_runner_root());
+
+        let encoded = serde_json::to_string(&host).expect("serialisable");
+        let decoded: Host = serde_json::from_str(&encoded).expect("deserialisable");
+        assert_eq!(decoded, host);
+        assert_eq!(decoded.runner_root_override, Some(root));
+        // Placement is not authentication: the host record carries no credential
+        // before this change and must carry none after it.
+        for needle in ["token", "secret", "password"] {
+            assert!(
+                !encoded.to_ascii_lowercase().contains(needle),
+                "the host record leaked {needle:?}: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_row_carrying_an_illegal_runner_root_fails_closed() {
+        // The stored shape is re-validated by `LocalAbsolutePath`'s own
+        // deserializer, so a hand-edited network share never becomes a runner
+        // root (D10).
+        let host = a_host();
+        let encoded = serde_json::to_string(&host).expect("serialisable");
+        let corrupted = encoded.replace(
+            "\"runner_root_override\":null",
+            "\"runner_root_override\":\"rman\"",
+        );
+        assert_ne!(corrupted, encoded, "the fixture must actually be corrupted");
+        assert!(serde_json::from_str::<Host>(&corrupted).is_err());
     }
 
     #[test]

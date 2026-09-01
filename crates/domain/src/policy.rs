@@ -31,6 +31,8 @@ use crate::model::{
     Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ScaleTarget,
     ValidationError,
 };
+use crate::path::LocalAbsolutePath;
+use crate::workspace::{WorkspaceError, WorkspaceKind, WorkspacePolicy};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -40,6 +42,11 @@ use crate::model::{
 pub enum PolicyError {
     #[error(transparent)]
     Invalid(#[from] ValidationError),
+
+    /// A workspace configuration this policy's target cannot hold, or a stored
+    /// pair of workspace columns this crate cannot have written (D4, D7).
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
 
     #[error(
         "an Autoscale policy requires routing labels; a policy with none is a \
@@ -932,10 +939,10 @@ impl fmt::Display for PolicyState {
 
 /// One target, scaled (or merely watched) by one host.
 ///
-/// `mode`, `enabled`, `state`, and `revision` are private: each is governed by an
-/// invariant that a direct assignment would bypass. `id`, `target`,
-/// `installation_id`, `host_id`, and `cache_policy` are public because they are
-/// either immutable identity or self-validating values.
+/// `mode`, `enabled`, `state`, `workspace_policy`, and `revision` are private:
+/// each is governed by an invariant that a direct assignment would bypass. `id`,
+/// `target`, `installation_id`, `host_id`, and `cache_policy` are public because
+/// they are either immutable identity or self-validating values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScalePolicy {
     pub id: PolicyId,
@@ -948,6 +955,14 @@ pub struct ScalePolicy {
     enabled: bool,
     state: PolicyState,
     pub cache_policy: CachePolicy,
+    /// D4: whether this repository's job workspace survives an attempt, and
+    /// where.
+    ///
+    /// Private because of D7: a persistent value is legal for a repository
+    /// target and corrupt state for an organization one, and `target` is right
+    /// here to check it against. [`Self::set_workspace_policy`] is the only
+    /// writer, so the pair cannot be made inconsistent by assignment.
+    workspace_policy: WorkspacePolicy,
     revision: u64,
 }
 
@@ -992,6 +1007,14 @@ pub struct PersistedPolicy {
     pub enabled: bool,
     pub state: PolicyState,
     pub cache_policy: CachePolicy,
+    /// `ephemeral` or `persistent`, stored beside the root below (D4). The two
+    /// are separate columns rather than one because that is what SQLite holds;
+    /// [`WorkspacePolicy::from_persisted`] is what refuses the combinations this
+    /// crate cannot have written.
+    pub workspace_kind: WorkspaceKind,
+    /// The configured persistent root: `Some` exactly when `workspace_kind` is
+    /// `persistent`.
+    pub workspace_root: Option<LocalAbsolutePath>,
     /// Optimistic-concurrency token. Not an identifier of anything.
     pub revision: u64,
 }
@@ -1050,6 +1073,10 @@ impl ScalePolicy {
             enabled: false,
             state: PolicyState::Pending,
             cache_policy,
+            // D3/D4: `repo add` never configures a workspace. Persistence is a
+            // separate, explicit `repo set-workspace`, so a policy this
+            // constructor produced is always disposable.
+            workspace_policy: WorkspacePolicy::Ephemeral,
             revision: 0,
         }
     }
@@ -1074,10 +1101,17 @@ impl ScalePolicy {
             enabled,
             state,
             cache_policy,
+            workspace_kind,
+            workspace_root,
             revision,
         } = fields;
 
         let mode = PolicyMode::from_persisted(routing_labels, min_capacity, max_capacity)?;
+        // D7 is re-run on every load and not only at the CLI. A row that claims
+        // an organization retains a job workspace is corrupt state, not a
+        // configuration this build should honour.
+        let workspace_policy =
+            WorkspacePolicy::from_persisted(workspace_kind, workspace_root, target.scope())?;
         Ok(Self {
             id,
             target,
@@ -1088,6 +1122,7 @@ impl ScalePolicy {
             enabled,
             state,
             cache_policy,
+            workspace_policy,
             revision,
         })
     }
@@ -1111,6 +1146,8 @@ impl ScalePolicy {
             enabled: self.enabled,
             state: self.state,
             cache_policy: self.cache_policy,
+            workspace_kind: self.workspace_policy.kind(),
+            workspace_root: self.workspace_policy.root().cloned(),
             revision: self.revision,
         }
     }
@@ -1143,6 +1180,42 @@ impl ScalePolicy {
     #[must_use]
     pub const fn routing_labels(&self) -> Option<&RoutingLabels> {
         self.mode.routing_labels()
+    }
+
+    /// D4: this repository's configured workspace behaviour.
+    #[must_use]
+    pub const fn workspace_policy(&self) -> &WorkspacePolicy {
+        &self.workspace_policy
+    }
+
+    /// `repo set-workspace --mode …` (D4).
+    ///
+    /// The refusal of a persistent workspace for an organization target is D7,
+    /// and it lives here rather than in the command layer because
+    /// [`Self::from_persisted`] has to apply the identical rule to a stored row:
+    /// one place, one message, one test.
+    ///
+    /// Like every other mutation on this type it bumps the revision, so `a2`'s
+    /// optimistic guard rejects a write built from a stale read. It does **not**
+    /// check for active attempts — D9's "a path change is refused while affected
+    /// attempts are active" needs the uncleaned-attempt count in the same write
+    /// transaction, which is `a2`'s fence and not something the domain can see.
+    ///
+    /// # Errors
+    /// [`PolicyError::Workspace`] wrapping
+    /// [`WorkspaceError::PersistentRequiresRepositoryScope`] for an organization
+    /// target.
+    pub fn set_workspace_policy(&mut self, workspace: WorkspacePolicy) -> Result<(), PolicyError> {
+        // `WorkspacePolicy::Persistent` is a public variant, so a caller can
+        // build one without going through `WorkspacePolicy::persistent`. The
+        // rule is re-run here on the value actually handed in, through the one
+        // predicate that owns it.
+        workspace.permitted_for(self.target.scope())?;
+        if self.workspace_policy != workspace {
+            self.workspace_policy = workspace;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1410,7 +1483,7 @@ impl ScalePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{HostId, PolicyId};
+    use crate::model::{HostId, PolicyId, TargetScope};
 
     fn nz(v: u16) -> NonZeroU16 {
         NonZeroU16::new(v).expect("test capacity is non-zero")
@@ -1433,6 +1506,196 @@ mod tests {
             PolicyMode::autoscale(host_labels("home"), 0, nz(max)).unwrap(),
             CachePolicy::default(),
         )
+    }
+
+    // =======================================================================
+    // Workspace policy (D4, D7)
+    // =======================================================================
+
+    fn workspace_root() -> LocalAbsolutePath {
+        LocalAbsolutePath::parse_for("/srv/rman/acme", crate::path::PathPlatform::Unix)
+            .expect("a valid persistent root")
+    }
+
+    fn repository_policy() -> ScalePolicy {
+        autoscale_policy(
+            ScaleTarget::repository("acme/api").unwrap(),
+            HostId::from_u128(1),
+            4,
+        )
+    }
+
+    fn organization_policy() -> ScalePolicy {
+        autoscale_policy(
+            ScaleTarget::organization("acme").unwrap(),
+            HostId::from_u128(1),
+            4,
+        )
+    }
+
+    #[test]
+    fn every_constructor_produces_an_ephemeral_workspace() {
+        // D3: `repo add` and `org add` never arm persistence, so a policy this
+        // build creates behaves exactly as it did before D4 existed.
+        for policy in [repository_policy(), organization_policy()] {
+            assert_eq!(policy.workspace_policy(), &WorkspacePolicy::Ephemeral);
+            assert!(!policy.workspace_policy().retains_job_workspace());
+            assert_eq!(
+                policy.to_persisted().workspace_kind,
+                WorkspaceKind::Ephemeral
+            );
+            assert_eq!(policy.to_persisted().workspace_root, None);
+        }
+
+        let monitor_only = ScalePolicy::new(
+            PolicyId::from_u128(2),
+            ScaleTarget::repository("acme/api").unwrap(),
+            42,
+            HostId::from_u128(1),
+            PolicyMode::MonitorOnly,
+            CachePolicy::default(),
+        );
+        assert_eq!(monitor_only.workspace_policy(), &WorkspacePolicy::Ephemeral);
+    }
+
+    #[test]
+    fn a_repository_policy_can_opt_into_a_persistent_workspace() {
+        let mut policy = repository_policy();
+        let before = policy.revision();
+
+        policy
+            .set_workspace_policy(
+                WorkspacePolicy::persistent(workspace_root(), TargetScope::Repository)
+                    .expect("a repository may be persistent"),
+            )
+            .expect("a repository policy accepts persistence");
+
+        assert!(policy.workspace_policy().is_persistent());
+        assert_eq!(policy.workspace_policy().root(), Some(&workspace_root()));
+        assert_eq!(
+            policy.revision(),
+            before + 1,
+            "a workspace change must bump the optimistic token, or `a2`'s guard \
+             cannot refuse a write built from a stale read"
+        );
+
+        // Setting the same value again is not a change and must not consume a
+        // revision, which would make an idempotent CLI call race the next writer.
+        let unchanged = policy.revision();
+        policy
+            .set_workspace_policy(policy.workspace_policy().clone())
+            .expect("re-setting the same policy is accepted");
+        assert_eq!(policy.revision(), unchanged);
+    }
+
+    #[test]
+    fn an_organization_policy_cannot_be_made_persistent() {
+        // D7: an organization runner can accept jobs from more than one
+        // repository, so a retained `_work` would cross a repository boundary.
+        let mut policy = organization_policy();
+        let before = policy.revision();
+
+        assert_eq!(
+            policy.set_workspace_policy(WorkspacePolicy::Persistent {
+                root: workspace_root()
+            }),
+            Err(PolicyError::Workspace(
+                WorkspaceError::PersistentRequiresRepositoryScope
+            ))
+        );
+        assert_eq!(policy.workspace_policy(), &WorkspacePolicy::Ephemeral);
+        assert_eq!(
+            policy.revision(),
+            before,
+            "a refused write consumes nothing"
+        );
+
+        // The constructor refuses the same thing, so there is no way to build the
+        // value and hand it in already-made.
+        assert_eq!(
+            WorkspacePolicy::persistent(workspace_root(), TargetScope::Organization),
+            Err(WorkspaceError::PersistentRequiresRepositoryScope)
+        );
+    }
+
+    #[test]
+    fn a_workspace_policy_round_trips_through_the_persisted_struct() {
+        let mut policy = repository_policy();
+        policy
+            .set_workspace_policy(
+                WorkspacePolicy::persistent(workspace_root(), TargetScope::Repository)
+                    .expect("a repository may be persistent"),
+            )
+            .expect("a repository policy accepts persistence");
+
+        let restored = ScalePolicy::from_persisted(policy.to_persisted())
+            .expect("a policy this crate wrote must load");
+        assert_eq!(restored, policy);
+        assert_eq!(restored.workspace_policy(), policy.workspace_policy());
+
+        let ephemeral = repository_policy();
+        assert_eq!(
+            ScalePolicy::from_persisted(ephemeral.to_persisted()).expect("must load"),
+            ephemeral
+        );
+    }
+
+    #[test]
+    fn an_organization_row_claiming_persistence_fails_closed_on_load() {
+        let mut fields = organization_policy().to_persisted();
+        fields.workspace_kind = WorkspaceKind::Persistent;
+        fields.workspace_root = Some(workspace_root());
+
+        assert_eq!(
+            ScalePolicy::from_persisted(fields),
+            Err(PolicyError::Workspace(
+                WorkspaceError::PersistentRequiresRepositoryScope
+            ))
+        );
+    }
+
+    #[test]
+    fn a_row_whose_workspace_columns_disagree_fails_closed_on_load() {
+        let base = repository_policy().to_persisted();
+
+        let mut without_root = base.clone();
+        without_root.workspace_kind = WorkspaceKind::Persistent;
+        assert_eq!(
+            ScalePolicy::from_persisted(without_root),
+            Err(PolicyError::Workspace(
+                WorkspaceError::PersistentWithoutRoot
+            ))
+        );
+
+        let mut stale_root = base;
+        stale_root.workspace_root = Some(workspace_root());
+        assert!(matches!(
+            ScalePolicy::from_persisted(stale_root),
+            Err(PolicyError::Workspace(
+                WorkspaceError::EphemeralWithRoot { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn workspace_retention_is_not_the_runner_package_cache_policy() {
+        // `02-target-architecture.md`: "`WorkspacePolicy` is separate from
+        // `CachePolicy`: runner-package retention and job-workspace retention
+        // answer different questions and have different cleanup paths."
+        let mut policy = repository_policy();
+        policy.cache_policy = CachePolicy::DiscardRunnerPackage;
+        policy
+            .set_workspace_policy(
+                WorkspacePolicy::persistent(workspace_root(), TargetScope::Repository)
+                    .expect("a repository may be persistent"),
+            )
+            .expect("a repository policy accepts persistence");
+
+        assert!(policy.workspace_policy().retains_job_workspace());
+        assert!(!policy.cache_policy.retains_runner_package());
+        // The v1 constant is unchanged and still answers only for the package
+        // cache; D4's decision is spelled on the other type on purpose.
+        assert!(!policy.cache_policy.retains_job_workspace());
     }
 
     // =======================================================================
