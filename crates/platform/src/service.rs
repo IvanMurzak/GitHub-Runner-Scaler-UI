@@ -95,10 +95,16 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use runner_manager_domain::model::StartMode;
+use runner_manager_domain::path::LocalAbsolutePath;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{HostLock, LockError, LockKind};
 use crate::paths::AppPaths;
+#[cfg(windows)]
+use crate::runner_root_access::RootAdmission;
+use crate::runner_root_access::{
+    Reversal, RootAccessChange, RootAccessError, RootAccessReport, RootAccessSummary,
+};
 
 // ---------------------------------------------------------------------------
 // Names
@@ -522,6 +528,23 @@ pub enum ServiceError {
         /// The underlying failure.
         #[source]
         source: Box<LockError>,
+    },
+
+    /// The runner root this registration would run jobs under could not be
+    /// created, inspected, or given the access the registration's account needs.
+    ///
+    /// Reported *before* anything is registered. A registration whose workspaces
+    /// would land in a directory ordinary local users can write is a
+    /// registration that should not exist, and `04-security-recovery.md` asks
+    /// for exactly that refusal rather than a warning.
+    #[error(
+        "this registration would run jobs under the default runner root, and that root could \
+         not be prepared, so nothing was registered: {source}"
+    )]
+    RunnerRoot {
+        /// What [`crate::runner_root_access`] reported, including the remedy.
+        #[source]
+        source: Box<RootAccessError>,
     },
 
     /// The path of the running binary could not be resolved.
@@ -1037,6 +1060,41 @@ impl InstallPlan {
             out.push_str(&quote_argument(&argument.to_string_lossy()));
         }
         out
+    }
+}
+
+/// Undoes a runner-root change, and says what could not be undone.
+///
+/// `None` when the rollback was complete — either because there was nothing to
+/// undo, or because the directory this operation created was removed again and
+/// the descriptor it replaced was written back. `Some` is the "report any
+/// non-reversible existing directory state explicitly" half of the requirement,
+/// and the caller folds it into the failure it was already reporting.
+fn retained_runner_root(change: &RootAccessChange) -> Option<String> {
+    let reversal = change.revert();
+    matches!(reversal, Reversal::Retained { .. }).then(|| reversal.to_string())
+}
+
+/// [`retained_runner_root`], folded into the error a failed operation returns.
+///
+/// A complete rollback leaves `cause` exactly as it was: the operator's problem
+/// is what failed, not the tidying up afterwards. An incomplete one is promoted
+/// to [`ServiceError::Rollback`], which is the variant that exists to say "this
+/// failed *and* something is left behind".
+fn undo_runner_root(
+    change: &RootAccessChange,
+    operation: &'static str,
+    identity: &ServiceIdentity,
+    cause: ServiceError,
+) -> ServiceError {
+    match retained_runner_root(change) {
+        Some(rollback) => ServiceError::Rollback {
+            operation,
+            name: identity.name().to_string(),
+            cause: cause.to_string(),
+            rollback,
+        },
+        None => cause,
     }
 }
 
@@ -3144,6 +3202,11 @@ pub struct Installed {
     pub record: InstallRecord,
     /// What the definition grants, measured against the requirement.
     pub review: PrivilegeReview,
+    /// What was done to the runner root the registration will run jobs under.
+    ///
+    /// Named trustees rather than SIDs, so printing it adds no identity to the
+    /// output. See [`crate::runner_root_access`].
+    pub runner_root: RootAccessSummary,
 }
 
 /// What `uninstall` did — and, as importantly, what it did not.
@@ -3194,6 +3257,12 @@ pub struct StartModeChange {
     /// The secret store the new mode obliges, so a caller can tell an operator
     /// whether the token has to move too.
     pub store_scope: crate::secrets::SecretScope,
+    /// What the mode change did to the runner root's access control.
+    ///
+    /// A mode change moves the account the daemon runs as, and the runner root
+    /// admits that account by name — so the two move together or the new
+    /// registration cannot write its own workspaces.
+    pub runner_root: RootAccessSummary,
 }
 
 impl fmt::Display for StartModeChange {
@@ -3204,8 +3273,8 @@ impl fmt::Display for StartModeChange {
         write!(
             f,
             "The service now starts at {} instead of {}. It reads the {}-scoped secret store; \
-             if the token was stored under the other scope, run `auth login` again.",
-            self.to, self.from, self.store_scope
+             if the token was stored under the other scope, run `auth login` again. {}",
+            self.to, self.from, self.store_scope, self.runner_root
         )
     }
 }
@@ -3222,6 +3291,7 @@ pub struct ServiceOperations {
     paths: AppPaths,
     identity: ServiceIdentity,
     controls: std::sync::Arc<dyn ControlFactory>,
+    runner_root: Option<LocalAbsolutePath>,
 }
 
 impl ServiceOperations {
@@ -3252,7 +3322,32 @@ impl ServiceOperations {
             paths,
             identity,
             controls,
+            runner_root: None,
         }
+    }
+
+    /// Points runner-root preparation at a directory the caller owns, for the
+    /// **current account**.
+    ///
+    /// **Only a [`ServiceIdentity::fixture`] registration is allowed to move
+    /// it, and the guard is here rather than at the call site.** A product
+    /// registration ignores the override entirely and resolves
+    /// [`crate::runner_root::default_runner_root`] itself, which is what keeps
+    /// "custom roots are never re-ACLed" true no matter what a caller passes.
+    ///
+    /// It exists because the directory the product uses is
+    /// `%SystemDrive%\rman`, and a smoke test that created and re-permissioned
+    /// *that* would be editing the machine it runs on from outside its own
+    /// fixture. So a fixture aims this at a temporary directory it created and
+    /// will delete — and "and will delete" is why the override is always
+    /// reconciled for the calling account rather than for the account the start
+    /// mode obliges. A boot-mode root admits `SY` and `BA` only, which an
+    /// ordinary filtered token is neither, so a test that supplied one could
+    /// not then inspect or remove its own temporary directory.
+    #[must_use]
+    pub fn with_runner_root(mut self, root: LocalAbsolutePath) -> Self {
+        self.runner_root = Some(root);
+        self
     }
 
     /// The directories this operates against.
@@ -3309,26 +3404,50 @@ impl ServiceOperations {
             request,
             ServiceDirectories::of(&self.paths),
         )?;
+
+        // Item 8, and the one step that can refuse an otherwise valid install.
+        // Before the platform is asked to register anything, because a
+        // registration whose workspaces would land in a directory ordinary local
+        // users can write is one that should never have existed — and because
+        // undoing a directory is cheaper than undoing a service.
+        let root = self.prepare_runner_root(plan.start_mode())?;
+
         let control = self.controls.control(plan.start_mode())?;
-        let definition = control.install(&plan)?;
+        let definition = match control.install(&plan) {
+            Ok(definition) => definition,
+            Err(cause) => return Err(undo_runner_root(&root, "install", &self.identity, cause)),
+        };
         let review = review_least_privilege(&definition, &plan);
         let record = InstallRecord::of(&plan, &definition, Utc::now());
         if let Err(cause) = record.write(&self.paths) {
+            let retained = retained_runner_root(&root);
             if let Err(rollback) = control.uninstall(&self.identity) {
                 return Err(ServiceError::Rollback {
                     operation: "install",
                     name: self.identity.name().to_string(),
                     cause: cause.to_string(),
-                    rollback: rollback.to_string(),
+                    rollback: match retained {
+                        Some(note) => format!("{rollback}; {note}"),
+                        None => rollback.to_string(),
+                    },
                 });
             }
-            return Err(cause);
+            return Err(match retained {
+                Some(rollback) => ServiceError::Rollback {
+                    operation: "install",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback,
+                },
+                None => cause,
+            });
         }
         Ok(Installed {
             plan,
             definition,
             record,
             review,
+            runner_root: root.summary().clone(),
         })
     }
 
@@ -3400,11 +3519,15 @@ impl ServiceOperations {
         };
         let from = record.start_mode;
         if from == to {
+            // Nothing moves, so nothing about the root's access control has to.
+            // Reconciling it here would turn a no-op command into one that can
+            // fail on a permission it does not need.
             return Ok(StartModeChange {
                 from,
                 to,
                 changed: false,
                 store_scope: crate::secrets::SecretScope::for_start_mode(to),
+                runner_root: RootAccessSummary::NotApplicable,
             });
         }
 
@@ -3437,23 +3560,54 @@ impl ServiceOperations {
             Err(_) => plan,
         };
 
+        // The account changes with the mode, and so must the account the runner
+        // root admits: `04-security-recovery.md` requires the selected identity
+        // to be *reconciled* when service mode changes, which means adding the
+        // operator's on the way to login and dropping it again on the way back.
+        // Before the target install, for the same reason `install` does it
+        // first — a root that cannot be made safe must not produce a working
+        // registration.
+        let root = self.prepare_runner_root(to)?;
+
         // Install the target domain before touching the live one. This makes a
         // failed target install a no-op from the operator's point of view and,
         // unlike uninstall-first ordering, never trades a working service for
         // an error message.
         let target = self.controls.control(to)?;
-        let definition = target.install(&plan)?;
+        let definition = match target.install(&plan) {
+            Ok(definition) => definition,
+            Err(cause) => {
+                return Err(undo_runner_root(
+                    &root,
+                    "switch start mode",
+                    &self.identity,
+                    cause,
+                ));
+            }
+        };
         let next_record = InstallRecord::of(&plan, &definition, record.installed_at);
         if let Err(cause) = next_record.write(&self.paths) {
+            let retained = retained_runner_root(&root);
             if let Err(rollback) = target.uninstall(&self.identity) {
                 return Err(ServiceError::Rollback {
                     operation: "switch start mode",
                     name: self.identity.name().to_string(),
                     cause: cause.to_string(),
-                    rollback: rollback.to_string(),
+                    rollback: match retained {
+                        Some(note) => format!("{rollback}; {note}"),
+                        None => rollback.to_string(),
+                    },
                 });
             }
-            return Err(cause);
+            return Err(match retained {
+                Some(rollback) => ServiceError::Rollback {
+                    operation: "switch start mode",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback,
+                },
+                None => cause,
+            });
         }
 
         // Only after the target registration and its durable record exist is
@@ -3462,21 +3616,34 @@ impl ServiceOperations {
         if let Err(cause) = self.controls.control(from)?.uninstall(&self.identity) {
             let target_rollback = target.uninstall(&self.identity);
             let record_rollback = record.write(&self.paths);
+            let retained = retained_runner_root(&root);
             if let Err(rollback) = target_rollback.and(record_rollback) {
                 return Err(ServiceError::Rollback {
                     operation: "switch start mode",
                     name: self.identity.name().to_string(),
                     cause: cause.to_string(),
-                    rollback: rollback.to_string(),
+                    rollback: match retained {
+                        Some(note) => format!("{rollback}; {note}"),
+                        None => rollback.to_string(),
+                    },
                 });
             }
-            return Err(cause);
+            return Err(match retained {
+                Some(rollback) => ServiceError::Rollback {
+                    operation: "switch start mode",
+                    name: self.identity.name().to_string(),
+                    cause: cause.to_string(),
+                    rollback,
+                },
+                None => cause,
+            });
         }
         Ok(StartModeChange {
             from,
             to,
             changed: true,
             store_scope: crate::secrets::SecretScope::for_start_mode(to),
+            runner_root: root.summary().clone(),
         })
     }
 
@@ -3530,6 +3697,70 @@ impl ServiceOperations {
             last_github_contact,
             &self.paths,
         ))
+    }
+
+    /// Creates or reconciles the runner root this start mode's account needs.
+    ///
+    /// The account is not an argument: it is [`ServiceAccount::for_start_mode`],
+    /// the same function the registration's own principal comes from, so the
+    /// directory admits exactly the identity the definition registers and a mode
+    /// change reconciles both together or neither.
+    ///
+    /// On macOS and Linux this is a no-op that returns
+    /// [`RootAccessSummary::NotApplicable`]; see [`crate::runner_root_access`].
+    fn prepare_runner_root(&self, mode: StartMode) -> Result<RootAccessChange, ServiceError> {
+        #[cfg(not(windows))]
+        {
+            // `runner_root` is consumed here as well as in the Windows arm: a
+            // field only one platform reads is a dead field on the other.
+            let _ = (mode, &self.runner_root);
+            Ok(RootAccessChange::not_applicable())
+        }
+        #[cfg(windows)]
+        {
+            let wrap = |source| ServiceError::RunnerRoot {
+                source: Box::new(source),
+            };
+            // The test seam, and the two things allowed through it. `cfg!(test)`
+            // is false in every shipped binary, so what a released build honours
+            // is the fixture name alone — and a fixture name cannot be the
+            // product's, which is what keeps a released `service install`
+            // pointed at the platform default whatever a caller passes.
+            //
+            // An overridden root is always reconciled **for this account**,
+            // which is the foreground admission — a real mode of the product
+            // rather than a concession invented here. It has to be: a boot-mode
+            // root admits `SY` and `BA` only, and a test process holding an
+            // ordinary filtered token is neither, so it could not inspect the
+            // temporary directory it just supplied nor delete it afterwards.
+            // What that costs is that the *boot* descriptor is not proved
+            // through this path; it is proved purely, by this module's
+            // `the_runner_root_a_boot_registration_needs_admits_only_the_service`
+            // and by `runner_root_access`'s own tests, and for real by the
+            // privileged installer test, which runs elevated.
+            if let Some(root) = self
+                .runner_root
+                .as_ref()
+                .filter(|_| self.identity.is_fixture() || cfg!(test))
+            {
+                let admission = RootAdmission::of_this_account().map_err(wrap)?;
+                return crate::runner_root_access::reconcile(&self.paths, root, &admission)
+                    .map_err(wrap);
+            }
+
+            let admission = match ServiceAccount::for_start_mode(mode) {
+                // A boot registration runs as LocalSystem, which the constant
+                // `SY` ace already names.
+                ServiceAccount::LocalSystem => RootAdmission::LocalSystem,
+                // A login registration runs as this account, under a filtered
+                // token in which Administrators is deny-only — so without an
+                // ace of its own it would be admitted by nothing.
+                ServiceAccount::InvokingUser | ServiceAccount::Root => {
+                    RootAdmission::of_this_account().map_err(wrap)?
+                }
+            };
+            crate::runner_root_access::ensure_default_root(&self.paths, &admission).map_err(wrap)
+        }
     }
 
     /// Takes the single-instance lock, or refuses with `d1`'s own message.
@@ -3594,6 +3825,7 @@ pub struct ServiceStatus {
     log_file: PathBuf,
     store: Option<crate::secrets::ActiveStore>,
     last_github_contact: Option<DateTime<Utc>>,
+    runner_root: Option<(PathBuf, RootAccessReport)>,
     problems: Vec<StatusProblem>,
     notes: Vec<String>,
 }
@@ -3741,6 +3973,45 @@ impl ServiceStatus {
             );
         }
 
+        // The privileged inspection output. Read-only, tolerant of an account
+        // that may not read the descriptor at all, and never a `problem`: a
+        // root this account cannot inspect is a true statement about this
+        // account's rights, not a fault in the registration. What refuses an
+        // install is the preflight in `runner_root_access`, which runs as the
+        // installing account and has the authority to know.
+        let runner_root = crate::runner_root::default_runner_root(paths)
+            .ok()
+            .map(|root| {
+                let path = root.as_path().to_path_buf();
+                let report = crate::runner_root_access::report(&path);
+                (path, report)
+            });
+        // Reported, and deliberately not a `problem`. The Definition of Done
+        // asks for a broad root to be "reported and fail the security
+        // preflight", and the security preflight is `install`'s -- which runs
+        // as the installing account and refuses outright. `service status` runs
+        // as whoever typed it, is expected to be readable on a host with
+        // nothing installed at all, and drives an exit code; turning a
+        // directory that predates this feature into a non-zero exit for a
+        // machine that has never installed the service would report a fault
+        // that is not this registration's.
+        if let Some((
+            path,
+            RootAccessReport::Present {
+                broad_write: true, ..
+            },
+        )) = &runner_root
+        {
+            notes.push(format!(
+                "{} can be written by ordinary local users, so it is not a safe place to run \
+                 jobs. `service install` refuses it rather than tightening it, because the \
+                 contents of a directory anybody could write cannot be trusted: remove or \
+                 empty it, or choose another root with `runner-manager host set-runtime-root \
+                 --path <PATH>`.",
+                path.display()
+            ));
+        }
+
         Self {
             identity,
             record,
@@ -3749,9 +4020,24 @@ impl ServiceStatus {
             log_file,
             store,
             last_github_contact,
+            runner_root,
             problems,
             notes,
         }
+    }
+
+    /// What this host's default runner root grants, and to whom.
+    ///
+    /// `None` when the platform default could not even be resolved. The
+    /// descriptor inside has been through
+    /// [`crate::runner_root_access::redact`], so it names the well-known
+    /// trustees and says "an account" for everything else — no more identity
+    /// than the `account` line above it already prints.
+    #[must_use]
+    pub fn runner_root(&self) -> Option<(&Path, &RootAccessReport)> {
+        self.runner_root
+            .as_ref()
+            .map(|(path, report)| (path.as_path(), report))
     }
 
     /// Whether a registration exists at all.
@@ -3879,6 +4165,12 @@ impl fmt::Display for ServiceStatus {
             writeln!(f, "  binary                    {binary}")?;
         }
         writeln!(f, "  diagnostic log            {}", self.log_file.display())?;
+        if let Some((path, report)) = &self.runner_root {
+            writeln!(f, "  runner root               {}", path.display())?;
+            if *report != RootAccessReport::NotApplicable {
+                writeln!(f, "  runner root access        {report}")?;
+            }
+        }
         if let Some(store) = &self.store {
             writeln!(f, "  secret store              {store}")?;
         }
@@ -5609,6 +5901,15 @@ mod tests {
         _root: tempfile::TempDir,
         paths: AppPaths,
         binary: PathBuf,
+        /// A runner root inside this host's own temporary tree.
+        ///
+        /// Without it every `install` in this module would create and
+        /// re-permission the **real** `%SystemDrive%\rman` on the machine
+        /// running the tests, and would fail outright on any machine where that
+        /// directory already exists with the access control `C:\` gives it.
+        /// A sibling of the four application-data directories rather than a
+        /// child of one, so `b1`'s overlap check has nothing to object to.
+        runner_root: LocalAbsolutePath,
         controls: RecordingControls,
     }
 
@@ -5623,10 +5924,18 @@ mod tests {
                 "runner-manager"
             });
             std::fs::write(&binary, b"not a real binary").expect("a stand-in binary");
+            let runner_root = LocalAbsolutePath::new(
+                root.path()
+                    .join("runner-root")
+                    .to_str()
+                    .expect("a unicode temporary path"),
+            )
+            .expect("a local absolute path");
             Self {
                 _root: root,
                 paths,
                 binary,
+                runner_root,
                 controls: RecordingControls::new(),
             }
         }
@@ -5637,6 +5946,7 @@ mod tests {
                 ServiceIdentity::product(),
                 std::sync::Arc::new(self.controls.clone()),
             )
+            .with_runner_root(self.runner_root.clone())
         }
 
         fn request(&self, mode: StartMode) -> InstallRequest {
@@ -6822,6 +7132,203 @@ logs = \"/d\"
                 .any(|call| call == "uninstall runner-manager (boot)"),
             "the registration must be explicitly rolled back: {:?}",
             host.controls.calls()
+        );
+        assert!(
+            !host.runner_root.as_path().exists(),
+            "the rollback must take the runner root this install created with it; a directory \
+             prepared for a registration that does not exist is litter, and on Windows it is \
+             litter with a security descriptor"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The runner root (b2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_runner_root_a_boot_registration_needs_admits_only_the_service() {
+        use crate::runner_root_access::{RootAdmission, default_root_sddl, grants_broad_write};
+
+        // The mapping `prepare_runner_root` reads, asserted against the same
+        // function the registration's own principal comes from — which is the
+        // point of deriving it there rather than restating it.
+        assert_eq!(
+            ServiceAccount::for_definition(DefinitionKind::WindowsService, StartMode::Boot),
+            ServiceAccount::LocalSystem
+        );
+        assert_eq!(
+            ServiceAccount::for_definition(DefinitionKind::WindowsScheduledTask, StartMode::Login),
+            ServiceAccount::InvokingUser
+        );
+
+        let boot = default_root_sddl(&RootAdmission::LocalSystem);
+        assert!(!grants_broad_write(&boot), "{boot}");
+        assert!(
+            !boot.contains("S-1-5-21"),
+            "a boot registration runs as LocalSystem, so its root names no operator: {boot}"
+        );
+
+        // A login task runs under a *filtered* token — `RunLevel` is
+        // `LeastPrivilege`, see `windows_scheduled_task_xml` — in which
+        // Administrators is deny-only. Without an ace of its own the account
+        // the task runs as would be admitted by nothing at all.
+        let login = default_root_sddl(&RootAdmission::Account("S-1-5-21-1-2-3-1001".to_owned()));
+        assert!(login.contains("S-1-5-21-1-2-3-1001"), "{login}");
+        assert!(!grants_broad_write(&login), "{login}");
+    }
+
+    #[test]
+    fn an_install_reports_the_runner_root_it_prepared() {
+        let host = Host::new();
+        let installed = host
+            .operations()
+            .install(&host.request(StartMode::Boot))
+            .expect("an install");
+        let rendered = installed.runner_root.to_string();
+        assert!(
+            !rendered.contains("S-1-5-21"),
+            "the report must add no identity to the output: {rendered}"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                installed.runner_root.path(),
+                Some(host.runner_root.as_path())
+            );
+            assert!(
+                host.runner_root.as_path().is_dir(),
+                "the directory jobs would run in has to exist once the service is registered"
+            );
+        } else {
+            assert_eq!(
+                installed.runner_root,
+                crate::runner_root_access::RootAccessSummary::NotApplicable,
+                "macOS and Linux keep the runtime directory they have always used"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_start_mode_reconciles_the_runner_root_for_the_new_account() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install at boot");
+
+        let change = operations
+            .set_start_mode(StartMode::Login)
+            .expect("a switch to login");
+
+        assert!(change.changed);
+        if cfg!(windows) {
+            assert_eq!(change.runner_root.path(), Some(host.runner_root.as_path()));
+            assert!(
+                host.runner_root.as_path().is_dir(),
+                "the switch must not remove the directory it reconciled"
+            );
+        }
+        // The operator is told, because the account that may write there has
+        // moved with the mode.
+        assert!(
+            change.to_string().contains("runner root"),
+            "{}",
+            change.to_string()
+        );
+    }
+
+    #[test]
+    fn switching_to_the_mode_already_in_force_touches_no_runner_root() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install at boot");
+
+        let change = operations
+            .set_start_mode(StartMode::Boot)
+            .expect("a switch to the mode already in force");
+
+        assert!(!change.changed);
+        assert_eq!(
+            change.runner_root,
+            crate::runner_root_access::RootAccessSummary::NotApplicable,
+            "nothing moves, so nothing about the root's access control has to; reconciling here \
+             would turn a no-op command into one that can fail on a permission it does not need"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_registration_the_manager_refuses_leaves_no_runner_root_behind() {
+        let host = Host::new();
+        host.controls
+            .fail_next_install(StartMode::Boot, "injected registration failure");
+
+        let error = host
+            .operations()
+            .install(&host.request(StartMode::Boot))
+            .expect_err("the manager refuses the registration");
+
+        assert!(matches!(error, ServiceError::Control { .. }), "{error}");
+        assert!(
+            !host.runner_root.as_path().exists(),
+            "the directory was created for a registration that does not exist"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_broad_runner_root_refuses_the_install_before_anything_is_registered() {
+        let host = Host::new();
+        // What a directory created below `C:\` with inheritance left on looks
+        // like, built deliberately because a per-account `%TEMP%` never
+        // produces one by accident.
+        crate::runner_root_access::create_with_descriptor_for_tests(
+            host.runner_root.as_path(),
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)",
+        )
+        .expect("a deliberately open runner root");
+        let before = crate::runner_root_access::report(host.runner_root.as_path());
+
+        let error = host
+            .operations()
+            .install(&host.request(StartMode::Boot))
+            .expect_err("an open runner root is refused");
+
+        assert!(matches!(error, ServiceError::RunnerRoot { .. }), "{error}");
+        assert!(
+            error.to_string().contains("nothing was registered"),
+            "{error}"
+        );
+        assert!(
+            host.controls.registrations().is_empty(),
+            "the refusal has to come before the platform is asked to register anything: {:?}",
+            host.controls.calls()
+        );
+        assert_eq!(
+            crate::runner_root_access::report(host.runner_root.as_path()),
+            before,
+            "an open directory is refused rather than tightened: its contents cannot be trusted, \
+             so adopting it would be worse than declining it"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_leaves_the_runner_root_exactly_where_it_is() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install");
+        assert!(host.runner_root.as_path().is_dir());
+
+        operations.uninstall().expect("an uninstall");
+
+        assert!(
+            host.runner_root.as_path().is_dir(),
+            "`05-infrastructure.md` item 5: uninstall deregisters and deletes nothing else. A \
+             runner root may hold an operator's retained workspaces."
         );
     }
 

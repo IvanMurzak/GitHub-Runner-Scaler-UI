@@ -51,8 +51,14 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use runner_manager_domain::model::StartMode;
+use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::paths::AppPaths;
+use runner_manager_platform::runner_root::default_runner_root;
+use runner_manager_platform::runner_root_access::{
+    Reversal, RootAccessError, RootAccessReport, RootAdmission, ensure_default_root,
+    grants_broad_write, is_protected, report,
+};
 use runner_manager_platform::service::{
     BinaryPath, HostControls, InstallRecord, InstallRequest, Installed, RestartPolicy,
     ServiceError, ServiceIdentity, ServiceOperations, WINDOWS_SCM_HOST_ARGUMENT,
@@ -75,6 +81,15 @@ struct Fixture {
     paths: AppPaths,
     binary: PathBuf,
     heartbeat: PathBuf,
+    /// The runner root every registration this file makes is pointed at.
+    ///
+    /// `b2` made `install` prepare the directory jobs run in, and the platform
+    /// default is the real `%SystemDrive%\rman`. A smoke test must not create
+    /// or re-permission *that* — rule 3 of this file's header, applied to a
+    /// directory instead of a registration — so every fixture is given a root
+    /// inside its own temporary tree. The one test that does exercise the real
+    /// default asks for it explicitly and puts the machine back afterwards.
+    runner_root: PathBuf,
     _root: tempfile::TempDir,
 }
 
@@ -101,10 +116,17 @@ impl Fixture {
         let binary = root.path().join("runner-manager-selftest.exe");
         std::fs::copy(fixture_service_host(), &binary).expect("a copy of the fixture host");
 
+        // A sibling of the four application-data directories, so `b1`'s
+        // overlap check has nothing to object to.
+        let runner_root = root.path().join("runner-root");
         let operations = ServiceOperations::with_controls(
             paths.clone(),
             identity.clone(),
             std::sync::Arc::new(HostControls),
+        )
+        .with_runner_root(
+            LocalAbsolutePath::new(runner_root.to_str().expect("a unicode temporary path"))
+                .expect("a local absolute path"),
         );
 
         // Enumerate before creating. A name this test generated cannot already
@@ -125,6 +147,7 @@ impl Fixture {
             operations,
             paths,
             binary,
+            runner_root,
             _root: root,
         }
     }
@@ -138,7 +161,25 @@ impl Fixture {
     }
 
     fn request(&self, mode: StartMode, restart: RestartPolicy) -> InstallRequest {
+        self.request_exercising(mode, restart, None)
+    }
+
+    /// The same request, with the fixture host told to create, materialize and
+    /// clean a child below `root` on every start.
+    ///
+    /// The root is a second *path* argument, and the fixture host picks it out
+    /// by skipping flags rather than by counting, so the SCM marker below can
+    /// stay where it is.
+    fn request_exercising(
+        &self,
+        mode: StartMode,
+        restart: RestartPolicy,
+        exercise: Option<&Path>,
+    ) -> InstallRequest {
         let mut arguments = vec![self.heartbeat.as_os_str().to_owned()];
+        if let Some(root) = exercise {
+            arguments.push(root.as_os_str().to_owned());
+        }
         if mode == StartMode::Boot {
             arguments.push(std::ffi::OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
         }
@@ -147,6 +188,30 @@ impl Fixture {
             .with_arguments(arguments)
             .with_restart(restart)
             .started_on_demand()
+    }
+
+    /// What the fixture host made of the runner root it was given, if it has
+    /// got that far.
+    fn workspace_outcome(&self) -> Option<String> {
+        let mut name = self.heartbeat.as_os_str().to_owned();
+        name.push(".workspace");
+        std::fs::read_to_string(PathBuf::from(name)).ok()
+    }
+
+    /// Waits for the fixture host to report on the runner root it was given.
+    fn wait_for_workspace_outcome(&self, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(outcome) = self.workspace_outcome() {
+                return outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never reported what it could do below the runner root in {timeout:?}",
+                self.identity.name()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// Every line the fixture host has written, as `(started_at, pid)`.
@@ -822,4 +887,324 @@ fn a_killed_service_comes_back_and_no_sooner_than_the_bounded_delay() {
     );
 
     eprintln!("measured restart interval: {measured:?} against a {MEASURED_DELAY:?} bound");
+}
+
+// ---------------------------------------------------------------------------
+// The runner root (b2)
+// ---------------------------------------------------------------------------
+
+/// The Definition-of-Done item that only a real machine can answer:
+///
+/// > A boot service running as LocalSystem can create, materialize, and clean a
+/// > child below the default root.
+///
+/// **This is the one test in this file that touches the machine's real
+/// `%SystemDrive%\rman`**, and it does so deliberately, because
+/// `04-security-recovery.md`'s security gate is worded about that exact
+/// directory: *"A real Windows service creates and cleans `%SystemDrive%\rman`
+/// without broad local-user write access."* A temporary directory would prove
+/// the descriptor and not the gate.
+///
+/// It puts the machine back: reverting the change removes a directory this call
+/// created and restores a descriptor it replaced, so a host that had no
+/// `C:\rman` still has none afterwards and a host that had a narrow one has the
+/// same one.
+///
+/// A host that already has a **broad** `C:\rman` fails here rather than being
+/// repaired, which is the product behaviour under test rather than a limitation
+/// of the test.
+#[test]
+#[ignore = "creates and re-permissions the real %SystemDrive%\\rman and registers a real service"]
+fn a_boot_service_creates_materializes_and_cleans_a_child_below_the_real_default_root() {
+    let fixture = Fixture::new("root-boot");
+    let paths = fixture.paths.clone();
+
+    let root = default_runner_root(&paths).expect("this host resolves a default runner root");
+    let prepared = match ensure_default_root(&paths, &RootAdmission::LocalSystem) {
+        Ok(prepared) => prepared,
+        Err(error @ RootAccessError::BroadExistingAccess { .. }) => panic!(
+            "this host already has a runner root that ordinary local users can write, and the \
+             product refuses such a directory rather than adopting it -- which is the behaviour \
+             this test exists to preserve. Remove or empty it and run this again.\n{error}"
+        ),
+        Err(error) => panic!("the default runner root could not be prepared: {error}"),
+    };
+
+    // Whatever else is true, no unrelated local user may write there.
+    match report(root.as_path()) {
+        RootAccessReport::Present {
+            dacl,
+            protected,
+            broad_write,
+        } => {
+            assert!(!broad_write, "the whole point of this feature: {dacl}");
+            assert!(
+                protected,
+                "an unprotected root inherits whatever the volume grants, which is exactly the \
+                 Authenticated Users write grant this severs: {dacl}"
+            );
+            assert!(
+                !dacl.contains("S-1-5-21-1") && !dacl.contains("S-1-5-21-2"),
+                "the reported descriptor must be redacted: {dacl}"
+            );
+        }
+        other => panic!("the root this account just prepared must be readable, got {other:?}"),
+    }
+
+    // And now the part no descriptor can answer: what LocalSystem can actually
+    // do there. The fixture host runs as LocalSystem under the Service Control
+    // Manager and reports back.
+    match fixture.operations.install(&fixture.request_exercising(
+        StartMode::Boot,
+        RestartPolicy::default(),
+        Some(root.as_path()),
+    )) {
+        Ok(_) => {}
+        Err(error @ ServiceError::NeedsElevation { .. }) => require_elevation(&error),
+        Err(error) => panic!("{error}"),
+    }
+    fixture.operations.start().expect("SCM starts the fixture");
+    fixture.wait_for_starts(1, Duration::from_secs(30));
+
+    let outcome = fixture.wait_for_workspace_outcome(Duration::from_secs(30));
+    let _ = fixture.operations.stop();
+    // Put the machine back before asserting, so a failure still leaves the host
+    // as this test found it.
+    let reversal = prepared.revert();
+
+    assert_eq!(
+        outcome.trim(),
+        "ok",
+        "a boot service running as LocalSystem must be able to create a child below {}, write \
+         inside it, and remove it again",
+        root.as_path().display()
+    );
+    assert!(
+        !matches!(reversal, Reversal::Retained { .. }),
+        "this test must leave the host's runner root as it found it: {reversal}"
+    );
+}
+
+/// The other half of the same requirement:
+///
+/// > A login scheduled task can do the same as the selected invoking user after
+/// > a mode transition.
+///
+/// Against the fixture's own runner root rather than the real one, because a
+/// mode transition re-permissions the directory and there is no reason for a
+/// smoke test to do that to the machine twice.
+#[test]
+#[ignore = "registers a real Windows service and a real scheduled task; run explicitly"]
+fn a_login_task_uses_the_runner_root_as_the_invoking_user_after_a_mode_transition() {
+    let fixture = Fixture::new("root-login");
+    let exercised = fixture.runner_root.clone();
+
+    match fixture.operations.install(&fixture.request_exercising(
+        StartMode::Boot,
+        RestartPolicy::default(),
+        Some(&exercised),
+    )) {
+        Ok(installed) => assert_eq!(
+            installed.runner_root.path(),
+            Some(exercised.as_path()),
+            "install prepares the root the registration will run jobs under"
+        ),
+        Err(error @ ServiceError::NeedsElevation { .. }) => require_elevation(&error),
+        Err(error) => panic!("{error}"),
+    }
+
+    // The transition. The registration moves from the Service Control Manager
+    // to Task Scheduler, and the root is reconciled for the account the task
+    // will run as.
+    let change = fixture
+        .operations
+        .set_start_mode(StartMode::Login)
+        .expect("the registration moves to Task Scheduler");
+    assert!(change.changed);
+    assert_eq!(change.runner_root.path(), Some(exercised.as_path()));
+
+    let dacl = match report(&exercised) {
+        RootAccessReport::Present {
+            dacl, broad_write, ..
+        } => {
+            assert!(!broad_write, "{dacl}");
+            dacl
+        }
+        other => panic!("the reconciled root must be readable, got {other:?}"),
+    };
+
+    fixture
+        .operations
+        .start()
+        .expect("Task Scheduler starts the fixture as the invoking user");
+    fixture.wait_for_starts(1, Duration::from_secs(60));
+
+    let outcome = fixture.wait_for_workspace_outcome(Duration::from_secs(60));
+    let _ = fixture.operations.stop();
+
+    assert_eq!(
+        outcome.trim(),
+        "ok",
+        "a login task running as the invoking user must be able to create a child below {}, \
+         write inside it, and remove it again -- the task runs under a *filtered* token, in \
+         which Administrators is deny-only, so this passes only if the root admits the account \
+         by name. Its access control is {dacl}",
+        exercised.display()
+    );
+}
+
+/// > Existing broad ACLs are reported and fail the security preflight rather
+/// > than being silently accepted.
+///
+/// And, just as importantly, nothing is registered when they do.
+#[test]
+#[ignore = "drives the real installer against a real directory with a real ACL"]
+fn an_existing_broad_root_fails_the_preflight_and_registers_nothing() {
+    let fixture = Fixture::new("root-broad");
+
+    // A directory anybody can write, opened up with the same tool an operator
+    // would use, so the case is the real one rather than a mocked descriptor.
+    std::fs::create_dir_all(&fixture.runner_root).expect("a directory to open up");
+    grant_everyone_full_control(&fixture.runner_root);
+    assert!(
+        matches!(
+            report(&fixture.runner_root),
+            RootAccessReport::Present {
+                broad_write: true,
+                ..
+            }
+        ),
+        "the case under test was not actually set up"
+    );
+
+    let error = fixture
+        .operations
+        .install(&fixture.request(StartMode::Boot, RestartPolicy::default()))
+        .expect_err("a runner root ordinary local users can write must refuse the install");
+
+    assert!(matches!(error, ServiceError::RunnerRoot { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("nothing was registered"), "{message}");
+    assert!(message.contains("host set-runtime-root"), "{message}");
+    assert!(
+        fixture
+            .operations
+            .status()
+            .expect("the managers can be asked")
+            .registration()
+            .is_none(),
+        "the refusal has to come before anything is registered"
+    );
+}
+
+/// > Custom roots are never re-ACLed by this feature.
+///
+/// There is no public function that applies a security descriptor to a
+/// caller-chosen path -- `ensure_default_root` takes no path at all -- so what
+/// is left to check is that the read-only half really is read-only against a
+/// real directory with a real descriptor.
+#[test]
+#[ignore = "writes a real ACL to a temporary directory; run with the rest of this file"]
+fn a_custom_root_is_reported_and_never_rewritten() {
+    let fixture = Fixture::new("root-custom");
+    let custom = fixture.runner_root.join("an-operators-own-directory");
+    std::fs::create_dir_all(&custom).expect("an operator's own directory");
+    grant_everyone_full_control(&custom);
+
+    let before = report(&custom);
+    assert!(
+        matches!(
+            before,
+            RootAccessReport::Present {
+                broad_write: true,
+                ..
+            }
+        ),
+        "{before:?}"
+    );
+
+    // Reporting it repeatedly, as `service status` would on every invocation,
+    // must not drift it towards anything.
+    for _ in 0..3 {
+        assert_eq!(report(&custom), before);
+    }
+
+    // And the descriptor really is untouched, read back through a different
+    // route than the one that produced `before`.
+    let rendered = icacls(&custom, &[]);
+    assert!(
+        rendered.contains("Everyone"),
+        "the operator's own grant must survive being reported on: {rendered}"
+    );
+}
+
+/// The two pure predicates, against descriptors this machine actually produced.
+///
+/// Every other assertion about them is made against strings written by hand in
+/// `runner_root_access`'s own tests, which is the right place for the rules --
+/// but a rule that agrees with a hand-written example and disagrees with
+/// Windows would pass every one of them.
+#[test]
+#[ignore = "reads real descriptors from real directories"]
+fn the_predicates_agree_with_what_windows_actually_writes() {
+    let fixture = Fixture::new("root-predicates");
+    let narrow = fixture.runner_root.join("narrow");
+    let open = fixture.runner_root.join("open");
+    std::fs::create_dir_all(&narrow).expect("a directory");
+    std::fs::create_dir_all(&open).expect("a directory");
+
+    // Inheritance severed, LocalSystem only.
+    icacls(
+        &narrow,
+        &["/inheritance:r", "/grant", "*S-1-5-18:(OI)(CI)F"],
+    );
+    let RootAccessReport::Present {
+        dacl: narrow_dacl, ..
+    } = report(&narrow)
+    else {
+        panic!("the narrow directory must be readable")
+    };
+    assert!(is_protected(&narrow_dacl), "{narrow_dacl}");
+    assert!(!grants_broad_write(&narrow_dacl), "{narrow_dacl}");
+
+    // Everyone, full control, inherited by children.
+    grant_everyone_full_control(&open);
+    let RootAccessReport::Present {
+        dacl: open_dacl, ..
+    } = report(&open)
+    else {
+        panic!("the open directory must be readable")
+    };
+    assert!(
+        grants_broad_write(&open_dacl),
+        "a descriptor Windows itself wrote for Everyone must read as broadly writable: {open_dacl}"
+    );
+}
+
+/// Runs `icacls` against a path and returns what it printed.
+///
+/// The operator's own tool rather than this crate's writer, so a descriptor
+/// under test is one Windows produced from an operator's command instead of one
+/// this product knows how to make.
+fn icacls(path: &Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("icacls.exe is present on every Windows host");
+    assert!(
+        output.status.success(),
+        "icacls {arguments:?} failed on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Opens a directory to `Everyone`, inherited by everything below it.
+///
+/// `*S-1-1-0` rather than the name, because the name is localised and CI is not
+/// guaranteed to be English.
+fn grant_everyone_full_control(path: &Path) {
+    icacls(path, &["/grant", "*S-1-1-0:(OI)(CI)F"]);
 }

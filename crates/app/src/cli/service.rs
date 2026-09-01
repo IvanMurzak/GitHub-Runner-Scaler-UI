@@ -251,6 +251,12 @@ pub fn install(
         "  application data          captured from this command's account"
     )
     .map_err(failed)?;
+    // The directory jobs will actually run in, which is not one of the four
+    // application-data directories above and on Windows is not under the
+    // operator's profile at all. Said here because `service install` is where
+    // it is created, and because the sentence names who may write there --
+    // by role, never by SID. See `docs/service-account.md`.
+    writeln!(out, "  runner root               {}", installed.runner_root).map_err(failed)?;
     if cfg!(target_os = "linux") {
         writeln!(
             out,
@@ -362,6 +368,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::cli::{Cli, Command, DaemonCommand};
+    use runner_manager_domain::path::LocalAbsolutePath;
     use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
 
     /// The copy is what makes an upgrade possible at all: a package manager
@@ -445,6 +452,20 @@ mod tests {
             context.paths().clone(),
             ServiceIdentity::fixture("f3-stale-binary"),
             Arc::new(RecordingControls::new()),
+        )
+        // `install` prepares the runner root the registration would run jobs
+        // under, and the platform default is the real `%SystemDrive%\rman`.
+        // A unit test must neither create nor re-permission that, so a fixture
+        // registration aims it at this test's own temporary tree.
+        .with_runner_root(
+            LocalAbsolutePath::new(
+                temporary
+                    .path()
+                    .join("runner-root")
+                    .to_str()
+                    .expect("a unicode temporary path"),
+            )
+            .expect("a local absolute path"),
         );
         operations
             .install(&InstallRequest::new(StartMode::Boot).for_binary(&binary))
