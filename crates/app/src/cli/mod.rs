@@ -47,6 +47,7 @@ pub mod policy;
 pub mod service;
 pub mod status;
 pub mod ui;
+pub mod workspace;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -57,6 +58,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use runner_manager_domain::model::{Clock, Host, StartMode, SystemClock};
 use runner_manager_domain::store::{SqliteStore, Store};
+use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_github::{AppRegistration, Endpoints};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
@@ -518,6 +520,10 @@ pub struct AuthStatusArgs {
 pub enum HostCommand {
     /// Set the ceiling on concurrent runner attempts for this machine.
     SetCapacity(HostSetCapacityArgs),
+    /// Place disposable runner workspaces under a directory you choose.
+    SetRuntimeRoot(HostSetRuntimeRootArgs),
+    /// Return runner placement to this platform's default directory.
+    ResetRuntimeRoot,
     /// Show this machine's capacity, store, and projected REST budget.
     Show,
 }
@@ -527,6 +533,17 @@ pub struct HostSetCapacityArgs {
     /// Concurrent runner attempts this machine may hold, across every policy.
     #[arg(value_name = "N")]
     pub capacity: u16,
+}
+
+#[derive(Debug, Args)]
+pub struct HostSetRuntimeRootArgs {
+    /// An absolute local directory for disposable runner attempts.
+    ///
+    /// Application data does not move with it: config, the SQLite journal, logs
+    /// and the package cache stay where `--data-dir` puts them. Nothing under
+    /// the previous root is moved or deleted.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub path: String,
 }
 
 #[derive(Debug, Args)]
@@ -552,8 +569,68 @@ pub enum RepoCommand {
     AddLabel(RepoLabelArgs),
     /// Stop answering a label. The derived host label cannot be removed.
     RemoveLabel(RepoLabelArgs),
+    /// Choose disposable or persistent job workspaces for this repository.
+    SetWorkspace(RepoSetWorkspaceArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(RepoRemoveArgs),
+}
+
+/// `--mode`, mapped onto `a1`'s [`WorkspaceKind`].
+///
+/// A separate enum rather than a `clap` derive on the domain type: `a1` owns
+/// `crates/domain` and its value is a persisted token, while this is a
+/// command-line spelling. They are equal today and are allowed to diverge
+/// without one of them silently changing the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WorkspaceMode {
+    /// The default: the whole attempt directory is removed after every job.
+    Ephemeral,
+    /// Opt-in: a stable `sN` slot whose `_work` directory survives the job.
+    Persistent,
+}
+
+impl From<WorkspaceMode> for WorkspaceKind {
+    fn from(value: WorkspaceMode) -> Self {
+        match value {
+            WorkspaceMode::Ephemeral => WorkspaceKind::Ephemeral,
+            WorkspaceMode::Persistent => WorkspaceKind::Persistent,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// A DOC COMMENT ON A CLAP FIELD IS OPERATOR-FACING TEXT, NOT A NOTE TO A READER.
+// ----------------------------------------------------------------------------
+// `clap`'s derive turns the first line of a field's doc comment into its short
+// help and the rest into its LONG help, which is what `--help` prints. So the
+// rationale for the `--path` rule below is an ordinary `//` comment: an operator
+// asking how to configure a workspace should not be shown a paragraph about
+// which refusal `clap` can express.
+//
+// The rule itself: `--mode persistent` requires `--path` and `--mode ephemeral`
+// forbids it. clap can say the first (`required_if_eq`) and has no spelling for
+// the second, so the first is a usage error — exit 2, clap's own code — and the
+// second is `Failure::InvalidArgument`, exit 9, raised by `policy::set_workspace`.
+// That is exactly what the class is for: "an argument was well-formed for clap
+// and wrong for the domain". Both refuse and both name the command to run
+// instead; what neither does is silently ignore a path the operator typed, which
+// is the outcome `02-target-architecture.md` rules out.
+#[derive(Debug, Args)]
+pub struct RepoSetWorkspaceArgs {
+    /// The repository whose workspace behaviour is being set.
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    /// `ephemeral` discards the workspace after every job; `persistent` keeps
+    /// each slot's `_work` directory for the next job on the same slot.
+    #[arg(long, value_name = "MODE")]
+    pub mode: WorkspaceMode,
+    /// The directory this repository's persistent slots live in.
+    ///
+    /// Required by `--mode persistent`, and refused by `--mode ephemeral`,
+    /// which has no slots to place. Nothing under a previous root is moved or
+    /// deleted.
+    #[arg(long, value_name = "PATH", required_if_eq("mode", "persistent"))]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Args)]

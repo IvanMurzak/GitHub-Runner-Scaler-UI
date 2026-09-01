@@ -11,11 +11,16 @@ use runner_manager_domain::model::{
 };
 use runner_manager_domain::policy::{PolicyMode, PolicyState, RoutingLabels, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
+use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_github::InstallationAccount;
 use runner_manager_github::rest::{Admission, BudgetProjection, TargetCost};
+use runner_manager_platform::runner_root::RootOwner;
 
 use super::auth::CredentialState;
-use super::{CliError, Context, Failure, OrgCommand, RepoCommand, write_failed};
+use super::workspace;
+use super::{
+    CliError, Context, Failure, OrgCommand, RepoCommand, RepoSetWorkspaceArgs, write_failed,
+};
 
 const TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
 
@@ -61,6 +66,7 @@ pub fn dispatch_repo(
             LabelChange::Remove,
             out,
         ),
+        RepoCommand::SetWorkspace(a) => set_workspace(context, a, out),
         RepoCommand::Remove(a) => remove(
             context,
             ScaleTarget::repository(&a.repository).map_err(invalid)?,
@@ -119,6 +125,51 @@ pub fn dispatch_org(
             out,
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// repo set-workspace
+// ---------------------------------------------------------------------------
+
+/// `repo set-workspace OWNER/REPO --mode ephemeral|persistent [--path PATH]`.
+///
+/// # The two `--path` refusals, and why they are different classes
+///
+/// `--mode persistent` without `--path` is `required_if_eq` and never reaches
+/// here: clap refuses it with exit 2, which
+/// [`the taxonomy`](super::Failure) reserves for usage errors. `--mode
+/// ephemeral` **with** `--path` is a rule clap has no spelling for, so it is
+/// refused here as [`Failure::InvalidArgument`] — literally "an argument that
+/// was well-formed for clap and wrong for the domain". Silently ignoring the
+/// path is the one option `02-target-architecture.md` rules out: "`ephemeral`
+/// rejects `--path` so an ignored argument cannot mislead".
+fn set_workspace(
+    context: &Context,
+    args: &RepoSetWorkspaceArgs,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let target = ScaleTarget::repository(&args.repository).map_err(invalid)?;
+    let kind = WorkspaceKind::from(args.mode);
+    let owner = RootOwner::Repository(target.slug());
+    let path = match (kind, args.path.as_deref()) {
+        (WorkspaceKind::Ephemeral, Some(_)) => {
+            return Err(CliError::with_remedy(
+                Failure::InvalidArgument,
+                "--path names where persistent slots live, and an ephemeral workspace has \
+                 none; nothing was changed",
+                format!("runner-manager repo set-workspace {target} --mode ephemeral"),
+            ));
+        }
+        (WorkspaceKind::Ephemeral, None) => None,
+        (WorkspaceKind::Persistent, Some(raw)) => Some(workspace::parse_root(raw, &owner)?),
+        // clap's `required_if_eq` covers this; `e1` reaches the same refusal
+        // through `workspace::set_repository_workspace`.
+        (WorkspaceKind::Persistent, None) => None,
+    };
+
+    let store = context.store()?;
+    let change = workspace::set_repository_workspace(context, &store, &target, kind, path)?;
+    workspace::write_workspace_change(out, &change)
 }
 
 fn add(
@@ -580,6 +631,10 @@ fn write_add_result(
 fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<(), CliError> {
     let failed = write_failed("this policy list");
     let store = context.store()?;
+    // Read once for the whole list: every row's ephemeral fallback is the same
+    // host row, and re-reading it per policy would let two rows of one table
+    // describe two different hosts.
+    let host = super::host::local_host(&store)?;
     let mut count = 0;
     for policy in store.policies().map_err(store_failure)? {
         if policy.target.scope() != scope {
@@ -596,14 +651,63 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
             .map_or("-".to_string(), |n| n.to_string());
         writeln!(
             out,
-            "{}\t{}\t{}\tenabled={}\tmax={}",
+            "{}\t{}\t{}\tenabled={}\tmax={}\tworkspace={}",
             policy.target,
             mode,
             policy.state(),
             policy.enabled(),
-            maximum
+            maximum,
+            policy.workspace_policy().kind()
         )
         .map_err(failed)?;
+
+        // The detail line, which `d1` requires of the "repository detail" and
+        // `05-user-workflows.md` requires to name the effective path, its
+        // source, the leases, and the quarantined ones. It is a second line
+        // rather than more tab-separated columns so that `cut -f2` keeps
+        // working and the first line stays one policy per row.
+        //
+        // Assembled from the same read model `status --json` and `e1`'s screens
+        // use, so the three cannot answer "where does this repository's next
+        // attempt go" differently.
+        let view =
+            workspace::repository_workspace(context.paths(), &store, host.as_ref(), &policy)?;
+        let blocked = view
+            .leases
+            .iter()
+            .filter(|lease| lease.cleanup_blocked)
+            .count();
+        // `02-target-architecture.md`: "Organization Settings renders workspace
+        // mode as `ephemeral` and explains that persistent paths require
+        // repository scope." The explanation is the row, not a disabled control
+        // the operator has to guess about.
+        let why = if scope == TargetScope::Organization {
+            "; persistent workspaces require repository scope"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "workspace: {} root={} ({}) leases={} cleanup-blocked={blocked}{why}",
+            view.kind(),
+            view.effective_root()
+                .map_or_else(|| view.host_root.rendered(), str::to_string),
+            view.root_source_badge(),
+            view.leases.len(),
+        )
+        .map_err(failed)?;
+        // Leases outlive the mode that created them: a slot whose cleanup
+        // failed still holds its lease after the repository has been returned
+        // to ephemeral, and it is the thing that will refuse the operator's
+        // next path change. So it is reported whatever the current mode says.
+        for lease in view.leases.iter().filter(|lease| lease.cleanup_blocked) {
+            writeln!(
+                out,
+                "workspace: slot s{} quarantined ({}); remediation available",
+                lease.slot, lease.state
+            )
+            .map_err(failed)?;
+        }
         if policy.state() == PolicyState::RepairRequired {
             writeln!(
                 out,
