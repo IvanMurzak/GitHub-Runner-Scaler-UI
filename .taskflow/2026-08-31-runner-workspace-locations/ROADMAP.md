@@ -74,7 +74,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | ✅ | [PR #41](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/41), merge `bb30b7f` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | ✅ | [PR #39](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/39), merge `1ece70c` | 2026-09-01 |
-| [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | 🔵 | run `01a05d2e-d03f-70b8-80fd-523601830504` | 2026-09-01 |
+| [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | 🔵 | [PR #42](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/42) red, repairing | 2026-09-01 |
 | [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
 | [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | planned | none | 2026-08-31 |
 
@@ -187,6 +187,18 @@ directory untouched.
   The Windows failure is an ACL-narrowing defect, so gate 2 cannot be judged
   on this revision. Resumed the run at `code-review` to repair the branch,
   with the pre-merge guard re-armed.
+- Converted PR #40 to a draft so `gh pr merge` refuses deterministically,
+  replacing the race-prone process guard as the gate-2 hold.
+- `e1-workspace-tui` halted at `land`: PR #42 is open and unmerged because
+  `snapshot_every_required_settings_state` fails on all three platforms and
+  `tui_and_cli_store_byte_identical_workspace_values_and_render_one_message`
+  fails on Linux and macOS. Both are test-fixture defects, not product
+  defects: the parity fixture assumes the platform-default root is the same
+  string on every host, which decision D1 deliberately makes false, and the
+  stored snapshot embeds a host-specific path. Resumed at `code-review`.
+- Both cross-platform escapes share one cause: the pipeline local gate runs
+  only on the Windows development host, so a Linux or macOS difference
+  cannot be caught before CI.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
