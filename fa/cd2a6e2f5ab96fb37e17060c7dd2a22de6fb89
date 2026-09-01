@@ -1,0 +1,31 @@
+crates/agent/src/lifecycle.rs
+  s_7f44a57f5244c9::t_74477c35b65da0 1047-1048,5716-5740
+  s_7f44a57f5244c9::t_4367e8ecdbf040 828-834
+  s_7f44a57f5244c9::t_9743b044513167 1055-1059,1061-1064,1074-1075,5741
+  s_7f44a57f5244c9::t_fb867f90e3f44c 1060
+  s_7f44a57f5244c9::t_5467e8ef5e4205 3547-3551
+  s_7f44a57f5244c9::t_05ca2d982e2115 1008-1015
+  s_7f44a57f5244c9::t_14d0defd4f5fd2 545-550
+  s_7f44a57f5244c9::t_2393ececa5db80 921-929
+  s_7f44a57f5244c9::t_c190bc173f6bc0 591-595
+  s_7f44a57f5244c9::t_0754958d167e5f 1643-1645
+  s_7f44a57f5244c9::t_def0f8cab511da 1040-1046,1049-1054
+  s_7f44a57f5244c9::t_5eb0b697ecc692 958-960,962,970-973
+  s_7f44a57f5244c9::t_47b29e3bb7f254 5742
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "facd2a6e2f5ab96fb37e17060c7dd2a22de6fb89",
+  "prompts": {},
+  "sessions": {
+    "s_7f44a57f5244c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b217b5b0-7124-4be8-aea8-81aee57284ce",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
