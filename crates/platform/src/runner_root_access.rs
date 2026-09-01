@@ -80,11 +80,12 @@
 //! can assert the exact descriptor a Windows host will write, and the one test
 //! that needs a real DACL is the privileged one that has a real machine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use runner_manager_domain::path::LocalAbsolutePath;
 
 use crate::paths::AppPaths;
@@ -463,12 +464,24 @@ pub fn is_protected(descriptor: &str) -> bool {
 /// Every trustee a DACL grants write access to, canonicalised.
 #[must_use]
 pub fn write_trustees(descriptor: &str) -> BTreeSet<String> {
-    aces(descriptor)
-        .unwrap_or_default()
-        .iter()
-        .filter(|ace| ace.is_allow() && ace.grants_write())
-        .map(|ace| canonical_trustee(ace.trustee))
-        .collect()
+    write_grants(descriptor).into_keys().collect()
+}
+
+/// The same, with what each trustee is granted.
+///
+/// A rights field this cannot parse contributes `u32::MAX` rather than nothing,
+/// so a descriptor that cannot be read is a descriptor that never compares
+/// equal to the one this module writes — which costs a rewrite and cannot cost
+/// an under-reconciled root.
+fn write_grants(descriptor: &str) -> BTreeMap<String, u32> {
+    let mut grants: BTreeMap<String, u32> = BTreeMap::new();
+    for ace in aces(descriptor).unwrap_or_default() {
+        if ace.is_allow() && ace.grants_write() {
+            *grants.entry(canonical_trustee(ace.trustee)).or_default() |=
+                rights_mask(ace.rights).unwrap_or(u32::MAX);
+        }
+    }
+    grants
 }
 
 /// One spelling for the two trustees that have a fixed SID.
@@ -493,20 +506,37 @@ fn canonical_trustee(trustee: &str) -> String {
 /// costs one `SetNamedSecurityInfoW` — which is why an alias Windows substituted
 /// for an account SID is allowed to produce one — and a false positive would
 /// leave the root under-reconciled after a mode change, which is why the
-/// comparison is set equality rather than "contains what is needed".
+/// comparison is equality rather than "contains what is needed".
+///
+/// The rights are compared as well as the trustees, and that is not
+/// fastidiousness. A root that already names `SY`, `BA` and the selected
+/// account but grants the third `FA` matches on trustees alone, and `FA`
+/// carries the `WRITE_DAC` and `WRITE_OWNER` that [`ADMITTED_RIGHTS`] exists to
+/// withhold — so accepting it would leave the admitted account able to undo the
+/// protection this module applied. Masks rather than text, because Windows
+/// renders `FRFWFXSD` back as `0x1301bf`.
 #[must_use]
 pub fn admits_exactly(descriptor: &str, admission: &RootAdmission) -> bool {
+    let Some(full_control) = rights_mask("FA") else {
+        return false;
+    };
     if !is_protected(descriptor) {
         return false;
     }
-    let mut expected: BTreeSet<String> =
-        [SID_LOCAL_SYSTEM.to_owned(), SID_ADMINISTRATORS.to_owned()]
-            .into_iter()
-            .collect();
+    let mut expected: BTreeMap<String, u32> = [
+        (SID_LOCAL_SYSTEM.to_owned(), full_control),
+        (SID_ADMINISTRATORS.to_owned(), full_control),
+    ]
+    .into_iter()
+    .collect();
     if let Some(sid) = admission.sid() {
-        expected.insert(canonical_trustee(sid));
+        // `or_default` and `|=` rather than `insert`, because a daemon running
+        // as LocalSystem names a SID the first entry already carries, and
+        // `default_root_sddl` writes no second ACE for it.
+        *expected.entry(canonical_trustee(sid)).or_default() |=
+            rights_mask(ADMITTED_RIGHTS).unwrap_or(u32::MAX);
     }
-    write_trustees(descriptor) == expected
+    write_grants(descriptor) == expected
 }
 
 /// A security descriptor with account SIDs reduced to the fact that they are
@@ -666,13 +696,14 @@ impl RootAccessError {
 
 /// The command an operator runs to move the runner root elsewhere.
 ///
-/// Every caller outside the tests is in the Windows arm of [`reconcile`], which
-/// is the only place that builds an error carrying one.
+/// Every caller outside the tests is `reconcile`, which is Windows-only and is
+/// the only place that builds an error carrying one. Named without an intra-doc
+/// link for exactly that reason: off Windows there is no such item to link to.
 #[cfg_attr(
     not(windows),
     allow(
         dead_code,
-        reason = "only the Windows arm of `reconcile` builds an error that carries a remedy"
+        reason = "only `reconcile`, which is Windows-only, builds an error that carries a remedy"
     )
 )]
 fn remediation() -> String {
@@ -787,6 +818,15 @@ impl fmt::Display for RootAccessSummary {
 #[derive(Debug, Clone)]
 pub struct RootAccessChange {
     summary: RootAccessSummary,
+    /// Compiled where it is read rather than allowed where it is not.
+    ///
+    /// Only [`Self::revert`]'s Windows arm ever reads this, and only
+    /// [`reconcile`] ever fills it. On a platform with no descriptor to put
+    /// back the field is not there to be dead, so there is nothing to allow.
+    /// [`crate::process`] states the rule for this shape of problem: an
+    /// allowance leaves the lint's premise true and silences the report, while
+    /// a `cfg` makes the premise false instead.
+    #[cfg(windows)]
     previous_dacl: Option<String>,
 }
 
@@ -796,6 +836,7 @@ impl RootAccessChange {
     pub const fn not_applicable() -> Self {
         Self {
             summary: RootAccessSummary::NotApplicable,
+            #[cfg(windows)]
             previous_dacl: None,
         }
     }
@@ -978,8 +1019,21 @@ impl fmt::Display for RootAccessReport {
 pub fn report(path: &Path) -> RootAccessReport {
     #[cfg(windows)]
     {
-        if !path.exists() {
-            return RootAccessReport::Absent;
+        // `Path::exists` answers "absent" to every question it cannot answer,
+        // including "this account may not traverse the parent". That is the one
+        // answer this must not give for a directory that is there, because
+        // `Absent` reads as "nothing to worry about yet" while the truthful
+        // outcome is `Unreadable`, which says so.
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return RootAccessReport::Absent;
+            }
+            Err(source) => {
+                return RootAccessReport::Unreadable {
+                    detail: source.to_string(),
+                };
+            }
         }
         // The reader `crate::process` already carries, rather than a second
         // descriptor round trip of this module's own.
@@ -1048,7 +1102,12 @@ pub fn ensure_default_root(
 
 /// [`ensure_default_root`] against a root the caller names.
 ///
-/// `pub(crate)` and nothing more, so no consumer of this crate can reach it.
+/// `pub(crate)` and nothing more, so no consumer of this crate can reach it,
+/// and Windows-only because every caller is: [`ensure_default_root`] and
+/// [`crate::service::ServiceOperations`] both reach it from a Windows arm, so
+/// on the other two platforms it is not there to be dead rather than dead and
+/// allowed. [`RootAccessChange::not_applicable`] is what those platforms
+/// return instead.
 ///
 /// The only caller that passes a path other than the platform default is
 /// [`crate::service::ServiceOperations::with_runner_root`], whose override is
@@ -1059,89 +1118,82 @@ pub fn ensure_default_root(
 /// released `service install` pointed at the platform default whatever it is
 /// handed. A privileged smoke test uses it to exercise a directory it owns
 /// instead of the real `C:\rman`.
+#[cfg(windows)]
 pub(crate) fn reconcile(
     paths: &AppPaths,
     root: &LocalAbsolutePath,
     admission: &RootAdmission,
 ) -> Result<RootAccessChange, RootAccessError> {
-    #[cfg(not(windows))]
-    {
-        let _ = (paths, root, admission);
-        Ok(RootAccessChange::not_applicable())
-    }
-    #[cfg(windows)]
-    {
-        let checked = RootPreflight::new(paths)
-            .check(&RootOwner::Host, root)
-            .map_err(|source| RootAccessError::Resolve {
-                source: Box::new(source),
-            })?;
-        let desired = default_root_sddl(admission);
-        let path = root.as_path().to_path_buf();
+    let checked = RootPreflight::new(paths)
+        .check(&RootOwner::Host, root)
+        .map_err(|source| RootAccessError::Resolve {
+            source: Box::new(source),
+        })?;
+    let desired = default_root_sddl(admission);
+    let path = root.as_path().to_path_buf();
 
-        if checked.leaf_to_create().is_some() {
-            match sys::create_with_dacl(&path, &desired) {
-                Ok(()) => {
-                    return Ok(RootAccessChange {
-                        summary: RootAccessSummary::Created {
-                            path,
-                            admits: admission.admits(),
-                        },
-                        previous_dacl: None,
-                    });
-                }
-                // Another process created it between the preflight and here.
-                // Fall through and treat it as the pre-existing directory it now
-                // is, which applies the same refusal to it as to any other.
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => {
-                    return Err(RootAccessError::Create {
+    if checked.leaf_to_create().is_some() {
+        match sys::create_with_dacl(&path, &desired) {
+            Ok(()) => {
+                return Ok(RootAccessChange {
+                    summary: RootAccessSummary::Created {
                         path,
-                        source,
-                        remediation: remediation(),
-                    });
-                }
+                        admits: admission.admits(),
+                    },
+                    previous_dacl: None,
+                });
+            }
+            // Another process created it between the preflight and here.
+            // Fall through and treat it as the pre-existing directory it now
+            // is, which applies the same refusal to it as to any other.
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(RootAccessError::Create {
+                    path,
+                    source,
+                    remediation: remediation(),
+                });
             }
         }
+    }
 
-        let current = sys::read_dacl(&path).map_err(|source| RootAccessError::Inspect {
-            path: path.clone(),
-            source,
+    let current = sys::read_dacl(&path).map_err(|source| RootAccessError::Inspect {
+        path: path.clone(),
+        source,
+        remediation: remediation(),
+    })?;
+
+    if grants_broad_write(&current) {
+        return Err(RootAccessError::BroadExistingAccess {
+            dacl: redact(&current),
+            volume: volume_of(&path),
+            path,
             remediation: remediation(),
-        })?;
+        });
+    }
 
-        if grants_broad_write(&current) {
-            return Err(RootAccessError::BroadExistingAccess {
-                dacl: redact(&current),
-                volume: volume_of(&path),
-                path,
-                remediation: remediation(),
-            });
-        }
-
-        if admits_exactly(&current, admission) {
-            return Ok(RootAccessChange {
-                summary: RootAccessSummary::AlreadyReconciled {
-                    path,
-                    admits: admission.admits(),
-                },
-                previous_dacl: None,
-            });
-        }
-
-        sys::write_dacl(&path, &desired).map_err(|source| RootAccessError::Apply {
-            path: path.clone(),
-            source,
-            remediation: remediation(),
-        })?;
-        Ok(RootAccessChange {
-            summary: RootAccessSummary::Reconciled {
+    if admits_exactly(&current, admission) {
+        return Ok(RootAccessChange {
+            summary: RootAccessSummary::AlreadyReconciled {
                 path,
                 admits: admission.admits(),
             },
-            previous_dacl: Some(current),
-        })
+            previous_dacl: None,
+        });
     }
+
+    sys::write_dacl(&path, &desired).map_err(|source| RootAccessError::Apply {
+        path: path.clone(),
+        source,
+        remediation: remediation(),
+    })?;
+    Ok(RootAccessChange {
+        summary: RootAccessSummary::Reconciled {
+            path,
+            admits: admission.admits(),
+        },
+        previous_dacl: Some(current),
+    })
 }
 
 /// Creates a directory carrying an exact descriptor, for this crate's own tests
@@ -1159,10 +1211,11 @@ pub(crate) fn create_with_descriptor_for_tests(path: &Path, sddl: &str) -> io::R
 
 /// The volume a path sits on, for the message that explains where an inherited
 /// grant came from.
-#[cfg_attr(
-    not(windows),
-    expect(dead_code, reason = "only the Windows message needs it")
-)]
+///
+/// Windows-only because that message is: [`reconcile`] is the only caller, and
+/// it is the item this file compiles where it is used rather than allows where
+/// it is not.
+#[cfg(windows)]
 fn volume_of(path: &Path) -> PathBuf {
     path.ancestors()
         .last()
@@ -1207,8 +1260,27 @@ mod sys {
     }
 
     /// A `windows` error as the `io::Error` this module's callers report.
+    ///
+    /// The facility is unwrapped rather than passed through, and that is not
+    /// cosmetic. `windows-rs` reports a Win32 failure as `HRESULT_FROM_WIN32`,
+    /// so `ERROR_ALREADY_EXISTS` arrives as `0x8007_00B7` — and
+    /// `io::Error::from_raw_os_error` classifies the *Win32* code, which means
+    /// the wrapped form reads back as [`io::ErrorKind::Uncategorized`] where
+    /// the bare `183` reads back as [`io::ErrorKind::AlreadyExists`].
+    /// [`super::reconcile`] branches on exactly that kind to absorb a directory
+    /// created between the preflight and the creation, so leaving the facility
+    /// on would make that branch unreachable.
     fn io_error(error: &windows::core::Error) -> io::Error {
-        io::Error::from_raw_os_error(error.code().0)
+        /// The high half `HRESULT_FROM_WIN32` puts in front of a Win32 code.
+        const FACILITY_WIN32: u32 = 0x8007_0000;
+
+        let hresult = error.code().0;
+        let bits = hresult.cast_unsigned();
+        if bits & 0xFFFF_0000 == FACILITY_WIN32 {
+            io::Error::from_raw_os_error((bits & 0x0000_FFFF).cast_signed())
+        } else {
+            io::Error::from_raw_os_error(hresult)
+        }
     }
 
     /// A security descriptor built from SDDL, freed when it goes out of scope.
@@ -1338,6 +1410,25 @@ mod sys {
             Err(io::Error::from_raw_os_error(
                 i32::try_from(status.0).unwrap_or(i32::MAX),
             ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io;
+
+        /// [`super::super::reconcile`] absorbs a directory created between the
+        /// preflight and the creation by matching on
+        /// [`io::ErrorKind::AlreadyExists`]. That branch is reachable only if
+        /// [`super::io_error`] unwraps `HRESULT_FROM_WIN32`, so the mapping is
+        /// pinned here against a failure Windows itself produced rather than
+        /// against a constant this file chose.
+        #[test]
+        fn a_directory_that_already_exists_reads_back_as_already_exists() {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let error = super::create_with_dacl(directory.path(), "D:P(A;OICI;FA;;;SY)")
+                .expect_err("creating a directory that is already there fails");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
         }
     }
 }
@@ -1542,6 +1633,31 @@ mod tests {
     }
 
     #[test]
+    fn a_root_that_grants_the_account_full_control_is_reconciled_rather_than_accepted() {
+        // The trustees are exactly right and the rights are not: `FA` carries
+        // `WRITE_DAC` and `WRITE_OWNER`, the two the admitted account must not
+        // have, because either one lets it undo the protection. Matching on
+        // trustees alone would adopt this and leave the root re-openable by the
+        // account it exists to constrain.
+        let too_much = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)";
+        assert!(!grants_broad_write(too_much), "no broad trustee is named");
+        assert_eq!(
+            write_trustees(too_much),
+            write_trustees(&default_root_sddl(&account()))
+        );
+        assert!(!admits_exactly(too_much, &account()), "{too_much}");
+    }
+
+    #[test]
+    fn windows_own_spelling_of_the_admitted_rights_still_matches() {
+        // `FRFWFXSD` is not a form the converter hands back; it renders the
+        // same mask as `0x1301bf`. Comparing the text rather than the bits
+        // would rewrite the descriptor on every single install.
+        let rendered = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-21-1-2-3-1001)";
+        assert!(admits_exactly(rendered, &account()), "{rendered}");
+    }
+
+    #[test]
     fn an_unprotected_root_never_matches_however_narrow_it_looks() {
         let narrow = "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)";
         assert!(!grants_broad_write(narrow), "nothing broad is granted");
@@ -1706,13 +1822,58 @@ mod tests {
             }
             other => panic!("expected a readable descriptor, got {other:?}"),
         }
+        let after_creation = read_back(&directory);
 
-        // Idempotent: a second pass changes nothing and reverting it removes
-        // nothing, because there is nothing of this call's to remove.
+        // A second pass creates nothing, and reverting it removes nothing,
+        // because there is nothing of this call's to remove.
+        //
+        // Whether it also *rewrites* the descriptor is a property of the host
+        // rather than of this code, so it is deliberately not asserted here.
+        // `admits_exactly` compares SDDL text, and Windows renders an account
+        // whose RID has an alias back as that alias -- the built-in
+        // administrator's `S-1-5-21-...-500` reads back as `LA`. This module
+        // declines to claim a match it cannot resolve and pays for one
+        // redundant write instead, which is what a CI host running as that
+        // account did while a developer host running as an ordinary one did
+        // not. Both outcomes are correct; only removing the directory would
+        // not be.
+        // `an_account_alias_windows_substituted_is_reconciled_rather_than_trusted`
+        // pins that decision purely. What holds on every host, and is asserted
+        // instead, is that neither outcome changes anything: the directory
+        // survives and still carries the descriptor creation wrote.
         let again = reconcile(&app_paths, &checked, &admission).expect("a second pass succeeds");
-        assert!(!again.summary().created());
-        assert_eq!(again.revert(), Reversal::NothingToUndo);
+        assert!(!again.summary().created(), "{:?}", again.summary());
+        // Read back BEFORE reverting. A rewriting second pass keeps the
+        // descriptor it read as `previous_dacl`, so reverting puts
+        // `after_creation` back whatever it wrote — asserting only afterwards
+        // would pass however wrong that write had been.
+        //
+        // Compared by what it grants rather than by its exact text, for the
+        // reason `reverting_a_reconciliation_puts_the_previous_descriptor_back`
+        // gives: `SetNamedSecurityInfoW` records that it ran the
+        // auto-inheritance algorithm by adding `AI` to the control flags, so a
+        // host that took the rewriting branch reads back as `D:PAI` where
+        // `CreateDirectoryW` wrote `D:P`. Demanding the same characters would
+        // fail on exactly the host the comment above describes.
+        assert_same_grants(
+            &read_back(&directory),
+            &after_creation,
+            "a second pass must leave the descriptor granting what creation wrote",
+        );
+        let reversal = again.revert();
+        assert!(
+            matches!(
+                reversal,
+                Reversal::NothingToUndo | Reversal::Restored { .. }
+            ),
+            "a second pass has nothing of its own to undo: {reversal:?}"
+        );
         assert!(directory.is_dir(), "the second pass must not remove it");
+        assert_same_grants(
+            &read_back(&directory),
+            &after_creation,
+            "and reverting it must leave those grants alone",
+        );
 
         // The child a runner attempt would be, created and cleaned as this
         // account.
@@ -1809,6 +1970,21 @@ mod tests {
         descriptor
             .find('(')
             .map_or(descriptor, |start| &descriptor[start..])
+    }
+
+    /// Two descriptors grant the same thing, whoever wrote them.
+    ///
+    /// The same comparison [`aces_of`] exists for: every ACE identical and the
+    /// protection still in force, without demanding the `AI` control flag that
+    /// `SetNamedSecurityInfoW` adds and `CreateDirectoryW` does not.
+    #[cfg(windows)]
+    fn assert_same_grants(actual: &str, expected: &str, context: &str) {
+        assert_eq!(
+            aces_of(actual),
+            aces_of(expected),
+            "{context}: {actual} vs {expected}"
+        );
+        assert!(is_protected(actual), "{context}: {actual}");
     }
 
     #[cfg(windows)]

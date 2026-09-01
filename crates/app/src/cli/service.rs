@@ -256,7 +256,15 @@ pub fn install(
     // operator's profile at all. Said here because `service install` is where
     // it is created, and because the sentence names who may write there --
     // by role, never by SID. See `docs/service-account.md`.
-    writeln!(out, "  runner root               {}", installed.runner_root).map_err(failed)?;
+    //
+    // Only when this install actually did something to it. On macOS and Linux
+    // the runner root is the runtime directory `AppPaths` already permissions,
+    // and the summary is the sentence "nothing was created or changed" -- which
+    // under a `runner root` label reads as though there were no runner root at
+    // all. `status` prints the effective one on every platform.
+    if installed.runner_root.path().is_some() {
+        writeln!(out, "  runner root               {}", installed.runner_root).map_err(failed)?;
+    }
     if cfg!(target_os = "linux") {
         writeln!(
             out,

@@ -3587,6 +3587,11 @@ impl ServiceOperations {
         // so that no `?` sits between preparing the directory and the first
         // step that knows how to undo it.
         let target = self.controls.control(to)?;
+        // The domain being left, resolved here rather than where it is used for
+        // the same reason: the only step that removes it runs after the runner
+        // root has been prepared, and a `?` there would abandon the target
+        // registration, the record and the directory without a word.
+        let previous = self.controls.control(from)?;
 
         // The account changes with the mode, and so must the account the runner
         // root admits: `04-security-recovery.md` requires the selected identity
@@ -3622,7 +3627,7 @@ impl ServiceOperations {
         // Only after the target registration and its durable record exist is
         // it safe to remove the old domain. If that last step fails, remove the
         // target and put the old record back so status and reality agree.
-        if let Err(cause) = self.controls.control(from)?.uninstall(&self.identity) {
+        if let Err(cause) = previous.uninstall(&self.identity) {
             let target_rollback = target.uninstall(&self.identity);
             let record_rollback = record.write(&self.paths);
             return Err(rolled_back(
@@ -3998,11 +4003,11 @@ impl ServiceStatus {
         )) = &runner_root
         {
             notes.push(format!(
-                "{} can be written by ordinary local users, so it is not a safe place to run \
-                 jobs. `service install` refuses it rather than tightening it, because the \
-                 contents of a directory anybody could write cannot be trusted: remove or \
-                 empty it, or choose another root with `runner-manager host set-runtime-root \
-                 --path <PATH>`.",
+                "the platform default runner root {} can be written by ordinary local users, so \
+                 it is not a safe place to run jobs. `service install` refuses it rather than \
+                 tightening it, because the contents of a directory anybody could write cannot \
+                 be trusted: remove or empty it, or choose another root with `runner-manager \
+                 host set-runtime-root --path <PATH>`.",
                 path.display()
             ));
         }
@@ -4161,9 +4166,15 @@ impl fmt::Display for ServiceStatus {
         }
         writeln!(f, "  diagnostic log            {}", self.log_file.display())?;
         if let Some((path, report)) = &self.runner_root {
-            writeln!(f, "  runner root               {}", path.display())?;
+            // Named as the *default* rather than as "the runner root", because
+            // it is only the effective one until an operator runs
+            // `host set-runtime-root`. This crate cannot see that setting — it
+            // lives in the application's store — so an unqualified label here
+            // would contradict the `runner root … (host-configured)` row that
+            // `status` and `host show` print from the value that is in force.
+            writeln!(f, "  default runner root       {}", path.display())?;
             if *report != RootAccessReport::NotApplicable {
-                writeln!(f, "  runner root access        {report}")?;
+                writeln!(f, "  default root access       {report}")?;
             }
         }
         if let Some(store) = &self.store {
