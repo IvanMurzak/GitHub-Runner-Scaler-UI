@@ -576,8 +576,10 @@ impl FormLine {
         self
     }
 
-    fn copyable(mut self, text: impl Into<String>) -> Self {
-        self.copy = Some(text.into());
+    /// `None` is a row a click cannot copy, which is not the same as a row
+    /// that copies the placeholder it happens to be showing.
+    fn copyable(mut self, text: Option<String>) -> Self {
+        self.copy = text;
         self
     }
 }
@@ -714,6 +716,21 @@ impl SettingsUi {
         if self.workspace_path.is_editing() {
             self.workspace_path.cancel();
             self.workspace_notice = None;
+        }
+    }
+
+    /// Ends any edit in progress, keeping the draft, exactly as Enter does.
+    ///
+    /// The counterpart to [`Self::cancel_editing`], for the one route out that
+    /// stays on this screen: a click on another control. Leaving the screen
+    /// discards a draft nothing will ask about again; clicking `Save` beside
+    /// the field must save what is in it.
+    fn accept_editing(&mut self) {
+        if self.host_root.is_editing() {
+            self.host_root.accept();
+        }
+        if self.workspace_path.is_editing() {
+            self.workspace_path.accept();
         }
     }
 
@@ -899,10 +916,17 @@ impl SettingsUi {
         // `02-target-architecture.md` requires rather than a silently ignored
         // argument -- so the draft is simply not sent when the mode is
         // ephemeral, exactly as `repo set-workspace --mode ephemeral` omits it.
+        // A blank draft is "no path" rather than the empty string: sent as
+        // `Some("")` it was answered by the path parser -- `"" cannot be used
+        // as ...` -- instead of by
+        // `set_repository_workspace`'s `(Persistent, None)` arm, which states
+        // the rule the operator actually broke and is the wording the inline
+        // check already showed them.
         let path = self
             .workspace_mode
             .is_persistent()
-            .then(|| self.workspace_path.text());
+            .then(|| self.workspace_path.text())
+            .filter(|draft| !draft.trim().is_empty());
         let mut output = Vec::new();
         let result =
             form.save_workspace(context, self.workspace_mode, path.as_deref(), &mut output);
@@ -1040,6 +1064,19 @@ impl SettingsUi {
             .rows(width, compact)
             .get(usize::from(content_row))?
             .clone();
+        // The row map is read against the frame that was drawn -- with the
+        // caret and the editing hint still on it -- and only then is the edit
+        // ended, because the mouse is the second navigation an open editor
+        // cannot swallow. Left open it kept the whole keyboard for a field the
+        // click may just have removed from the form: clicking `Workspace mode`
+        // while the persistent root is being typed toggles the mode back to
+        // ephemeral, which drops the path control, and every subsequent key
+        // then went into a field no frame was drawing any more.
+        //
+        // Accepted rather than cancelled: Enter keeps the draft, and clicking
+        // `Save runner root` on a path the operator has just typed has to save
+        // that path rather than the value it replaced.
+        self.accept_editing();
         if let Some(control) = row.control {
             self.focus = control;
             return if self.focused().is_some_and(Control::is_adjustable) {
@@ -1335,11 +1372,10 @@ impl SettingsUi {
                     .as_deref()
                     .unwrap_or("not reserved until promotion")
             ))
-            .copyable(
-                form.copyable_runs_on
-                    .clone()
-                    .unwrap_or_else(|| "not reserved until promotion".to_owned()),
-            ),
+            // Only a reserved label is copyable. A monitor-only policy has
+            // none, and putting the placeholder sentence on the clipboard
+            // would hand the operator a `runs-on:` value no workflow can use.
+            .copyable(form.copyable_runs_on.clone()),
         ];
         let mut next = 0;
         if form.exposes_scale_toggle() {
@@ -1600,7 +1636,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool)
         })
         .collect();
     if let Some(message) = &ui.message {
-        lines.extend(wrap(message, width).into_iter().map(Line::from));
+        // Split on newlines *before* wrapping. Every workspace message is the
+        // command's own multi-line success block, and `wrap` only breaks on
+        // spaces, so one `Line` holding `\n` drew "Runner root configured."
+        // and "Previous: ..." run together on one row with the break swallowed.
+        lines.extend(
+            message
+                .lines()
+                .flat_map(|line| wrap(line, width))
+                .map(Line::from),
+        );
     }
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().title("Settings").borders(Borders::ALL)),
@@ -3165,6 +3210,100 @@ mod tests {
             assert!(
                 !text.contains(line.trim()),
                 "an organization is never offered persistence, so it is never warned about it"
+            );
+        }
+    }
+
+    /// Clicking another control closes the editor that owns the keyboard, and
+    /// keeps the draft it was holding.
+    ///
+    /// The mouse is the second navigation an open editor cannot swallow. Left
+    /// open by a click on `Workspace mode`, it kept the whole keyboard for a
+    /// path control the same click had just removed from the form: the mode
+    /// went back to ephemeral, the row stopped being drawn, and every key
+    /// after that -- `q` included -- was typed into a field nobody could see.
+    #[test]
+    fn clicking_another_control_ends_the_edit_and_keeps_what_was_typed() {
+        let fixture = Workspaces::new();
+        let width = 100usize;
+        let row_of = |ui: &SettingsUi, control: Control| {
+            let index = ui
+                .controls()
+                .iter()
+                .position(|candidate| *candidate == control)
+                .expect("the control is on this screen");
+            u16::try_from(
+                ui.rows(width, false)
+                    .iter()
+                    .position(|row| row.control == Some(index))
+                    .expect("the control is drawn"),
+            )
+            .unwrap()
+        };
+
+        // The control the click removes.
+        let mut ui = fixture.policy_screen();
+        focus_by_keyboard(&mut ui, Control::WorkspaceMode);
+        let _ = ui.key(KeyCode::Right);
+        focus_by_keyboard(&mut ui, Control::WorkspacePath);
+        assert!(ui.key(KeyCode::Enter).is_none());
+        type_path(&mut ui, &fixture.root("slots"));
+        let mode_row = row_of(&ui, Control::WorkspaceMode);
+        let _ = ui.click(mode_row, width, false);
+        assert_eq!(ui.workspace_mode, WorkspaceKind::Ephemeral);
+        assert!(
+            !ui.is_editing(),
+            "a field no frame draws may not keep the keyboard"
+        );
+
+        // And the draft survives, so clicking Save saves what was typed.
+        let mut ui = fixture.host_screen();
+        focus_by_keyboard(&mut ui, Control::HostRunnerRoot);
+        assert!(ui.key(KeyCode::Enter).is_none());
+        type_path(&mut ui, &fixture.root("clicked"));
+        let save_row = row_of(&ui, Control::HostRootSave);
+        let command = ui.click(save_row, width, false).expect("Save dispatches");
+        assert!(!ui.is_editing());
+        ui.execute(&fixture.context, command);
+        assert_eq!(
+            fixture
+                .stored_host()
+                .runner_root_override
+                .map(|root| root.as_str().to_owned()),
+            Some(fixture.root("clicked")),
+            "{:?}",
+            ui.message
+        );
+    }
+
+    /// A save message is the command's own multi-line block, and every line of
+    /// it gets a row of its own.
+    #[test]
+    fn a_multi_line_save_message_is_drawn_one_line_per_row() {
+        let fixture = Workspaces::new();
+        let mut ui = fixture.host_screen();
+        edit_path(
+            &mut ui,
+            &fixture.context,
+            Control::HostRunnerRoot,
+            &fixture.root("drawn"),
+        );
+        activate(&mut ui, &fixture.context, Control::HostRootSave);
+        let message = ui.message.clone().expect("the success block");
+        assert!(message.lines().count() > 1, "{message}");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &ui, false))
+            .unwrap();
+        let drawn = super::super::buffer_text(terminal.backend().buffer());
+        for line in message.lines() {
+            let head = line.split_whitespace().next().unwrap_or_default();
+            assert!(
+                drawn
+                    .lines()
+                    .any(|row| row.trim_start_matches('│').trim_start().starts_with(head)),
+                "{head:?} does not begin a row of its own:\n{drawn}"
             );
         }
     }
