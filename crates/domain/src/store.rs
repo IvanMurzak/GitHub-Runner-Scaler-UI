@@ -828,9 +828,15 @@ impl CountedAttempts {
     /// The scalar sub-select counting this set for the policy bound as `:id`.
     ///
     /// Clamped to `u16::MAX` in SQL so the comparison against the caller's `u16`
-    /// is total: a journal holding more than 65 535 uncleaned attempts for one
-    /// policy compares unequal to every value a caller can pass, which refuses
-    /// the write rather than wrapping into an accidental match.
+    /// is representable on both sides rather than wrapping: a journal holding
+    /// more than 65 535 uncleaned attempts for one policy reports the ceiling,
+    /// which is the same figure the diagnosis below reports and the same one a
+    /// caller's own saturating count would produce. The clamp is therefore a
+    /// saturation, not a fence in its own right — at the ceiling the two sides
+    /// can still agree — and it is chosen deliberately, because the alternative
+    /// is a refusal whose message reads "expected 65535, but now has 65535".
+    /// Nothing in this product creates 65 535 concurrent attempts for one
+    /// policy; host capacity is a `NonZeroU16` bound checked long before here.
     fn count_sql(self) -> String {
         let predicate = match self {
             CountedAttempts::Active => active_sql(),
