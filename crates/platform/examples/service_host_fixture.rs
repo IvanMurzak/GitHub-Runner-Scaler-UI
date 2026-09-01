@@ -132,6 +132,38 @@ fn record_workspace(heartbeat: &std::path::Path, root: &std::path::Path) {
     let _ = std::fs::write(workspace_outcome_path(heartbeat), outcome);
 }
 
+/// Whether the installer marked this launch as the Service Control Manager's.
+///
+/// Read from the arguments rather than guessed at, and read from the constant
+/// the installer itself writes rather than from a copy of its spelling.
+#[cfg(windows)]
+fn launched_by_the_service_control_manager() -> bool {
+    std::env::args_os()
+        .any(|argument| argument == runner_manager_platform::service::WINDOWS_SCM_HOST_ARGUMENT)
+}
+
+/// Records a start, exercises the runner root if asked to, and parks.
+///
+/// The shape every manager but the Windows Service Control Manager starts: an
+/// ordinary process that runs until it is terminated. launchd and systemd both
+/// do this, and so does Windows **Task Scheduler**, which is what a login-mode
+/// registration is — there is no dispatcher to connect to and nothing to report.
+fn run_as_an_ordinary_process() -> ! {
+    let Some(path) = heartbeat_path() else {
+        std::process::exit(2);
+    };
+    record_start(&path);
+    if let Some(root) = runner_root() {
+        record_workspace(&path, &root);
+    }
+    // Park until the manager signals. The default `SIGTERM` disposition ends
+    // the process, which is exactly the clean stop launchd and systemd expect,
+    // so no handler is installed; Task Scheduler terminates it outright.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 #[cfg(windows)]
 mod host {
     use std::ffi::OsString;
@@ -154,6 +186,18 @@ mod host {
     /// apart from a run as a service without a flag either side could get
     /// wrong.
     pub fn run() {
+        // Only a *boot* registration is a service. A login registration is a
+        // Task Scheduler task, which starts an ordinary process: there is no
+        // service controller to connect to, and connecting anyway would end
+        // this process at the dispatcher's refusal before it wrote a single
+        // heartbeat line. The two are told apart by the marker the installer
+        // puts on the SCM registration and on no other -- the same
+        // discriminator the product's own daemon reads -- rather than by a
+        // failed connection, which is indistinguishable from a genuine SCM
+        // failure that must still be reported.
+        if !super::launched_by_the_service_control_manager() {
+            super::run_as_an_ordinary_process();
+        }
         if let Err(error) = windows_service::service_dispatcher::start("", ffi_service_main) {
             eprintln!("this fixture only runs under the Windows Service Control Manager: {error}");
             std::process::exit(2);
@@ -210,19 +254,7 @@ mod host {
     /// launchd and systemd both start an ordinary process and both stop it with
     /// `SIGTERM`, so there is no dispatcher to connect to and nothing to report.
     pub fn run() {
-        let Some(path) = super::heartbeat_path() else {
-            std::process::exit(2);
-        };
-        super::record_start(&path);
-        if let Some(root) = super::runner_root() {
-            super::record_workspace(&path, &root);
-        }
-        // Park until the service manager signals. The default `SIGTERM`
-        // disposition ends the process, which is exactly the clean stop both
-        // managers expect, so no handler is installed.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        super::run_as_an_ordinary_process();
     }
 }
 

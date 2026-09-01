@@ -3405,6 +3405,12 @@ impl ServiceOperations {
             ServiceDirectories::of(&self.paths),
         )?;
 
+        // Resolved before the runner root, and used after it: every step from
+        // here on has to be able to undo the directory, and a `?` between the
+        // preparation and the first fallible use would leave one behind with
+        // nothing to say so.
+        let control = self.controls.control(plan.start_mode())?;
+
         // Item 8, and the one step that can refuse an otherwise valid install.
         // Before the platform is asked to register anything, because a
         // registration whose workspaces would land in a directory ordinary local
@@ -3412,7 +3418,6 @@ impl ServiceOperations {
         // undoing a directory is cheaper than undoing a service.
         let root = self.prepare_runner_root(plan.start_mode())?;
 
-        let control = self.controls.control(plan.start_mode())?;
         let definition = match control.install(&plan) {
             Ok(definition) => definition,
             Err(cause) => return Err(undo_runner_root(&root, "install", &self.identity, cause)),
@@ -3560,6 +3565,14 @@ impl ServiceOperations {
             Err(_) => plan,
         };
 
+        // Install the target domain before touching the live one. This makes a
+        // failed target install a no-op from the operator's point of view and,
+        // unlike uninstall-first ordering, never trades a working service for
+        // an error message. Resolved before the runner root and used after it,
+        // so that no `?` sits between preparing the directory and the first
+        // step that knows how to undo it.
+        let target = self.controls.control(to)?;
+
         // The account changes with the mode, and so must the account the runner
         // root admits: `04-security-recovery.md` requires the selected identity
         // to be *reconciled* when service mode changes, which means adding the
@@ -3569,11 +3582,6 @@ impl ServiceOperations {
         // registration.
         let root = self.prepare_runner_root(to)?;
 
-        // Install the target domain before touching the live one. This makes a
-        // failed target install a no-op from the operator's point of view and,
-        // unlike uninstall-first ordering, never trades a working service for
-        // an error message.
-        let target = self.controls.control(to)?;
         let definition = match target.install(&plan) {
             Ok(definition) => definition,
             Err(cause) => {

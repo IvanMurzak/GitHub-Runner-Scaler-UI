@@ -56,8 +56,8 @@ use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::runner_root::default_runner_root;
 use runner_manager_platform::runner_root_access::{
-    Reversal, RootAccessError, RootAccessReport, RootAdmission, ensure_default_root,
-    grants_broad_write, is_protected, report,
+    Reversal, RootAccessChange, RootAccessError, RootAccessReport, RootAdmission,
+    ensure_default_root, grants_broad_write, is_protected, report,
 };
 use runner_manager_platform::service::{
     BinaryPath, HostControls, InstallRecord, InstallRequest, Installed, RestartPolicy,
@@ -893,6 +893,34 @@ fn a_killed_service_comes_back_and_no_sooner_than_the_bounded_delay() {
 // The runner root (b2)
 // ---------------------------------------------------------------------------
 
+/// Puts the machine's real runner root back however this test ends.
+///
+/// A guard rather than a line near the bottom, for the reason [`Fixture`]'s own
+/// [`Drop`] exists: every `assert!`, every `panic!` and every `expect` between
+/// the preparation and that line is a path that would otherwise skip it and
+/// leave a re-permissioned `%SystemDrive%\rman` on the host -- which is exactly
+/// what the CI job checks for afterwards, and would then report as a broken
+/// rollback rather than as the failure that actually happened.
+struct RestoresTheRealRunnerRoot(Option<RootAccessChange>);
+
+impl RestoresTheRealRunnerRoot {
+    /// Reverts now, and says what that achieved.
+    ///
+    /// Idempotent: a second call, including [`Drop`]'s, has nothing left to do.
+    fn revert(&mut self) -> Reversal {
+        self.0
+            .take()
+            .map_or(Reversal::NothingToUndo, |change| change.revert())
+    }
+}
+
+impl Drop for RestoresTheRealRunnerRoot {
+    fn drop(&mut self) {
+        // Never panics: a second panic during an unwind aborts the process.
+        let _ = self.revert();
+    }
+}
+
 /// The Definition-of-Done item that only a real machine can answer:
 ///
 /// > A boot service running as LocalSystem can create, materialize, and clean a
@@ -920,8 +948,8 @@ fn a_boot_service_creates_materializes_and_cleans_a_child_below_the_real_default
     let paths = fixture.paths.clone();
 
     let root = default_runner_root(&paths).expect("this host resolves a default runner root");
-    let prepared = match ensure_default_root(&paths, &RootAdmission::LocalSystem) {
-        Ok(prepared) => prepared,
+    let mut prepared = match ensure_default_root(&paths, &RootAdmission::LocalSystem) {
+        Ok(prepared) => RestoresTheRealRunnerRoot(Some(prepared)),
         Err(error @ RootAccessError::BroadExistingAccess { .. }) => panic!(
             "this host already has a runner root that ordinary local users can write, and the \
              product refuses such a directory rather than adopting it -- which is the behaviour \

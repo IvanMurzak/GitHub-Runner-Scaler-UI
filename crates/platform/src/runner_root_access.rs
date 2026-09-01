@@ -310,6 +310,18 @@ struct Ace<'a> {
 /// ACEs".
 fn aces(descriptor: &str) -> Option<Vec<Ace<'_>>> {
     let body = descriptor.split("D:").nth(1)?;
+    // The other spelling of the same thing. `NO_ACCESS_CONTROL` is how SDDL
+    // renders a **NULL** DACL, which grants everyone everything — so it is `D:`
+    // present and no access control at all, not `D:` present with no entries.
+    // Read as a flags field it parses to zero ACEs, which would read back as
+    // the narrowest possible directory rather than the widest.
+    if body
+        .split('(')
+        .next()
+        .is_some_and(|flags| flags.contains("NO_ACCESS_CONTROL"))
+    {
+        return None;
+    }
     Some(
         body.split('(')
             .skip(1)
@@ -733,12 +745,17 @@ impl fmt::Display for RootAccessSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (verb, path, admits) = match self {
             Self::NotApplicable => {
+                // Said without claiming *which* root it is about. This is both
+                // the macOS and Linux answer, where the root is the runtime
+                // directory `AppPaths` already permissions, and the Windows
+                // answer for an operation that moved nothing — and on Windows
+                // the runner root is emphatically not the runtime directory.
                 return f.write_str(
-                    "The runner root is this platform's existing runtime directory and needed no \
-                     access-control change.",
+                    "The runner root's access control was not created or changed by this \
+                     operation.",
                 );
             }
-            Self::Created { path, admits } => ("was created", path, admits),
+            Self::Created { path, admits } => ("was created admitting", path, admits),
             Self::AlreadyReconciled { path, admits } => ("already admitted", path, admits),
             Self::Reconciled { path, admits } => ("was reconciled to admit", path, admits),
         };
@@ -1474,6 +1491,13 @@ mod tests {
         assert!(grants_broad_write("D:P(A;OICI;QQ;;;WD)"), "unknown rights");
         assert!(grants_broad_write("D:P(A;OICI;FAX;;;AU)"), "odd length");
         assert!(grants_broad_write("D:P(A;OICI;0xzz;;;AU)"), "bad hex");
+        assert!(
+            grants_broad_write("D:NO_ACCESS_CONTROL"),
+            "a NULL DACL grants everyone everything; read as a flags field it would otherwise \
+             parse to zero ACEs and be adopted as the narrowest directory on the machine"
+        );
+        assert!(!is_protected("D:NO_ACCESS_CONTROL"));
+        assert!(write_trustees("D:NO_ACCESS_CONTROL").is_empty());
     }
 
     #[test]
