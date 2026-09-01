@@ -542,7 +542,12 @@ fn lowest_free_slot(leases: &[RunnerAttempt], ceiling: NonZeroU16) -> Option<Non
 /// be repaired here.
 fn create_or_validate_slot(slot: &Path) -> Result<(), LifecycleError> {
     match fs::symlink_metadata(slot) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(slot_refusal(
+        // [`is_link_like`] and not `is_symlink`, so that this is the same
+        // question cleanup asks in [`slot_is_present`]: a reparse tag the
+        // standard library has no name for is refused here rather than
+        // allocated into and then quarantined forever by a cleanup that will
+        // not scrub it.
+        Ok(metadata) if is_link_like(&metadata) => Err(slot_refusal(
             slot,
             "is a symbolic link, junction or other reparse point, which could place runner \
              files outside the configured root",
@@ -583,10 +588,11 @@ fn accept_reusable_slot(slot: &Path) -> Result<(), LifecycleError> {
                 format!("entry {name:?} could not be inspected: {source}"),
             )
         })?;
-        // `symlink_metadata` reports a link as a link, so `is_dir` here is
-        // already "a real directory" and the link test is the message, not the
-        // rule.
-        if is_work_folder(&name) && metadata.is_dir() {
+        // The same predicate cleanup retains by, so a `_work` this accepts is
+        // one [`scrub_slot_entries`] will keep rather than refuse: a link, a
+        // junction or any other reparse point is not a job workspace to either
+        // of them.
+        if is_retainable_work_folder(&name, &metadata) {
             continue;
         }
         refused.push(name.to_string_lossy().into_owned());
@@ -819,7 +825,13 @@ fn verify_journalled_slot(
     // Containment's lexical half, by construction: `derive_child` accepts one
     // component, so the equality below can only hold when the journalled path
     // really is this root's `sN` and nothing else.
-    let derived = runner_root::derive_child(&root, &format!("s{slot}")).map_err(|_| mislaid())?;
+    // The directory name comes from the domain that allocation named it with,
+    // never from a second `s{n}` spelled out here: a convention with two
+    // spellings would let cleanup refuse every slot the allocator created.
+    let name = AttemptWorkspace::persistent_slot(slot)
+        .slot_directory_name()
+        .expect("a persistent workspace names its slot directory");
+    let derived = runner_root::derive_child(&root, &name).map_err(|_| mislaid())?;
     if derived != runtime_path {
         return Err(mislaid());
     }
@@ -906,7 +918,15 @@ fn scrub_slot_entries(slot: &Path) -> Result<(), SlotQuarantine> {
     for entry in fs::read_dir(slot).map_err(unreadable)? {
         let name = entry.map_err(unreadable)?.file_name();
         let path = slot.join(&name);
-        let metadata = fs::symlink_metadata(&path).map_err(unreadable)?;
+        // An entry named by the listing and gone by the time it is stat-ed is
+        // one this pass no longer has to remove, not a slot that could not be
+        // enumerated. Nothing is assumed from that: `verify_slot_scrubbed` asks
+        // the filesystem again afterwards and refuses if it is still there.
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(unreadable(source)),
+        };
         if is_work_folder(&name) {
             if is_retainable_work_folder(&name, &metadata) {
                 continue;
@@ -935,8 +955,11 @@ fn scrub_slot_entries(slot: &Path) -> Result<(), SlotQuarantine> {
 }
 
 /// Remove one slot entry without following it.
+///
+/// An entry that is already gone is removed: the post-condition this serves is
+/// "not there", and racing with whatever removed it first is not a refusal.
 fn remove_slot_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
-    if is_link_like(metadata) {
+    let removed = if is_link_like(metadata) {
         // A file symlink unlinks with `remove_file`; a directory symlink or a
         // Windows junction needs `remove_dir`. Neither follows the link.
         fs::remove_file(path).or_else(|_| fs::remove_dir(path))
@@ -944,6 +967,10 @@ fn remove_slot_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
+    };
+    match removed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -978,7 +1005,14 @@ fn verify_slot_scrubbed(slot: &Path) -> Result<(), SlotQuarantine> {
     let mut named: Vec<String> = Vec::new();
     for entry in fs::read_dir(slot).map_err(unreadable)? {
         let name = entry.map_err(unreadable)?.file_name();
-        let metadata = fs::symlink_metadata(slot.join(&name)).map_err(unreadable)?;
+        // Listed and then gone is absent, which is what this pass is here to
+        // establish. The named half below stats every sensitive entry again, so
+        // an entry that only *looks* absent to this listing is still caught.
+        let metadata = match fs::symlink_metadata(slot.join(&name)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(unreadable(source)),
+        };
         if is_retainable_work_folder(&name, &metadata) {
             continue;
         }
@@ -1003,6 +1037,31 @@ fn verify_slot_scrubbed(slot: &Path) -> Result<(), SlotQuarantine> {
     named.dedup();
     Err(SlotQuarantine::new(
         SlotRefusal::Residue,
+        residue_detail(slot, residue, &named),
+    ))
+}
+
+/// Word a [`SlotRefusal::Residue`] refusal from the two facts that produced it.
+///
+/// Separate from [`verify_slot_scrubbed`] because the disagreement it has to
+/// report — a listing that counted nothing and a filesystem that answered
+/// otherwise — is a race no test can stage, and a message that contradicts
+/// itself is exactly what an operator reads at three in the morning.
+///
+/// `named` is the sanitized half: entries this crate published the names of.
+/// A name a workflow chose is only ever counted, never echoed.
+fn residue_detail(slot: &Path, residue: usize, named: &[String]) -> String {
+    if residue == 0 {
+        // The whole reason the second pass ignores the listing: the listing
+        // reported a clean slot and the filesystem disagrees. Saying "0
+        // entries survived" here would report the under-count as the fact.
+        format!(
+            "the listing of {} reported nothing but `{DEFAULT_WORK_FOLDER}`, yet {} survived \
+                 cleanup",
+            slot.display(),
+            named.join(", ")
+        )
+    } else {
         format!(
             "{residue} entr{} other than `{DEFAULT_WORK_FOLDER}` survived cleanup of {}{}",
             if residue == 1 { "y" } else { "ies" },
@@ -1012,8 +1071,8 @@ fn verify_slot_scrubbed(slot: &Path) -> Result<(), SlotQuarantine> {
             } else {
                 format!(", including {}", named.join(", "))
             }
-        ),
-    ))
+        )
+    }
 }
 
 fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
@@ -1581,9 +1640,9 @@ impl LifecycleError {
             Self::Journal => FailureReason::Other("attempt journal operation failed".into()),
             Self::Missing(_) => FailureReason::Other("attempt disappeared from the journal".into()),
             Self::Transition => FailureReason::Other("attempt transition was refused".into()),
-            Self::SlotQuarantined { detail, .. } => {
-                FailureReason::Other(format!("the persistent slot was not cleaned: {detail}"))
-            }
+            // Rendered through `Display` rather than a second copy of the same
+            // sentence, so the two cannot drift apart.
+            Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
         }
     }
 }
@@ -3485,9 +3544,11 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert!(
-            names
-                .iter()
-                .all(|name| !name.to_string_lossy().starts_with("jit-")),
+            names.iter().all(|name| {
+                !name
+                    .to_string_lossy()
+                    .starts_with(RestrictiveHandoff::NAME_PREFIX)
+            }),
             "JIT artifact survived: {names:?}"
         );
         assert_eq!(
@@ -5650,6 +5711,33 @@ mod tests {
 
         assert_eq!(entries_of(&slot), only_the_job_workspace());
         assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_residue_refusal_never_reports_the_under_count_as_the_fact() {
+        let slot = Path::new("/runners/s1");
+
+        // The ordinary case: the listing counted, so the count is the fact and
+        // the published names qualify it.
+        let counted = residue_detail(slot, 2, &["`bin`".to_owned()]);
+        assert!(counted.contains("2 entries other than"), "{counted}");
+        assert!(counted.contains("including `bin`"), "{counted}");
+        assert_eq!(
+            residue_detail(slot, 1, &[]),
+            format!(
+                "1 entry other than `{DEFAULT_WORK_FOLDER}` survived cleanup of {}",
+                slot.display()
+            )
+        );
+
+        // The race the second pass exists for: the listing saw nothing and the
+        // filesystem answered otherwise. Saying "0 entries survived" here would
+        // state the under-count as the fact and contradict the rest of the
+        // sentence.
+        let raced = residue_detail(slot, 0, &["`.credentials`".to_owned()]);
+        assert!(!raced.contains('0'), "{raced}");
+        assert!(raced.contains("reported nothing but"), "{raced}");
+        assert!(raced.contains("`.credentials` survived cleanup"), "{raced}");
     }
 
     #[test]
