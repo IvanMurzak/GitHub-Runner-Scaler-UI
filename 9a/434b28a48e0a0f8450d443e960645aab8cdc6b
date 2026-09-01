@@ -1,0 +1,45 @@
+crates/domain/src/policy.rs
+  s_47736fc0b3bef4::t_eaa0a4932699b8 31,34-35,46-50,942-945,958-965,1010-1017,1076-1079,1104-1105,1110-1114,1125,1149-1150,1185-1220,1511-1699
+crates/domain/src/lib.rs
+  s_47736fc0b3bef4::t_1cdd53d64dcc4c 20-25
+  s_47736fc0b3bef4::t_1d2aa957e28ad3 43,46
+crates/domain/src/capacity.rs
+  s_47736fc0b3bef4::t_558adaf07dc8b8 280
+  s_47736fc0b3bef4::t_bd2222f53dcb41 340-341
+crates/agent/src/reconcile.rs
+  s_47736fc0b3bef4::t_938056a19f65cb 2477,2889-2890,2908-2909
+crates/testkit/src/fixtures.rs
+  s_47736fc0b3bef4::t_84a93060a5a2d0 34,404,421-423,509-521,557-558
+crates/domain/src/workspace.rs
+  s_47736fc0b3bef4::t_eaa0a4932699b8 293-295,358,604-605
+  s_47736fc0b3bef4::t_a45711b2699715 1-292,296-357,359-603,606-608
+crates/domain/src/store.rs
+  s_47736fc0b3bef4::t_ae63b7c4703d53 79
+  s_47736fc0b3bef4::t_c1ba70bb350ef6 1426-1430
+  s_47736fc0b3bef4::t_cb1b886022882d 1400-1404
+crates/domain/src/path.rs
+  s_47736fc0b3bef4::t_eaa0a4932699b8 763-767
+  s_47736fc0b3bef4::t_390e961dba78e5 1-762,768-805
+crates/domain/src/attempt.rs
+  s_47736fc0b3bef4::t_eaa0a4932699b8 2225-2227,2284-2286,2288-2290,2292-2294
+  s_47736fc0b3bef4::t_10a3ccd1b7d2f6 32,46-50,605-614,654-661,687-688,698-701,708-730,740,763-764,770-777,848,880-900,2213-2224,2228-2283,2287,2291,2295-2399,2414-2415
+crates/domain/src/model.rs
+  s_47736fc0b3bef4::t_a946f3d55e0470 373-381
+  s_47736fc0b3bef4::t_eaa0a4932699b8 31-32,1066-1079,1108-1111,1120-1129,1477-1541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9a434b28a48e0a0f8450d443e960645aab8cdc6b",
+  "prompts": {},
+  "sessions": {
+    "s_47736fc0b3bef4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "506ce015-7c30-4aad-90d9-387028af6c8e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
