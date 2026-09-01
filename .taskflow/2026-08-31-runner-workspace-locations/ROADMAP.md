@@ -69,14 +69,14 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ✅ | [PR #34](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/34), merge `66ba5a8` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | ✅ | run `01a05ac7-b731-704b-8753-5aa75b0b4fdb` | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
-| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🔵 | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40) red, repairing | 2026-09-01 |
+| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🟣 | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40) green, awaiting gate 2 | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | ✅ | [PR #41](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/41), merge `bb30b7f` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | ✅ | [PR #39](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/39), merge `1ece70c` | 2026-09-01 |
-| [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | 🔵 | [PR #42](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/42) red, repairing | 2026-09-01 |
+| [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | ✅ | [PR #42](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/42), merge `48230a4` | 2026-09-01 |
 | [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
-| [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | planned | none | 2026-08-31 |
+| [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | 🔵 | run `01a05e06-d489-704a-b88b-29f93aa1f63c` | 2026-09-01 |
 
 ## Required evidence before merge
 
@@ -210,6 +210,15 @@ directory untouched.
 - `land` also runs `gh pr ready` when it finds a draft PR, so a draft is not a
   durable hold while a run is driving `land`. The hold now rests on no run
   driving `land` for `b2` until the owner records gate 2 GO.
+- `e1-workspace-tui` landed as PR #42 / `48230a4` with all seven required
+  checks green. The repair shared one root fixture between the two surfaces
+  and redacted the volatile markers from the snapshot, so both tests now
+  prove the rendering rather than the host.
+- PR #40 is green on `686872f`, including `check (windows-x86_64)` and the
+  privileged installer smoke tests, so gate 2 can now be judged on real
+  evidence.
+- Started `g1-readme-workspace-guidance` as run
+  `01a05e06-d489-704a-b88b-29f93aa1f63c`; `f1` remains blocked on `b2`.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
