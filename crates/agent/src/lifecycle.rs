@@ -918,14 +918,10 @@ fn scrub_slot_entries(slot: &Path) -> Result<(), SlotQuarantine> {
     for entry in fs::read_dir(slot).map_err(unreadable)? {
         let name = entry.map_err(unreadable)?.file_name();
         let path = slot.join(&name);
-        // An entry named by the listing and gone by the time it is stat-ed is
-        // one this pass no longer has to remove, not a slot that could not be
-        // enumerated. Nothing is assumed from that: `verify_slot_scrubbed` asks
-        // the filesystem again afterwards and refuses if it is still there.
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(unreadable(source)),
+        // Nothing is assumed from an entry that vanished: `verify_slot_scrubbed`
+        // asks the filesystem again afterwards and refuses if it is still there.
+        let Some(metadata) = listed_entry_metadata(&path).map_err(unreadable)? else {
+            continue;
         };
         if is_work_folder(&name) {
             if is_retainable_work_folder(&name, &metadata) {
@@ -952,6 +948,19 @@ fn scrub_slot_entries(slot: &Path) -> Result<(), SlotQuarantine> {
         })?;
     }
     Ok(())
+}
+
+/// What a listed entry *is*, or `None` when it is no longer there.
+///
+/// An entry named by a listing and gone by the time it is stat-ed is absent,
+/// which is a fact both passes over a slot want rather than an enumeration that
+/// failed. Nothing is followed: `symlink_metadata` reports a link as a link.
+fn listed_entry_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
 }
 
 /// Remove one slot entry without following it.
@@ -1005,13 +1014,11 @@ fn verify_slot_scrubbed(slot: &Path) -> Result<(), SlotQuarantine> {
     let mut named: Vec<String> = Vec::new();
     for entry in fs::read_dir(slot).map_err(unreadable)? {
         let name = entry.map_err(unreadable)?.file_name();
-        // Listed and then gone is absent, which is what this pass is here to
-        // establish. The named half below stats every sensitive entry again, so
-        // an entry that only *looks* absent to this listing is still caught.
-        let metadata = match fs::symlink_metadata(slot.join(&name)) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(unreadable(source)),
+        // Absent is what this pass is here to establish. The named half below
+        // stats every sensitive entry again, so an entry that only *looks*
+        // absent to this listing is still caught.
+        let Some(metadata) = listed_entry_metadata(&slot.join(&name)).map_err(unreadable)? else {
+            continue;
         };
         if is_retainable_work_folder(&name, &metadata) {
             continue;
@@ -3263,19 +3270,7 @@ mod tests {
                 events: Arc::clone(&events) as Arc<dyn AttemptEventSink>,
                 reconcile_events: Arc::clone(&reconcile_events) as Arc<dyn EventSink>,
             };
-            let launcher = LifecycleLauncher::new(
-                policy.host_id,
-                paths.clone(),
-                paths.logs_dir(),
-                1,
-                RecoveryTimeouts::new(
-                    Elapsed::seconds(10),
-                    Elapsed::seconds(10),
-                    Elapsed::seconds(10),
-                ),
-                RetryPolicy::bounded(3, Duration::from_millis(10), Duration::from_millis(25)),
-                ports,
-            );
+            let launcher = Self::launcher_over(policy.host_id, &paths, ports);
             Self {
                 _root: root,
                 app_paths: paths,
@@ -3379,13 +3374,17 @@ mod tests {
                 .expect("the slot is scrubbed and the lease released");
         }
 
-        /// The same journal, the same directories, a launcher that remembers
-        /// nothing — which is what a daemon restart is.
-        fn restart(&self) -> LifecycleLauncher {
+        /// The launcher configuration every launcher in this harness shares, so
+        /// that the one a restart mints cannot drift from the original.
+        fn launcher_over(
+            host: HostId,
+            paths: &runner_manager_platform::paths::AppPaths,
+            ports: LifecyclePorts,
+        ) -> LifecycleLauncher {
             LifecycleLauncher::new(
-                self.policy.host_id,
-                self.app_paths.clone(),
-                self.app_paths.logs_dir(),
+                host,
+                paths.clone(),
+                paths.logs_dir(),
                 1,
                 RecoveryTimeouts::new(
                     Elapsed::seconds(10),
@@ -3393,6 +3392,16 @@ mod tests {
                     Elapsed::seconds(10),
                 ),
                 RetryPolicy::bounded(3, Duration::from_millis(10), Duration::from_millis(25)),
+                ports,
+            )
+        }
+
+        /// The same journal, the same directories, a launcher that remembers
+        /// nothing — which is what a daemon restart is.
+        fn restart(&self) -> LifecycleLauncher {
+            Self::launcher_over(
+                self.policy.host_id,
+                &self.app_paths,
                 LifecyclePorts {
                     store: Arc::clone(&self.store) as Arc<dyn Store>,
                     github: Arc::clone(&self.github) as Arc<dyn LifecycleGithub>,
@@ -5290,25 +5299,19 @@ mod tests {
     /// The runner state one attempt leaves at a slot root, as a real attempt
     /// leaves it: binaries, registration identity, a JIT handoff that outlived
     /// its process, and this agent's own lifecycle sidecars.
+    ///
+    /// Driven by [`SENSITIVE_SLOT_ENTRIES`] rather than by a second copy of it,
+    /// so a name added to the thing cleanup must prove absent is a name every
+    /// test here starts leaving behind.
     fn litter_the_slot(slot: &Path) {
         for directory in ["bin", "externals", "_diag"] {
             fs::create_dir_all(slot.join(directory)).unwrap();
         }
         fs::write(slot.join("bin").join("Runner.Listener"), b"binary").unwrap();
-        for file in [
-            ".runner",
-            ".credentials",
-            ".credentials_rsaparams",
-            ".env",
-            ".path",
-            "run.sh",
-            "run.cmd",
-            IDENTITY_FILE,
-            FALLBACK_IDENTITY_FILE,
-            UNRESOLVED_PROCESS_FILE,
-            RUNNER_ID_FILE,
-            TERMINATE_INTENT_FILE,
-        ] {
+        for file in SENSITIVE_SLOT_ENTRIES
+            .iter()
+            .filter(|entry| !slot.join(entry).is_dir())
+        {
             fs::write(slot.join(file), b"runner state").unwrap();
         }
         // A handoff whose owning process died before `Drop` could delete it.
