@@ -903,6 +903,15 @@ const fn compact_layout(area: Rect) -> bool {
     area.width < 60 || area.height < 18
 }
 
+/// Whether the frame is too small to draw at all.
+///
+/// One definition for the same reason [`compact_layout`] is one: below this
+/// [`render`] draws a one-line fallback instead of a screen, so there is no
+/// form on it and no row for a click to reach.
+const fn below_minimum_frame(area: Rect) -> bool {
+    area.width < 12 || area.height < 5
+}
+
 /// How many form rows a settings frame of this size actually puts on screen.
 ///
 /// The pane keeps a status row, a navigation row, its own two borders and the
@@ -912,8 +921,7 @@ const fn compact_layout(area: Rect) -> bool {
 /// unclipped row list it would activate a control the operator never saw, which
 /// on these screens means *Save* instead of *Reset*.
 const fn settings_content_rows(size: Rect) -> u16 {
-    if size.width < 12 || size.height < 5 {
-        // `render` draws the one-line fallback instead of a form.
+    if below_minimum_frame(size) {
         return 0;
     }
     size.height.saturating_sub(SETTINGS_FIRST_ROW + 2)
@@ -1368,7 +1376,7 @@ fn selected_repository_target(state: &AppState) -> Option<String> {
 /// Draw one frame from memory only.
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
-    if area.width < 12 || area.height < 5 {
+    if below_minimum_frame(area) {
         frame.render_widget(
             Paragraph::new("runner-manager\n? help").wrap(Wrap { trim: true }),
             area,

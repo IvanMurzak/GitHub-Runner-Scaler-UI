@@ -544,7 +544,9 @@ struct FormLine {
     text: String,
     /// The control this row focuses, as an index into [`SettingsUi::controls`].
     control: Option<usize>,
-    /// Text this row yields to a click when it is not a control.
+    /// Text this row yields to a click. Only a row that focuses no control
+    /// has one: clicking a control activates it instead, and `c` is what
+    /// copies a focused control's value.
     copy: Option<String>,
     /// `e1`: "Keep current value, validation error, and save action visible in
     /// constrained layouts". A compact terminal keeps these rows plus the
@@ -980,9 +982,6 @@ impl SettingsUi {
             KeyCode::Enter => return self.activate(),
             _ => return None,
         }
-        // Toggling a repository back to ephemeral removes the path control, so
-        // a focus that was on it would otherwise point past the end.
-        self.focus = self.focus.min(self.control_count().saturating_sub(1));
         None
     }
 
@@ -1045,7 +1044,6 @@ impl SettingsUi {
             self.focus = control;
             return if self.focused().is_some_and(Control::is_adjustable) {
                 self.adjust(true);
-                self.focus = self.focus.min(self.control_count().saturating_sub(1));
                 None
             } else {
                 self.activate()
@@ -1193,6 +1191,11 @@ impl SettingsUi {
             | Control::WorkspacePath
             | Control::WorkspaceSave => {}
         }
+        // Toggling a repository back to ephemeral removes the path control, so
+        // a focus that was on it would otherwise point past the end. Clamped
+        // here rather than in each caller, because this is the only thing that
+        // changes what the control list contains.
+        self.focus = self.focus.min(self.control_count().saturating_sub(1));
     }
 
     fn activate(&mut self) -> Option<SettingsCommand> {
@@ -1296,13 +1299,9 @@ impl SettingsUi {
                 "Affected attempts: {} active, {} awaiting cleanup",
                 form.affected.active, form.affected.cleanup_blocked
             )),
-            FormLine::keep(self.field_row("Override", &self.host_root, width))
-                .at(4)
-                .copyable(if self.host_root.is_blank() {
-                    form.runner_root.rendered()
-                } else {
-                    self.host_root.text()
-                }),
+            // No `copyable`: a row that focuses a control is activated by a
+            // click, never copied by one. `c` copies it, through `copy_text`.
+            FormLine::keep(self.field_row("Override", &self.host_root, width)).at(4),
         ];
         if let Some(notice) = &self.host_root_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -1436,8 +1435,7 @@ impl SettingsUi {
         if self.workspace_mode.is_persistent() {
             lines.push(
                 FormLine::keep(self.field_row("Persistent root", &self.workspace_path, width))
-                    .at(control)
-                    .copyable(self.workspace_path.text()),
+                    .at(control),
             );
             control += 1;
         }
