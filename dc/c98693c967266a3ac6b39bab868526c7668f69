@@ -1,0 +1,19 @@
+.taskflow/2026-08-31-runner-workspace-locations/ROADMAP.md
+  s_bd2d140ed0e25a::t_aaac6568e6a513 10-11,13-14,69,141-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "dcc98693c967266a3ac6b39bab868526c7668f69",
+  "prompts": {},
+  "sessions": {
+    "s_bd2d140ed0e25a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a05a31-3b49-7163-befa-fdd3fc510f68",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
