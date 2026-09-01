@@ -476,6 +476,41 @@ fn preflight_against_everything<'a>(
     preflight
 }
 
+/// Steps 4 and 5, for either owner: validate the candidate against every other
+/// configured root, then create the one leaf it needs, if it needs one.
+///
+/// The two are one function because their order is the invariant, not a detail
+/// of either mutation: `d1` requires a "validated leaf only after all
+/// non-mutating checks pass", so a refused change must leave no directory
+/// behind. Splitting them would let a future caller do them the other way
+/// around.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a path this host cannot hold, and
+/// [`Failure::LocalState`] when the leaf cannot be created.
+fn validated_leaf(
+    app_paths: &AppPaths,
+    host_root: &HostRoot,
+    policies: &[ScalePolicy],
+    owner: &RootOwner,
+    root: &LocalAbsolutePath,
+) -> Result<Option<PathBuf>, CliError> {
+    let checked = preflight_against_everything(app_paths, host_root, policies)
+        .check(owner, root)
+        .map_err(|source| unusable(source, owner))?;
+    let Some(leaf) = checked.leaf_to_create() else {
+        return Ok(None);
+    };
+    std::fs::create_dir(leaf).map_err(|source| {
+        CliError::with_remedy(
+            Failure::LocalState,
+            format!("cannot create {}: {source}", leaf.display()),
+            owner.remediation(),
+        )
+    })?;
+    Ok(Some(leaf.to_path_buf()))
+}
+
 /// The refusal an ephemeral workspace answers a path with, stated once.
 ///
 /// `02-target-architecture.md`: "`ephemeral` rejects `--path` so an ignored
@@ -562,23 +597,19 @@ pub fn set_host_runner_root(
     }
 
     // Steps 4 and 5: validate everything, then create at most one leaf.
-    let mut created = None;
-    if let Some(root) = &requested {
-        let policies = store.policies().map_err(read_failure)?;
-        let checked = preflight_against_everything(context.paths(), &previous, &policies)
-            .check(&RootOwner::Host, root)
-            .map_err(|source| unusable(source, &RootOwner::Host))?;
-        if let Some(leaf) = checked.leaf_to_create() {
-            std::fs::create_dir(leaf).map_err(|source| {
-                CliError::with_remedy(
-                    Failure::LocalState,
-                    format!("cannot create {}: {source}", leaf.display()),
-                    RootOwner::Host.remediation(),
-                )
-            })?;
-            created = Some(leaf.to_path_buf());
+    let created = match &requested {
+        Some(root) => {
+            let policies = store.policies().map_err(read_failure)?;
+            validated_leaf(
+                context.paths(),
+                &previous,
+                &policies,
+                &RootOwner::Host,
+                root,
+            )?
         }
-    }
+        None => None,
+    };
 
     // Step 6: the targeted, fenced write. Never `put_host`, which would roll a
     // concurrent `host set-capacity` back.
@@ -709,22 +740,10 @@ pub fn set_repository_workspace(
         }
     };
 
-    let mut created = None;
-    if let Some(root) = requested.root() {
-        let checked = preflight_against_everything(context.paths(), &host_root, &policies)
-            .check(&owner, root)
-            .map_err(|source| unusable(source, &owner))?;
-        if let Some(leaf) = checked.leaf_to_create() {
-            std::fs::create_dir(leaf).map_err(|source| {
-                CliError::with_remedy(
-                    Failure::LocalState,
-                    format!("cannot create {}: {source}", leaf.display()),
-                    owner.remediation(),
-                )
-            })?;
-            created = Some(leaf.to_path_buf());
-        }
-    }
+    let created = match requested.root() {
+        Some(root) => validated_leaf(context.paths(), &host_root, &policies, &owner, root)?,
+        None => None,
+    };
 
     policy
         .set_workspace_policy(requested.clone())

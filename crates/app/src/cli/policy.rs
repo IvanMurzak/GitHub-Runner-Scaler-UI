@@ -151,15 +151,18 @@ fn set_workspace(
     let target = ScaleTarget::repository(&args.repository).map_err(invalid)?;
     let kind = WorkspaceKind::from(args.mode);
     let owner = RootOwner::Repository(target.slug());
-    let path = match (kind, args.path.as_deref()) {
-        (WorkspaceKind::Ephemeral, Some(_)) => {
+    let path = match args.path.as_deref() {
+        // Refused before the path is even parsed, so `--mode ephemeral --path`
+        // is answered by the rule it broke rather than by a complaint about the
+        // path it will never use.
+        Some(_) if kind == WorkspaceKind::Ephemeral => {
             return Err(workspace::ephemeral_rejects_a_path(&target));
         }
-        (WorkspaceKind::Ephemeral, None) => None,
-        (WorkspaceKind::Persistent, Some(raw)) => Some(workspace::parse_root(raw, &owner)?),
-        // clap's `required_if_eq` covers this; `e1` reaches the same refusal
-        // through `workspace::set_repository_workspace`.
-        (WorkspaceKind::Persistent, None) => None,
+        Some(raw) => Some(workspace::parse_root(raw, &owner)?),
+        // A missing path under `--mode persistent` is clap's `required_if_eq`
+        // and never reaches here; `e1` reaches the same refusal through
+        // `workspace::set_repository_workspace`.
+        None => None,
     };
 
     let store = context.store()?;

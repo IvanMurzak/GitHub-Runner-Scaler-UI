@@ -389,8 +389,8 @@ pub fn dispatch(
 ) -> Result<(), CliError> {
     match command {
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
-        HostCommand::SetRuntimeRoot(args) => set_runtime_root(context, &args.path, out),
-        HostCommand::ResetRuntimeRoot => reset_runtime_root(context, out),
+        HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), out),
+        HostCommand::ResetRuntimeRoot => runtime_root(context, None, out),
         HostCommand::Show => show(context, out),
     }
 }
@@ -399,7 +399,9 @@ pub fn dispatch(
 // host set-runtime-root / host reset-runtime-root
 // ---------------------------------------------------------------------------
 
-/// `host set-runtime-root --path PATH` (D2/D11).
+/// `host set-runtime-root --path PATH` and `host reset-runtime-root` (D2/D11),
+/// which differ only in whether a path was given: `Some` configures a root,
+/// `None` returns to the platform default.
 ///
 /// Nothing but argument parsing and rendering happens here: the ordering, the
 /// preflight, the two refusal counts and the fenced write are
@@ -410,20 +412,12 @@ pub fn dispatch(
 /// [`Failure::InvalidArgument`] for a path this host cannot hold,
 /// [`Failure::Conflict`] for affected attempts or a lost race, and
 /// [`Failure::LocalState`] for a journal or filesystem failure.
-pub fn set_runtime_root(context: &Context, raw: &str, out: &mut dyn Write) -> Result<(), CliError> {
+fn runtime_root(context: &Context, raw: Option<&str>, out: &mut dyn Write) -> Result<(), CliError> {
     let store = context.store()?;
-    let root = workspace::parse_root(raw, &RootOwner::Host)?;
-    let change = workspace::set_host_runner_root(context, &store, Some(root))?;
-    workspace::write_root_change(out, &change)
-}
-
-/// `host reset-runtime-root`.
-///
-/// # Errors
-/// As [`set_runtime_root`], minus the path failures.
-pub fn reset_runtime_root(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
-    let store = context.store()?;
-    let change = workspace::set_host_runner_root(context, &store, None)?;
+    let root = raw
+        .map(|raw| workspace::parse_root(raw, &RootOwner::Host))
+        .transpose()?;
+    let change = workspace::set_host_runner_root(context, &store, root)?;
     workspace::write_root_change(out, &change)
 }
 
