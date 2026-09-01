@@ -513,18 +513,12 @@ fn create_or_validate_slot(slot: &Path) -> Result<(), LifecycleError> {
         )),
         Ok(metadata) if !metadata.is_dir() => Err(slot_refusal(slot, "is not a directory")),
         Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(slot).map_err(|source| {
-                LifecycleError::Failed(FailureReason::Other(format!(
-                    "the persistent slot {} could not be created: {source}",
-                    slot.display()
-                )))
-            })
-        }
-        Err(source) => Err(LifecycleError::Failed(FailureReason::Other(format!(
-            "the persistent slot {} could not be inspected: {source}",
-            slot.display()
-        )))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(slot)
+            .map_err(|source| slot_refusal(slot, format!("could not be created: {source}"))),
+        Err(source) => Err(slot_refusal(
+            slot,
+            format!("could not be inspected: {source}"),
+        )),
     }
 }
 
@@ -540,26 +534,18 @@ fn create_or_validate_slot(slot: &Path) -> Result<(), LifecycleError> {
 /// The inspection is one level deep and uses `symlink_metadata`, so nothing is
 /// followed while it is being judged.
 fn accept_reusable_slot(slot: &Path) -> Result<(), LifecycleError> {
-    let entries = fs::read_dir(slot).map_err(|source| {
-        LifecycleError::Failed(FailureReason::Other(format!(
-            "the persistent slot {} could not be read: {source}",
-            slot.display()
-        )))
-    })?;
+    let unreadable =
+        |source: std::io::Error| slot_refusal(slot, format!("could not be read: {source}"));
+    let entries = fs::read_dir(slot).map_err(unreadable)?;
     let mut refused: Vec<String> = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| {
-            LifecycleError::Failed(FailureReason::Other(format!(
-                "the persistent slot {} could not be read: {source}",
-                slot.display()
-            )))
-        })?;
+        let entry = entry.map_err(unreadable)?;
         let name = entry.file_name();
         let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
-            LifecycleError::Failed(FailureReason::Other(format!(
-                "an entry of the persistent slot {} could not be inspected: {source}",
-                slot.display()
-            )))
+            slot_refusal(
+                slot,
+                format!("entry {name:?} could not be inspected: {source}"),
+            )
         })?;
         // `symlink_metadata` reports a link as a link, so `is_dir` here is
         // already "a real directory" and the link test is the message, not the
@@ -2740,7 +2726,7 @@ mod tests {
         /// running the suite. Every test added by `c2` places its files inside
         /// its own temporary directory instead.
         fn with_host_runner_root(mut self) -> Self {
-            let host_root = self._root.path().join("host-root");
+            let host_root = self.host_root();
             fs::create_dir_all(&host_root).unwrap();
             self.host.runner_root_override = Some(
                 LocalAbsolutePath::new(host_root.to_str().expect("a UTF-8 temporary path"))
