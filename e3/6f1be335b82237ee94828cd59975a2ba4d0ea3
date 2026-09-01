@@ -1,0 +1,38 @@
+crates/platform/src/service.rs
+  s_b232b6ca6b3f9c::t_118a6daf8b86c6 3590-3594
+  s_b232b6ca6b3f9c::t_1794270a76c64c 3630
+  s_b232b6ca6b3f9c::t_b5dcca5952b8f8 4169-4175,4177
+  s_b232b6ca6b3f9c::t_a0c29c76a2d252 4006-4010
+crates/app/src/cli/service.rs
+  s_b232b6ca6b3f9c::t_79935a91831841 259-267
+crates/platform/src/runner_root_access.rs
+  s_b232b6ca6b3f9c::t_b19ef0e48f8a48 88,821-829,839,1105-1110,1121,1127-1139,1141-1144,1146-1151,1153-1156,1158,1160-1170,1172-1177,1181-1196,1214-1218,1635,1825-1843,1845,1863-1870,1876
+  s_b232b6ca6b3f9c::t_9aa473cdc9e8f4 509-517,520-522,526-531,533-537,539
+  s_b232b6ca6b3f9c::t_5a7fa70d8a58c9 467-484
+  s_b232b6ca6b3f9c::t_c412141c5b773d 1636-1643,1648-1659
+  s_b232b6ca6b3f9c::t_709f73fce12630 1644-1647
+  s_b232b6ca6b3f9c::t_dadf903316d65b 1850-1861,1872-1875
+  s_b232b6ca6b3f9c::t_654d3a131c442d 1263-1272,1274-1283
+  s_b232b6ca6b3f9c::t_0ba8e2f853f0de 1415-1433
+  s_b232b6ca6b3f9c::t_d7dcb64baafef0 1975-1989
+  s_b232b6ca6b3f9c::t_7461a121950943 1846-1849,1862
+  s_b232b6ca6b3f9c::t_43d220490da9d8 699-701,706
+  s_b232b6ca6b3f9c::t_ee97849774ae64 1022-1036
+  s_b232b6ca6b3f9c::t_e53be4911c960e 83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e36f1be335b82237ee94828cd59975a2ba4d0ea3",
+  "prompts": {},
+  "sessions": {
+    "s_b232b6ca6b3f9c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "33307e72-9e7b-4033-8c6a-9b60f678e8ac",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
