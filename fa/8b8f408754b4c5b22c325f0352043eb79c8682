@@ -1,0 +1,28 @@
+crates/platform/src/runner_root.rs
+  s_6822e4cbf908c9::t_c6e4fca9712e24 598-602
+  s_6822e4cbf908c9::t_413c8ada8be099 588,596-597,603
+  s_6822e4cbf908c9::t_6af52d60a9425f 879-891,898
+  s_6822e4cbf908c9::t_51011e61f1ff71 991,1049,1071
+  s_6822e4cbf908c9::t_26d2a478f4a0eb 660,667
+  s_6822e4cbf908c9::t_fd26f000516fa5 1571-1582
+  s_6822e4cbf908c9::t_32d22b21ff2c23 1824-1825,1842,1857-1858,1875-1876,1891-1892,1910-1911,1931-1932,1951-1952
+  s_6822e4cbf908c9::t_208582a5830ee1 2399-2400
+  s_6822e4cbf908c9::t_3e95e4e345e5a4 215-216,225-226
+  s_6822e4cbf908c9::t_edb7b91b2a5eaf 804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fa8b8f408754b4c5b22c325f0352043eb79c8682",
+  "prompts": {},
+  "sessions": {
+    "s_6822e4cbf908c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb6198cc-d1e2-481d-b623-051321971fd2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

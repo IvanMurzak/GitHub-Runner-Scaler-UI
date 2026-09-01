@@ -1,0 +1,23 @@
+crates/platform/src/lib.rs
+  s_71ba8c3d9fb223::t_a96c6e7efa8655 17,54
+crates/platform/src/runner_root.rs
+  s_71ba8c3d9fb223::t_4f5e8f61d89a33 1-2263
+Cargo.toml
+  s_71ba8c3d9fb223::t_0ff658b5b1f800 205-230,237,239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6627514c86c2ddac1e120c75e7204fa9ffdc1208",
+  "prompts": {},
+  "sessions": {
+    "s_71ba8c3d9fb223": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "950f4f0f-6e2a-4b44-851c-e6d489f4f43a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
