@@ -28,7 +28,7 @@
 //!
 //! **It never creates, deletes, or re-permissions anything.** Both writability
 //! probes are pure queries — `access(2)` on Unix, and on Windows a directory
-//! *handle* opened for `FILE_ADD_FILE`, which runs the real access check
+//! *handle* opened for `FILE_ADD_SUBDIRECTORY`, which runs the real access check
 //! against the real DACL and produces no file. That is deliberate: "validation
 //! performs no deletion or permission mutation" is then a property of the code
 //! rather than a convention, and a preflight that probed by writing a marker
@@ -160,14 +160,20 @@ fn components_of(path: &str, platform: PathPlatform) -> Vec<&str> {
 
 /// Whether two path components name the same directory on `platform`.
 ///
-/// Windows compares case-insensitively. Unix does not: a Linux volume is
-/// case-sensitive, and refusing to distinguish `/srv/Rman` from `/srv/rman`
-/// there would reject two directories an operator legitimately has. A
-/// case-insensitive macOS volume is the residual, and it is the safe direction
+/// Windows compares case-insensitively, and over the whole of Unicode rather
+/// than over ASCII alone: NTFS folds `Ärman` and `ärman` to one directory, so an
+/// ASCII-only comparison would call two roots disjoint that later turn out to be
+/// the same tree, which is the direction that loses data. Unix does not fold: a
+/// Linux volume is case-sensitive, and refusing to distinguish `/srv/Rman` from
+/// `/srv/rman` there would reject two directories an operator legitimately has.
+/// A case-insensitive macOS volume is the residual, and it is the safe direction
 /// only for the containment test, so it is stated rather than hidden.
 fn same_component(left: &str, right: &str, platform: PathPlatform) -> bool {
     match platform {
-        PathPlatform::Windows => left.eq_ignore_ascii_case(right),
+        PathPlatform::Windows => left
+            .chars()
+            .flat_map(char::to_lowercase)
+            .eq(right.chars().flat_map(char::to_lowercase)),
         PathPlatform::Unix => left == right,
     }
 }
@@ -293,19 +299,23 @@ pub enum RunnerRootError {
 
     #[error(
         "{} exists but this account may not create entries in it. Grant this account \
-         write access, or configure a directory it owns.",
+         write access, or configure a directory it owns with `{remediation}`.",
         path.display()
     )]
-    NotWritable { path: PathBuf },
+    NotWritable { path: PathBuf, remediation: String },
 
     #[error(
         "{} does not exist yet and this account may not create it: its parent {} \
          refuses. Grant this account write access to that directory, or configure a \
-         directory it owns.",
+         directory it owns with `{remediation}`.",
         leaf.display(),
         parent.display()
     )]
-    ParentNotWritable { parent: PathBuf, leaf: PathBuf },
+    ParentNotWritable {
+        parent: PathBuf,
+        leaf: PathBuf,
+        remediation: String,
+    },
 
     #[error(
         "{} is on {filesystem}. Runner correctness and restart recovery may not depend \
@@ -942,26 +952,37 @@ impl<'a> RootPreflight<'a> {
         // not exist yet.
         self.reject_overlap(owner, root.as_str(), false)?;
 
+        // What the candidate itself is, before anything is resolved. This runs
+        // ahead of the projection because a link whose target is gone cannot be
+        // canonicalised: asking `project` first would report a bare "cannot
+        // inspect … not found" for a name the operator can plainly see, instead
+        // of the `Symlinked` refusal that says what to do about it.
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(RunnerRootError::Symlinked {
+                    path: candidate.to_path_buf(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(RunnerRootError::ExistingFile {
+                    path: candidate.to_path_buf(),
+                });
+            }
+            Ok(_) => {}
+            // Absence is the ordinary case: the leaf is created after this
+            // returns. Anything else is a genuine inspection failure.
+            Err(error) if means_absent(&error) => {}
+            Err(source) => {
+                return Err(RunnerRootError::Inspect {
+                    path: candidate.to_path_buf(),
+                    source,
+                });
+            }
+        }
+
         let projection = project(candidate)?;
         match projection.missing.len() {
-            0 => {
-                let metadata = std::fs::symlink_metadata(candidate).map_err(|source| {
-                    RunnerRootError::Inspect {
-                        path: candidate.to_path_buf(),
-                        source,
-                    }
-                })?;
-                if metadata.file_type().is_symlink() {
-                    return Err(RunnerRootError::Symlinked {
-                        path: candidate.to_path_buf(),
-                    });
-                }
-                if !metadata.is_dir() {
-                    return Err(RunnerRootError::ExistingFile {
-                        path: candidate.to_path_buf(),
-                    });
-                }
-            }
+            0 => {}
             1 => {
                 if !projection.anchor.is_dir() {
                     return Err(RunnerRootError::ParentIsNotADirectory {
@@ -1015,14 +1036,19 @@ impl<'a> RootPreflight<'a> {
                 source,
             })?;
         if !writable {
+            // `05-user-workflows.md` requires an unwritable parent to "show
+            // `host set-runtime-root` or `repo set-workspace` remediation",
+            // which is what the owner was carried here for.
             return Err(if projection.missing.is_empty() {
                 RunnerRootError::NotWritable {
                     path: projection.anchor_as_written.clone(),
+                    remediation: owner.remediation(),
                 }
             } else {
                 RunnerRootError::ParentNotWritable {
                     parent: projection.anchor_as_written.clone(),
                     leaf: candidate.to_path_buf(),
+                    remediation: owner.remediation(),
                 }
             });
         }
@@ -1072,6 +1098,9 @@ pub fn derive_child(
 /// it journals. Both are this function.
 ///
 /// # Errors
+/// [`RunnerRootError::ForeignPlatform`] when either value is written in the
+/// other operating system's path syntax, which the rest of this function would
+/// otherwise judge against this host's filesystem;
 /// [`RunnerRootError::Escapes`] when `child` is not strictly inside `root`
 /// either lexically or once every existing component is resolved;
 /// [`RunnerRootError::Inspect`] when the filesystem cannot answer.
@@ -1079,6 +1108,18 @@ pub fn verify_containment(
     root: &LocalAbsolutePath,
     child: &LocalAbsolutePath,
 ) -> Result<(), RunnerRootError> {
+    // The same guard [`RootPreflight::check`] opens with. Both halves below ask
+    // the *native* filesystem what these strings resolve to, so a row written on
+    // another operating system is corrupt state here rather than a path whose
+    // containment can be argued about.
+    for value in [root, child] {
+        if value.platform() != PathPlatform::NATIVE {
+            return Err(RunnerRootError::ForeignPlatform {
+                got: value.as_str().to_string(),
+                platform: value.platform(),
+            });
+        }
+    }
     let escapes = |resolved: PathBuf| RunnerRootError::Escapes {
         root: root.as_path().to_path_buf(),
         child: child.as_path().to_path_buf(),
@@ -1119,9 +1160,8 @@ mod sys {
 
     use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetVolumePathNameW,
-        OPEN_EXISTING,
+        CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetVolumePathNameW, OPEN_EXISTING,
     };
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
     use windows::Win32::System::WindowsProgramming::{
@@ -1141,8 +1181,22 @@ mod sys {
         }
     }
 
+    /// The `io::Error` a Windows failure really is.
+    ///
+    /// `io::Error::from_raw_os_error` expects the Win32 code, not the
+    /// `HRESULT` windows-rs reports. Handing it `0x8007_0005` produces an error
+    /// whose `kind()` is `Uncategorized` and whose text ends `(os error
+    /// -2147024891)`, so the low word is unwrapped again whenever the facility
+    /// is `FACILITY_WIN32`.
     fn io_error(error: &windows::core::Error) -> io::Error {
-        io::Error::from_raw_os_error(error.code().0)
+        let code = error.code().0;
+        #[allow(clippy::cast_sign_loss)]
+        let unsigned = code as u32;
+        if unsigned & 0xffff_0000 == 0x8007_0000 {
+            #[allow(clippy::cast_possible_wrap)]
+            return io::Error::from_raw_os_error((unsigned & 0x0000_ffff) as i32);
+        }
+        io::Error::from_raw_os_error(code)
     }
 
     fn to_wide(path: &Path) -> Vec<u16> {
@@ -1218,14 +1272,26 @@ mod sys {
 
     /// Whether this account may create entries in `directory`.
     ///
-    /// Opening a *handle* to the directory for `FILE_ADD_FILE` runs the real
-    /// access check against the real DACL, including inherited and deny
+    /// Opening a *handle* to the directory for `FILE_ADD_SUBDIRECTORY` runs the
+    /// real access check against the real DACL, including inherited and deny
     /// entries, and creates nothing. `_waccess` cannot answer this on Windows:
     /// it reports the read-only attribute and not the access-control entries
     /// that actually decide.
+    ///
+    /// `FILE_ADD_SUBDIRECTORY` alone, and deliberately not
+    /// `FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY`: `CreateFileW` grants a handle
+    /// only when *every* requested right is held, and the default DACL of the
+    /// system drive root grants `Authenticated Users` exactly `AD` — add
+    /// subdirectory — without `WD`. Asking for both therefore refuses `C:\`,
+    /// which would make the product's own Windows default `C:\rman`
+    /// unconfigurable for any process that is not elevated. Only directories
+    /// are ever created directly in a runner root (`<root>/<attempt>` and
+    /// `<root>/sN`), so this is also the right question rather than a weaker
+    /// one; files below them are governed by the DACL those directories
+    /// inherit.
     pub(super) fn is_writable(directory: &Path) -> io::Result<bool> {
         let wide = to_wide(directory);
-        let access = FILE_ADD_FILE.0 | FILE_ADD_SUBDIRECTORY.0;
+        let access = FILE_ADD_SUBDIRECTORY.0;
         // SAFETY: `wide` is NUL-terminated and outlives the call. The handle is
         // closed on the success path below and nothing else is passed by
         // pointer. `FILE_FLAG_BACKUP_SEMANTICS` is what makes `CreateFileW`
@@ -1834,6 +1900,27 @@ mod tests {
     }
 
     #[test]
+    fn a_link_whose_target_is_gone_is_still_reported_as_a_link() {
+        // A junction left behind by a removed target is the ordinary way this
+        // shows up. It cannot be canonicalised, so a preflight that resolved
+        // before it classified would answer "cannot inspect … not found" for a
+        // name the operator can see in a directory listing.
+        let fixture = fixture();
+        let root = fixture.workspaces.join("rman");
+        if !link_dir(&fixture.workspaces.join("gone"), &root) {
+            return;
+        }
+
+        let error = RootPreflight::new(&fixture.paths)
+            .check(&RootOwner::Host, &native(&root))
+            .expect_err("a dangling link is not a runner root");
+        assert!(
+            matches!(error, RunnerRootError::Symlinked { .. }),
+            "got {error}"
+        );
+    }
+
+    #[test]
     fn a_link_in_the_path_cannot_smuggle_a_root_into_application_data() {
         let fixture = fixture();
         let bridge = fixture.workspaces.join("bridge");
@@ -2031,15 +2118,32 @@ mod tests {
             matches!(error, RunnerRootError::NotWritable { .. }),
             "got {error}"
         );
+        assert!(
+            error.to_string().contains(&RootOwner::Host.remediation()),
+            "the refusal must show the command that fixes it: {error}"
+        );
 
         let error = preflight
             .check(&RootOwner::Host, &native(&missing))
             .expect_err("an unwritable parent cannot hold a new leaf");
-        let RunnerRootError::ParentNotWritable { parent, leaf } = &error else {
+        let RunnerRootError::ParentNotWritable { parent, leaf, .. } = &error else {
             panic!("expected ParentNotWritable, got {error}");
         };
         assert_eq!(parent, &fixture.workspaces);
         assert_eq!(leaf, &missing);
+        assert!(
+            error.to_string().contains(&RootOwner::Host.remediation()),
+            "the refusal must show the command that fixes it: {error}"
+        );
+
+        let repository = RootOwner::Repository("acme/widgets".to_string());
+        let error = preflight
+            .check(&repository, &native(&missing))
+            .expect_err("an unwritable parent cannot hold a new leaf");
+        assert!(
+            error.to_string().contains(&repository.remediation()),
+            "a repository root must name its own command: {error}"
+        );
     }
 
     #[test]
@@ -2099,6 +2203,38 @@ mod tests {
                 .is_writable(&canonical)
                 .expect("the platform answers"),
             "a directory this process just created must be writable"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_system_drive_root_is_writable_when_a_directory_can_be_created_in_it() {
+        // The default DACL of the system drive root grants `Authenticated
+        // Users` `AD` without `WD`, so a probe that asks for
+        // `FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY` refuses `C:\` for every
+        // process that is not elevated — and with it the product's own default
+        // `C:\rman`. Probe rather than ask: the assertion only runs on a host
+        // where the account demonstrably can create the directory.
+        let paths = AppPaths::rooted_at(Path::new("C:\\does-not-matter"));
+        let default = default_runner_root(&paths).expect("this host has a system directory");
+        let parent = default
+            .as_path()
+            .parent()
+            .expect("the default root is one level below the system drive")
+            .to_path_buf();
+
+        let probe = parent.join(format!("rman-preflight-probe-{}", std::process::id()));
+        if std::fs::create_dir(&probe).is_err() {
+            return;
+        }
+        let writable = HostFilesystem.is_writable(&parent);
+        std::fs::remove_dir(&probe).expect("the probe is removed");
+
+        assert!(
+            writable.expect("the platform answers"),
+            "{} accepts a new directory, so the preflight must not refuse the default \
+             runner root as unwritable",
+            parent.display()
         );
     }
 
