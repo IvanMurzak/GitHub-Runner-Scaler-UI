@@ -542,6 +542,36 @@ pub fn parse_root(raw: &str, owner: &RootOwner) -> Result<LocalAbsolutePath, Cli
     })
 }
 
+/// The non-mutating half of a path change: everything
+/// [`set_host_runner_root`] and [`set_repository_workspace`] decide before they
+/// create or write anything.
+///
+/// `e1`'s Host and Repository Settings screens answer "is this draft usable?"
+/// while the operator is still typing, and `05-user-workflows.md` allows exactly
+/// that — *"TUI preview may run this check"* — provided it is **this** check and
+/// not a second one. Nothing is created here, so previewing a path that is never
+/// saved leaves no directory behind, and the message a screen shows inline is
+/// the message the command would have printed.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a path this host cannot hold, and
+/// [`Failure::LocalState`] when the host row or the policy set cannot be read.
+pub fn check_root(
+    context: &Context,
+    store: &dyn Store,
+    owner: &RootOwner,
+    raw: &str,
+) -> Result<LocalAbsolutePath, CliError> {
+    let root = parse_root(raw, owner)?;
+    let host = super::host::local_host(store)?;
+    let current = host_root(context.paths(), host.as_ref());
+    let policies = store.policies().map_err(read_failure)?;
+    preflight_against_everything(context.paths(), &current, &policies)
+        .check(owner, &root)
+        .map_err(|source| unusable(source, owner))?;
+    Ok(root)
+}
+
 // ---------------------------------------------------------------------------
 // The mutations
 // ---------------------------------------------------------------------------

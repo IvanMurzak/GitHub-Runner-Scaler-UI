@@ -1,8 +1,10 @@
 // owner: g1-tui-shell-input
 //
 // g1 owns this module list, `run`, and `shell`; g2 owns `screens` and the
-// `table` grid it draws with; g3 owns `settings`.
+// `table` grid it draws with; g3 owns `settings`. `e1-workspace-tui` adds
+// `path_field`, the editable path control both settings screens use.
 
+pub mod path_field;
 pub mod screens;
 pub mod settings;
 pub mod shell;
