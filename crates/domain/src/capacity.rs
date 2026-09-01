@@ -277,6 +277,7 @@ mod tests {
         Arch, AttemptId, CachePolicy, HostLabel, Os, PolicyId, ScaleTarget, Timestamp,
     };
     use crate::policy::{PolicyMode, RoutingLabels, RunsOn, ScalePolicy};
+    use crate::workspace::WorkspaceKind;
 
     fn ts(secs: i64) -> Timestamp {
         chrono::DateTime::from_timestamp(secs, 0).expect("valid timestamp")
@@ -336,6 +337,8 @@ mod tests {
             outcome,
             process_id: None,
             runtime_path: "runtime/p/a".into(),
+            workspace_kind: WorkspaceKind::Ephemeral,
+            workspace_slot: None,
             created_at: ts(0),
             terminal_at: state.is_terminal().then(|| ts(0)),
             last_state_change_at: ts(0),

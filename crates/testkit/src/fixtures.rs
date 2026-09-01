@@ -31,6 +31,7 @@ use runner_manager_domain::model::{
     ScaleTarget, StartMode, Timestamp,
 };
 use runner_manager_domain::policy::{PolicyMode, RoutingLabels, RunsOn, ScalePolicy};
+use runner_manager_domain::workspace::AttemptWorkspace;
 
 use crate::clock::{DEFAULT_EPOCH_SECS, timestamp};
 
@@ -400,6 +401,7 @@ pub struct AttemptBuilder {
     outcome: Option<AttemptOutcome>,
     process_id: Option<u32>,
     runtime_path: String,
+    workspace: AttemptWorkspace,
     created_at: Timestamp,
     entered_state_at: Option<Timestamp>,
 }
@@ -416,6 +418,9 @@ impl Default for AttemptBuilder {
             runtime_path: "runtime/00000000-0000-0000-0000-000000000010/\
                            00000000-0000-0000-0000-000000000100"
                 .to_string(),
+            // D3: the fixture default is the product default. A test about a
+            // persistent slot has to say so with `persistent_slot`.
+            workspace: AttemptWorkspace::Ephemeral,
             created_at: created_at(),
             entered_state_at: None,
         }
@@ -501,6 +506,19 @@ impl AttemptBuilder {
         self
     }
 
+    /// Lease persistent slot `slot`, as `c2`'s allocator does.
+    ///
+    /// # Panics
+    /// If `slot` is zero; there is no `s0`, and a fixture that could name one
+    /// would be building state the domain refuses.
+    #[must_use]
+    pub fn persistent_slot(mut self, slot: u16) -> Self {
+        self.workspace = AttemptWorkspace::persistent_slot(
+            NonZeroU16::new(slot).expect("a persistent slot is positive"),
+        );
+        self
+    }
+
     #[must_use]
     pub fn created_at(mut self, at: Timestamp) -> Self {
         self.created_at = at;
@@ -536,6 +554,8 @@ impl AttemptBuilder {
             outcome,
             process_id: self.process_id,
             runtime_path: self.runtime_path.into(),
+            workspace_kind: self.workspace.kind(),
+            workspace_slot: self.workspace.slot_number(),
             created_at: self.created_at,
             terminal_at,
             last_state_change_at: entered_state_at,

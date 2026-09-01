@@ -17,6 +17,12 @@
 //!   restart-recovery decisions.
 //! * [`capacity`] — the two-level ceiling (D7, D9), as an allocator over all
 //!   policies rather than a check a caller may forget.
+//! * [`path`] — the pure stored shape of an operator-configured local path. It
+//!   decides syntax only; whether the directory exists, is local, or is writable
+//!   is `b1`'s operational preflight in `crates/platform`.
+//! * [`workspace`] — where an attempt's files live and whether they survive it:
+//!   a repository's [`workspace::WorkspacePolicy`] and one attempt's immutable
+//!   [`workspace::AttemptWorkspace`] allocation.
 //! * [`store`] — SQLite persistence. Owned by `b2`, and the only module here
 //!   that touches I/O.
 //!
@@ -34,5 +40,7 @@
 pub mod attempt;
 pub mod capacity;
 pub mod model;
+pub mod path;
 pub mod policy;
 pub mod store;
+pub mod workspace;
