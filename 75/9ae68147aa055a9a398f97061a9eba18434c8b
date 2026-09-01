@@ -1,0 +1,31 @@
+.pipeline/workflows/implement-task/_shared/worktree-preamble.md
+  s_2d912ceaf1ce93::t_ce339a0efd359d 3,5,13,21
+.pipeline/workflows/implement-task/steps/simplify.md
+  s_2d912ceaf1ce93::t_66f1d22ac6ea19 5,16,29
+.taskflow/2026-08-31-runner-workspace-locations/ROADMAP.md
+  s_11a4c61ec36669::t_cc0825dd45336e 73,146-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "759ae68147aa055a9a398f97061a9eba18434c8b",
+  "prompts": {},
+  "sessions": {
+    "s_11a4c61ec36669": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a059a3-279d-78a3-afe4-a75dc48bc6c9",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_2d912ceaf1ce93": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a05a23-a187-78c2-99d0-bfabaa1ad487",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
