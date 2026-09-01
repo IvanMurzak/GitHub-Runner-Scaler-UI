@@ -220,9 +220,9 @@ impl WorkspacePolicy {
     ) -> Result<Self, WorkspaceError> {
         match (kind, root) {
             (WorkspaceKind::Ephemeral, None) => Ok(WorkspacePolicy::Ephemeral),
-            (WorkspaceKind::Ephemeral, Some(root)) => Err(WorkspaceError::EphemeralWithRoot {
-                root: root.as_str().to_string(),
-            }),
+            (WorkspaceKind::Ephemeral, Some(root)) => {
+                Err(WorkspaceError::EphemeralWithRoot { root: root.into() })
+            }
             (WorkspaceKind::Persistent, None) => Err(WorkspaceError::PersistentWithoutRoot),
             (WorkspaceKind::Persistent, Some(root)) => Self::persistent(root, scope),
         }
@@ -247,7 +247,7 @@ impl WorkspacePolicy {
 
     #[must_use]
     pub const fn is_persistent(&self) -> bool {
-        matches!(self, WorkspacePolicy::Persistent { .. })
+        self.kind().is_persistent()
     }
 
     /// Whether the job workspace survives an attempt under this policy.
@@ -355,7 +355,7 @@ impl AttemptWorkspace {
 
     #[must_use]
     pub const fn is_persistent(&self) -> bool {
-        matches!(self, AttemptWorkspace::PersistentSlot { .. })
+        self.kind().is_persistent()
     }
 
     /// The slot's directory name under the persistent root.

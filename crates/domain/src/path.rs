@@ -127,11 +127,6 @@ impl PathPlatform {
         PathPlatform::Unix
     };
 
-    #[must_use]
-    pub const fn native() -> Self {
-        Self::NATIVE
-    }
-
     /// The separator a normalised path is rendered with.
     #[must_use]
     pub const fn separator(self) -> char {
@@ -149,12 +144,6 @@ impl PathPlatform {
             PathPlatform::Windows => c == '\\' || c == '/',
             PathPlatform::Unix => c == '/',
         }
-    }
-}
-
-impl Default for PathPlatform {
-    fn default() -> Self {
-        Self::NATIVE
     }
 }
 
@@ -309,14 +298,6 @@ impl TryFrom<String> for LocalAbsolutePath {
     type Error = LocalPathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl TryFrom<&str> for LocalAbsolutePath {
-    type Error = LocalPathError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::new(value)
     }
 }
@@ -657,34 +638,59 @@ mod tests {
 
     #[test]
     fn windows_unrepresentable_components_are_rejected() {
-        assert!(matches!(
-            parse("C:\\rman\\a<b", Windows),
-            Err(LocalPathError::UnrepresentableCharacter { found: '<', .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\a|b", Windows),
-            Err(LocalPathError::UnrepresentableCharacter { found: '|', .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\a:b", Windows),
-            Err(LocalPathError::UnrepresentableCharacter { found: ':', .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\slots.", Windows),
-            Err(LocalPathError::TrailingDotOrSpace { .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\slots ", Windows),
-            Err(LocalPathError::TrailingDotOrSpace { .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\NUL", Windows),
-            Err(LocalPathError::ReservedName { .. })
-        ));
-        assert!(matches!(
-            parse("C:\\rman\\com1.txt", Windows),
-            Err(LocalPathError::ReservedName { .. })
-        ));
+        // The offending *component* is asserted alongside the variant: an error
+        // that reported the whole raw path would tell the operator to fix the
+        // wrong part of their input.
+        let cases = [
+            (
+                "C:\\rman\\a<b",
+                LocalPathError::UnrepresentableCharacter {
+                    component: "a<b".to_string(),
+                    found: '<',
+                },
+            ),
+            (
+                "C:\\rman\\a|b",
+                LocalPathError::UnrepresentableCharacter {
+                    component: "a|b".to_string(),
+                    found: '|',
+                },
+            ),
+            (
+                "C:\\rman\\a:b",
+                LocalPathError::UnrepresentableCharacter {
+                    component: "a:b".to_string(),
+                    found: ':',
+                },
+            ),
+            (
+                "C:\\rman\\slots.",
+                LocalPathError::TrailingDotOrSpace {
+                    component: "slots.".to_string(),
+                },
+            ),
+            (
+                "C:\\rman\\slots ",
+                LocalPathError::TrailingDotOrSpace {
+                    component: "slots ".to_string(),
+                },
+            ),
+            (
+                "C:\\rman\\NUL",
+                LocalPathError::ReservedName {
+                    component: "NUL".to_string(),
+                },
+            ),
+            (
+                "C:\\rman\\com1.txt",
+                LocalPathError::ReservedName {
+                    component: "com1.txt".to_string(),
+                },
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(parse(raw, Windows), Err(expected), "input {raw:?}");
+        }
     }
 
     #[test]

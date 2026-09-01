@@ -1575,7 +1575,8 @@ mod tests {
         assert_eq!(
             policy.revision(),
             before + 1,
-            "a workspace change must bump the optimistic token, or `a2`'s guard              cannot refuse a write built from a stale read"
+            "a workspace change must bump the optimistic token, or `a2`'s guard \
+             cannot refuse a write built from a stale read"
         );
 
         // Setting the same value again is not a change and must not consume a
