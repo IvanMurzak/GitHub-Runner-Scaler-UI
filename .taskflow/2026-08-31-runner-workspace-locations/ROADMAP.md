@@ -21,7 +21,7 @@ derivation base `ce7945d` on `main`.
 Taskflow execution creates and verifies this isolated worktree before product
 implementation. The primary working tree is not an execution target.
 
-**Last updated:** 2026-08-31.
+**Last updated:** 2026-09-01.
 
 ## Outcome
 
@@ -69,11 +69,11 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ✅ | [PR #34](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/34), merge `66ba5a8` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | ✅ | run `01a05ac7-b731-704b-8753-5aa75b0b4fdb` | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
-| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🔵 | none | 2026-08-31 |
+| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | planned | none | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
-| [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
+| [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | 🔵 | native worker | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
-| [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | planned | none | 2026-08-31 |
+| [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | 🔵 | native worker | 2026-09-01 |
 | [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | planned | none | 2026-08-31 |
 | [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
 | [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | planned | none | 2026-08-31 |
@@ -149,4 +149,9 @@ directory untouched.
 - Completed task c1-effective-runtime-root using implement-task pipeline via manual session loop. PR #37 created and merged.
 - Implemented dynamically resolved paths in LifecycleLauncher and updated corresponding tests.
 - Survived limit exhaustion, fixed missing simplify skill reference during retrospective, and marked c1 task as ✅.
+- Reconciled a stale `b2-windows-root-acl` 🔵 row: no branch, worktree, or PR
+  existed, so the row returned to `planned`.
+- Started `c2-persistent-slot-allocation` and `d1-workspace-cli-read-models`
+  concurrently with native `taskflow-implementer` worktree isolation.
+- Withheld `b2-windows-root-acl` because human gate 2 is still pending.
 
