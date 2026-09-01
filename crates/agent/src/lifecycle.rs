@@ -54,6 +54,42 @@ const UNRESOLVED_PROCESS_FILE: &str = ".runner-process.unresolved";
 const RUNNER_ID_FILE: &str = ".github-runner-id";
 const TERMINATE_INTENT_FILE: &str = ".terminate-registration-timeout";
 const MAX_POST_SPAWN_STOP_ATTEMPTS: usize = 3;
+
+/// Slot-root names a cleaned persistent attempt must not have left behind.
+///
+/// This is not the rule — the rule is that *nothing* but a real `_work`
+/// survives, and [`verify_slot_scrubbed`] enforces that by counting. This list
+/// is the second, independent question asked of the same directory: each name
+/// is stat-ed directly, so a scrub that skipped one is caught even if the
+/// enumeration that was supposed to find it under-reported. Every entry is one
+/// of the things `04-security-recovery.md` requires to be proven absent before a
+/// slot is released; the encoded JIT handoff is the one exception, matched by
+/// its published prefix in [`verify_slot_scrubbed`] because the rest of its name
+/// is a UUID. Being compile-time constants, these are also the only entry names
+/// a refusal message is allowed to print.
+const SENSITIVE_SLOT_ENTRIES: &[&str] = &[
+    // Runner binaries and the launchers beside them.
+    "bin",
+    "externals",
+    "run.sh",
+    "run.cmd",
+    "config.sh",
+    "config.cmd",
+    // The registration identity GitHub's runner writes for itself, and the
+    // per-run environment it reads back.
+    ".runner",
+    ".credentials",
+    ".credentials_rsaparams",
+    ".env",
+    ".path",
+    "_diag",
+    // This agent's own process-identity and lifecycle sidecars.
+    IDENTITY_FILE,
+    FALLBACK_IDENTITY_FILE,
+    UNRESOLVED_PROCESS_FILE,
+    RUNNER_ID_FILE,
+    TERMINATE_INTENT_FILE,
+];
 #[cfg(test)]
 const TEST_LISTENER_READY: &str = ".test-listener-ready";
 
@@ -506,7 +542,12 @@ fn lowest_free_slot(leases: &[RunnerAttempt], ceiling: NonZeroU16) -> Option<Non
 /// be repaired here.
 fn create_or_validate_slot(slot: &Path) -> Result<(), LifecycleError> {
     match fs::symlink_metadata(slot) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(slot_refusal(
+        // [`is_link_like`] and not `is_symlink`, so that this is the same
+        // question cleanup asks in [`slot_is_present`]: a reparse tag the
+        // standard library has no name for is refused here rather than
+        // allocated into and then quarantined forever by a cleanup that will
+        // not scrub it.
+        Ok(metadata) if is_link_like(&metadata) => Err(slot_refusal(
             slot,
             "is a symbolic link, junction or other reparse point, which could place runner \
              files outside the configured root",
@@ -547,10 +588,11 @@ fn accept_reusable_slot(slot: &Path) -> Result<(), LifecycleError> {
                 format!("entry {name:?} could not be inspected: {source}"),
             )
         })?;
-        // `symlink_metadata` reports a link as a link, so `is_dir` here is
-        // already "a real directory" and the link test is the message, not the
-        // rule.
-        if is_work_folder(&name) && metadata.is_dir() {
+        // The same predicate cleanup retains by, so a `_work` this accepts is
+        // one [`scrub_slot_entries`] will keep rather than refuse: a link, a
+        // junction or any other reparse point is not a job workspace to either
+        // of them.
+        if is_retainable_work_folder(&name, &metadata) {
             continue;
         }
         refused.push(name.to_string_lossy().into_owned());
@@ -586,10 +628,10 @@ fn slot_refusal(slot: &Path, detail: impl fmt::Display) -> LifecycleError {
 ///
 /// The comparison folds case on Windows because the filesystem does: there
 /// `_Work` and `_work` are one directory, so a case-sensitive test would let
-/// [`remove_slot_entries_except_work`] delete the very directory it exists to
-/// keep, let [`accept_reusable_slot`] refuse a slot that holds nothing but a
-/// valid job workspace, and let a package's top-level `_Work` merge itself into
-/// the previous attempt's `_work`. Elsewhere the two names really are two
+/// [`scrub_slot_entries`] delete the very directory it exists to keep, let
+/// [`accept_reusable_slot`] refuse a slot that holds nothing but a valid job
+/// workspace, and let a package's top-level `_Work` merge itself into the
+/// previous attempt's `_work`. Elsewhere the two names really are two
 /// directories and only the exact one is the job workspace.
 fn is_work_folder(name: &OsStr) -> bool {
     if cfg!(windows) {
@@ -597,6 +639,40 @@ fn is_work_folder(name: &OsStr) -> bool {
     } else {
         name == OsStr::new(DEFAULT_WORK_FOLDER)
     }
+}
+
+/// Whether the operating system would follow this entry somewhere else.
+///
+/// `FileType::is_symlink` is the whole answer on Unix. On Windows it is not:
+/// the standard library reports only the symlink and mount-point reparse tags,
+/// and the substitution this has to refuse is *any* reparse point standing
+/// where a real directory should be. So the attribute bit is the test there,
+/// and a tag the standard library has no name for fails closed with the two it
+/// does.
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Whether an entry is the retained job workspace and is safe to retain.
+///
+/// The two halves are one question. A `_work` that is a file, a symlink, a
+/// junction or any other reparse point is not a job workspace, and it is also
+/// the exact substitution a hostile workflow makes to send cleanup somewhere
+/// else (`04-security-recovery.md`, "A workflow replaces `_work` with a
+/// junction or symlink to escape cleanup").
+fn is_retainable_work_folder(name: &OsStr, metadata: &fs::Metadata) -> bool {
+    is_work_folder(name) && metadata.is_dir() && !is_link_like(metadata)
 }
 
 /// Undo one package materialization, dispatching on the journalled workspace.
@@ -608,36 +684,402 @@ fn is_work_folder(name: &OsStr) -> bool {
 fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
     match attempt.workspace() {
         AttemptWorkspace::Ephemeral => fs::remove_dir_all(attempt.runtime_path()),
-        AttemptWorkspace::PersistentSlot { .. } => {
-            remove_slot_entries_except_work(attempt.runtime_path())
+        AttemptWorkspace::PersistentSlot { .. } => scrub_slot_entries(attempt.runtime_path())
+            .map_err(|quarantine| std::io::Error::other(quarantine.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent cleanup (`04-security-recovery.md`, "Safe path handling")
+// ---------------------------------------------------------------------------
+
+/// Why a persistent slot could not be proven safe to scrub.
+///
+/// A closed set rather than a formatted string, for two reasons that point the
+/// same way. [`LifecycleEvent::AttemptCleanFailed`] takes a `&'static str` for
+/// exactly the reason [`crate::reconcile::failure_reason_kind`] documents —
+/// free text is the one shape that can carry a credential past a field
+/// allow-list. And the entries under a slot root are *workflow-controlled*: a
+/// job that writes a file named after a secret would publish it through any
+/// message that echoed a directory listing, which is why nothing here ever
+/// renders an entry name that did not come from this module's own constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotRefusal {
+    /// The journalled runtime path is not `<root>/sN` for the journalled slot.
+    NotTheJournalledSlot,
+    /// A policy that still exists names a different root than the journal does.
+    PolicyRootDisagrees,
+    /// The slot is not strictly inside its root once components resolve.
+    Containment,
+    /// The slot itself is a file, a link, or could not be inspected.
+    SlotNotADirectory,
+    /// The slot's direct entries could not be listed.
+    Enumeration,
+    /// `_work` is a file, a symlink, a junction or another reparse point.
+    WorkNotADirectory,
+    /// An entry that had to go could not be removed.
+    Deletion,
+    /// Something other than the job workspace survived removal.
+    Residue,
+}
+
+impl SlotRefusal {
+    /// The event field: a fixed vocabulary, never operator or workflow text.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::NotTheJournalledSlot => "slot_path_is_not_the_journalled_slot",
+            Self::PolicyRootDisagrees => "slot_root_disagrees_with_policy",
+            Self::Containment => "slot_escapes_its_root",
+            Self::SlotNotADirectory => "slot_is_not_a_directory",
+            Self::Enumeration => "slot_could_not_be_enumerated",
+            Self::WorkNotADirectory => "retained_work_is_not_a_directory",
+            Self::Deletion => "slot_entry_could_not_be_removed",
+            Self::Residue => "slot_still_holds_runner_state",
+        }
+    }
+
+    /// What the operator has to do, in one sentence and with no path in it.
+    const fn remediation(self) -> &'static str {
+        match self {
+            Self::NotTheJournalledSlot | Self::PolicyRootDisagrees | Self::Containment => {
+                "the attempt keeps its slot lease and nothing was removed; correct the \
+                 repository's persistent workspace path, or remove the slot directory by hand \
+                 once you have confirmed what is in it"
+            }
+            Self::SlotNotADirectory | Self::WorkNotADirectory => {
+                "the attempt keeps its slot lease and nothing was removed; a job replaced the \
+                 slot or its `_work` with a link, so inspect it before deleting anything and \
+                 treat the retained workspace as untrusted"
+            }
+            Self::Enumeration | Self::Deletion | Self::Residue => {
+                "the attempt keeps its slot lease and will be cleaned again on the next pass; \
+                 release whatever is holding the files open, or remove the slot's contents by \
+                 hand leaving only `_work`"
+            }
         }
     }
 }
 
-/// Every direct child of a slot except the retained job workspace.
+/// A refusal that leaves one persistent slot quarantined.
 ///
-/// A link-shaped entry is unlinked rather than followed, so removal cannot
-/// reach outside the slot even though `accept_reusable_slot` already refused to
-/// allocate into a slot holding one.
-fn remove_slot_entries_except_work(slot: &Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(slot)? {
-        let entry = entry?;
-        if is_work_folder(&entry.file_name()) {
-            continue;
-        }
-        let path = entry.path();
-        let file_type = fs::symlink_metadata(&path)?.file_type();
-        if file_type.is_symlink() {
-            // A file symlink unlinks with `remove_file`; a directory symlink or
-            // a Windows junction needs `remove_dir`. Neither follows the link.
-            fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
-        } else if file_type.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
+/// `detail` is redacted by construction: it may hold paths this product
+/// configured, `std::io::ErrorKind` values, counts, and names drawn from
+/// [`SENSITIVE_SLOT_ENTRIES`] — and nothing that came out of a directory
+/// listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotQuarantine {
+    refusal: SlotRefusal,
+    detail: String,
+}
+
+impl SlotQuarantine {
+    fn new(refusal: SlotRefusal, detail: impl Into<String>) -> Self {
+        Self {
+            refusal,
+            detail: detail.into(),
         }
     }
+}
+
+impl fmt::Display for SlotQuarantine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; {}", self.detail, self.refusal.remediation())
+    }
+}
+
+/// Steps 1 to 3: the journalled root, the journalled slot, and containment.
+///
+/// Everything comes from the two immutable allocation facts — the exact runtime
+/// path and the slot number. Not from the filesystem: scanning a root to decide
+/// which directories are "mine" is what invariant 6 forbids, and it is also
+/// impossible for an attempt whose policy has since been deleted. `configured`
+/// is therefore a *cross-check* and not a source. A policy that survives has to
+/// agree; a policy that does not survive removes a check rather than the
+/// ability to clean the directory the journal already names.
+///
+/// The name test comes before the parent is used, so `<root>/s1` for a journal
+/// row that says `s2` — and anything at all that is not one `sN` component —
+/// is refused before a root is derived from it.
+fn verify_journalled_slot(
+    runtime: &Path,
+    slot: NonZeroU16,
+    configured: Option<&LocalAbsolutePath>,
+) -> Result<(), SlotQuarantine> {
+    let mislaid = || {
+        SlotQuarantine::new(
+            SlotRefusal::NotTheJournalledSlot,
+            format!(
+                "the journalled runtime {} is not the slot s{slot} this attempt was allocated as",
+                runtime.display()
+            ),
+        )
+    };
+    let local = |path: &Path| {
+        path.to_str()
+            .and_then(|raw| LocalAbsolutePath::new(raw).ok())
+            .ok_or_else(mislaid)
+    };
+
+    let runtime_path = local(runtime)?;
+    let root = local(runtime.parent().ok_or_else(mislaid)?)?;
+    // Containment's lexical half, by construction: `derive_child` accepts one
+    // component, so the equality below can only hold when the journalled path
+    // really is this root's `sN` and nothing else.
+    // The directory name comes from the domain that allocation named it with,
+    // never from a second `s{n}` spelled out here: a convention with two
+    // spellings would let cleanup refuse every slot the allocator created.
+    let name = AttemptWorkspace::persistent_slot(slot)
+        .slot_directory_name()
+        .expect("a persistent workspace names its slot directory");
+    let derived = runner_root::derive_child(&root, &name).map_err(|_| mislaid())?;
+    if derived != runtime_path {
+        return Err(mislaid());
+    }
+    if let Some(configured) = configured
+        && configured != &root
+    {
+        return Err(SlotQuarantine::new(
+            SlotRefusal::PolicyRootDisagrees,
+            format!(
+                "the journalled slot {} is not under the repository's configured persistent root \
+                 {}",
+                runtime.display(),
+                configured.as_str()
+            ),
+        ));
+    }
+    // And containment's canonical half, which is what a junction planted inside
+    // the root between allocation and cleanup has to get past.
+    runner_root::verify_containment(&root, &derived).map_err(|source| {
+        SlotQuarantine::new(
+            SlotRefusal::Containment,
+            format!("the journalled slot is not inside the root it was allocated from: {source}"),
+        )
+    })
+}
+
+/// Whether the slot is there to be scrubbed at all, before its entries are.
+///
+/// `Ok(false)` — the directory is gone — is not a refusal. There is nothing to
+/// remove and nothing to prove absent, which is the same tolerance the
+/// disposable arm has always had for a runtime that vanished under it.
+///
+/// A slot that is a file, a link, a junction or any other reparse point *is* a
+/// refusal, and it is checked here rather than inside the enumeration so that
+/// the reason an operator reads names the shape rather than reporting that a
+/// directory could not be listed.
+fn slot_is_present(slot: &Path) -> Result<bool, SlotQuarantine> {
+    match fs::symlink_metadata(slot) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SlotQuarantine::new(
+            SlotRefusal::SlotNotADirectory,
+            format!(
+                "the slot {} could not be inspected: {:?}",
+                slot.display(),
+                source.kind()
+            ),
+        )),
+        Ok(metadata) if !metadata.is_dir() || is_link_like(&metadata) => Err(SlotQuarantine::new(
+            SlotRefusal::SlotNotADirectory,
+            format!(
+                "the slot {} is a link or a file rather than a real directory",
+                slot.display()
+            ),
+        )),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// Steps 4 to 6: list the slot's direct entries, keep one real `_work`, remove
+/// every other one.
+///
+/// Every call is a literal filesystem API against a path built from the slot
+/// root and one entry name — no glob, no shell string, no repository-controlled
+/// fragment. Nothing is followed: `symlink_metadata` says what each entry *is*,
+/// and a link-shaped entry is unlinked rather than descended into, so a junction
+/// planted where `bin` used to be cannot take the deletion outside the slot.
+///
+/// A `_work` that is not a real directory is the one entry this refuses to act
+/// on at all. Removing it could destroy an operator's data if the link were
+/// theirs; keeping it would hand the next attempt a workspace pointing
+/// anywhere. `04-security-recovery.md` requires that case to quarantine the
+/// slot, so the whole scrub stops there with nothing removed after it.
+fn scrub_slot_entries(slot: &Path) -> Result<(), SlotQuarantine> {
+    let unreadable = |source: std::io::Error| {
+        SlotQuarantine::new(
+            SlotRefusal::Enumeration,
+            format!(
+                "the entries of {} could not be listed: {:?}",
+                slot.display(),
+                source.kind()
+            ),
+        )
+    };
+    for entry in fs::read_dir(slot).map_err(unreadable)? {
+        let name = entry.map_err(unreadable)?.file_name();
+        let path = slot.join(&name);
+        // Nothing is assumed from an entry that vanished: `verify_slot_scrubbed`
+        // asks the filesystem again afterwards and refuses if it is still there.
+        let Some(metadata) = listed_entry_metadata(&path).map_err(unreadable)? else {
+            continue;
+        };
+        if is_work_folder(&name) {
+            if is_retainable_work_folder(&name, &metadata) {
+                continue;
+            }
+            return Err(SlotQuarantine::new(
+                SlotRefusal::WorkNotADirectory,
+                format!(
+                    "the retained `{DEFAULT_WORK_FOLDER}` in {} is a link or a file rather than a \
+                     real directory",
+                    slot.display()
+                ),
+            ));
+        }
+        remove_slot_entry(&path, &metadata).map_err(|source| {
+            SlotQuarantine::new(
+                SlotRefusal::Deletion,
+                format!(
+                    "an entry of {} could not be removed: {:?}",
+                    slot.display(),
+                    source.kind()
+                ),
+            )
+        })?;
+    }
     Ok(())
+}
+
+/// What a listed entry *is*, or `None` when it is no longer there.
+///
+/// An entry named by a listing and gone by the time it is stat-ed is absent,
+/// which is a fact both passes over a slot want rather than an enumeration that
+/// failed. Nothing is followed: `symlink_metadata` reports a link as a link.
+fn listed_entry_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+/// Remove one slot entry without following it.
+///
+/// An entry that is already gone is removed: the post-condition this serves is
+/// "not there", and racing with whatever removed it first is not a refusal.
+fn remove_slot_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    let removed = if is_link_like(metadata) {
+        // A file symlink unlinks with `remove_file`; a directory symlink or a
+        // Windows junction needs `remove_dir`. Neither follows the link.
+        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Step 7: prove that nothing but the retained job workspace is left.
+///
+/// Two passes, deliberately independent, because the interesting failure is an
+/// enumeration that under-reports. The first asks the directory what remains
+/// and counts everything that is not a real `_work`. The second ignores the
+/// listing entirely and stats the names an attempt is known to write — the
+/// runner's binaries, the registration identity it stores beside them, the
+/// process-identity sidecars and this agent's lifecycle marks — so a scrub that
+/// silently skipped one is caught by a question that never consulted the
+/// listing that skipped it.
+///
+/// Only the second pass names anything, and the encoded JIT handoff is reported
+/// by its published prefix rather than by the UUID that follows it. A slot root
+/// is workflow-writable, so a job that named a file after a secret would publish
+/// it through any message that echoed the listing; the first pass therefore
+/// reports a count.
+fn verify_slot_scrubbed(slot: &Path) -> Result<(), SlotQuarantine> {
+    let unreadable = |source: std::io::Error| {
+        SlotQuarantine::new(
+            SlotRefusal::Enumeration,
+            format!(
+                "the entries of {} could not be listed to verify the scrub: {:?}",
+                slot.display(),
+                source.kind()
+            ),
+        )
+    };
+    let mut residue = 0_usize;
+    let mut named: Vec<String> = Vec::new();
+    for entry in fs::read_dir(slot).map_err(unreadable)? {
+        let name = entry.map_err(unreadable)?.file_name();
+        // Absent is what this pass is here to establish. The named half below
+        // stats every sensitive entry again, so an entry that only *looks*
+        // absent to this listing is still caught.
+        let Some(metadata) = listed_entry_metadata(&slot.join(&name)).map_err(unreadable)? else {
+            continue;
+        };
+        if is_retainable_work_folder(&name, &metadata) {
+            continue;
+        }
+        residue = residue.saturating_add(1);
+        if name
+            .to_string_lossy()
+            .starts_with(RestrictiveHandoff::NAME_PREFIX)
+        {
+            named.push("an encoded JIT handoff".to_owned());
+        }
+    }
+    named.extend(
+        SENSITIVE_SLOT_ENTRIES
+            .iter()
+            .filter(|entry| fs::symlink_metadata(slot.join(entry)).is_ok())
+            .map(|entry| format!("`{entry}`")),
+    );
+    if residue == 0 && named.is_empty() {
+        return Ok(());
+    }
+    named.sort_unstable();
+    named.dedup();
+    Err(SlotQuarantine::new(
+        SlotRefusal::Residue,
+        residue_detail(slot, residue, &named),
+    ))
+}
+
+/// Word a [`SlotRefusal::Residue`] refusal from the two facts that produced it.
+///
+/// Separate from [`verify_slot_scrubbed`] because the disagreement it has to
+/// report — a listing that counted nothing and a filesystem that answered
+/// otherwise — is a race no test can stage, and a message that contradicts
+/// itself is exactly what an operator reads at three in the morning.
+///
+/// `named` is the sanitized half: entries this crate published the names of.
+/// A name a workflow chose is only ever counted, never echoed.
+fn residue_detail(slot: &Path, residue: usize, named: &[String]) -> String {
+    if residue == 0 {
+        // The whole reason the second pass ignores the listing: the listing
+        // reported a clean slot and the filesystem disagrees. Saying "0
+        // entries survived" here would report the under-count as the fact.
+        format!(
+            "the listing of {} reported nothing but `{DEFAULT_WORK_FOLDER}`, yet {} survived \
+                 cleanup",
+            slot.display(),
+            named.join(", ")
+        )
+    } else {
+        format!(
+            "{residue} entr{} other than `{DEFAULT_WORK_FOLDER}` survived cleanup of {}{}",
+            if residue == 1 { "y" } else { "ies" },
+            slot.display(),
+            if named.is_empty() {
+                String::new()
+            } else {
+                format!(", including {}", named.join(", "))
+            }
+        )
+    }
 }
 
 fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
@@ -1178,6 +1620,21 @@ pub enum LifecycleError {
     Transition,
     #[error("startup recovery has not completed")]
     RecoveryIncomplete,
+    /// A persistent slot could not be proven safe to scrub, so the attempt keeps
+    /// its uncleaned state and, with it, its slot lease.
+    ///
+    /// Separate from [`Self::Failed`] because the two demand opposite handling
+    /// from the same call sites. A failure aborts the pass; a quarantine must
+    /// not, or one stuck slot would stop the host launching anything at all —
+    /// which is precisely what `04-security-recovery.md` rules out when it says
+    /// such an attempt "does not count as active host capacity" and "recovery
+    /// retries the same cleanup".
+    #[error("the persistent slot was not cleaned: {detail}")]
+    SlotQuarantined {
+        /// The closed-vocabulary event field; never operator or workflow text.
+        class: &'static str,
+        detail: String,
+    },
     #[error("runner lifecycle failed: {0}")]
     Failed(FailureReason),
 }
@@ -1190,6 +1647,9 @@ impl LifecycleError {
             Self::Journal => FailureReason::Other("attempt journal operation failed".into()),
             Self::Missing(_) => FailureReason::Other("attempt disappeared from the journal".into()),
             Self::Transition => FailureReason::Other("attempt transition was refused".into()),
+            // Rendered through `Display` rather than a second copy of the same
+            // sentence, so the two cannot drift apart.
+            Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
         }
     }
 }
@@ -1348,7 +1808,7 @@ impl LifecycleLauncher {
             return Ok(ReconcileProgress::Reconciled);
         }
         if attempt.is_terminal() {
-            self.clean_attempt(&mut attempt)?;
+            self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
         let process_alive = self
@@ -1406,7 +1866,7 @@ impl LifecycleLauncher {
             && self.ports.processes.completed_successfully(&attempt)
         {
             self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
-            self.clean_attempt(&mut attempt)?;
+            self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
 
@@ -1418,7 +1878,7 @@ impl LifecycleLauncher {
                 &mut attempt,
                 AttemptOutcome::failed(FailureReason::TerminatedAfterRegistrationTimeout),
             )?;
-            self.clean_attempt(&mut attempt)?;
+            self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Replacement {
                 attempt: attempt.id,
                 operation: "registration_timeout_replacement",
@@ -1447,7 +1907,7 @@ impl LifecycleLauncher {
                 &mut attempt,
                 AttemptOutcome::failed(FailureReason::JitExpired),
             )?;
-            self.clean_attempt(&mut attempt)?;
+            self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Replacement {
                 attempt: attempt.id,
                 operation: "jit_expired_replacement",
@@ -1472,7 +1932,7 @@ impl LifecycleLauncher {
                 Ok(ReconcileProgress::Reconciled)
             }
             RecoveryDecision::Clean => {
-                self.clean_attempt(&mut attempt)?;
+                self.clean_or_quarantine(&mut attempt)?;
                 Ok(ReconcileProgress::Reconciled)
             }
             RecoveryDecision::Observe(state) => {
@@ -1512,7 +1972,7 @@ impl LifecycleLauncher {
                     self.deregister_runner(policy, &attempt).await;
                 }
                 self.conclude(&mut attempt, outcome)?;
-                self.clean_attempt(&mut attempt)?;
+                self.clean_or_quarantine(&mut attempt)?;
                 Ok(
                     replacement.map_or(ReconcileProgress::Reconciled, |operation| {
                         ReconcileProgress::Replacement {
@@ -1567,7 +2027,7 @@ impl LifecycleLauncher {
                 };
                 self.deregister_runner(policy, &attempt).await;
                 self.conclude(&mut attempt, outcome)?;
-                self.clean_attempt(&mut attempt)?;
+                self.clean_or_quarantine(&mut attempt)?;
                 // A surplus runner is not replaced. It was stopped precisely
                 // because the work it was started for went elsewhere; asking the
                 // allocator for another one rebuilds it every idle timeout.
@@ -1658,32 +2118,43 @@ impl LifecycleLauncher {
         Ok(())
     }
 
+    /// Clean a concluded attempt, tolerating a quarantined persistent slot.
+    ///
+    /// The quarantine is reported and stepped over rather than raised, because
+    /// raising it aborts the whole pass: on the startup path that leaves
+    /// `recovery_complete` false and stops the host launching anything, which is
+    /// the opposite of `04-security-recovery.md`'s "it does not count as active
+    /// host capacity" and "recovery retries the same cleanup". The attempt keeps
+    /// its state, so it keeps its slot lease and its directory, and the next
+    /// pass — [`crate::reconcile::Reconciler`]'s terminal sweep on every poll,
+    /// or the next startup — attempts exactly the same cleanup again.
+    ///
+    /// Only a *quarantine* is tolerated. A journal failure or a package lease
+    /// that cannot be released still propagates: those are not one slot's
+    /// problem.
+    fn clean_or_quarantine(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
+        match self.clean_attempt(attempt) {
+            Err(LifecycleError::SlotQuarantined { class, .. }) => {
+                self.ports
+                    .reconcile_events
+                    .emit(LifecycleEvent::AttemptCleanFailed {
+                        policy: attempt.policy_id,
+                        attempt: attempt.id,
+                        reason: class,
+                    });
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     fn clean_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
         let outcome = attempt
             .outcome()
             .cloned()
             .ok_or(LifecycleError::Transition)?;
         self.preserve_diagnostics(attempt, &outcome)?;
-        #[cfg(test)]
-        let cleanup_result = if matches!(
-            std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref(),
-            Ok("skip_workspace_cleanup" | "reuse_job_workspace")
-        ) {
-            Ok(())
-        } else {
-            fs::remove_dir_all(attempt.runtime_path())
-        };
-        #[cfg(not(test))]
-        let cleanup_result = fs::remove_dir_all(attempt.runtime_path());
-        match cleanup_result {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "attempt workspace could not be removed".into(),
-                )));
-            }
-        }
+        self.scrub_workspace(attempt)?;
         self.ports
             .packages
             .release(attempt.id)
@@ -1705,6 +2176,115 @@ impl LifecycleLauncher {
                 outcome: kind,
             });
         Ok(())
+    }
+
+    /// Undo an attempt's placement by the algorithm its journalled workspace
+    /// kind makes legal (`02-target-architecture.md`, "Cleanup and recovery").
+    ///
+    /// The dispatch is on the *journal*, never on what the directory looks like
+    /// now. A slot whose `_work` was replaced by a junction is still scrubbed as
+    /// a slot rather than removed whole, and a disposable directory that happens
+    /// to contain a `_work` still goes whole rather than being spared: the
+    /// workspace kind is immutable precisely so that the shape of a directory a
+    /// workflow can write to cannot choose the algorithm applied to it.
+    fn scrub_workspace(&self, attempt: &RunnerAttempt) -> Result<(), LifecycleError> {
+        #[cfg(test)]
+        {
+            // The two contamination mutants `f1` drives the security gates with.
+            // They sit in front of the dispatch rather than inside one arm so
+            // that a skipped cleanup is equally observable in both modes.
+            if matches!(
+                std::env::var("RUNNER_MANAGER_TEST_MUTANT").as_deref(),
+                Ok("skip_workspace_cleanup" | "reuse_job_workspace")
+            ) {
+                return Ok(());
+            }
+        }
+        match attempt.workspace() {
+            AttemptWorkspace::Ephemeral => match fs::remove_dir_all(attempt.runtime_path()) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
+                    "attempt workspace could not be removed".into(),
+                ))),
+            },
+            AttemptWorkspace::PersistentSlot { slot } => self.scrub_persistent_slot(attempt, slot),
+        }
+    }
+
+    /// Retain exactly `_work` and prove everything else is gone.
+    ///
+    /// The seven ordered checks of `04-security-recovery.md`, "Safe path
+    /// handling": the journalled root and slot, a surviving policy's agreement,
+    /// lexical and canonical containment, a literal enumeration, the one-entry
+    /// allowlist, and a verification pass before the caller releases the package
+    /// lease and marks the attempt cleaned. Any of them may refuse, and a
+    /// refusal removes nothing after it.
+    ///
+    /// A slot directory that is already gone is not a refusal. There is nothing
+    /// to scrub and nothing to prove absent, which is the same tolerance the
+    /// disposable arm has always had for a runtime that vanished under it.
+    fn scrub_persistent_slot(
+        &self,
+        attempt: &RunnerAttempt,
+        slot: NonZeroU16,
+    ) -> Result<(), LifecycleError> {
+        // The policy is read from the journal, never inferred from the
+        // directory tree, and its absence is legal: `Reconciler` cleans every
+        // concluded attempt whether or not its policy still exists, and this
+        // one's root is already journalled on the attempt itself.
+        let configured = self
+            .ports
+            .store
+            .policy(attempt.policy_id)
+            .map_err(|_| LifecycleError::Journal)?
+            .and_then(|policy| match policy.workspace_policy() {
+                WorkspacePolicy::Persistent { root } => Some(root.clone()),
+                WorkspacePolicy::Ephemeral => None,
+            });
+        let runtime = attempt.runtime_path();
+        self.quarantine_on_refusal(
+            attempt,
+            verify_journalled_slot(runtime, slot, configured.as_ref())
+                .and_then(|()| slot_is_present(runtime))
+                .and_then(|present| {
+                    if present {
+                        scrub_slot_entries(runtime).and_then(|()| verify_slot_scrubbed(runtime))
+                    } else {
+                        Ok(())
+                    }
+                }),
+        )
+    }
+
+    /// Turn a slot refusal into the error that keeps the attempt uncleaned.
+    ///
+    /// The warning is emitted here, at the one place a quarantine is minted, so
+    /// that both routes out of cleanup carry it: the reconciler's terminal sweep,
+    /// which receives the error through the launcher port, and
+    /// [`Self::clean_or_quarantine`], which swallows it to keep the pass alive.
+    /// Everything logged is either a path this product configured or a constant
+    /// from this module — see [`SlotQuarantine`] for why that matters.
+    fn quarantine_on_refusal(
+        &self,
+        attempt: &RunnerAttempt,
+        outcome: Result<(), SlotQuarantine>,
+    ) -> Result<(), LifecycleError> {
+        let Err(quarantine) = outcome else {
+            return Ok(());
+        };
+        let detail = quarantine.to_string();
+        tracing::warn!(
+            attempt = %attempt.id,
+            policy = %attempt.policy_id,
+            slot = attempt.workspace().slot_number(),
+            refusal = quarantine.refusal.class(),
+            "{detail}"
+        );
+        Err(LifecycleError::SlotQuarantined {
+            class: quarantine.refusal.class(),
+            detail,
+        })
     }
 
     fn preserve_diagnostics(
@@ -2641,7 +3221,9 @@ mod tests {
 
     struct Harness {
         _root: tempfile::TempDir,
+        app_paths: runner_manager_platform::paths::AppPaths,
         launcher: LifecycleLauncher,
+        demand: Arc<dyn DemandPersistence>,
         store: Arc<SqliteStore>,
         github: Arc<FakeGithubLifecycle>,
         packages: Arc<FakePackages>,
@@ -2683,27 +3265,17 @@ mod tests {
                 packages: Arc::clone(&packages) as Arc<dyn RuntimePackages>,
                 processes: Arc::clone(&processes) as Arc<dyn ProcessSupervisor>,
                 clock: Arc::clone(&clock) as Arc<dyn Clock>,
-                demand,
+                demand: Arc::clone(&demand),
                 delay: Arc::clone(&delay) as Arc<dyn RetryDelay>,
                 events: Arc::clone(&events) as Arc<dyn AttemptEventSink>,
                 reconcile_events: Arc::clone(&reconcile_events) as Arc<dyn EventSink>,
             };
-            let launcher = LifecycleLauncher::new(
-                policy.host_id,
-                paths.clone(),
-                paths.logs_dir(),
-                1,
-                RecoveryTimeouts::new(
-                    Elapsed::seconds(10),
-                    Elapsed::seconds(10),
-                    Elapsed::seconds(10),
-                ),
-                RetryPolicy::bounded(3, Duration::from_millis(10), Duration::from_millis(25)),
-                ports,
-            );
+            let launcher = Self::launcher_over(policy.host_id, &paths, ports);
             Self {
                 _root: root,
+                app_paths: paths,
                 launcher,
+                demand,
                 store,
                 github,
                 packages,
@@ -2754,6 +3326,9 @@ mod tests {
                 )
                 .expect("a repository may be persistent");
             self.workspace_root = Some(root);
+            // The journal's copy, so that cleanup's cross-check against a
+            // surviving policy is exercised rather than skipped.
+            self.store.insert_policy(&self.policy).unwrap();
             self
         }
 
@@ -2778,9 +3353,8 @@ mod tests {
                 .expect("the attempt is journalled")
         }
 
-        /// Stand in for `c3`'s persistent cleanup, which this task does not own:
-        /// the lease is released by the journal and everything but `_work` goes.
-        fn cleanup_retaining_work(&self, id: AttemptId) {
+        /// Conclude an attempt and run the real cleanup over it.
+        fn conclude(&self, id: AttemptId) -> RunnerAttempt {
             let mut attempt = self.attempt(id);
             attempt
                 .conclude(
@@ -2788,9 +3362,58 @@ mod tests {
                     self.clock.now(),
                 )
                 .unwrap();
-            attempt.clean(self.clock.now()).unwrap();
             self.store.record_attempt(&attempt).unwrap();
-            remove_slot_entries_except_work(attempt.runtime_path()).unwrap();
+            attempt
+        }
+
+        async fn cleanup_retaining_work(&self, id: AttemptId) {
+            self.conclude(id);
+            self.launcher
+                .clean(id)
+                .await
+                .expect("the slot is scrubbed and the lease released");
+        }
+
+        /// The launcher configuration every launcher in this harness shares, so
+        /// that the one a restart mints cannot drift from the original.
+        fn launcher_over(
+            host: HostId,
+            paths: &runner_manager_platform::paths::AppPaths,
+            ports: LifecyclePorts,
+        ) -> LifecycleLauncher {
+            LifecycleLauncher::new(
+                host,
+                paths.clone(),
+                paths.logs_dir(),
+                1,
+                RecoveryTimeouts::new(
+                    Elapsed::seconds(10),
+                    Elapsed::seconds(10),
+                    Elapsed::seconds(10),
+                ),
+                RetryPolicy::bounded(3, Duration::from_millis(10), Duration::from_millis(25)),
+                ports,
+            )
+        }
+
+        /// The same journal, the same directories, a launcher that remembers
+        /// nothing — which is what a daemon restart is.
+        fn restart(&self) -> LifecycleLauncher {
+            Self::launcher_over(
+                self.policy.host_id,
+                &self.app_paths,
+                LifecyclePorts {
+                    store: Arc::clone(&self.store) as Arc<dyn Store>,
+                    github: Arc::clone(&self.github) as Arc<dyn LifecycleGithub>,
+                    packages: Arc::clone(&self.packages) as Arc<dyn RuntimePackages>,
+                    processes: Arc::clone(&self.processes) as Arc<dyn ProcessSupervisor>,
+                    clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
+                    demand: Arc::clone(&self.demand),
+                    delay: Arc::clone(&self.delay) as Arc<dyn RetryDelay>,
+                    events: Arc::clone(&self.events) as Arc<dyn AttemptEventSink>,
+                    reconcile_events: Arc::clone(&self.reconcile_events) as Arc<dyn EventSink>,
+                },
+            )
         }
 
         async fn ready(&self) {
@@ -2930,9 +3553,11 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert!(
-            names
-                .iter()
-                .all(|name| !name.to_string_lossy().starts_with("jit-")),
+            names.iter().all(|name| {
+                !name
+                    .to_string_lossy()
+                    .starts_with(RestrictiveHandoff::NAME_PREFIX)
+            }),
             "JIT artifact survived: {names:?}"
         );
         assert_eq!(
@@ -4294,7 +4919,7 @@ mod tests {
         fs::create_dir_all(&checkout).unwrap();
         fs::write(checkout.join("checkout.txt"), b"from the first job").unwrap();
 
-        harness.cleanup_retaining_work(first.id);
+        harness.cleanup_retaining_work(first.id).await;
 
         let second = harness.launch().await;
         assert_ne!(second.id, first.id);
@@ -4332,7 +4957,7 @@ mod tests {
             .join("kept.txt");
         fs::create_dir_all(kept.parent().unwrap()).unwrap();
         fs::write(&kept, b"s2 was here").unwrap();
-        harness.cleanup_retaining_work(second.id);
+        harness.cleanup_retaining_work(second.id).await;
 
         // The operator lowers the ceiling while s1 is still leased.
         harness.policy.set_max_capacity(nz(1)).unwrap();
@@ -4667,5 +5292,820 @@ mod tests {
             !disposable_path.exists(),
             "a disposable directory is still removed whole"
         );
+    }
+
+    // -- c3: persistent cleanup and recovery --------------------------------
+
+    /// The runner state one attempt leaves at a slot root, as a real attempt
+    /// leaves it: binaries, registration identity, a JIT handoff that outlived
+    /// its process, and this agent's own lifecycle sidecars.
+    ///
+    /// Driven by [`SENSITIVE_SLOT_ENTRIES`] rather than by a second copy of it,
+    /// so a name added to the thing cleanup must prove absent is a name every
+    /// test here starts leaving behind.
+    fn litter_the_slot(slot: &Path) {
+        for directory in ["bin", "externals", "_diag"] {
+            fs::create_dir_all(slot.join(directory)).unwrap();
+        }
+        fs::write(slot.join("bin").join("Runner.Listener"), b"binary").unwrap();
+        for file in SENSITIVE_SLOT_ENTRIES
+            .iter()
+            .filter(|entry| !slot.join(entry).is_dir())
+        {
+            fs::write(slot.join(file), b"runner state").unwrap();
+        }
+        // A handoff whose owning process died before `Drop` could delete it.
+        fs::write(
+            slot.join(format!(
+                "{}0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0.tmp",
+                RestrictiveHandoff::NAME_PREFIX
+            )),
+            JIT.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// A marker under `_work` of the kind a job leaves for the next one.
+    fn retain_under_work(slot: &Path) -> PathBuf {
+        let checkout = slot.join(DEFAULT_WORK_FOLDER).join("repo").join("target");
+        fs::create_dir_all(&checkout).unwrap();
+        let marker = checkout.join("build-output.bin");
+        fs::write(&marker, RETAINED).unwrap();
+        marker
+    }
+
+    /// What a job leaves under `_work` for the next job to reuse.
+    const RETAINED: &str = "a Git-ignored build output the next job reuses";
+
+    /// Every direct entry of a directory, sorted, as plain strings.
+    fn entries_of(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The one entry a cleaned slot is allowed to hold.
+    fn only_the_job_workspace() -> Vec<String> {
+        vec![DEFAULT_WORK_FOLDER.to_owned()]
+    }
+
+    /// One slot entry that refuses to be removed, and the undo that lets the
+    /// temporary directory be torn down afterwards.
+    ///
+    /// The two operating systems refuse for different reasons and there is no
+    /// portable third. Windows will not open a file for deletion while a handle
+    /// with share mode zero is held on it; Unix will not unlink from a directory
+    /// the caller cannot write. Both are states a real machine reaches -- a
+    /// scanner holding a file open, a job that left a directory read-only -- so
+    /// the injection is a filesystem fact rather than a seam cut into the
+    /// product for a test to pull.
+    ///
+    /// The Unix half is a permission, and permissions do not apply to `root`.
+    /// [`Self::inject`] proves the block on a throwaway directory before
+    /// claiming it, so a suite running as `root` says it could not inject rather
+    /// than asserting nothing and passing.
+    struct BlockedDeletion {
+        directory: PathBuf,
+        #[cfg(windows)]
+        _handle: fs::File,
+    }
+
+    impl BlockedDeletion {
+        const HELD: &'static str = "held-open";
+
+        /// Fill `directory` with a file that cannot be removed, or answer `None`
+        /// when this account cannot be stopped from removing anything.
+        fn inject(directory: &Path) -> Option<Self> {
+            #[cfg(unix)]
+            if !Self::refusal_is_possible() {
+                return None;
+            }
+            fs::create_dir_all(directory).unwrap();
+            fs::write(
+                directory.join(Self::HELD),
+                b"a file the scrub cannot remove",
+            )
+            .unwrap();
+            #[cfg(windows)]
+            let handle = {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(directory.join(Self::HELD))
+                    .expect("the blocking handle opens")
+            };
+            #[cfg(unix)]
+            Self::set_mode(directory, 0o555);
+            Some(Self {
+                directory: directory.to_path_buf(),
+                #[cfg(windows)]
+                _handle: handle,
+            })
+        }
+
+        fn release(self) {
+            drop(self);
+        }
+
+        #[cfg(unix)]
+        fn refusal_is_possible() -> bool {
+            let probe = tempfile::tempdir().unwrap();
+            let directory = probe.path().join("probe");
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("file"), b"probe").unwrap();
+            Self::set_mode(&directory, 0o555);
+            let refused = fs::remove_dir_all(&directory).is_err();
+            Self::set_mode(&directory, 0o755);
+            refused
+        }
+
+        #[cfg(unix)]
+        fn set_mode(directory: &Path, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(directory).unwrap().permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(directory, permissions).unwrap();
+        }
+    }
+
+    impl Drop for BlockedDeletion {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            Self::set_mode(&self.directory, 0o755);
+            #[cfg(not(unix))]
+            let _ = &self.directory;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_sequential_jobs_keep_the_checkout_and_start_without_the_earlier_runner_state() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+
+        let first = harness.launch().await;
+        let slot = harness.slot_path(1);
+        assert_eq!(first.runtime_path(), slot);
+        assert_eq!(
+            read_runner_id(&slot),
+            Some(73),
+            "the attempt registered, so its identity is on disk"
+        );
+        let marker = retain_under_work(&slot);
+        litter_the_slot(&slot);
+
+        harness.cleanup_retaining_work(first.id).await;
+
+        // The allowlist is exactly one entry, so this assertion is the security
+        // property in full: what is retained, and that nothing else is.
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), RETAINED);
+        assert_eq!(
+            read_runner_id(&slot),
+            None,
+            "the first attempt's registration identity is gone before the second starts"
+        );
+        assert_eq!(harness.attempt(first.id).state(), AttemptState::Cleaned);
+        assert!(!harness.attempt(first.id).holds_slot_lease());
+
+        let second = harness.launch().await;
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.workspace(), AttemptWorkspace::persistent_slot(nz(1)));
+        assert_eq!(
+            second.runtime_path(),
+            slot,
+            "the same slot, so the same retained `_work`"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), RETAINED);
+    }
+
+    #[tokio::test]
+    async fn cleaning_a_persistent_slot_needs_no_policy_and_scans_no_directory_for_ownership() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let slot = harness.slot_path(1);
+        let marker = retain_under_work(&slot);
+        litter_the_slot(&slot);
+        harness.conclude(attempt.id);
+
+        // A repository removed from the product between the attempt concluding
+        // and the sweep reaching it. The journalled runtime path and slot are
+        // the only facts left, and `04-security-recovery.md` requires them to be
+        // enough: the alternative is scanning a root to work out which
+        // directories were ours, which invariant 6 forbids.
+        harness
+            .store
+            .remove_policy(harness.policy.id, harness.policy.revision())
+            .unwrap();
+        assert!(harness.store.policy(harness.policy.id).unwrap().is_none());
+
+        harness
+            .launcher
+            .clean(attempt.id)
+            .await
+            .expect("journal facts alone are enough to clean the slot");
+
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert!(marker.exists());
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn an_injected_partial_deletion_quarantines_the_slot_across_a_restart() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.ready().await;
+        let first = harness.launch().await;
+        let slot = harness.slot_path(1);
+        let marker = retain_under_work(&slot);
+        litter_the_slot(&slot);
+        harness.conclude(first.id);
+
+        let Some(block) = BlockedDeletion::inject(&slot.join("bin")) else {
+            eprintln!(
+                "skipped: this account cannot be refused a deletion, so no partial deletion can \
+                 be injected"
+            );
+            return;
+        };
+
+        let refusal = harness
+            .launcher
+            .clean(first.id)
+            .await
+            .expect_err("a deletion that failed may not report a cleaned slot");
+        let rendered = refusal.reason.to_string();
+        assert!(rendered.contains("could not be removed"), "{rendered}");
+
+        let held = harness.attempt(first.id);
+        assert_eq!(held.state(), AttemptState::Failed, "still not cleaned");
+        assert!(held.holds_slot_lease(), "so the slot is still leased");
+        assert!(
+            !held.state().counts_against_capacity(),
+            "and a concluded attempt still costs the host no capacity"
+        );
+
+        // The same journal and the same directories, under a launcher that
+        // remembers nothing. Recovery must complete: a host that can launch
+        // nothing at all because one slot is stuck is not what "does not count
+        // as active host capacity" means.
+        let restarted = harness.restart();
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("one quarantined slot does not stop the host recovering");
+        assert_eq!(
+            harness.attempt(first.id).state(),
+            AttemptState::Failed,
+            "the quarantine survived the restart"
+        );
+        assert!(
+            harness
+                .reconcile_events
+                .events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    LifecycleEvent::AttemptCleanFailed {
+                        reason: "slot_entry_could_not_be_removed",
+                        ..
+                    }
+                )),
+            "the refusal is reported rather than retried in silence"
+        );
+
+        // Capacity two, slot one quarantined: the next attempt goes to s2 and
+        // never to the slot still holding runner state.
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let second = restarted
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect("the host can still launch");
+        assert_eq!(second.workspace(), AttemptWorkspace::persistent_slot(nz(2)));
+        drop(guard);
+
+        // And the same cleanup succeeds once the obstruction is gone, which is
+        // what "retry through normal recovery" has to mean.
+        block.release();
+        restarted
+            .clean(first.id)
+            .await
+            .expect("the retried cleanup completes");
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert!(marker.exists());
+        assert_eq!(harness.attempt(first.id).state(), AttemptState::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn changing_a_repository_back_to_ephemeral_leaves_every_old_slot_untouched() {
+        let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+        let first = harness.launch().await;
+        let slot = harness.slot_path(1);
+        let marker = retain_under_work(&slot);
+        harness.cleanup_retaining_work(first.id).await;
+
+        // Every attempt for this policy is cleaned, so the mutation is allowed
+        // (`04-security-recovery.md`, "Recovery rules"). What it must not do is
+        // move or delete anything the operator still owns.
+        harness
+            .policy
+            .set_workspace_policy(WorkspacePolicy::Ephemeral)
+            .unwrap();
+
+        let second = harness.launch().await;
+        assert_eq!(second.workspace(), AttemptWorkspace::Ephemeral);
+        assert_eq!(
+            second.runtime_path().parent().unwrap(),
+            harness.host_root(),
+            "a disposable attempt is a child of the host root"
+        );
+        assert!(slot.is_dir(), "the old slot is left where it stands");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), RETAINED);
+
+        // And cleaning the disposable attempt removes its own directory whole
+        // without reaching the retained slot beside it.
+        harness.conclude(second.id);
+        harness.launcher.clean(second.id).await.unwrap();
+        assert!(!second.runtime_path().exists());
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn a_persistent_slot_is_scrubbed_only_after_the_process_is_signalled_and_gone() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+        let slot = harness.slot_path(1);
+        fs::create_dir_all(&slot).unwrap();
+        let marker = retain_under_work(&slot);
+        litter_the_slot(&slot);
+
+        let id = AttemptId::new_random();
+        let mut attempt = RunnerAttempt::allocate_in(
+            id,
+            harness.policy.id,
+            &slot,
+            AttemptWorkspace::persistent_slot(nz(1)),
+            harness.clock.now(),
+        );
+        attempt.jit_received(harness.clock.now()).unwrap();
+        attempt.started(4242, harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        harness.clock.advance_secs(11);
+        harness.processes.set_alive(true);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        // The identity and termination ordering `e3` established is unchanged by
+        // the workspace kind: the intent is durable before the signal, and the
+        // slot is scrubbed only once the process is gone.
+        let actions = harness.processes.actions.lock().unwrap().clone();
+        let intent = actions
+            .iter()
+            .position(|action| *action == "terminate_intent")
+            .unwrap();
+        let signal = actions
+            .iter()
+            .position(|action| *action == "terminate")
+            .unwrap();
+        assert!(intent < signal, "{actions:?}");
+        assert!(!harness.processes.alive.load(Ordering::SeqCst));
+
+        let cleaned = harness.attempt(id);
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+        assert!(matches!(
+            cleaned.outcome(),
+            Some(AttemptOutcome::Failed {
+                reason: FailureReason::TerminatedAfterRegistrationTimeout
+            })
+        ));
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_scrub_retains_one_real_work_directory_and_removes_every_other_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        let marker = retain_under_work(&slot);
+        litter_the_slot(&slot);
+        fs::write(slot.join("runner-package"), b"verified").unwrap();
+
+        scrub_slot_entries(&slot).expect("a slot of ordinary runner state scrubs");
+        verify_slot_scrubbed(&slot).expect("and proves it afterwards");
+
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_residue_refusal_never_reports_the_under_count_as_the_fact() {
+        let slot = Path::new("/runners/s1");
+
+        // The ordinary case: the listing counted, so the count is the fact and
+        // the published names qualify it.
+        let counted = residue_detail(slot, 2, &["`bin`".to_owned()]);
+        assert!(counted.contains("2 entries other than"), "{counted}");
+        assert!(counted.contains("including `bin`"), "{counted}");
+        assert_eq!(
+            residue_detail(slot, 1, &[]),
+            format!(
+                "1 entry other than `{DEFAULT_WORK_FOLDER}` survived cleanup of {}",
+                slot.display()
+            )
+        );
+
+        // The race the second pass exists for: the listing saw nothing and the
+        // filesystem answered otherwise. Saying "0 entries survived" here would
+        // state the under-count as the fact and contradict the rest of the
+        // sentence.
+        let raced = residue_detail(slot, 0, &["`.credentials`".to_owned()]);
+        assert!(!raced.contains('0'), "{raced}");
+        assert!(raced.contains("reported nothing but"), "{raced}");
+        assert!(raced.contains("`.credentials` survived cleanup"), "{raced}");
+    }
+
+    #[test]
+    fn verification_asks_the_filesystem_rather_than_the_listing_that_missed_an_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        fs::create_dir(slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+        verify_slot_scrubbed(&slot).expect("only `_work` is a clean slot");
+
+        // Runner binaries, registration identity, process identity and this
+        // agent's lifecycle marks, one at a time, so a scrub that skipped
+        // exactly one is still caught.
+        for survivor in ["bin", ".credentials", IDENTITY_FILE, RUNNER_ID_FILE] {
+            fs::write(slot.join(survivor), b"left behind").unwrap();
+            let quarantine = verify_slot_scrubbed(&slot).unwrap_err();
+            assert_eq!(quarantine.refusal, SlotRefusal::Residue);
+            assert!(
+                quarantine.detail.contains(&format!("`{survivor}`")),
+                "{quarantine}"
+            );
+            fs::remove_file(slot.join(survivor)).unwrap();
+        }
+
+        // A handoff is named by its published prefix, never by the UUID that
+        // follows it, and never by the payload it holds.
+        let handoff = slot.join(format!("{}whatever.tmp", RestrictiveHandoff::NAME_PREFIX));
+        fs::write(&handoff, JIT.as_bytes()).unwrap();
+        let quarantine = verify_slot_scrubbed(&slot).unwrap_err();
+        assert!(
+            quarantine.detail.contains("an encoded JIT handoff"),
+            "{quarantine}"
+        );
+        assert!(!quarantine.detail.contains(JIT), "{quarantine}");
+        fs::remove_file(&handoff).unwrap();
+
+        // A name a workflow chose is counted and never echoed: a slot root is
+        // writable by the job, so a file named after a secret would be published
+        // by any message that repeated the listing.
+        fs::write(slot.join("ghp_DO_NOT_LEAK"), b"named by the job").unwrap();
+        let quarantine = verify_slot_scrubbed(&slot).unwrap_err();
+        assert!(
+            quarantine.detail.contains("1 entry other than"),
+            "{quarantine}"
+        );
+        assert!(
+            !quarantine.detail.contains("ghp_DO_NOT_LEAK"),
+            "{quarantine}"
+        );
+    }
+
+    #[test]
+    fn a_slot_is_derived_from_the_journal_and_refused_when_it_disagrees() {
+        let root = tempfile::tempdir().unwrap();
+        let configured =
+            LocalAbsolutePath::new(root.path().to_str().unwrap()).expect("a local absolute root");
+        let slot = configured.as_path().join("s1");
+        fs::create_dir(&slot).unwrap();
+
+        verify_journalled_slot(&slot, nz(1), Some(&configured))
+            .expect("the journalled slot agrees");
+        verify_journalled_slot(&slot, nz(1), None)
+            .expect("and a policy that is gone removes a check, not the ability to clean");
+
+        // The journalled slot number is what names the directory. `s1` recorded
+        // as slot two is corrupt state, not a slot to clean.
+        assert_eq!(
+            verify_journalled_slot(&slot, nz(2), None)
+                .unwrap_err()
+                .refusal,
+            SlotRefusal::NotTheJournalledSlot
+        );
+        for stray in ["s1/nested", "not-a-slot", "s01"] {
+            let path = configured.as_path().join(stray);
+            assert_eq!(
+                verify_journalled_slot(&path, nz(1), None)
+                    .unwrap_err()
+                    .refusal,
+                SlotRefusal::NotTheJournalledSlot,
+                "{}",
+                path.display()
+            );
+        }
+
+        // A surviving policy that names a different root does not get to have
+        // its disagreement resolved by deleting something.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other =
+            LocalAbsolutePath::new(elsewhere.path().to_str().unwrap()).expect("a second root");
+        assert_eq!(
+            verify_journalled_slot(&slot, nz(1), Some(&other))
+                .unwrap_err()
+                .refusal,
+            SlotRefusal::PolicyRootDisagrees
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_substituted_work_directory_quarantines_the_slot_and_deletes_nothing_outside_it() {
+        // Windows needs a privilege to create a junction or a symlink, so the
+        // substitution is made here; the rule is platform-independent because it
+        // is `symlink_metadata`'s answer plus the reparse attribute.
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("operator-data");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("do-not-delete.txt");
+        fs::write(
+            &sentinel,
+            b"an operator's data, outside every approved root",
+        )
+        .unwrap();
+
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        fs::create_dir(slot.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+
+        let quarantine = scrub_slot_entries(&slot).unwrap_err();
+        assert_eq!(quarantine.refusal, SlotRefusal::WorkNotADirectory);
+        assert!(
+            sentinel.exists(),
+            "the deletion followed the link out of the slot"
+        );
+        assert!(outside.is_dir());
+        assert!(
+            slot.join(DEFAULT_WORK_FOLDER).symlink_metadata().is_ok(),
+            "the substituted link is left for the operator, never unlinked as if it were ours"
+        );
+
+        // A `_work` that is a plain file is the same refusal for the same
+        // reason: it is not a job workspace, and this is not the code that
+        // decides what to do about it.
+        let file_work = root.path().join("s2");
+        fs::create_dir(&file_work).unwrap();
+        fs::write(file_work.join(DEFAULT_WORK_FOLDER), b"not a directory").unwrap();
+        assert_eq!(
+            scrub_slot_entries(&file_work).unwrap_err().refusal,
+            SlotRefusal::WorkNotADirectory
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_replaced_by_a_link_out_of_its_root_is_refused_before_anything_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("operator-data");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("do-not-delete.txt");
+        fs::write(
+            &sentinel,
+            b"an operator's data, outside every approved root",
+        )
+        .unwrap();
+
+        // The lexical half of containment passes -- the name is right and the
+        // parent is right -- and canonical resolution is what catches it.
+        let inside = root.path().join("inside");
+        fs::create_dir(&inside).unwrap();
+        let slot = inside.join("s1");
+        std::os::unix::fs::symlink(&outside, &slot).unwrap();
+
+        assert_eq!(
+            verify_journalled_slot(&slot, nz(1), None)
+                .unwrap_err()
+                .refusal,
+            SlotRefusal::Containment
+        );
+        assert!(sentinel.exists());
+        assert!(
+            slot.symlink_metadata().is_ok(),
+            "the link is left for the operator rather than removed as if it were ours"
+        );
+    }
+
+    /// Plant a directory junction at `link` pointing at `target`.
+    ///
+    /// A junction is the Windows substitution this has to refuse, and unlike a
+    /// symbolic link it needs no privilege — which is exactly why it is the one
+    /// an unprivileged workflow would reach for. `mklink` is a `cmd` builtin, so
+    /// there is no binary to find and nothing to install; `None` means this
+    /// machine would not make one and the caller says so rather than asserting
+    /// nothing.
+    #[cfg(windows)]
+    fn plant_junction(link: &Path, target: &Path) -> Option<()> {
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .ok()?;
+        (made.status.success() && link.symlink_metadata().is_ok()).then_some(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_work_directory_replaced_by_a_junction_fails_closed_and_deletes_nothing_beyond_it() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("operator-data");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("do-not-delete.txt");
+        fs::write(
+            &sentinel,
+            b"an operator's data, outside every approved root",
+        )
+        .unwrap();
+
+        let slot = root.path().join("s1");
+        fs::create_dir(&slot).unwrap();
+        fs::create_dir(slot.join("bin")).unwrap();
+        let Some(()) = plant_junction(&slot.join(DEFAULT_WORK_FOLDER), &outside) else {
+            eprintln!("skipped: this machine would not create a directory junction");
+            return;
+        };
+
+        // The reparse point is what `is_link_like` answers on, so a junction is
+        // refused for the same reason a symbolic link is and neither is
+        // descended into.
+        let work = fs::symlink_metadata(slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+        assert!(is_link_like(&work), "a junction is a reparse point");
+        let quarantine = scrub_slot_entries(&slot).unwrap_err();
+        assert_eq!(quarantine.refusal, SlotRefusal::WorkNotADirectory);
+        assert!(
+            sentinel.exists(),
+            "the deletion followed the junction out of the slot"
+        );
+        assert!(outside.is_dir());
+
+        // A junction standing where an ordinary entry was is unlinked rather
+        // than followed, so the removal still cannot reach through it.
+        let elsewhere = root.path().join("s2");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::create_dir(elsewhere.join(DEFAULT_WORK_FOLDER)).unwrap();
+        if plant_junction(&elsewhere.join("externals"), &outside).is_some() {
+            scrub_slot_entries(&elsewhere).expect("an ordinary entry is removed, junction or not");
+            verify_slot_scrubbed(&elsewhere).expect("and the slot verifies");
+            assert!(sentinel.exists(), "the junction was followed, not unlinked");
+            assert_eq!(entries_of(&elsewhere), only_the_job_workspace());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_substituted_work_directory_leaves_the_attempt_uncleaned_and_still_leased() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(2);
+        harness.ready().await;
+        let first = harness.launch().await;
+        let slot = harness.slot_path(1);
+        harness.conclude(first.id);
+
+        let outside = harness._root.path().join("operator-data");
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("do-not-delete.txt");
+        fs::write(&sentinel, b"outside every approved root").unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join(DEFAULT_WORK_FOLDER)).unwrap();
+
+        harness
+            .launcher
+            .clean(first.id)
+            .await
+            .expect_err("a slot whose `_work` was substituted is quarantined");
+        assert!(sentinel.exists());
+
+        let held = harness.attempt(first.id);
+        assert_eq!(held.state(), AttemptState::Failed);
+        assert!(held.holds_slot_lease());
+
+        // The quarantined slot is not silently chosen again.
+        let second = harness.launch().await;
+        assert_eq!(second.workspace(), AttemptWorkspace::persistent_slot(nz(2)));
+    }
+
+    #[test]
+    fn a_slot_that_is_a_file_is_refused_and_a_slot_that_is_gone_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let occupied = root.path().join("s1");
+        fs::write(&occupied, b"an operator's file").unwrap();
+        // The journal check passes -- it is the right name under the right root
+        // -- and the shape check is what refuses.
+        verify_journalled_slot(&occupied, nz(1), None).expect("the path is the journalled slot");
+        assert_eq!(
+            slot_is_present(&occupied).unwrap_err().refusal,
+            SlotRefusal::SlotNotADirectory
+        );
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "an operator's file");
+
+        // A directory that is simply not there leaves nothing to remove and
+        // nothing to prove absent, so it is not a refusal.
+        assert!(!slot_is_present(&root.path().join("s2")).unwrap());
+        let present = root.path().join("s3");
+        fs::create_dir(&present).unwrap();
+        assert!(slot_is_present(&present).unwrap());
+    }
+
+    #[test]
+    fn cleanup_dispatches_on_the_journalled_kind_and_not_on_what_the_directory_holds() {
+        let root = tempfile::tempdir().unwrap();
+
+        // A disposable directory that happens to contain a `_work` still goes
+        // whole: the workspace kind is immutable so that the shape of a
+        // directory a workflow can write to cannot choose its own algorithm.
+        let disposable = root.path().join("abcdef012345");
+        fs::create_dir_all(disposable.join(DEFAULT_WORK_FOLDER).join("repo")).unwrap();
+        let ephemeral = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            fixtures::POLICY_ID,
+            &disposable,
+            fixtures::created_at(),
+        );
+        remove_materialized_package(&ephemeral).unwrap();
+        assert!(!disposable.exists());
+
+        // And a slot keeps its `_work` with the same contents beneath it.
+        let slot = root.path().join("s1");
+        fs::create_dir_all(slot.join(DEFAULT_WORK_FOLDER).join("repo")).unwrap();
+        fs::create_dir_all(slot.join("bin")).unwrap();
+        let persistent = RunnerAttempt::allocate_in(
+            AttemptId::new_random(),
+            fixtures::POLICY_ID,
+            &slot,
+            AttemptWorkspace::persistent_slot(nz(1)),
+            fixtures::created_at(),
+        );
+        remove_materialized_package(&persistent).unwrap();
+        assert_eq!(entries_of(&slot), only_the_job_workspace());
+        assert!(slot.join(DEFAULT_WORK_FOLDER).join("repo").is_dir());
+    }
+
+    #[test]
+    fn every_slot_refusal_names_a_distinct_event_class_and_keeps_the_lease() {
+        let refusals = [
+            SlotRefusal::NotTheJournalledSlot,
+            SlotRefusal::PolicyRootDisagrees,
+            SlotRefusal::Containment,
+            SlotRefusal::SlotNotADirectory,
+            SlotRefusal::Enumeration,
+            SlotRefusal::WorkNotADirectory,
+            SlotRefusal::Deletion,
+            SlotRefusal::Residue,
+        ];
+        let classes: BTreeSet<&str> = refusals.iter().map(|refusal| refusal.class()).collect();
+        assert_eq!(
+            classes.len(),
+            refusals.len(),
+            "an event class shared by two refusals tells an operator less than it appears to"
+        );
+        for refusal in refusals {
+            // The event field is a closed vocabulary, so it has to look like
+            // one: `d1`'s sink allows the name verbatim.
+            assert!(
+                refusal
+                    .class()
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{}",
+                refusal.class()
+            );
+            assert!(
+                refusal.remediation().contains("slot lease"),
+                "every refusal has to say the lease is still held: {}",
+                refusal.class()
+            );
+        }
     }
 }

@@ -948,6 +948,16 @@ pub struct RestrictiveHandoff {
 }
 
 impl RestrictiveHandoff {
+    /// What every handoff file's name begins with.
+    ///
+    /// Published because the name is otherwise a UUID nobody can predict, and
+    /// `c3`'s persistent cleanup has to answer "did an encoded configuration
+    /// survive into this slot?" *after* the process that owned it is gone
+    /// (`04-security-recovery.md`: JIT values are "never retained in slot").
+    /// A second `"jit-"` spelled out over there would be a second source of
+    /// truth for the one fact that decides whether a secret is still on disk.
+    pub const NAME_PREFIX: &'static str = "jit-";
+
     /// Writes `payload` to a new uniquely named file in `directory`.
     ///
     /// The name is a UUID rather than a predictable one, so that another local
@@ -961,7 +971,7 @@ impl RestrictiveHandoff {
     pub fn create(directory: &Path, payload: SecretString) -> Result<Self, HandoffError> {
         use std::io::Write as _;
 
-        let path = directory.join(format!("jit-{}.tmp", uuid::Uuid::new_v4()));
+        let path = directory.join(format!("{}{}.tmp", Self::NAME_PREFIX, uuid::Uuid::new_v4()));
 
         let mut file =
             sys::create_restrictive_file(&path).map_err(|source| HandoffError::Create {
