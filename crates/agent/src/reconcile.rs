@@ -2474,6 +2474,7 @@ mod tests {
     use runner_manager_domain::attempt::PersistedAttempt;
     use runner_manager_domain::model::{CachePolicy, HostId};
     use runner_manager_domain::policy::PolicyMode;
+    use runner_manager_domain::workspace::WorkspaceKind;
     use runner_manager_github::rest::RateLimited;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
@@ -2885,6 +2886,8 @@ mod tests {
             outcome,
             process_id: None,
             runtime_path: "runtime/p/a".into(),
+            workspace_kind: WorkspaceKind::Ephemeral,
+            workspace_slot: None,
             created_at: fixtures::created_at(),
             terminal_at: state.is_terminal().then(fixtures::created_at),
             last_state_change_at: fixtures::created_at(),
@@ -2902,6 +2905,8 @@ mod tests {
             outcome: Some(outcome),
             process_id: None,
             runtime_path: "runtime/p/a".into(),
+            workspace_kind: WorkspaceKind::Ephemeral,
+            workspace_slot: None,
             created_at: fixtures::created_at(),
             terminal_at: Some(fixtures::created_at()),
             last_state_change_at: fixtures::created_at(),
