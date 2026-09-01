@@ -33,8 +33,10 @@ use runner_manager_domain::model::{
     Arch, AttemptId, CachePolicy, Clock, Elapsed, Host, HostId, Os, PolicyId, StartMode,
     TargetScope,
 };
+use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
-use runner_manager_domain::store::{SCHEMA_VERSION, SqliteStore, Store};
+use runner_manager_domain::store::{SCHEMA_VERSION, SqliteStore, Store, StoreError};
+use runner_manager_domain::workspace::{AttemptWorkspace, WorkspacePolicy};
 use runner_manager_testkit::clock::FakeClock;
 use runner_manager_testkit::fixtures;
 
@@ -56,6 +58,21 @@ fn database(dir: &Path) -> std::path::PathBuf {
 /// tidily.
 fn abandon(store: SqliteStore) {
     std::mem::forget(store);
+}
+
+/// A native absolute path with this leaf, for the columns that hold one.
+///
+/// Built per platform, because `LocalAbsolutePath::new` judges against the
+/// running host: a Unix literal is corrupt state on Windows and vice versa. The
+/// drive letter is deliberately not `C:` — nothing here may assume the system
+/// drive exists or is named it.
+fn a_root(leaf: &str) -> LocalAbsolutePath {
+    let raw = if cfg!(windows) {
+        format!("X:\\{leaf}")
+    } else {
+        format!("/{leaf}")
+    };
+    LocalAbsolutePath::new(raw).expect("a fixture root is a storable local path")
 }
 
 // ---------------------------------------------------------------------------
@@ -82,11 +99,37 @@ fn a_host_round_trips_byte_identically_in_every_configuration() {
                 store.put_host(&host).expect("stored");
                 let back = store.host(host.id).expect("loads").expect("present");
                 assert_eq!(back, host, "{os}/{arch}/{mode} did not round-trip");
+                assert_eq!(
+                    back.runner_root_override, None,
+                    "a host nobody configured is on the platform default"
+                );
             }
         }
     }
 
     assert_eq!(store.hosts().expect("loads").len(), 3 * 3 * 2);
+
+    // And the same host once an operator has moved its runner root. Both
+    // directions are exercised, because `host reset-runtime-root` writes the
+    // second one and a column that only ever gained a value would pass a test
+    // that only ever set one.
+    let configured = a_root("rman");
+    let mut host = fixtures::host().id(HostId::from_u128(0x1000)).build();
+    host.runner_root_override = Some(configured.clone());
+    store.put_host(&host).expect("stored");
+    let back = store.host(host.id).expect("loads").expect("present");
+    assert_eq!(back, host, "a configured runner root did not round-trip");
+    assert_eq!(back.runner_root_override, Some(configured));
+    assert!(back.has_configured_runner_root());
+
+    host.runner_root_override = None;
+    store.put_host(&host).expect("stored");
+    let back = store.host(host.id).expect("loads").expect("present");
+    assert_eq!(
+        back.runner_root_override, None,
+        "resetting to the platform default must clear the column, not keep a \
+         stale path the effective-path display would then contradict"
+    );
 }
 
 #[test]
@@ -171,6 +214,23 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
             policy.authentication_failed().expect("any state may");
             policy
         }),
+        // D4. The persistent root is a *configuration* and has to survive
+        // storage as exactly the value the operator set: a root that came back
+        // subtly different would send `c2` to build `sN` somewhere else.
+        ("a repository policy that retains its job workspace", {
+            let mut policy = fixtures::policy()
+                .id(PolicyId::from_u128(9))
+                .repository("o/persistent")
+                .active()
+                .build();
+            policy
+                .set_workspace_policy(
+                    WorkspacePolicy::persistent(a_root("workspaces"), TargetScope::Repository)
+                        .expect("a repository may"),
+                )
+                .expect("a repository may");
+            policy
+        }),
     ];
 
     for (label, policy) in &cases {
@@ -189,7 +249,7 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
     assert_eq!(loaded.len(), cases.len());
     assert_eq!(
         loaded.iter().filter(|p| p.owns_runners()).count(),
-        6,
+        7,
         "the monitor-only/autoscale split must survive storage"
     );
     assert_eq!(
@@ -206,6 +266,130 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
             .any(|p| p.state() == PolicyState::RepairRequired),
         "a repair_required policy must be loadable, which is this task's Goal"
     );
+    assert_eq!(
+        loaded
+            .iter()
+            .filter(|p| p.workspace_policy().retains_job_workspace())
+            .count(),
+        1,
+        "exactly the one persistent policy retains its workspace; every other \
+         policy above was built by a constructor and D3 keeps those ephemeral"
+    );
+}
+
+#[test]
+fn every_persistent_attempt_state_round_trips_and_keeps_its_lease() {
+    // The journal is the only authority on which slot leases exist (invariant
+    // 6), so the leased slot has to survive storage in every state an attempt
+    // can be in — including the terminal ones, where a lost slot would let a
+    // second attempt materialise into a directory the first has not finished
+    // with.
+    let store = SqliteStore::open_in_memory().expect("in-memory");
+    let clock = FakeClock::default();
+
+    for (index, state) in AttemptState::ALL.into_iter().enumerate() {
+        // One slot each: two uncleaned attempts on one slot is precisely what
+        // the partial unique index refuses, and that refusal has its own test.
+        let slot = u16::try_from(index + 1).expect("nine slots fit");
+        let attempt = fixtures::attempt()
+            .id(AttemptId::from_u128(0x300 + index as u128))
+            .state(state)
+            .persistent_slot(slot)
+            .runtime_path(format!("workspaces/s{slot}"))
+            .entered_state_at(clock.now() + Elapsed::seconds(index as i64))
+            .build();
+        store.record_attempt(&attempt).expect("journalled");
+
+        let back = store
+            .attempt(attempt.id)
+            .expect("loads")
+            .expect("present after a write");
+        assert_eq!(back, attempt, "a persistent {state} did not round-trip");
+        assert_eq!(
+            back.workspace(),
+            AttemptWorkspace::persistent_slot(NonZeroU16::new(slot).expect("positive")),
+        );
+        assert_eq!(
+            back.holds_slot_lease(),
+            state != AttemptState::Cleaned,
+            "{state}: every uncleaned persistent attempt is a lease, and a \
+             cleaned one is not"
+        );
+    }
+
+    let leases = store
+        .slot_leases_for_policy(fixtures::POLICY_ID)
+        .expect("loads");
+    assert_eq!(
+        leases.len(),
+        AttemptState::ALL.len() - 1,
+        "every state but `cleaned` still holds its slot"
+    );
+    assert!(
+        leases.iter().all(|attempt| attempt.holds_slot_lease()),
+        "the lease query and the domain predicate must agree"
+    );
+    assert!(
+        store
+            .uncleaned_ephemeral_attempts()
+            .expect("loads")
+            .is_empty(),
+        "and none of them is an ephemeral attempt"
+    );
+}
+
+#[test]
+fn a_second_uncleaned_attempt_cannot_take_a_leased_slot_across_two_connections() {
+    // The index is a property of the rows, not of a process, so it holds where
+    // the in-process allocation lock cannot: a second connection — a second
+    // `runner-manager` invocation — writing the same lease.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = database(dir.path());
+    let first = SqliteStore::open(&path).expect("opens");
+    let second = SqliteStore::open(&path).expect("opens again");
+
+    let held = fixtures::attempt()
+        .id(AttemptId::from_u128(0x401))
+        .state(AttemptState::Busy)
+        .persistent_slot(1)
+        .build();
+    first.record_attempt(&held).expect("the lease is taken");
+
+    let contender = fixtures::attempt()
+        .id(AttemptId::from_u128(0x402))
+        .persistent_slot(1)
+        .build();
+    let error = second
+        .record_attempt(&contender)
+        .expect_err("the other process must not take the same slot");
+    assert!(
+        matches!(error, StoreError::SlotAlreadyLeased { slot: 1, .. }),
+        "expected SlotAlreadyLeased, got {error:?}"
+    );
+    assert!(
+        error.is_conflict(),
+        "an allocator that lost the race picks another slot"
+    );
+    assert!(
+        second.attempt(contender.id).expect("loads").is_none(),
+        "the refused write left nothing behind"
+    );
+
+    // The lease survives the process that took it, which is the restart case.
+    abandon(first);
+    let reopened = SqliteStore::open(&path).expect("reopens after an unclean stop");
+    assert_eq!(
+        reopened
+            .slot_leases_for_policy(held.policy_id)
+            .expect("loads")
+            .len(),
+        1,
+        "a journalled lease is still a lease after a restart"
+    );
+    assert!(matches!(
+        reopened.record_attempt(&contender),
+        Err(StoreError::SlotAlreadyLeased { slot: 1, .. })
+    ));
 }
 
 #[test]
@@ -719,7 +903,13 @@ fn no_fixture_database_or_its_dump_holds_a_token_shaped_value() {
     let dump = {
         let store = SqliteStore::open(&path).expect("opens");
 
-        store.put_host(&fixtures::host().build()).expect("stored");
+        // The host carries a configured runner root, so the scan passes over
+        // `hosts.runner_root_override` rather than over a NULL. A path is not a
+        // credential, and this is where that claim is checked instead of merely
+        // documented.
+        let mut configured = fixtures::host().build();
+        configured.runner_root_override = Some(a_root("rman"));
+        store.put_host(&configured).expect("stored");
         store
             .put_host(
                 &Host::new(
@@ -748,6 +938,20 @@ fn no_fixture_database_or_its_dump_holds_a_token_shaped_value() {
                 .id(PolicyId::from_u128(3))
                 .monitor_only()
                 .build(),
+            {
+                let mut persistent = fixtures::policy()
+                    .id(PolicyId::from_u128(4))
+                    .repository("o/persistent")
+                    .active()
+                    .build();
+                persistent
+                    .set_workspace_policy(
+                        WorkspacePolicy::persistent(a_root("workspaces"), TargetScope::Repository)
+                            .expect("a repository may"),
+                    )
+                    .expect("a repository may");
+                persistent
+            },
         ]
         .into_iter()
         .enumerate()
@@ -766,6 +970,19 @@ fn no_fixture_database_or_its_dump_holds_a_token_shaped_value() {
                 .entered_state_at(clock.now())
                 .build();
             store.record_attempt(&attempt).expect("journalled");
+
+            // The same states again as persistent slot leases, one slot each,
+            // so `attempts.workspace_mode` and `attempts.workspace_slot` are
+            // populated for the scan rather than left NULL.
+            let slot = u16::try_from(index + 1).expect("nine slots fit");
+            let leased = fixtures::attempt()
+                .id(AttemptId::from_u128(0x700 + index as u128))
+                .state(state)
+                .persistent_slot(slot)
+                .runtime_path(format!("workspaces/s{slot}"))
+                .entered_state_at(clock.now())
+                .build();
+            store.record_attempt(&leased).expect("journalled");
         }
 
         let dump = store.dump_text().expect("dumpable");

@@ -75,8 +75,9 @@ use crate::model::{
     Arch, AttemptId, CachePolicy, Clock, Host, HostId, HostLabel, Os, PolicyId, RefreshInterval,
     ScaleTarget, StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
 };
+use crate::path::LocalAbsolutePath;
 use crate::policy::{PersistedPolicy, PolicyError, PolicyState, RoutingLabels, ScalePolicy};
-use crate::workspace::WorkspaceKind;
+use crate::workspace::{WorkspaceError, WorkspaceKind};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -158,6 +159,72 @@ pub enum StoreError {
         found: u16,
     },
 
+    /// A host runner-root write was built from an override that is no longer
+    /// the stored one. **Nothing was written.**
+    ///
+    /// This is the host counterpart of [`StoreError::StaleRevision`], and it
+    /// exists because `hosts` carries no revision column: `03-migration-rollout`
+    /// requires the host mutation to compare "the expected old override" and
+    /// update *only* that column, so that a capacity or service-mode change made
+    /// between the operator's read and this write is not silently rolled back by
+    /// a whole-record [`Store::put_host`].
+    ///
+    /// Both paths are rendered rather than optional, so a message reads the same
+    /// way whichever direction the change went: an unset override is "the
+    /// platform default".
+    #[error(
+        "host {id} was written against runner root {expected}, but the stored \
+         override is now {found}; another process changed it first and nothing \
+         was written"
+    )]
+    RunnerRootChanged {
+        id: HostId,
+        expected: String,
+        found: String,
+    },
+
+    /// Uncleaned attempts changed after an operator observed the count a path
+    /// mutation was refused or permitted on. **Nothing was written.**
+    ///
+    /// Distinct from [`StoreError::ActiveCountChanged`], and the difference is
+    /// the whole point of the variant. *Active* excludes a terminal attempt;
+    /// *uncleaned* includes one, because a `finished` attempt whose cleanup has
+    /// not run still owns the directory under the root being moved, and a
+    /// persistent one still holds its slot lease
+    /// (`04-security-recovery.md`: "A host root setting cannot change while any
+    /// ephemeral attempt is active or unresolved").
+    ///
+    /// `subject` names the host or policy the count was taken for, already
+    /// rendered, because the two callers count different sets and an operator
+    /// reading the message needs to know which.
+    #[error(
+        "{subject} was confirmed with {expected} uncleaned attempt(s), but now \
+         has {found}; nothing was written"
+    )]
+    UncleanedCountChanged {
+        subject: String,
+        expected: u16,
+        found: u16,
+    },
+
+    /// Two uncleaned persistent attempts cannot hold one slot.
+    ///
+    /// Raised when a journal write collides with the partial unique index
+    /// `one_uncleaned_persistent_attempt_per_slot`. The allocation lock in `c2`
+    /// coordinates slot *selection*; this is the durable guard that catches the
+    /// race the lock cannot see — a second process, or a restart that lost the
+    /// lock — and `04-security-recovery.md` names it as the control for "two
+    /// attempts use one slot concurrently".
+    ///
+    /// **Nothing was written**: the statement is a single INSERT, so SQLite
+    /// rolls it back whole and the existing lease is untouched.
+    #[error(
+        "policy {policy} already holds an uncleaned attempt in persistent slot \
+         s{slot}; one slot is leased to at most one uncleaned attempt and \
+         nothing was written"
+    )]
+    SlotAlreadyLeased { policy: PolicyId, slot: u16 },
+
     /// The row a write was aimed at is not there.
     #[error("no {what} with id {id} is in the database")]
     NotFound { what: &'static str, id: String },
@@ -191,6 +258,23 @@ pub enum StoreError {
         id: HostId,
         #[source]
         source: ValidationError,
+    },
+
+    /// A stored host's configured runner root is not a shape this product will
+    /// place a runner under.
+    ///
+    /// Separate from [`StoreError::CorruptHost`] because the source error is a
+    /// different vocabulary: `hosts.runner_root_override` is re-parsed through
+    /// [`LocalAbsolutePath::new`], so a hand-edited `\\nas\builds`, a relative
+    /// path, a bare drive root, or a Windows path in a database opened on Linux
+    /// fails closed here with the reason attached (D10). A path is not a
+    /// credential — see `crates/domain/src/path.rs` — so the offending text may
+    /// travel in the message, which is what makes the refusal actionable.
+    #[error("the stored host {id} has an unusable configured runner root: {source}")]
+    CorruptHostWorkspace {
+        id: HostId,
+        #[source]
+        source: WorkspaceError,
     },
 
     /// One column holds something that is not the kind of value it is declared
@@ -251,11 +335,22 @@ impl StoreError {
     /// and the caller can distinguish it from an I/O error". This is that
     /// distinction, exposed so a caller need not match on the variant shape to
     /// make it.
+    ///
+    /// The three fences the workspace mutations add are conflicts on exactly the
+    /// same footing: each means "someone else got there first, re-read and try
+    /// again", and none of them means the database is unwell.
+    /// [`StoreError::SlotAlreadyLeased`] is included because that is what an
+    /// allocator that lost a race to a slot must do — pick another one — rather
+    /// than surface an I/O failure to an operator.
     #[must_use]
     pub const fn is_conflict(&self) -> bool {
         matches!(
             self,
-            StoreError::StaleRevision { .. } | StoreError::ActiveCountChanged { .. }
+            StoreError::StaleRevision { .. }
+                | StoreError::ActiveCountChanged { .. }
+                | StoreError::RunnerRootChanged { .. }
+                | StoreError::UncleanedCountChanged { .. }
+                | StoreError::SlotAlreadyLeased { .. }
         )
     }
 }
@@ -274,14 +369,14 @@ struct Migration {
 
 /// The ordered, forward-only migration chain.
 ///
-/// **There is exactly one entry today, and that is a fact about the product's
-/// age rather than about this mechanism.** Nothing has shipped, so no database
-/// exists at an older shape and there is no second step to write; splitting the
-/// initial schema in two so the chain "looks like" a chain would be ceremony
-/// that tests nothing. The runner, [`apply_migrations`], is written and tested as
-/// a general one: its multi-step behaviour is exercised against a synthetic chain
-/// in `tests::a_database_one_version_behind_gets_only_the_missing_step`, which is
-/// the honest way to test a property the production chain cannot yet exhibit.
+/// The runner, [`apply_migrations`], is a general one: its step-skipping
+/// behaviour is exercised against a synthetic chain in
+/// `tests::a_database_one_version_behind_gets_only_the_missing_step`, and
+/// against the production chain itself in
+/// `tests::a_version_one_database_migrates_through_the_whole_chain` and
+/// `tests::a_version_two_database_migrates_every_row_to_ephemeral`, which stop
+/// at `&MIGRATIONS[..1]` / `&MIGRATIONS[..2]`, write rows at that older shape,
+/// and then reopen through [`SqliteStore::open`].
 ///
 /// Adding a step means adding a numbered `.sql` file beside this module and one
 /// entry here. It never means editing an applied file; see the header of
@@ -297,6 +392,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "policy_host_label",
         sql: include_str!("store/migrations/0002_policy_host_label.sql"),
     },
+    Migration {
+        version: 3,
+        name: "workspace_locations",
+        sql: include_str!("store/migrations/0003_workspace_locations.sql"),
+    },
 ];
 
 /// The schema version this build writes and understands.
@@ -304,7 +404,7 @@ const MIGRATIONS: &[Migration] = &[
 /// A database above this is refused with [`StoreError::SchemaTooNew`]; a database
 /// below it is migrated up on open. Both directions are decided from the
 /// `schema_migrations` table, which records every applied step and when.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Created outside the numbered chain, because the chain needs somewhere to
 /// record itself before its first step runs.
@@ -419,6 +519,47 @@ pub trait Store: fmt::Debug + Send + Sync {
     /// As [`Store::host`].
     fn hosts(&self) -> Result<Vec<Host>, StoreError>;
 
+    /// Move the configured runner root, and **only** that column, while both the
+    /// override the caller read and the uncleaned ephemeral count it observed
+    /// still hold.
+    ///
+    /// `expected` is the override the caller **read**, and `new_root` the one it
+    /// wants stored; `None` on either side means "the platform default". A
+    /// mutation from and to the same value is a no-op that still runs both
+    /// predicates, which is what makes `host reset-runtime-root` safe to run
+    /// twice.
+    ///
+    /// **Why this is not [`Store::put_host`] with a changed field.**
+    /// `02-target-architecture.md`: "The store exposes a targeted host-root
+    /// mutation rather than writing a stale whole `Host` value. In one SQLite
+    /// transaction it compares the previously read override, confirms the count
+    /// of uncleaned ephemeral attempts, and updates only `runner_root_override`.
+    /// This prevents a simultaneous capacity or service-mode change from being
+    /// overwritten." A whole-record upsert built from a `Host` read seconds ago
+    /// would silently roll back a `host set-capacity` that landed in between,
+    /// and no revision column exists on `hosts` to catch it.
+    ///
+    /// **What is counted.** Every attempt in the journal whose workspace is
+    /// ephemeral and whose state is not `cleaned` — see
+    /// [`Store::uncleaned_ephemeral_attempts`], which is the read a caller uses
+    /// to obtain the number it passes here, so the two cannot disagree about
+    /// the set. Implementations must evaluate both predicates in the same write
+    /// transaction as the update; a separate read followed by a write does not
+    /// satisfy this contract.
+    ///
+    /// # Errors
+    /// [`StoreError::RunnerRootChanged`] when the stored override moved,
+    /// [`StoreError::UncleanedCountChanged`] when the count moved,
+    /// [`StoreError::NotFound`] when the host row is gone. In every case
+    /// nothing is written.
+    fn set_runner_root_override(
+        &self,
+        id: HostId,
+        expected: Option<&LocalAbsolutePath>,
+        new_root: Option<&LocalAbsolutePath>,
+        expected_uncleaned: u16,
+    ) -> Result<(), StoreError>;
+
     /// Add a policy that is not there yet.
     ///
     /// # Errors
@@ -452,6 +593,37 @@ pub trait Store: fmt::Debug + Send + Sync {
         policy: &ScalePolicy,
         expected_revision: u64,
         expected_active: u16,
+    ) -> Result<(), StoreError>;
+
+    /// Atomically update a policy only while its revision and **uncleaned**
+    /// attempt count are exactly the values the caller observed.
+    ///
+    /// The fence `repo set-workspace` needs, and the reason it is not
+    /// [`Store::update_policy_confirming_active_count`]: an attempt that has
+    /// concluded but not yet been cleaned is *not* active, and it is exactly the
+    /// attempt a workspace-path change must be refused behind. It still owns the
+    /// directory under the old root, and if it is persistent it still holds its
+    /// slot lease. `04-security-recovery.md`: "A repository path setting cannot
+    /// change while any attempt for that policy is active **or unresolved**."
+    ///
+    /// `03-migration-rollout.md` states the transaction boundary this
+    /// implements: "The policy store operation compares its revision and
+    /// confirms the uncleaned policy-attempt count. Both checks happen inside
+    /// the same SQLite write transaction as the mutation. The existing
+    /// whole-record `put_host` and active-count-only policy guard are not
+    /// sufficient for these commands." Composing
+    /// [`Store::uncleaned_attempts_for_policy`] and [`Store::update_policy`]
+    /// therefore does not satisfy this contract, even though that read is where
+    /// the caller gets the number it passes here.
+    ///
+    /// # Errors
+    /// [`StoreError::StaleRevision`], [`StoreError::UncleanedCountChanged`], or
+    /// [`StoreError::NotFound`]. In every case nothing is written.
+    fn update_policy_confirming_uncleaned_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_uncleaned: u16,
     ) -> Result<(), StoreError>;
 
     /// Delete a policy, subject to the same revision check as a write.
@@ -513,11 +685,206 @@ pub trait Store: fmt::Debug + Send + Sync {
     /// As [`Store::attempt`].
     fn attempts_for_policy(&self, policy_id: PolicyId) -> Result<Vec<RunnerAttempt>, StoreError>;
 
+    /// The attempts of one policy that still occupy a host capacity slot.
+    ///
+    /// "Active" is [`AttemptState::counts_against_capacity`] — every
+    /// non-terminal state — and this is the narrower of the two questions a
+    /// workspace mutation asks. It is here beside its counterpart so that the
+    /// distinction is visible at the trait rather than reconstructed by each
+    /// caller from [`Store::attempts_for_policy`] and a filter each writes
+    /// slightly differently.
+    ///
+    /// # Errors
+    /// As [`Store::attempt`].
+    fn active_attempts_for_policy(
+        &self,
+        policy_id: PolicyId,
+    ) -> Result<Vec<RunnerAttempt>, StoreError>;
+
+    /// The attempts of one policy that have not been cleaned, oldest first.
+    ///
+    /// A superset of [`Store::active_attempts_for_policy`]: it also holds the
+    /// terminal attempts whose cleanup has not completed. Those are invisible to
+    /// capacity and decisive for a path change, which is the distinction
+    /// `04-security-recovery.md` draws between "active" and "unresolved".
+    ///
+    /// This is the read that produces `expected_uncleaned` for
+    /// [`Store::update_policy_confirming_uncleaned_count`], and `c2`'s allocator
+    /// input: "Load uncleaned attempts for the policy"
+    /// (`02-target-architecture.md`, "Slot allocation").
+    ///
+    /// # Errors
+    /// As [`Store::attempt`].
+    fn uncleaned_attempts_for_policy(
+        &self,
+        policy_id: PolicyId,
+    ) -> Result<Vec<RunnerAttempt>, StoreError>;
+
+    /// The durable slot leases one policy holds, oldest first.
+    ///
+    /// Every uncleaned **persistent** attempt, which is the same set the partial
+    /// unique index `one_uncleaned_persistent_attempt_per_slot` enforces
+    /// uniqueness over. It deliberately includes a terminal attempt whose
+    /// cleanup failed: "Every persistent attempt whose state is not `cleaned` is
+    /// a durable slot lease, including a terminal attempt whose cleanup failed"
+    /// (`02-target-architecture.md`). Every returned attempt therefore answers
+    /// `true` to [`RunnerAttempt::holds_slot_lease`] and carries a slot.
+    ///
+    /// The filesystem is never consulted to answer this. Invariant 6: "Uncleaned
+    /// attempt rows, the database lease constraint, and the allocation lock
+    /// remain authoritative; the filesystem is never scanned to infer ownership
+    /// or capacity."
+    ///
+    /// # Errors
+    /// As [`Store::attempt`].
+    fn slot_leases_for_policy(&self, policy_id: PolicyId)
+    -> Result<Vec<RunnerAttempt>, StoreError>;
+
+    /// Every uncleaned **ephemeral** attempt on this host, oldest first.
+    ///
+    /// The read that produces `expected_uncleaned` for
+    /// [`Store::set_runner_root_override`], and the reason it is host-wide
+    /// rather than per-policy: these attempts are the ones whose directories sit
+    /// under the host runner root, and an attempt that outlived its policy row
+    /// still owns one (see the note on `attempts.policy_id` in the schema). A
+    /// count scoped to the policies of one host would drop exactly those, and
+    /// `04-security-recovery.md` requires unknown-policy attempts to keep their
+    /// fail-closed ownership behaviour rather than to become invisible.
+    ///
+    /// # Errors
+    /// As [`Store::attempt`].
+    fn uncleaned_ephemeral_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError>;
+
     /// Forget one attempt. Returns whether a row was removed.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] on an I/O failure.
     fn remove_attempt(&self, id: AttemptId) -> Result<bool, StoreError>;
+}
+
+// ---------------------------------------------------------------------------
+// Attempt sets
+// ---------------------------------------------------------------------------
+//
+// Four questions are asked of the `attempts` table by the mutations and queries
+// above, and three of them are new. Their `WHERE` fragments are built here, from
+// the domain's own predicates and the domain's own serde tokens, rather than
+// written out at each call site.
+//
+// **Why derived rather than spelled.** The active-set fragment used to be the
+// literal `state IN ('allocated', 'jit_received', 'starting', 'idle', 'busy')`,
+// written twice in one function. That is a copy of
+// `AttemptState::counts_against_capacity` maintained by hand: a tenth attempt
+// state added to the domain would be counted by the formula in `capacity` and
+// silently *not* counted by this fence, and no test that does not already know
+// to look would say so. Deriving it means the domain decides once, and
+// `tests::the_attempt_set_predicates_follow_the_domain` asserts the two agree
+// state by state.
+
+/// `WHERE`-fragment for the attempts that still occupy a capacity slot.
+fn active_sql() -> String {
+    let states = AttemptState::ALL
+        .into_iter()
+        .filter(|state| state.counts_against_capacity())
+        .map(|state| format!("'{}'", token(&state)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("state IN ({states})")
+}
+
+/// `WHERE`-fragment for the attempts whose cleanup has not completed.
+///
+/// Deliberately `<> 'cleaned'` and not "is not terminal": a `finished` attempt
+/// that has not been cleaned still owns its directory and, when persistent, its
+/// slot lease.
+fn uncleaned_sql() -> String {
+    format!("state <> '{}'", token(&AttemptState::Cleaned))
+}
+
+/// `WHERE`-fragment for the uncleaned attempts of one workspace kind.
+fn uncleaned_of_kind_sql(kind: WorkspaceKind) -> String {
+    format!(
+        "workspace_mode = '{}' AND {}",
+        token(&kind),
+        uncleaned_sql()
+    )
+}
+
+/// The ceiling every guarded attempt count saturates at, on both sides.
+///
+/// Named once because it is stated twice in two notations — as an integer
+/// literal inside SQL by [`attempt_count_sql`], and as a Rust narrowing by
+/// [`clamped_count`] — and the fences are only sound while the two agree.
+const ATTEMPT_COUNT_CEILING: u16 = u16::MAX;
+
+/// The scalar sub-select counting the attempts matching `predicate`.
+///
+/// Clamped to [`ATTEMPT_COUNT_CEILING`] in SQL so the comparison against the
+/// caller's `u16` is representable on both sides rather than wrapping: a journal
+/// holding more than 65 535 uncleaned attempts for one subject reports the
+/// ceiling, which is the same figure the diagnosis reports and the same one a
+/// caller's own saturating count would produce. The clamp is therefore a
+/// saturation, not a fence in its own right — at the ceiling the two sides can
+/// still agree — and it is chosen deliberately, because the alternative is a
+/// refusal whose message reads "expected 65535, but now has 65535". Nothing in
+/// this product creates 65 535 concurrent attempts for one policy; host capacity
+/// is a `NonZeroU16` bound checked long before here.
+fn attempt_count_sql(predicate: &str) -> String {
+    format!("SELECT MIN(COUNT(*), {ATTEMPT_COUNT_CEILING}) FROM attempts WHERE {predicate}")
+}
+
+/// The narrowing partner of [`attempt_count_sql`]'s clamp.
+///
+/// The sub-select already saturates, so the `unwrap_or` is unreachable for any
+/// value SQLite can return through it; it is spelled out rather than
+/// `expect`-ed so that a future caller counting through some other statement
+/// still saturates instead of panicking.
+fn clamped_count(found: i64) -> u16 {
+    u16::try_from(found).unwrap_or(ATTEMPT_COUNT_CEILING)
+}
+
+/// Which set of attempts a guarded policy write counts.
+///
+/// A closed enum rather than a `&str` argument, so the SQL a caller can reach is
+/// one of two constants built here and never text a caller supplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountedAttempts {
+    /// Still occupying a capacity slot — the fence `set-scale --enabled false`
+    /// needs.
+    Active,
+    /// Not yet cleaned, terminal or otherwise — the fence `repo set-workspace`
+    /// needs.
+    Uncleaned,
+}
+
+impl CountedAttempts {
+    /// The scalar sub-select counting this set for the policy bound as `:id`.
+    ///
+    /// Scoped to one policy; [`attempt_count_sql`] owns the statement shape and
+    /// the saturation contract it shares with the host-wide fence.
+    fn count_sql(self) -> String {
+        let predicate = match self {
+            CountedAttempts::Active => active_sql(),
+            CountedAttempts::Uncleaned => uncleaned_sql(),
+        };
+        attempt_count_sql(&format!("policy_id = :id AND {predicate}"))
+    }
+
+    /// The conflict this set reports when the count moved under the write.
+    fn count_changed(self, id: PolicyId, expected: u16, found: u16) -> StoreError {
+        match self {
+            CountedAttempts::Active => StoreError::ActiveCountChanged {
+                id,
+                expected,
+                found,
+            },
+            CountedAttempts::Uncleaned => StoreError::UncleanedCountChanged {
+                subject: format!("policy {id}"),
+                expected,
+                found,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,14 +1195,41 @@ impl SqliteStore {
         expected_active: u16,
         after_write_fence: impl FnOnce(),
     ) -> Result<(), StoreError> {
+        self.update_policy_confirming_count_with(
+            policy,
+            expected_revision,
+            expected_active,
+            CountedAttempts::Active,
+            after_write_fence,
+        )
+    }
+
+    /// The shared body of both guarded policy writes.
+    ///
+    /// The two differ in one thing — which attempts they count — and everything
+    /// else about them has to be identical: the same column list, the same
+    /// IMMEDIATE fence, the same "diagnose only after the write matched nothing"
+    /// ordering. Written twice they would drift, and the drift would be
+    /// invisible until a column added to one UPDATE went missing from the other.
+    /// [`CountedAttempts`] carries the only difference, as a closed enum whose
+    /// two SQL fragments are constants rather than caller-supplied text.
+    fn update_policy_confirming_count_with(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_count: u16,
+        counted: CountedAttempts,
+        after_write_fence: impl FnOnce(),
+    ) -> Result<(), StoreError> {
         let fields = policy.to_persisted();
         let mut params = policy_params(&fields)?;
         params.push((
             ":expected_revision",
             int(u64_to_sql("the expected revision", expected_revision)?),
         ));
-        params.push((":expected_active", int(i64::from(expected_active))));
+        params.push((":expected_count", int(i64::from(expected_count))));
 
+        let count_sql = counted.count_sql();
         let mut conn = self.lock();
         // IMMEDIATE fences every attempt insert/update/delete on every other
         // connection before the count predicate is evaluated. The count and
@@ -844,26 +1238,26 @@ impl SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         after_write_fence();
         let changed = tx.execute(
-            "UPDATE policies SET
-                 target_scope    = :target_scope,
-                 target_slug     = :target_slug,
-                 installation_id = :installation_id,
-                 host_id         = :host_id,
-                 requested_host_label = :requested_host_label,
-                 routing_labels  = :routing_labels,
-                 min_capacity    = :min_capacity,
-                 max_capacity    = :max_capacity,
-                 enabled         = :enabled,
-                 state           = :state,
-                 cache_policy    = :cache_policy,
-                 revision        = :revision
-             WHERE id = :id
-               AND revision = :expected_revision
-               AND :expected_active = (
-                   SELECT MIN(COUNT(*), 65535) FROM attempts
-                    WHERE policy_id = :id
-                      AND state IN ('allocated', 'jit_received', 'starting', 'idle', 'busy')
-               )",
+            &format!(
+                "UPDATE policies SET
+                     target_scope    = :target_scope,
+                     target_slug     = :target_slug,
+                     installation_id = :installation_id,
+                     host_id         = :host_id,
+                     requested_host_label = :requested_host_label,
+                     routing_labels  = :routing_labels,
+                     min_capacity    = :min_capacity,
+                     max_capacity    = :max_capacity,
+                     enabled         = :enabled,
+                     state           = :state,
+                     cache_policy    = :cache_policy,
+                     workspace_mode  = :workspace_mode,
+                     workspace_path  = :workspace_path,
+                     revision        = :revision
+                 WHERE id = :id
+                   AND revision = :expected_revision
+                   AND :expected_count = ({count_sql})"
+            ),
             &bind(&params)[..],
         )?;
         if changed == 0 {
@@ -873,18 +1267,15 @@ impl SqliteStore {
                     expected, found, ..
                 } if expected == found => {
                     let found: i64 = tx.query_row(
-                        "SELECT MIN(COUNT(*), 65535) FROM attempts
-                          WHERE policy_id = :id
-                            AND state IN ('allocated', 'jit_received', 'starting', 'idle', 'busy')",
+                        &count_sql,
                         named_params! { ":id": uuid_text(fields.id.as_uuid()) },
                         |row| row.get(0),
                     )?;
-                    let found = u16::try_from(found).unwrap_or(u16::MAX);
-                    return Err(StoreError::ActiveCountChanged {
-                        id: fields.id,
-                        expected: expected_active,
-                        found,
-                    });
+                    return Err(counted.count_changed(
+                        fields.id,
+                        expected_count,
+                        clamped_count(found),
+                    ));
                 }
                 other => return Err(other),
             }
@@ -899,6 +1290,49 @@ impl SqliteStore {
         RunnerAttempt::from_persisted(fields)
             .map_err(|source| StoreError::CorruptAttempt { id, source })
     }
+
+    /// Every attempt satisfying `predicate`, oldest first.
+    ///
+    /// The four attempt queries differ only in their `WHERE` fragment and their
+    /// bindings; sharing the body is what keeps them agreeing on the ordering
+    /// and, more importantly, on going through [`Self::attempt_from_row`] — a
+    /// query that decoded a row itself would skip the clock-skew repair and the
+    /// load-time revalidation every other read applies.
+    fn attempts_where(
+        &self,
+        predicate: &str,
+        params: &[(&str, &dyn ToSql)],
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM attempts WHERE {predicate} ORDER BY created_at, id"
+        ))?;
+        let mut rows = stmt.query(params)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(self.attempt_from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Every attempt of one policy also satisfying `and`, oldest first.
+    ///
+    /// The binding is the part the four per-policy queries must not restate:
+    /// the parameter name and the `&dyn ToSql` cast have to agree across all of
+    /// them, and the only thing that actually varies between them is the
+    /// fragment `and` supplies.
+    fn attempts_of_policy(
+        &self,
+        policy_id: PolicyId,
+        and: Option<&str>,
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        let id = uuid_text(policy_id.as_uuid());
+        let predicate = and.map_or_else(
+            || "policy_id = :policy_id".to_string(),
+            |and| format!("policy_id = :policy_id AND {and}"),
+        );
+        self.attempts_where(&predicate, &[(":policy_id", &id as &dyn ToSql)])
+    }
 }
 
 impl Store for SqliteStore {
@@ -907,10 +1341,12 @@ impl Store for SqliteStore {
         conn.execute(
             "INSERT INTO hosts (
                  id, display_name, os, architecture, host_capacity,
-                 service_start_mode, refresh_interval_secs, created_at
+                 service_start_mode, refresh_interval_secs, runner_root_override,
+                 created_at
              ) VALUES (
                  :id, :display_name, :os, :architecture, :host_capacity,
-                 :service_start_mode, :refresh_interval_secs, :created_at
+                 :service_start_mode, :refresh_interval_secs, :runner_root_override,
+                 :created_at
              )
              ON CONFLICT(id) DO UPDATE SET
                  display_name          = excluded.display_name,
@@ -919,6 +1355,7 @@ impl Store for SqliteStore {
                  host_capacity         = excluded.host_capacity,
                  service_start_mode    = excluded.service_start_mode,
                  refresh_interval_secs = excluded.refresh_interval_secs,
+                 runner_root_override  = excluded.runner_root_override,
                  created_at            = excluded.created_at",
             // `created_at` **is** in this DO UPDATE list, and `record_attempt`
             // deliberately leaves it out of its own. The asymmetry is intended
@@ -939,6 +1376,15 @@ impl Store for SqliteStore {
             // `a_host_round_trips_byte_identically_in_every_configuration`
             // asserts. Excluding it would silently discard a correction an
             // operator made on purpose.
+            //
+            // `runner_root_override` is written here for the same reason —
+            // this is a whole-record upsert and the row must equal the `Host` it
+            // was handed — and that is precisely why it is *not* how `host
+            // set-runtime-root` writes. A caller that read a `Host`, changed the
+            // override on it and called this would also write back the capacity
+            // and service mode it read, rolling back anything that changed in
+            // between. `Store::set_runner_root_override` is the targeted,
+            // fenced mutation for that command.
             named_params! {
                 ":id": uuid_text(host.id.as_uuid()),
                 ":display_name": host.display_name.as_str(),
@@ -947,6 +1393,10 @@ impl Store for SqliteStore {
                 ":host_capacity": i64::from(host.host_capacity.get()),
                 ":service_start_mode": token(&host.service_start_mode),
                 ":refresh_interval_secs": i64::from(host.refresh_interval.as_secs()),
+                ":runner_root_override": host
+                    .runner_root_override
+                    .as_ref()
+                    .map(LocalAbsolutePath::as_str),
                 ":created_at": timestamp_to_text(host.created_at),
             },
         )?;
@@ -974,6 +1424,81 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn set_runner_root_override(
+        &self,
+        id: HostId,
+        expected: Option<&LocalAbsolutePath>,
+        new_root: Option<&LocalAbsolutePath>,
+        expected_uncleaned: u16,
+    ) -> Result<(), StoreError> {
+        // Host-wide, not scoped to this host's policies: see the contract note
+        // on `Store::uncleaned_ephemeral_attempts` for why an attempt that
+        // outlived its policy row still has to count.
+        let count_sql = attempt_count_sql(&uncleaned_of_kind_sql(WorkspaceKind::Ephemeral));
+
+        let mut conn = self.lock();
+        // IMMEDIATE for the reason `update_policy` gives: the diagnosis below
+        // reads inside this transaction, so the write lock is taken up front
+        // rather than being upgraded mid-transaction into a `SQLITE_BUSY` the
+        // busy handler refuses to retry. It is also what fences a concurrent
+        // attempt write out of the count predicate.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // `IS` rather than `=`: the override is NULL for every host that has
+        // never been configured, and `NULL = NULL` is NULL, so `=` would refuse
+        // the most ordinary mutation there is -- the first `host
+        // set-runtime-root` on a fresh install.
+        let changed = tx.execute(
+            &format!(
+                "UPDATE hosts SET runner_root_override = :new_root
+                  WHERE id = :id
+                    AND runner_root_override IS :expected
+                    AND :expected_uncleaned = ({count_sql})"
+            ),
+            named_params! {
+                ":id": uuid_text(id.as_uuid()),
+                ":new_root": new_root.map(LocalAbsolutePath::as_str),
+                ":expected": expected.map(LocalAbsolutePath::as_str),
+                ":expected_uncleaned": i64::from(expected_uncleaned),
+            },
+        )?;
+        if changed == 0 {
+            // The transaction is dropped, and therefore rolled back, on return.
+            let stored: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT runner_root_override FROM hosts WHERE id = :id",
+                    named_params! { ":id": uuid_text(id.as_uuid()) },
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(stored) = stored else {
+                return Err(StoreError::NotFound {
+                    what: "host",
+                    id: id.to_string(),
+                });
+            };
+            // The override is compared first, so that when both moved the
+            // operator is told about the one that names a directory. The stored
+            // text is echoed as it is rather than re-parsed: a row this build
+            // would refuse to load is exactly the row whose value the message
+            // has to show.
+            if stored.as_deref() != expected.map(LocalAbsolutePath::as_str) {
+                return Err(StoreError::RunnerRootChanged {
+                    id,
+                    expected: render_root(expected.map(LocalAbsolutePath::as_str)),
+                    found: render_root(stored.as_deref()),
+                });
+            }
+            let found: i64 = tx.query_row(&count_sql, [], |row| row.get(0))?;
+            return Err(StoreError::UncleanedCountChanged {
+                subject: format!("host {id}"),
+                expected: expected_uncleaned,
+                found: clamped_count(found),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
         let fields = policy.to_persisted();
         let params = policy_params(&fields)?;
@@ -982,11 +1507,11 @@ impl Store for SqliteStore {
             "INSERT INTO policies (
                  id, target_scope, target_slug, installation_id, host_id,
                  requested_host_label, routing_labels, min_capacity, max_capacity, enabled, state,
-                 cache_policy, revision
+                 cache_policy, workspace_mode, workspace_path, revision
              ) VALUES (
                  :id, :target_scope, :target_slug, :installation_id, :host_id,
                  :requested_host_label, :routing_labels, :min_capacity, :max_capacity, :enabled, :state,
-                 :cache_policy, :revision
+                 :cache_policy, :workspace_mode, :workspace_path, :revision
              )",
             &bind(&params)[..],
         )
@@ -1056,6 +1581,8 @@ impl Store for SqliteStore {
                  enabled         = :enabled,
                  state           = :state,
                  cache_policy    = :cache_policy,
+                 workspace_mode  = :workspace_mode,
+                 workspace_path  = :workspace_path,
                  revision        = :revision
              WHERE id = :id AND revision = :expected_revision",
             &bind(&params)[..],
@@ -1078,6 +1605,21 @@ impl Store for SqliteStore {
             policy,
             expected_revision,
             expected_active,
+            || {},
+        )
+    }
+
+    fn update_policy_confirming_uncleaned_count(
+        &self,
+        policy: &ScalePolicy,
+        expected_revision: u64,
+        expected_uncleaned: u16,
+    ) -> Result<(), StoreError> {
+        self.update_policy_confirming_count_with(
+            policy,
+            expected_revision,
+            expected_uncleaned,
+            CountedAttempts::Uncleaned,
             || {},
         )
     }
@@ -1127,10 +1669,12 @@ impl Store for SqliteStore {
         conn.execute(
             "INSERT INTO attempts (
                  id, policy_id, github_runner_id, state, outcome, process_id,
-                 runtime_path, created_at, terminal_at, last_state_change_at
+                 runtime_path, workspace_mode, workspace_slot,
+                 created_at, terminal_at, last_state_change_at
              ) VALUES (
                  :id, :policy_id, :github_runner_id, :state, :outcome, :process_id,
-                 :runtime_path, :created_at, :terminal_at, :last_state_change_at
+                 :runtime_path, :workspace_mode, :workspace_slot,
+                 :created_at, :terminal_at, :last_state_change_at
              )
              ON CONFLICT(id) DO UPDATE SET
                  policy_id            = excluded.policy_id,
@@ -1146,8 +1690,19 @@ impl Store for SqliteStore {
             // the one that stands and no later journal write can rewrite it.
             // `put_host` above does the opposite with its own `created_at`, and
             // its comment says why the two are not the same case.
+            //
+            // `workspace_mode` and `workspace_slot` are absent for the same
+            // reason and a sharper one. They are the *immutable allocation
+            // fact* -- `02-target-architecture.md`: "The workspace kind and slot
+            // number tell recovery which cleanup algorithm is legal. Neither may
+            // change after allocation" -- and `RunnerAttempt` exposes no
+            // mutator for either. Leaving them out of the update makes that a
+            // property of the journal too, so the row a crash leaves behind
+            // still names the algorithm the directory was created under, and no
+            // later write can move a live lease onto a different slot.
             &bind(&params)[..],
-        )?;
+        )
+        .map_err(|source| slot_lease_error(attempt, source))?;
         Ok(())
     }
 
@@ -1173,17 +1728,35 @@ impl Store for SqliteStore {
     }
 
     fn attempts_for_policy(&self, policy_id: PolicyId) -> Result<Vec<RunnerAttempt>, StoreError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM attempts WHERE policy_id = :policy_id ORDER BY created_at, id",
-        )?;
-        let mut rows =
-            stmt.query(named_params! { ":policy_id": uuid_text(policy_id.as_uuid()) })?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(self.attempt_from_row(row)?);
-        }
-        Ok(out)
+        self.attempts_of_policy(policy_id, None)
+    }
+
+    fn active_attempts_for_policy(
+        &self,
+        policy_id: PolicyId,
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        self.attempts_of_policy(policy_id, Some(&active_sql()))
+    }
+
+    fn uncleaned_attempts_for_policy(
+        &self,
+        policy_id: PolicyId,
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        self.attempts_of_policy(policy_id, Some(&uncleaned_sql()))
+    }
+
+    fn slot_leases_for_policy(
+        &self,
+        policy_id: PolicyId,
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        self.attempts_of_policy(
+            policy_id,
+            Some(&uncleaned_of_kind_sql(WorkspaceKind::Persistent)),
+        )
+    }
+
+    fn uncleaned_ephemeral_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
+        self.attempts_where(&uncleaned_of_kind_sql(WorkspaceKind::Ephemeral), &[])
     }
 
     fn remove_attempt(&self, id: AttemptId) -> Result<bool, StoreError> {
@@ -1260,6 +1833,16 @@ fn policy_params(fields: &PersistedPolicy) -> Result<NamedParams, StoreError> {
         (":enabled", int(i64::from(fields.enabled))),
         (":state", text(token(&fields.state))),
         (":cache_policy", text(token(&fields.cache_policy))),
+        (":workspace_mode", text(token(&fields.workspace_kind))),
+        (
+            ":workspace_path",
+            opt_text(
+                fields
+                    .workspace_root
+                    .as_ref()
+                    .map(|root| root.as_str().to_string()),
+            ),
+        ),
         (
             ":revision",
             int(u64_to_sql("policies.revision", fields.revision)?),
@@ -1292,6 +1875,11 @@ fn attempt_params(fields: &PersistedAttempt) -> Result<NamedParams, StoreError> 
         (":outcome", opt_text(fields.outcome.as_ref().map(json))),
         (":process_id", opt_int(fields.process_id.map(i64::from))),
         (":runtime_path", text(runtime_path)),
+        (":workspace_mode", text(token(&fields.workspace_kind))),
+        (
+            ":workspace_slot",
+            opt_int(fields.workspace_slot.map(i64::from)),
+        ),
         (":created_at", text(timestamp_to_text(fields.created_at))),
         (
             ":terminal_at",
@@ -1328,6 +1916,20 @@ fn host_from_row(row: &Row<'_>) -> Result<Host, StoreError> {
     )?;
     let service_start_mode: StartMode = token_column(row, TABLE, "service_start_mode", &key)?;
     let refresh_interval_secs = u16_column(row, TABLE, "refresh_interval_secs", &key)?;
+    // Re-parsed through the *native* entry point, so a hand-edited UNC share, a
+    // bare drive root, a `..` component, or a Windows path in a database opened
+    // on Linux fails closed here rather than becoming a directory this product
+    // creates runners under (D10). NULL is the ordinary state: it means "use the
+    // platform default", which is resolved at runtime and is deliberately not
+    // stored.
+    let runner_root_override = row
+        .get::<_, Option<String>>("runner_root_override")?
+        .map(LocalAbsolutePath::new)
+        .transpose()
+        .map_err(|source| StoreError::CorruptHostWorkspace {
+            id,
+            source: WorkspaceError::from(source),
+        })?;
     let created_at = timestamp_column(row, TABLE, "created_at", &key)?;
 
     // `Host::new` re-runs the display-name rule and `RefreshInterval::from_secs`
@@ -1345,6 +1947,7 @@ fn host_from_row(row: &Row<'_>) -> Result<Host, StoreError> {
     host.service_start_mode = service_start_mode;
     host.refresh_interval = RefreshInterval::from_secs(refresh_interval_secs)
         .map_err(|source| StoreError::CorruptHost { id, source })?;
+    host.runner_root_override = runner_root_override;
     Ok(host)
 }
 
@@ -1397,11 +2000,22 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
         enabled: bool_column(row, TABLE, "enabled", &key)?,
         state: token_column::<PolicyState>(row, TABLE, "state", &key)?,
         cache_policy: token_column::<CachePolicy>(row, TABLE, "cache_policy", &key)?,
-        // Schema 2 has no workspace columns, so every row loaded by this build
-        // is ephemeral — which is also what `a2`'s migration must produce for
-        // every historical row. It reads them from the schema-3 columns.
-        workspace_kind: WorkspaceKind::Ephemeral,
-        workspace_root: None,
+        // The two columns are read separately and paired by
+        // `WorkspacePolicy::from_persisted` inside `ScalePolicy::from_persisted`
+        // below, which is what refuses persistent-without-path,
+        // ephemeral-with-path, and an organization policy claiming to retain a
+        // workspace (D7). Migration 3 gave every historical row
+        // `'ephemeral'`/NULL, which is the pair that rebuilds as
+        // `WorkspacePolicy::Ephemeral`.
+        workspace_kind: token_column::<WorkspaceKind>(row, TABLE, "workspace_mode", &key)?,
+        workspace_root: row
+            .get::<_, Option<String>>("workspace_path")?
+            .map(LocalAbsolutePath::new)
+            .transpose()
+            .map_err(|source| StoreError::CorruptPolicy {
+                id,
+                source: PolicyError::Workspace(WorkspaceError::from(source)),
+            })?,
         revision: u64_column(row, TABLE, "revision", &key)?,
     };
 
@@ -1423,11 +2037,14 @@ fn persisted_attempt_from_row(row: &Row<'_>) -> Result<PersistedAttempt, StoreEr
         outcome: json_column::<AttemptOutcome>(row, TABLE, "outcome", &key, "an attempt outcome")?,
         process_id: u32_option_column(row, TABLE, "process_id", &key)?,
         runtime_path: PathBuf::from(runtime_path),
-        // As for policies: schema 2 journals no workspace, so every attempt this
-        // build loads is ephemeral and keeps its exact stored path. `a2` reads
-        // the schema-3 columns here.
-        workspace_kind: WorkspaceKind::Ephemeral,
-        workspace_slot: None,
+        // As for policies, the pair is rebuilt by the domain --
+        // `AttemptWorkspace::from_persisted`, called first thing in
+        // `RunnerAttempt::from_persisted` -- because it decides which cleanup
+        // algorithm is legal on `runtime_path`. The slot is read as a raw `u16`
+        // on purpose: a stored `0` is a refusal there rather than an
+        // unrepresentable value that panics here.
+        workspace_kind: token_column::<WorkspaceKind>(row, TABLE, "workspace_mode", &key)?,
+        workspace_slot: u16_option_column(row, TABLE, "workspace_slot", &key)?,
         created_at: timestamp_column(row, TABLE, "created_at", &key)?,
         terminal_at: timestamp_option_column(row, TABLE, "terminal_at", &key)?,
         last_state_change_at: timestamp_column(row, TABLE, "last_state_change_at", &key)?,
@@ -1711,6 +2328,48 @@ fn position_only(raw: &str, error: &serde_json::Error) -> String {
     }
 }
 
+/// How a configured runner root reads in an error message.
+///
+/// `None` is not "nothing"; it is the platform default, resolved at runtime by
+/// `b1`. Rendering it as an empty string or as `None` would make
+/// [`StoreError::RunnerRootChanged`] read as though a value had gone missing,
+/// when what it means is that the host is back on its default.
+fn render_root(value: Option<&str>) -> String {
+    value.map_or_else(|| "the platform default".to_string(), clip)
+}
+
+/// Name a constraint violation on the attempt journal for what it can only be.
+///
+/// `attempts` carries two unique constraints. The primary key is handled by the
+/// statement's own `ON CONFLICT(id) DO UPDATE`, so it cannot surface here; what
+/// is left is `one_uncleaned_persistent_attempt_per_slot`, the partial index
+/// migration 3 adds.
+///
+/// **The decision is made from the value being written, not by parsing SQLite's
+/// message.** An attempt that holds no slot lease cannot violate a partial index
+/// restricted to uncleaned persistent rows, so a constraint failure on one of
+/// those is passed through as an ordinary [`StoreError::Sqlite`] rather than
+/// being mislabelled. Matching on the error string would work today and break
+/// silently the first time SQLite reworded it.
+///
+/// "Which rows the index covers" is asked of [`RunnerAttempt::holds_slot_lease`]
+/// rather than re-derived from the persisted columns. The same predicate is
+/// frozen a third time in the migration's partial `WHERE`, which the forward-only
+/// rule keeps from drifting; these two are the pair that could, so only one of
+/// them decides.
+fn slot_lease_error(attempt: &RunnerAttempt, source: rusqlite::Error) -> StoreError {
+    match (
+        attempt.workspace().slot_number(),
+        is_constraint_violation(&source),
+    ) {
+        (Some(slot), true) if attempt.holds_slot_lease() => StoreError::SlotAlreadyLeased {
+            policy: attempt.policy_id,
+            slot,
+        },
+        _ => StoreError::Sqlite(source),
+    }
+}
+
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -1926,12 +2585,16 @@ mod tests {
     use crate::attempt::FailureReason;
     use crate::model::Label;
     use crate::policy::PolicyMode;
+    use crate::workspace::{AttemptWorkspace, WorkspacePolicy};
 
     // `b1`'s fixture ids, spelled as the UUID text a row holds, so a row written
     // by hand here and a `testkit` fixture in `tests/` describe the same objects.
     const HOST_UUID: &str = "00000000-0000-0000-0000-000000000001";
     const POLICY_UUID: &str = "00000000-0000-0000-0000-000000000010";
     const ATTEMPT_UUID: &str = "00000000-0000-0000-0000-000000000100";
+    /// The `runtime_path` every pre-migration attempt fixture is written with,
+    /// and the one migration 3 must leave exactly as it found it.
+    const HISTORICAL_PATH: &str = "runtime/policy/pre-upgrade-attempt";
     const LABELS_JSON: &str = r#"{"host_label":"rm-home-win-x64","additional":[]}"#;
     const COMPLETED_JOB: &str = r#"{"outcome":"completed_job"}"#;
     static ATTEMPT_WRITE_BLOCKED: AtomicBool = AtomicBool::new(false);
@@ -1976,6 +2639,7 @@ mod tests {
         host_capacity: i64,
         service_start_mode: String,
         refresh_interval_secs: i64,
+        runner_root_override: Option<String>,
         created_at: String,
     }
 
@@ -1989,6 +2653,9 @@ mod tests {
                 host_capacity: 2,
                 service_start_mode: "boot".to_string(),
                 refresh_interval_secs: 60,
+                // D3: a host that has never been configured is on the platform
+                // default, and the default is not stored.
+                runner_root_override: None,
                 created_at: timestamp_to_text(ts(1_000)),
             }
         }
@@ -2001,10 +2668,12 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO hosts (
                          id, display_name, os, architecture, host_capacity,
-                         service_start_mode, refresh_interval_secs, created_at
+                         service_start_mode, refresh_interval_secs,
+                         runner_root_override, created_at
                      ) VALUES (
                          :id, :display_name, :os, :architecture, :host_capacity,
-                         :service_start_mode, :refresh_interval_secs, :created_at
+                         :service_start_mode, :refresh_interval_secs,
+                         :runner_root_override, :created_at
                      )",
                     named_params! {
                         ":id": self.id,
@@ -2014,6 +2683,7 @@ mod tests {
                         ":host_capacity": self.host_capacity,
                         ":service_start_mode": self.service_start_mode,
                         ":refresh_interval_secs": self.refresh_interval_secs,
+                        ":runner_root_override": self.runner_root_override,
                         ":created_at": self.created_at,
                     },
                 )
@@ -2034,6 +2704,8 @@ mod tests {
         enabled: i64,
         state: String,
         cache_policy: String,
+        workspace_mode: String,
+        workspace_path: Option<String>,
         revision: i64,
     }
 
@@ -2051,6 +2723,9 @@ mod tests {
                 enabled: 1,
                 state: "active".to_string(),
                 cache_policy: "retain_runner_package".to_string(),
+                // D3, and what migration 3 gives every historical row.
+                workspace_mode: "ephemeral".to_string(),
+                workspace_path: None,
                 revision: 1,
             }
         }
@@ -2064,11 +2739,11 @@ mod tests {
                     "INSERT OR REPLACE INTO policies (
                          id, target_scope, target_slug, installation_id, host_id,
                          routing_labels, min_capacity, max_capacity, enabled,
-                         state, cache_policy, revision
+                         state, cache_policy, workspace_mode, workspace_path, revision
                      ) VALUES (
                          :id, :target_scope, :target_slug, :installation_id, :host_id,
                          :routing_labels, :min_capacity, :max_capacity, :enabled,
-                         :state, :cache_policy, :revision
+                         :state, :cache_policy, :workspace_mode, :workspace_path, :revision
                      )",
                     named_params! {
                         ":id": self.id,
@@ -2082,6 +2757,8 @@ mod tests {
                         ":enabled": self.enabled,
                         ":state": self.state,
                         ":cache_policy": self.cache_policy,
+                        ":workspace_mode": self.workspace_mode,
+                        ":workspace_path": self.workspace_path,
                         ":revision": self.revision,
                     },
                 )
@@ -2098,6 +2775,8 @@ mod tests {
         outcome: Option<String>,
         process_id: Option<i64>,
         runtime_path: String,
+        workspace_mode: String,
+        workspace_slot: Option<i64>,
         created_at: String,
         terminal_at: Option<String>,
         last_state_change_at: String,
@@ -2113,6 +2792,8 @@ mod tests {
                 outcome: None,
                 process_id: None,
                 runtime_path: "runtime/policy/attempt".to_string(),
+                workspace_mode: "ephemeral".to_string(),
+                workspace_slot: None,
                 created_at: timestamp_to_text(ts(1_000)),
                 terminal_at: None,
                 last_state_change_at: timestamp_to_text(ts(1_000)),
@@ -2127,10 +2808,12 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO attempts (
                          id, policy_id, github_runner_id, state, outcome, process_id,
-                         runtime_path, created_at, terminal_at, last_state_change_at
+                         runtime_path, workspace_mode, workspace_slot,
+                         created_at, terminal_at, last_state_change_at
                      ) VALUES (
                          :id, :policy_id, :github_runner_id, :state, :outcome, :process_id,
-                         :runtime_path, :created_at, :terminal_at, :last_state_change_at
+                         :runtime_path, :workspace_mode, :workspace_slot,
+                         :created_at, :terminal_at, :last_state_change_at
                      )",
                     named_params! {
                         ":id": self.id,
@@ -2140,6 +2823,8 @@ mod tests {
                         ":outcome": self.outcome,
                         ":process_id": self.process_id,
                         ":runtime_path": self.runtime_path,
+                        ":workspace_mode": self.workspace_mode,
+                        ":workspace_slot": self.workspace_slot,
                         ":created_at": self.created_at,
                         ":terminal_at": self.terminal_at,
                         ":last_state_change_at": self.last_state_change_at,
@@ -2147,6 +2832,24 @@ mod tests {
                 )
                 .expect("the raw attempt row is writable");
         }
+    }
+
+    /// A native absolute path with this leaf, for the columns that hold one.
+    ///
+    /// Built per platform rather than written as a literal, because
+    /// `LocalAbsolutePath::new` judges against `PathPlatform::NATIVE`: a Unix
+    /// literal is corrupt state on Windows and vice versa, which is the rule
+    /// under test elsewhere and would be an accident here. The drive letter is
+    /// deliberately not `C:` — nothing in these tests may assume the system
+    /// drive exists or is named (`02-target-architecture.md`, "Windows root
+    /// discovery ... never assumes `C:` in tests or code").
+    fn a_root(leaf: &str) -> LocalAbsolutePath {
+        let raw = if cfg!(windows) {
+            format!("X:\\{leaf}")
+        } else {
+            format!("/{leaf}")
+        };
+        LocalAbsolutePath::new(raw).expect("a fixture root is a storable local path")
     }
 
     // -- the on-disk format -------------------------------------------------
@@ -2241,6 +2944,19 @@ mod tests {
                 match scope {
                     TargetScope::Repository => "repository",
                     TargetScope::Organization => "organization",
+                }
+            );
+        }
+        // `workspace_mode` on two tables, and the literal the partial unique
+        // index in migration 3 filters on. A rename in the domain would leave
+        // every existing lease outside the index that enforces it, so the token
+        // is pinned exactly as the states above are.
+        for kind in [WorkspaceKind::Ephemeral, WorkspaceKind::Persistent] {
+            assert_eq!(
+                token(&kind),
+                match kind {
+                    WorkspaceKind::Ephemeral => "ephemeral",
+                    WorkspaceKind::Persistent => "persistent",
                 }
             );
         }
@@ -2392,6 +3108,150 @@ mod tests {
             })
             .expect("readable");
         assert_eq!(applied, 2, "a step must be recorded exactly once");
+    }
+
+    /// A database stopped at `version`, holding one host, one policy and one
+    /// attempt written at that schema's shape.
+    ///
+    /// The rows are written with plain SQL against the older tables rather than
+    /// through the store, because the store only knows how to write the current
+    /// shape — which is the whole thing these tests need not to be true.
+    fn a_database_at_version(path: &Path, version: u32) {
+        let mut conn = Connection::open(path).expect("openable");
+        let applied = apply_migrations(&mut conn, &MIGRATIONS[..version as usize], &SystemClock)
+            .expect("the older chain applies");
+        assert_eq!(applied, version);
+
+        conn.execute(
+            "INSERT INTO hosts (
+                 id, display_name, os, architecture, host_capacity,
+                 service_start_mode, refresh_interval_secs, created_at
+             ) VALUES (?1, 'home-pc', 'windows', 'x64', 2, 'boot', 60, ?2)",
+            rusqlite::params![HOST_UUID, timestamp_to_text(ts(1_000))],
+        )
+        .expect("a version-1 host row");
+
+        // `requested_host_label` arrived in migration 2, so a version-1 database
+        // must not name it and a version-2 one may. Both spellings are exercised
+        // rather than one, because "the column list an older build wrote" is
+        // exactly what a migration has to cope with.
+        let policy_sql = if version >= 2 {
+            "INSERT INTO policies (
+                 id, target_scope, target_slug, installation_id, host_id,
+                 requested_host_label, routing_labels, min_capacity, max_capacity,
+                 enabled, state, cache_policy, revision
+             ) VALUES (?1, 'repository', 'o/r', 1, ?2, 'host', ?3, 0, 2, 1,
+                       'active', 'retain_runner_package', 1)"
+        } else {
+            "INSERT INTO policies (
+                 id, target_scope, target_slug, installation_id, host_id,
+                 routing_labels, min_capacity, max_capacity,
+                 enabled, state, cache_policy, revision
+             ) VALUES (?1, 'repository', 'o/r', 1, ?2, ?3, 0, 2, 1,
+                       'active', 'retain_runner_package', 1)"
+        };
+        conn.execute(
+            policy_sql,
+            rusqlite::params![POLICY_UUID, HOST_UUID, LABELS_JSON],
+        )
+        .expect("a historical policy row");
+
+        conn.execute(
+            "INSERT INTO attempts (
+                 id, policy_id, state, runtime_path, created_at, last_state_change_at
+             ) VALUES (?1, ?2, 'idle', ?3, ?4, ?4)",
+            rusqlite::params![
+                ATTEMPT_UUID,
+                POLICY_UUID,
+                HISTORICAL_PATH,
+                timestamp_to_text(ts(1_000))
+            ],
+        )
+        .expect("a historical attempt row");
+
+        drop(conn);
+    }
+
+    /// The assertions `03-migration-rollout.md` states for every migrated row,
+    /// whichever version the database started at.
+    fn assert_everything_migrated_to_ephemeral(store: &SqliteStore) {
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+
+        let host = store.host(host_id()).expect("loads").expect("present");
+        assert_eq!(
+            host.runner_root_override, None,
+            "a migrated host is on the platform default; storing the effective \
+             path instead would freeze today's default into every database"
+        );
+        assert!(!host.has_configured_runner_root());
+        // The columns migration 3 did not touch are still what they were, which
+        // is what makes this an upgrade rather than a rewrite.
+        assert_eq!(host.host_capacity.get(), 2);
+        assert_eq!(host.service_start_mode, StartMode::Boot);
+
+        let policy = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(
+            policy.workspace_policy(),
+            &WorkspacePolicy::Ephemeral,
+            "an upgrade must not retain a workspace the operator never selected"
+        );
+        assert_eq!(policy.requested_host_label.as_str(), "host");
+
+        let attempt = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(attempt.workspace(), AttemptWorkspace::Ephemeral);
+        assert!(!attempt.holds_slot_lease());
+        assert_eq!(
+            attempt.runtime_path(),
+            Path::new(HISTORICAL_PATH),
+            "`No journal row is rewritten merely to adopt the new default`: \
+             recovery removes the exact directory the attempt was created in, \
+             so a rewritten path would point cleanup at one it never used"
+        );
+        assert_eq!(attempt.state(), AttemptState::Idle);
+    }
+
+    #[test]
+    fn a_version_one_database_migrates_through_the_whole_chain() {
+        // The oldest shape that exists: no `requested_host_label`, no workspace
+        // columns. Both later steps have to run, in order, on one open.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+        a_database_at_version(&path, 1);
+
+        let store = SqliteStore::open(&path).expect("a version-1 database migrates");
+        assert_everything_migrated_to_ephemeral(&store);
+
+        let conn = store.lock();
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .expect("prepared");
+        let applied: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("queried")
+            .collect::<Result<_, _>>()
+            .expect("collected");
+        assert_eq!(applied, vec![1, 2, 3], "the full chain, in order, once");
+    }
+
+    #[test]
+    fn a_version_two_database_migrates_every_row_to_ephemeral() {
+        // The shape a shipped build actually leaves behind, and the one
+        // `03-migration-rollout.md`'s Phase 0 gate is written against: "Prove
+        // version-2 databases migrate every policy and attempt to ephemeral."
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+        a_database_at_version(&path, 2);
+
+        let store = SqliteStore::open(&path).expect("a version-2 database migrates");
+        assert_everything_migrated_to_ephemeral(&store);
+
+        // Migrating twice is what every subsequent start does.
+        drop(store);
+        let reopened = SqliteStore::open(&path).expect("reopens");
+        assert_everything_migrated_to_ephemeral(&reopened);
     }
 
     #[test]
@@ -3008,11 +3868,13 @@ mod tests {
         // and a reader of this test should know which half they are looking at.
         let store = store();
 
+        let configured_root = a_root("distinguishable-root");
         RawHost {
             host_capacity: 7,
             refresh_interval_secs: 45,
             created_at: timestamp_to_text(ts(1_234)),
             display_name: "distinguishable-name".to_string(),
+            runner_root_override: Some(configured_root.as_str().to_string()),
             ..RawHost::default()
         }
         .insert(&store);
@@ -3034,7 +3896,13 @@ mod tests {
             StartMode::Boot,
             "hosts.service_start_mode"
         );
+        assert_eq!(
+            host.runner_root_override,
+            Some(configured_root),
+            "hosts.runner_root_override"
+        );
 
+        let persistent_root = a_root("distinguishable-workspace");
         RawPolicy {
             installation_id: 111,
             revision: 222,
@@ -3044,6 +3912,8 @@ mod tests {
             state: "pending".to_string(),
             cache_policy: "discard_runner_package".to_string(),
             target_slug: "owner/repo".to_string(),
+            workspace_mode: "persistent".to_string(),
+            workspace_path: Some(persistent_root.as_str().to_string()),
             ..RawPolicy::default()
         }
         .insert(&store);
@@ -3088,6 +3958,16 @@ mod tests {
             "rm-home-win-x64",
             "policies.routing_labels"
         );
+        assert_eq!(
+            policy.workspace_policy().root(),
+            Some(&persistent_root),
+            "policies.workspace_path"
+        );
+        assert_eq!(
+            policy.workspace_policy().kind(),
+            WorkspaceKind::Persistent,
+            "policies.workspace_mode"
+        );
 
         RawAttempt {
             github_runner_id: Some(73),
@@ -3095,6 +3975,8 @@ mod tests {
             state: "finished".to_string(),
             outcome: Some(COMPLETED_JOB.to_string()),
             runtime_path: "runtime/distinguishable".to_string(),
+            workspace_mode: "persistent".to_string(),
+            workspace_slot: Some(37),
             created_at: timestamp_to_text(ts(1_000)),
             last_state_change_at: timestamp_to_text(ts(2_000)),
             terminal_at: Some(timestamp_to_text(ts(3_000))),
@@ -3140,6 +4022,16 @@ mod tests {
             attempt.terminal_at(),
             Some(ts(3_000)),
             "attempts.terminal_at"
+        );
+        assert_eq!(
+            attempt.workspace().slot_number(),
+            Some(37),
+            "attempts.workspace_slot"
+        );
+        assert_eq!(
+            attempt.workspace().kind(),
+            WorkspaceKind::Persistent,
+            "attempts.workspace_mode"
         );
     }
 
@@ -3449,6 +4341,839 @@ mod tests {
                 "{label} must be reported as a corrupt column"
             );
         }
+    }
+
+    // -- hand-corrupted workspace columns -----------------------------------
+
+    #[test]
+    fn a_hand_corrupted_host_runner_root_is_rejected_on_load() {
+        // D10 and `02-target-architecture.md`'s "Path validation": the pure
+        // stored-shape rules run at database load, with no filesystem probe, so
+        // a hand-edited row cannot make this product place a runner on a network
+        // share or above a filesystem root. The refusal names the reason,
+        // because a path is not a credential and an operator has to be able to
+        // fix the row.
+        let store = store();
+
+        for (label, raw) in [
+            ("a UNC share", r"\\nas\builds"),
+            ("a relative path", "runners"),
+            (
+                "a traversal component",
+                if cfg!(windows) {
+                    r"X:\rman\..\elsewhere"
+                } else {
+                    "/srv/rman/../elsewhere"
+                },
+            ),
+            (
+                "a bare filesystem root",
+                if cfg!(windows) { r"X:\" } else { "/" },
+            ),
+            // The one rule that is about *this* host rather than about syntax:
+            // "an absolute path native to the current host". The foreign
+            // spelling is a shape this build will not place a runner under.
+            (
+                "a path from the other platform",
+                if cfg!(windows) {
+                    "/srv/rman"
+                } else {
+                    r"X:\rman"
+                },
+            ),
+        ] {
+            RawHost {
+                runner_root_override: Some(raw.to_string()),
+                ..RawHost::default()
+            }
+            .insert(&store);
+
+            let error = store
+                .host(host_id())
+                .expect_err(&format!("{label} must not load"));
+            assert!(
+                matches!(error, StoreError::CorruptHostWorkspace { id, .. } if id == host_id()),
+                "{label} must be reported against the host row, got {error:?}"
+            );
+            assert!(
+                !error.is_conflict(),
+                "{label} is corrupt state, not a concurrency conflict"
+            );
+        }
+
+        // And the shape that *is* legal still loads, so the check above is not
+        // refusing everything.
+        let configured = a_root("rman");
+        RawHost {
+            runner_root_override: Some(configured.as_str().to_string()),
+            ..RawHost::default()
+        }
+        .insert(&store);
+        let host = store.host(host_id()).expect("loads").expect("present");
+        assert_eq!(host.runner_root_override, Some(configured));
+        assert!(host.has_configured_runner_root());
+    }
+
+    #[test]
+    fn a_hand_corrupted_policy_workspace_is_rejected_on_load() {
+        // The four illegal combinations of `workspace_mode` and
+        // `workspace_path`, plus D7. `03-migration-rollout.md` states the shape
+        // rule the loader enforces: "policy ephemeral -> workspace_path IS NULL;
+        // policy persistent -> repository scope and workspace_path IS NOT NULL".
+        let store = store();
+        let root = a_root("workspaces");
+
+        for (label, raw) in [
+            (
+                "persistent without a path",
+                RawPolicy {
+                    workspace_mode: "persistent".to_string(),
+                    workspace_path: None,
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "ephemeral with a stale path",
+                RawPolicy {
+                    workspace_mode: "ephemeral".to_string(),
+                    workspace_path: Some(root.as_str().to_string()),
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "an organization policy claiming to retain a workspace",
+                RawPolicy {
+                    target_scope: "organization".to_string(),
+                    target_slug: "tap-top-fun".to_string(),
+                    workspace_mode: "persistent".to_string(),
+                    workspace_path: Some(root.as_str().to_string()),
+                    ..RawPolicy::default()
+                },
+            ),
+            (
+                "a persistent root that is not a storable local path",
+                RawPolicy {
+                    workspace_mode: "persistent".to_string(),
+                    workspace_path: Some(r"\\nas\builds".to_string()),
+                    ..RawPolicy::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            let error = store
+                .policy(policy_id())
+                .expect_err(&format!("{label} must not load"));
+            assert!(
+                matches!(error, StoreError::CorruptPolicy { id, .. } if id == policy_id()),
+                "{label} must be reported against the policy row, got {error:?}"
+            );
+        }
+
+        // An unrecognised mode is a column failure rather than a shape failure,
+        // and it must not fall back to the default: an upgrade that read
+        // `persistent-ish` as `ephemeral` would delete a retained workspace.
+        RawPolicy {
+            workspace_mode: "sticky".to_string(),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        assert!(
+            matches!(
+                store.policy(policy_id()),
+                Err(StoreError::CorruptColumn {
+                    table: "policies",
+                    column: "workspace_mode",
+                    ..
+                })
+            ),
+            "an unknown workspace mode must fail closed"
+        );
+
+        // The legal persistent shape still loads.
+        RawPolicy {
+            workspace_mode: "persistent".to_string(),
+            workspace_path: Some(root.as_str().to_string()),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        let policy = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(policy.workspace_policy().root(), Some(&root));
+        assert!(policy.workspace_policy().retains_job_workspace());
+    }
+
+    #[test]
+    fn a_hand_corrupted_attempt_workspace_is_rejected_on_load() {
+        // `04-security-recovery.md`, "Corrupt SQLite changes cleanup mode for an
+        // old path": the journalled kind decides which cleanup algorithm is
+        // legal, so a pair that cannot describe one allocation must not load at
+        // all rather than fall through to the destructive branch.
+        let store = store();
+
+        for (label, raw) in [
+            (
+                "persistent without a slot",
+                RawAttempt {
+                    workspace_mode: "persistent".to_string(),
+                    workspace_slot: None,
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "ephemeral holding a slot",
+                RawAttempt {
+                    workspace_mode: "ephemeral".to_string(),
+                    workspace_slot: Some(1),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "slot zero, which names no directory",
+                RawAttempt {
+                    workspace_mode: "persistent".to_string(),
+                    workspace_slot: Some(0),
+                    ..RawAttempt::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(
+                    store.attempt(attempt_id()),
+                    Err(StoreError::CorruptAttempt { .. })
+                ),
+                "{label} must not load"
+            );
+        }
+
+        for (label, raw) in [
+            (
+                "an unrecognised mode",
+                RawAttempt {
+                    workspace_mode: "sticky".to_string(),
+                    ..RawAttempt::default()
+                },
+            ),
+            (
+                "a slot above u16",
+                RawAttempt {
+                    workspace_mode: "persistent".to_string(),
+                    workspace_slot: Some(70_000),
+                    ..RawAttempt::default()
+                },
+            ),
+        ] {
+            raw.insert(&store);
+            assert!(
+                matches!(
+                    store.attempt(attempt_id()),
+                    Err(StoreError::CorruptColumn {
+                        table: "attempts",
+                        ..
+                    })
+                ),
+                "{label} must be reported as a corrupt column"
+            );
+        }
+
+        RawAttempt {
+            workspace_mode: "persistent".to_string(),
+            workspace_slot: Some(2),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+        let attempt = store
+            .attempt(attempt_id())
+            .expect("loads")
+            .expect("present");
+        assert_eq!(
+            attempt.workspace(),
+            AttemptWorkspace::persistent_slot(NonZeroU16::new(2).expect("non-zero"))
+        );
+        assert!(attempt.holds_slot_lease());
+    }
+
+    // -- durable slot leases ------------------------------------------------
+
+    /// The outcome a terminal state has to be paired with, and `None` for a
+    /// non-terminal one.
+    ///
+    /// `RunnerAttempt::from_persisted` refuses a terminal row without an outcome
+    /// and one whose outcome names a different terminal state, so a test that
+    /// puts an attempt into an arbitrary state has to supply the matching value
+    /// rather than one fixed one. `Cleaned` is the exception the loader itself
+    /// makes -- it follows any of the three -- and takes the ordinary one.
+    fn outcome_for(state: AttemptState) -> Option<AttemptOutcome> {
+        match state {
+            AttemptState::Failed => Some(AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly,
+            )),
+            AttemptState::Orphaned => Some(AttemptOutcome::Orphaned),
+            AttemptState::Finished | AttemptState::Cleaned => Some(AttemptOutcome::CompletedJob),
+            _ => None,
+        }
+    }
+
+    /// The same attempt in a different state, rebuilt rather than transitioned.
+    ///
+    /// One helper covers every state without these tests knowing the
+    /// lifecycle's edge list, which is `b1`'s to own and is tested there.
+    fn attempt_in_state(attempt: &RunnerAttempt, state: AttemptState) -> RunnerAttempt {
+        let mut fields = attempt.to_persisted();
+        fields.state = state;
+        fields.outcome = outcome_for(state);
+        fields.terminal_at = state.is_terminal().then(|| ts(2_000));
+        fields.last_state_change_at = ts(2_000);
+        RunnerAttempt::from_persisted(fields).expect("a state the domain accepts")
+    }
+
+    /// A journalled persistent attempt on `slot`, in `state`.
+    fn persistent_attempt(id: u128, slot: u16, state: AttemptState) -> RunnerAttempt {
+        let attempt = RunnerAttempt::allocate_in(
+            AttemptId::from_u128(id),
+            policy_id(),
+            format!("root/s{slot}"),
+            AttemptWorkspace::persistent_slot(NonZeroU16::new(slot).expect("positive")),
+            ts(1_000),
+        );
+        if state == AttemptState::Allocated {
+            return attempt;
+        }
+        attempt_in_state(&attempt, state)
+    }
+
+    #[test]
+    fn one_slot_is_leased_to_at_most_one_uncleaned_attempt() {
+        // Invariant 5, enforced durably. The allocation lock coordinates
+        // selection; this index is what catches the race the lock cannot see,
+        // and `04-security-recovery.md` names it as the control for "two
+        // attempts use one slot concurrently".
+        let store = store();
+        let first = persistent_attempt(0x501, 1, AttemptState::Idle);
+        store.record_attempt(&first).expect("the first lease");
+
+        let second = persistent_attempt(0x502, 1, AttemptState::Allocated);
+        let error = store
+            .record_attempt(&second)
+            .expect_err("a second uncleaned attempt must not take a leased slot");
+        assert!(
+            matches!(
+                error,
+                StoreError::SlotAlreadyLeased { policy, slot }
+                    if policy == policy_id() && slot == 1
+            ),
+            "expected SlotAlreadyLeased, got {error:?}"
+        );
+        assert!(
+            error.is_conflict(),
+            "an allocator that lost a slot picks another one; this is not an \
+             I/O failure"
+        );
+
+        // Atomic: the refused write left nothing behind, and the existing lease
+        // is untouched.
+        assert!(
+            store.attempt(second.id).expect("loads").is_none(),
+            "the refused insert must not be half-applied"
+        );
+        let leases = store.slot_leases_for_policy(policy_id()).expect("loads");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].id, first.id);
+
+        // A *different* slot is free, and so is the same slot under a different
+        // policy: the index is scoped to the pair.
+        store
+            .record_attempt(&persistent_attempt(0x503, 2, AttemptState::Allocated))
+            .expect("slot 2 is not leased");
+        let other_policy = RunnerAttempt::allocate_in(
+            AttemptId::from_u128(0x504),
+            PolicyId::from_u128(0x11),
+            "root/s1",
+            AttemptWorkspace::persistent_slot(NonZeroU16::new(1).expect("positive")),
+            ts(1_000),
+        );
+        store
+            .record_attempt(&other_policy)
+            .expect("another policy's s1 is a different slot");
+    }
+
+    #[test]
+    fn a_cleaned_historical_attempt_releases_its_slot_for_reuse() {
+        // "Persistent directories provide retained bytes but never lease truth."
+        // The lease is the uncleaned row, so cleaning it is what frees `s1` --
+        // and the historical row stays in the journal, because `g2`'s history
+        // and `04`'s audit trail both read it.
+        let store = store();
+        let first = persistent_attempt(0x511, 1, AttemptState::Cleaned);
+        store.record_attempt(&first).expect("a cleaned lease");
+        assert!(!first.holds_slot_lease());
+        assert!(
+            store
+                .slot_leases_for_policy(policy_id())
+                .expect("loads")
+                .is_empty(),
+            "a cleaned attempt holds no lease"
+        );
+
+        let second = persistent_attempt(0x512, 1, AttemptState::Allocated);
+        store
+            .record_attempt(&second)
+            .expect("a cleaned row must not block reuse of its slot");
+
+        assert_eq!(
+            store.attempts_for_policy(policy_id()).expect("loads").len(),
+            2,
+            "the historical row is kept, not deleted, when the slot is reused"
+        );
+
+        // A third attempt now collides with the *live* lease rather than with
+        // the historical row.
+        assert!(matches!(
+            store.record_attempt(&persistent_attempt(0x513, 1, AttemptState::Allocated)),
+            Err(StoreError::SlotAlreadyLeased { slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_terminal_attempt_awaiting_cleanup_still_holds_its_slot() {
+        // `04-security-recovery.md`, "Cleanup partly fails and the slot is
+        // reused anyway": the attempt "remains not-cleaned and continues to hold
+        // the slot through the unique lease index; it does not count as active
+        // host capacity".
+        let store = store();
+        let failed_cleanup = persistent_attempt(0x521, 1, AttemptState::Finished);
+        store.record_attempt(&failed_cleanup).expect("journalled");
+
+        assert!(
+            store
+                .active_attempts_for_policy(policy_id())
+                .expect("loads")
+                .is_empty(),
+            "a terminal attempt occupies no capacity slot"
+        );
+        let leases = store.slot_leases_for_policy(policy_id()).expect("loads");
+        assert_eq!(leases.len(), 1, "but it does still hold its lease");
+        assert_eq!(leases[0].workspace().slot_number(), Some(1));
+
+        assert!(matches!(
+            store.record_attempt(&persistent_attempt(0x522, 1, AttemptState::Allocated)),
+            Err(StoreError::SlotAlreadyLeased { slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn journalling_the_same_attempt_again_cannot_move_its_lease() {
+        // The allocation fact is immutable in the domain and write-once in the
+        // journal: `record_attempt` is called repeatedly over one attempt's
+        // life, and none of those calls may rewrite the kind or the slot that
+        // decides which cleanup algorithm is legal on its directory.
+        let store = store();
+        let allocated = persistent_attempt(0x531, 1, AttemptState::Allocated);
+        store.record_attempt(&allocated).expect("journalled");
+
+        let mut fields = allocated.to_persisted();
+        fields.state = AttemptState::Idle;
+        fields.last_state_change_at = ts(2_000);
+        fields.workspace_slot = Some(9);
+        let moved = RunnerAttempt::from_persisted(fields).expect("a legal attempt in isolation");
+        store
+            .record_attempt(&moved)
+            .expect("the state change lands");
+
+        let stored = store
+            .attempt(allocated.id)
+            .expect("loads")
+            .expect("present");
+        assert_eq!(stored.state(), AttemptState::Idle, "the state did move");
+        assert_eq!(
+            stored.workspace().slot_number(),
+            Some(1),
+            "the slot journalled at allocation is the one that stands"
+        );
+    }
+
+    // -- attempt sets -------------------------------------------------------
+
+    #[test]
+    fn the_attempt_set_predicates_follow_the_domain() {
+        // The SQL fragments are derived from `AttemptState`'s own predicates and
+        // tokens; this is the assertion that the derivation and the domain agree
+        // state by state, so a tenth state cannot be counted by the capacity
+        // formula and silently missed by the fence.
+        let store = store();
+        for (index, state) in AttemptState::ALL.into_iter().enumerate() {
+            // Ephemeral, so that every state can coexist under one policy
+            // without the lease index refusing the second one.
+            let attempt = RunnerAttempt::allocate(
+                AttemptId::from_u128(0x600 + index as u128),
+                policy_id(),
+                format!("runtime/{state}"),
+                ts(1_000),
+            );
+            store
+                .record_attempt(&attempt_in_state(&attempt, state))
+                .expect("journalled");
+        }
+
+        let expected_active = AttemptState::ALL
+            .into_iter()
+            .filter(|state| state.counts_against_capacity())
+            .count();
+        let expected_uncleaned = AttemptState::ALL
+            .into_iter()
+            .filter(|state| *state != AttemptState::Cleaned)
+            .count();
+        assert_ne!(
+            expected_active, expected_uncleaned,
+            "if these were equal the two fences would be the same fence and this \
+             test would prove nothing"
+        );
+
+        assert_eq!(
+            store
+                .active_attempts_for_policy(policy_id())
+                .expect("loads")
+                .len(),
+            expected_active
+        );
+        assert_eq!(
+            store
+                .uncleaned_attempts_for_policy(policy_id())
+                .expect("loads")
+                .len(),
+            expected_uncleaned
+        );
+        assert_eq!(
+            store.uncleaned_ephemeral_attempts().expect("loads").len(),
+            expected_uncleaned,
+            "every attempt here is ephemeral, so the host-wide set is the same \
+             size as the per-policy uncleaned one"
+        );
+        assert!(
+            store
+                .slot_leases_for_policy(policy_id())
+                .expect("loads")
+                .is_empty(),
+            "and none of them is a slot lease"
+        );
+    }
+
+    #[test]
+    fn the_host_wide_ephemeral_set_counts_an_attempt_that_outlived_its_policy() {
+        // The note on `Store::uncleaned_ephemeral_attempts`: an attempt whose
+        // policy row is gone still owns a directory under the host runner root,
+        // and `04-security-recovery.md` requires unknown-policy attempts to keep
+        // their fail-closed ownership behaviour. A count scoped to this host's
+        // policies would drop exactly those.
+        let store = store();
+        let orphan = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x701),
+            PolicyId::from_u128(0xdead),
+            "runtime/orphan",
+            ts(1_000),
+        );
+        store.record_attempt(&orphan).expect("journalled");
+        store
+            .record_attempt(&persistent_attempt(0x702, 1, AttemptState::Allocated))
+            .expect("journalled");
+
+        let ephemeral = store.uncleaned_ephemeral_attempts().expect("loads");
+        assert_eq!(ephemeral.len(), 1, "the persistent attempt is not counted");
+        assert_eq!(ephemeral[0].id, orphan.id);
+    }
+
+    // -- targeted host-root mutation ----------------------------------------
+
+    /// The store, its host, and a `Host` value equal to the stored row.
+    fn a_stored_host(store: &SqliteStore) -> Host {
+        let host = Host::new(
+            host_id(),
+            "home-pc",
+            Os::Windows,
+            Arch::X64,
+            NonZeroU16::new(2).expect("non-zero"),
+            ts(1_000),
+        )
+        .expect("valid");
+        store.put_host(&host).expect("stored");
+        host
+    }
+
+    #[test]
+    fn the_host_root_mutation_writes_only_its_own_column() {
+        // `02-target-architecture.md`: the targeted mutation exists so that "a
+        // simultaneous capacity or service-mode change" is not overwritten. This
+        // is that property, stated as a test: the concurrent change is made
+        // *between* the read and the write, and it survives.
+        let store = store();
+        let read = a_stored_host(&store);
+
+        let mut concurrent = read.clone();
+        concurrent.host_capacity = NonZeroU16::new(7).expect("non-zero");
+        concurrent.service_start_mode = StartMode::Login;
+        store.put_host(&concurrent).expect("the other writer wins");
+
+        let configured = a_root("rman");
+        store
+            .set_runner_root_override(host_id(), None, Some(&configured), 0)
+            .expect("the root moves");
+
+        let stored = store.host(host_id()).expect("loads").expect("present");
+        assert_eq!(stored.runner_root_override, Some(configured));
+        assert_eq!(
+            stored.host_capacity.get(),
+            7,
+            "a whole-record write built from the stale read would have rolled \
+             this back to 2"
+        );
+        assert_eq!(stored.service_start_mode, StartMode::Login);
+    }
+
+    #[test]
+    fn the_host_root_mutation_refuses_a_changed_expected_override() {
+        let store = store();
+        a_stored_host(&store);
+        let first = a_root("rman");
+        let second = a_root("elsewhere");
+
+        store
+            .set_runner_root_override(host_id(), None, Some(&first), 0)
+            .expect("the first mutation");
+
+        // A second operator read `None` before the first landed.
+        let error = store
+            .set_runner_root_override(host_id(), None, Some(&second), 0)
+            .expect_err("a stale expected override must be refused");
+        assert!(
+            matches!(&error, StoreError::RunnerRootChanged { id, .. } if *id == host_id()),
+            "expected RunnerRootChanged, got {error:?}"
+        );
+        assert!(error.is_conflict());
+        let message = error.to_string();
+        assert!(
+            message.contains("the platform default") && message.contains(first.as_str()),
+            "the message must name both sides so the operator can re-read: \
+             {message}"
+        );
+        assert_eq!(
+            store
+                .host(host_id())
+                .expect("loads")
+                .expect("present")
+                .runner_root_override,
+            Some(first.clone()),
+            "nothing was written"
+        );
+
+        // Resetting to the default is the same mutation in the other direction,
+        // and it works once the expected value is the one actually stored.
+        store
+            .set_runner_root_override(host_id(), Some(&first), None, 0)
+            .expect("reset to the platform default");
+        assert_eq!(
+            store
+                .host(host_id())
+                .expect("loads")
+                .expect("present")
+                .runner_root_override,
+            None
+        );
+    }
+
+    #[test]
+    fn the_host_root_mutation_refuses_a_changed_uncleaned_ephemeral_count() {
+        // `04-security-recovery.md`: "A host root setting cannot change while
+        // any ephemeral attempt is active or unresolved." The count is confirmed
+        // in the same transaction as the write, so an attempt journalled between
+        // the operator's read and the write refuses it.
+        let store = store();
+        a_stored_host(&store);
+        let configured = a_root("rman");
+
+        let mut attempt = RunnerAttempt::allocate(
+            attempt_id(),
+            policy_id(),
+            "runtime/policy/attempt",
+            ts(1_000),
+        );
+        store.record_attempt(&attempt).expect("journalled");
+
+        let error = store
+            .set_runner_root_override(host_id(), None, Some(&configured), 0)
+            .expect_err("an attempt appeared after the operator counted zero");
+        assert!(
+            matches!(
+                &error,
+                StoreError::UncleanedCountChanged { expected: 0, found: 1, subject }
+                    if subject.contains(&host_id().to_string())
+            ),
+            "expected UncleanedCountChanged naming the host, got {error:?}"
+        );
+        assert!(error.is_conflict());
+
+        // Confirming the count that is actually there is a refusal at the
+        // command layer, not here: this store call is the fence, and it commits
+        // when the caller's observation was correct.
+        store
+            .set_runner_root_override(host_id(), None, Some(&configured), 1)
+            .expect("the confirmed count matches");
+
+        // A *terminal but uncleaned* attempt still counts. This is the whole
+        // difference between this fence and the active-count one.
+        attempt = attempt_in_state(&attempt, AttemptState::Finished);
+        store.record_attempt(&attempt).expect("journalled");
+        assert!(
+            store
+                .active_attempts_for_policy(policy_id())
+                .expect("loads")
+                .is_empty()
+        );
+        assert!(matches!(
+            store.set_runner_root_override(host_id(), Some(&configured), None, 0),
+            Err(StoreError::UncleanedCountChanged { found: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn the_host_root_mutation_reports_a_missing_host_rather_than_a_conflict() {
+        let store = store();
+        let error = store
+            .set_runner_root_override(host_id(), None, Some(&a_root("rman")), 0)
+            .expect_err("there is no such host");
+        assert!(
+            matches!(error, StoreError::NotFound { what: "host", .. }),
+            "expected NotFound, got {error:?}"
+        );
+        assert!(!error.is_conflict());
+    }
+
+    // -- policy mutation fenced on the uncleaned count -----------------------
+
+    /// The autoscale policy these tests mutate, in the store.
+    ///
+    /// The sibling of [`a_stored_host`]; `testkit`'s `fixtures::policy()` builds
+    /// exactly this object but is unreachable from here, for the
+    /// dev-dependency-cycle reason `tests/store_journal.rs` opens with.
+    fn a_stored_policy(store: &SqliteStore) -> ScalePolicy {
+        let policy = ScalePolicy::new(
+            policy_id(),
+            ScaleTarget::repository("o/r").expect("valid"),
+            1,
+            host_id(),
+            PolicyMode::autoscale(
+                RoutingLabels::from_host_label(Label::new("rm-home-win-x64").expect("valid")),
+                0,
+                NonZeroU16::new(2).expect("non-zero"),
+            )
+            .expect("valid"),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&policy).expect("inserted");
+        policy
+    }
+
+    #[test]
+    fn the_policy_workspace_mutation_confirms_revision_and_uncleaned_count() {
+        // `03-migration-rollout.md`: "The policy store operation compares its
+        // revision and confirms the uncleaned policy-attempt count. Both checks
+        // happen inside the same SQLite write transaction as the mutation."
+        let store = store();
+        let mut policy = a_stored_policy(&store);
+
+        let read_revision = policy.revision();
+        let root = a_root("workspaces");
+        policy
+            .set_workspace_policy(
+                WorkspacePolicy::persistent(root.clone(), TargetScope::Repository)
+                    .expect("a repository may"),
+            )
+            .expect("a repository may");
+
+        // A stale revision is refused even when the count is right.
+        assert!(matches!(
+            store.update_policy_confirming_uncleaned_count(&policy, read_revision + 7, 0),
+            Err(StoreError::StaleRevision { .. })
+        ));
+
+        // A terminal-but-uncleaned attempt refuses the path change, which is the
+        // case `update_policy_confirming_active_count` would have let through.
+        let attempt =
+            RunnerAttempt::allocate(attempt_id(), policy_id(), "runtime/attempt", ts(1_000));
+        store
+            .record_attempt(&attempt_in_state(&attempt, AttemptState::Failed))
+            .expect("journalled");
+
+        let error = store
+            .update_policy_confirming_uncleaned_count(&policy, read_revision, 0)
+            .expect_err("an unresolved attempt appeared");
+        assert!(
+            matches!(
+                &error,
+                StoreError::UncleanedCountChanged { expected: 0, found: 1, subject }
+                    if subject.contains(&policy_id().to_string())
+            ),
+            "expected UncleanedCountChanged naming the policy, got {error:?}"
+        );
+        assert!(error.is_conflict());
+        assert_eq!(
+            store
+                .policy(policy_id())
+                .expect("loads")
+                .expect("present")
+                .workspace_policy(),
+            &WorkspacePolicy::Ephemeral,
+            "nothing was written"
+        );
+        // The same write through the active-count guard would have committed,
+        // which is why the two guards are not one.
+        assert!(
+            store
+                .update_policy_confirming_active_count(&policy, read_revision, 0)
+                .is_ok(),
+            "an unresolved attempt is invisible to the active-count guard"
+        );
+    }
+
+    #[test]
+    fn a_workspace_policy_survives_a_guarded_write_and_a_reload() {
+        let store = store();
+        let mut policy = a_stored_policy(&store);
+
+        let root = a_root("workspaces");
+        let read_revision = policy.revision();
+        policy
+            .set_workspace_policy(
+                WorkspacePolicy::persistent(root.clone(), TargetScope::Repository)
+                    .expect("a repository may"),
+            )
+            .expect("a repository may");
+        store
+            .update_policy_confirming_uncleaned_count(&policy, read_revision, 0)
+            .expect("no attempt stands in the way");
+
+        let stored = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(&stored, &policy);
+        assert_eq!(stored.workspace_policy().root(), Some(&root));
+
+        // And back to ephemeral, which must clear the path rather than leave a
+        // stale one the loader would refuse.
+        let read_revision = stored.revision();
+        let mut back = stored;
+        back.set_workspace_policy(WorkspacePolicy::Ephemeral)
+            .expect("always permitted");
+        store
+            .update_policy_confirming_uncleaned_count(&back, read_revision, 0)
+            .expect("no attempt stands in the way");
+        let stored = store.policy(policy_id()).expect("loads").expect("present");
+        assert_eq!(stored.workspace_policy(), &WorkspacePolicy::Ephemeral);
+        let raw: Option<String> = store
+            .lock()
+            .query_row(
+                "SELECT workspace_path FROM policies WHERE id = :id",
+                named_params! { ":id": POLICY_UUID },
+                |row| row.get(0),
+            )
+            .expect("readable");
+        assert_eq!(raw, None, "the column is cleared, not merely ignored");
     }
 
     // -- optimistic concurrency ---------------------------------------------
@@ -3972,9 +5697,24 @@ mod tests {
     #[test]
     fn the_dump_names_every_table_and_reaches_every_column() {
         let store = store();
-        RawHost::default().insert(&store);
-        RawPolicy::default().insert(&store);
-        RawAttempt::default().insert(&store);
+        let root = a_root("rman");
+        RawHost {
+            runner_root_override: Some(root.as_str().to_string()),
+            ..RawHost::default()
+        }
+        .insert(&store);
+        RawPolicy {
+            workspace_mode: "persistent".to_string(),
+            workspace_path: Some(root.as_str().to_string()),
+            ..RawPolicy::default()
+        }
+        .insert(&store);
+        RawAttempt {
+            workspace_mode: "persistent".to_string(),
+            workspace_slot: Some(1),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
 
         let dump = store.dump_text().expect("dumpable");
         for table in TABLES {
@@ -3991,6 +5731,19 @@ mod tests {
             dump.contains("attempts.runtime_path=runtime/policy/attempt"),
             "a dump that omitted a column would make the security scan vacuous"
         );
+        // The schema-3 columns reach the dump too, which is what keeps the
+        // security scan over a populated database honest about them: a
+        // configured path is not a credential, and this is where that claim is
+        // actually checkable rather than merely asserted.
+        for column in [
+            format!("hosts.runner_root_override={root}"),
+            format!("policies.workspace_path={root}"),
+            "policies.workspace_mode=persistent".to_string(),
+            "attempts.workspace_mode=persistent".to_string(),
+            "attempts.workspace_slot=1".to_string(),
+        ] {
+            assert!(dump.contains(&column), "{column} is missing from the dump");
+        }
 
         // A free-form string reaches the dump, which is why `07-security.md`'s
         // scan runs over the dump rather than over the schema: the schema alone

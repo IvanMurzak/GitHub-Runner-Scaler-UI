@@ -1048,6 +1048,17 @@ mod tests {
             self.inner.hosts()
         }
 
+        fn set_runner_root_override(
+            &self,
+            id: HostId,
+            expected: Option<&runner_manager_domain::path::LocalAbsolutePath>,
+            new_root: Option<&runner_manager_domain::path::LocalAbsolutePath>,
+            expected_uncleaned: u16,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .set_runner_root_override(id, expected, new_root, expected_uncleaned)
+        }
+
         fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
             if self.fail_next_insert.swap(false, Ordering::SeqCst) {
                 self.inner.insert_policy(policy)?;
@@ -1077,6 +1088,19 @@ mod tests {
                 policy,
                 expected_revision,
                 expected_active,
+            )
+        }
+
+        fn update_policy_confirming_uncleaned_count(
+            &self,
+            policy: &ScalePolicy,
+            expected_revision: u64,
+            expected_uncleaned: u16,
+        ) -> Result<(), StoreError> {
+            self.inner.update_policy_confirming_uncleaned_count(
+                policy,
+                expected_revision,
+                expected_uncleaned,
             )
         }
 
@@ -1110,6 +1134,31 @@ mod tests {
             policy_id: PolicyId,
         ) -> Result<Vec<RunnerAttempt>, StoreError> {
             self.inner.attempts_for_policy(policy_id)
+        }
+
+        fn active_attempts_for_policy(
+            &self,
+            policy_id: PolicyId,
+        ) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.active_attempts_for_policy(policy_id)
+        }
+
+        fn uncleaned_attempts_for_policy(
+            &self,
+            policy_id: PolicyId,
+        ) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.uncleaned_attempts_for_policy(policy_id)
+        }
+
+        fn slot_leases_for_policy(
+            &self,
+            policy_id: PolicyId,
+        ) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.slot_leases_for_policy(policy_id)
+        }
+
+        fn uncleaned_ephemeral_attempts(&self) -> Result<Vec<RunnerAttempt>, StoreError> {
+            self.inner.uncleaned_ephemeral_attempts()
         }
 
         fn remove_attempt(&self, id: AttemptId) -> Result<bool, StoreError> {
