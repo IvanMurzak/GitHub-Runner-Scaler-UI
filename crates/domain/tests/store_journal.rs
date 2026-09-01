@@ -318,7 +318,7 @@ fn every_persistent_attempt_state_round_trips_and_keeps_its_lease() {
     }
 
     let leases = store
-        .slot_leases_for_policy(fixtures::attempt().build().policy_id)
+        .slot_leases_for_policy(fixtures::POLICY_ID)
         .expect("loads");
     assert_eq!(
         leases.len(),

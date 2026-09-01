@@ -810,6 +810,39 @@ fn uncleaned_of_kind_sql(kind: WorkspaceKind) -> String {
     )
 }
 
+/// The ceiling every guarded attempt count saturates at, on both sides.
+///
+/// Named once because it is stated twice in two notations — as an integer
+/// literal inside SQL by [`attempt_count_sql`], and as a Rust narrowing by
+/// [`clamped_count`] — and the fences are only sound while the two agree.
+const ATTEMPT_COUNT_CEILING: u16 = u16::MAX;
+
+/// The scalar sub-select counting the attempts matching `predicate`.
+///
+/// Clamped to [`ATTEMPT_COUNT_CEILING`] in SQL so the comparison against the
+/// caller's `u16` is representable on both sides rather than wrapping: a journal
+/// holding more than 65 535 uncleaned attempts for one subject reports the
+/// ceiling, which is the same figure the diagnosis reports and the same one a
+/// caller's own saturating count would produce. The clamp is therefore a
+/// saturation, not a fence in its own right — at the ceiling the two sides can
+/// still agree — and it is chosen deliberately, because the alternative is a
+/// refusal whose message reads "expected 65535, but now has 65535". Nothing in
+/// this product creates 65 535 concurrent attempts for one policy; host capacity
+/// is a `NonZeroU16` bound checked long before here.
+fn attempt_count_sql(predicate: &str) -> String {
+    format!("SELECT MIN(COUNT(*), {ATTEMPT_COUNT_CEILING}) FROM attempts WHERE {predicate}")
+}
+
+/// The narrowing partner of [`attempt_count_sql`]'s clamp.
+///
+/// The sub-select already saturates, so the `unwrap_or` is unreachable for any
+/// value SQLite can return through it; it is spelled out rather than
+/// `expect`-ed so that a future caller counting through some other statement
+/// still saturates instead of panicking.
+fn clamped_count(found: i64) -> u16 {
+    u16::try_from(found).unwrap_or(ATTEMPT_COUNT_CEILING)
+}
+
 /// Which set of attempts a guarded policy write counts.
 ///
 /// A closed enum rather than a `&str` argument, so the SQL a caller can reach is
@@ -827,25 +860,14 @@ enum CountedAttempts {
 impl CountedAttempts {
     /// The scalar sub-select counting this set for the policy bound as `:id`.
     ///
-    /// Clamped to `u16::MAX` in SQL so the comparison against the caller's `u16`
-    /// is representable on both sides rather than wrapping: a journal holding
-    /// more than 65 535 uncleaned attempts for one policy reports the ceiling,
-    /// which is the same figure the diagnosis below reports and the same one a
-    /// caller's own saturating count would produce. The clamp is therefore a
-    /// saturation, not a fence in its own right — at the ceiling the two sides
-    /// can still agree — and it is chosen deliberately, because the alternative
-    /// is a refusal whose message reads "expected 65535, but now has 65535".
-    /// Nothing in this product creates 65 535 concurrent attempts for one
-    /// policy; host capacity is a `NonZeroU16` bound checked long before here.
+    /// Scoped to one policy; [`attempt_count_sql`] owns the statement shape and
+    /// the saturation contract it shares with the host-wide fence.
     fn count_sql(self) -> String {
         let predicate = match self {
             CountedAttempts::Active => active_sql(),
             CountedAttempts::Uncleaned => uncleaned_sql(),
         };
-        format!(
-            "SELECT MIN(COUNT(*), 65535) FROM attempts \
-              WHERE policy_id = :id AND {predicate}"
-        )
+        attempt_count_sql(&format!("policy_id = :id AND {predicate}"))
     }
 
     /// The conflict this set reports when the count moved under the write.
@@ -1249,8 +1271,11 @@ impl SqliteStore {
                         named_params! { ":id": uuid_text(fields.id.as_uuid()) },
                         |row| row.get(0),
                     )?;
-                    let found = u16::try_from(found).unwrap_or(u16::MAX);
-                    return Err(counted.count_changed(fields.id, expected_count, found));
+                    return Err(counted.count_changed(
+                        fields.id,
+                        expected_count,
+                        clamped_count(found),
+                    ));
                 }
                 other => return Err(other),
             }
@@ -1288,6 +1313,25 @@ impl SqliteStore {
             out.push(self.attempt_from_row(row)?);
         }
         Ok(out)
+    }
+
+    /// Every attempt of one policy also satisfying `and`, oldest first.
+    ///
+    /// The binding is the part the four per-policy queries must not restate:
+    /// the parameter name and the `&dyn ToSql` cast have to agree across all of
+    /// them, and the only thing that actually varies between them is the
+    /// fragment `and` supplies.
+    fn attempts_of_policy(
+        &self,
+        policy_id: PolicyId,
+        and: Option<&str>,
+    ) -> Result<Vec<RunnerAttempt>, StoreError> {
+        let id = uuid_text(policy_id.as_uuid());
+        let predicate = and.map_or_else(
+            || "policy_id = :policy_id".to_string(),
+            |and| format!("policy_id = :policy_id AND {and}"),
+        );
+        self.attempts_where(&predicate, &[(":policy_id", &id as &dyn ToSql)])
     }
 }
 
@@ -1387,11 +1431,10 @@ impl Store for SqliteStore {
         new_root: Option<&LocalAbsolutePath>,
         expected_uncleaned: u16,
     ) -> Result<(), StoreError> {
-        let ephemeral = uncleaned_of_kind_sql(WorkspaceKind::Ephemeral);
         // Host-wide, not scoped to this host's policies: see the contract note
         // on `Store::uncleaned_ephemeral_attempts` for why an attempt that
         // outlived its policy row still has to count.
-        let count_sql = format!("SELECT MIN(COUNT(*), 65535) FROM attempts WHERE {ephemeral}");
+        let count_sql = attempt_count_sql(&uncleaned_of_kind_sql(WorkspaceKind::Ephemeral));
 
         let mut conn = self.lock();
         // IMMEDIATE for the reason `update_policy` gives: the diagnosis below
@@ -1449,7 +1492,7 @@ impl Store for SqliteStore {
             return Err(StoreError::UncleanedCountChanged {
                 subject: format!("host {id}"),
                 expected: expected_uncleaned,
-                found: u16::try_from(found).unwrap_or(u16::MAX),
+                found: clamped_count(found),
             });
         }
         tx.commit()?;
@@ -1659,7 +1702,7 @@ impl Store for SqliteStore {
             // later write can move a live lease onto a different slot.
             &bind(&params)[..],
         )
-        .map_err(|source| slot_lease_error(&fields, source))?;
+        .map_err(|source| slot_lease_error(attempt, source))?;
         Ok(())
     }
 
@@ -1685,46 +1728,30 @@ impl Store for SqliteStore {
     }
 
     fn attempts_for_policy(&self, policy_id: PolicyId) -> Result<Vec<RunnerAttempt>, StoreError> {
-        let id = uuid_text(policy_id.as_uuid());
-        self.attempts_where(
-            "policy_id = :policy_id",
-            &[(":policy_id", &id as &dyn ToSql)],
-        )
+        self.attempts_of_policy(policy_id, None)
     }
 
     fn active_attempts_for_policy(
         &self,
         policy_id: PolicyId,
     ) -> Result<Vec<RunnerAttempt>, StoreError> {
-        let id = uuid_text(policy_id.as_uuid());
-        self.attempts_where(
-            &format!("policy_id = :policy_id AND {}", active_sql()),
-            &[(":policy_id", &id as &dyn ToSql)],
-        )
+        self.attempts_of_policy(policy_id, Some(&active_sql()))
     }
 
     fn uncleaned_attempts_for_policy(
         &self,
         policy_id: PolicyId,
     ) -> Result<Vec<RunnerAttempt>, StoreError> {
-        let id = uuid_text(policy_id.as_uuid());
-        self.attempts_where(
-            &format!("policy_id = :policy_id AND {}", uncleaned_sql()),
-            &[(":policy_id", &id as &dyn ToSql)],
-        )
+        self.attempts_of_policy(policy_id, Some(&uncleaned_sql()))
     }
 
     fn slot_leases_for_policy(
         &self,
         policy_id: PolicyId,
     ) -> Result<Vec<RunnerAttempt>, StoreError> {
-        let id = uuid_text(policy_id.as_uuid());
-        self.attempts_where(
-            &format!(
-                "policy_id = :policy_id AND {}",
-                uncleaned_of_kind_sql(WorkspaceKind::Persistent)
-            ),
-            &[(":policy_id", &id as &dyn ToSql)],
+        self.attempts_of_policy(
+            policy_id,
+            Some(&uncleaned_of_kind_sql(WorkspaceKind::Persistent)),
         )
     }
 
@@ -2324,14 +2351,21 @@ fn render_root(value: Option<&str>) -> String {
 /// those is passed through as an ordinary [`StoreError::Sqlite`] rather than
 /// being mislabelled. Matching on the error string would work today and break
 /// silently the first time SQLite reworded it.
-fn slot_lease_error(fields: &PersistedAttempt, source: rusqlite::Error) -> StoreError {
-    match (fields.workspace_slot, is_constraint_violation(&source)) {
-        (Some(slot), true) if fields.state != AttemptState::Cleaned => {
-            StoreError::SlotAlreadyLeased {
-                policy: fields.policy_id,
-                slot,
-            }
-        }
+///
+/// "Which rows the index covers" is asked of [`RunnerAttempt::holds_slot_lease`]
+/// rather than re-derived from the persisted columns. The same predicate is
+/// frozen a third time in the migration's partial `WHERE`, which the forward-only
+/// rule keeps from drifting; these two are the pair that could, so only one of
+/// them decides.
+fn slot_lease_error(attempt: &RunnerAttempt, source: rusqlite::Error) -> StoreError {
+    match (
+        attempt.workspace().slot_number(),
+        is_constraint_violation(&source),
+    ) {
+        (Some(slot), true) if attempt.holds_slot_lease() => StoreError::SlotAlreadyLeased {
+            policy: attempt.policy_id,
+            slot,
+        },
         _ => StoreError::Sqlite(source),
     }
 }
@@ -2558,6 +2592,9 @@ mod tests {
     const HOST_UUID: &str = "00000000-0000-0000-0000-000000000001";
     const POLICY_UUID: &str = "00000000-0000-0000-0000-000000000010";
     const ATTEMPT_UUID: &str = "00000000-0000-0000-0000-000000000100";
+    /// The `runtime_path` every pre-migration attempt fixture is written with,
+    /// and the one migration 3 must leave exactly as it found it.
+    const HISTORICAL_PATH: &str = "runtime/policy/pre-upgrade-attempt";
     const LABELS_JSON: &str = r#"{"host_label":"rm-home-win-x64","additional":[]}"#;
     const COMPLETED_JOB: &str = r#"{"outcome":"completed_job"}"#;
     static ATTEMPT_WRITE_BLOCKED: AtomicBool = AtomicBool::new(false);
@@ -3079,9 +3116,7 @@ mod tests {
     /// The rows are written with plain SQL against the older tables rather than
     /// through the store, because the store only knows how to write the current
     /// shape — which is the whole thing these tests need not to be true.
-    fn a_database_at_version(path: &Path, version: u32) -> &'static str {
-        const HISTORICAL_PATH: &str = "runtime/policy/pre-upgrade-attempt";
-
+    fn a_database_at_version(path: &Path, version: u32) {
         let mut conn = Connection::open(path).expect("openable");
         let applied = apply_migrations(&mut conn, &MIGRATIONS[..version as usize], &SystemClock)
             .expect("the older chain applies");
@@ -3135,12 +3170,11 @@ mod tests {
         .expect("a historical attempt row");
 
         drop(conn);
-        HISTORICAL_PATH
     }
 
     /// The assertions `03-migration-rollout.md` states for every migrated row,
     /// whichever version the database started at.
-    fn assert_everything_migrated_to_ephemeral(store: &SqliteStore, historical_path: &str) {
+    fn assert_everything_migrated_to_ephemeral(store: &SqliteStore) {
         assert_eq!(store.schema_version(), SCHEMA_VERSION);
 
         let host = store.host(host_id()).expect("loads").expect("present");
@@ -3171,7 +3205,7 @@ mod tests {
         assert!(!attempt.holds_slot_lease());
         assert_eq!(
             attempt.runtime_path(),
-            Path::new(historical_path),
+            Path::new(HISTORICAL_PATH),
             "`No journal row is rewritten merely to adopt the new default`: \
              recovery removes the exact directory the attempt was created in, \
              so a rewritten path would point cleanup at one it never used"
@@ -3185,10 +3219,10 @@ mod tests {
         // columns. Both later steps have to run, in order, on one open.
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("runner-manager.sqlite3");
-        let historical_path = a_database_at_version(&path, 1);
+        a_database_at_version(&path, 1);
 
         let store = SqliteStore::open(&path).expect("a version-1 database migrates");
-        assert_everything_migrated_to_ephemeral(&store, historical_path);
+        assert_everything_migrated_to_ephemeral(&store);
 
         let conn = store.lock();
         let mut stmt = conn
@@ -3209,15 +3243,15 @@ mod tests {
         // version-2 databases migrate every policy and attempt to ephemeral."
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("runner-manager.sqlite3");
-        let historical_path = a_database_at_version(&path, 2);
+        a_database_at_version(&path, 2);
 
         let store = SqliteStore::open(&path).expect("a version-2 database migrates");
-        assert_everything_migrated_to_ephemeral(&store, historical_path);
+        assert_everything_migrated_to_ephemeral(&store);
 
         // Migrating twice is what every subsequent start does.
         drop(store);
         let reopened = SqliteStore::open(&path).expect("reopens");
-        assert_everything_migrated_to_ephemeral(&reopened, historical_path);
+        assert_everything_migrated_to_ephemeral(&reopened);
     }
 
     #[test]
@@ -5014,13 +5048,13 @@ mod tests {
 
     // -- policy mutation fenced on the uncleaned count -----------------------
 
-    #[test]
-    fn the_policy_workspace_mutation_confirms_revision_and_uncleaned_count() {
-        // `03-migration-rollout.md`: "The policy store operation compares its
-        // revision and confirms the uncleaned policy-attempt count. Both checks
-        // happen inside the same SQLite write transaction as the mutation."
-        let store = store();
-        let mut policy = ScalePolicy::new(
+    /// The autoscale policy these tests mutate, in the store.
+    ///
+    /// The sibling of [`a_stored_host`]; `testkit`'s `fixtures::policy()` builds
+    /// exactly this object but is unreachable from here, for the
+    /// dev-dependency-cycle reason `tests/store_journal.rs` opens with.
+    fn a_stored_policy(store: &SqliteStore) -> ScalePolicy {
+        let policy = ScalePolicy::new(
             policy_id(),
             ScaleTarget::repository("o/r").expect("valid"),
             1,
@@ -5034,6 +5068,16 @@ mod tests {
             CachePolicy::default(),
         );
         store.insert_policy(&policy).expect("inserted");
+        policy
+    }
+
+    #[test]
+    fn the_policy_workspace_mutation_confirms_revision_and_uncleaned_count() {
+        // `03-migration-rollout.md`: "The policy store operation compares its
+        // revision and confirms the uncleaned policy-attempt count. Both checks
+        // happen inside the same SQLite write transaction as the mutation."
+        let store = store();
+        let mut policy = a_stored_policy(&store);
 
         let read_revision = policy.revision();
         let root = a_root("workspaces");
@@ -5092,20 +5136,7 @@ mod tests {
     #[test]
     fn a_workspace_policy_survives_a_guarded_write_and_a_reload() {
         let store = store();
-        let mut policy = ScalePolicy::new(
-            policy_id(),
-            ScaleTarget::repository("o/r").expect("valid"),
-            1,
-            host_id(),
-            PolicyMode::autoscale(
-                RoutingLabels::from_host_label(Label::new("rm-home-win-x64").expect("valid")),
-                0,
-                NonZeroU16::new(2).expect("non-zero"),
-            )
-            .expect("valid"),
-            CachePolicy::default(),
-        );
-        store.insert_policy(&policy).expect("inserted");
+        let mut policy = a_stored_policy(&store);
 
         let root = a_root("workspaces");
         let read_revision = policy.revision();
