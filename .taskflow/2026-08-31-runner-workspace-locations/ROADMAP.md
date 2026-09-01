@@ -71,8 +71,8 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
 | [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🔵 | run `01a05ca7-d5be-7000-829f-53ec8b04614e` | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
-| [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | 🔵 | run `01a05ca5-c42b-70bc-be54-ec55b8622c11` | 2026-09-01 |
-| [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
+| [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
+| [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | 🔵 | run `01a05d10-6cea-703f-bb33-6bdbe8c86ab7` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | 🔵 | run `01a05ca5-c4f0-70e7-8090-f88f09571984` | 2026-09-01 |
 | [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | planned | none | 2026-08-31 |
 | [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
@@ -162,6 +162,11 @@ directory untouched.
 - Started `c2-persistent-slot-allocation` and `d1-workspace-cli-read-models`
   as headless `pipeline drive` runs of `implement-task`.
 - Started `b2-windows-root-acl` as run
+- `c2-persistent-slot-allocation` landed as PR #38 / `dc62d57` with all seven
+  required checks green; every DoD item is covered by a named test in
+  `crates/agent/src/lifecycle.rs`.
+- Started `c3-persistent-cleanup-recovery` as run
+  `01a05d10-6cea-703f-bb33-6bdbe8c86ab7` once group C was free again.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
