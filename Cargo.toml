@@ -202,14 +202,41 @@ rand = "0.10.2"
 #                                primitive.
 #   Win32_Storage_FileSystem     `CreateFileW` taking `SECURITY_ATTRIBUTES`, for
 #                                `d1`'s restrictive handoff and `e3`'s
-#                                restrictive temporary file.
+#                                restrictive temporary file. Also
+#                                `GetVolumePathNameW` + `GetDriveTypeW`, which
+#                                `b1-runner-path-platform` uses to prove a
+#                                configured runner root is on a local volume
+#                                rather than a network share, and the
+#                                directory-handle open that answers "may this
+#                                account create entries here?" without writing
+#                                anything.
+#   Win32_System_SystemInformation
+#                                `GetSystemDirectoryW`.
+#                                `b1-runner-path-platform`'s Definition of Done
+#                                is that the Windows default runner root is
+#                                `<system-drive>\rman` derived "without reading
+#                                a mutable `%SystemDrive%` value as authority",
+#                                and this is the platform API that answers it.
+#   Win32_System_WindowsProgramming
+#                                the `DRIVE_*` return values of `GetDriveTypeW`.
+#                                They live in a different feature module from
+#                                the function itself; spelling the constants by
+#                                hand instead would be three magic numbers in
+#                                the one place that decides whether a runner
+#                                root is remote.
+#
+# Neither of the two `b1` modules adds a package to `Cargo.lock`: the `windows`
+# crate's features are cfg gates over its own generated bindings and pull in no
+# optional dependency.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 windows-service = "0.8.1"
 
