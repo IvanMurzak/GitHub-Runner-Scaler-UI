@@ -52,9 +52,13 @@ use crate::path::{LocalAbsolutePath, LocalPathError};
 
 /// Why a workspace configuration or allocation cannot exist.
 ///
-/// Every variant is reachable from a stored row, because every one of them is
-/// also a load-time refusal: `04-security-recovery.md` requires "load-time shape
-/// validation and immutable attempt workspace kind; unknown values fail closed".
+/// Every variant is a load-time refusal, because `04-security-recovery.md`
+/// requires "load-time shape validation and immutable attempt workspace kind;
+/// unknown values fail closed". The shape refusals below are already raised by
+/// [`WorkspacePolicy::from_persisted`] and [`AttemptWorkspace::from_persisted`];
+/// [`Self::InvalidPath`] is the `#[from]` conversion for the same load path and
+/// starts being raised when the stored root column is parsed into a
+/// [`LocalAbsolutePath`], which is `a2`'s store work rather than this crate's.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WorkspaceError {
     #[error(transparent)]
@@ -166,16 +170,39 @@ impl WorkspacePolicy {
     /// Configure persistence for a target of `scope`.
     ///
     /// The scope is an argument rather than something the caller checks first,
-    /// so D7 cannot be forgotten at a call site: there is no way to build a
-    /// persistent policy without stating whose it is.
+    /// so D7 is stated at the call site rather than remembered. It is *not* the
+    /// only gate: `Persistent { root }` is a public variant and so is
+    /// constructible directly, which is why
+    /// [`ScalePolicy::set_workspace_policy`](crate::policy::ScalePolicy::set_workspace_policy)
+    /// and [`Self::from_persisted`] re-run [`Self::permitted_for`] on the value
+    /// they are handed rather than trusting that it came through here.
     ///
     /// # Errors
     /// [`WorkspaceError::PersistentRequiresRepositoryScope`] for an
     /// organization target.
     pub fn persistent(root: LocalAbsolutePath, scope: TargetScope) -> Result<Self, WorkspaceError> {
+        let policy = WorkspacePolicy::Persistent { root };
+        policy.permitted_for(scope)?;
+        Ok(policy)
+    }
+
+    /// D7: whether a target of `scope` may hold this policy.
+    ///
+    /// The one place the rule and its message live, so the constructor, the
+    /// loader and `repo set-workspace` cannot drift apart. `scope` is matched
+    /// exhaustively on purpose: a future third scope has to make this decision
+    /// rather than inherit "not a repository, therefore refused".
+    ///
+    /// # Errors
+    /// [`WorkspaceError::PersistentRequiresRepositoryScope`] for a persistent
+    /// policy on an organization target.
+    pub(crate) const fn permitted_for(&self, scope: TargetScope) -> Result<(), WorkspaceError> {
         match scope {
-            TargetScope::Repository => Ok(WorkspacePolicy::Persistent { root }),
-            TargetScope::Organization => Err(WorkspaceError::PersistentRequiresRepositoryScope),
+            TargetScope::Repository => Ok(()),
+            TargetScope::Organization if self.is_persistent() => {
+                Err(WorkspaceError::PersistentRequiresRepositoryScope)
+            }
+            TargetScope::Organization => Ok(()),
         }
     }
 

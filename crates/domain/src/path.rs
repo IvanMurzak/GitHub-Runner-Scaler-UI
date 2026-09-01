@@ -462,11 +462,10 @@ fn validate_component(component: &str, platform: PathPlatform) -> Result<(), Loc
             component: component.to_string(),
         });
     }
-    let stem = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .trim_end_matches(' ');
+    // Windows resolves a device name from the part before the first `.`, so
+    // `com1.txt` is `COM1`. A component with no `.` at all is its own stem.
+    let (stem, _) = component.split_once('.').unwrap_or((component, ""));
+    let stem = stem.trim_end_matches(' ');
     if WINDOWS_RESERVED_NAMES
         .iter()
         .any(|name| stem.eq_ignore_ascii_case(name))

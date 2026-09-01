@@ -28,7 +28,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ScaleTarget, TargetScope,
+    Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ScaleTarget,
     ValidationError,
 };
 use crate::path::LocalAbsolutePath;
@@ -1206,11 +1206,11 @@ impl ScalePolicy {
     /// [`WorkspaceError::PersistentRequiresRepositoryScope`] for an organization
     /// target.
     pub fn set_workspace_policy(&mut self, workspace: WorkspacePolicy) -> Result<(), PolicyError> {
-        if workspace.is_persistent() && self.target.scope() != TargetScope::Repository {
-            return Err(PolicyError::Workspace(
-                WorkspaceError::PersistentRequiresRepositoryScope,
-            ));
-        }
+        // `WorkspacePolicy::Persistent` is a public variant, so a caller can
+        // build one without going through `WorkspacePolicy::persistent`. The
+        // rule is re-run here on the value actually handed in, through the one
+        // predicate that owns it.
+        workspace.permitted_for(self.target.scope())?;
         if self.workspace_policy != workspace {
             self.workspace_policy = workspace;
             self.revision = self.revision.saturating_add(1);
@@ -1483,7 +1483,7 @@ impl ScalePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{HostId, PolicyId};
+    use crate::model::{HostId, PolicyId, TargetScope};
 
     fn nz(v: u16) -> NonZeroU16 {
         NonZeroU16::new(v).expect("test capacity is non-zero")
