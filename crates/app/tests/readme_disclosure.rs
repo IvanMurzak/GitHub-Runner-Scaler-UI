@@ -468,3 +468,340 @@ fn the_install_instructions_state_the_properties_the_scripts_actually_have() {
          run` with no reading in between is the piped form with extra typing."
     );
 }
+
+// ----------------------------------------------------------------------------
+// THE WORKSPACE GUIDANCE IS THE ONLY NOTICE A USER GETS OF A TRUST BOUNDARY.
+// ----------------------------------------------------------------------------
+// `04-security-recovery.md` deliberately gives up the disposable-mode guarantee
+// for a repository that opts into persistent slots, and lists the things that
+// must be said before persistence is saved. CLI and TUI say them at the moment
+// of the change; the README is where somebody decides whether to make it at
+// all, which is earlier and is the decision that matters.
+//
+// `05-user-workflows.md` turns that into a list under "README acceptance", and
+// each assertion below is one of its items. They are measured inside the
+// customization section rather than anywhere in the file, so a sentence that
+// happens to appear in the install guidance cannot satisfy one of them.
+
+/// `## Customize your setup`, from its heading to the next `## `.
+fn customization_section(source: &str) -> &str {
+    const HEADING: &str = "\n## Customize your setup\n";
+    let start = source.find(HEADING).unwrap_or_else(|| {
+        panic!(
+            "README.md must carry a `## Customize your setup` section: it is \
+             where runner placement and persistent workspaces are explained, \
+             and `the_permission_disclosure_follows_the_operator_workflow` \
+             measures the disclosure's position against it."
+        )
+    });
+    let after = start + HEADING.len();
+    let end = source[after..]
+        .find("\n## ")
+        .map(|offset| after + offset)
+        .unwrap_or(source.len());
+    &source[start..end]
+}
+
+/// A section with runs of whitespace collapsed, so that an assertion about a
+/// sentence is not really an assertion about where the line was wrapped.
+fn flattened(section: &str) -> String {
+    section.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn the_customization_section_states_the_platform_runner_root_defaults() {
+    let source = readme();
+    let flat = flattened(customization_section(&source));
+
+    // `02-target-architecture.md`, "Platform defaults": the Windows root is a
+    // short path off the SYSTEM DRIVE, and `C:` is an example of that drive
+    // rather than the definition of it. Both spellings have to be present. The
+    // first is what a reader whose system drive is not `C:` needs; the second
+    // is what makes the first readable at a glance.
+    for (needle, why) in [
+        (
+            "%SystemDrive%",
+            "the Windows default is resolved from the system drive, which is \
+             not always `C:`, and the design says never to hard-code one",
+        ),
+        (
+            "C:\\rman",
+            "the concrete example that makes `%SystemDrive%\\rman` legible",
+        ),
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the customization section never mentions `{needle}`: {why}"
+        );
+    }
+
+    // The other half of the same table: nothing moved on macOS or Linux, and a
+    // reader on either has to be told that rather than left to infer it from a
+    // Windows path.
+    assert!(
+        flat.contains("macOS and Linux"),
+        "the customization section does not say what macOS and Linux do. \
+         `02-target-architecture.md` keeps `AppPaths::runtime_dir()` as their \
+         effective runner root, and an unchanged default still has to be \
+         stated where a changed one is."
+    );
+
+    // `05-user-workflows.md`, UX principles 1 and 2: show the effective path,
+    // and name whether it is default or configured. `host show` prints both.
+    assert!(
+        flat.contains("host show") && flat.contains("platform-default"),
+        "the customization section does not point at `host show` and the \
+         `platform-default` source it prints. Principle 1 of \
+         `05-user-workflows.md` is to show the effective path BEFORE asking \
+         anybody to change it."
+    );
+}
+
+#[test]
+fn the_customization_section_carries_every_complete_workspace_command() {
+    let source = readme();
+    let flat = flattened(customization_section(&source));
+
+    // ------------------------------------------------------------------------
+    // COMPLETE COMMANDS WITH PLACEHOLDERS, NOT PROSE ABOUT A FLAG.
+    // ------------------------------------------------------------------------
+    // `02-target-architecture.md` § Documentation names the two placeholders,
+    // and `05-user-workflows.md` § README acceptance requires one complete
+    // command for each. A reader copies a command; a reader does not assemble
+    // one out of a sentence describing it.
+    for (needle, why) in [
+        (
+            "runner-manager host set-runtime-root --path \"<GLOBAL_RUNNER_ROOT>\"",
+            "the global runner-root command, with the placeholder \
+             `02-target-architecture.md` spells",
+        ),
+        (
+            "runner-manager host reset-runtime-root",
+            "the way back to the platform default (Journey 2)",
+        ),
+        (
+            "runner-manager repo set-workspace OWNER/REPO",
+            "the repository workspace command",
+        ),
+        (
+            "--mode persistent",
+            "the mode that opts one repository in (Journey 3)",
+        ),
+        (
+            "--path \"<REPOSITORY_WORKSPACE_ROOT>\"",
+            "the repository placeholder, which is a DIFFERENT root from the \
+             host one and must not be shown as the same value",
+        ),
+        (
+            "runner-manager repo set-workspace OWNER/REPO --mode ephemeral",
+            "Journey 4, returning a repository to disposable workspaces. A \
+             feature documented with no way out is one nobody cautious will \
+             try.",
+        ),
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the customization section does not carry `{needle}`: {why}"
+        );
+    }
+}
+
+#[test]
+fn the_checkout_tip_stands_next_to_persistence_and_does_not_claim_to_be_it() {
+    let source = readme();
+    let section = customization_section(&source);
+    let flat = flattened(section);
+
+    // Journey 5 puts the two together on purpose: the repository command is
+    // what retains the directory, and `clean: false` is what stops the next
+    // checkout emptying it again. Either one alone leaves the user with no
+    // cache and no idea which half was missing.
+    let workspace_command = section
+        .find("--mode persistent")
+        .expect("checked by the test above: the persistent command is present");
+    let checkout = section.find("clean: false").unwrap_or_else(|| {
+        panic!(
+            "the customization section no longer shows the `actions/checkout` \
+             `clean: false` example. `05-user-workflows.md` Journey 5 requires \
+             the repository command and the checkout setting to be presented \
+             together."
+        )
+    });
+    assert!(
+        checkout > workspace_command,
+        "`clean: false` appears at byte {checkout}, BEFORE the persistent \
+         workspace command at byte {workspace_command}. The order is the \
+         instruction: persistence first, then the checkout setting that stops \
+         Git deleting what persistence retained."
+    );
+    assert!(
+        flat.contains("actions/checkout@v"),
+        "the checkout example must be the official action, pinned to a major \
+         version, rather than prose describing one"
+    );
+
+    // ------------------------------------------------------------------------
+    // THE CLAIM THIS SECTION USED TO MAKE WAS THE WRONG WAY ROUND.
+    // ------------------------------------------------------------------------
+    // Before persistent workspaces existed, the README offered `clean: false`
+    // under "Keep ignored build files during checkout" -- which is what a
+    // reader wanting a warm cache would search for, and is NOT what produces
+    // one: `runner-manager` removed the whole attempt directory afterwards
+    // whatever the checkout did. Now that the repository command exists the
+    // risk inverts, because a reader could take `clean: false` for the switch
+    // and skip the command. So the disclaimer has to survive any rewrite of
+    // this section, in both directions.
+    assert!(
+        flat.contains("`clean: false` on its own does not make a workspace persistent."),
+        "the customization section does not say, in as many words, that \
+         `clean: false` alone does not create persistence. \
+         `02-target-architecture.md` § Documentation: \"It must not claim \
+         `clean: false` alone makes an ephemeral workspace persistent.\"\n\
+         The section reads:\n{flat}"
+    );
+}
+
+#[test]
+fn the_persistent_guidance_states_the_trust_boundary_it_gives_up() {
+    let source = readme();
+    let flat = flattened(customization_section(&source)).to_lowercase();
+
+    // `04-security-recovery.md` § Operator-visible warnings, clause by clause.
+    // The CLI prints these as `PERSISTENT_TRUST_WARNING` when the change is
+    // saved; this is the same list in the place a reader meets the feature
+    // first, which is the only place a reader can still decide against it.
+    for (needle, clause) in [
+        (
+            "_work",
+            "files under `_work` are an input to later jobs on the same slot",
+        ),
+        (
+            "later jobs",
+            "the same clause, said in the direction the reader cares about",
+        ),
+        (
+            "branch and job boundaries",
+            "executable and generated content can cross branch and job \
+             boundaries",
+        ),
+        (
+            "fork",
+            "do not enable it for untrusted fork or pull-request workflows",
+        ),
+        ("pull-request", "the other half of the same clause"),
+        (
+            "not isolation",
+            "persistence is a trusted-workflow optimization and must not read \
+             as isolation that happens to start faster",
+        ),
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the customization section never mentions `{needle}`, so it does \
+             not state this clause of the persistent-mode warning: {clause}"
+        );
+    }
+
+    // Persistent mode is repository-scoped because an organization runner can
+    // accept jobs from more than one repository. A reader who is not told that
+    // will look for the `org` command and conclude the feature is half-built.
+    assert!(
+        flat.contains("organization"),
+        "the customization section does not say why persistence is \
+         repository-scoped. `04-security-recovery.md`: \"Persistent mode is \
+         rejected for organization policies because a runner may accept jobs \
+         from more than one repository.\""
+    );
+}
+
+#[test]
+fn the_customization_section_promises_no_directory_is_deleted_on_a_change() {
+    let source = readme();
+    let flat = flattened(customization_section(&source)).to_lowercase();
+
+    // `02-target-architecture.md`: "old directories are reported but never
+    // copied or removed". It is asserted TWICE, once per root, because the two
+    // changes are made with different commands on different days, and a reader
+    // who met the promise beside one of them has no reason to assume the
+    // other behaves the same way.
+    let promises = flat.matches("moved or deleted").count();
+    assert!(
+        promises >= 2,
+        "the customization section states `moved or deleted` {promises} \
+         time(s). Both the host runner root and the repository workspace root \
+         leave every existing directory in place when they change, and each \
+         command needs the promise beside it: it is what makes trying the \
+         feature reversible."
+    );
+    assert!(
+        !flat.contains("deletes the old")
+            && !flat.contains("removes the old")
+            && !flat.contains("moves the old"),
+        "the customization section claims a path change moves or deletes old \
+         data. It does neither, and `04-security-recovery.md` makes sentinel \
+         files surviving a mode, root and rollback change an acceptance gate."
+    );
+}
+
+#[test]
+fn data_dir_is_no_longer_offered_as_the_runner_placement_control() {
+    let source = readme();
+    let section = customization_section(&source);
+
+    // ------------------------------------------------------------------------
+    // THIS IS A CORRECTION, NOT A PREFERENCE, WHICH IS WHY IT IS PINNED.
+    // ------------------------------------------------------------------------
+    // `--data-dir` used to be documented as the way to place "config, state,
+    // logs and workspaces". `02-target-architecture.md` splits those: it still
+    // relocates application data, and "no longer represents the normal way to
+    // shorten or move runner workspaces". A reader who follows the old
+    // sentence to shorten a Windows build path moves the SQLite journal and
+    // leaves the runners exactly where they were.
+    let paragraph = section
+        .split("\n\n")
+        .find(|block| block.contains("`--data-dir DIR`"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the customization section no longer explains `--data-dir \
+                 DIR`. It still relocates config, state, logs and the package \
+                 cache, and dropping it is not what \
+                 `02-target-architecture.md` asks for."
+            )
+        });
+
+    assert!(
+        !paragraph.to_lowercase().contains("workspace"),
+        "the `--data-dir` paragraph still promises to place workspaces:\n  \
+         {paragraph}\n`--data-dir` relocates application data only. Runner \
+         placement is `host set-runtime-root`."
+    );
+    assert!(
+        paragraph.contains("host set-runtime-root"),
+        "the `--data-dir` paragraph does not name the command that DOES place \
+         runners:\n  {paragraph}\nUX principle 6 of `05-user-workflows.md` is \
+         to make a path error actionable by printing the command that fixes \
+         it, and naming the right command here is the same idea one step \
+         earlier."
+    );
+}
+
+#[test]
+fn the_readme_uses_no_em_dash() {
+    let source = readme();
+
+    // The prose convention for this repository's user-facing markdown, and the
+    // one character rule that can be checked cheaply. `--`, a colon or a comma
+    // survives every terminal, mail client and feed reader a README is read
+    // in. An em dash arrives from a word processor or a model, and is the one
+    // mark nobody types here on purpose.
+    let offenders: Vec<&str> = source
+        .lines()
+        .filter(|line| line.contains('\u{2014}'))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "README.md contains the em dash character on {} line(s):\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}

@@ -12,11 +12,12 @@ service.
 ## Features
 
 - ✅ **Works behind NAT:** no inbound ports, webhooks or servers.
-- ✅ **Starts clean:** every job gets a fresh runner and workspace.
+- ✅ **Starts clean:** every job gets a fresh runner, and a fresh workspace by default.
 - ✅ **Survives reboots:** auto-starts on Windows, macOS or Linux.
 - ✅ **Protects hardware:** set concurrency limits for every target.
 - ✅ **Tests safely:** monitor demand before enabling automation.
 - ✅ **Shows live activity:** inspect runners, jobs and errors in the TUI.
+- ✅ **Reuses build caches:** opt one repository into persistent workspaces.
 - ✅ **Secures credentials:** secrets stay in the operating system store.
 
 ## Install
@@ -177,6 +178,8 @@ runner-manager auth logout                                     # Purge the local
 
 runner-manager host show                                       # Show capacity, secret store and REST budget
 runner-manager host set-capacity N                             # Limit concurrent runners on this machine
+runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
+runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
@@ -186,6 +189,9 @@ runner-manager repo set-capacity OWNER/REPO --max-capacity N   # Change reposito
 runner-manager repo set-scale OWNER/REPO --enabled BOOL        # Enable scaling or drain runners
 runner-manager repo add-label OWNER/REPO --label LABEL         # Add a runs-on label
 runner-manager repo remove-label OWNER/REPO --label LABEL      # Remove a runs-on label
+runner-manager repo set-workspace OWNER/REPO --mode ephemeral  # Discard the workspace after every job
+runner-manager repo set-workspace OWNER/REPO \
+  --mode persistent --path PATH                                # Keep each slot's _work between jobs
 runner-manager repo remove OWNER/REPO [--purge]                # Remove a policy and optional retained data
 
 runner-manager org add ORG --host-label HOST                   # Add an organization in monitor-only mode
@@ -211,10 +217,46 @@ and use a distinct exit code for each failure class.
 
 ## Customize your setup
 
-### Keep ignored build files during checkout
+### Choose where runners work
 
-Want an existing checkout to keep Git-ignored build artifacts or local caches? Disable
-cleanup in `actions/checkout`:
+By default every job runs in a disposable workspace under this machine's runner root. On Windows
+that root is `%SystemDrive%\rman`, normally `C:\rman`, so build paths stay short. macOS and
+Linux keep using the platform runtime directory, exactly as before. `runner-manager host show`
+prints the effective path and whether it is `platform-default` or `configured`.
+
+Put runners somewhere else, such as a faster disk:
+
+```powershell
+runner-manager host set-runtime-root --path "<GLOBAL_RUNNER_ROOT>"
+```
+
+Go back to the platform default:
+
+```powershell
+runner-manager host reset-runtime-root
+```
+
+Both take effect for the next runner and never relocate a running one. Both are also refused
+while this host still has runner attempts it has not cleaned up, naming how many are active and
+how many are awaiting cleanup, so run them once the host is idle. No existing directory is moved
+or deleted.
+
+### Keep a build cache between jobs
+
+Slow to warm up? Give one repository persistent workspaces, so its dependency and build
+caches survive from job to job:
+
+```powershell
+runner-manager repo set-workspace OWNER/REPO `
+  --mode persistent `
+  --path "<REPOSITORY_WORKSPACE_ROOT>"
+```
+
+Concurrent runners lease numbered slots, `s1`, `s2` and so on, under that directory. Each
+slot keeps its `_work` directory for the next job that leases it. Runner binaries, the
+registration handoff and lifecycle files are still removed after every job.
+
+Then stop the workflow's checkout from wiping the cache it just filled:
 
 ```yaml
 - uses: actions/checkout@v7
@@ -222,14 +264,36 @@ cleanup in `actions/checkout`:
     clean: false
 ```
 
-This does not yet persist files between jobs. `runner-manager` still creates and removes a
-fresh workspace for every runner attempt.
+`clean: false` on its own does not make a workspace persistent. In the default mode
+`runner-manager` removes the whole workspace after every job, whatever the checkout does.
+Set the repository to persistent mode first; the checkout setting only stops Git from
+deleting the retained files.
 
-### Store runner data somewhere else
+Persistence is for workflows you trust, and it is not isolation. Files under `_work` become
+an input to later jobs on the same slot, so executables, generated sources and caches can
+cross branch and job boundaries. Keep untrusted fork and pull-request workflows on the
+default mode. Persistence is repository-scoped for the same reason: an organization policy
+can accept jobs from many repositories, so it always uses fresh workspaces.
 
-Add `--data-dir DIR` to any command to place config, state, logs and workspaces under your
-chosen root. Set `RUNNER_MANAGER_DATA_DIR` to make it the default. Re-run
-`runner-manager service install` after changing the root.
+Go back to a fresh workspace for every job:
+
+```powershell
+runner-manager repo set-workspace OWNER/REPO --mode ephemeral
+```
+
+Like the host commands, this one is refused while the repository still has a runner attempt
+awaiting cleanup, so run it once that repository is idle. Switching off persistence, or moving
+it to another directory, keeps every slot you already have: no old directory is moved or
+deleted. Remove the ones you no longer want yourself.
+
+### Store application data somewhere else
+
+Add `--data-dir DIR` to any command to place config, state, logs and the package cache under
+your chosen root. Set `RUNNER_MANAGER_DATA_DIR` to make it the default. On macOS and Linux it
+also moves the platform-default runner root, which lives inside that tree; on Windows it does
+not. Either way it is not how you choose runner placement: `host set-runtime-root` decides that,
+and it wins over the platform default everywhere. Re-run `runner-manager service install` after
+changing the root.
 
 ### Adapt the dashboard to your terminal
 

@@ -401,3 +401,269 @@ fn without_the_tag_the_product_registration_is_the_one_reported() {
     // product installed is not this suite's business, and asserting either way
     // is what made four tests depend on it.
 }
+
+// ----------------------------------------------------------------------------
+// THE README'S `## Commands` BLOCK IS PART OF THE SURFACE, NOT A DESCRIPTION OF
+// IT.
+// ----------------------------------------------------------------------------
+// The block is what a user copies. Every line in it is therefore a claim that
+// the binary accepts those arguments, and a claim nothing checked until this
+// existed: `--data-dir` moved, `set-runtime-root` arrived, `set-workspace`
+// arrived, and the README could have documented any spelling of any of them
+// without a single test noticing.
+//
+// So each documented line is fed to the REAL parser, and the set of families
+// and subcommands it names is compared against clap's own `--help` in both
+// directions. A command in the README and not in `--help` is a promise the
+// binary does not keep; a command in `--help` and not in the README is a
+// feature nobody can find.
+
+fn repository_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("the repository root must exist")
+}
+
+/// The README, with line endings normalised.
+///
+/// The repository does not pin `*.md` to LF, so a Windows checkout with
+/// `core.autocrlf=true` delivers CRLF and every offset below would be measured
+/// against a different string than CI on Linux sees.
+fn readme() -> String {
+    let path = repository_root().join("README.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// Every command line inside the README's `## Commands` fenced block, with
+/// backslash continuations joined and trailing `# comments` removed.
+fn documented_command_lines(source: &str) -> Vec<String> {
+    const HEADING: &str = "\n## Commands\n";
+    let heading = source.find(HEADING).unwrap_or_else(|| {
+        panic!("README.md must carry a `## Commands` section listing the surface")
+    });
+    let rest = &source[heading + HEADING.len()..];
+    let fence = rest
+        .find("```bash\n")
+        .expect("the `## Commands` section must open a ```bash block");
+    let body = &rest[fence + "```bash\n".len()..];
+    let close = body
+        .find("\n```")
+        .expect("the ```bash block under `## Commands` must be closed");
+    let body = &body[..close];
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for raw in body.lines() {
+        // The comment is documentation about the command, not part of it, and
+        // it is stripped before the continuation is joined so that a comment
+        // on a continued line cannot swallow the rest of it.
+        let code = match raw.find(" #") {
+            Some(offset) => &raw[..offset],
+            None => raw,
+        }
+        .trim();
+        if code.is_empty() {
+            continue;
+        }
+        if let Some(head) = code.strip_suffix('\\') {
+            pending.push_str(head.trim_end());
+            pending.push(' ');
+            continue;
+        }
+        pending.push_str(code);
+        lines.push(std::mem::take(&mut pending).trim().to_string());
+    }
+    assert!(
+        pending.is_empty(),
+        "a documented command ends with a `\\` continuation and no following \
+         line: {pending}"
+    );
+    lines
+}
+
+/// One documented line turned into arguments the parser can be given.
+///
+/// `[...]` marks an OPTIONAL part, and the optional parts are kept rather than
+/// dropped: an optional flag the binary no longer accepts is exactly the kind
+/// of stale documentation this test is for. `a|b` is a choice, and the first
+/// alternative stands for it. Everything else that is a metavariable becomes a
+/// value of the right shape, because `host set-capacity N` has to reach the
+/// parser as a number or it would fail here for a reason the README did not
+/// cause.
+fn arguments_for(line: &str, path_value: &str) -> Vec<String> {
+    line.split_whitespace()
+        .map(|token| token.replace(['[', ']'], ""))
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            match token.split('|').next().unwrap_or(&token) {
+                "OWNER/REPO" => "owner/repo",
+                "ORG" => "acme",
+                "HOST" => "home",
+                "LABEL" => "gpu",
+                "BOOL" => "true",
+                "N" => "1",
+                "PATH" | "DIR" => path_value,
+                literal => literal,
+            }
+            .to_string()
+        })
+        .collect()
+}
+
+/// `--help` is appended rather than running the command for real, because
+/// `auth login`, `daemon run`, `service install` and `tui` all *do* something.
+///
+/// It is not a weaker check than it looks. clap resolves the subcommand path,
+/// rejects an unknown flag and rejects a value outside a `ValueEnum` even when
+/// `--help` is present -- `an_undocumented_flag_is_still_refused_with_help`
+/// below pins exactly that, so a run of this suite cannot pass because the
+/// parser stopped looking.
+#[test]
+fn every_command_the_readme_documents_is_accepted_by_the_real_parser() {
+    let source = readme();
+    let lines = documented_command_lines(&source);
+    assert!(
+        !lines.is_empty(),
+        "no commands were parsed out of the README's `## Commands` block, \
+         which would make every assertion below vacuous"
+    );
+
+    // One disposable root for the whole loop: `--help` short-circuits before the
+    // binary reads or creates anything under it, so a directory per documented
+    // line would buy nothing and cost two dozen filesystem round trips.
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let path_value = temporary.path().join("root").display().to_string();
+
+    for line in &lines {
+        let arguments = arguments_for(line, &path_value);
+        let (binary, arguments) = arguments
+            .split_first()
+            .expect("a documented line has at least one token");
+        assert_eq!(
+            binary, "runner-manager",
+            "every line in the `## Commands` block must invoke the product: {line}"
+        );
+
+        let mut command = runner_manager(temporary.path());
+        command.args(arguments);
+        command.arg("--help");
+        let outcome = run(command);
+        assert_eq!(
+            outcome.code, 0,
+            "the README documents `{line}`, and the real parser refuses it \
+             (exit {}):\n{}\nThe `## Commands` block is copied by users; a \
+             line in it that the binary does not accept is a defect in the \
+             product, not in its documentation.",
+            outcome.code, outcome.stderr
+        );
+    }
+}
+
+/// The negative control for the test above: `--help` does not make clap accept
+/// anything at all.
+#[test]
+fn an_undocumented_flag_is_still_refused_with_help() {
+    for arguments in [
+        // A plausible misspelling of the flag `host set-runtime-root` takes.
+        vec!["host", "set-runtime-root", "--root", "C:/rman", "--help"],
+        // A value outside `WorkspaceMode`.
+        vec![
+            "repo",
+            "set-workspace",
+            "owner/repo",
+            "--mode",
+            "shared",
+            "--help",
+        ],
+    ] {
+        let temporary = tempfile::tempdir().expect("a temporary directory");
+        let outcome = run({
+            let mut command = runner_manager(temporary.path());
+            command.args(&arguments);
+            command
+        });
+        assert_eq!(
+            outcome.code,
+            2,
+            "`{}` must be clap's usage error. If it is not, appending \
+             `--help` short-circuits parsing and \
+             `every_command_the_readme_documents_is_accepted_by_the_real_parser` \
+             proves nothing; stderr: {}",
+            arguments.join(" "),
+            outcome.stderr
+        );
+    }
+}
+
+/// Both directions between the README and clap's own `--help`.
+#[test]
+fn the_readme_documents_exactly_the_commands_the_help_text_lists() {
+    let source = readme();
+    let lines = documented_command_lines(&source);
+
+    // clap's own answer, read once per family: this suite already spawns the
+    // binary a few dozen times and re-reading a help page per documented line
+    // would multiply that for no extra signal.
+    let families: Vec<(String, Vec<String>)> = commands_in(&help_for(&[]))
+        .into_iter()
+        .map(|family| {
+            let subcommands = commands_in(&help_for(&[family.as_str()]));
+            (family, subcommands)
+        })
+        .collect();
+
+    // What the README names, as `family` or `family subcommand`.
+    let mut documented: Vec<String> = Vec::new();
+    for line in &lines {
+        let tokens: Vec<&str> = line.split_whitespace().skip(1).collect();
+        let Some(family) = tokens.first().copied() else {
+            panic!("a documented line names no command: {line}");
+        };
+        let subcommands = families
+            .iter()
+            .find(|(name, _)| name == family)
+            .map(|(_, subcommands)| subcommands.as_slice())
+            .unwrap_or_default();
+        let named = match tokens.get(1).copied() {
+            Some(second) if subcommands.iter().any(|name| name == second) => {
+                format!("{family} {second}")
+            }
+            _ => family.to_string(),
+        };
+        documented.push(named);
+    }
+    documented.sort();
+    documented.dedup();
+
+    // What `--help` lists, in the same spelling.
+    let mut listed: Vec<String> = Vec::new();
+    for (family, subcommands) in &families {
+        if subcommands.is_empty() {
+            listed.push(family.clone());
+        } else {
+            listed.extend(
+                subcommands
+                    .iter()
+                    .map(|subcommand| format!("{family} {subcommand}")),
+            );
+        }
+    }
+    listed.sort();
+    listed.dedup();
+
+    assert!(
+        !listed.is_empty(),
+        "no commands were parsed out of `--help`, so this comparison would be \
+         vacuous"
+    );
+    assert_eq!(
+        documented, listed,
+        "the README's `## Commands` block and `--help` must name the same \
+         commands. A command only in `--help` is one no user can discover; a \
+         command only in the README is a promise the binary does not keep."
+    );
+}
