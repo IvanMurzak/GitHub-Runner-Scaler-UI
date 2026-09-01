@@ -3297,6 +3297,34 @@ mod tests {
         (root, context, target)
     }
 
+    /// Opens Host Settings the way an operator does — the `h` key, then the
+    /// load the shell's effect boundary hands back.
+    fn open_host_settings(state: &mut AppState, context: &crate::cli::Context) {
+        let effects = reduce(state, key(KeyCode::Char('h')));
+        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
+            panic!("h must load the host form")
+        };
+        state.settings.execute(context, command);
+    }
+
+    /// Walks the focus to one control with the arrow keys alone.
+    ///
+    /// Deliberately not `state.settings.focus = n`: a control that cannot be
+    /// reached from the keyboard is an accessibility defect, and assigning the
+    /// index would hide it.
+    fn focus_control(state: &mut AppState, control: settings::Control) {
+        let index = state
+            .settings
+            .controls()
+            .iter()
+            .position(|candidate| *candidate == control)
+            .unwrap_or_else(|| panic!("{control:?} is not on this screen"));
+        for _ in 0..index {
+            reduce(state, key(KeyCode::Down));
+        }
+        assert_eq!(state.settings.focused(), Some(control));
+    }
+
     /// The reducer's half of `05-user-workflows.md`'s interaction rules.
     ///
     /// A path control that did not own the keyboard was the whole risk here:
@@ -3316,26 +3344,10 @@ mod tests {
             30,
         );
 
-        let effects = reduce(&mut state, key(KeyCode::Char('h')));
-        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
-            panic!("h must load the host form")
-        };
-        state.settings.execute(&context, command);
+        open_host_settings(&mut state, &context);
 
         // Open the path editor with the keyboard alone.
-        let control = state
-            .settings
-            .controls()
-            .iter()
-            .position(|control| *control == settings::Control::HostRunnerRoot)
-            .unwrap();
-        for _ in 0..control {
-            reduce(&mut state, key(KeyCode::Down));
-        }
-        assert_eq!(
-            state.settings.focused(),
-            Some(settings::Control::HostRunnerRoot)
-        );
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
         reduce(&mut state, key(KeyCode::Enter));
         assert!(state.settings.is_editing());
 
@@ -3392,20 +3404,8 @@ mod tests {
     fn leaving_a_settings_screen_by_mouse_closes_the_path_editor() {
         let (_root, context, _target) = workspace_context();
         let mut state = AppState::new(PresentationState::default(), 120, 30);
-        let effects = reduce(&mut state, key(KeyCode::Char('h')));
-        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
-            panic!("h must load the host form")
-        };
-        state.settings.execute(&context, command);
-        let control = state
-            .settings
-            .controls()
-            .iter()
-            .position(|control| *control == settings::Control::HostRunnerRoot)
-            .unwrap();
-        for _ in 0..control {
-            reduce(&mut state, key(KeyCode::Down));
-        }
+        open_host_settings(&mut state, &context);
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
         reduce(&mut state, key(KeyCode::Enter));
         assert!(state.settings.is_editing());
 
@@ -3452,20 +3452,8 @@ mod tests {
     fn c_copies_the_focused_path_control_on_a_settings_screen() {
         let (_root, context, _target) = workspace_context();
         let mut state = AppState::new(PresentationState::default(), 120, 30);
-        let effects = reduce(&mut state, key(KeyCode::Char('h')));
-        let Effect::Settings(command) = effects.into_iter().next().unwrap() else {
-            panic!("h must load the host form")
-        };
-        state.settings.execute(&context, command);
-        let control = state
-            .settings
-            .controls()
-            .iter()
-            .position(|control| *control == settings::Control::HostRunnerRoot)
-            .unwrap();
-        for _ in 0..control {
-            reduce(&mut state, key(KeyCode::Down));
-        }
+        open_host_settings(&mut state, &context);
+        focus_control(&mut state, settings::Control::HostRunnerRoot);
         let Effect::Copy(copied) = reduce(&mut state, key(KeyCode::Char('c'))).remove(0) else {
             panic!("c must copy the focused path")
         };

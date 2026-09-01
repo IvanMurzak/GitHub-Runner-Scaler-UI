@@ -1276,12 +1276,14 @@ impl SettingsUi {
     /// directory, and the platform default the fixture's own data directory
     /// resolves to -- and a substitution made after the wrap would pin the
     /// characters while leaving the wrap points machine-specific.
-    fn lay_out(logical: Vec<FormLine>, width: usize, compact: bool, focus: usize) -> Vec<FormLine> {
-        let mut logical = logical;
+    fn lay_out(
+        mut logical: Vec<FormLine>,
+        width: usize,
+        compact: bool,
+        focus: usize,
+    ) -> Vec<FormLine> {
         if compact {
-            logical.retain(|line| {
-                line.essential || (line.control.is_some() && line.control == Some(focus))
-            });
+            logical.retain(|line| line.essential || line.control == Some(focus));
         }
         let mut physical = Vec::with_capacity(logical.len());
         for line in logical {
@@ -1645,7 +1647,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool)
         .rows(width, compact)
         .into_iter()
         .map(|row| {
-            let focused = row.control.is_some() && row.control == Some(ui.focus);
+            let focused = row.control == Some(ui.focus);
             focus_line(focused, row.text)
         })
         .collect();
@@ -2761,7 +2763,7 @@ mod tests {
 
         // The one string two independent stores cannot be asked to agree on.
         //
-        // Decision `D1` makes the Windows default `<system-drive>man` -- one
+        // Decision `D1` makes the Windows default `<system-drive>\rman` -- one
         // constant for every store on the machine -- while macOS and Linux keep
         // the platform-standard runtime directory, which is derived from the
         // data directory. These two surfaces must have *separate* stores,
