@@ -212,8 +212,8 @@ pub enum RunnerRootError {
     #[error(
         "the operating system did not report a system directory, so the default runner \
          root <system-drive>\\{WINDOWS_RUNNER_ROOT_NAME} cannot be resolved: {source}. \
-         Configure one explicitly with \
-         `runner-manager host set-runtime-root --path <PATH>`."
+         Configure one explicitly with `{}`.",
+        RootOwner::Host.remediation()
     )]
     SystemDirectoryUnavailable {
         #[source]
@@ -222,8 +222,8 @@ pub enum RunnerRootError {
 
     #[error(
         "the system directory {got:?} is not a usable volume for the default runner \
-         root: {source}. Configure one explicitly with \
-         `runner-manager host set-runtime-root --path <PATH>`."
+         root: {source}. Configure one explicitly with `{}`.",
+        RootOwner::Host.remediation()
     )]
     SystemDirectoryUnusable {
         got: String,
@@ -585,7 +585,7 @@ pub fn default_runner_root(app_paths: &AppPaths) -> Result<LocalAbsolutePath, Ru
 /// every overlap, containment and locality decision below is taken against,
 /// which is what makes a symlinked parent unable to smuggle a root into the
 /// application-data tree or onto a network share.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct Projection {
     /// The deepest ancestor that exists, canonicalised.
     anchor: PathBuf,
@@ -593,8 +593,14 @@ struct Projection {
     anchor_as_written: PathBuf,
     /// `anchor` with the missing components appended.
     canonical: PathBuf,
-    /// The components that do not exist yet, outermost first.
-    missing: Vec<OsString>,
+    /// How many components do not exist yet.
+    ///
+    /// A count rather than the names, because that is the whole question: the
+    /// leaf is there (`0`), is the one directory the caller may create (`1`),
+    /// or is too deep to create. The names are consumed building `canonical`
+    /// and are the *as-written* spellings, so reading them afterwards would
+    /// mean reasoning about a path that has not been resolved.
+    missing: usize,
 }
 
 /// Whether an error means "this path is not there", as opposed to "this path
@@ -650,16 +656,15 @@ fn project(path: &Path) -> Result<Projection, RunnerRootError> {
             source,
         })?;
 
-    missing.reverse();
     let mut canonical = anchor.clone();
-    for component in &missing {
+    for component in missing.iter().rev() {
         canonical.push(component);
     }
     Ok(Projection {
         anchor,
         anchor_as_written: cursor,
         canonical,
-        missing,
+        missing: missing.len(),
     })
 }
 
@@ -796,11 +801,7 @@ impl<'a> RootPreflight<'a> {
     /// A preflight that asks the real operating system.
     #[must_use]
     pub fn new(app_paths: &'a AppPaths) -> Self {
-        Self {
-            app_paths,
-            others: Vec::new(),
-            probe: &HOST_FILESYSTEM,
-        }
+        Self::with_probe(app_paths, &HOST_FILESYSTEM)
     }
 
     /// A preflight that asks `probe` instead.
@@ -875,20 +876,26 @@ impl<'a> RootPreflight<'a> {
         // directory is permitted for exactly the paths at or below `runtime/`.
         // Equality with a protected directory, and ancestry over one, stay
         // refused everywhere.
-        let runtime = text_of(self.app_paths.runtime_dir());
-        let inside_runtime = runtime.as_deref().is_some_and(|runtime| {
-            matches!(
-                overlap_of(candidate, runtime, native),
-                Overlap::Same | Overlap::Inside
-            )
-        });
+        //
+        // Asked lazily, because only a descent reaches it. On the canonical
+        // pass `text_of` is a full ancestor walk plus `canonicalize`, so
+        // computing this up front would make every *accepted* root pay a
+        // syscall for an answer no branch ever reads.
+        let inside_runtime = || {
+            text_of(self.app_paths.runtime_dir()).is_some_and(|runtime| {
+                matches!(
+                    overlap_of(candidate, &runtime, native),
+                    Overlap::Same | Overlap::Inside
+                )
+            })
+        };
 
         for (label, path) in self.protected() {
             let Some(other) = text_of(path) else {
                 continue;
             };
             let relation = overlap_of(candidate, &other, native);
-            if relation == Overlap::Disjoint || (relation == Overlap::Inside && inside_runtime) {
+            if relation == Overlap::Disjoint || (relation == Overlap::Inside && inside_runtime()) {
                 continue;
             }
             return Err(RunnerRootError::Overlaps {
@@ -981,7 +988,7 @@ impl<'a> RootPreflight<'a> {
         }
 
         let projection = project(candidate)?;
-        match projection.missing.len() {
+        match projection.missing {
             0 => {}
             1 => {
                 if !projection.anchor.is_dir() {
@@ -1039,7 +1046,7 @@ impl<'a> RootPreflight<'a> {
             // `05-user-workflows.md` requires an unwritable parent to "show
             // `host set-runtime-root` or `repo set-workspace` remediation",
             // which is what the owner was carried here for.
-            return Err(if projection.missing.is_empty() {
+            return Err(if projection.missing == 0 {
                 RunnerRootError::NotWritable {
                     path: projection.anchor_as_written.clone(),
                     remediation: owner.remediation(),
@@ -1061,7 +1068,7 @@ impl<'a> RootPreflight<'a> {
         Ok(PreflightedRoot {
             root: root.clone(),
             canonical: projection.canonical,
-            exists: projection.missing.is_empty(),
+            exists: projection.missing == 0,
             filesystem,
         })
     }
@@ -1561,6 +1568,18 @@ mod tests {
         workspaces: PathBuf,
     }
 
+    impl Fixture {
+        /// Preflights `path` as the host root, against the real filesystem.
+        ///
+        /// The construction every test below shares. The tests that are *about*
+        /// the owner, or about a probe the machine cannot provide, build a
+        /// [`RootPreflight`] themselves with `against` or `with_probe`; for the
+        /// rest, the owner is ceremony rather than the thing under test.
+        fn check(&self, path: &Path) -> Result<PreflightedRoot, RunnerRootError> {
+            RootPreflight::new(&self.paths).check(&RootOwner::Host, &native(path))
+        }
+    }
+
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths = AppPaths::rooted_at(root.path());
@@ -1802,8 +1821,8 @@ mod tests {
         let root = fixture.workspaces.join("rman");
         std::fs::create_dir(&root).expect("the root is created");
 
-        let checked = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let checked = fixture
+            .check(&root)
             .expect("a plain writable directory on this machine is usable");
 
         assert!(checked.exists());
@@ -1820,9 +1839,7 @@ mod tests {
         let fixture = fixture();
         let root = fixture.workspaces.join("rman");
 
-        let checked = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
-            .expect("a creatable leaf is usable");
+        let checked = fixture.check(&root).expect("a creatable leaf is usable");
 
         assert!(!checked.exists());
         assert_eq!(checked.leaf_to_create(), Some(root.as_path()));
@@ -1837,8 +1854,8 @@ mod tests {
         let fixture = fixture();
         let root = fixture.workspaces.join("a").join("b");
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("only the leaf may be missing");
         let RunnerRootError::MissingParents {
             deepest_existing, ..
@@ -1855,8 +1872,8 @@ mod tests {
         let root = fixture.workspaces.join("rman");
         std::fs::write(&root, b"not a directory").expect("the file is created");
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("a file is not a runner root");
         assert!(
             matches!(error, RunnerRootError::ExistingFile { .. }),
@@ -1871,8 +1888,8 @@ mod tests {
         std::fs::write(&file, b"notes").expect("the file is created");
         let root = file.join("rman");
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("nothing can be created inside a file");
         assert!(
             matches!(error, RunnerRootError::ParentIsNotADirectory { .. }),
@@ -1890,8 +1907,8 @@ mod tests {
             return;
         }
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("a runner root is the base of a recursive cleanup");
         assert!(
             matches!(error, RunnerRootError::Symlinked { .. }),
@@ -1911,8 +1928,8 @@ mod tests {
             return;
         }
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("a dangling link is not a runner root");
         assert!(
             matches!(error, RunnerRootError::Symlinked { .. }),
@@ -1931,8 +1948,8 @@ mod tests {
         // lands inside it.
         let root = bridge.join("rman");
 
-        let error = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(&root))
+        let error = fixture
+            .check(&root)
             .expect_err("the canonical check must see through the link");
         let RunnerRootError::Overlaps { relation, .. } = &error else {
             panic!("expected Overlaps, got {error}");
@@ -2379,8 +2396,8 @@ mod tests {
         assert!(message.contains("nfs"), "{message}");
         assert!(message.contains("local volume"), "{message}");
 
-        let message = RootPreflight::new(&fixture.paths)
-            .check(&RootOwner::Host, &native(fixture.paths.state_dir()))
+        let message = fixture
+            .check(fixture.paths.state_dir())
             .expect_err("application data is protected")
             .to_string();
         assert!(
