@@ -46,7 +46,7 @@ and user documentation.
 | # | Decision | Status | Blocks |
 |---|---|---|---|
 | 1 | Approve `%SystemDrive%\rman`, configurable host root, repository-only persistent slots, local absolute paths, non-destructive reconfiguration, and CLI/TUI parity. | GO recorded 2026-08-31. | Task derivation |
-| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%\rman`. | Pending pilot evidence. | `b2` and Wave 5 exit |
+| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%\rman`. | Owner authorized `b2` implementation 2026-09-01; approval of the produced ACL evidence is still required before merge. | `b2` merge and Wave 5 exit |
 | 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Owner intent recorded; final GO pending evidence. | Wave 5 exit |
 | 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Not granted. Mocked and local work may proceed. | Only the specific live test |
 | 5 | Confirm a verified version-2 database backup before any real host is migrated to schema 3. | Pending real-host rollout. | Production rollout only |
@@ -69,7 +69,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ✅ | [PR #34](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/34), merge `66ba5a8` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | ✅ | run `01a05ac7-b731-704b-8753-5aa75b0b4fdb` | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
-| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | planned | none | 2026-09-01 |
+| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🔵 | native worker | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | 🔵 | native worker | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
@@ -153,5 +153,8 @@ directory untouched.
   existed, so the row returned to `planned`.
 - Started `c2-persistent-slot-allocation` and `d1-workspace-cli-read-models`
   concurrently with native `taskflow-implementer` worktree isolation.
-- Withheld `b2-windows-root-acl` because human gate 2 is still pending.
+- Owner clarified human gate 2 as approval of the produced ACL result rather
+  than a precondition to implementation, and authorized `b2-windows-root-acl`
+  to run. Its work holds at 🟣 for gate-2 approval before merge.
+- Started `b2-windows-root-acl` with native worktree isolation.
 
