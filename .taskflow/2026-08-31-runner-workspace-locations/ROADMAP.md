@@ -49,7 +49,7 @@ and user documentation.
 | 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%
 man`. | GO recorded 2026-09-02 on PR #40 head `686872f` with all seven checks green. | Cleared |
 | 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Owner intent recorded; final GO pending evidence. | Wave 5 exit |
-| 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Not granted. Mocked and local work may proceed. | Only the specific live test |
+| 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Granted 2026-09-02 for the fixture-backed `e2e` acceptance suite only. | Cleared for that suite |
 | 5 | Confirm a verified version-2 database backup before any real host is migrated to schema 3. | Pending real-host rollout. | Production rollout only |
 
 ## Dependency graph
@@ -252,6 +252,15 @@ directory untouched.
   structure, but the scenarios skip without the disposable GitHub fixture
   that human gate 4 has not authorized. The CI `e2e` jobs finished in three
   to seven seconds, which is the skip path, not an executed demonstration.
+- Owner granted human gate 4 for the fixture-backed `e2e` suite so the gate 3
+  demonstration can actually run. It cannot be run from this session: the
+  suite binds its evidence to `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`,
+  `GITHUB_SHA`, `RUNNER_ARCH` and a 256-bit `RUNNER_MANAGER_E2E_CHALLENGE`,
+  so only a real Actions run can produce evidence, and supplying those
+  values by hand would forge exactly the property the binding exists for.
+- The four guard inputs are unset on this repository, so `e2e` currently
+  takes its skip path. Gate 3 stays open until the owner provisions the
+  disposable fixture and the suite runs green.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
