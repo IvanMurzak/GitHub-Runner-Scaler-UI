@@ -129,6 +129,34 @@ fn ci_checks_that_no_self_test_fixture_survives_the_installer_job() {
 }
 
 #[test]
+fn ci_checks_that_the_real_default_runner_root_was_put_back() {
+    // `b2`'s boot test is the one place in this repository that deliberately
+    // creates and re-permissions the machine's own `%SystemDrive%\rman`,
+    // because `04-security-recovery.md`'s security gate is worded about that
+    // directory rather than about a temporary stand-in. It reverts the change,
+    // and the claim that the revert is real is worth exactly as much as the
+    // check that runs afterwards -- which is the same argument the fixture leak
+    // check above rests on.
+    let (path, source) = ci_workflow();
+    assert!(
+        source.contains("the runner-root rollback did not restore this host"),
+        "{}'s installer job must assert that the real default runner root was put back. The \
+         boot-mode privileged test creates it on purpose; without this step a rollback that \
+         silently stopped working would leave a re-permissioned directory on every host that \
+         ran the suite, and nothing would say so.",
+        path.display()
+    );
+    // Two `if: always()` steps now, and the count is what keeps this from
+    // passing on the strength of the fixture leak check's one.
+    assert!(
+        source.matches("if: always()").count() >= 2,
+        "{}'s runner-root check must run even when the tests failed -- which is precisely when \
+         a rollback would have been skipped.",
+        path.display()
+    );
+}
+
+#[test]
 fn every_test_in_the_privileged_file_is_ignored_by_default() {
     // The complement of the two tests above. They guard the job that runs these
     // tests; this guards the property that makes the job necessary -- that an

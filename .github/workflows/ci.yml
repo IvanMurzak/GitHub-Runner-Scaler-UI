@@ -267,3 +267,21 @@ jobs:
           }
           Write-Output 'no self-test fixture remains'
 
+      # `b2`'s boot test is the one place in this repository that deliberately
+      # creates and re-permissions the machine's real default runner root,
+      # because `04-security-recovery.md`'s security gate is worded about that
+      # exact directory. It reverts the change; this is the check that the
+      # revert is real. A fresh runner has no such directory, so its presence
+      # afterwards means the rollback did not run or did not work.
+      # `privileged_tests_are_wired_into_ci.rs` asserts this step still exists.
+      - name: Assert the real default runner root was put back
+        if: always()
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:SystemDrive 'rman'
+          if (Test-Path $root) {
+            Write-Error "$root survived the privileged tests; the runner-root rollback did not restore this host"
+            exit 1
+          }
+          Write-Output "$root does not exist, as it did not before"
+

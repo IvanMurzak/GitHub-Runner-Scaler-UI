@@ -18,6 +18,17 @@
 //! service manager launched it, and it appends one line to the file named by its
 //! first argument every time it starts. The test reads the timestamps.
 //!
+//! # And one more, for `b2`
+//!
+//! *"A boot service running as LocalSystem can create, materialize, and clean a
+//! child below the default root"* has the same shape as the restart
+//! requirement: no amount of reading a security descriptor proves it, because
+//! the question is what a **different account** can do — and the account is
+//! LocalSystem, which a test process cannot become. So when a second path
+//! argument is given, this creates a child below it, writes a file inside, and
+//! removes the child again, exactly as an attempt directory's life cycle does.
+//! The outcome goes beside the heartbeat and the test reads it.
+//!
 //! # Why an example rather than a second binary
 //!
 //! `a1` owns every manifest in this workspace, and adding a `[[bin]]` would mean
@@ -52,15 +63,104 @@ fn record_start(path: &std::path::Path) {
     }
 }
 
-/// The heartbeat file this instance was registered with.
+/// The path arguments this instance was registered with, in order.
 ///
-/// It arrives as a launch argument rather than through the environment because
+/// They arrive as launch arguments rather than through the environment because
 /// a service does not inherit the installing process's environment: Windows
 /// hands a service the machine environment, and systemd and launchd hand a job
 /// only what their definition names. An argument is the one channel all three
 /// carry unchanged.
+///
+/// Flags are skipped rather than counted past. A boot registration also carries
+/// `--windows-service-host`, and where the installer chooses to put it is not
+/// something this fixture should have an opinion about.
+fn path_arguments() -> impl Iterator<Item = PathBuf> {
+    std::env::args_os()
+        .skip(1)
+        .filter(|argument| !argument.to_string_lossy().starts_with("--"))
+        .map(PathBuf::from)
+}
+
+/// The heartbeat file this instance was registered with.
 fn heartbeat_path() -> Option<PathBuf> {
-    std::env::args_os().nth(1).map(PathBuf::from)
+    path_arguments().next()
+}
+
+/// The runner root this instance was asked to exercise, when it was asked to.
+fn runner_root() -> Option<PathBuf> {
+    path_arguments().nth(1)
+}
+
+/// Where the outcome of that exercise is written.
+///
+/// Beside the heartbeat rather than inside it: the test parses the heartbeat as
+/// `<timestamp>\t<pid>` lines, and a third kind of line there would break the
+/// restart measurement that file exists for.
+fn workspace_outcome_path(heartbeat: &std::path::Path) -> PathBuf {
+    let mut name = heartbeat.as_os_str().to_owned();
+    name.push(".workspace");
+    PathBuf::from(name)
+}
+
+/// The whole life cycle of an attempt directory, in three calls.
+///
+/// Create a child of the runner root, materialize something inside it, and
+/// clean it up again. Each one needs a different right, which is why all three
+/// are here rather than just the first: creating the child needs
+/// `FILE_ADD_SUBDIRECTORY` on the root, writing inside it needs the root's ace
+/// to have been *inherited* by the child, and removing it needs `DELETE` on
+/// everything the recursion reaches.
+fn exercise_workspace(root: &std::path::Path) -> std::io::Result<()> {
+    let child = root.join(format!("selftest-{}", std::process::id()));
+    std::fs::create_dir(&child)?;
+    std::fs::write(child.join("marker"), b"a job would put its checkout here")?;
+    std::fs::remove_dir_all(&child)
+}
+
+/// Records what [`exercise_workspace`] did, including why it could not.
+///
+/// The failure is written down rather than allowed to end the process: a
+/// service that exits before reporting itself started tells the test only that
+/// something went wrong, and the interesting part of an access-control failure
+/// is which of the three calls refused.
+fn record_workspace(heartbeat: &std::path::Path, root: &std::path::Path) {
+    let outcome = match exercise_workspace(root) {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => format!("error: {error}"),
+    };
+    let _ = std::fs::write(workspace_outcome_path(heartbeat), outcome);
+}
+
+/// Whether the installer marked this launch as the Service Control Manager's.
+///
+/// Read from the arguments rather than guessed at, and read from the constant
+/// the installer itself writes rather than from a copy of its spelling.
+#[cfg(windows)]
+fn launched_by_the_service_control_manager() -> bool {
+    std::env::args_os()
+        .any(|argument| argument == runner_manager_platform::service::WINDOWS_SCM_HOST_ARGUMENT)
+}
+
+/// Records a start, exercises the runner root if asked to, and parks.
+///
+/// The shape every manager but the Windows Service Control Manager starts: an
+/// ordinary process that runs until it is terminated. launchd and systemd both
+/// do this, and so does Windows **Task Scheduler**, which is what a login-mode
+/// registration is — there is no dispatcher to connect to and nothing to report.
+fn run_as_an_ordinary_process() -> ! {
+    let Some(path) = heartbeat_path() else {
+        std::process::exit(2);
+    };
+    record_start(&path);
+    if let Some(root) = runner_root() {
+        record_workspace(&path, &root);
+    }
+    // Park until the manager signals. The default `SIGTERM` disposition ends
+    // the process, which is exactly the clean stop launchd and systemd expect,
+    // so no handler is installed; Task Scheduler terminates it outright.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 #[cfg(windows)]
@@ -85,6 +185,18 @@ mod host {
     /// apart from a run as a service without a flag either side could get
     /// wrong.
     pub fn run() {
+        // Only a *boot* registration is a service. A login registration is a
+        // Task Scheduler task, which starts an ordinary process: there is no
+        // service controller to connect to, and connecting anyway would end
+        // this process at the dispatcher's refusal before it wrote a single
+        // heartbeat line. The two are told apart by the marker the installer
+        // puts on the SCM registration and on no other -- the same
+        // discriminator the product's own daemon reads -- rather than by a
+        // failed connection, which is indistinguishable from a genuine SCM
+        // failure that must still be reported.
+        if !super::launched_by_the_service_control_manager() {
+            super::run_as_an_ordinary_process();
+        }
         if let Err(error) = windows_service::service_dispatcher::start("", ffi_service_main) {
             eprintln!("this fixture only runs under the Windows Service Control Manager: {error}");
             std::process::exit(2);
@@ -123,6 +235,9 @@ mod host {
         // the service started would be a line the test could see for a start
         // the manager does not consider to have happened.
         super::record_start(&path);
+        if let Some(root) = super::runner_root() {
+            super::record_workspace(&path, &root);
+        }
 
         let _ = stop_rx.recv();
         let _ = status_handle.set_service_status(ServiceStatus {
@@ -138,16 +253,7 @@ mod host {
     /// launchd and systemd both start an ordinary process and both stop it with
     /// `SIGTERM`, so there is no dispatcher to connect to and nothing to report.
     pub fn run() {
-        let Some(path) = super::heartbeat_path() else {
-            std::process::exit(2);
-        };
-        super::record_start(&path);
-        // Park until the service manager signals. The default `SIGTERM`
-        // disposition ends the process, which is exactly the clean stop both
-        // managers expect, so no handler is installed.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        super::run_as_an_ordinary_process();
     }
 }
 

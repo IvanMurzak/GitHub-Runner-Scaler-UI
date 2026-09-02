@@ -15,6 +15,7 @@
 //! | [`os`] | Host OS/architecture, and their standing in GitHub's documented support matrix | `f2` warns on ARM64 and reports the Linux-only container limitation |
 //! | [`paths`] | The `config/`, `state/`, `runtime/`, `logs/` directories, in platform-standard locations | everything that touches disk |
 //! | [`runner_root`] | Where runner workspaces go: the short `%SystemDrive%` default, and the local/writable/non-overlapping check every configured root passes | `b2`'s default-root ACL, `c1`'s ephemeral launch, `d1`'s mutations |
+//! | [`runner_root_access`] | Creating the default runner root, and the protected DACL that keeps unrelated local users out of it | `b2`'s Windows acceptance test, `f1`'s security gate |
 //! | [`lock`] | The single-instance lock and the runtime allocation lock | `e1`'s allocation, `e3`'s restart recovery |
 //! | [`process`] | Spawn, observe, terminate; a process identity a recycled PID cannot forge; the restrictive JIT handoff | `e3` adopts a live process without starting a duplicate |
 //! | [`logging`] | Structured allowlist logging with unconditional redaction | `07-security.md`'s secret-injection log scan |
@@ -52,5 +53,6 @@ pub mod os;
 pub mod paths;
 pub mod process;
 pub mod runner_root;
+pub mod runner_root_access;
 pub mod secrets;
 pub mod service;

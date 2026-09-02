@@ -194,12 +194,96 @@ rather than papered over.
 
 ---
 
+## The runner root, and who may write inside it
+
+The four directories above are *application data*. The directory jobs actually
+run in is separate, and on Windows it is not under the operator's profile at
+all: `%SystemDrive%\rman`, short enough that a deep `_work` checkout does not
+hit `MAX_PATH`.
+
+That location has a problem the four application-data directories do not. The
+security descriptor of `C:\` carries an inherit-only entry of roughly this
+shape:
+
+```text
+(A;OICIIO;SDGXGWGR;;;AU)
+```
+
+— *Authenticated Users*, delete plus generic read, write and execute, inherited
+by every child of `C:\`. A directory created there with inheritance left on is
+writable by **every account that can log in to the machine**. Runner workspaces
+hold executable content that a later job re-enters, so this is a
+code-execution boundary rather than an untidiness.
+
+`service install` therefore creates the directory with a *protected* descriptor
+— `SE_DACL_PROTECTED`, the `P` in SDDL — which severs inheritance, and admits
+exactly:
+
+| Trustee | Rights | Why |
+|---|---|---|
+| `SY` — LocalSystem | Full control, `(OI)(CI)` | A boot registration runs as LocalSystem |
+| `BA` — Administrators | Full control, `(OI)(CI)` | Already outside this threat model, per `07-security.md`; without it an operator cannot clean up after a service account they are not signed in as |
+| the selected account | `FRFWFXSD`, `(OI)(CI)` | A login registration or a foreground daemon runs as an ordinary user |
+
+The third row is the one that is easy to get wrong. A login-mode registration is
+a Task Scheduler task rendered with `RunLevel = LeastPrivilege`, so it runs
+under the operator's **filtered** token — in which the Administrators group is
+present but *deny-only*. A descriptor naming only `SY` and `BA` grants such a
+task nothing at all, even when the operator is an administrator. So the account
+is named explicitly, and `service set-start-mode` reconciles it: the account
+admitted for login mode is not the account boot mode needs, and the two move
+together.
+
+The selected account gets modify rather than full control on purpose.
+`FILE_ALL_ACCESS` includes `WRITE_DAC` and `WRITE_OWNER`, the two rights that
+would let the admitted account undo the protection. Read, write, execute and
+delete is everything "create a child, materialize a runner into it, clean it up
+again" needs; deleting a whole attempt tree works because the inherited entry
+grants `DELETE` on every entry below it.
+
+### What it refuses, and what it never touches
+
+- **An existing broad root fails the install, and is not repaired.** If
+  `%SystemDrive%\rman` is already there and ordinary local users can write it,
+  `service install` refuses and says so. Tightening it instead would silently
+  adopt whatever a local account had already put inside a directory whose
+  contents get executed. The remedy is to remove or empty it, or to point the
+  runner root somewhere else.
+- **A custom root is reported, never re-permissioned.** An operator's
+  `host set-runtime-root` path is theirs. `service status` describes what it
+  grants; nothing in this feature rewrites it. The enforcement is structural
+  rather than a check: the function that applies a descriptor resolves the
+  platform default itself and takes no path argument.
+- **Rollback is real, and what cannot be rolled back is said.** A failed install
+  removes a directory it created and restores a descriptor it replaced. A
+  directory that existed beforehand is never deleted, and when its previous
+  descriptor cannot be put back the failure message says so rather than leaving
+  the operator to discover it.
+- **`service status` reports but does not fail.** A broad root appears as a note
+  with the remedy. It does not make an otherwise healthy host report an error,
+  because a directory that predates this feature is not a fault in the
+  registration — refusing it is `service install`'s job, and `service install`
+  runs as the account with the authority to know.
+
+macOS and Linux are unaffected. Their default runner root is the `runtime/`
+directory attempts have always used, whose permissions `AppPaths` already
+establishes; there is no inherited broad grant to sever and relocating live
+workspaces to solve a problem those platforms do not have would be a
+regression.
+
+---
+
 ## What `service uninstall` may delete
 
 Exactly one thing: the registration, plus the install record
 (`config/service.toml`) that describes it. No backend may delete anything else,
 and `Uninstalled::preserved` names the four directories that survive so that
 `service uninstall` can print them.
+
+The runner root survives too, and is deliberately absent from that list because
+it is not application data: it may hold an operator's retained workspaces, and
+deleting a directory this product created but did not fill is not `uninstall`'s
+call to make.
 
 The stored GitHub token is untouched too. Purging it is `auth logout`, which is
 a separate, deliberate act — `05-infrastructure.md`: *"The installer rollback is
