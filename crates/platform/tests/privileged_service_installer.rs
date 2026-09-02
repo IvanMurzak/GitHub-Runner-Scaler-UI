@@ -948,6 +948,28 @@ fn a_boot_service_creates_materializes_and_cleans_a_child_below_the_real_default
     let paths = fixture.paths.clone();
 
     let root = default_runner_root(&paths).expect("this host resolves a default runner root");
+
+    // `f1`'s Definition of Done asks the privileged evidence to show the
+    // *resolved system drive*, and this is the one run in the repository where
+    // that resolution is a real machine's rather than a table row's. Asserted as
+    // a shape, because re-deriving the drive here would mean reading
+    // `%SystemDrive%` -- the mutable value `b1` forbids the product from
+    // trusting, so a test that read it could agree with a product that read it
+    // too. `runner_root::tests::the_windows_default_ignores_a_rewritten_system_drive_variable`
+    // is where that property is measured; what is measured here is that the
+    // directory this privileged run then creates and re-permissions really is a
+    // short root at a drive root and not the long application path.
+    let rendered = root.as_str();
+    let mut characters = rendered.chars();
+    assert!(
+        characters
+            .next()
+            .is_some_and(|drive| drive.is_ascii_uppercase())
+            && characters.as_str().eq_ignore_ascii_case(":\\rman")
+            && rendered.len() == 7,
+        "the privileged evidence must be about `<system drive>:\\rman`, got {rendered:?}"
+    );
+
     let mut prepared = match ensure_default_root(&paths, &RootAdmission::LocalSystem) {
         Ok(prepared) => RestoresTheRealRunnerRoot(Some(prepared)),
         Err(error @ RootAccessError::BroadExistingAccess { .. }) => panic!(

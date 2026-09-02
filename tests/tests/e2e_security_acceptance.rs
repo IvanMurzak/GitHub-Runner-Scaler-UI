@@ -37,7 +37,7 @@ const SCENARIOS: [(&str, &str); 8] = [
     ("two_host_contention", "repository"),
 ];
 
-const SECURITY_GATES: [&str; 10] = [
+const SECURITY_GATES: [&str; 11] = [
     "process_inspection",
     "two_job_contamination",
     "runner_package_integrity",
@@ -45,6 +45,14 @@ const SECURITY_GATES: [&str; 10] = [
     "revoked_token_rejection",
     "credential_free_config_and_sqlite",
     "workspace_removal",
+    // `f1`. `workspace_removal` above is the disposable guarantee -- the whole
+    // attempt directory goes. This is the persistent one, which is its opposite
+    // in one direction and identical in the other: `_work` survives, and every
+    // piece of runner state beside it does not. `04-security-recovery.md`
+    // requires both to be green at the same time, because a build that satisfied
+    // either alone is a build that has either lost the cache the feature exists
+    // for or leaked the runner identity the trust boundary rests on.
+    "persistent_workspace_retention",
     "restart_duplicate_poll",
     "budget_refusal",
     "post_condition",
@@ -557,6 +565,38 @@ fn security_gate_workspace_removal_requires_success_and_failure_evidence() -> Re
         "success and failure cleanup are required"
     );
     recipe_declares_product_mutants(recipe)
+}
+
+/// The persistent guarantee is asserted *beside* the disposable one, and both
+/// have to be mutation-sensitive.
+///
+/// `04-security-recovery.md`'s security gates say "Persistent two-job tests
+/// prove intended `_work` retention and unintended runner-state removal
+/// simultaneously". Two tests, because retention alone and ordering alone are
+/// each satisfiable by a build that fails the other.
+#[test]
+fn security_gate_persistent_retention_requires_both_directions() -> Result<()> {
+    let persistent = recipe("persistent_workspace_retention");
+    ensure!(
+        persistent.tests.len() == 2,
+        "retention-with-scrubbing and the scrub ordering are both required"
+    );
+    ensure!(
+        persistent
+            .tests
+            .iter()
+            .all(|test| test.mutant == Some("skip_workspace_cleanup")),
+        "both persistent controls must be driven by the cleanup-bypass mutant"
+    );
+    recipe_declares_product_mutants(persistent)?;
+    // And the disposable gate is still there, unweakened: the pair is the
+    // evidence, not either one.
+    ensure!(
+        recipe("workspace_removal").tests.len() == 2
+            && !recipe("two_job_contamination").tests.is_empty(),
+        "the disposable guarantees must stay green alongside the persistent one"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1276,6 +1316,11 @@ fn run_security_gates(
         execute_recipe(recipe("revoked_token_rejection"), fixture, evidence_root)?,
         credential_free_state_gate(fixture, evidence_root)?,
         execute_recipe(recipe("workspace_removal"), fixture, evidence_root)?,
+        execute_recipe(
+            recipe("persistent_workspace_retention"),
+            fixture,
+            evidence_root,
+        )?,
         execute_recipe(recipe("restart_duplicate_poll"), fixture, evidence_root)?,
         budget_refusal_gate()?,
     ];
@@ -1429,6 +1474,33 @@ const WORKSPACE_TESTS: &[TestCase] = &[
         mutant: Some("skip_workspace_cleanup"),
     },
 ];
+/// `f1`'s persistent half of the workspace gates.
+///
+/// Both entries drive `skip_workspace_cleanup`, which
+/// `LifecycleLauncher::scrub_workspace` places *in front of* its dispatch on the
+/// journalled workspace kind, precisely so that a skipped cleanup is equally
+/// observable in a disposable directory and in a persistent slot. Injecting it
+/// here therefore proves these two tests are really reaching the cleanup that
+/// removes runner state, rather than asserting over a slot nothing ever wrote.
+///
+/// The first test carries the "simultaneously" clause on its own: one run in
+/// which the retained `_work` marker survives *and* the runner package, the
+/// registration identity, the process-identity sidecar and the encoded JIT
+/// handoff are all proven absent before the second job starts. The second adds
+/// the ordering that makes the first safe -- the slot is scrubbed only after the
+/// process has been signalled and observed gone.
+const PERSISTENT_RETENTION_TESTS: &[TestCase] = &[
+    TestCase {
+        package: "runner-manager-agent",
+        filter: "two_sequential_jobs_keep_the_checkout_and_start_without_the_earlier_runner_state",
+        mutant: Some("skip_workspace_cleanup"),
+    },
+    TestCase {
+        package: "runner-manager-agent",
+        filter: "a_persistent_slot_is_scrubbed_only_after_the_process_is_signalled_and_gone",
+        mutant: Some("skip_workspace_cleanup"),
+    },
+];
 const DUPLICATE_TESTS: &[TestCase] = &[TestCase {
     package: "runner-manager-domain",
     filter: "mutant_ignoring_in_flight_attempts_is_detected",
@@ -1456,6 +1528,10 @@ fn recipe(name: &str) -> &'static GateRecipe {
         GateRecipe {
             gate: "workspace_removal",
             tests: WORKSPACE_TESTS,
+        },
+        GateRecipe {
+            gate: "persistent_workspace_retention",
+            tests: PERSISTENT_RETENTION_TESTS,
         },
         GateRecipe {
             gate: "restart_duplicate_poll",

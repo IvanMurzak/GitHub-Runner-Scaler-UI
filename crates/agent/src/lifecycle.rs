@@ -5608,6 +5608,64 @@ mod tests {
         assert_eq!(harness.attempt(first.id).state(), AttemptState::Cleaned);
     }
 
+    /// The disposable half of the same injection, which had no test of its own.
+    ///
+    /// `scrub_workspace`'s ephemeral arm turns a failed `remove_dir_all` into
+    /// `"attempt workspace could not be removed"`, and until now that branch was
+    /// only reachable in theory: every injected-deletion test drove a persistent
+    /// slot. The property is the same one and matters for the same reason --
+    /// `04-security-recovery.md`'s "Cleanup partly fails and the slot is reused
+    /// anyway" -- but the disposable guarantee is stronger, so a cleanup that
+    /// reported success over a directory it had not removed would be the
+    /// contamination gate failing silently rather than a slot being held.
+    #[tokio::test]
+    async fn an_injected_deletion_failure_leaves_a_disposable_attempt_uncleaned() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let runtime = attempt.runtime_path().to_path_buf();
+        assert_eq!(attempt.workspace(), AttemptWorkspace::Ephemeral);
+        harness.conclude(attempt.id);
+
+        let Some(block) = BlockedDeletion::inject(&runtime.join("held-open-subdirectory")) else {
+            eprintln!(
+                "skipped: this account cannot be refused a deletion, so no partial deletion can be injected"
+            );
+            return;
+        };
+
+        let refusal = harness
+            .launcher
+            .clean(attempt.id)
+            .await
+            .expect_err("a deletion that failed may not report a removed workspace");
+        let rendered = refusal.reason.to_string();
+        assert!(
+            rendered.contains("could not be removed"),
+            "the refusal names what happened: {rendered}"
+        );
+        assert_ne!(
+            harness.attempt(attempt.id).state(),
+            AttemptState::Cleaned,
+            "an attempt whose directory is still on disk is not cleaned"
+        );
+        assert!(
+            runtime.is_dir(),
+            "the directory the removal could not finish is still there, which is the fact the journal must keep agreeing with"
+        );
+
+        // And the ordinary retry -- the reconciler's next terminal sweep --
+        // finishes it once the obstruction is gone.
+        block.release();
+        harness
+            .launcher
+            .clean(attempt.id)
+            .await
+            .expect("the retried cleanup completes");
+        assert!(!runtime.exists(), "the whole attempt directory goes");
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+    }
+
     #[tokio::test]
     async fn changing_a_repository_back_to_ephemeral_leaves_every_old_slot_untouched() {
         let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
@@ -5913,6 +5971,54 @@ mod tests {
         assert!(
             slot.symlink_metadata().is_ok(),
             "the link is left for the operator rather than removed as if it were ours"
+        );
+    }
+
+    /// The Windows half of the case above.
+    ///
+    /// Containment was proven only on Unix, and a symbolic link is the wrong
+    /// instrument to prove it with on Windows: creating one needs a privilege an
+    /// ordinary workflow does not have, so it is not the substitution an
+    /// attacker would reach for. A **junction** needs none, which makes it both
+    /// the realistic attack and the one this repository must refuse -- and
+    /// `04-security-recovery.md` names it in the same breath as the symlink for
+    /// exactly that reason.
+    #[cfg(windows)]
+    #[test]
+    fn a_slot_root_replaced_by_a_junction_is_refused_before_anything_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("operator-data");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("do-not-delete.txt");
+        fs::write(
+            &sentinel,
+            b"an operator's data, outside every approved root",
+        )
+        .unwrap();
+
+        // The lexical half of containment passes -- `s1` under the root the
+        // journal names -- and canonical resolution is what catches it.
+        let inside = root.path().join("inside");
+        fs::create_dir(&inside).unwrap();
+        let slot = inside.join("s1");
+        let Some(()) = plant_junction(&slot, &outside) else {
+            eprintln!("skipped: this machine would not create a directory junction");
+            return;
+        };
+
+        assert_eq!(
+            verify_journalled_slot(&slot, nz(1), None)
+                .unwrap_err()
+                .refusal,
+            SlotRefusal::Containment
+        );
+        assert!(
+            sentinel.exists(),
+            "the refusal resolved the junction and reached the operator's data"
+        );
+        assert!(
+            slot.symlink_metadata().is_ok(),
+            "the junction is left for the operator rather than removed as if it were ours"
         );
     }
 
