@@ -150,10 +150,11 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
             match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => pending.push(path),
                 Ok(_) => {
-                    found.insert(path.clone(), Some(fs::read(&path).unwrap_or_default()));
+                    let bytes = fs::read(&path).unwrap_or_default();
+                    found.insert(path, Some(bytes));
                 }
                 Err(_) => {
-                    found.insert(path.clone(), Some(Vec::new()));
+                    found.insert(path, Some(Vec::new()));
                 }
             }
         }

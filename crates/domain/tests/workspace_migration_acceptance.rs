@@ -207,6 +207,15 @@ impl VersionTwoHost {
         self.root.path().join("persistent")
     }
 
+    /// The directory a lease on `slot` names, as the journal stores it.
+    fn slot_path(&self, slot: u16) -> String {
+        self.persistent_root()
+            .join(format!("s{slot}"))
+            .to_str()
+            .expect("a temporary path is UTF-8")
+            .to_owned()
+    }
+
     /// Applies migrations 1 and 2 and writes the rows a shipped build left.
     fn write_version_two_database(&self) {
         let conn = Connection::open(self.database()).expect("a temporary database is openable");
@@ -465,13 +474,7 @@ fn the_slot_lease_index_guards_an_upgraded_database_immediately() {
         .policy_id(repository)
         .state(AttemptState::Busy)
         .persistent_slot(slot.get())
-        .runtime_path(
-            host.persistent_root()
-                .join("s1")
-                .to_str()
-                .expect("a temporary path is UTF-8")
-                .to_owned(),
-        )
+        .runtime_path(host.slot_path(slot.get()))
         .build();
     store
         .record_attempt(&first)
@@ -482,13 +485,7 @@ fn the_slot_lease_index_guards_an_upgraded_database_immediately() {
         .policy_id(repository)
         .state(AttemptState::Allocated)
         .persistent_slot(slot.get())
-        .runtime_path(
-            host.persistent_root()
-                .join("s1")
-                .to_str()
-                .expect("a temporary path is UTF-8")
-                .to_owned(),
-        )
+        .runtime_path(host.slot_path(slot.get()))
         .build();
     let refusal = store
         .record_attempt(&second)
@@ -615,13 +612,7 @@ fn a_backup_taken_before_the_upgrade_rolls_back_without_deleting_a_directory() {
                 .policy_id(repository)
                 .state(AttemptState::Busy)
                 .persistent_slot(1)
-                .runtime_path(
-                    host.persistent_root()
-                        .join("s1")
-                        .to_str()
-                        .expect("a temporary path is UTF-8")
-                        .to_owned(),
-                )
+                .runtime_path(host.slot_path(1))
                 .build(),
         )
         .expect("slot s1 is leased");

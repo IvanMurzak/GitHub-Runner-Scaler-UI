@@ -136,24 +136,22 @@ fn evidence() -> BTreeMap<String, BTreeMap<String, Item>> {
 /// so a doc comment naming `fn something(` does not put a name into the index
 /// and cannot make a stale reference look live.
 fn declared_function(line: &str) -> Option<String> {
+    const MODIFIERS: [&str; 8] = [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "default ",
+        "const ",
+        "async ",
+        "unsafe ",
+        "extern ",
+    ];
     let mut rest = line.trim_start();
-    loop {
-        let stripped = [
-            "pub(crate) ",
-            "pub(super) ",
-            "pub ",
-            "default ",
-            "const ",
-            "async ",
-            "unsafe ",
-            "extern ",
-        ]
+    while let Some(next) = MODIFIERS
         .iter()
-        .find_map(|modifier| rest.strip_prefix(modifier));
-        match stripped {
-            Some(next) => rest = next.trim_start(),
-            None => break,
-        }
+        .find_map(|modifier| rest.strip_prefix(modifier))
+    {
+        rest = next.trim_start();
     }
     let name = rest.strip_prefix("fn ")?.split(['(', '<']).next()?.trim();
     (!name.is_empty()
