@@ -46,7 +46,8 @@ and user documentation.
 | # | Decision | Status | Blocks |
 |---|---|---|---|
 | 1 | Approve `%SystemDrive%\rman`, configurable host root, repository-only persistent slots, local absolute paths, non-destructive reconfiguration, and CLI/TUI parity. | GO recorded 2026-08-31. | Task derivation |
-| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%man`. | GO recorded 2026-09-02 on PR #40 head `686872f` with all seven checks green. | Cleared |
+| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%
+man`. | GO recorded 2026-09-02 on PR #40 head `686872f` with all seven checks green. | Cleared |
 | 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Owner intent recorded; final GO pending evidence. | Wave 5 exit |
 | 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Not granted. Mocked and local work may proceed. | Only the specific live test |
 | 5 | Confirm a verified version-2 database backup before any real host is migrated to schema 3. | Pending real-host rollout. | Production rollout only |
@@ -234,6 +235,10 @@ directory untouched.
 - Started `f1-workspace-security-acceptance` as run
   `01a06362-f188-70df-99f5-b5dfb9cd9171`, the last task. It needs no live
   credentials, so human gate 4 is not engaged.
+- The `f1` run committed its acceptance suite as `8b11b69`, then its drive
+  process died during `code-review` without recording an outcome. The run
+  state stayed resumable, and the resumed drive reported `step.crash_resume`
+  for that step, so no work was lost and nothing was re-implemented.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
