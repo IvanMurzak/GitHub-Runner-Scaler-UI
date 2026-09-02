@@ -76,7 +76,7 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | ✅ | [PR #41](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/41), merge `bb30b7f` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | ✅ | [PR #39](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/39), merge `1ece70c` | 2026-09-01 |
 | [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | ✅ | [PR #42](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/42), merge `48230a4` | 2026-09-01 |
-| [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | 🔵 | run `01a06362-f188-70df-99f5-b5dfb9cd9171` | 2026-09-02 |
+| [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | ✅ | [PR #44](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/44), merge `f3400ce` | 2026-09-02 |
 | [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | ✅ | [PR #43](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/43), merge `17af664` | 2026-09-01 |
 
 ## Required evidence before merge
@@ -239,6 +239,19 @@ directory untouched.
   process died during `code-review` without recording an outcome. The run
   state stayed resumable, and the resumed drive reported `step.crash_resume`
   for that step, so no work was lost and nothing was re-implemented.
+- `f1-workspace-security-acceptance` landed as PR #44 / `f3400ce` with all
+  seven required checks green. Every task row is now ✅.
+- `docs/workspace-acceptance-evidence.md` records each required-evidence item
+  against named tests and privileged pilot commands, and
+  `crates/app/tests/workspace_acceptance_evidence.rs` fails when a recorded
+  test no longer exists, a pilot command leaves `ci.yml`, or the item list
+  disagrees with this ROADMAP while this Taskflow is still in the tree.
+- Human gate 3 is NOT satisfied by this run. The two-job demonstration exists
+  as declared e2e recipes driven by the `skip_workspace_cleanup` mutant, and
+  `security_gate_persistent_retention_requires_both_directions` asserts that
+  structure, but the scenarios skip without the disposable GitHub fixture
+  that human gate 4 has not authorized. The CI `e2e` jobs finished in three
+  to seven seconds, which is the skip path, not an executed demonstration.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
