@@ -163,11 +163,18 @@ fn declared_function(line: &str) -> Option<String> {
     .then(|| name.to_owned())
 }
 
-/// Every function declared in the repository's Rust sources.
+/// Every **test** function declared in the repository's Rust sources.
 ///
 /// Built once and searched, rather than one `grep` per name: the document names
 /// more than eighty tests and this suite should not walk the tree eighty times.
-fn declared_functions() -> BTreeSet<String> {
+///
+/// Only functions carrying a test attribute go into the index, and that is the
+/// whole point. An index of every `fn` would be satisfied by a private helper
+/// that happens to share the name, and — the failure this file exists for — by a
+/// gate whose `#[test]` was removed: the function would still be declared, this
+/// suite would stay green, and the gate would have silently stopped running. The
+/// attribute is what makes a name a gate, so the attribute is what is indexed.
+fn declared_test_functions() -> BTreeSet<String> {
     let root = repository_root();
     let mut found = BTreeSet::new();
     let mut pending = vec![root.join("crates"), root.join("tests")];
@@ -183,9 +190,26 @@ fn declared_functions() -> BTreeSet<String> {
                 }
                 pending.push(path);
             } else if path.extension().is_some_and(|extension| extension == "rs") {
+                // A test attribute applies to the next declaration in its own
+                // attribute block, so the marker survives the further attributes
+                // and doc comments that may sit between the two — `#[cfg(windows)]
+                // #[test]` and `#[test] #[ignore = "..."]` are both in this tree —
+                // and is dropped at the blank line that separates one item from
+                // the next.
+                let mut attributed = false;
                 for line in read(&path).lines() {
+                    let trimmed = line.trim();
                     if let Some(name) = declared_function(line) {
-                        found.insert(name);
+                        if attributed {
+                            found.insert(name);
+                        }
+                        attributed = false;
+                    } else if trimmed.is_empty() {
+                        attributed = false;
+                    } else if trimmed.starts_with("#[")
+                        && (trimmed.contains("test]") || trimmed.contains("test("))
+                    {
+                        attributed = true;
                     }
                 }
             }
@@ -193,7 +217,7 @@ fn declared_functions() -> BTreeSet<String> {
     }
     assert!(
         found.len() > 500,
-        "the function index found only {} names, which means the walk did not reach \
+        "the test index found only {} names, which means the walk did not reach \
          the sources and every assertion below would be vacuous",
         found.len()
     );
@@ -260,7 +284,7 @@ fn normalise(raw: &str) -> String {
 #[test]
 fn every_recorded_gate_names_a_test_that_still_exists() {
     let sections = evidence();
-    let declared = declared_functions();
+    let declared = declared_test_functions();
 
     for section in ["Required evidence", "Rollback gate", "Secret posture"] {
         assert!(
@@ -281,10 +305,11 @@ fn every_recorded_gate_names_a_test_that_still_exists() {
             for test in &entry.tests {
                 assert!(
                     declared.contains(test),
-                    "`{item}` names the test `{test}`, and no `fn {test}` exists in this \
-                     repository. Either the test was renamed -- update \
+                    "`{item}` names the test `{test}`, and no `#[test] fn {test}` exists in \
+                     this repository. Either the test was renamed -- update \
                      docs/workspace-acceptance-evidence.md to the new name -- or the gate \
-                     it provided has been deleted, which is a decision rather than a typo."
+                     it provided has been deleted, or has stopped being a test and no \
+                     longer runs, each of which is a decision rather than a typo."
                 );
                 checked += 1;
             }

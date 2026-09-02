@@ -339,8 +339,13 @@ fn every_adversarial_root_is_refused_by_both_commands_and_changes_nothing() {
                 outcome.stdout,
                 outcome.stderr
             );
+            // The remedy line specifically, not the binary's name anywhere in
+            // the output: `error: ...` messages quote the operator's own path,
+            // and a real installation's application data directory is itself
+            // called `runner-manager`, so a looser match would go on passing
+            // over a refusal that had dropped its `try:` line entirely.
             assert!(
-                outcome.stderr.contains("runner-manager"),
+                outcome.stderr.contains("try: runner-manager "),
                 "{}: `05-user-workflows.md`'s sixth principle asks a path refusal to print \
                  the exact command that fixes it: {}",
                 case.case,

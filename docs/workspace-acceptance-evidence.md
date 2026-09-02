@@ -7,9 +7,10 @@ This file is **machine-checked**. `crates/app/tests/workspace_acceptance_evidenc
 parses it and fails when:
 
 - an item under `## Required evidence` names no evidence at all;
-- a `test` entry names a function that no longer exists in the repository (a
-  rename is the failure this catches — a gate whose test was renamed away is a
-  gate that quietly stopped being one);
+- a `test` entry names something that is not a test function in the repository —
+  renamed, deleted, or no longer carrying `#[test]` (each is a gate that quietly
+  stopped being one, and the attribute is checked rather than just the name so
+  that a gate demoted to a helper cannot keep its record);
 - a `pilot` entry names a command that is not in `.github/workflows/ci.yml`, so
   a privileged gate cannot be recorded here while being deleted from CI;
 - the item list disagrees with the `Required evidence before merge` list in
