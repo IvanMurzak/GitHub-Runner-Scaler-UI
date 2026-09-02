@@ -46,7 +46,7 @@ and user documentation.
 | # | Decision | Status | Blocks |
 |---|---|---|---|
 | 1 | Approve `%SystemDrive%\rman`, configurable host root, repository-only persistent slots, local absolute paths, non-destructive reconfiguration, and CLI/TUI parity. | GO recorded 2026-08-31. | Task derivation |
-| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%\rman`. | Owner authorized `b2` implementation 2026-09-01; approval of the produced ACL evidence is still required before merge. | `b2` merge and Wave 5 exit |
+| 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%man`. | GO recorded 2026-09-02 on PR #40 head `686872f` with all seven checks green. | Cleared |
 | 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Owner intent recorded; final GO pending evidence. | Wave 5 exit |
 | 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Not granted. Mocked and local work may proceed. | Only the specific live test |
 | 5 | Confirm a verified version-2 database backup before any real host is migrated to schema 3. | Pending real-host rollout. | Production rollout only |
@@ -69,14 +69,14 @@ a1 domain ──┬── a2 store ─────┬── c1 ephemeral ── 
 | [a1-workspace-domain](tasks/a1-workspace-domain.md) | none | `. / main` | 10/8 | top | ✅ | [PR #34](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/34), merge `66ba5a8` | 2026-08-31 |
 | [a2-workspace-store](tasks/a2-workspace-store.md) | a1-workspace-domain | `. / main` | 10/10 | top | ✅ | run `01a05ac7-b731-704b-8753-5aa75b0b4fdb` | 2026-08-31 |
 | [b1-runner-path-platform](tasks/b1-runner-path-platform.md) | a1-workspace-domain | `. / main` | 10/9 | top | ✅ | run `01a05ac7-c88a-7058-aecc-31cf32861cf6` | 2026-08-31 |
-| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | 🟣 | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40) green, awaiting gate 2 | 2026-09-01 |
+| [b2-windows-root-acl](tasks/b2-windows-root-acl.md) | b1-runner-path-platform | `. / main` | 9/9 | top | ✅ | [PR #40](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/40), merge `8d4ab2a` | 2026-09-01 |
 | [c1-effective-runtime-root](tasks/c1-effective-runtime-root.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/8 | top | ✅ | PR #37 | 2026-09-01 |
 | [c2-persistent-slot-allocation](tasks/c2-persistent-slot-allocation.md) | c1-effective-runtime-root | `. / main` | 10/10 | top | ✅ | [PR #38](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/38), merge `dc62d57` | 2026-09-01 |
 | [c3-persistent-cleanup-recovery](tasks/c3-persistent-cleanup-recovery.md) | c2-persistent-slot-allocation | `. / main` | 10/10 | top | ✅ | [PR #41](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/41), merge `bb30b7f` | 2026-09-01 |
 | [d1-workspace-cli-read-models](tasks/d1-workspace-cli-read-models.md) | a2-workspace-store, b1-runner-path-platform | `. / main` | 10/9 | top | ✅ | [PR #39](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/39), merge `1ece70c` | 2026-09-01 |
 | [e1-workspace-tui](tasks/e1-workspace-tui.md) | c2-persistent-slot-allocation, d1-workspace-cli-read-models | `. / main` | 9/9 | top | ✅ | [PR #42](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/42), merge `48230a4` | 2026-09-01 |
-| [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | planned | none | 2026-08-31 |
-| [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | 🔵 | run `01a05e06-d489-704a-b88b-29f93aa1f63c` | 2026-09-01 |
+| [f1-workspace-security-acceptance](tasks/f1-workspace-security-acceptance.md) | b2-windows-root-acl, c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 10/10 | top | 🔵 | run `01a06362-f188-70df-99f5-b5dfb9cd9171` | 2026-09-02 |
+| [g1-readme-workspace-guidance](tasks/g1-readme-workspace-guidance.md) | c3-persistent-cleanup-recovery, d1-workspace-cli-read-models, e1-workspace-tui | `. / main` | 8/4 | fast | ✅ | [PR #43](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/43), merge `17af664` | 2026-09-01 |
 
 ## Required evidence before merge
 
@@ -219,6 +219,21 @@ directory untouched.
   evidence.
 - Started `g1-readme-workspace-guidance` as run
   `01a05e06-d489-704a-b88b-29f93aa1f63c`; `f1` remains blocked on `b2`.
+
+### 2026-09-02
+
+- Owner recorded human gate 2 as GO after reviewing the protected DACL, the
+  admitted rights, and the one host-dependent assertion the repair replaced.
+  `b2-windows-root-acl` merged as PR #40 / `8d4ab2a`.
+- Review of that branch also closed a real access-control defect:
+  `admits_exactly` compared trustees without their granted masks, so a root
+  already granting the admitted account `FA` matched and that account could
+  have undone the protection.
+- `g1-readme-workspace-guidance` landed as PR #43 / `17af664` with all seven
+  required checks green.
+- Started `f1-workspace-security-acceptance` as run
+  `01a06362-f188-70df-99f5-b5dfb9cd9171`, the last task. It needs no live
+  credentials, so human gate 4 is not engaged.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
