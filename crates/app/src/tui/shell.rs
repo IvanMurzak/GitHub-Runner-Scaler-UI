@@ -2229,13 +2229,7 @@ mod tests {
 
         let produced = Arc::new(AtomicUsize::new(0));
         let producer_count = Arc::clone(&produced);
-        // The refreshed snapshot, not a deadline, decides when the input task
-        // quits. `Notify` is signalled from the source thread's synchronous
-        // closure, stores a permit when it wins the race against `notified()`,
-        // and tolerates the closure being called more than twice.
-        let refreshed = Arc::new(tokio::sync::Notify::new());
-        let producer_refreshed = Arc::clone(&refreshed);
-        let (source, agent_events) = LocalAgentEventSource::start_with(
+        let (source, mut source_events) = LocalAgentEventSource::start_with(
             move |_| {
                 let refresh = producer_count.fetch_add(1, Ordering::SeqCst);
                 let snapshot = if refresh == 0 {
@@ -2254,9 +2248,6 @@ mod tests {
                         ..Snapshot::default()
                     }
                 };
-                if refresh >= 1 {
-                    producer_refreshed.notify_one();
-                }
                 AgentEvent {
                     summary: format!("production refresh {refresh}"),
                     health: Health::Ready,
@@ -2266,6 +2257,32 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect("production source thread");
+
+        // The refreshed snapshot, not a deadline, decides when the input task
+        // quits, and the signal is raised *after* the event is queued for the
+        // loop rather than from inside the source closure: a source thread
+        // preempted between the two would otherwise let `q` win and exit
+        // before the refreshed snapshot was ever applied. Forwarding from a
+        // separate task, plus the `biased` join below, then orders the loop's
+        // poll ahead of the input task, so `q` can only be sent once the
+        // refreshed snapshot has been reduced.
+        let (agent_sender, agent_events) = mpsc::unbounded_channel();
+        let refreshed = Arc::new(tokio::sync::Notify::new());
+        let forward_refreshed = Arc::clone(&refreshed);
+        let _forwarder = tokio::spawn(async move {
+            while let Some(event) = source_events.recv().await {
+                let is_refresh = event
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.availability == Availability::Ready);
+                if agent_sender.send(event).is_err() {
+                    break;
+                }
+                if is_refresh {
+                    forward_refreshed.notify_one();
+                }
+            }
+        });
 
         let output = SharedWriter::default();
         let capture_log = Arc::new(Mutex::new(Vec::new()));
@@ -2291,6 +2308,7 @@ mod tests {
                 .unwrap();
         };
         let (result, ()) = tokio::join!(
+            biased;
             run_loop(
                 &mut terminal,
                 &mut session,
@@ -2299,7 +2317,7 @@ mod tests {
                 &source,
                 None,
             ),
-            input_producer,
+            input_producer
         );
         let final_state = result.unwrap();
         assert!(produced.load(Ordering::SeqCst) >= 2);
