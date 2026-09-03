@@ -2229,7 +2229,7 @@ mod tests {
 
         let produced = Arc::new(AtomicUsize::new(0));
         let producer_count = Arc::clone(&produced);
-        let (source, agent_events) = LocalAgentEventSource::start_with(
+        let (source, mut source_events) = LocalAgentEventSource::start_with(
             move |_| {
                 let refresh = producer_count.fetch_add(1, Ordering::SeqCst);
                 let snapshot = if refresh == 0 {
@@ -2258,6 +2258,32 @@ mod tests {
         )
         .expect("production source thread");
 
+        // The refreshed snapshot, not a deadline, decides when the input task
+        // quits, and the signal is raised *after* the event is queued for the
+        // loop rather than from inside the source closure: a source thread
+        // preempted between the two would otherwise let `q` win and exit
+        // before the refreshed snapshot was ever applied. Forwarding from a
+        // separate task, plus the `biased` join below, then orders the loop's
+        // poll ahead of the input task, so `q` can only be sent once the
+        // refreshed snapshot has been reduced.
+        let (agent_sender, agent_events) = mpsc::unbounded_channel();
+        let refreshed = Arc::new(tokio::sync::Notify::new());
+        let forward_refreshed = Arc::clone(&refreshed);
+        let _forwarder = tokio::spawn(async move {
+            while let Some(event) = source_events.recv().await {
+                let is_refresh = event
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.availability == Availability::Ready);
+                if agent_sender.send(event).is_err() {
+                    break;
+                }
+                if is_refresh {
+                    forward_refreshed.notify_one();
+                }
+            }
+        });
+
         let output = SharedWriter::default();
         let capture_log = Arc::new(Mutex::new(Vec::new()));
         let mut session = TerminalSession::start(CrosstermActions::with_mouse_capture(
@@ -2268,22 +2294,21 @@ mod tests {
         .unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let (input_sender, input) = futures::channel::mpsc::unbounded::<io::Result<Event>>();
-        let input_count = Arc::clone(&produced);
+        let input_refreshed = Arc::clone(&refreshed);
         let input_producer = async move {
             input_sender
                 .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::F(5)))))
                 .unwrap();
-            for _ in 0..100 {
-                if input_count.load(Ordering::SeqCst) >= 2 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            // Generous only so a genuine hang fails the test instead of
+            // hanging CI; `q` is sent even on timeout so the assertions below
+            // report the real condition.
+            let _ = tokio::time::timeout(Duration::from_secs(30), input_refreshed.notified()).await;
             input_sender
                 .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::Char('q')))))
                 .unwrap();
         };
         let (result, ()) = tokio::join!(
+            biased;
             run_loop(
                 &mut terminal,
                 &mut session,
@@ -2292,7 +2317,7 @@ mod tests {
                 &source,
                 None,
             ),
-            input_producer,
+            input_producer
         );
         let final_state = result.unwrap();
         assert!(produced.load(Ordering::SeqCst) >= 2);
