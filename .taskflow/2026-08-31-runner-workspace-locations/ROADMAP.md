@@ -48,7 +48,7 @@ and user documentation.
 | 1 | Approve `%SystemDrive%\rman`, configurable host root, repository-only persistent slots, local absolute paths, non-destructive reconfiguration, and CLI/TUI parity. | GO recorded 2026-08-31. | Task derivation |
 | 2 | Approve the real Windows ACL and service-account result for `%SystemDrive%
 man`. | GO recorded 2026-09-02 on PR #40 head `686872f` with all seven checks green. | Cleared |
-| 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Owner intent recorded; final GO pending evidence. | Wave 5 exit |
+| 3 | Accept the persistent-workspace cross-job trust boundary after the two-job security demonstration. | Blocked on unbuilt test infrastructure, not on owner judgement. See the 2026-09-02 log. | Wave 5 exit |
 | 4 | Authorize any test that uses live GitHub credentials, a production repository, paid infrastructure, or an external side effect. | Granted 2026-09-02 for the fixture-backed `e2e` acceptance suite only. | Cleared for that suite |
 | 5 | Confirm a verified version-2 database backup before any real host is migrated to schema 3. | Pending real-host rollout. | Production rollout only |
 
@@ -261,6 +261,24 @@ directory untouched.
 - The four guard inputs are unset on this repository, so `e2e` currently
   takes its skip path. Gate 3 stays open until the owner provisions the
   disposable fixture and the suite runs green.
+- The fixture was provisioned (`WetFish-Co/runner-test`, App installed, both
+  tokens and the evidence key stored) and the suite ran for real: the `e2e`
+  jobs took 53 seconds to 3 minutes instead of the 3-to-7-second skip path.
+- It then failed by design. `tests/examples/e2e-host-controller.rs` refuses to
+  seal evidence on a hosted runner, and behind that
+  `tests/host-controller.sh` has a second, unconditional gate that no
+  variable opens: a reboot acceptance cannot be driven from the host being
+  rebooted, and the repository defines neither the fixture workflow contract
+  nor an external two-host controller topology. `tests/README.md` states
+  that even a physical host terminates `required_manual` until those
+  contracts exist.
+- Gate 3 therefore cannot be judged on live evidence today, and no amount of
+  credentials or hardware changes that. It needs the two-host controller
+  topology to be built first, which is outside this Taskflow.
+- Because the guard inputs make `e2e` fail rather than skip, the two fixture
+  variables were removed again to keep `main` and every future pull request
+  green. The three secrets were left in place for whenever that topology
+  lands.
   `01a05ca7-d5be-7000-829f-53ec8b04614e` with a pre-merge guard: the run is
   halted the moment `land` opens its pull request, so the squash-merge cannot
   run before human gate 2 is recorded GO. The run resumes at `land` after
