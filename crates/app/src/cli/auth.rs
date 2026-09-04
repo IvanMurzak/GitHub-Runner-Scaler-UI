@@ -229,33 +229,28 @@ fn write_action_two(
 ) -> io::Result<()> {
     let url = verification_url.to_string();
     writeln!(out)?;
-    if opened {
-        writeln!(
-            out,
-            "{} opened {} in your browser. Enter this code:",
-            styling.step(&format!("Action 2 of {ONBOARDING_ACTIONS}:")),
-            styling.url(&url)
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{} open {} in a browser and enter this code:",
-            styling.step(&format!("Action 2 of {ONBOARDING_ACTIONS}:")),
-            styling.url(&url)
-        )?;
-    }
+    writeln!(
+        out,
+        "{} enter this code at {}{}",
+        styling.step(&format!("Action 2 of {ONBOARDING_ACTIONS}:")),
+        styling.url(&url),
+        if opened { " (opened for you):" } else { ":" }
+    )?;
+    // The code keeps its own line and the blank lines around it. Everything
+    // else on this screen got shorter; this is the one thing the operator is
+    // here to read, and crowding it to save two lines would be saving them in
+    // the wrong place.
     writeln!(out)?;
     writeln!(out, "    {}", styling.code(&format!(" {user_code} ")))?;
     writeln!(out)?;
-    // One sentence, and it keeps the two clauses that are load-bearing: the
-    // code goes nowhere else (the phishing control `07-security.md` names), and
-    // it expires (so a stalled login has an explanation other than a bug).
+    // One line, keeping the two clauses that are load-bearing: the code goes
+    // nowhere else (the phishing control `07-security.md` names), and it
+    // expires (so a stalled login has an explanation other than a bug).
     writeln!(
         out,
-        "Type it only on that page -- nothing else ever asks for it. Good for about {} minutes.",
+        "Enter it only on that page; expires in ~{} min. Waiting for approval...",
         expires_in.as_secs() / 60
     )?;
-    writeln!(out, "Waiting for you to approve it...")?;
     Ok(())
 }
 
@@ -281,30 +276,36 @@ fn write_action_three(
     let url = install_url.to_string();
     let opened = open_in_browser(&url, styling);
     writeln!(out)?;
-    if opened {
-        writeln!(
-            out,
-            "{} opened {} in your browser. Choose the",
-            styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
-            styling.url(&url)
-        )?;
-        writeln!(
-            out,
-            "repositories to install the App on — only the ones you want this host to serve."
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{} open {} and choose the repositories to",
-            styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
-            styling.url(&url)
-        )?;
-        writeln!(
-            out,
-            "install the App on. Choose only the ones you want this host to serve."
-        )?;
-    }
+    writeln!(
+        out,
+        "{} install the App at {}{}",
+        styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS}:")),
+        styling.url(&url),
+        if opened { " (opened for you)." } else { "." }
+    )?;
+    writeln!(
+        out,
+        "Choose only the repositories you want this host to serve."
+    )?;
     Ok(())
+}
+
+/// Action 3, on a host where it has already been done.
+///
+/// # Why an action that asks for nothing is still printed
+///
+/// The counter is the operator's progress bar, and a transcript that stops at
+/// *"Action 2 of 3"* reads as one that gave up — which is exactly what a
+/// successful sign-in on a host with the App already installed used to look
+/// like. The third action was skipped because there was nothing to choose, and
+/// nothing said so.
+fn write_action_three_already_done(out: &mut dyn Write, styling: Styling) -> io::Result<()> {
+    writeln!(out)?;
+    writeln!(
+        out,
+        "{} the App is already installed; nothing to choose.",
+        styling.step(&format!("Action 3 of {ONBOARDING_ACTIONS} (done):"))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -348,18 +349,19 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
     // Stated as a fact about the store rather than as "signing in to", because
     // this line is written before the credential is examined and a host that
     // turns out to be signed in already is not signing in to anything.
-    writeln!(out, "Credential store: {scope} (start mode: {mode}).")?;
-    if !chosen {
-        // One line, and it has to fit on one: this is a warning about a
-        // default, printed above the code the operator came here to type. The
-        // paragraph it replaced said the same thing three times and pushed the
-        // code down the screen to do it.
+    //
+    // The unchosen case is a parenthetical on the same line rather than a
+    // `warning:` of its own. It is a note about a default, printed above the
+    // code the operator came here to type, and every line spent on it is a line
+    // pushing that code further down the screen.
+    if chosen {
+        writeln!(out, "Credential store: {scope} (start mode {mode}).")
+    } else {
         writeln!(
             out,
-            "warning: no start mode is recorded; `{mode}` assumed. Pass `--start-at login` for a login-start service."
-        )?;
+            "Credential store: {scope} (start mode {mode}, assumed; `--start-at login` to change)."
+        )
     }
-    Ok(())
 }
 
 /// Renews a credential and stores it, in that order and no other.
@@ -547,12 +549,18 @@ pub fn login(
     // a line saying so.
     let resumable = match secrets.load() {
         Ok(existing) => existing,
-        Err(source) => {
+        Err(_) => {
+            // One line, and it does not carry the reason. That reason runs to a
+            // paragraph — `secrets::locked_out` has to explain a keychain ACL
+            // to somebody who has never met one — and printing it here buries
+            // the code the operator came for under a diagnosis of a credential
+            // this very command is about to replace. `status` and `auth status`
+            // both still report it in full, which is where somebody who wants
+            // the diagnosis is looking.
             writeln!(
                 out,
-                "\nThe credential already in the {} could not be read, so this sign-in \n\
-                 replaces it rather than resuming it. The reason was: {source}",
-                secrets.location()
+                "\nThe credential already there could not be read, so this replaces it rather \
+                 than resuming it. `auth status` says why."
             )
             .map_err(failed)?;
             None
@@ -592,13 +600,6 @@ pub fn login(
         .store(&token.to_stored_document())
         .map_err(|source| secret_store_failure(&source))?;
 
-    writeln!(
-        out,
-        "\nSigned in. The token is in the {} and nowhere else.",
-        secrets.location()
-    )
-    .map_err(failed)?;
-
     // ---- what the credential reaches, and the third action if any --------
     let client = AuthenticatedClient::new(context.endpoints().clone(), token, context.clock())
         .map_err(|source| github_failure(&source))?;
@@ -606,6 +607,26 @@ pub fn login(
     let discovery = runtime
         .block_on(client.discover_installations(&app))
         .map_err(|source| github_failure(&source))?;
+
+    // The counted actions come before the outcome, all three of them. An
+    // install that is still to be done announces itself from inside
+    // `write_discovery`, below the sign-in line, because it is the next thing
+    // the operator has to go and do; one that is already done is announced
+    // here, above it, because it is part of what just finished.
+    if matches!(discovery, InstallationDiscovery::Installed(_)) {
+        write_action_three_already_done(out, styling).map_err(failed)?;
+    }
+
+    // The scope, not the full location. The location is a keychain path plus an
+    // item name, it was already named on the first line of this command, and
+    // `host show` prints it whenever somebody actually needs it. What belongs
+    // here is the claim: one store, and nowhere else.
+    writeln!(
+        out,
+        "\nSigned in. The token is in the {}-scoped store and nowhere else.",
+        secrets.scope()
+    )
+    .map_err(failed)?;
 
     write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
     Ok(())
@@ -949,47 +970,37 @@ fn write_discovery(
             writeln!(out)?;
             writeln!(
                 out,
-                "This credential reaches {} repositor{} and {} organization{}:",
+                "Reaches {} repositor{} and {} organization{}:",
                 repositories.len(),
                 if repositories.len() == 1 { "y" } else { "ies" },
                 organizations.len(),
                 if organizations.len() == 1 { "" } else { "s" },
             )?;
-            writeln!(out)?;
             for installation in targets.installations() {
                 write_installation(out, installation, list)?;
             }
             if targets.skipped() > 0 {
-                writeln!(out)?;
                 writeln!(
                     out,
-                    "  NOTE: {} further installation(s) could not be described, so this list is",
+                    "  NOTE: {} further installation(s) could not be described, so this list is \
+                     incomplete rather than merely short.",
                     targets.skipped()
                 )?;
-                writeln!(out, "  incomplete rather than merely short.")?;
             }
             let over_broad = targets.over_broad();
             if !over_broad.is_empty() {
-                writeln!(out)?;
                 writeln!(
                     out,
-                    "  warning: {} installation(s) above reach ALL repositories on the account,",
+                    "  warning: {} installation(s) reach ALL repositories on the account, \
+                     including ones created later.",
                     over_broad.len()
-                )?;
-                writeln!(
-                    out,
-                    "  including ones created later. Narrow it on GitHub to pick individual ones."
                 )?;
             }
             // Last, deliberately. This is the least urgent line in the block
             // and the warning above it is the most, so the hint does not sit
             // between an operator and the sentence they need to read.
             if !list && !repositories.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "  Add --list to name every repository the installations above reach."
-                )?;
+                writeln!(out, "  Add --list to name every repository.")?;
             }
         }
     }

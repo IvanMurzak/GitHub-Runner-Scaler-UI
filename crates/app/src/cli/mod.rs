@@ -1210,6 +1210,15 @@ fn run_with_shutdown(
             "the service supplied its recorded application-data directories, so --data-dir cannot also select a different database",
         ));
     }
+    // The service supplying its own directories is also what says this process
+    // is the daemon rather than a command an operator typed, and the two write
+    // different files: on a boot-mode host they are different accounts sharing
+    // one `logs/` directory. See `logging::LogRole`.
+    let role = if service_paths.is_some() {
+        runner_manager_platform::logging::LogRole::Service
+    } else {
+        runner_manager_platform::logging::LogRole::Operator
+    };
     let context = match service_paths {
         Some(paths) => Context::resolve_service(paths, err)?,
         None => Context::resolve(cli.data_dir.as_deref(), err)?,
@@ -1219,7 +1228,7 @@ fn run_with_shutdown(
     // could not install them is still a CLI that must run, so this is a warning
     // rather than a failure: the alternative is `host show` refusing to print a
     // capacity because a log file could not be opened.
-    let _logging = match runner_manager_platform::logging::install(context.paths(), "warn") {
+    let _logging = match runner_manager_platform::logging::install(context.paths(), role, "warn") {
         Ok(guard) => Some(guard),
         Err(source) => {
             let _ = writeln!(err, "warning: diagnostics are not being recorded: {source}");

@@ -2067,11 +2067,25 @@ mod sys {
     const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
 
     /// `errSecAuthFailed`, which a keychain answers when the item is there and
-    /// the ACL does not name the program asking.
+    /// the caller may not have it — because the ACL does not name the program
+    /// asking, or because the keychain's master key is out of this account's
+    /// reach. [`locked_out`] tells those two apart.
     const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
     fn is_duplicate(error: &security_framework::base::Error) -> bool {
         error.code() == ERR_SEC_DUPLICATE_ITEM
+    }
+
+    /// Whether this process is `root`.
+    ///
+    /// Only ever used to *explain* a refusal, never to decide whether to
+    /// attempt one: the keychain is the authority on what this process may
+    /// read, and a privilege check of our own that disagreed with it would be a
+    /// second, wrong answer.
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` takes no argument, reads only this process's own
+        // credentials, and is documented never to fail.
+        unsafe { libc::geteuid() == 0 }
     }
 
     /// Removes the item without reading it, so that a value this program may
@@ -2109,6 +2123,15 @@ mod sys {
     /// does not apply. The value is being replaced either way, which is the
     /// only reason destroying it is the right move here.
     fn replace_unreadable(keychain: &SecKeychain) -> io::Result<()> {
+        delete_by_query(keychain).map_err(|error| sec_error(&error))
+    }
+
+    /// The delete itself, with the platform error kept intact.
+    ///
+    /// Separate from [`replace_unreadable`] only so that
+    /// [`remove_any_existing`] can read the status code rather than the
+    /// rendered message.
+    fn delete_by_query(keychain: &SecKeychain) -> Result<(), security_framework::base::Error> {
         use security_framework::item::{ItemClass, ItemSearchOptions};
 
         ItemSearchOptions::new()
@@ -2117,7 +2140,19 @@ mod sys {
             .service(service())
             .account(ITEM)
             .delete()
-            .map_err(|error| sec_error(&error))
+    }
+
+    /// [`replace_unreadable`], for a caller that does not know whether there is
+    /// anything there.
+    ///
+    /// Nothing to delete is the ordinary state of a first `auth login`, and is
+    /// success.
+    fn remove_any_existing(keychain: &SecKeychain) -> io::Result<()> {
+        match delete_by_query(keychain) {
+            Ok(()) => Ok(()),
+            Err(error) if is_absence(&error) => Ok(()),
+            Err(error) => Err(sec_error(&error)),
+        }
     }
 
     /// Suppresses keychain UI for as long as the returned guard lives.
@@ -2247,21 +2282,371 @@ mod sys {
             )
         })?;
 
-        match keychain.set_generic_password(service(), ITEM, plaintext) {
-            Ok(()) => {}
-            // The item is there and this program may not read it, so the
-            // crate's update-or-add could do neither. Take it away and write a
-            // fresh one, which is what replacing a credential means anyway.
-            Err(error) if is_duplicate(&error) => {
-                replace_unreadable(&keychain)?;
-                keychain
-                    .set_generic_password(service(), ITEM, plaintext)
-                    .map_err(|error| sec_error(&error))?;
+        if grants_every_application(site) {
+            // Removed and written afresh, never updated. An item keeps the
+            // access it was created with, so `set_generic_password` on an
+            // existing item would leave the per-binary grant in place — which
+            // is the whole condition this branch exists to end. Deleting by
+            // query needs no permission to *read* the value, so it works even
+            // against an item this program is already locked out of.
+            remove_any_existing(&keychain)?;
+            add_granted_to_every_application(&keychain, plaintext)?;
+        } else {
+            match keychain.set_generic_password(service(), ITEM, plaintext) {
+                Ok(()) => {}
+                // The item is there and this program may not read it, so the
+                // crate's update-or-add could do neither. Take it away and
+                // write a fresh one, which is what replacing a credential means
+                // anyway.
+                Err(error) if is_duplicate(&error) => {
+                    replace_unreadable(&keychain)?;
+                    keychain
+                        .set_generic_password(service(), ITEM, plaintext)
+                        .map_err(|error| sec_error(&error))?;
+                }
+                Err(error) => return Err(sec_error(&error)),
             }
-            Err(error) => return Err(sec_error(&error)),
         }
 
         restrict(site)
+    }
+
+    // -----------------------------------------------------------------------
+    // Who the stored item is granted to
+    // -----------------------------------------------------------------------
+
+    /// The name the keychain shows for this grant, if it ever shows one.
+    const ACCESS_DESCRIPTOR: &str = "runner-manager user access token";
+
+    /// Whether items in this keychain are granted to **every** application
+    /// rather than to the one binary that wrote them.
+    ///
+    /// # The failure this ends
+    ///
+    /// A keychain ACL names *applications*, and identifies an unsigned one by
+    /// its code directory hash — so replacing the binary produces a program the
+    /// ACL does not name. Replacing the binary is what an upgrade is. The
+    /// daemon then reads `errSecAuthFailed` from the credential it is supposed
+    /// to own, exits `13`, and launchd restarts it every fifteen seconds
+    /// forever; watched on a real host upgrading 0.1.12 to 0.1.15, and again on
+    /// 0.1.16 to 0.1.17.
+    ///
+    /// The remedy the store used to print — sign in again, from a graphical
+    /// terminal, with the exact copy of the binary that will do the reading —
+    /// works exactly once, until the next upgrade. It is not a remedy, it is a
+    /// recurring outage with instructions.
+    ///
+    /// # Why widening the grant costs nothing on these two keychains
+    ///
+    /// The per-application ACL is only a boundary where something else is
+    /// **not** already the boundary, and on both of these it is:
+    ///
+    /// * The **System Keychain** is decrypted with `/var/db/SystemKey`, which
+    ///   is `root`-only. Every process that can read an item there is already
+    ///   `root`, and `07-security.md` records that *"a local administrator or
+    ///   `root` can read the token"* as an accepted trade-off of machine-scoped
+    ///   storage. Granting every application does not admit one caller that the
+    ///   master key was keeping out.
+    /// * A **rooted** keychain is protected by the `0700` directory it sits in
+    ///   and is unlocked with [`ROOTED_KEYCHAIN_PASSWORD`], a constant in a
+    ///   public binary. Its ACL was never the thing holding anybody out either.
+    ///
+    /// The **login** keychain is the one place where the ACL is a real boundary
+    /// — every process running as the operator can reach that keychain, and the
+    /// per-application grant is what stops one of them reading this token
+    /// silently. So it keeps the default, and pays the upgrade prompt instead.
+    /// A user-scoped host has an operator present to answer that prompt, which
+    /// is exactly what a boot-mode daemon does not.
+    fn grants_every_application(site: &Site) -> bool {
+        match site.kind {
+            Kind::System | Kind::Rooted => true,
+            Kind::Login => false,
+        }
+    }
+
+    /// Adds the item with its access already decided.
+    ///
+    /// # Why not add it and then widen it
+    ///
+    /// That was the first shape of this, and it deadlocks a headless process.
+    /// `SecKeychainItemSetAccess` *changes* an existing item's access control,
+    /// which is itself an ACL-guarded operation, and macOS asks the person at
+    /// the desk to confirm it — through Authorization Services, which
+    /// `SecKeychainSetUserInteractionAllowed(false)` does not suppress. The
+    /// call does not fail; `SecurityAgent` starts and the process waits behind
+    /// a panel that a daemon has no desktop to draw on. Watched here: the store
+    /// hung indefinitely with `SecurityAgent` running.
+    ///
+    /// Supplying the access at creation asks nobody anything, because there is
+    /// no existing access to be authorized against. It is also what
+    /// `security add-generic-password -A` does, and for the same reason.
+    fn add_granted_to_every_application(
+        keychain: &SecKeychain,
+        plaintext: &[u8],
+    ) -> io::Result<()> {
+        use core_foundation::base::TCFType as _;
+
+        let access = AnyApplicationAccess::create()?;
+
+        // The two attributes that identify a generic password. Both buffers
+        // outlive the call below, which is the whole of the safety argument for
+        // the raw pointers in the attribute list.
+        let service_name = service();
+        let account = ITEM;
+        let mut attributes = [
+            ffi::SecKeychainAttribute {
+                tag: ffi::SEC_SERVICE_ITEM_ATTR,
+                length: u32::try_from(service_name.len()).map_err(|_| {
+                    io::Error::other(
+                        "the keychain service name is longer than an attribute can carry",
+                    )
+                })?,
+                data: service_name.as_ptr().cast::<std::ffi::c_void>().cast_mut(),
+            },
+            ffi::SecKeychainAttribute {
+                tag: ffi::SEC_ACCOUNT_ITEM_ATTR,
+                length: u32::try_from(account.len()).map_err(|_| {
+                    io::Error::other(
+                        "the keychain account name is longer than an attribute can carry",
+                    )
+                })?,
+                data: account.as_ptr().cast::<std::ffi::c_void>().cast_mut(),
+            },
+        ];
+        let mut list = ffi::SecKeychainAttributeList {
+            count: 2,
+            attr: attributes.as_mut_ptr(),
+        };
+        let length = u32::try_from(plaintext.len())
+            .map_err(|_| io::Error::other("the value is longer than a keychain item can hold"))?;
+
+        // SAFETY: the attribute list, its two buffers and `plaintext` all
+        // outlive the call; `keychain` and `access` are live references; the
+        // item is not asked for, so nothing is returned that must be released.
+        let status = unsafe {
+            ffi::SecKeychainItemCreateFromContent(
+                ffi::SEC_GENERIC_PASSWORD_ITEM_CLASS,
+                &raw mut list,
+                length,
+                plaintext.as_ptr().cast(),
+                keychain.as_concrete_TypeRef().cast(),
+                access.raw(),
+                std::ptr::null_mut(),
+            )
+        };
+        os_status("SecKeychainItemCreateFromContent", status)
+    }
+
+    /// A `SecAccess` whose every access-control entry names no application,
+    /// which is how Security.framework spells *"any application, without
+    /// prompting"*.
+    ///
+    /// `SecAccessCreate` with a null trusted list produces the system default:
+    /// entries naming just the calling application. Each is then rewritten with
+    /// a null application list, keeping the prompt text and selector the system
+    /// chose. This is what `security add-generic-password -A` does, in the same
+    /// order.
+    struct AnyApplicationAccess(ffi::SecAccessRef);
+
+    impl AnyApplicationAccess {
+        fn create() -> io::Result<Self> {
+            use core_foundation::base::TCFType as _;
+            use core_foundation::string::CFString;
+
+            let descriptor = CFString::new(ACCESS_DESCRIPTOR);
+            let mut access: ffi::SecAccessRef = std::ptr::null_mut();
+            // SAFETY: `descriptor` outlives the call; a null trusted list is
+            // the documented way to ask for the default entries; `access` is a
+            // valid out-pointer and is only read when the call reports success.
+            let status = unsafe {
+                ffi::SecAccessCreate(
+                    descriptor.as_concrete_TypeRef().cast(),
+                    std::ptr::null(),
+                    &raw mut access,
+                )
+            };
+            os_status("SecAccessCreate", status)?;
+            if access.is_null() {
+                return Err(io::Error::other(
+                    "SecAccessCreate reported success and produced no access",
+                ));
+            }
+            let owned = Self(access);
+            owned.widen()?;
+            Ok(owned)
+        }
+
+        fn raw(&self) -> ffi::SecAccessRef {
+            self.0
+        }
+
+        /// Rewrites every entry to name no application.
+        fn widen(&self) -> io::Result<()> {
+            let mut list: ffi::CFArrayRef = std::ptr::null();
+            // SAFETY: `self.0` is a live `SecAccessRef`; `list` is a valid
+            // out-pointer, and the array it returns is owned by this call.
+            let status = unsafe { ffi::SecAccessCopyACLList(self.0, &raw mut list) };
+            os_status("SecAccessCopyACLList", status)?;
+            let entries = CfOwned(list.cast());
+
+            // SAFETY: `list` came back retained from the call above.
+            let count = unsafe { ffi::CFArrayGetCount(list) };
+            for index in 0..count {
+                // SAFETY: `index` is within the count the array just reported.
+                let entry = unsafe { ffi::CFArrayGetValueAtIndex(list, index) };
+                if entry.is_null() {
+                    continue;
+                }
+                widen_one(entry.cast_mut().cast())?;
+            }
+            drop(entries);
+            Ok(())
+        }
+    }
+
+    impl Drop for AnyApplicationAccess {
+        fn drop(&mut self) {
+            // SAFETY: created retained by `SecAccessCreate` and released once.
+            unsafe { ffi::CFRelease(self.0.cast_const().cast()) };
+        }
+    }
+
+    /// One access-control entry, rewritten to name no application.
+    ///
+    /// An entry whose contents cannot be read in this simple form is left
+    /// alone rather than failing the store: `SecAccessCreate`'s default
+    /// includes entries that are not application lists at all, and the one that
+    /// decides whether the value can be decrypted is not among them.
+    fn widen_one(entry: ffi::SecACLRef) -> io::Result<()> {
+        let mut applications: ffi::CFArrayRef = std::ptr::null();
+        let mut description: ffi::CFStringRef = std::ptr::null();
+        let mut prompt: u16 = 0;
+        // SAFETY: `entry` is an element of a live ACL array, and all three
+        // out-pointers are valid. Anything returned is owned by this call.
+        let copied = unsafe {
+            ffi::SecACLCopyContents(
+                entry,
+                &raw mut applications,
+                &raw mut description,
+                &raw mut prompt,
+            )
+        };
+        if copied != 0 {
+            return Ok(());
+        }
+        let previous = CfOwned(applications.cast());
+        let text = CfOwned(description.cast());
+
+        // SAFETY: `entry` is live and `description` is either null or a live
+        // string; a null application list is the documented "any application".
+        let status =
+            unsafe { ffi::SecACLSetContents(entry, std::ptr::null(), description, prompt) };
+        drop(previous);
+        drop(text);
+        os_status("SecACLSetContents", status)
+    }
+
+    /// A Core Foundation value this code owns a reference to.
+    struct CfOwned(*const std::ffi::c_void);
+
+    impl Drop for CfOwned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: every construction site holds a reference returned by
+                // a `Copy`/`Create` call, and releases it exactly once.
+                unsafe { ffi::CFRelease(self.0) };
+            }
+        }
+    }
+
+    /// `noErr` is success; anything else is named with the call that returned
+    /// it, because an operator reading `-25244` needs to know which of five
+    /// calls produced it.
+    fn os_status(call: &'static str, status: i32) -> io::Result<()> {
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{call} returned {status}")))
+        }
+    }
+
+    /// The Security and Core Foundation entry points that `security-framework`
+    /// does not wrap.
+    ///
+    /// Declared here rather than pulled in as another dependency:
+    /// `security-framework-sys` binds neither `SecAccess*` nor `SecACL*`, so a
+    /// dependency would have to be a new one, for five functions whose
+    /// signatures are fixed platform ABI.
+    mod ffi {
+        use std::ffi::c_void;
+
+        pub type CFArrayRef = *const c_void;
+        pub type CFStringRef = *const c_void;
+        pub type CFIndex = isize;
+        pub type SecAccessRef = *mut c_void;
+        pub type SecACLRef = *mut c_void;
+        pub type SecKeychainRef = *mut c_void;
+        pub type SecKeychainItemRef = *mut c_void;
+
+        /// `kSecGenericPasswordItemClass`, the four-character code `'genp'`.
+        pub const SEC_GENERIC_PASSWORD_ITEM_CLASS: u32 = u32::from_be_bytes(*b"genp");
+        /// `kSecServiceItemAttr`, `'svce'`.
+        pub const SEC_SERVICE_ITEM_ATTR: u32 = u32::from_be_bytes(*b"svce");
+        /// `kSecAccountItemAttr`, `'acct'`.
+        pub const SEC_ACCOUNT_ITEM_ATTR: u32 = u32::from_be_bytes(*b"acct");
+
+        /// `SecKeychainAttribute` from `SecBase.h`.
+        #[repr(C)]
+        pub struct SecKeychainAttribute {
+            pub tag: u32,
+            pub length: u32,
+            pub data: *mut c_void,
+        }
+
+        /// `SecKeychainAttributeList` from `SecBase.h`.
+        #[repr(C)]
+        pub struct SecKeychainAttributeList {
+            pub count: u32,
+            pub attr: *mut SecKeychainAttribute,
+        }
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            pub fn CFRelease(value: *const c_void);
+            pub fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
+            pub fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> *const c_void;
+        }
+
+        #[link(name = "Security", kind = "framework")]
+        unsafe extern "C" {
+            pub fn SecAccessCreate(
+                descriptor: CFStringRef,
+                trusted_list: CFArrayRef,
+                access: *mut SecAccessRef,
+            ) -> i32;
+            pub fn SecAccessCopyACLList(access: SecAccessRef, list: *mut CFArrayRef) -> i32;
+            pub fn SecACLCopyContents(
+                entry: SecACLRef,
+                applications: *mut CFArrayRef,
+                description: *mut CFStringRef,
+                prompt_selector: *mut u16,
+            ) -> i32;
+            pub fn SecACLSetContents(
+                entry: SecACLRef,
+                applications: CFArrayRef,
+                description: CFStringRef,
+                prompt_selector: u16,
+            ) -> i32;
+            pub fn SecKeychainItemCreateFromContent(
+                item_class: u32,
+                attributes: *mut SecKeychainAttributeList,
+                length: u32,
+                data: *const c_void,
+                keychain: SecKeychainRef,
+                initial_access: SecAccessRef,
+                item: *mut SecKeychainItemRef,
+            ) -> i32;
+        }
     }
 
     pub(super) fn load(site: &Site, _scope: SecretScope) -> io::Result<Option<Vec<u8>>> {
@@ -2275,40 +2660,54 @@ mod sys {
             Err(error) if is_absence(&error) => Ok(None),
             // The one refusal an operator can act on, and the one they cannot
             // guess. See `locked_out`.
-            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => Err(locked_out(&error)),
+            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => Err(locked_out(site, &error)),
             Err(error) => Err(sec_error(&error)),
         }
     }
 
     /// Why a keychain refuses a program its own credential, and what ends it.
     ///
-    /// # The state this diagnoses
+    /// # Two states wear the same number
     ///
-    /// A keychain grants access per *application*. The daemon runs a copy of
-    /// the binary that `service install` makes, and replacing that copy — which
-    /// is what an upgrade is — produces a program the item's ACL does not name.
-    /// It then reads `-25293` from the credential it is supposed to own, exits
-    /// `13`, and launchd restarts it every fifteen seconds forever.
+    /// `errSecAuthFailed` is what a keychain says when the item is there and
+    /// the caller may not have it, and there are two quite different reasons
+    /// for that. Telling an operator the wrong one sends them to a remedy that
+    /// cannot work, so this reads which one it is instead of guessing:
     ///
-    /// Watched on 2026-08-30 upgrading a real host from 0.1.12 to 0.1.15:
-    /// `runs` climbing, `last exit code = 13` each time, and a stderr log
-    /// growing by the same four lines.
-    ///
-    /// # Which binary has to sign in
-    ///
-    /// The one that will read it. Signing in with the copy on `PATH` grants
-    /// that copy and leaves the daemon exactly as stuck, which is the part an
-    /// operator has no way to know — so the message says it rather than
-    /// leaving `-25293` to be interpreted.
-    fn locked_out(error: &security_framework::base::Error) -> io::Error {
+    /// 1. **The account may not open the keychain at all.** The System Keychain
+    ///    is decrypted with `/var/db/SystemKey`, which is `root`-only, so an
+    ///    ordinary `runner-manager status` gets `-25293` on a perfectly healthy
+    ///    credential. Nothing is broken and nothing needs repairing — the value
+    ///    belongs to the account the boot-mode daemon runs as.
+    /// 2. **The item was written by an older version.** Before the store
+    ///    granted its items to every application, the ACL named the single
+    ///    binary that wrote them, and an upgrade replaces that binary. This is
+    ///    what took a real host down twice; [`grants_every_application`] is the
+    ///    fix, and one more `auth login` rewrites the item so it cannot happen
+    ///    again.
+    fn locked_out(site: &Site, error: &security_framework::base::Error) -> io::Error {
+        if site.kind == Kind::System && !is_root() {
+            return io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Security.framework returned {} ({error}). The machine-scoped store is the \
+                     System Keychain, and what decrypts it is /var/db/SystemKey, which only \
+                     root may read -- so this is what a healthy credential looks like to an \
+                     account that is not the one holding it. The boot-mode daemon runs as root \
+                     and reads it. Nothing here needs repairing: run this command with sudo if \
+                     you need the value itself, or install with `--start-at login` to keep the \
+                     token in your own login keychain instead.",
+                    error.code()
+                ),
+            );
+        }
         io::Error::other(format!(
-            "Security.framework returned {} ({error}). The item is there and this keychain \
-             does not grant it to the program asking: access is granted per application, and \
-             this program is not the one that stored it -- which is what replacing the \
-             binary during an upgrade does. Sign in again **with the binary that will read \
-             it**: for the service that is the copy `service install` made under \
-             `state/bin`, not the one on PATH, and it must be run from a graphical terminal \
-             so the keychain can prompt. Answer `Always Allow`.",
+            "Security.framework returned {} ({error}). The item is there and this keychain does \
+             not grant it to the program asking. An earlier version granted the stored token to \
+             the single binary that wrote it, and an upgrade replaces that binary -- so an item \
+             written by one of those versions locks out every later copy, the daemon's included. \
+             Signing in once more rewrites it with a grant that survives upgrades: run \
+             `runner-manager auth login`, with sudo if this is the machine-scoped store.",
             error.code()
         ))
     }

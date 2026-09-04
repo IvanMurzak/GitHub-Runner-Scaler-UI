@@ -139,6 +139,25 @@ pub struct Product {
 /// accepts it runs `auth status`, which has five answers and an exit code for
 /// each.
 ///
+/// # `present` is only an answer when `unreadable` is null
+///
+/// There is a third state, and on the platform this product's persona actually
+/// runs it is the ordinary one. A boot-mode host keeps the token in the
+/// machine-scoped store, which on macOS is the System Keychain — decrypted with
+/// a `root`-only master key, because the daemon that reads it runs as `root`.
+/// So the operator's own `runner-manager status` cannot read it, and there is
+/// nothing wrong.
+///
+/// This document used to *fail* there: one unreadable field ended the command
+/// and printed no snapshot at all, so a boot-mode macOS host could not report
+/// its capacity, its policies or its attempts without `sudo`. Reporting
+/// `present: false` instead would have been worse — the operator would be sent
+/// to `auth login`, which overwrites a credential that was never the problem.
+///
+/// So the failure to read is carried rather than thrown or flattened.
+/// `unreadable` holds the reason, in the store's own words; `present` is
+/// `false` and means nothing while it is set.
+///
 /// # There is deliberately no `store_agrees_with_start_mode`
 ///
 /// An earlier draft of schema v1 carried one, from `d2`'s
@@ -163,6 +182,11 @@ pub struct Product {
 #[derive(Debug, Clone, Serialize)]
 pub struct Credential {
     pub present: bool,
+    /// Why the store could not be read, or `null` when it was read.
+    ///
+    /// While this is set, `present` is `false` because it has to be something
+    /// and carries no information.
+    pub unreadable: Option<String>,
     pub store_scope: String,
     pub store_location: String,
 }
@@ -364,16 +388,15 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
     // a value it did not write as `Corrupt` rather than as absence — and a
     // status document that read a corrupt store as "no credential" would send
     // an operator to `auth login`, which overwrites the evidence.
-    let present = secrets
-        .load()
-        .map_err(|source| {
-            CliError::with_remedy(
-                Failure::SecretStore,
-                format!("cannot read the secret store: {source}"),
-                "runner-manager auth logout, then runner-manager auth login",
-            )
-        })?
-        .is_some();
+    //
+    // A store that cannot be read is reported, not thrown. See `Credential`:
+    // on the platform this product is actually run on, the ordinary reason is
+    // that the operator is not the account the daemon runs as, and a snapshot
+    // of everything else is exactly what they asked for.
+    let (present, unreadable) = match secrets.load() {
+        Ok(value) => (value.is_some(), None),
+        Err(source) => (false, Some(source.to_string())),
+    };
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
@@ -398,6 +421,7 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         github_contacted: false,
         credential: Credential {
             present,
+            unreadable,
             store_scope: secrets.scope().to_string(),
             store_location: secrets.location(),
         },
@@ -532,13 +556,22 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     writeln!(
         out,
         "  credential                {} in the {}-scoped store",
-        if document.credential.present {
-            "present"
-        } else {
-            "absent"
+        match (&document.credential.unreadable, document.credential.present) {
+            // Never "absent". An unreadable store has not answered the
+            // question, and the two words an operator acts on differently must
+            // not be the same word.
+            (Some(_), _) => "not readable by this account",
+            (None, true) => "present",
+            (None, false) => "absent",
         },
         document.credential.store_scope
     )?;
+    // The store's own words, on their own line, for the same reason the runner
+    // root's problem gets one: the reason names a remedy and a two-column table
+    // cell would truncate it.
+    if let Some(reason) = &document.credential.unreadable {
+        writeln!(out, "  credential problem        {reason}")?;
+    }
     writeln!(
         out,
         "  GitHub contacted          no (this is a local snapshot; `auth status` asks GitHub)"
@@ -619,6 +652,7 @@ mod tests {
             github_contacted: false,
             credential: Credential {
                 present: true,
+                unreadable: None,
                 store_scope: "machine".to_string(),
                 store_location: "C:/ProgramData/runner-manager/secrets".to_string(),
             },
@@ -721,7 +755,7 @@ mod tests {
         assert_eq!(keys(&emitted, "/product"), ["name", "version"]);
         assert_eq!(
             keys(&emitted, "/credential"),
-            ["present", "store_location", "store_scope"]
+            ["present", "store_location", "store_scope", "unreadable"]
         );
         assert_eq!(
             keys(&emitted, "/host"),
@@ -904,6 +938,42 @@ mod tests {
             "a status line that named the retained directory would be one step from \
              listing it: {text}"
         );
+    }
+
+    /// A store this account may not read is reported, and never as "absent".
+    ///
+    /// The distinction is the whole point: `absent` sends an operator to `auth
+    /// login`, and on a boot-mode macOS host — where the token is in the
+    /// root-only System Keychain and the operator is not root — that would
+    /// overwrite a credential that was never the problem. `snapshot` used to
+    /// fail outright here instead, so the command printed no host, no policies
+    /// and no budget either.
+    #[test]
+    fn an_unreadable_store_is_reported_rather_than_read_as_absent() {
+        let mut document = document();
+        document.credential.present = false;
+        document.credential.unreadable = Some("only root may read /var/db/SystemKey".to_string());
+
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            text.contains("credential                not readable by this account"),
+            "{text}"
+        );
+        assert!(
+            text.contains("credential problem        only root may read /var/db/SystemKey"),
+            "the store's own words are what name the remedy: {text}"
+        );
+        assert!(
+            !text.contains("credential                absent"),
+            "an unreadable store has not answered the question, and `absent` is the one \
+             answer that sends an operator to overwrite it: {text}"
+        );
+        // And the rest of the snapshot is still there, which is what failing
+        // outright used to cost.
+        assert!(text.contains("Policies (1)"), "{text}");
     }
 
     /// The version is in the document, and it is the constant. A schema that

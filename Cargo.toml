@@ -243,6 +243,15 @@ windows-service = "0.8.1"
 # --- macOS-only platform adapters -------------------------------------------
 # System Keychain for the machine-scoped secret store (`d2`).
 security-framework = "3.7.0"
+# `security-framework` wraps every Security.framework object in a Core
+# Foundation type and exposes the raw reference only through
+# `core_foundation::base::TCFType`. `d2` needs that reference for the one call
+# the wrapper does not make -- setting a stored item's access so that it is
+# granted to every application rather than to the single binary that wrote it,
+# without which a macOS daemon loses its own credential on every upgrade. This
+# adds no package to `Cargo.lock`: `security-framework` already resolves the
+# same 0.10 line.
+core-foundation = "0.10.1"
 
 # --- Unix-only platform adapters --------------------------------------------
 # The Unix half of the same process-identity primitive the Windows block above

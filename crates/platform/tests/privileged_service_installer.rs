@@ -431,9 +431,14 @@ fn install_status_and_uninstall_round_trip_against_the_real_service_manager() {
     let status = fixture.operations.status().expect("a status");
     assert!(status.is_installed());
     assert_eq!(status.start_mode(), Some(StartMode::Boot));
+    // The *daemon's* stem, which is not the operator's. On a boot-mode host the
+    // service runs under a different account and writes into the same `logs/`
+    // directory, so the two were separated: see `logging::LogRole`. Spelled out
+    // rather than taken from `LOG_FILE_STEM` so that a change to the constant
+    // fails here instead of being agreed with.
     assert_eq!(
         status.log_file(),
-        fixture.paths.logs_dir().join("runner-manager.log")
+        fixture.paths.logs_dir().join("runner-manager.service.log")
     );
     assert!(
         matches!(status.binary(), Some(BinaryPath::Current { .. })),

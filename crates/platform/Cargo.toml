@@ -41,6 +41,7 @@ windows = { workspace = true }
 windows-service = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
 security-framework = { workspace = true }
 
 # `d1` pairs a PID with the process start time so that a recycled PID cannot
