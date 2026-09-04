@@ -130,7 +130,7 @@
 
 use std::fmt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
@@ -1476,6 +1476,69 @@ where
 // Installing the sink
 // ---------------------------------------------------------------------------
 
+/// Whose diagnostics these are, and therefore which file they go in.
+///
+/// # Why the daemon does not share the operator's file
+///
+/// On the two Unixes a boot-mode registration runs the daemon as `root` while
+/// the four application-data directories stay in the operator's profile —
+/// `05-infrastructure.md` puts them there and `service install` records those
+/// paths into the plist. So two accounts write into one `logs/` directory, and
+/// the appender creates its file with the umask default, `0644`. Whichever
+/// account opened today's file first owns it, and if that was `root` the
+/// operator's own `runner-manager status` can no longer append to it.
+///
+/// That was not a degraded log. `tracing_appender::rolling::daily` **panics**
+/// when it cannot open the file, so every CLI command on such a host died with
+/// a backtrace before it did anything — reported on 0.1.17, on a host whose
+/// daemon had rolled the file over at midnight as `root`:
+///
+/// ```text
+/// thread 'main' panicked at rolling.rs:156:14:
+/// initializing rolling file appender failed: InitError { context: "failed to
+/// create log file", source: Os { code: 13, kind: PermissionDenied } }
+/// ```
+///
+/// [`install`] no longer panics — see there — but not panicking would only have
+/// turned a crash into an operator who never gets diagnostics again. The two
+/// writers are separated instead, so neither can take the other's file: the
+/// account that runs the daemon owns [`SERVICE_LOG_STEM`] and the operator owns
+/// [`OPERATOR_LOG_STEM`], for as long as the registration lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogRole {
+    /// A command the operator ran, or a daemon they started in the foreground.
+    Operator,
+    /// The daemon a service manager started, which on a boot-mode host is a
+    /// different account from the operator's.
+    Service,
+}
+
+/// The file stem [`LogRole::Operator`] writes.
+pub const OPERATOR_LOG_STEM: &str = "runner-manager.log";
+/// The file stem [`LogRole::Service`] writes, and what `service status`
+/// reports as the daemon's log.
+pub const SERVICE_LOG_STEM: &str = "runner-manager.service.log";
+
+impl LogRole {
+    /// The file stem this role writes, before the appender's date suffix.
+    #[must_use]
+    pub const fn file_stem(self) -> &'static str {
+        match self {
+            Self::Operator => OPERATOR_LOG_STEM,
+            Self::Service => SERVICE_LOG_STEM,
+        }
+    }
+}
+
+impl fmt::Display for LogRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Operator => "operator",
+            Self::Service => "service",
+        })
+    }
+}
+
 /// The sink could not be installed.
 #[derive(Debug, thiserror::Error)]
 pub enum LoggingError {
@@ -1493,6 +1556,30 @@ pub enum LoggingError {
         /// The underlying error.
         #[source]
         source: crate::paths::PathsError,
+    },
+
+    /// No diagnostics file in `logs/` could be opened for appending.
+    ///
+    /// Both stems are named because [`install`] tries two — the role's own, and
+    /// then one qualified by the account — and an operator who is told only
+    /// about the second would go looking for a file this process never reached
+    /// for first.
+    #[error(
+        "cannot open a diagnostics file in {}: neither {first_stem}.<date> ({first_source}) \
+         nor {second_stem}.<date> ({second_source}) could be appended to",
+        directory.display()
+    )]
+    Appender {
+        /// The diagnostics directory.
+        directory: PathBuf,
+        /// The stem this role would ordinarily write.
+        first_stem: String,
+        /// Why that one could not be opened.
+        first_source: String,
+        /// The account-qualified stem tried after it.
+        second_stem: String,
+        /// Why that one could not be opened either.
+        second_source: String,
     },
 
     /// A global subscriber was already installed.
@@ -1517,13 +1604,19 @@ pub struct LoggingGuard {
 /// Installs the redacting sink as this process's global subscriber, writing
 /// daily-rotating files into `logs/`.
 ///
-/// `default_filter` applies when `RUST_LOG` is unset or unparseable.
+/// `role` decides the file, for the reason [`LogRole`] gives. `default_filter`
+/// applies when `RUST_LOG` is unset or unparseable.
 ///
 /// # Errors
 ///
-/// [`LoggingError::Directory`] and [`LoggingError::AlreadyInstalled`].
+/// [`LoggingError::Directory`], [`LoggingError::Appender`] and
+/// [`LoggingError::AlreadyInstalled`]. **None of them is fatal to the caller**,
+/// and the CLI treats all three as a warning: a `host show` that refused to
+/// print a capacity because a log file could not be opened would be a worse
+/// failure than the one it was reporting.
 pub fn install(
     paths: &crate::paths::AppPaths,
+    role: LogRole,
     default_filter: &str,
 ) -> Result<LoggingGuard, LoggingError> {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -1544,7 +1637,7 @@ pub fn install(
             source,
         })?;
 
-    let appender = tracing_appender::rolling::daily(&directory, "runner-manager.log");
+    let appender = open_appender(&directory, role)?;
     let (writer, worker) = tracing_appender::non_blocking(appender);
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1559,6 +1652,118 @@ pub fn install(
         })?;
 
     Ok(LoggingGuard { _worker: worker })
+}
+
+/// Opens today's diagnostics file, falling back to one only this account can
+/// have created.
+///
+/// # Why there is a second attempt at all
+///
+/// [`LogRole`] keeps the daemon and the operator apart, which is enough on a
+/// host where nothing else ever writes here. Two things still put a file the
+/// caller cannot append to under the stem it wants:
+///
+/// 1. **A privileged command.** Signing in to the machine-scoped store is
+///    `sudo runner-manager auth login`, and that run writes the *operator's*
+///    stem as `root`. Every unprivileged command for the rest of that day then
+///    finds a `root`-owned file under it.
+/// 2. **A host upgraded into this change.** Files written before the roles were
+///    split are all under [`OPERATOR_LOG_STEM`], and on a boot-mode host the
+///    ones from the last few days belong to `root`.
+///
+/// Neither is worth losing diagnostics over, and neither can be repaired from
+/// inside an unprivileged process — it may not chown the file, may not change
+/// its mode, and must not delete an existing log. So it writes beside it, under
+/// a stem carrying this account's identity, which no other account will choose.
+///
+/// The fallback is deliberately *not* the first choice. A file named after
+/// whoever happened to open it first is a file an operator has to go looking
+/// for; the plain stem stays the plain stem, and the qualified one appears only
+/// on a host that has the collision.
+fn open_appender(
+    directory: &Path,
+    role: LogRole,
+) -> Result<tracing_appender::rolling::RollingFileAppender, LoggingError> {
+    let stem = role.file_stem();
+    let first = match build_appender(directory, stem) {
+        Ok(appender) => return Ok(appender),
+        Err(error) => error,
+    };
+
+    let qualified = account_qualified_stem(stem);
+    match build_appender(directory, &qualified) {
+        Ok(appender) => Ok(appender),
+        Err(second) => Err(LoggingError::Appender {
+            directory: directory.to_path_buf(),
+            first_stem: stem.to_string(),
+            first_source: first,
+            second_stem: qualified,
+            second_source: second,
+        }),
+    }
+}
+
+/// One attempt, through the constructor that **returns** its failure.
+///
+/// `tracing_appender::rolling::daily` is the same thing with an `.expect` on
+/// the end, and that `.expect` is a panic in the middle of an operator's `status`
+/// command. The whole reason this function exists is that the builder hands the
+/// error back instead.
+fn build_appender(
+    directory: &Path,
+    stem: &str,
+) -> Result<tracing_appender::rolling::RollingFileAppender, String> {
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(stem)
+        .build(directory)
+        .map_err(|error| error.to_string())
+}
+
+/// `runner-manager.log` becomes `runner-manager.<account>.log`.
+///
+/// The stem carries its own `.log`, so the account goes before it rather than
+/// after: the appender appends `.<date>`, and `runner-manager.log.uid-501` would
+/// read as a rotated file rather than as another account's.
+fn account_qualified_stem(stem: &str) -> String {
+    let account = account_tag();
+    match stem.rsplit_once('.') {
+        Some((head, tail)) => format!("{head}.{account}.{tail}"),
+        None => format!("{stem}.{account}"),
+    }
+}
+
+/// Something stable, filename-safe, and different for every local account.
+///
+/// The numeric effective user id rather than a name: it needs no lookup, cannot
+/// contain a path separator, and is the identity the filesystem actually
+/// compared when it refused the open.
+#[cfg(unix)]
+fn account_tag() -> String {
+    // SAFETY: `geteuid` takes no argument, touches no memory this process owns,
+    // and is documented never to fail.
+    let uid = unsafe { libc::geteuid() };
+    format!("uid-{uid}")
+}
+
+/// As the Unix half, from the one identity Windows exposes without a lookup.
+///
+/// Sanitized rather than trusted: this becomes a file name, and `USERNAME` is
+/// an ordinary environment variable that a caller may set to anything at all,
+/// including something holding a path separator.
+#[cfg(windows)]
+fn account_tag() -> String {
+    let raw = std::env::var("USERNAME").unwrap_or_default();
+    let safe: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    if safe.is_empty() {
+        "other-account".to_string()
+    } else {
+        format!("user-{safe}")
+    }
 }
 
 #[cfg(test)]
@@ -2277,7 +2482,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths = crate::paths::AppPaths::rooted_at(root.path());
 
-        let outcome = install(&paths, "trace");
+        let outcome = install(&paths, LogRole::Operator, "trace");
 
         // Asserted before the early return below, because `install` creates the
         // directories before it touches the global subscriber: this holds
@@ -2317,6 +2522,100 @@ mod tests {
         assert!(contents.contains(REDACTION), "{contents}");
         serde_json::from_str::<Value>(contents.lines().next().expect("a line"))
             .expect("each line is a JSON object");
+    }
+
+    // -----------------------------------------------------------------------
+    // Two accounts, one logs/ directory
+    // -----------------------------------------------------------------------
+
+    /// The daemon and the operator do not reach for the same file.
+    ///
+    /// Cheap, and it is the whole of the separation: everything else about
+    /// [`LogRole`] follows from these two names being different.
+    #[test]
+    fn the_daemon_and_the_operator_write_different_files() {
+        assert_ne!(
+            LogRole::Service.file_stem(),
+            LogRole::Operator.file_stem(),
+            "a boot-mode daemon runs as another account and creates its file 0644; sharing a \
+             stem hands whichever of them opened it first the day's file and locks the other out"
+        );
+        assert_eq!(LogRole::Operator.file_stem(), OPERATOR_LOG_STEM);
+        assert_eq!(LogRole::Service.file_stem(), SERVICE_LOG_STEM);
+    }
+
+    /// A file this account may not append to is written *beside*, not panicked
+    /// on.
+    ///
+    /// This is the reported 0.1.17 crash, reproduced at the mode that caused
+    /// it. On the host it was ownership — `root` had rolled the file over at
+    /// midnight — and an unprivileged test cannot make a `root`-owned file, so
+    /// it makes an unwritable one instead: the appender's `OpenOptions` refuse
+    /// both with the same `EACCES`, and refusing was what
+    /// `tracing_appender::rolling::daily` turned into a panic.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_file_this_account_cannot_append_to_is_written_beside() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // `root` is not subject to the mode bits, so it would sail through the
+        // very open this test needs to fail.
+        if account_tag() == "uid-0" {
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let paths = crate::paths::AppPaths::rooted_at(root.path());
+        paths
+            .create_all()
+            .expect("the four directories are created");
+
+        // Every date the appender might choose, so the test cannot flake on a
+        // run that straddles midnight UTC.
+        let logs = paths.logs_dir().to_path_buf();
+        let today = chrono::Utc::now();
+        for date in [
+            (today - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string(),
+            today.format("%Y-%m-%d").to_string(),
+            (today + chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string(),
+        ] {
+            let taken = logs.join(format!("{OPERATOR_LOG_STEM}.{date}"));
+            std::fs::write(&taken, b"another account's diagnostics").expect("writable");
+            std::fs::set_permissions(&taken, std::fs::Permissions::from_mode(0o444))
+                .expect("the mode is applied");
+        }
+
+        let mut appender = open_appender(&logs, LogRole::Operator)
+            .expect("a diagnostics file is opened beside the one this account may not append to");
+        appender
+            .write_all(b"a line\n")
+            .expect("the line is written");
+        appender.flush().expect("the line is flushed");
+
+        let qualified = account_qualified_stem(OPERATOR_LOG_STEM);
+        let written: Vec<String> = std::fs::read_dir(&logs)
+            .expect("the directory is readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            written.iter().any(|name| name.starts_with(&qualified)),
+            "expected a file under {qualified:?} beside the unwritable ones, and found {written:?}"
+        );
+        for name in &written {
+            if name.starts_with(&qualified) {
+                continue;
+            }
+            assert_eq!(
+                std::fs::read(logs.join(name)).expect("readable"),
+                b"another account's diagnostics",
+                "{name} belongs to another account and must not have been touched"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

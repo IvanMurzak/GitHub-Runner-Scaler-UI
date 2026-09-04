@@ -120,8 +120,12 @@ fn a_full_cycle_leaves_no_token_shaped_value_outside_the_store() {
     // the store does not store anything.
     let store_root = tempfile::TempDir::new().expect("a temporary directory");
 
-    let guard = runner_manager_platform::logging::install(&paths, "trace")
-        .expect("the redacting sink installs");
+    let guard = runner_manager_platform::logging::install(
+        &paths,
+        runner_manager_platform::logging::LogRole::Operator,
+        "trace",
+    )
+    .expect("the redacting sink installs");
 
     run_a_full_cycle(&token, store_root.path());
 

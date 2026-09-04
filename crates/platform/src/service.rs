@@ -150,14 +150,17 @@ pub const RECORD_FILE: &str = "service.toml";
 /// and Journey 5 step 4 requires it.
 pub const CONTACT_FILE: &str = "github-contact.toml";
 
-/// The rotating diagnostic log [`crate::logging::install`] writes, inside
-/// `logs/`.
+/// The rotating diagnostic log the **daemon** writes, inside `logs/`.
 ///
-/// `tracing_appender::rolling::daily` appends its own date suffix, so this is
-/// the stem rather than a file that exists. `service status` reports the
-/// directory and the stem, because that is what an operator needs in order to
-/// find today's file and yesterday's.
-pub const LOG_FILE_STEM: &str = "runner-manager.log";
+/// The appender adds its own date suffix, so this is the stem rather than a
+/// file that exists. `service status` reports the directory and the stem,
+/// because that is what an operator needs in order to find today's file and
+/// yesterday's.
+///
+/// It is [`crate::logging::SERVICE_LOG_STEM`] and not the operator's, because a
+/// boot-mode daemon runs under a different account and writes a different file.
+/// [`crate::logging::LogRole`] says why the two were separated.
+pub const LOG_FILE_STEM: &str = crate::logging::SERVICE_LOG_STEM;
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -597,16 +600,25 @@ pub enum ServiceError {
         delay_secs: u64,
     },
 
-    /// A registration is already there.
+    /// A registration is already there, in the **other** start mode.
+    ///
+    /// Only the other one. A registration in the mode being asked for is
+    /// replaced rather than refused — see [`Operations::install`], and the
+    /// outage that taught us why.
     #[error(
-        "{name} is already registered to start at {existing}. Use `service uninstall` first, or \
-         switch the start mode in place, which does not re-register anything."
+        "{name} is already registered to start at {existing}, and this asks for {requested}. \
+         Changing the start mode moves the registration between two different service \
+         managers, so it is not something an install does by itself: run `service uninstall` \
+         first, or change the start mode in the terminal UI (`runner-manager tui`), which \
+         switches it in place and keeps the registration running throughout."
     )]
     AlreadyInstalled {
         /// Which registration.
         name: String,
         /// The mode it currently carries.
         existing: StartMode,
+        /// The mode this install asked for.
+        requested: StartMode,
     },
 
     /// No registration is there.
@@ -640,6 +652,33 @@ pub enum ServiceError {
         /// The record file.
         path: PathBuf,
         /// What was wrong with it.
+        detail: String,
+    },
+
+    /// The record is there and **this account** may not read it.
+    ///
+    /// Its own variant rather than a [`ServiceError::Record`] with a
+    /// `Permission denied` in the detail, because it is the one record failure
+    /// that is not a fault in the record: `service status` reports it and
+    /// carries on, where every other read failure ends the command. See
+    /// [`Operations::status`].
+    ///
+    /// A version before this one wrote the record at `0600` through a temporary
+    /// file, so a boot-mode `sudo service install` left it owned by `root` and
+    /// unreadable by the operator whose profile it is in. `service status` then
+    /// failed on their own host, with a remedy naming the command that had just
+    /// failed.
+    #[error(
+        "the service record {} is there and this account may not read it: {detail}. It was \
+         written by whichever account installed the service -- on a boot-mode host, `sudo \
+         service install`. Running `service install` again rewrites it readable; until then \
+         only what the service manager itself reports is available.",
+        path.display()
+    )]
+    RecordNotPermitted {
+        /// The record file.
+        path: PathBuf,
+        /// What the operating system said.
         detail: String,
     },
 
@@ -2771,14 +2810,23 @@ impl InstallRecord {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Record`] when the file exists and cannot be read, and
-    /// [`ServiceError::RecordUnreadable`] when it is not a record this version
-    /// understands.
+    /// [`ServiceError::Record`] when the file exists and cannot be read,
+    /// [`ServiceError::RecordNotPermitted`] when it exists and this account may
+    /// not read it, and [`ServiceError::RecordUnreadable`] when it is not a
+    /// record this version understands.
     pub fn read(paths: &AppPaths) -> Result<Option<Self>, ServiceError> {
         let path = Self::path(paths);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Told apart from every other read failure because `status` carries
+            // on through this one alone. See `ServiceError::RecordNotPermitted`.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(ServiceError::RecordNotPermitted {
+                    path,
+                    detail: error.to_string(),
+                });
+            }
             Err(error) => {
                 return Err(ServiceError::Record {
                     operation: "read",
@@ -2844,6 +2892,34 @@ impl InstallRecord {
                 path: path.clone(),
                 detail: error.to_string(),
             })?;
+        // ------------------------------------------------------------------
+        // THE RECORD IS READABLE BY THE ACCOUNT WHOSE DIRECTORY IT IS IN.
+        // ------------------------------------------------------------------
+        // `NamedTempFile` creates at `0600`, which is right for a temporary
+        // file and wrong for this one. A boot-mode `service install` runs under
+        // `sudo`, so `0600` made the record `root`-owned and unreadable by the
+        // operator — and `service status`, which asks no privilege of anybody,
+        // failed on their own host with `Permission denied` and a remedy that
+        // named the command that had just failed.
+        //
+        // `0644` does not widen anything: `RECORD_FILE`'s own documentation is
+        // that this is *"non-secret TOML"* holding no credential, and
+        // `AppPaths::create_all` puts it in a `0700` directory, so no other
+        // local account can reach it whatever its own mode says. It is the same
+        // arrangement the rotating diagnostics already have.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))
+                .map_err(|error| ServiceError::Record {
+                    operation: "write",
+                    path: path.clone(),
+                    detail: error.to_string(),
+                })?;
+        }
         temporary
             .persist(&path)
             .map(|_| ())
@@ -3236,6 +3312,14 @@ pub struct Installed {
     /// Named trustees rather than SIDs, so printing it adds no identity to the
     /// output. See [`crate::runner_root_access`].
     pub runner_root: RootAccessSummary,
+    /// Whether this replaced a registration that was already there, rather than
+    /// making a new one.
+    ///
+    /// Reported rather than glossed over: "Service installed" on a host that
+    /// had one already reads as though nothing had been taken away and put
+    /// back, and what was taken away and put back is the thing an operator
+    /// watching a running agent wants to know about.
+    pub replaced_existing: bool,
 }
 
 /// What `uninstall` did — and, as importantly, what it did not.
@@ -3421,12 +3505,45 @@ impl ServiceOperations {
         // the release, so an early return releases it too.
         let _guard = self.refuse_while_an_agent_runs()?;
 
-        if let Some((mode, _)) = self.find_registration()? {
-            return Err(ServiceError::AlreadyInstalled {
-                name: self.identity.name().to_string(),
-                existing: mode,
-            });
-        }
+        // --------------------------------------------------------------------
+        // AN INSTALL OVER THE SAME START MODE REPLACES; IT DOES NOT REFUSE.
+        // --------------------------------------------------------------------
+        // This used to refuse any existing registration, and that was wrong in
+        // a way that took a real host down.
+        //
+        // `service install` is *also* how an operator moves to a new version by
+        // hand — `install_owned_copy` says so, and the `.old` rename it does
+        // exists precisely so that reinstalling over a **running** service
+        // works. So the caller replaces the copy the service runs and *then*
+        // asks to register it. Refusing at that point does not undo the swap:
+        // the daemon is left running a binary nobody registered, the command
+        // reports failure, and on macOS the new binary is a program the stored
+        // credential's keychain grant does not name. Watched on 0.1.17: the
+        // copy under `state/bin` was replaced at 00:16, `service install` said
+        // "already registered", and the daemon crash-looped on `-25293` from
+        // then on.
+        //
+        // Registering the same service twice is not what an operator is asking
+        // for here and is not what they get: the platform is asked to drop the
+        // registration and take it again, which is a deregister followed by a
+        // register because that is the only thing launchd, systemd and the SCM
+        // all support — `launchctl bootstrap` refuses a label already loaded.
+        //
+        // The *other* mode is still refused. Moving between boot and login
+        // moves the registration between two service managers and changes the
+        // account and the secret store with it; `set_start_mode` does that,
+        // carefully, and an install is not the place for it.
+        let replacing = match self.find_registration()? {
+            Some((existing, _)) if existing == request.start_mode() => true,
+            Some((existing, _)) => {
+                return Err(ServiceError::AlreadyInstalled {
+                    name: self.identity.name().to_string(),
+                    existing,
+                    requested: request.start_mode(),
+                });
+            }
+            None => false,
+        };
 
         let plan = InstallPlan::resolve(
             self.identity.clone(),
@@ -3447,9 +3564,33 @@ impl ServiceOperations {
         // undoing a directory is cheaper than undoing a service.
         let root = self.prepare_runner_root(plan.start_mode())?;
 
+        // Read before the registration is dropped, so that a replace which then
+        // fails to take can put back what was there. A record this account
+        // cannot read leaves nothing to reinstate, which is reported rather
+        // than pretended: see `reinstate`.
+        let previous = if replacing {
+            InstallRecord::read(&self.paths).ok().flatten()
+        } else {
+            None
+        };
+        if replacing && let Err(cause) = control.uninstall(&self.identity) {
+            return Err(undo_runner_root(&root, "install", &self.identity, cause));
+        }
+
         let definition = match control.install(&plan) {
             Ok(definition) => definition,
-            Err(cause) => return Err(undo_runner_root(&root, "install", &self.identity, cause)),
+            Err(cause) => {
+                // Nothing was deregistered on a first install, so there is
+                // nothing to put back and `reinstate` says so with `Ok(())`.
+                let restored = self.reinstate(control.as_ref(), previous.as_ref());
+                return Err(rolled_back(
+                    retained_runner_root(&root),
+                    restored,
+                    "install",
+                    &self.identity,
+                    cause,
+                ));
+            }
         };
         let review = review_least_privilege(&definition, &plan);
         let record = InstallRecord::of(&plan, &definition, Utc::now());
@@ -3468,7 +3609,46 @@ impl ServiceOperations {
             record,
             review,
             runner_root: root.summary().clone(),
+            replaced_existing: replacing,
         })
+    }
+
+    /// Puts back a registration this call deregistered in order to replace it.
+    ///
+    /// `Ok(())` when there was nothing to put back, which is the ordinary case:
+    /// a first install deregisters nothing. When there *was* a record, the plan
+    /// is rebuilt from it rather than from the request, because the request is
+    /// the one that just failed.
+    ///
+    /// Best effort by construction — the caller passes the result to
+    /// [`rolled_back`], which reports a failed rollback alongside the original
+    /// cause rather than replacing it.
+    fn reinstate(
+        &self,
+        control: &dyn ServiceControl,
+        previous: Option<&InstallRecord>,
+    ) -> Result<(), ServiceError> {
+        let Some(record) = previous else {
+            return Ok(());
+        };
+        let plan = InstallPlan::unchecked(
+            self.identity.clone(),
+            record.start_mode,
+            record.binary.clone(),
+            record.directories.clone(),
+        )
+        .with_arguments(record.arguments.clone())
+        .with_restart(record.restart());
+        let plan = if record.starts_on_demand {
+            plan.started_on_demand()
+        } else {
+            plan
+        };
+        let plan = match crate::secrets::PlatformSecretStore::for_start_mode(record.start_mode) {
+            Ok(store) => plan.with_secret_guard(store.guard()),
+            Err(_) => plan,
+        };
+        control.install(&plan).map(|_| ())
     }
 
     /// Deregisters, and deletes nothing else.
@@ -3686,13 +3866,27 @@ impl ServiceOperations {
     /// error here: it is a reported state, because a status command that
     /// refused to print anything else would hide the very facts an operator
     /// needs in order to fix it.
+    ///
+    /// A record **this account may not read** is reported for the same reason
+    /// and is the second exception. On a boot-mode host the record was written
+    /// by `sudo service install`, and a version before this one wrote it `0600`
+    /// — so the operator's own `service status` ended with `Permission denied`
+    /// and printed nothing at all, on a host whose registration the service
+    /// manager would have described perfectly well. What launchd, systemd or
+    /// the SCM says is a separate fact from the record, and it is still worth
+    /// having.
     pub fn status(&self) -> Result<ServiceStatus, ServiceError> {
-        let record = InstallRecord::read(&self.paths)?;
+        let (record, record_refused) = match InstallRecord::read(&self.paths) {
+            Ok(record) => (record, None),
+            Err(refusal @ ServiceError::RecordNotPermitted { .. }) => (None, Some(refusal)),
+            Err(error) => return Err(error),
+        };
         let found = self.find_registration()?;
         let last_github_contact = last_github_contact(&self.paths)?;
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
+            record_refused.as_ref(),
             found.map(|(_, registration)| registration),
             last_github_contact,
             &self.paths,
@@ -3831,15 +4025,31 @@ pub struct ServiceStatus {
 }
 
 impl ServiceStatus {
+    /// `record_refused` carries a [`ServiceError::RecordNotPermitted`] when
+    /// there **is** a record and this account may not read it, which is not the
+    /// same state as having none and must not be reported as one. See
+    /// [`Operations::status`].
     fn compose(
         identity: ServiceIdentity,
         record: Option<InstallRecord>,
+        record_refused: Option<&ServiceError>,
         registration: Option<Registration>,
         last_github_contact: Option<DateTime<Utc>>,
         paths: &AppPaths,
     ) -> Self {
         let mut problems = Vec::new();
         let mut notes = Vec::new();
+
+        if let Some(refusal) = record_refused {
+            // A problem rather than a note: `is_healthy` stays false, because
+            // an operator who cannot read their own install record does have
+            // something to fix. It is just not a reason to withhold everything
+            // the service manager knows.
+            problems.push(StatusProblem {
+                subject: "install record",
+                detail: refusal.to_string(),
+            });
+        }
 
         let log_file = record.as_ref().map_or_else(
             || ServiceDirectories::of(paths).log_file(),
@@ -3871,7 +4081,11 @@ impl ServiceStatus {
                          registration. Run `service install` again; it deletes nothing."
                     .to_string(),
             }),
-            (None, Some(found)) => problems.push(StatusProblem {
+            // Not reported when the record was refused rather than absent: the
+            // problem above already names the real state, and "there is no
+            // install record" would be a second, wrong diagnosis of the same
+            // file, with a `service uninstall` in its remedy.
+            (None, Some(found)) if record_refused.is_none() => problems.push(StatusProblem {
                 subject: "record",
                 detail: format!(
                     "{} holds a registration for this service but there is no install record, so \
@@ -3880,6 +4094,7 @@ impl ServiceStatus {
                     found.manager
                 ),
             }),
+            (None, Some(_)) => {}
             (Some(record), Some(found)) => {
                 if record.start_mode != found.start_mode {
                     problems.push(StatusProblem {
@@ -6894,6 +7109,44 @@ mod tests {
         assert!(read.binary.is_absolute());
     }
 
+    /// The record is readable by the account whose directory it is in.
+    ///
+    /// A boot-mode `service install` runs under `sudo`, and `NamedTempFile`
+    /// creates at `0600`, so the record landed `root`-owned and unreadable by
+    /// the operator — `service status` then failed on their own host with
+    /// `Permission denied`. Ownership cannot be reproduced in an unprivileged
+    /// test, but the mode that made ownership fatal can, and it is the half
+    /// this code controls.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_is_not_written_readable_only_by_whoever_installed_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = Host::new();
+        let plan = InstallPlan::resolve(
+            ServiceIdentity::product(),
+            &host.request(StartMode::Boot),
+            ServiceDirectories::of(&host.paths),
+        )
+        .expect("a resolvable plan");
+        let definition = ServiceDefinition::from_text(DefinitionKind::SystemdUnit, "[Service]\n");
+        InstallRecord::of(&plan, &definition, Utc::now())
+            .write(&host.paths)
+            .expect("a writable record");
+
+        let mode = std::fs::metadata(InstallRecord::path(&host.paths))
+            .expect("the record is there")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the record is mode {mode:04o}; at 0600 an operator cannot read a record `sudo \
+             service install` wrote, and `service status` fails on their own host. It holds no \
+             credential and sits in a 0700 directory, so 0644 discloses nothing"
+        );
+    }
+
     /// A record written before the service ran a copy of its own must still
     /// load. It reads as `None`, which is the truth about it: that registration
     /// names the package manager's file and cannot be upgraded under itself.
@@ -7098,19 +7351,74 @@ logs = \"/d\"
         );
     }
 
+    /// Installing over the same start mode replaces the registration.
+    ///
+    /// It used to be refused, and the refusal is what broke a real host: the
+    /// caller has already swapped the binary the service runs by the time this
+    /// is reached — that is the documented way to upgrade by hand — so refusing
+    /// left a daemon running an unregistered binary and, on macOS, one the
+    /// stored credential's keychain grant did not name.
     #[test]
-    fn installing_over_an_existing_registration_is_refused() {
+    fn installing_over_the_same_start_mode_replaces_the_registration() {
         let host = Host::new();
         let operations = host.operations();
         operations
             .install(&host.request(StartMode::Boot))
             .expect("the first install");
-        let error = operations
+
+        let again = operations
             .install(&host.request(StartMode::Boot))
-            .expect_err("the second install");
+            .expect("an install over the same mode replaces rather than refusing");
+
         assert!(
-            matches!(error, ServiceError::AlreadyInstalled { .. }),
+            again.replaced_existing,
+            "the operator is told this replaced something rather than made it"
+        );
+        assert_eq!(
+            host.controls.registrations().len(),
+            1,
+            "replacing must not leave two registrations behind"
+        );
+        assert_eq!(
+            InstallRecord::read(&host.paths)
+                .expect("readable")
+                .expect("a record")
+                .start_mode,
+            StartMode::Boot
+        );
+    }
+
+    /// The *other* mode is still refused, because changing it moves the
+    /// registration between two service managers and changes the account and
+    /// the secret store with it. `set_start_mode` is what does that.
+    #[test]
+    fn installing_over_the_other_start_mode_is_refused() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("the first install");
+
+        let error = operations
+            .install(&host.request(StartMode::Login))
+            .expect_err("a mode change is not an install");
+        assert!(
+            matches!(
+                error,
+                ServiceError::AlreadyInstalled {
+                    existing: StartMode::Boot,
+                    requested: StartMode::Login,
+                    ..
+                }
+            ),
             "{error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("switch the start mode in place,"),
+            "the old remedy named a capability no command offers; the terminal UI is where \
+             the start mode moves: {error}"
         );
         assert_eq!(host.controls.registrations().len(), 1);
     }
@@ -7657,6 +7965,66 @@ logs = \"/d\"
         ] {
             assert!(printed.contains(fragment), "{printed}");
         }
+    }
+
+    /// A record this account may not read is reported, and `status` keeps
+    /// going.
+    ///
+    /// It used to end the command with `Permission denied`, which is exactly
+    /// what an operator met on a boot-mode host: `sudo service install` wrote
+    /// the record `0600` and `root`-owned, and `service status` — a command
+    /// that asks no privilege of anybody — then printed nothing at all about a
+    /// registration the service manager could describe perfectly well.
+    ///
+    /// Ownership cannot be reproduced without privileges; the mode that made it
+    /// fatal can.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_a_record_it_may_not_read_and_still_reports_the_registration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // `root` is not subject to the mode bits and would read the record
+        // regardless, leaving the assertions below testing nothing.
+        // SAFETY: `geteuid` takes no argument and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Boot))
+            .expect("an install");
+        assert!(
+            operations.status().expect("a status").is_healthy(),
+            "the discriminator: healthy before the record is made unreadable"
+        );
+
+        let record = InstallRecord::path(&host.paths);
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000))
+            .expect("the mode is applied");
+
+        let status = operations
+            .status()
+            .expect("a record this account may not read is reported, not thrown");
+        assert!(status.is_installed(), "{status}");
+        assert!(!status.is_healthy(), "{status}");
+
+        let printed = status.to_string();
+        assert!(
+            printed.contains("this account may not read it"),
+            "the operator is told which of the two states this is: {printed}"
+        );
+        assert!(
+            !printed.contains("there is no install record"),
+            "a record that is there and unreadable is not a record that is missing, and the \
+             missing one's remedy starts with `service uninstall`: {printed}"
+        );
+
+        // Left readable so the fixture's own cleanup is not the thing that
+        // fails on a host where TempDir removal walks the tree.
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is restored");
     }
 
     #[test]

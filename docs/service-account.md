@@ -85,6 +85,42 @@ stay there. The macOS machine-scoped store is the System Keychain, and what
 decides who can decrypt it is `/var/db/SystemKey`, which is root-only. A
 LaunchDaemon under any other account starts and then finds no credential.
 
+#### The stored item names no application, and why that is not a widening
+
+A keychain item also carries an access control list naming the *applications*
+allowed to read it, and for an unsigned binary a keychain identifies an
+application by the hash of the binary. **Replacing the binary is what an upgrade
+is.** An item granted to the copy that wrote it therefore locks out the copy
+that replaces it: the daemon reads `errSecAuthFailed` (`-25293`) from the
+credential it owns, exits `13`, and launchd restarts it every fifteen seconds
+until somebody notices. That happened on two separate upgrades of a real host.
+
+So `secrets.rs` creates the item with an access that names **no** application,
+which Security.framework reads as *any* application — the same grant
+`security add-generic-password -A` writes.
+
+What that costs is nothing, because on this keychain the ACL was never the
+boundary:
+
+- The System Keychain is decrypted with `/var/db/SystemKey`, mode `0400`, owner
+  `root`. Every process that can read an item there is already `root`.
+- "Any local administrator or `root` account on that machine can read it" is
+  already the accepted trade-off of machine-scoped storage, recorded in
+  `07-security.md` and repeated under *What is not claimed* below.
+
+The **login** keychain (`--start-at login`) is the one place where the
+per-application ACL is a real boundary — every process running as the operator
+can reach that keychain — so it is left alone and keeps the default grant. A
+user-scoped host has an operator present to answer the keychain's prompt, which
+is precisely what a boot-mode daemon does not.
+
+The property is tested rather than asserted:
+`crates/platform/tests/another_program_can_read_the_stored_token.rs` writes a
+value through this store and then reads it back with `/usr/bin/security` — a
+program this repository did not build — under a deadline, because a
+per-application grant does not fail, it waits for an approval nobody is there to
+give.
+
 The plist states `UserName = root` explicitly rather than relying on launchd's
 default, so the account is a reviewable fact rather than an implicit one, and
 `review_least_privilege` reports a shortfall if it is absent.
@@ -141,7 +177,38 @@ runtime/     per-attempt disposable runner workspaces
 logs/        rotating redacted diagnostics
 ```
 
-On Linux this is enforced, not merely intended:
+### Two accounts write into one `logs/`
+
+On a boot-mode host those four directories are in the **operator's** profile —
+`service install` records the paths it resolved and the plist repeats them — and
+the daemon writes into them as `root`. `logs/` is the one place where that
+collides, because the rotating appender creates its file at the umask default:
+whichever account opens the day's file first owns it, and if that was `root`
+then the operator's own commands cannot append to it. On 0.1.17 that did not
+degrade the log, it **crashed every CLI command**, because the appender panics
+when it cannot open its file.
+
+Two things keep the two apart now, in `crates/platform/src/logging.rs`:
+
+| writer | file |
+|---|---|
+| the daemon a service manager started | `logs/runner-manager.service.log.<date>` |
+| a command the operator ran, or a foreground `daemon run` | `logs/runner-manager.log.<date>` |
+
+and if a file under the wanted stem still cannot be appended to — a `sudo
+runner-manager auth login` earlier the same day, or a host upgraded into this
+change — the process writes beside it under `runner-manager.uid-<uid>.log.<date>`
+rather than failing. `service status` reports the daemon's stem, which is the
+one an operator diagnosing the service wants.
+
+The mode of the two application-data files a privileged install leaves behind
+matters for the same reason. `config/service.toml` is written `0644`: it holds
+no credential — that is what makes it *"non-secret TOML"* — and it sits in a
+`0700` directory, so no other local account can reach it, while the operator who
+owns that directory can read the record `sudo service install` wrote. At `0600`
+they could not, and `service status` failed on their own host.
+
+On Linux the confinement below is enforced, not merely intended:
 
 ```ini
 ProtectSystem=strict
@@ -272,6 +339,33 @@ workspaces to solve a problem those platforms do not have would be a
 regression.
 
 ---
+
+## What `service install` does when there is already a registration
+
+`service install` is how an operator moves to a new version by hand: it replaces
+the copy of the binary under `state/bin` that the service actually runs — the
+package manager's own file is never registered, because a running service holds
+it open and `npm i -g` then reports a success it did not achieve.
+
+The copy is replaced **before** the registration can name it, and that ordering
+is why the command's failure modes matter more than they look.
+
+- **Over the same start mode, it replaces the registration.** It used to refuse
+  with *"already registered"* — after having swapped the binary. The daemon was
+  then running a version no completed command had registered, and on macOS a
+  version the stored credential's keychain grant did not name, which is a
+  crash loop every fifteen seconds until somebody reads the launchd log.
+  Replacing means asking the service manager to drop the registration and take
+  it again, because that is the only thing launchd, systemd and the SCM all
+  support: `launchctl bootstrap` refuses a label that is already loaded.
+- **Over the *other* start mode, it still refuses.** Moving between boot and
+  login moves the registration between two service managers and changes both
+  the account and the secret store with it. That is `set_start_mode`'s job —
+  reachable from the terminal UI — and it keeps the service running throughout.
+- **Any failure puts the previous binary back.** Including the refusal above,
+  and including *"an agent is already running on this host"*, which an install
+  meets whenever the daemon happens to hold the single-instance lock at that
+  moment. Whatever the reason, the service is left running what it was running.
 
 ## What `service uninstall` may delete
 

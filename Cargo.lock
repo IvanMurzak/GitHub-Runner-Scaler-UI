@@ -2630,6 +2630,7 @@ version = "0.1.17"
 dependencies = [
  "async-trait",
  "chrono",
+ "core-foundation 0.10.1",
  "directories",
  "insta",
  "libc",

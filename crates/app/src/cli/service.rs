@@ -131,6 +131,47 @@ fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
     arguments
 }
 
+/// The copy of this executable that the service runs, and how to undo making
+/// it.
+///
+/// # Why undoing it matters
+///
+/// The copy is swapped **before** the registration is asked for, because the
+/// registration has to name the new path. So every way the install can fail
+/// after that point is a way to leave the daemon running a binary that no
+/// command completed: the operator is told the install failed and the running
+/// service has quietly moved to a new version anyway. On macOS that is not
+/// cosmetic — a keychain grants a stored item to the binary that wrote it, so a
+/// swapped copy is a daemon locked out of its own credential, which is exactly
+/// how a real host spent a night crash-looping.
+///
+/// [`OwnedCopy::restore`] puts the previous copy back, so a failed
+/// `service install` leaves the service running what it was running before.
+struct OwnedCopy {
+    /// Where the service will run it from.
+    path: PathBuf,
+    /// Where the copy it replaced was moved to, when there was one.
+    replaced: Option<PathBuf>,
+}
+
+impl OwnedCopy {
+    /// Puts back the copy this install moved aside.
+    ///
+    /// Best effort and deliberately silent: it runs on a path that is already
+    /// returning an error, and a failure to undo is not worth replacing the
+    /// operator's actual diagnosis with. What it cannot do is make things
+    /// worse — the destination is a file this product owns and just wrote.
+    fn restore(self) {
+        let Some(replaced) = self.replaced else {
+            // Nothing was there before, so the tidy state is nothing there now.
+            let _ = std::fs::remove_file(&self.path);
+            return;
+        };
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::rename(&replaced, &self.path);
+    }
+}
+
 /// Copies the running executable to a path this product owns, and answers where.
 ///
 /// # Why the copy is replaced rather than reused
@@ -139,8 +180,9 @@ fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
 /// a stale copy left in place would silently keep the old daemon. The previous
 /// copy is renamed aside first rather than deleted: on Windows the file cannot
 /// be removed while a service still runs it, but it *can* be renamed, which is
-/// what makes reinstalling over a running service work at all.
-fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<PathBuf, CliError> {
+/// what makes reinstalling over a running service work at all — and it is what
+/// gives [`OwnedCopy::restore`] something to put back.
+fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<OwnedCopy, CliError> {
     fn failed(what: &'static str) -> impl Fn(std::io::Error) -> CliError {
         move |source| CliError::new(Failure::LocalState, format!("cannot {what}: {source}"))
     }
@@ -151,14 +193,19 @@ fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<Pat
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("runner-manager")),
     );
+    let mut replaced = None;
     if owned.exists() {
         let aside = owned.with_extension("old");
         let _ = std::fs::remove_file(&aside);
         std::fs::rename(&owned, &aside)
             .map_err(failed("move the previous service binary aside"))?;
+        replaced = Some(aside);
     }
     std::fs::copy(source, &owned).map_err(failed("copy the binary the service will run"))?;
-    Ok(owned)
+    Ok(OwnedCopy {
+        path: owned,
+        replaced,
+    })
 }
 
 pub fn install(
@@ -215,10 +262,19 @@ pub fn install(
     })?;
     let owned = install_owned_copy(context, &source)?;
     let request = InstallRequest::new(mode)
-        .for_binary(&owned)
+        .for_binary(&owned.path)
         .copied_from(&source)
         .with_arguments(daemon_arguments(context, mode));
-    let installed = operations.install(&request).map_err(service_failure)?;
+    // The swap above is undone on every failure below it. See `OwnedCopy`: a
+    // refused install that left the new copy in place is what put a running
+    // daemon on a binary nobody registered.
+    let installed = match operations.install(&request) {
+        Ok(installed) => installed,
+        Err(source) => {
+            owned.restore();
+            return Err(service_failure(source));
+        }
+    };
 
     if let Err(source) = persist_mode(&store, &mut host, mode)
         && durable_mode(&store).ok().flatten() != Some(mode)
@@ -227,7 +283,16 @@ pub fn install(
         return Err(rollback_failure("install", source, rollback.err()));
     }
 
-    writeln!(out, "Service installed.").map_err(failed)?;
+    writeln!(
+        out,
+        "{}",
+        if installed.replaced_existing {
+            "Service re-registered, replacing the registration that was there."
+        } else {
+            "Service installed."
+        }
+    )
+    .map_err(failed)?;
     writeln!(
         out,
         "  start mode                {}",
@@ -366,7 +431,19 @@ fn service_failure(source: ServiceError) -> CliError {
         ServiceError::NeedsElevation { .. } => Failure::UnsupportedHost,
         _ => Failure::LocalState,
     };
-    CliError::with_remedy(class, source.to_string(), "runner-manager service status")
+    // `service status` is the default remedy and is the wrong one for a
+    // failure `service status` itself produced: an operator whose install
+    // record could not be read was told to run the command that had just told
+    // them that. A record this account may not read is a record written by
+    // another one, which on a boot-mode host means `sudo service install` --
+    // and re-running the install is what repairs its mode.
+    let remedy = match &source {
+        ServiceError::Record { operation, .. } if *operation == "read" => {
+            "runner-manager service install"
+        }
+        _ => "runner-manager service status",
+    };
+    CliError::with_remedy(class, source.to_string(), remedy)
 }
 
 #[cfg(test)]
@@ -390,7 +467,9 @@ mod tests {
         let source = temporary.path().join("package-manager-owned.bin");
         std::fs::write(&source, b"first version").unwrap();
 
-        let owned = install_owned_copy(&context, &source).expect("the copy is made");
+        let owned = install_owned_copy(&context, &source)
+            .expect("the copy is made")
+            .path;
         assert!(owned.starts_with(context.paths().state_dir()), "{owned:?}");
         assert_ne!(owned, source, "the service must not run the source itself");
         assert_eq!(std::fs::read(&owned).unwrap(), b"first version");
@@ -399,7 +478,9 @@ mod tests {
         // Windows the file cannot be unlinked while a service is running it,
         // but it can be renamed, and that is what lets this run at all.
         std::fs::write(&source, b"second version").unwrap();
-        let again = install_owned_copy(&context, &source).expect("the copy is replaced");
+        let again = install_owned_copy(&context, &source)
+            .expect("the copy is replaced")
+            .path;
         assert_eq!(
             again, owned,
             "the registered path must not move between installs"
@@ -413,6 +494,61 @@ mod tests {
             std::fs::read(owned.with_extension("old")).unwrap(),
             b"first version",
             "the previous copy is kept aside, not destroyed"
+        );
+    }
+
+    /// A `service install` that fails leaves the service running what it was
+    /// running.
+    ///
+    /// The copy has to be swapped before the registration can name it, so every
+    /// failure after that point used to leave the daemon on a binary no
+    /// completed command ever registered. On macOS that is what locks a daemon
+    /// out of its own keychain item.
+    #[test]
+    fn a_failed_install_puts_back_the_binary_the_service_was_running() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
+        let source = temporary.path().join("package-manager-owned.bin");
+
+        std::fs::write(&source, b"the version that is running").unwrap();
+        let running = install_owned_copy(&context, &source)
+            .expect("the copy is made")
+            .path;
+
+        std::fs::write(&source, b"the version that failed to install").unwrap();
+        let attempt = install_owned_copy(&context, &source).expect("the copy is replaced");
+        assert_eq!(
+            std::fs::read(&running).unwrap(),
+            b"the version that failed to install",
+            "the discriminator: the swap really happened before it was undone"
+        );
+
+        attempt.restore();
+        assert_eq!(
+            std::fs::read(&running).unwrap(),
+            b"the version that is running",
+            "a refused install must not move a running service to a new binary"
+        );
+    }
+
+    /// And on a *first* install there is nothing to put back, so the tidy state
+    /// is no copy at all rather than one nothing registered.
+    #[test]
+    fn a_failed_first_install_leaves_no_copy_behind() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
+        let source = temporary.path().join("package-manager-owned.bin");
+        std::fs::write(&source, b"a version nothing registered").unwrap();
+
+        let attempt = install_owned_copy(&context, &source).expect("the copy is made");
+        let path = attempt.path.clone();
+        assert!(path.exists());
+
+        attempt.restore();
+        assert!(
+            !path.exists(),
+            "a copy no registration names is a copy that should not be there: {}",
+            path.display()
         );
     }
 
