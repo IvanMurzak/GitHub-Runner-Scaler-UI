@@ -47,6 +47,7 @@ pub mod policy;
 pub mod service;
 pub mod status;
 pub mod ui;
+pub mod update;
 pub mod workspace;
 
 use std::fmt;
@@ -283,6 +284,22 @@ failure_taxonomy! {
     /// machine with no daemon at all. So the restart is bought with a non-zero
     /// code, and this variant exists to say which one and why.
     UpgradePending = 21 => "upgrade_pending",
+    /// `update` will not update this copy, and nothing was attempted. Either
+    /// it is not an installation at all -- a build in a checkout, or the
+    /// private copy the service runs -- or the package manager that owns it is
+    /// not on this PATH.
+    ///
+    /// Distinct from [`Failure::UpdateFailed`] because the two need opposite
+    /// responses: this one says the command was aimed at the wrong file and the
+    /// remedy names the right one, and re-running `update` here will refuse
+    /// again forever.
+    UpdateUnsupported = 22 => "update_unsupported",
+    /// `update` was attempted and did not complete: a package manager exited
+    /// non-zero, or the replacement could not be carried out.
+    ///
+    /// The binary in place is the one that was there before -- every path that
+    /// raises this either changed nothing or put the previous file back.
+    UpdateFailed = 23 => "update_failed",
 }
 
 impl Failure {
@@ -471,6 +488,8 @@ pub enum Command {
     Tui,
     /// One snapshot of this host, for a human or for a script.
     Status(StatusArgs),
+    /// Install the newest release over this one, however it was installed.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -551,6 +570,31 @@ pub struct StatusArgs {
     /// Emit the versioned, schema-stable JSON document instead of text.
     #[arg(long)]
     pub json: bool,
+}
+
+// ----------------------------------------------------------------------------
+// `update` HAS NO `--version` FLAG, AND CANNOT HAVE ONE.
+// ----------------------------------------------------------------------------
+// `propagate_version = true` on the root command gives every subcommand its own
+// `-V/--version`, which prints this build's version and exits. A `--version
+// 1.2.3` argument on `update` would collide with it, and the collision is a
+// clap panic at startup rather than a compile error -- so the flag is not
+// merely unavailable, it is unwritable.
+//
+// Pinning a version is what the installer is for, and it already takes one:
+//
+//     curl -fsSL <...>/install.sh | sh -s -- --version 1.2.3
+//
+// so nothing is lost by leaving that where it already works.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Report what an update would do and change nothing.
+    ///
+    /// Exits zero whether or not a newer release exists; the report says which.
+    /// An update being available is not a failure, and giving it a non-zero
+    /// exit would put it in a taxonomy whose every other member is one.
+    #[arg(long)]
+    pub check: bool,
 }
 
 // -- f2's surface, declared here so `f2` attaches to a shape that exists ------
@@ -1291,6 +1335,10 @@ fn is_decorated_report(command: &Command) -> bool {
         // `auth status` and `auth logout` are reports; `auth login` is a
         // conversation with a person and streams.
         Command::Auth(AuthCommand::Status(_) | AuthCommand::Logout) => true,
+        // `update` opens with a report and then downloads tens of megabytes or
+        // hands the terminal to `npm`. Buffering it would show the operator
+        // nothing until the work was already done, which is the same reason
+        // `auth login` is not decorated.
         _ => false,
     }
 }
@@ -1310,6 +1358,7 @@ fn route(
         Command::Org(command) => policy::dispatch_org(context, command, out),
         Command::Daemon(command) => daemon::dispatch(context, command, out, service_shutdown),
         Command::Service(command) => service::dispatch(context, command, out),
+        Command::Update(args) => update::dispatch(context, args, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),

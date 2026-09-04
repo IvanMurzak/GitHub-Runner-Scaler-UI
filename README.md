@@ -131,6 +131,37 @@ registry on your behalf.
 
 </details>
 
+## Update
+
+One command, whichever way you installed it:
+
+```sh
+runner-manager update
+```
+
+It works out how this copy was installed, compares your version against the
+newest release, and updates through that same channel. An install-script or
+standalone binary is replaced in place; `npm`, `brew` and `cargo` are asked to
+do their own job. The archive it downloads is verified against the release's
+published SHA-256 before anything is replaced, and a mismatch installs nothing.
+
+To see what it would do without changing anything:
+
+```sh
+runner-manager update --check
+```
+
+If the agent is installed as a service, you do not need to do anything else.
+`service install` registers a copy of the binary rather than the file a package
+manager owns, so the running daemon notices the new version, finishes every job
+it is holding, swaps its copy and is restarted by the operating system. Until it
+does, `runner-manager service status` still reports the old version. That is the
+hand-over in progress, not a failed update.
+
+`update` refuses two things rather than overwriting them: a `cargo build` inside
+a checkout of this repository, and the private copy the service runs. Both name
+what to do instead.
+
 ## Quick start
 
 These four commands connect one repository, allow one concurrent job and keep the agent
@@ -210,6 +241,7 @@ runner-manager service install [--start-at boot|login]         # Start the agent
 runner-manager service status                                  # Check service health
 runner-manager service uninstall                               # Remove the service but keep local state
 runner-manager tui                                             # Open the terminal dashboard
+runner-manager update [--check]                                # Install the newest release over this one
 ```
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
