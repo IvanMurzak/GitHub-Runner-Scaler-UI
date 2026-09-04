@@ -1564,22 +1564,19 @@ pub enum LoggingError {
     /// then one qualified by the account — and an operator who is told only
     /// about the second would go looking for a file this process never reached
     /// for first.
-    #[error(
-        "cannot open a diagnostics file in {}: neither {first_stem}.<date> ({first_source}) \
-         nor {second_stem}.<date> ({second_source}) could be appended to",
-        directory.display()
-    )]
+    ///
+    /// The two attempts are composed into one string rather than carried as
+    /// four fields. As four this variant reached 128 bytes on Windows — where
+    /// `PathBuf` is wider than on the Unixes — and tripped
+    /// `clippy::result_large_err`, which is a lint about every *success* path
+    /// paying for the size of a failure. The message is the same either way,
+    /// and only this error is ever built.
+    #[error("cannot open a diagnostics file in {}: {attempts}", directory.display())]
     Appender {
         /// The diagnostics directory.
         directory: PathBuf,
-        /// The stem this role would ordinarily write.
-        first_stem: String,
-        /// Why that one could not be opened.
-        first_source: String,
-        /// The account-qualified stem tried after it.
-        second_stem: String,
-        /// Why that one could not be opened either.
-        second_source: String,
+        /// Both stems that were tried, and why each was refused.
+        attempts: String,
     },
 
     /// A global subscriber was already installed.
@@ -1693,12 +1690,14 @@ fn open_appender(
     let qualified = account_qualified_stem(stem);
     match build_appender(directory, &qualified) {
         Ok(appender) => Ok(appender),
+        // Both stems are named. An operator told only about the second would go
+        // looking for a file this process never reached for first.
         Err(second) => Err(LoggingError::Appender {
             directory: directory.to_path_buf(),
-            first_stem: stem.to_string(),
-            first_source: first,
-            second_stem: qualified,
-            second_source: second,
+            attempts: format!(
+                "neither {stem}.<date> ({first}) nor {qualified}.<date> ({second}) could be \
+                 appended to"
+            ),
         }),
     }
 }
