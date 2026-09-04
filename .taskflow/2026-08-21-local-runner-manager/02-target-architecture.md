@@ -61,10 +61,20 @@ runner-manager daemon run
 runner-manager service install [--start-at boot|login] | uninstall | status
 runner-manager tui
 runner-manager status --json
+runner-manager update [--check]
 ```
 
 `repo add` is the primary, automation-safe configuration workflow. `tui` is
 an optional view and editing surface, not a required background process.
+
+`update` installs the newest release over this one through the channel this copy
+came from — the release archive, npm, Homebrew or `cargo install` — and says
+what the running service will do about the binary that changed. It is one
+command rather than five documented rituals because the step operators actually
+miss is the last one: `service install` registers a *copy*, so replacing the
+installed binary hands over only after the daemon has drained every job it
+holds. A build in a checkout and the service's own copy are refused rather than
+overwritten; both belong to somebody else.
 
 `repo add` and `org add` create the policy in the `pending` state and never
 enable scaling by default; the operator enables it explicitly (D20). This keeps

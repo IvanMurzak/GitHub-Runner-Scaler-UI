@@ -33,6 +33,25 @@ clap = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 ratatui = { workspace = true }
+# ---------------------------------------------------------------------------
+# `update` REPLACES AN EXECUTABLE, AND EVERY CRATE BELOW IS PART OF PROVING IT
+# IS THE RIGHT ONE.
+# ---------------------------------------------------------------------------
+# `reqwest` fetches the release's `SHA256SUMS` and streams the archive;
+# `sha2` + `hex` produce the digest that decides whether the archive is used at
+# all; `flate2` + `tar` and `zip` unpack the two archive formats this project
+# publishes; `tempfile` holds the download until it has been verified.
+#
+# None of them is new to this workspace -- every one is already a dependency of
+# `crates/agent`, which downloads and verifies GitHub's runner package the same
+# way -- so this adds dependency edges and no packages to `Cargo.lock`.
+flate2 = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+zip = { workspace = true }
 runner-manager-agent = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
@@ -56,6 +75,9 @@ insta = { workspace = true }
 predicates = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
+# Also a normal dependency above. Listed here as well because `tests/` links
+# against dev-dependencies only: this crate has no library target, so a
+# `[dependencies]` entry is invisible to every file under `tests/`.
 tempfile = { workspace = true }
 # `f3`'s daemon shutdown and backoff tests drive `tokio::time::pause()`.
 tokio = { workspace = true, features = ["test-util"] }

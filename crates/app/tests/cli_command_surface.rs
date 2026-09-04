@@ -23,7 +23,7 @@ use support::{run, runner_manager};
 /// The exhaustive surface, transcribed from `02-target-architecture.md`.
 ///
 /// Top-level commands, and for each family the subcommands under it.
-const SURFACE: [(&str, &[&str]); 8] = [
+const SURFACE: [(&str, &[&str]); 9] = [
     ("auth", &["login", "status", "logout"]),
     (
         "host",
@@ -63,6 +63,7 @@ const SURFACE: [(&str, &[&str]); 8] = [
     ("service", &["install", "uninstall", "status"]),
     ("tui", &[]),
     ("status", &[]),
+    ("update", &[]),
 ];
 
 /// The command names clap lists under `Commands:` in a help page.
