@@ -376,6 +376,16 @@ fn mutate_labels(
         let list: Vec<&str> = changed.iter().map(Label::as_str).collect();
         writeln!(out, "{target} {verb}: {}", list.join(", ")).map_err(failed)?;
     }
+    report_labels(&policy, out)
+}
+
+/// The standing label set and the race warning that goes with it.
+///
+/// Shared by every path that changes a label — `repo add-label`,
+/// `repo remove-label`, and the TUI's field — so the warning cannot be present
+/// on one route and missing on another.
+fn report_labels(policy: &ScalePolicy, out: &mut dyn Write) -> Result<(), CliError> {
+    let failed = write_failed("this label result");
     if let Some(current) = policy.routing_labels() {
         let all: Vec<&str> = current.iter().map(Label::as_str).collect();
         writeln!(out, "Routing labels: {}", all.join(", ")).map_err(failed)?;
@@ -390,6 +400,101 @@ fn mutate_labels(
         }
     }
     Ok(())
+}
+
+/// Make the optional routing labels of `target` be exactly `desired`.
+///
+/// `g2`'s label field edits a *set*, not a sequence of add and remove commands:
+/// the operator retypes the line and saves it once. Expressed as two calls to
+/// [`mutate_labels`] that would be two store writes, and a refusal on the
+/// second would leave the policy in a state the operator never asked for —
+/// labels removed but the replacements not added. So the whole diff is applied
+/// to one loaded policy and written under one revision check, which is also
+/// what makes a concurrent `repo add-label` lose the race cleanly rather than
+/// half-apply.
+///
+/// The host label is not in `desired` and is never touched: it is this
+/// machine's routing identity, [`RoutingLabels::remove`] refuses to drop it,
+/// and the field the operator types into does not contain it.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a label GitHub would reject or for a
+/// monitor-only policy, which reserves no labels until it is promoted, and
+/// [`Failure::LocalState`] for a store failure or a lost revision race.
+pub fn replace_optional_labels(
+    context: &Context,
+    target: &ScaleTarget,
+    desired: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let desired = parse_labels(desired)?;
+    let store = context.store()?;
+    let mut policy = find_policy(&store, target)?;
+    let expected = policy.revision();
+
+    let Some(current) = policy.routing_labels() else {
+        return Err(CliError::with_remedy(
+            Failure::InvalidArgument,
+            format!(
+                "{target} is monitor-only, so it has no routing labels to change. Nothing was changed."
+            ),
+            format!(
+                "runner-manager {} set-capacity {target} --max-capacity N",
+                scope_word(target.scope())
+            ),
+        ));
+    };
+    // The host label is filtered out of the desired set rather than refused.
+    // The field is seeded with the optional labels alone, so a host label in it
+    // is the operator having typed the row above by hand; `RoutingLabels::add`
+    // would drop it silently anyway, and the alternative — refusing the save —
+    // rejects a line that describes exactly the state already stored.
+    let host_label = current.host_label().clone();
+    let desired: Vec<Label> = desired
+        .into_iter()
+        .filter(|label| *label != host_label)
+        .collect();
+
+    let removals: Vec<Label> = current
+        .additional()
+        .filter(|label| !desired.contains(label))
+        .cloned()
+        .collect();
+    let additions: Vec<Label> = desired
+        .iter()
+        .filter(|label| !current.contains(label))
+        .cloned()
+        .collect();
+
+    for label in &removals {
+        policy.remove_routing_label(label).map_err(invalid)?;
+    }
+    for label in &additions {
+        policy.add_routing_label(label.clone()).map_err(invalid)?;
+    }
+
+    if policy.revision() != expected {
+        store
+            .update_policy(&policy, expected)
+            .map_err(store_failure)?;
+    }
+
+    let failed = write_failed("this label result");
+    if removals.is_empty() && additions.is_empty() {
+        writeln!(out, "No label changed; {target} already had them that way.").map_err(failed)?;
+    } else {
+        let mut changes = Vec::new();
+        if !additions.is_empty() {
+            let list: Vec<&str> = additions.iter().map(Label::as_str).collect();
+            changes.push(format!("now answers: {}", list.join(", ")));
+        }
+        if !removals.is_empty() {
+            let list: Vec<&str> = removals.iter().map(Label::as_str).collect();
+            changes.push(format!("no longer answers: {}", list.join(", ")));
+        }
+        writeln!(out, "{target} {}", changes.join("; ")).map_err(failed)?;
+    }
+    report_labels(&policy, out)
 }
 
 #[allow(clippy::too_many_arguments)]

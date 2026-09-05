@@ -514,6 +514,13 @@ async fn production_screen_snapshot(
             } else {
                 AgentHealth::Degraded
             },
+            // `PolicySnapshot::routing_labels` is `RoutingLabels::iter` flattened
+            // -- host label first, then the optional labels in sorted order --
+            // so the split is positional here and nowhere else. A monitor-only
+            // policy reserves no label at all and yields an empty vector, which
+            // is the `None` the row draws as "not reserved".
+            host_label: policy.routing_labels.first().cloned(),
+            extra_labels: policy.routing_labels.iter().skip(1).cloned().collect(),
         });
         for runner in refreshed.runners.runners() {
             if !seen_runners.insert(runner.id) {
@@ -2244,6 +2251,8 @@ mod tests {
                             mode: PolicyMode::Autoscale,
                             max_capacity: Some(4),
                             health: AgentHealth::Healthy,
+                            host_label: Some("rm-home-win-x64".into()),
+                            extra_labels: vec![],
                         }],
                         ..Snapshot::default()
                     }
@@ -2651,6 +2660,8 @@ mod tests {
                 mode: screens::PolicyMode::MonitorOnly,
                 max_capacity: None,
                 health: screens::AgentHealth::Healthy,
+                host_label: None,
+                extra_labels: vec![],
             }],
             ..Snapshot::default()
         };
@@ -3035,6 +3046,8 @@ mod tests {
                     mode: PolicyMode::Autoscale,
                     max_capacity: Some(4),
                     health: AgentHealth::Healthy,
+                    host_label: Some("rm-home-win-x64".into()),
+                    extra_labels: vec![],
                 })
                 .collect(),
             ..Snapshot::default()
@@ -3189,6 +3202,8 @@ mod tests {
                 mode: PolicyMode::Autoscale,
                 max_capacity: Some(2),
                 health: AgentHealth::Healthy,
+                host_label: Some("rm-home-win-x64".into()),
+                extra_labels: vec![],
             }],
             ..Snapshot::default()
         });

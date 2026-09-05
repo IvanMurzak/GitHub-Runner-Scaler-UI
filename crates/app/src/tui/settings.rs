@@ -272,7 +272,15 @@ pub struct PolicySettings {
     pub mode: SettingsPolicyMode,
     pub enabled: bool,
     pub current_max_capacity: Option<u16>,
-    pub routing_labels: Vec<String>,
+    /// The immovable host-identity label, absent while monitor-only.
+    ///
+    /// Held apart from [`Self::extra_labels`] because only the second half is
+    /// editable: `RoutingLabels::remove` refuses the host label outright, so a
+    /// field seeded with the whole set would invite a save the domain rejects.
+    pub host_label: Option<String>,
+    /// The optional descriptive labels, sorted, without the host label. This is
+    /// what the label field is seeded from and what it writes back.
+    pub extra_labels: Vec<String>,
     pub copyable_runs_on: Option<String>,
     pub cache_policy: CachePolicy,
     pub active_runners: u16,
@@ -305,8 +313,11 @@ impl PolicySettings {
             .attempts_for_policy(policy.id)
             .map_err(store_failure)?;
         let active_runners = active_count_for(policy.id, attempts.iter());
-        let routing_labels = policy.routing_labels().map_or_else(Vec::new, |labels| {
-            labels.iter().map(ToString::to_string).collect()
+        let host_label = policy
+            .routing_labels()
+            .map(|labels| labels.host_label().to_string());
+        let extra_labels = policy.routing_labels().map_or_else(Vec::new, |labels| {
+            labels.additional().map(ToString::to_string).collect()
         });
         let copyable_runs_on = policy.routing_labels().map(|labels| {
             labels
@@ -332,7 +343,8 @@ impl PolicySettings {
             },
             enabled: policy.enabled(),
             current_max_capacity: policy.max_capacity().map(std::num::NonZeroU16::get),
-            routing_labels,
+            host_label,
+            extra_labels,
             copyable_runs_on,
             cache_policy: policy.cache_policy,
             active_runners,
@@ -386,6 +398,61 @@ impl PolicySettings {
             },
             out,
         )
+    }
+
+    /// The label field's seed: the optional labels as one editable line.
+    #[must_use]
+    pub fn editable_labels_text(&self) -> String {
+        self.extra_labels.join(", ")
+    }
+
+    /// `repo add-label` / `repo remove-label` collapsed into one save, through
+    /// [`cli::policy::replace_optional_labels`] rather than a second copy of
+    /// the set arithmetic.
+    ///
+    /// The typed line is split on commas and nothing else, because this parse
+    /// has to be the exact inverse of [`Self::editable_labels_text`], which
+    /// joins with `", "`. The field is *seeded from stored values*, so anything
+    /// the render can produce and the parse cannot read back is a label the
+    /// operator destroys by opening the screen and pressing save without
+    /// typing. A comma is the one character [`Label::new`] refuses outright,
+    /// which is what makes splitting on it lossless; whitespace is not, and an
+    /// earlier draft that also split on spaces would have silently turned a
+    /// stored `my label` into `my` and `label`.
+    ///
+    /// The cost is that a label list typed with spaces alone reads as one
+    /// label. That is recoverable — the operator retypes the line — and the row
+    /// beneath the field says which separator it wants. Every other rule about
+    /// what a label may contain stays in `Label::new`, which the shared command
+    /// runs.
+    ///
+    /// # Errors
+    /// [`Failure::InvalidArgument`] for a label GitHub would reject or for a
+    /// monitor-only policy, and [`Failure::LocalState`] for a store failure.
+    pub fn save_labels(
+        &self,
+        context: &Context,
+        typed: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), CliError> {
+        let desired: Vec<String> = typed
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        cli::policy::replace_optional_labels(context, &self.target, &desired, out)
+    }
+
+    /// The label field and its save button. Monitor-only reserves no labels, so
+    /// it gets neither — the row says why instead, exactly as the `runs-on:`
+    /// line already does.
+    #[must_use]
+    pub const fn label_action_count(&self) -> u8 {
+        match self.mode {
+            SettingsPolicyMode::Autoscale => 2,
+            SettingsPolicyMode::MonitorOnly => 0,
+        }
     }
 
     /// Mode, path, save — and no path control at all in ephemeral mode, which is
@@ -506,6 +573,10 @@ pub enum Control {
     PolicyCapacity,
     PolicyCache,
     PolicySave,
+    /// The optional-routing-label text field. Present only in autoscale mode,
+    /// because a monitor-only policy has no label set to edit.
+    PolicyLabels,
+    PolicyLabelsSave,
     /// `ephemeral` / `persistent` for one repository.
     WorkspaceMode,
     /// The repository persistent-root text field; present only in persistent
@@ -604,6 +675,15 @@ pub struct SettingsUi {
     pub host_root: PathField,
     /// Inline validation and refusal preview for [`Self::host_root`].
     pub host_root_notice: Option<String>,
+    /// The optional routing labels being edited, as one comma-separated line.
+    ///
+    /// A [`PathField`] rather than a `String` for the same three reasons a path
+    /// needs one — cursor, horizontal window, and the value Escape restores —
+    /// and a label list outgrows its column just as readily. It holds only the
+    /// *optional* labels; the host label is drawn above it and is not editable.
+    pub policy_labels: PathField,
+    /// Inline answer for [`Self::policy_labels`], shown after a save.
+    pub policy_labels_notice: Option<String>,
     /// The repository workspace mode being edited.
     pub workspace_mode: WorkspaceKind,
     /// The repository persistent root being edited.
@@ -626,7 +706,11 @@ pub enum SettingsView {
     /// "Loading settings..." indefinitely.
     Notice(String),
     Host(HostSettings),
-    Policy(PolicySettings),
+    /// Boxed because it is by some way the largest thing a `SettingsUi` can
+    /// hold — workspace leases, two label lists, and the whole repository
+    /// workspace read model — and every other variant of this enum, including
+    /// the default one, would otherwise pay for it in `AppState`.
+    Policy(Box<PolicySettings>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +730,8 @@ pub enum SettingsCommand {
     CheckWorkspaceRoot,
     /// `repo set-workspace OWNER/REPO --mode <draft> [--path <draft>]`.
     SaveWorkspace,
+    /// The optional routing labels of this policy, made to equal the field.
+    SaveLabels,
 }
 
 impl SettingsUi {
@@ -663,7 +749,9 @@ impl SettingsUi {
     /// Settings in the middle of `C:\home\runners`.
     #[must_use]
     pub const fn is_editing(&self) -> bool {
-        self.host_root.is_editing() || self.workspace_path.is_editing()
+        self.host_root.is_editing()
+            || self.workspace_path.is_editing()
+            || self.policy_labels.is_editing()
     }
 
     /// Bracketed paste into whichever path control is being edited.
@@ -672,6 +760,8 @@ impl SettingsUi {
             self.host_root.paste(text);
         } else if self.workspace_path.is_editing() {
             self.workspace_path.paste(text);
+        } else if self.policy_labels.is_editing() {
+            self.policy_labels.paste(text);
         }
     }
 
@@ -697,6 +787,12 @@ impl SettingsUi {
                 SettingsView::Policy(_) => Some(self.workspace_path.text()),
                 _ => None,
             },
+            // The whole `runs-on:` set, host label included -- which is what a
+            // workflow needs and is not what the field holds.
+            Control::PolicyLabels => match &self.view {
+                SettingsView::Policy(form) => form.copyable_runs_on.clone(),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -717,6 +813,10 @@ impl SettingsUi {
             self.workspace_path.cancel();
             self.workspace_notice = None;
         }
+        if self.policy_labels.is_editing() {
+            self.policy_labels.cancel();
+            self.policy_labels_notice = None;
+        }
     }
 
     /// Ends any edit in progress, keeping the draft, exactly as Enter does.
@@ -731,6 +831,9 @@ impl SettingsUi {
         }
         if self.workspace_path.is_editing() {
             self.workspace_path.accept();
+        }
+        if self.policy_labels.is_editing() {
+            self.policy_labels.accept();
         }
     }
 
@@ -766,6 +869,7 @@ impl SettingsUi {
             }
             SettingsCommand::CheckWorkspaceRoot => self.check_workspace_root(context),
             SettingsCommand::SaveWorkspace => self.save_workspace(context),
+            SettingsCommand::SaveLabels => self.save_labels(context),
         };
         if let Err(error) = result {
             self.message = Some(format!("error: {error}"));
@@ -790,9 +894,11 @@ impl SettingsUi {
         self.workspace_mode = form.workspace.kind();
         self.workspace_path.reset_to(&form.configured_root_text());
         self.workspace_notice = None;
+        self.policy_labels.reset_to(&form.editable_labels_text());
+        self.policy_labels_notice = None;
         self.awaiting_drain_confirmation = false;
         self.drain_observation = None;
-        self.view = SettingsView::Policy(form);
+        self.view = SettingsView::Policy(Box::new(form));
         Ok(())
     }
 
@@ -952,6 +1058,44 @@ impl SettingsUi {
         Ok(())
     }
 
+    /// Make the stored optional labels equal what is in the field.
+    ///
+    /// The same shape as [`Self::save_workspace`], and for the same reason: the
+    /// form is re-read either way, because a refusal leaves the stored set
+    /// exactly where it was and the host-label row above must keep showing it —
+    /// and the refused draft is then put back, so the operator corrects the line
+    /// they typed instead of retyping it from the value that refused it
+    /// (Journey 6, "preserves the operator's draft for correction").
+    fn save_labels(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Policy(form) = &self.view else {
+            return Ok(());
+        };
+        let form = form.clone();
+        let typed = self.policy_labels.text();
+        let mut output = Vec::new();
+        let result = form.save_labels(context, &typed, &mut output);
+        let draft = (
+            self.policy_labels.clone(),
+            self.policy_labels_notice.clone(),
+        );
+        let reloaded = self.load_policy(context, &form.target);
+        if result.is_err() {
+            (self.policy_labels, self.policy_labels_notice) = draft;
+        }
+        result?;
+        reloaded?;
+        // The race warning the shared command emits is the one thing worth
+        // keeping beside the field, and it is the only multi-line part of the
+        // output -- so the first line becomes the status message and the rest
+        // stays inline, rather than both being flattened into one banner.
+        let rendered = String::from_utf8_lossy(&output);
+        let mut lines = rendered.trim().lines();
+        self.message = lines.next().map(ToOwned::to_owned);
+        let rest = lines.map(str::trim).collect::<Vec<_>>().join(" ");
+        self.policy_labels_notice = (!rest.is_empty()).then_some(rest);
+        Ok(())
+    }
+
     fn apply_policy(&mut self, context: &Context) -> Result<(), CliError> {
         let SettingsView::Policy(form) = &self.view else {
             return Ok(());
@@ -981,7 +1125,7 @@ impl SettingsUi {
         if let Err(error) = result {
             self.awaiting_drain_confirmation = false;
             self.drain_observation = None;
-            self.view = SettingsView::Policy(PolicySettings::load(context, &target)?);
+            self.view = SettingsView::Policy(Box::new(PolicySettings::load(context, &target)?));
             return Err(error);
         }
         self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
@@ -1014,11 +1158,19 @@ impl SettingsUi {
     /// `05-user-workflows.md`: "Keyboard typing, Backspace, Delete, Home, End,
     /// arrows, paste, Escape cancel, and Enter accept work in path controls."
     fn edit_key(&mut self, code: KeyCode) -> Option<SettingsCommand> {
-        let host = self.host_root.is_editing();
-        let field = if host {
-            &mut self.host_root
+        // Which field owns the keyboard also decides which preview Enter asks
+        // for, so it is resolved once here rather than re-tested at the bottom.
+        let owner = if self.host_root.is_editing() {
+            Control::HostRunnerRoot
+        } else if self.workspace_path.is_editing() {
+            Control::WorkspacePath
         } else {
-            &mut self.workspace_path
+            Control::PolicyLabels
+        };
+        let field = match owner {
+            Control::HostRunnerRoot => &mut self.host_root,
+            Control::WorkspacePath => &mut self.workspace_path,
+            _ => &mut self.policy_labels,
         };
         match code {
             KeyCode::Char(character) => field.insert(character),
@@ -1030,21 +1182,29 @@ impl SettingsUi {
             KeyCode::End => field.end(),
             KeyCode::Esc => {
                 field.cancel();
-                if host {
-                    self.host_root_notice = None;
-                } else {
-                    self.workspace_notice = None;
+                match owner {
+                    Control::HostRunnerRoot => self.host_root_notice = None,
+                    Control::WorkspacePath => self.workspace_notice = None,
+                    _ => self.policy_labels_notice = None,
                 }
             }
             // Accepting revalidates immediately, so the operator reads the
             // refusal beside the field instead of discovering it on save.
+            //
+            // The label field is the exception: there is nothing to preview.
+            // A path is checked against this machine — is it absolute, local,
+            // writable, does it overlap another root — and none of those
+            // questions have an analogue for a label, whose only rule is
+            // `Label::new` and whose only real answer comes from GitHub when a
+            // job is routed. So Enter accepts the draft and leaves the save to
+            // the button beside it.
             KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
                 field.accept();
-                return Some(if host {
-                    SettingsCommand::CheckHostRoot
-                } else {
-                    SettingsCommand::CheckWorkspaceRoot
-                });
+                return match owner {
+                    Control::HostRunnerRoot => Some(SettingsCommand::CheckHostRoot),
+                    Control::WorkspacePath => Some(SettingsCommand::CheckWorkspaceRoot),
+                    _ => None,
+                };
             }
             _ => {}
         }
@@ -1110,6 +1270,13 @@ impl SettingsUi {
                 controls.push(Control::PolicyCapacity);
                 controls.push(Control::PolicyCache);
                 controls.push(Control::PolicySave);
+                // Only an autoscale policy has a reserved label set; a
+                // monitor-only one is told so on the `runs-on:` row rather than
+                // handed a field whose save would be refused.
+                if form.exposes_scale_toggle() {
+                    controls.push(Control::PolicyLabels);
+                    controls.push(Control::PolicyLabelsSave);
+                }
                 // D7: an organization policy is shown its mode and told why it
                 // cannot be changed, rather than given a control that refuses.
                 if !form.is_organization() {
@@ -1155,7 +1322,7 @@ impl SettingsUi {
             return;
         };
         let form = match &self.view {
-            SettingsView::Policy(form) => Some(form.clone()),
+            SettingsView::Policy(form) => Some((**form).clone()),
             _ => None,
         };
         match control {
@@ -1225,6 +1392,8 @@ impl SettingsUi {
             | Control::HostRootReset
             | Control::HostRootSave
             | Control::PolicySave
+            | Control::PolicyLabels
+            | Control::PolicyLabelsSave
             | Control::WorkspacePath
             | Control::WorkspaceSave => {}
         }
@@ -1245,6 +1414,11 @@ impl SettingsUi {
             Control::HostRootReset => Some(SettingsCommand::ResetHostRoot),
             Control::HostRootSave => Some(SettingsCommand::SaveHostRoot),
             Control::PolicySave => Some(SettingsCommand::ApplyPolicy),
+            Control::PolicyLabels => {
+                self.policy_labels.begin();
+                None
+            }
+            Control::PolicyLabelsSave => Some(SettingsCommand::SaveLabels),
             Control::WorkspacePath => {
                 self.workspace_path.begin();
                 None
@@ -1354,7 +1528,13 @@ impl SettingsUi {
             )),
             // No `copyable`: a row that focuses a control is activated by a
             // click, never copied by one. `c` copies it, through `copy_text`.
-            FormLine::keep(self.field_row("Override", &self.host_root, width)).at(4),
+            FormLine::keep(self.field_row(
+                "Override",
+                &self.host_root,
+                width,
+                "(none - platform default)",
+            ))
+            .at(4),
         ];
         if let Some(notice) = &self.host_root_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -1434,14 +1614,62 @@ impl SettingsUi {
         lines.push(FormLine::keep("Confirm policy [Enter/click]").at(next));
         next += 1;
         lines.push(FormLine::text(""));
+        lines.extend(self.label_lines(form, width, &mut next));
+        lines.push(FormLine::text(""));
         lines.extend(self.workspace_lines(form, width, next));
         lines.push(FormLine::text(format!(
-            "Focused form actions: {}/{} scaling, {}/{} workspace",
+            "Focused form actions: {}/{} scaling, {}/{} labels, {}/{} workspace",
             form.focused_action_count(),
+            MAX_FOCUSED_FORM_ACTIONS,
+            form.label_action_count(),
             MAX_FOCUSED_FORM_ACTIONS,
             form.workspace_action_count(self.workspace_mode),
             MAX_FOCUSED_FORM_ACTIONS
         )));
+        lines
+    }
+
+    /// The routing-label half of Repository Settings.
+    ///
+    /// Two rows carry the whole rule the operator has to hold: the host label
+    /// is shown but not editable, and everything below it is theirs. Saying so
+    /// in the row itself is what keeps the field from looking like it lost a
+    /// label the domain was never going to let them remove.
+    fn label_lines(
+        &self,
+        form: &PolicySettings,
+        width: usize,
+        control: &mut usize,
+    ) -> Vec<FormLine> {
+        let Some(host_label) = &form.host_label else {
+            // Monitor-only: the `runs-on:` row above already says "not reserved
+            // until promotion", so this one says what to do about it instead of
+            // repeating it.
+            return vec![FormLine::text(
+                "Routing labels: none until this policy is promoted; set a max_capacity above.",
+            )];
+        };
+        let mut lines = vec![
+            FormLine::keep(format!(
+                "Host label: {host_label}  (fixed: it is this machine's routing identity)"
+            )),
+            FormLine::keep(self.field_row(
+                "Extra labels",
+                &self.policy_labels,
+                width,
+                "(none - this policy answers its host label only)",
+            ))
+            .at(*control),
+        ];
+        *control += 1;
+        lines.push(FormLine::text(
+            "Comma-separated. Saving makes the stored set equal this line.",
+        ));
+        if let Some(notice) = &self.policy_labels_notice {
+            lines.push(FormLine::keep(notice.clone()));
+        }
+        lines.push(FormLine::keep("Save labels [Enter/click]").at(*control));
+        *control += 1;
         lines
     }
 
@@ -1486,8 +1714,13 @@ impl SettingsUi {
         control += 1;
         if self.workspace_mode.is_persistent() {
             lines.push(
-                FormLine::keep(self.field_row("Persistent root", &self.workspace_path, width))
-                    .at(control),
+                FormLine::keep(self.field_row(
+                    "Persistent root",
+                    &self.workspace_path,
+                    width,
+                    "(none - platform default)",
+                ))
+                .at(control),
             );
             control += 1;
         }
@@ -1532,7 +1765,13 @@ impl SettingsUi {
 
     /// One path control's row: label, the visible window of the value, and the
     /// keys that apply right now.
-    fn field_row(&self, label: &str, field: &PathField, width: usize) -> String {
+    /// One editable field as a form row.
+    ///
+    /// `empty` is passed in rather than fixed, because "no value" does not mean
+    /// the same thing in every field: an empty runner root is the platform
+    /// default, and an empty label line is a policy that answers its host label
+    /// alone. One shared sentence would be wrong on one of them.
+    fn field_row(&self, label: &str, field: &PathField, width: usize, empty: &str) -> String {
         let hint = if field.is_editing() {
             "  [Esc cancel | Enter accept]"
         } else {
@@ -1544,7 +1783,7 @@ impl SettingsUi {
         let view = field.view(budget);
         let rendered = view.rendered();
         let shown = if rendered.is_empty() {
-            "(none - platform default)".to_owned()
+            empty.to_owned()
         } else {
             rendered
         };
@@ -1783,7 +2022,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use runner_manager_domain::attempt::RunnerAttempt;
-    use runner_manager_domain::model::{Arch, AttemptId, Host, HostId, HostLabel, Os, PolicyId};
+    use runner_manager_domain::model::{
+        Arch, AttemptId, Host, HostId, HostLabel, Label, Os, PolicyId,
+    };
     use runner_manager_domain::policy::{PolicyState, RoutingLabels};
     use tempfile::TempDir;
 
@@ -1849,7 +2090,8 @@ mod tests {
         let policy = PolicySettings::load(&context, &target).unwrap();
         assert_eq!(policy.current_max_capacity, Some(2));
         assert_eq!(policy.host_identity, "local-home");
-        assert_eq!(policy.routing_labels, ["rm-home-linux-x64"]);
+        assert_eq!(policy.host_label.as_deref(), Some("rm-home-linux-x64"));
+        assert!(policy.extra_labels.is_empty());
         assert_eq!(
             policy.copyable_runs_on.as_deref(),
             Some("rm-home-linux-x64")
@@ -2559,8 +2801,39 @@ mod tests {
         match control {
             Control::HostRunnerRoot => &ui.host_root,
             Control::WorkspacePath => &ui.workspace_path,
-            other => panic!("{other:?} is not a path control"),
+            Control::PolicyLabels => &ui.policy_labels,
+            other => panic!("{other:?} is not a text control"),
         }
+    }
+
+    /// Retype the label line and save it, exactly as a keyboard does.
+    ///
+    /// Not `edit_path`: that helper requires Enter to dispatch an inline check,
+    /// and the label field deliberately has none — there is no local question
+    /// to ask about a label. So accepting returns nothing and the save is a
+    /// separate control, which is the thing this helper has to exercise.
+    fn edit_labels(ui: &mut SettingsUi, context: &Context, text: &str) {
+        focus_by_keyboard(ui, Control::PolicyLabels);
+        assert!(ui.key(KeyCode::Enter).is_none(), "Enter opens the editor");
+        assert!(ui.is_editing());
+        let _ = ui.key(KeyCode::End);
+        for _ in 0..field_of(ui, Control::PolicyLabels).text().chars().count() {
+            let _ = ui.key(KeyCode::Backspace);
+        }
+        assert!(field_of(ui, Control::PolicyLabels).text().is_empty());
+        type_path(ui, text);
+        assert!(
+            ui.key(KeyCode::Enter).is_none(),
+            "accepting a label line previews nothing"
+        );
+        assert!(!ui.is_editing());
+        activate(ui, context, Control::PolicyLabelsSave);
+    }
+
+    /// The stored optional labels, read back through a fresh load.
+    fn stored_labels(context: &Context, target: &ScaleTarget) -> (String, Vec<String>) {
+        let form = PolicySettings::load(context, target).unwrap();
+        (form.host_label.unwrap(), form.extra_labels)
     }
 
     /// Focus a control and press Enter, running whatever it dispatches.
@@ -3541,7 +3814,7 @@ mod tests {
     /// temporary directory would be a snapshot that passes exactly once.
     #[test]
     fn snapshot_every_required_settings_state() {
-        insta::assert_snapshot!(settings_matrix(), @r###"
+        insta::assert_snapshot!(settings_matrix(), @r#"
         --- host/default ---
         Host settings
         Current capacity: 4
@@ -3643,13 +3916,18 @@ mod tests {
         Preview: no runner is terminated immediately.
         Confirm policy [Enter/click]
 
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
+
         Workspace: ephemeral  (platform-default)
         Workspace root: <DEFAULT>
         Slot leases: none
         Affected attempts: 0 active, 0 awaiting cleanup
         Workspace mode: ephemeral  [toggle]
         Save workspace [Enter/click]
-        Focused form actions: 4/5 scaling, 2/5 workspace
+        Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
         --- repository/persistent-warning ---
         Target: octo/repo
         Mode: Autoscale
@@ -3661,6 +3939,11 @@ mod tests {
         Cache policy: RetainRunnerPackage  [toggle]
         Preview: no runner is terminated immediately.
         Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
 
         Workspace: ephemeral  (platform-default)
         Workspace root: <DEFAULT>
@@ -3677,7 +3960,7 @@ mod tests {
           - `actions/checkout` still cleans the workspace, including Git-ignored files,
             unless the workflow sets `clean: false`.
         Save workspace [Enter/click]
-        Focused form actions: 4/5 scaling, 3/5 workspace
+        Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
         --- repository/cleanup-blocked ---
         Target: octo/repo
         Mode: Autoscale
@@ -3689,6 +3972,11 @@ mod tests {
         Cache policy: RetainRunnerPackage  [toggle]
         Preview: no runner is terminated immediately.
         Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
 
         Workspace: persistent  (repository-specific)
         Workspace root: <SLOTS>
@@ -3708,8 +3996,8 @@ mod tests {
         Left in place: every slot under <SLOTS> remains on disk, including its _work directory. Nothing is
         moved or deleted.
         Save workspace [Enter/click]
-        Focused form actions: 4/5 scaling, 3/5 workspace
-        "###);
+        Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
+        "#);
     }
 
     fn settings_matrix() -> String {
@@ -3820,5 +4108,176 @@ mod tests {
             .map(|(name, body)| format!("--- {name} ---\n{body}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// `g2`: the TUI shows the label set and changes it.
+    ///
+    /// The field edits a *set*: what is typed is what is stored, so one save
+    /// both adds and removes. Asserted in that order — add two, then retype the
+    /// line with one of them gone — because a control that only ever grew the
+    /// set would pass an add-only test and still be unable to undo a typo.
+    #[test]
+    fn the_label_field_stores_exactly_what_was_typed() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+        // Seeded from the stored set, and the host label is not in it.
+        assert_eq!(field_of(&ui, Control::PolicyLabels).text(), "");
+        let drawn = rows_paragraph(&ui, 100, false);
+        assert!(
+            drawn.contains("Host label: rm-home-linux-x64"),
+            "the immovable label is shown: {drawn}"
+        );
+
+        edit_labels(&mut ui, &context, "self-hosted, macos");
+        assert_eq!(
+            stored_labels(&context, &target),
+            (
+                "rm-home-linux-x64".to_owned(),
+                vec!["macos".to_owned(), "self-hosted".to_owned()]
+            ),
+            "both labels are stored, sorted, beside an untouched host label"
+        );
+
+        // Retyping without one of them removes it, in the same one save.
+        edit_labels(&mut ui, &context, "macos");
+        assert_eq!(
+            stored_labels(&context, &target),
+            ("rm-home-linux-x64".to_owned(), vec!["macos".to_owned()]),
+            "a label left out of the line is removed"
+        );
+
+        // And the race warning the CLI emits reaches the screen, because it is
+        // the one consequence of an extra label the operator cannot see.
+        let drawn = rows_paragraph(&ui, 100, false);
+        assert!(
+            drawn.contains("race this product cannot arbitrate"),
+            "the shared warning is shown beside the field: {drawn}"
+        );
+    }
+
+    /// The host label survives being typed into the field that does not own it.
+    ///
+    /// `RoutingLabels::remove` refuses to drop it and `add` silently ignores it,
+    /// so the only way this can go wrong is the field appearing to accept a
+    /// change it did not make. It is filtered, not refused: the line still
+    /// describes the state that is stored.
+    #[test]
+    fn typing_the_host_label_into_the_field_changes_nothing() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+        edit_labels(&mut ui, &context, "rm-home-linux-x64, macos");
+        assert_eq!(
+            stored_labels(&context, &target),
+            ("rm-home-linux-x64".to_owned(), vec!["macos".to_owned()]),
+            "the host label is not duplicated into the optional set"
+        );
+        assert!(
+            !ui.message.as_deref().unwrap_or_default().contains("error"),
+            "and it is not an error to have typed it: {:?}",
+            ui.message
+        );
+    }
+
+    /// A label GitHub would reject is refused, and the line stays put.
+    ///
+    /// Over-long rather than ill-formed, because `Label::new` refuses exactly
+    /// four things — empty, over-long, comma-bearing, control-bearing — and the
+    /// field can only ever hand it the second: empties are filtered, commas are
+    /// the separator, and `PathField::insert` drops control characters. So this
+    /// is the one refusal the screen can actually produce, which makes it the
+    /// one worth pinning.
+    ///
+    /// Journey 6: the screen "preserves the operator's draft for correction".
+    /// Reloading the form on refusal is what keeps the host-label row honest,
+    /// so the draft has to be put back afterwards or the operator would be
+    /// asked to retype a line they can no longer see.
+    #[test]
+    fn a_refused_label_keeps_the_draft_and_changes_nothing() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        edit_labels(&mut ui, &context, "macos");
+
+        let too_long = "x".repeat(Label::MAX_LEN + 1);
+        let typed = format!("macos, {too_long}");
+        edit_labels(&mut ui, &context, &typed);
+        assert!(
+            ui.message
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("error"),
+            "the refusal is reported: {:?}",
+            ui.message
+        );
+        assert_eq!(
+            field_of(&ui, Control::PolicyLabels).text(),
+            typed,
+            "the refused draft is still there to be corrected"
+        );
+        assert_eq!(
+            stored_labels(&context, &target),
+            ("rm-home-linux-x64".to_owned(), vec!["macos".to_owned()]),
+            "and nothing was stored -- not even the half of the line that parsed"
+        );
+    }
+
+    /// The seed and the save are inverses, for a label the parse could mangle.
+    ///
+    /// A `Label` may contain a space, and the field is seeded from stored
+    /// values — so opening the screen and saving without typing has to be a
+    /// no-op on every label the store can hold, not only on the ones that look
+    /// like the labels people usually pick.
+    #[test]
+    fn opening_the_screen_and_saving_changes_nothing() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        edit_labels(&mut ui, &context, "my label, self-hosted");
+        let before = stored_labels(&context, &target);
+        assert_eq!(before.1, ["my label", "self-hosted"]);
+
+        // Reload, then save the untouched seed.
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        assert_eq!(
+            field_of(&ui, Control::PolicyLabels).text(),
+            "my label, self-hosted"
+        );
+        activate(&mut ui, &context, Control::PolicyLabelsSave);
+        assert_eq!(
+            stored_labels(&context, &target),
+            before,
+            "a save with no edit must not rewrite the set"
+        );
+        assert_eq!(
+            ui.message.as_deref(),
+            Some("No label changed; octo/repo already had them that way.")
+        );
+    }
+
+    /// A monitor-only policy reserves no labels, so it gets no field.
+    ///
+    /// It is told why instead of being handed a control whose save would be
+    /// refused — the same rule the scale toggle already follows.
+    #[test]
+    fn monitor_only_has_no_label_control() {
+        let (_dir, context, target) = fixture(true);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+        let controls = ui.controls();
+        assert!(
+            !controls.contains(&Control::PolicyLabels)
+                && !controls.contains(&Control::PolicyLabelsSave),
+            "no label control on a monitor-only policy: {controls:?}"
+        );
+        let drawn = rows_paragraph(&ui, 100, false);
+        assert!(
+            drawn.contains("none until this policy is promoted"),
+            "and the screen says why: {drawn}"
+        );
     }
 }

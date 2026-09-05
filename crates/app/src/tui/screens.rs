@@ -199,6 +199,19 @@ pub struct RepositoryRow {
     pub mode: PolicyMode,
     pub max_capacity: Option<u16>,
     pub health: AgentHealth,
+    /// The immovable host-identity label this policy answers.
+    ///
+    /// `None` for a monitor-only policy, which reserves no label until it is
+    /// promoted -- the same distinction `PolicySettings` draws between a label
+    /// set and "not reserved until promotion". Kept apart from
+    /// [`Self::extra_labels`] rather than stored as one positional list,
+    /// because the two differ in what the operator may do to them: the host
+    /// label cannot be removed (`RoutingLabels::remove`), and a row that
+    /// coloured them alike would invite an edit the domain refuses.
+    pub host_label: Option<String>,
+    /// The optional descriptive labels, sorted and without the host label,
+    /// exactly as `RoutingLabels::additional` yields them.
+    pub extra_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -586,12 +599,22 @@ enum Laid {
     Grid(Grid),
 }
 
-const REPOSITORY_COLUMNS: [Column; 5] = [
+/// The dashboard draws the first five of these and the Repositories screen
+/// draws all six, so the order is load-bearing on two screens exactly as
+/// [`RUNNER_COLUMNS`] is: a reader scans the repository, its workload, and
+/// whether anything is wrong before they need the label set that routes it.
+///
+/// `Labels` is last and the most willing to give up width because it is the
+/// one column whose value the operator can reconstruct elsewhere -- the
+/// settings screen shows the same set in full, with the `runs-on:` line beside
+/// it. Losing its tail on a narrow terminal costs less than losing `Agent`.
+const REPOSITORY_COLUMNS: [Column; 6] = [
     Column::flexible("Repository", 14, 0),
     Column::rigid("Workflows", 2).right(),
     Column::rigid("Mode", 3),
     Column::rigid("Capacity", 1).right(),
     Column::rigid("Agent", 0),
+    Column::flexible("Labels", 10, 1).trimming(Trim::Tail),
 ];
 
 /// The repository leads, the state follows, and the runner name comes third:
@@ -1058,6 +1081,10 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
             "Repositories",
             &model.visible_repositories(),
             rows,
+            // The dashboard is a summary beside a second grid, so it stops at
+            // `Agent`; the Repositories screen owns the whole width and draws
+            // the label set as well.
+            &REPOSITORY_COLUMNS[..5],
         )),
         Section::Prose(vec![Line::default()]),
         Section::Grid(runner_grid(
@@ -1106,13 +1133,44 @@ fn repository_sections(
                     Tone::Plain,
                 ),
                 ("Agent health: ", row.health.marker(), row.health.tone()),
+                (
+                    "Host label: ",
+                    row.host_label
+                        .clone()
+                        .unwrap_or_else(|| "not reserved until promotion".into()),
+                    if row.host_label.is_some() {
+                        Tone::Ok
+                    } else {
+                        Tone::Muted
+                    },
+                ),
+                (
+                    "Extra labels: ",
+                    if row.extra_labels.is_empty() {
+                        "none".into()
+                    } else {
+                        row.extra_labels.join(", ")
+                    },
+                    if row.extra_labels.is_empty() {
+                        Tone::Muted
+                    } else {
+                        Tone::Busy
+                    },
+                ),
             ],
-            "Action: Esc returns to the repository list",
+            "Action: Esc returns to the repository list | s opens settings to edit labels",
         )];
     }
     vec![
         table_status(skin, &model.repositories),
-        Section::Grid(repository_grid(model, skin, "", visible, rows)),
+        Section::Grid(repository_grid(
+            model,
+            skin,
+            "",
+            visible,
+            rows,
+            &REPOSITORY_COLUMNS,
+        )),
     ]
 }
 
@@ -1242,12 +1300,36 @@ fn table_status(skin: &Skin, state: &TableViewState) -> Section {
     )))
 }
 
+/// The routing label set of one repository, host label first.
+///
+/// Two tones rather than one, and the separator between them muted, because
+/// the two halves are not the same kind of fact: the host label is this
+/// machine's routing identity and cannot be removed, while the rest are
+/// descriptive labels the operator chose and may take back. The words are
+/// identical under both skins and the host label is always first, so the
+/// distinction survives `NO_COLOR` -- the colour repeats the order, it does not
+/// replace it.
+fn label_cell(row: &RepositoryRow) -> Cell {
+    let Some(host) = &row.host_label else {
+        // The same sentence the settings screen shows for a monitor-only
+        // policy, which reserves no label until it is promoted.
+        return Cell::new("not reserved", Tone::Muted);
+    };
+    let mut parts = vec![(host.clone(), Tone::Ok)];
+    for extra in &row.extra_labels {
+        parts.push((", ".to_owned(), Tone::Muted));
+        parts.push((extra.clone(), Tone::Busy));
+    }
+    Cell::compound(parts)
+}
+
 fn repository_grid(
     model: &ScreenModel,
     skin: &Skin,
     caption: &str,
     visible: &[&RepositoryRow],
     rows: usize,
+    columns: &[Column],
 ) -> Grid {
     let body = window(visible, model.repositories.scroll, rows)
         .iter()
@@ -1270,13 +1352,14 @@ fn repository_grid(
                         |capacity| Cell::plain(capacity.to_string()),
                     ),
                     row.health.badge(skin),
+                    label_cell(row),
                 ],
             }
         })
         .collect();
     Grid {
         caption: caption.to_owned(),
-        columns: REPOSITORY_COLUMNS.to_vec(),
+        columns: columns.to_vec(),
         rows: body,
         sorted: Some(match model.repositories.sort_order {
             SortOrder::NameAscending => (0, false),
@@ -1391,6 +1474,8 @@ mod tests {
                     mode: PolicyMode::Autoscale,
                     max_capacity: Some(4),
                     health: AgentHealth::Healthy,
+                    host_label: Some("rm-home-win-x64".into()),
+                    extra_labels: vec!["self-hosted".into()],
                 },
                 RepositoryRow {
                     id: "observe".into(),
@@ -1399,6 +1484,8 @@ mod tests {
                     mode: PolicyMode::MonitorOnly,
                     max_capacity: None,
                     health: AgentHealth::Degraded,
+                    host_label: None,
+                    extra_labels: vec![],
                 },
             ],
             runners: vec![
@@ -1512,7 +1599,7 @@ mod tests {
 
     #[test]
     fn snapshot_all_four_screens_in_every_required_state() {
-        insta::assert_snapshot!(matrix_snapshot(), @r###"
+        insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
         Dashboard/populated: lines=20 bytes=1004 fnv=3b9b67f438345697 | HEALTH: OK live snapshot
         Dashboard/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
@@ -1520,7 +1607,7 @@ mod tests {
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         Repositories/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Repositories/populated: lines=7 bytes=494 fnv=0662e695ce8441f4 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
+        Repositories/populated: lines=7 bytes=680 fnv=62f7540f925a9ab8 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
         Repositories/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
         Repositories/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Repositories/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
@@ -1537,7 +1624,7 @@ mod tests {
         Activity/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Activity/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Activity/offline: lines=14 bytes=1117 fnv=9ec94493ae3b9622 | OFFLINE - no new runners will start | Action: a opens Activity & errors
-        "###);
+        ");
     }
 
     /// One frame, exactly as the terminal receives it.
@@ -1810,6 +1897,8 @@ mod tests {
                 mode: PolicyMode::MonitorOnly,
                 max_capacity: None,
                 health: AgentHealth::Healthy,
+                host_label: None,
+                extra_labels: vec![],
             })
             .collect();
         let mut model = ScreenModel::new(snapshot);
@@ -1920,6 +2009,8 @@ mod tests {
                 mode: PolicyMode::Autoscale,
                 max_capacity: Some(2),
                 health: AgentHealth::Healthy,
+                host_label: Some(format!("rm-home-{index:02}-win-x64")),
+                extra_labels: vec![],
             })
             .collect();
         let mut model = ScreenModel::new(snapshot);
