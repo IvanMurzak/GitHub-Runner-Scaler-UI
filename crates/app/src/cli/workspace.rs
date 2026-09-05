@@ -1032,6 +1032,14 @@ pub fn write_service_access_warning(
             .code("sudo runner-manager service uninstall && sudo runner-manager service install")
     ))?;
     line("")?;
+    line("The grant follows the binary, not the path: an upgrade that replaces the service")?;
+    line("binary revokes it, and it has to be granted again to the new one. Once the agent")?;
+    line("has tried and been refused, that refusal is reported by")?;
+    line(&format!(
+        "  {}",
+        styling.code("runner-manager service status")
+    ))?;
+    line("")?;
     line("Or avoid the grant entirely by running the agent as you, in your own session:")?;
     line(&format!(
         "  {}",

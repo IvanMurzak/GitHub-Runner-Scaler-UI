@@ -150,6 +150,11 @@ pub const RECORD_FILE: &str = "service.toml";
 /// and Journey 5 step 4 requires it.
 pub const CONTACT_FILE: &str = "github-contact.toml";
 
+/// The agent's last runner-root refusal, for `service status` to report.
+///
+/// See [`record_runner_root_refusal`] for the contract.
+pub const ROOT_REFUSAL_FILE: &str = "runner-root-refusal.toml";
+
 /// The rotating diagnostic log the **daemon** writes, inside `logs/`.
 ///
 /// The appender adds its own date suffix, so this is the stem rather than a
@@ -3040,6 +3045,205 @@ pub fn contact_path(paths: &AppPaths) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// The last runner-root refusal
+// ---------------------------------------------------------------------------
+
+const ROOT_REFUSAL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RootRefusalFile {
+    schema_version: u32,
+    /// Keyed by policy, because the fact is per-policy and not per-host.
+    #[serde(default)]
+    refusals: BTreeMap<String, RootRefusalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RootRefusalEntry {
+    at: DateTime<Utc>,
+    kind: String,
+    root: String,
+    detail: String,
+}
+
+/// One policy's last runner-root refusal, as `service status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRootRefusal {
+    /// The policy that placed no runner.
+    pub policy: String,
+    /// When it was last refused.
+    pub at: DateTime<Utc>,
+    /// The closed-vocabulary cause, as `RunnerRootError::kind` names it.
+    pub kind: String,
+    /// The root it was refused.
+    pub root: String,
+    /// The refusal in full, including the remediation. Not redacted: this file
+    /// is read by a command in the operator's terminal, not by the log sink.
+    pub detail: String,
+}
+
+/// Records that one policy could not use its runner root.
+///
+/// # The contract, and why a file
+///
+/// A launch the runner root refuses fails before any attempt row exists, so the
+/// journal cannot carry it and no screen can show it. The daemon's own log
+/// cannot either: it redacts every field it does not allow-list and scrubs
+/// anything path-shaped out of the ones it does, which is most of a
+/// `RunnerRootError`. So the sentence an operator needs — the directory and the
+/// remediation, verbatim — has nowhere to go, and the failure reads
+/// `runner_start_failed reason=other` once per poll for as long as it lasts.
+/// That is not hypothetical: it cost three hours.
+///
+/// **Keyed by policy, and that is load-bearing.** A host runs several policies
+/// and they do not share a fate: `allocate_persistent_slot` tolerates an
+/// unresolvable host default, so a repository with its own persistent root
+/// places runners happily while an ephemeral policy on a withheld volume places
+/// none. A single host-wide slot would have the working policy clear the broken
+/// one's record on the same reconcile pass, and `service status` would report a
+/// healthy host that had started zero runners for an entire target.
+///
+/// **The daemon writes this when a root refuses a launch and clears the policy's
+/// entry when one succeeds; nothing else writes it.** It keeps the last refusal
+/// per policy rather than a history, for the reason [`record_github_contact`] is
+/// a single timestamp: the operator is asking whether runners can be placed
+/// *now*.
+///
+/// Written whole through a temporary in the same directory, so a status command
+/// cannot read half a record.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when `state/` cannot be read or written.
+pub fn record_runner_root_refusal(
+    paths: &AppPaths,
+    policy: &str,
+    at: DateTime<Utc>,
+    kind: &str,
+    root: &str,
+    detail: &str,
+) -> Result<(), ServiceError> {
+    let mut file = read_refusal_file(paths)?.unwrap_or(RootRefusalFile {
+        schema_version: ROOT_REFUSAL_SCHEMA_VERSION,
+        refusals: BTreeMap::new(),
+    });
+    file.schema_version = ROOT_REFUSAL_SCHEMA_VERSION;
+    file.refusals.insert(
+        policy.to_owned(),
+        RootRefusalEntry {
+            at,
+            kind: kind.to_owned(),
+            root: root.to_owned(),
+            detail: detail.to_owned(),
+        },
+    );
+    write_refusal_file(paths, &file)
+}
+
+/// Clears one policy's entry, because that policy placed a runner.
+///
+/// Removes the file once the last entry goes, so a host that is working leaves
+/// nothing behind for a later `service status` to report. A policy with no entry
+/// is not an error: this is called on every successful placement, and almost
+/// every one of those follows another success.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when `state/` cannot be read or written.
+pub fn clear_runner_root_refusal(paths: &AppPaths, policy: &str) -> Result<(), ServiceError> {
+    let Some(mut file) = read_refusal_file(paths)? else {
+        return Ok(());
+    };
+    if file.refusals.remove(policy).is_none() {
+        return Ok(());
+    }
+    if file.refusals.is_empty() {
+        let path = root_refusal_path(paths);
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ServiceError::Record {
+                operation: "remove",
+                path,
+                detail: error.to_string(),
+            }),
+        };
+    }
+    write_refusal_file(paths, &file)
+}
+
+/// Every policy whose runner root refused it and has not since succeeded.
+///
+/// Ordered by policy, so two runs of `service status` on an unchanged host
+/// print the same thing in the same order.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when the file exists and cannot be read or parsed.
+/// Reported rather than treated as absence, for the reason
+/// [`last_github_contact`] gives: absence means "every policy is placing
+/// runners", and answering a parse failure with that would be a wrong answer.
+pub fn runner_root_refusals(paths: &AppPaths) -> Result<Vec<RunnerRootRefusal>, ServiceError> {
+    Ok(read_refusal_file(paths)?
+        .map(|file| {
+            file.refusals
+                .into_iter()
+                .map(|(policy, entry)| RunnerRootRefusal {
+                    policy,
+                    at: entry.at,
+                    kind: entry.kind,
+                    root: entry.root,
+                    detail: entry.detail,
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn read_refusal_file(paths: &AppPaths) -> Result<Option<RootRefusalFile>, ServiceError> {
+    let path = root_refusal_path(paths);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::Record {
+                operation: "read",
+                path,
+                detail: error.to_string(),
+            });
+        }
+    };
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|error| ServiceError::Record {
+            operation: "read",
+            path,
+            detail: error.to_string(),
+        })
+}
+
+fn write_refusal_file(paths: &AppPaths, file: &RootRefusalFile) -> Result<(), ServiceError> {
+    let path = root_refusal_path(paths);
+    let failed = |detail: String| ServiceError::Record {
+        operation: "write",
+        path: path.clone(),
+        detail,
+    };
+    let text = toml::to_string_pretty(file).map_err(|error| failed(error.to_string()))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
+    std::fs::rename(&temporary, &path).map_err(|error| failed(error.to_string()))
+}
+
+/// Where the refusals live.
+#[must_use]
+pub fn root_refusal_path(paths: &AppPaths) -> PathBuf {
+    paths.state_dir().join(ROOT_REFUSAL_FILE)
+}
+
+// ---------------------------------------------------------------------------
 // The recorded binary path
 // ---------------------------------------------------------------------------
 
@@ -4225,6 +4429,48 @@ impl ServiceStatus {
                  host set-runtime-root --path <PATH>`.",
                 path.display()
             ));
+        }
+
+        // The surface the agent has nowhere else to reach. A root that refuses
+        // a launch does so before any attempt row exists, and the daemon's log
+        // redacts the paths out of the sentence, so without this the operator
+        // sees `runner_start_failed reason=other` once per poll and nothing
+        // that names the directory or the fix.
+        //
+        // A **note** and not a problem, by the same rule the broad-write root
+        // above obeys: `service status` runs as whoever typed it, is expected
+        // to be readable on a host with nothing installed at all, and drives an
+        // exit code. A problem here would fail that exit code on three hosts
+        // that are not broken -- one whose root was fixed but which has had no
+        // queued job since, one whose service was uninstalled without clearing
+        // `state/`, and one that only ever ran the agent in the foreground --
+        // and the printed remedy (`service uninstall && service install`) does
+        // not touch `state/`, so following it would not clear the error either.
+        // A note is read by the same operator at the same moment and traps
+        // nobody in a loop.
+        //
+        // A read failure is reported and not swallowed, for the reason
+        // `runner_root_refusals` documents: absence means "every policy is
+        // placing runners", and answering a parse failure with that would be
+        // the wrong answer to the question this row exists for.
+        match runner_root_refusals(paths) {
+            Ok(refusals) => {
+                for refusal in refusals {
+                    notes.push(format!(
+                        "policy {} started no runner: its runner root {} refused the launch \
+                         ({}), last at {}. {} This clears when that policy next places a \
+                         runner.",
+                        refusal.policy,
+                        refusal.root,
+                        refusal.kind,
+                        refusal.at.to_rfc3339(),
+                        refusal.detail,
+                    ));
+                }
+            }
+            Err(error) => notes.push(format!(
+                "whether the agent could use its runner roots could not be read: {error}"
+            )),
         }
 
         Self {
@@ -7284,6 +7530,169 @@ logs = \"/d\"
         assert!(matches!(error, ServiceError::Record { .. }), "{error}");
     }
 
+    /// The surface the three-hour outage did not have.
+    ///
+    /// A root that refuses a launch does so before any attempt row exists, and
+    /// the daemon's log scrubs the paths out of the sentence, so this file is
+    /// the only place the directory and the remediation can reach the operator.
+    #[test]
+    fn a_runner_root_refusal_round_trips_for_service_status() {
+        let host = Host::new();
+        let at = DateTime::from_timestamp(1_760_000_000, 0).expect("a valid instant");
+
+        assert!(
+            runner_root_refusals(&host.paths)
+                .expect("readable")
+                .is_empty(),
+            "no record means every policy is placing runners"
+        );
+
+        record_runner_root_refusal(
+            &host.paths,
+            "policy-a",
+            at,
+            "denied_by_privacy_policy",
+            "/Volumes/NVME/runners",
+            "the runner root /Volumes/NVME/runners cannot be used: ... Grant Full Disk Access",
+        )
+        .expect("a writable record");
+
+        let refusals = runner_root_refusals(&host.paths).expect("readable");
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0].policy, "policy-a");
+        assert_eq!(refusals[0].at, at);
+        assert_eq!(refusals[0].kind, "denied_by_privacy_policy");
+        assert_eq!(refusals[0].root, "/Volumes/NVME/runners");
+        assert!(
+            refusals[0].detail.contains("/Volumes/NVME/runners")
+                && refusals[0].detail.contains("Full Disk Access"),
+            "the path and the remediation are the whole point of this file: {refusals:?}"
+        );
+    }
+
+    /// The regression that would put the outage straight back.
+    ///
+    /// A host runs several policies and they do not share a fate. When the
+    /// record was one host-wide slot, the policy that placed a runner deleted
+    /// the record of the policy that could not — on the same reconcile pass —
+    /// and `service status` reported a healthy host that had started zero
+    /// runners for an entire target.
+    #[test]
+    fn one_policy_placing_a_runner_does_not_clear_another_policys_refusal() {
+        let host = Host::new();
+        let at = DateTime::from_timestamp(1_760_000_000, 0).expect("a valid instant");
+        record_runner_root_refusal(
+            &host.paths,
+            "broken",
+            at,
+            "denied_by_privacy_policy",
+            "/Volumes/NVME/runners",
+            "detail",
+        )
+        .expect("a writable record");
+        record_runner_root_refusal(
+            &host.paths,
+            "also-broken",
+            at,
+            "not_writable",
+            "/srv/other",
+            "detail",
+        )
+        .expect("a writable record");
+
+        // The policy with its own working root succeeds and clears only itself.
+        clear_runner_root_refusal(&host.paths, "healthy")
+            .expect("clearing an absent policy is fine");
+        clear_runner_root_refusal(&host.paths, "also-broken").expect("that policy recovered");
+
+        let refusals = runner_root_refusals(&host.paths).expect("readable");
+        assert_eq!(
+            refusals
+                .iter()
+                .map(|r| r.policy.as_str())
+                .collect::<Vec<_>>(),
+            vec!["broken"],
+            "the policy that is still refused must keep its record"
+        );
+    }
+
+    /// Clearing is what keeps a fixed host from reporting a stale fault, and the
+    /// file goes when the last entry does.
+    #[test]
+    fn clearing_the_last_refusal_removes_the_file_and_is_idempotent() {
+        let host = Host::new();
+        record_runner_root_refusal(
+            &host.paths,
+            "p",
+            Utc::now(),
+            "not_writable",
+            "/srv/x",
+            "detail",
+        )
+        .expect("a writable record");
+
+        clear_runner_root_refusal(&host.paths, "p").expect("the record is removed");
+        assert!(
+            !root_refusal_path(&host.paths).exists(),
+            "a host with nothing refused leaves nothing behind"
+        );
+        clear_runner_root_refusal(&host.paths, "p").expect("removing what is gone is not an error");
+    }
+
+    /// Same rule as the heartbeat: absence means "every policy is placing
+    /// runners", so a record that cannot be parsed must not be reported as one.
+    #[test]
+    fn a_malformed_refusal_is_an_error_and_not_silently_none() {
+        let host = Host::new();
+        std::fs::write(root_refusal_path(&host.paths), b"not toml \x00").expect("writable");
+        let error = runner_root_refusals(&host.paths)
+            .expect_err("an unparseable record is not the same as no record");
+        assert!(matches!(error, ServiceError::Record { .. }), "{error}");
+    }
+
+    /// The half of this feature that turns the file into a diagnosis, and the
+    /// half that had no test: `service status` must actually read it.
+    ///
+    /// A **note** and not a problem, deliberately. `service status` runs as
+    /// whoever typed it, must stay readable on a host with nothing installed,
+    /// and drives an exit code -- and nothing an operator can type clears this
+    /// record, so a problem would fail that exit code on a host whose root was
+    /// fixed but which has had no queued job since, with a printed remedy
+    /// (`service uninstall && service install`) that does not touch `state/`.
+    #[test]
+    fn service_status_reports_a_refusal_as_a_note_and_stays_healthy() {
+        let host = Host::new();
+        record_runner_root_refusal(
+            &host.paths,
+            "policy-a",
+            DateTime::from_timestamp(1_760_000_000, 0).expect("a valid instant"),
+            "denied_by_privacy_policy",
+            "/Volumes/NVME/runners",
+            "Grant Full Disk Access to the program that runs the service",
+        )
+        .expect("a writable record");
+
+        let status = host.operations().status().expect("a readable status");
+        let notes = status.notes().join("\n");
+
+        assert!(
+            notes.contains("/Volumes/NVME/runners") && notes.contains("Full Disk Access"),
+            "the directory and the remediation the log had to scrub must appear here: {notes}"
+        );
+        assert!(
+            notes.contains("policy-a"),
+            "the operator has to know which target placed no runner: {notes}"
+        );
+        assert!(
+            !status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == "runner root"),
+            "a record nothing an operator types can clear must not drive the exit code"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
     // Install
     // -----------------------------------------------------------------------

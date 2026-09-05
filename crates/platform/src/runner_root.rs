@@ -310,7 +310,9 @@ pub enum RunnerRootError {
          withholds through its privacy controls. Grant Full Disk Access to the program \
          that runs the service -- System Settings > Privacy & Security > Full Disk \
          Access -- and start the service again, or configure a directory on the startup \
-         disk with `{remediation}`.",
+         disk with `{remediation}`. Note that the grant follows the binary and not the \
+         path: an upgrade that replaces the service binary revokes it, and it has to be \
+         granted again to the new one.",
         requested.display(),
         refused.display()
     )]
