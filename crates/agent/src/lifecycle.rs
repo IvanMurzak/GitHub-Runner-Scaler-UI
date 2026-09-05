@@ -2430,14 +2430,20 @@ impl LifecycleLauncher {
         policy: &ScalePolicy,
         id: AttemptId,
     ) -> Result<Placement, LifecycleError> {
-        match policy.workspace_policy() {
+        let placement = match policy.workspace_policy() {
             // Precedence (`02-target-architecture.md`): the repository's
             // persistent root is selected *before* the host root, which is why
             // this arm is first and why it never makes resolving the host
             // default a precondition of its own success.
             WorkspacePolicy::Persistent { root } => self.allocate_persistent_slot(policy, root),
-            WorkspacePolicy::Ephemeral => self.allocate_disposable(id),
+            WorkspacePolicy::Ephemeral => self.allocate_disposable(policy, id),
+        };
+        // Here rather than inside the two arms, so that every path a root can
+        // accept clears the record and none can be forgotten.
+        if placement.is_ok() {
+            self.root_accepted(policy.id);
         }
+        placement
     }
 
     /// `Host.runner_root_override`, read from the journal.
@@ -2457,20 +2463,71 @@ impl LifecycleLauncher {
     }
 
     /// `Host.runner_root_override`, or the platform default standing in for it.
-    fn effective_host_root(&self) -> Result<LocalAbsolutePath, LifecycleError> {
+    ///
+    /// Takes the policy because an unresolvable default is a refusal like any
+    /// other, and the record it leaves is that policy's.
+    fn effective_host_root(
+        &self,
+        policy: &ScalePolicy,
+    ) -> Result<LocalAbsolutePath, LifecycleError> {
         match self.configured_host_root()? {
             Some(configured) => Ok(configured),
-            None => default_runner_root(&self.app_paths).map_err(root_failure),
+            None => default_runner_root(&self.app_paths).map_err(|error| {
+                // No root resolved, so there is no path to name but the one the
+                // platform would have produced.
+                self.root_refused(policy.id, "the platform default runner root", error)
+            }),
         }
+    }
+
+    /// Turns a runner-root refusal into a failure, and leaves the sentence
+    /// somewhere an operator can read it.
+    ///
+    /// Per policy, because the policies on a host do not share a fate: one with
+    /// its own persistent root places runners while another on a withheld
+    /// volume places none, and a host-wide record would have the first clear
+    /// the second's on the same pass.
+    ///
+    /// The recording is best-effort and its failure is deliberately swallowed:
+    /// this runs on the path that is already failing, and a host that cannot
+    /// write a diagnostic file must still report the refusal it came to report.
+    /// `service status` says so itself when the file is unreadable.
+    fn root_refused(&self, policy: PolicyId, root: &str, error: RunnerRootError) -> LifecycleError {
+        let _ = runner_manager_platform::service::record_runner_root_refusal(
+            &self.app_paths,
+            &policy.to_string(),
+            self.ports.clock.now(),
+            error.kind(),
+            root,
+            &error.to_string(),
+        );
+        root_failure(error)
+    }
+
+    /// Clears that policy's record, because its root accepted a placement.
+    ///
+    /// Called on every successful placement rather than only after a failure:
+    /// the daemon that recovers is often not the process that failed -- a
+    /// self-update restarts it -- so "clear it if we wrote it" would leave a
+    /// stale note on `service status` for as long as the host ran.
+    fn root_accepted(&self, policy: PolicyId) {
+        let _ = runner_manager_platform::service::clear_runner_root_refusal(
+            &self.app_paths,
+            &policy.to_string(),
+        );
     }
 
     /// D3's disposable placement: a unique child of the effective host root,
     /// removed whole on cleanup. `c1`'s behaviour, moved behind the branch.
-    fn allocate_disposable(&self, id: AttemptId) -> Result<Placement, LifecycleError> {
-        let effective_root = self.effective_host_root()?;
+    fn allocate_disposable(
+        &self,
+        policy: &ScalePolicy,
+        id: AttemptId,
+    ) -> Result<Placement, LifecycleError> {
+        let effective_root = self.effective_host_root(policy)?;
         RootPreflight::new(&self.app_paths)
             .check(&RootOwner::Host, &effective_root)
-            .map_err(root_failure)?;
+            .map_err(|error| self.root_refused(policy.id, effective_root.as_str(), error))?;
         let runtime = effective_root.as_path().join({
             #[cfg(test)]
             {
@@ -2557,7 +2614,7 @@ impl LifecycleLauncher {
         }
         let checked = preflight
             .check(&RootOwner::Repository(policy.target.to_string()), root)
-            .map_err(root_failure)?;
+            .map_err(|error| self.root_refused(policy.id, root.as_str(), error))?;
         if let Some(leaf) = checked.leaf_to_create() {
             fs::create_dir(leaf).map_err(|source| {
                 LifecycleError::Failed(FailureReason::Other(format!(
@@ -2570,9 +2627,11 @@ impl LifecycleLauncher {
         // 5-6. `<root>/sN`, contained lexically by construction, then created or
         // validated, then contained canonically now that it resolves, and only
         // then accepted for reuse.
-        let slot_path = runner_root::derive_child(root, &name).map_err(root_failure)?;
+        let slot_path = runner_root::derive_child(root, &name)
+            .map_err(|error| self.root_refused(policy.id, root.as_str(), error))?;
         create_or_validate_slot(slot_path.as_path())?;
-        runner_root::verify_containment(root, &slot_path).map_err(root_failure)?;
+        runner_root::verify_containment(root, &slot_path)
+            .map_err(|error| self.root_refused(policy.id, root.as_str(), error))?;
         accept_reusable_slot(slot_path.as_path())?;
         Ok(Placement {
             runtime: slot_path.as_path().to_path_buf(),
@@ -3584,6 +3643,73 @@ mod tests {
         fn only_attempt(&self) -> RunnerAttempt {
             self.store.attempts().unwrap().into_iter().next().unwrap()
         }
+    }
+
+    /// The wiring the three-hour outage needed and did not have.
+    ///
+    /// A root that refuses a launch does so before `record_allocation`, so no
+    /// attempt row carries it, and the daemon's log scrubs the paths out of the
+    /// sentence. The record this asserts is the only surface left, and
+    /// `service status` reads it -- so if this wiring is ever dropped, the
+    /// failure goes back to reading `runner_start_failed reason=other` once per
+    /// poll and nothing else.
+    #[tokio::test]
+    async fn a_root_that_refuses_a_launch_is_recorded_and_cleared_when_one_succeeds() {
+        use runner_manager_platform::service::{clear_runner_root_refusal, runner_root_refusals};
+
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_host_runner_root();
+        harness.ready().await;
+
+        // A root under two directories that do not exist: refused by the
+        // preflight, for a reason that has nothing to do with this platform, so
+        // the assertion holds on all three.
+        let unusable = harness
+            ._root
+            .path()
+            .join("absent")
+            .join("deeper")
+            .join("runners");
+        let mut host = harness.host.clone();
+        host.runner_root_override = Some(
+            LocalAbsolutePath::new(unusable.to_str().expect("a UTF-8 temporary path"))
+                .expect("a local absolute host root"),
+        );
+        harness.store.put_host(&host).unwrap();
+
+        let failure = harness
+            .launch_result()
+            .await
+            .expect_err("a root whose parents are missing cannot hold a runner");
+        assert!(
+            matches!(failure.reason, FailureReason::Other(_)),
+            "{failure:?}"
+        );
+
+        let refusals = runner_root_refusals(&harness.app_paths).expect("readable");
+        let refusal = refusals
+            .first()
+            .expect("the refusal reached the one surface that can hold it");
+        assert_eq!(refusal.policy, harness.policy.id.to_string());
+        assert_eq!(refusal.kind, "missing_parents");
+        assert!(
+            refusal.root.contains("runners") && refusal.detail.contains("runners"),
+            "the directory must be named in full: {refusal:?}"
+        );
+
+        // And a root that works clears it, so a host that has been fixed stops
+        // reporting a fault it no longer has.
+        harness.store.put_host(&harness.host).unwrap();
+        harness.launch().await;
+        assert!(
+            runner_root_refusals(&harness.app_paths)
+                .expect("readable")
+                .is_empty(),
+            "a successful placement clears that policy's record"
+        );
+
+        clear_runner_root_refusal(&harness.app_paths, &harness.policy.id.to_string())
+            .expect("cleanup");
     }
 
     #[tokio::test]
