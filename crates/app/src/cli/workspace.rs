@@ -48,15 +48,18 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use runner_manager_domain::attempt::RunnerAttempt;
-use runner_manager_domain::model::{Host, ScaleTarget, TargetScope};
+use runner_manager_domain::model::{Host, ScaleTarget, StartMode, TargetScope};
 use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::{WorkspaceKind, WorkspacePolicy};
 use runner_manager_platform::paths::AppPaths;
-use runner_manager_platform::runner_root::{RootOwner, RootPreflight, default_runner_root};
+use runner_manager_platform::runner_root::{
+    RootOwner, RootPreflight, default_runner_root, is_on_privacy_gated_volume,
+};
+use runner_manager_platform::service::{InstallRecord, ServiceError};
 
-use super::{CliError, Context, Failure, write_failed};
+use super::{CliError, Context, Failure, Styling, write_failed};
 
 // ---------------------------------------------------------------------------
 // The trust warning
@@ -590,6 +593,119 @@ pub struct RootChange {
     pub created: Option<PathBuf>,
     /// The previous directory, which was neither moved nor deleted.
     pub retained: Option<LocalAbsolutePath>,
+    /// What the *service* will not be able to reach, though the caller can.
+    pub service_access: Option<ServiceAccessWarning>,
+}
+
+/// A root this account can use and the service account cannot.
+///
+/// The gap this closes: every check `host set-runtime-root` runs, it runs as the
+/// operator typing the command. A boot-mode service on macOS runs as `root`
+/// under `launchd`, which the privacy layer treats as a different subject
+/// entirely -- it is denied any volume other than the startup disk until the
+/// program is granted Full Disk Access, and being a daemon it cannot raise the
+/// consent prompt that would say so. The command therefore used to accept the
+/// path, print "Runner root configured.", and leave the daemon refusing every
+/// launch once per poll with nothing on screen to connect the two.
+///
+/// Deliberately a warning and not a refusal. The path is legitimate, the consent
+/// is grantable, and an operator who is about to grant it -- or who is about to
+/// switch the service to login mode -- must not be blocked from configuring the
+/// root first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceAccessWarning {
+    /// The binary to grant access to: the copy the service manager actually
+    /// runs, and not whichever `runner-manager` is on `PATH`.
+    ///
+    /// `None` when a registration exists but this account may not read the
+    /// record that names it -- the ordinary state for a boot-mode service, whose
+    /// record is written by the account that installed it. The warning is still
+    /// worth printing then; it just has to say how to find the path instead of
+    /// naming it, because naming the wrong one is worse than naming none.
+    pub program: Option<PathBuf>,
+}
+
+/// Whether a service started this way may be denied a root on this volume.
+///
+/// Both conditions have to hold, and the policy is separated from the probes so
+/// that it can be stated exhaustively in a test: which volume a directory is on
+/// is a question only the running machine can answer, and the suite cannot mount
+/// one to ask it.
+///
+/// A **login-mode** service runs as the operator in their own session, where the
+/// consent they have already granted applies and a prompt can still appear if it
+/// has not; only a boot-mode daemon is mute. A root on the startup disk is not
+/// gated at all.
+const fn service_may_be_denied(start_mode: StartMode, on_gated_volume: bool) -> bool {
+    matches!(start_mode, StartMode::Boot) && on_gated_volume
+}
+
+/// What the install record says about the service this warning is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredService {
+    /// No registration: nothing to warn about.
+    None,
+    /// A registration whose record was read.
+    Known {
+        start_mode: StartMode,
+        binary: PathBuf,
+    },
+    /// A registration exists and this account may not read its record.
+    Unreadable,
+}
+
+/// Reads the install record, which is the only authority on what is registered.
+///
+/// Deliberately not a scan of `<state>/bin`. That directory is not the record:
+/// `service uninstall` removes the registration and the record but leaves the
+/// copy behind by design, so a scan reports a daemon that no longer exists; the
+/// copy is named after the *source* file it was installed from, so
+/// `runner-manager-0.3.0` and `runner-manager` can both be there; and a single
+/// Finder visit adds `.DS_Store`, which has no extension and sorts first. Every
+/// one of those names a path the operator would grant access to for nothing.
+fn registered_service(paths: &AppPaths) -> RegisteredService {
+    match InstallRecord::read(paths) {
+        Ok(Some(record)) => RegisteredService::Known {
+            start_mode: record.start_mode,
+            binary: record.binary,
+        },
+        Ok(None) => RegisteredService::None,
+        // The record is there and unreadable, which is the ordinary state for a
+        // boot-mode registration: it is written by the account that installed
+        // it, usually through `sudo`. Told apart from "no record" because the
+        // two mean opposite things here.
+        Err(ServiceError::RecordNotPermitted { .. }) => RegisteredService::Unreadable,
+        // Any other read failure is not evidence that a service exists, and a
+        // warning is not the place to report a corrupt record.
+        Err(_) => RegisteredService::None,
+    }
+}
+
+/// Whether the service will be able to reach `root`, and what to say if not.
+///
+/// `host` is consulted only when the record cannot be read: `Host` carries the
+/// start mode this host *believes*, and `StartMode::default()` is `Boot`, so a
+/// row that never saw an install claims boot mode. The record's own start mode
+/// is preferred wherever it is available.
+fn service_access_warning(
+    paths: &AppPaths,
+    host: &Host,
+    root: &LocalAbsolutePath,
+) -> Option<ServiceAccessWarning> {
+    // The volume question first: it is the same answer whatever is installed,
+    // and it is what keeps this off every root on the startup disk.
+    if !is_on_privacy_gated_volume(root.as_path()) {
+        return None;
+    }
+    let (start_mode, program) = match registered_service(paths) {
+        RegisteredService::None => return None,
+        RegisteredService::Known { start_mode, binary } => (start_mode, Some(binary)),
+        RegisteredService::Unreadable => (host.service_start_mode, None),
+    };
+    if !service_may_be_denied(start_mode, true) {
+        return None;
+    }
+    Some(ServiceAccessWarning { program })
 }
 
 /// `host set-runtime-root --path` and `host reset-runtime-root`.
@@ -652,6 +768,10 @@ pub fn set_host_runner_root(
         )
         .map_err(|source| write_failure(source, created.as_deref()))?;
 
+    // Before the `Host` below takes ownership of `requested`.
+    let service_access = requested
+        .as_ref()
+        .and_then(|root| service_access_warning(context.paths(), &host, root));
     let current = host_root(
         context.paths(),
         Some(&Host {
@@ -664,6 +784,7 @@ pub fn set_host_runner_root(
         previous,
         current,
         created,
+        service_access,
     })
 }
 
@@ -846,6 +967,79 @@ pub fn write_root_change(out: &mut dyn Write, change: &RootChange) -> Result<(),
     Ok(())
 }
 
+/// The bright block that follows a root the service will not be able to reach.
+///
+/// Printed after the ordinary result rather than instead of it: the root *was*
+/// configured, and the operator needs to see what it was set to as well as what
+/// is still in their way.
+///
+/// # Errors
+/// [`Failure::LocalState`] when the output stream cannot be written.
+pub fn write_service_access_warning(
+    out: &mut dyn Write,
+    styling: Styling,
+    warning: &ServiceAccessWarning,
+    settings_opened: bool,
+) -> Result<(), CliError> {
+    let failed = write_failed("this runner root warning");
+    // One `writeln!` per rendered line, deliberately. A wrapped paragraph built
+    // from `\`-continuations puts the source's own indentation into the output,
+    // and the block is read on a terminal where that shows.
+    let mut line = |text: &str| writeln!(out, "{text}").map_err(&failed);
+
+    line("")?;
+    line(&styling.caution("The service cannot use this path yet."))?;
+    // The path itself is deliberately not repeated here: `Current:` above
+    // already names it, and inlining it made this line as long as the path.
+    line("This root is on a separate volume, and this host starts the agent at boot as")?;
+    line("`root`. macOS withholds such volumes from a background service until the")?;
+    line("program is granted Full Disk Access, and a service cannot ask for it: the")?;
+    line("refusal is silent, and every launch fails with nothing on screen to say why.")?;
+    line("")?;
+    line(&styling.step("To fix it now:"))?;
+    // Never claims a window appeared unless one did: `open_in_browser` declines
+    // whenever stdout is not a terminal, and a redirected run that promised an
+    // open window would send the operator looking for it.
+    if settings_opened {
+        line("  1. In the window that just opened -- System Settings > Privacy &")?;
+        line("     Security > Full Disk Access -- select `+` and add this exact program:")?;
+    } else {
+        line("  1. Open System Settings > Privacy & Security > Full Disk Access, then")?;
+        line("     select `+` and add this exact program:")?;
+    }
+    match &warning.program {
+        Some(program) => {
+            line(&format!(
+                "     {}",
+                styling.code(&program.display().to_string())
+            ))?;
+            line("     It is the copy the service runs, not the one on your PATH.")?;
+        }
+        // Never a guessed path: granting access to the wrong file looks like it
+        // worked and changes nothing.
+        None => {
+            line("     the binary this host's service is registered to run, which")?;
+            line(&format!(
+                "     {} prints as `binary`. It is not the one on your PATH.",
+                styling.code("sudo runner-manager service status")
+            ))?;
+        }
+    }
+    line("  2. Restart the service so it picks the grant up:")?;
+    line(&format!(
+        "     {}",
+        styling
+            .code("sudo runner-manager service uninstall && sudo runner-manager service install")
+    ))?;
+    line("")?;
+    line("Or avoid the grant entirely by running the agent as you, in your own session:")?;
+    line(&format!(
+        "  {}",
+        styling.code("runner-manager service install --start-at login")
+    ))?;
+    Ok(())
+}
+
 /// Journey 3's and Journey 4's success blocks.
 ///
 /// # Errors
@@ -983,6 +1177,97 @@ mod tests {
 
     use runner_manager_domain::attempt::{AttemptOutcome, FailureReason, RunnerAttempt};
     use runner_manager_domain::model::{AttemptId, PolicyId};
+
+    /// The configuration-time half of the outage this pair exists for.
+    ///
+    /// Every check `host set-runtime-root` runs, it runs as the operator typing
+    /// it -- who can reach an external volume perfectly well. The boot-mode
+    /// daemon that will actually use the root cannot, and says so nowhere a
+    /// person looks. The command used to accept such a path, print "Runner root
+    /// configured.", and leave the service refusing every launch.
+    #[test]
+    fn a_boot_service_pointed_off_the_startup_volume_is_warned_about() {
+        assert!(
+            service_may_be_denied(StartMode::Boot, true),
+            "a boot-mode daemon is the one identity that cannot ask for consent"
+        );
+    }
+
+    /// A `<state>/bin` copy is not a registration, and an earlier version of
+    /// this warning treated it as one.
+    ///
+    /// `service uninstall` removes the registration and the record and leaves
+    /// the binary copy behind on purpose, so an operator who uninstalled and
+    /// then configured a root on an external volume was warned about a daemon
+    /// that does not exist, told to grant Full Disk Access to a binary nothing
+    /// runs, and told to restart a service that is not installed.
+    #[test]
+    fn no_install_record_means_no_registered_service() {
+        let data_dir = tempfile::tempdir().expect("a temporary directory");
+        let paths = AppPaths::rooted_at(data_dir.path());
+        // The copy the uninstall left behind, which must not be mistaken for a
+        // registration.
+        let bin = paths.state_dir().join("bin");
+        std::fs::create_dir_all(&bin).expect("the service binary directory");
+        std::fs::write(bin.join("runner-manager"), b"leftover").expect("the leftover copy");
+
+        assert_eq!(
+            registered_service(&paths),
+            RegisteredService::None,
+            "only the install record says a service is registered"
+        );
+    }
+
+    // The `Known` arm has no test of its own deliberately: it reads
+    // `record.binary` and `record.start_mode` straight off the deserialised
+    // record, so there is no logic left to get wrong. The logic that *was*
+    // wrong -- picking a file out of `<state>/bin` by name and sort order -- is
+    // gone, and the test above is what keeps it gone.
+
+    /// The block must never invent a path when the record cannot be read, which
+    /// is the ordinary state for a boot-mode service installed under `sudo`.
+    #[test]
+    fn an_unknown_program_is_described_rather_than_guessed() {
+        let mut out = Vec::new();
+        write_service_access_warning(
+            &mut out,
+            Styling::plain(),
+            &ServiceAccessWarning { program: None },
+            false,
+        )
+        .expect("the block is written");
+        let text = String::from_utf8(out).expect("utf-8");
+
+        assert!(
+            text.contains("service status"),
+            "an unknown path must be described, not omitted: {text}"
+        );
+        assert!(
+            !text.contains("bin/runner-manager"),
+            "a guessed path is worse than none -- granting it changes nothing: {text}"
+        );
+        assert!(
+            !text.contains("window that just opened"),
+            "nothing opened, so nothing may claim it did: {text}"
+        );
+    }
+
+    /// The three cases that must stay quiet, so the warning keeps its meaning.
+    #[test]
+    fn every_other_combination_is_left_alone() {
+        assert!(
+            !service_may_be_denied(StartMode::Boot, false),
+            "the startup disk is not gated at all"
+        );
+        assert!(
+            !service_may_be_denied(StartMode::Login, true),
+            "a login-mode agent runs as the operator, in a session that can still prompt"
+        );
+        assert!(
+            !service_may_be_denied(StartMode::Login, false),
+            "nothing to warn about"
+        );
+    }
 
     fn ts(secs: i64) -> runner_manager_domain::model::Timestamp {
         chrono::DateTime::from_timestamp(secs, 0).expect("a valid timestamp")
@@ -1221,6 +1506,7 @@ mod tests {
         let previous = a_root(&root_text("rman"));
         let current = a_root(&root_text("runners"));
         let change = RootChange {
+            service_access: None,
             previous: HostRoot {
                 configured: None,
                 effective: Some(previous.clone()),

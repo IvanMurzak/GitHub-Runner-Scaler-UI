@@ -44,6 +44,9 @@ zip = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# Only to prove that a launch refusal actually reaches an operator: the detail is
+# carried on a `tracing` event, so asserting it needs a subscriber to catch it.
+tracing-subscriber = { workspace = true }
 runner-manager-testkit = { workspace = true }
 serial_test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

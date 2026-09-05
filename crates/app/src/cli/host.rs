@@ -88,7 +88,7 @@ use runner_manager_platform::runner_root::RootOwner;
 use runner_manager_platform::secrets::SecretStore;
 
 use super::workspace;
-use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, write_failed};
+use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, Styling, write_failed};
 
 // ---------------------------------------------------------------------------
 // The one place a target is priced
@@ -412,12 +412,13 @@ fn store_failure(source: StoreError) -> CliError {
 pub fn dispatch(
     context: &Context,
     command: &HostCommand,
+    styling: Styling,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
-        HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), out),
-        HostCommand::ResetRuntimeRoot => runtime_root(context, None, out),
+        HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
+        HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
     }
 }
@@ -443,6 +444,7 @@ pub fn dispatch(
 pub fn runtime_root(
     context: &Context,
     raw: Option<&str>,
+    styling: Styling,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let store = context.store()?;
@@ -450,7 +452,28 @@ pub fn runtime_root(
         .map(|raw| workspace::parse_root(raw, &RootOwner::Host))
         .transpose()?;
     let change = workspace::set_host_runner_root(context, &store, root)?;
-    workspace::write_root_change(out, &change)
+    workspace::write_root_change(out, &change)?;
+    let Some(warning) = &change.service_access else {
+        return Ok(());
+    };
+    // Opened before the steps are printed, so that "the window that just
+    // opened" is true by the time it is read. `open_in_browser` is already the
+    // one policy for this: it does nothing unless stdout is a terminal, which
+    // keeps System Settings out of pipes, out of CI and out of the integration
+    // tests -- and the steps below name the pane in full, so a machine that
+    // opens nothing still tells the operator exactly where to go.
+    //
+    // Asked of `Styling::for_stdout` rather than of the `styling` argument, and
+    // that is the whole point of the distinction: `host` is a decorated report,
+    // so what arrives here is `plain_for_buffer` -- colour deferred until the
+    // block is decorated, NOT a claim that no terminal is attached. Passing it
+    // on would make this branch unreachable in every real invocation while
+    // still passing every test.
+    let opened = super::open_in_browser(
+        runner_manager_platform::os::FULL_DISK_ACCESS_SETTINGS_URL,
+        Styling::for_stdout(),
+    );
+    workspace::write_service_access_warning(out, styling, warning, opened)
 }
 
 // ---------------------------------------------------------------------------
