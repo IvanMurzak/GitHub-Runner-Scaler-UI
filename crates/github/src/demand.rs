@@ -733,6 +733,21 @@ impl RestDemand {
     /// at all, which is the right trade: its count is already a floor above any
     /// realistic host ceiling, and one more `needs:`-gated job cannot change the
     /// allocation.
+    ///
+    /// # Why a run is resolved at most once, though the two queries are disjoint
+    ///
+    /// They are disjoint *at any one instant*, and these are two requests with
+    /// time between them. A run that is `queued` when the first is answered and
+    /// `in_progress` when the second is — which is precisely what happens when
+    /// its last waiting job gets picked up, so it is the common transition
+    /// rather than an exotic one — appears in **both** lists. Listing its jobs
+    /// twice would count every queued job it still holds twice, and demand that
+    /// double-counts starts runners for work that does not exist.
+    ///
+    /// The seen set is what stops that. It is deliberately not an argument that
+    /// the race is too narrow to matter: the window is one HTTP round trip
+    /// against a poll that repeats every sixty seconds forever, and the failure
+    /// it produces is silent inflation rather than an error.
     async fn repository_queued(
         &self,
         repository: &OwnerRepo,
@@ -740,6 +755,7 @@ impl RestDemand {
     ) -> Result<RepositoryDemand, InventoryError> {
         let mut jobs: Vec<RunsOn> = Vec::new();
         let mut exact = true;
+        let mut resolved: BTreeSet<u64> = BTreeSet::new();
 
         for (status, cap) in [
             (QUEUED_RUN_STATUS, MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL),
@@ -752,6 +768,11 @@ impl RestDemand {
             exact &= listing.complete;
 
             for run_id in listing.run_ids {
+                // A run that changed status between the two listings is in both.
+                // Resolving it twice would double every queued job it holds.
+                if !resolved.insert(run_id) {
+                    continue;
+                }
                 let run = self.queued_jobs_of_run(repository, run_id, cancel).await?;
                 exact &= run.complete;
                 jobs.extend(run.jobs);
@@ -795,19 +816,36 @@ impl RestDemand {
             && total != listed as u64
         {
             // Free, and no longer load-bearing: see `MAX_BENIGN_TOTAL_COUNT_SKEW`
-            // for why this is a `warn!` and not the `debug_assert!` it was while
-            // `total_count` *was* the demand number.
-            let gross = total > (listed as u64).saturating_add(MAX_BENIGN_TOTAL_COUNT_SKEW);
-            tracing::warn!(
-                repository = %repository,
-                status,
-                total_count = total,
-                listed,
-                gross,
-                "GitHub's `total_count` disagrees with the single page it sent for a \
-                 filtered query; demand is counted from the jobs and does not depend on \
-                 this field, but a gross disagreement means it is not the filtered count"
-            );
+            // for why this is a log line and not the `debug_assert!` it was
+            // while `total_count` *was* the demand number. The two levels draw
+            // the same distinction that constant does. A handful over is the
+            // documented race of a run leaving the queue mid-serialisation,
+            // which this module's own documentation calls legitimate — warning
+            // on it every poll is how an operator learns to ignore the warning.
+            // Thousands over is the unfiltered lifetime total, which is a real
+            // finding about the API.
+            if total > (listed as u64).saturating_add(MAX_BENIGN_TOTAL_COUNT_SKEW) {
+                tracing::warn!(
+                    repository = %repository,
+                    status,
+                    total_count = total,
+                    listed,
+                    "GitHub's `total_count` is far larger than the single page it sent for \
+                     a filtered query, so it is not the filtered count. Demand is counted \
+                     from the jobs and does not depend on this field, but `c3` reads the \
+                     same envelope for a dashboard number and does"
+                );
+            } else {
+                tracing::debug!(
+                    repository = %repository,
+                    status,
+                    total_count = total,
+                    listed,
+                    "GitHub's `total_count` disagrees slightly with the page it arrived \
+                     with; this is the documented race of a run leaving the queue while \
+                     the response was being built"
+                );
+            }
         }
 
         let run_ids: Vec<u64> = page
@@ -1416,6 +1454,40 @@ mod tests {
         assert_eq!(demand.total(), 0);
         assert!(demand.is_complete());
         assert_eq!(gateway.requests_issued(), 3);
+    }
+
+    /// A run caught mid-transition appears in both listings and is counted once.
+    ///
+    /// The two GitHub queries are disjoint at any one instant and these are two
+    /// requests with time between them. A run whose last waiting job is picked
+    /// up between them is `queued` for the first and `in_progress` for the
+    /// second — the ordinary transition, not an exotic one — so it comes back in
+    /// both lists. Counting its jobs twice would inflate demand silently, which
+    /// is the failure mode with no error to notice.
+    #[tokio::test]
+    async fn a_run_in_both_listings_is_resolved_once_and_not_counted_twice() {
+        let server = MockServer::start().await;
+        // The same run id in both lists, which is what the race produces.
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[100])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, runs_body(&[100])).await;
+        mount_jobs(&server, &repo(), 100, jobs_body(&["rm-home-win-x64"], 3, 0)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(
+            demand.total(),
+            3,
+            "the run holds three queued jobs, and appearing in both listings does not              make it six"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            3,
+            "and the duplicate costs no second job listing either"
+        );
     }
 
     /// A `needs:`-gated job whose run has already started is still demand.
