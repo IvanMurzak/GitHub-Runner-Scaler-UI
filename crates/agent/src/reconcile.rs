@@ -1461,7 +1461,26 @@ impl EventSink for TracingEvents {
                     not_matched,
                     unresolvable,
                     count = u64::from(complete),
-                )
+                );
+                // There is deliberately no `warn!` here for the "demand is zero
+                // but jobs were not matched" shape, though it is the one this
+                // change introduced: before demand was filtered, a repository
+                // with work in it always produced some, and now a policy whose
+                // labels do not cover its jobs produces none.
+                //
+                // The reason is that the shape is indistinguishable from a
+                // healthy one. A repository served by a Windows host and a macOS
+                // host has the other host's jobs queued in it constantly, so
+                // each agent would warn on every poll about work that is being
+                // served correctly by the other machine. Telling the two apart
+                // needs to know whether this policy has *ever* matched anything,
+                // which is state across polls that this loop does not keep.
+                //
+                // What an operator gets instead is the `not_matched` count, on
+                // this event and in its `Display`, which `g2` renders. "0 queued
+                // jobs for this host, 5 for other labels" is the diagnosis; a
+                // warning that fired on every healthy minute would be the kind
+                // nobody reads.
             }
             LifecycleEvent::TargetUnreadable { policy, reason } => {
                 tracing::warn!(event = name, policy_id = %policy, reason);
