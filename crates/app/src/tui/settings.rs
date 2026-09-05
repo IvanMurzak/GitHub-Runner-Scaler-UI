@@ -3549,8 +3549,8 @@ mod tests {
         Capacity: 4  [-/+ or click]
         Service start: boot  [toggle]
         Refresh interval: 60s  [-/+ 30s]
-        Projected requests/hour: 180
-        Maximum repository targets: about 13
+        Projected requests/hour: 360
+        Maximum repository targets: about 6
         30-second floor; over-budget changes are refused.
         Save host settings [Enter/click]
 
@@ -3567,8 +3567,8 @@ mod tests {
         Capacity: 4  [-/+ or click]
         Service start: boot  [toggle]
         Refresh interval: 60s  [-/+ 30s]
-        Projected requests/hour: 180
-        Maximum repository targets: about 13
+        Projected requests/hour: 360
+        Maximum repository targets: about 6
         30-second floor; over-budget changes are refused.
         Save host settings [Enter/click]
 
@@ -3585,8 +3585,8 @@ mod tests {
         Capacity: 4  [-/+ or click]
         Service start: boot  [toggle]
         Refresh interval: 60s  [-/+ 30s]
-        Projected requests/hour: 180
-        Maximum repository targets: about 13
+        Projected requests/hour: 360
+        Maximum repository targets: about 6
         30-second floor; over-budget changes are refused.
         Save host settings [Enter/click]
 
@@ -3606,8 +3606,8 @@ mod tests {
         Capacity: 4  [-/+ or click]
         Service start: boot  [toggle]
         Refresh interval: 60s  [-/+ 30s]
-        Projected requests/hour: 180
-        Maximum repository targets: about 13
+        Projected requests/hour: 360
+        Maximum repository targets: about 6
         30-second floor; over-budget changes are refused.
         Save host settings [Enter/click]
 
