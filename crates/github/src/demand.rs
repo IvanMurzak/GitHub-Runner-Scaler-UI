@@ -1520,6 +1520,159 @@ mod tests {
         );
     }
 
+    // -- the wire contract, against payloads GitHub really sent -------------
+
+    /// The deserializers are pinned against **real** GitHub responses, not only
+    /// against fixtures written to match them.
+    ///
+    /// Every other test here builds its own JSON, so all of them would keep
+    /// passing if this module's idea of the wire format were wrong in the same
+    /// way the fixtures are. That is the one failure a mock server cannot catch,
+    /// and it is the failure this change was most exposed to: the previous owner
+    /// decision deliberately read *nothing* out of a run and had no job
+    /// endpoint at all, so `workflow_runs[].id`, `jobs[].status` and
+    /// `jobs[].labels` are all fields this crate had never parsed before.
+    ///
+    /// The payloads below are verbatim excerpts captured from
+    /// `api.github.com` on 2026-09-05 against a repository using this product,
+    /// trimmed only by replacing the `steps` array — which is long, which this
+    /// module does not read, and whose presence is itself part of what is being
+    /// asserted, since a job object carries twenty-odd fields that must all be
+    /// ignored without error.
+    #[test]
+    fn the_wire_shapes_parse_a_payload_github_really_sent() {
+        // GET /repos/{o}/{r}/actions/runs/33938794901/jobs?filter=latest&per_page=100
+        let jobs: RunJobsPage = serde_json::from_value(json!({
+          "total_count": 5,
+          "jobs": [
+            {
+              "id": 101_231_925_899_i64,
+              "run_id": 33_938_794_901_i64,
+              "workflow_name": "tests",
+              "head_branch": "worktree-p1-lock-and-worktree-set",
+              "run_url": "https://api.github.com/repos/o/r/actions/runs/33938794901",
+              "run_attempt": 1,
+              "node_id": "CR_kwDOS_wnss8AAAAXkeSaiw",
+              "head_sha": "e78bc5d1865693aba030d83a2c627dd5515edf45",
+              "url": "https://api.github.com/repos/o/r/actions/jobs/101231925899",
+              "html_url": "https://github.com/o/r/actions/runs/33938794901/job/101231925899",
+              "status": "completed",
+              "conclusion": "success",
+              "created_at": "2026-09-05T02:20:30Z",
+              "started_at": "2026-09-05T02:26:03Z",
+              "completed_at": "2026-09-05T02:28:44Z",
+              "name": "scripts-tests",
+              "steps": [],
+              "check_run_url": "https://api.github.com/repos/o/r/check-runs/101231925899",
+              "labels": ["self-hosted", "windows"],
+              "runner_id": 725,
+              "runner_name": "runner-manager-4bd32f05-088f-4b13-a59c-6900b9142aa1",
+              "runner_group_id": 1,
+              "runner_group_name": "Default"
+            },
+            {
+              "id": 101_231_925_900_i64,
+              "run_id": 33_938_794_901_i64,
+              "status": "queued",
+              "conclusion": serde_json::Value::Null,
+              "started_at": serde_json::Value::Null,
+              "completed_at": serde_json::Value::Null,
+              "name": "pipeline-tests",
+              "steps": [],
+              "labels": ["self-hosted", "windows"],
+              "runner_id": serde_json::Value::Null,
+              "runner_name": "",
+              "runner_group_name": ""
+            },
+            {
+              "id": 101_231_925_901_i64,
+              "status": "queued",
+              "name": "scripts-tests-macos",
+              "labels": ["self-hosted", "macOS", "rm-macmini-osx-arm64"]
+            }
+          ]
+        }))
+        .expect("the jobs page GitHub really sends must deserialize");
+
+        assert_eq!(
+            jobs.jobs.len(),
+            3,
+            "every job is read, whatever else it carries"
+        );
+
+        // What the gateway does with it: keep the queued ones, and turn each
+        // one's `labels` array into the `RunsOn` `b1` matches.
+        let queued: Vec<RunsOn> = jobs
+            .jobs
+            .into_iter()
+            .filter(|job| job.status == QUEUED_JOB_STATUS)
+            .map(|job| RunsOn::from_job_labels(job.labels))
+            .collect();
+
+        assert_eq!(
+            queued,
+            vec![
+                RunsOn::Many(vec!["self-hosted".into(), "windows".into()]),
+                RunsOn::Many(vec![
+                    "self-hosted".into(),
+                    "macOS".into(),
+                    "rm-macmini-osx-arm64".into()
+                ]),
+            ],
+            "the completed job is dropped and the two queued ones keep their labels"
+        );
+
+        // And the demand a Windows policy on that host would clamp: one, not
+        // two, because the macOS job belongs to another machine.
+        let tally = host_labels().tally(&queued);
+        assert_eq!(tally.demand(), 1);
+        assert_eq!(tally.not_matched, 1);
+
+        // GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, as an idle
+        // repository answers it. `total_count` and an empty array, which is the
+        // shape that must read as "nothing waiting" rather than as a failure.
+        let idle: QueuedRunsPage = serde_json::from_value(json!({
+            "total_count": 0,
+            "workflow_runs": []
+        }))
+        .expect("an idle run listing must deserialize");
+        assert_eq!(idle.total_count, Some(0));
+        assert!(idle.workflow_runs.is_empty());
+
+        // And a busy one. A run object carries far more than the id, and the id
+        // is the only field this module reads out of it.
+        let busy: QueuedRunsPage = serde_json::from_value(json!({
+            "total_count": 1,
+            "workflow_runs": [{
+                "id": 33_938_794_901_i64,
+                "name": "tests",
+                "node_id": "WFR_kwLOS_wnss8AAAAH6oSPFQ",
+                "head_branch": "main",
+                "head_sha": "e78bc5d1865693aba030d83a2c627dd5515edf45",
+                "path": ".github/workflows/tests.yml",
+                "run_number": 412,
+                "event": "push",
+                "status": "queued",
+                "conclusion": serde_json::Value::Null,
+                "workflow_id": 213_842_591_i64,
+                "url": "https://api.github.com/repos/o/r/actions/runs/33938794901",
+                "created_at": "2026-09-05T02:20:30Z",
+                "updated_at": "2026-09-05T02:20:31Z"
+            }]
+        }))
+        .expect("a busy run listing must deserialize");
+        assert_eq!(
+            busy.workflow_runs
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![33_938_794_901],
+            "the run id is what the job listing is fetched by, and it is a u64: \
+             GitHub's run ids passed 2^32 long ago, so a u32 here would have \
+             wrapped on every real repository"
+        );
+    }
+
     // -- the caps -----------------------------------------------------------
 
     /// More queued runs than the cap resolves makes the answer a floor.
