@@ -341,6 +341,12 @@ action you need:
 `d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
 `h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
 
+The repositories view lists each policy's `runs-on` labels beside its capacity and health;
+`s` opens the settings for the selected repository, where the optional labels can be edited
+in place. The host label above them is fixed, because it is the identity that keeps two
+machines from answering each other's jobs, so only the descriptive labels are editable.
+Saving makes the stored set equal exactly what is on the line.
+
 Every status is also written in words, so the dashboard remains usable without colour or
 box-drawing characters.
 
