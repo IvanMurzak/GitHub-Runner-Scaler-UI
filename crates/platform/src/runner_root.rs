@@ -1543,11 +1543,25 @@ mod sys {
         false
     }
 
+    /// Never consulted: the privacy branch that asks gates on macOS first. It
+    /// exists so the trait's default method compiles on every target.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) const fn is_read_only(_path: &Path) -> bool {
+        false
+    }
+
     /// Whether `path` is on a filesystem mounted read-only.
     ///
     /// `MNT_RDONLY`, which is the mount flag rather than a probe of `path`
     /// itself: a writable directory cannot exist on a read-only mount, and the
     /// mount is the thing whose remediation differs.
+    ///
+    /// macOS-only, and the `cfg` is load-bearing rather than tidiness: `f_flags`
+    /// and `MNT_RDONLY` are BSD `statfs`, and Linux's `statfs` has neither --
+    /// it spells the same fact `f_flags`-less, through `statvfs`'s `ST_RDONLY`.
+    /// Only the macOS branch of the caller asks, so the other targets answer
+    /// `false` rather than carrying a second implementation nothing reaches.
+    #[cfg(target_os = "macos")]
     pub(super) fn is_read_only(path: &Path) -> bool {
         let Ok(path) = c_path(path) else {
             return false;
