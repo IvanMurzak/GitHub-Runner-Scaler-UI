@@ -10,96 +10,124 @@
 //!
 //! ```text
 //! GET /repos/{owner}/{repo}/actions/runs?status=queued&per_page=100
-//!   -> 200 { "total_count": N, "workflow_runs": [ … ] }
+//! GET /repos/{owner}/{repo}/actions/runs?status=in_progress&per_page=100
+//!   -> 200 { "total_count": N, "workflow_runs": [ { "id": … }, … ] }
+//! GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100
+//!   -> 200 { "total_count": M, "jobs": [ { "status": …, "labels": […] }, … ] }
 //! ```
 //!
-//! One request per repository. An organization target has no organization-wide
-//! workflow-runs endpoint, so it pays that once per repository the App is
-//! installed on there; see [`demand_requests_per_poll`].
+//! # The counting unit is a **job**, and this reverses an earlier decision
 //!
-//! # The counting unit is a **run**, not a job
+//! This is the single most important thing to know about this module, and it is
+//! an owner decision that **replaced the opposite owner decision**. The history
+//! is kept here rather than deleted, because the reasoning that produced the old
+//! answer is still sound in the abstract and a later reader who only sees the
+//! new code will otherwise re-derive it and revert this.
 //!
-//! This is the single most important thing to know about this module, it is an
-//! owner decision rather than an implementation accident, and it is **accepted
-//! product behaviour rather than a defect**.
+//! **What the previous decision said.** `d18b-run-count-filtering.md` probed the
+//! runs endpoint against live GitHub and established that its `total_count`
+//! counts **workflow runs matching the query**. Counting runs costs exactly one
+//! request per repository, a fixed figure the budget model
+//! ([`crate::rest::TargetCost`], [`crate::rest::BudgetProjection`]) could price
+//! and `f2`'s `add` refusals could be computed from. Resolving each queued run's
+//! jobs costs one extra request *per run*, a variable cost scaling with queue
+//! depth. The owner chose the fixed cost, accepted the resulting under-count,
+//! and this module said at length: *do not "fix" this, and do not add a per-run
+//! job listing*.
 //!
-//! `d18b-run-count-filtering.md` probed the endpoint above against live GitHub
-//! and established that `total_count` counts **workflow runs matching the
-//! query**. A workflow run can hold many jobs — a matrix, or a `jobs:` map with
-//! several independent entries — and **each job needs its own runner**. So a
-//! single queued run holding eight matrix jobs reads here as demand `1`, `e1`
-//! starts **one** runner, that runner takes one job, and the remaining seven
-//! queue behind it and are served serially as further polls observe the run
-//! still queued.
+//! **Why it was reversed.** A workflow run holds many jobs — a matrix, or a
+//! `jobs:` map with several independent entries — and **each job needs its own
+//! runner**. Under the run count, a single queued run holding eight jobs read as
+//! demand `1`, `e1` started **one** runner, that runner took one job, and the
+//! remaining seven queued behind it. The next poll saw the same run still
+//! queued, still read `1`, and started one more. So a host configured for ten
+//! concurrent runners served an eight-job matrix **serially, roughly one at a
+//! time**, with the queue depth on GitHub growing while the machine sat idle.
+//! The under-count was not a rounding error in the demand signal; on the
+//! workflow shape people actually write, it was the difference between the
+//! product's headline feature working and not working. That is a worse outcome
+//! than a variable request cost, so the trade was re-made the other way.
 //!
-//! The alternative was resolving each queued run's jobs through
-//! `GET /repos/{o}/{r}/actions/runs/{run_id}/jobs`, which costs **one extra
-//! request per queued run** — a variable cost scaling with queue depth, against
-//! a budget ([`crate::rest::TargetCost`], [`crate::rest::BudgetProjection`])
-//! whose whole design is a fixed per-refresh figure that `f2` computes its `add`
-//! refusals from. The owner chose the fixed cost and the resulting under-count.
+//! **What that means for a later reader.** The per-run job listing below is
+//! deliberate and load-bearing. Removing it to restore a fixed per-repository
+//! cost re-creates the serial-matrix defect described above. If a future owner
+//! decision reverses this again, it belongs in this documentation and in
+//! `tests::the_runs_on_predicate_is_b1s_and_this_module_only_feeds_it` before it
+//! belongs in the code.
 //!
-//! **So: do not "fix" this, and do not add a per-run job listing.** It is
-//! written here at length precisely so that a later reader rediscovering the
-//! under-count recognises it as a decision with a reason rather than as a bug
-//! with an obvious patch.
+//! # Both run statuses are polled, and the second one is not redundant
 //!
-//! # What that costs, stated plainly rather than left to be discovered
+//! `status=queued` alone is the obvious query and it is not sufficient. A run's
+//! status is a property of the *run*, and a run holding both a running job and a
+//! queued one has to report one value for both. Live observation on a repository
+//! using this product caught a run of five jobs — two completed, one
+//! `in_progress`, two `queued` — reporting `status: "queued"`, so `queued` does
+//! take precedence over `in_progress` while any job is still waiting.
 //!
-//! A workflow *run* carries no `runs-on`. Labels live on **jobs**, and this
-//! module fetches no jobs — so **routing-label filtering is not applied to
-//! demand here at all**. Every queued run in a watched repository counts,
-//! including runs whose jobs target `ubuntu-latest`, another host's
-//! `rm-<host>-…` label, or a label set this policy does not carry.
+//! That observation is what makes `status=queued` the *primary* signal, and it
+//! is not what makes it sufficient. The case it does not cover is a job that
+//! becomes queued **later**: `needs:` holds a job back until its dependency
+//! finishes, and whether GitHub flips the run's status back to `queued` at that
+//! moment is a claim about a state machine this project has not observed. A
+//! `needs:`-gated job is an ordinary workflow shape, and missing one entirely
+//! would be the same class of defect this module was just rewritten to fix.
 //!
-//! `b1` owns the predicate that *would* filter it
-//! ([`runner_manager_domain::policy::RoutingLabels::matches`] and
-//! [`runner_manager_domain::policy::RoutingLabels::tally`]), this module
-//! deliberately re-implements none of it, and
-//! `the_runs_on_forms_b1_matches_are_the_predicate_this_module_does_not_own`
-//! below pins that the predicate is `b1`'s. What is missing is not the
-//! predicate but its **input**: nothing on the fixed-cost path produces a
-//! `RunsOn` to feed it.
+//! So `status=in_progress` is polled too, as a **safety net rather than a second
+//! primary signal**, and it is budgeted like one: it is read after the queued
+//! runs and gets the smaller of the two run caps
+//! ([`MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL`] against
+//! [`MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL`]). A run appears in at most one of
+//! the two lists — the queries are disjoint by construction — and only jobs
+//! whose own `status` is `queued` are counted, so an in-progress run whose jobs
+//! have all been dispatched contributes nothing but the request that discovered
+//! that.
 //!
-//! The bounding controls are therefore the ones that do not need a job listing,
-//! and they are named in `02-target-architecture.md` and implemented elsewhere:
-//! the per-policy `max_capacity`, the host-wide `host_capacity`, and the fact
-//! that a runner registered with host-scoped labels is never *assigned* a job it
-//! does not match. A runner started for demand this host cannot serve is the
-//! surplus-runner case — an accepted, bounded cost with an idle-timeout exit
-//! (`01-current-architecture.md`, edge case 6; `h1` scenario 8), not a runner
-//! that steals work.
+//! `completed` and `waiting` runs are not polled. A completed run has no
+//! dispatchable job left, and a `waiting` run is held by a deployment gate or a
+//! concurrency group rather than by the absence of a runner — starting one for
+//! it would produce a runner that idles until its timeout.
 //!
-//! # Why `status=queued` and not `c3`'s in-progress count
+//! # Routing labels ARE applied now, and the predicate is still `b1`'s
 //!
-//! [`crate::rest::InventoryGateway::in_progress_activity`] answers a different
-//! question and is not reusable here. `status=in_progress` **excludes** queued
-//! runs, and a queued run is precisely one waiting for a runner that does not
-//! exist — which is the definition of demand. An in-progress run already has a
-//! runner; counting it as demand would start a second one for work already
-//! being done.
+//! The previous decision's second accepted cost was that **no routing-label
+//! filtering happened at all**: a run carries no `runs-on`, labels live on jobs,
+//! and this module fetched no jobs. Every queued run in a watched repository
+//! counted, including runs whose jobs targeted `ubuntu-latest` or another host's
+//! `rm-<host>-…` label, and each runner started that way idled until it timed
+//! out.
 //!
-//! The exclusion is inferred from GitHub's documented status vocabulary rather
-//! than observed: `d18b`'s two fixtures never produced a queued run, so both
-//! `queued` and `in_progress` read `0` there and neither could discriminate.
-//! It is recorded as an inference on purpose.
+//! Fetching the jobs supplies the input that was missing, so that cost is paid
+//! back by the same change. **This module still owns no predicate.** It reads
+//! each job's `labels` array, builds a [`RunsOn`] from it, and hands that to the
+//! caller. `b1` owns the matching
+//! ([`runner_manager_domain::policy::RoutingLabels::matches`] and its `tally`),
+//! `e1` owns applying it per policy, and
+//! `tests::the_runs_on_predicate_is_b1s_and_this_module_only_feeds_it` scans
+//! this file's own source to pin that no second implementation grows here.
 //!
-//! # `total_count` is trusted, and the trust is checked for free
+//! The filtering is deliberately **not** done in this module even though it now
+//! has the input, and the reason is `e1`'s: one target can be watched by more
+//! than one policy, each with its own routing labels, and `e1` polls a target
+//! once for all of them. A gateway that filtered would have to be told whose
+//! labels to filter by, which would make the poll per-policy and multiply its
+//! request cost by the number of policies sharing the target. So the gateway
+//! returns the jobs and each policy tallies them.
 //!
-//! `d18b` verified against public data that `total_count` on a filtered query is
-//! the filtered count: `1` beside a live in-progress run on a 58-run
-//! repository, `0` on a 680-run one, invariant under `per_page` at 1, 100 and
-//! `page=5`, and an exact partition of a 680-run fixture across three
-//! conclusions. So one request yields the whole count.
+//! # What is still approximate, stated plainly rather than left to be discovered
 //!
-//! That is an assumption about a live API, and this is the layer where being
-//! wrong about it is most expensive — `c3` reads the same envelope for a
-//! dashboard number, and this one reaches `clamp()`. So the same zero-cost
-//! tripwire `c3` wrote is reused: when there is no `rel="next"`, the whole
-//! filtered set is on this page, so `total_count` **must** equal
-//! `workflow_runs.len()`. A disagreement is always warned about, and past
-//! `MAX_BENIGN_TOTAL_COUNT_SKEW` it `debug_assert!`s — see that constant for
-//! why the two thresholds differ.
+//! * **A job listing is a snapshot.** A job that leaves the queue between the
+//!   run list and the job list is counted; one that arrives after is not. The
+//!   next poll corrects both, and `e1`'s per-policy `active_owned` term stops a
+//!   job already being served from being served twice.
+//! * **The run caps make a large queue a floor.** Past
+//!   [`MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL`] the count is a *floor* rather
+//!   than a total, reported through [`QueuedDemand::is_truncated`]. Scaling up
+//!   from a floor is safe and successive polls converge; concluding "idle" from
+//!   one is not, which is why the floor is expressible at all.
+//! * **`runs-on` is not always resolvable.** `runs-on: ${{ matrix.runner }}` can
+//!   only be evaluated by GitHub. `b1` reports those as
+//!   [`runner_manager_domain::policy::UnresolvableRunsOn`] and they are neither
+//!   counted as demand nor silently dropped.
 //!
 //! # There is no job reservation, and nothing here may pretend otherwise
 //!
@@ -125,11 +153,14 @@ use std::{
     },
 };
 
-use runner_manager_domain::model::{Clock, OwnerRepo, TargetScope, Timestamp};
+use runner_manager_domain::{
+    model::{Clock, OwnerRepo, TargetScope, Timestamp},
+    policy::RunsOn,
+};
 use serde::Deserialize;
 
 use crate::{
-    ApiRequest, ApiResponse, AuthenticatedClient, GithubError, MAX_PAGES,
+    ApiRequest, ApiResponse, AuthenticatedClient, GithubError,
     rest::{
         ActivityScope, CancelToken, InventoryError, PER_PAGE, RateLimited, TargetCost,
         UnavailableRepository,
@@ -140,69 +171,143 @@ use crate::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// The `status` filter that selects runs waiting for a runner.
+/// The `status` filter that selects runs with a job that may still be waiting.
 ///
 /// Stated as a constant rather than inlined because it is the whole difference
 /// between this module and `c3`'s activity count, and a one-word typo here
 /// produces a plausible-looking number rather than an error.
 pub const QUEUED_RUN_STATUS: &str = "queued";
 
-/// Requests one demand poll costs, **per repository**.
+/// The `status` filter for the safety-net pass over runs already under way.
 ///
-/// **One**, not the `2` that [`crate::rest::DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`]
-/// estimates and `04-subsystem-contracts.md` tabulates as "queued runs plus
-/// their jobs (~120/hour)". That estimate priced a jobs request alongside the
-/// runs request; the owner decision this module implements removed the jobs
-/// request entirely, so the measured cost is half the estimate.
-///
-/// This is what [`target_cost`] reports through
-/// [`TargetCost::with_demand_requests_per_repository`] — the seam `c3` left
-/// open for exactly this, so that reporting a measured cost does not mean
-/// editing a constant in a file this task does not own.
-///
-/// # This is the best case, and it says so for the same reason `c3`'s does
-///
-/// One request is what a repository costs **when GitHub sends `total_count`**,
-/// which `d18b` observed on every response it made. When it is absent the count
-/// falls back to walking pages and may spend up to
-/// [`MAX_DEMAND_FALLBACK_PAGES`], so the true worst case per repository per poll
-/// is **four**. That gap is stated rather than modelled, exactly as
-/// [`crate::rest::ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`] states its own,
-/// and it is absorbed by [`crate::rest::BUDGET_SHARE_DIVISOR`]: the projection
-/// is compared against half the ceiling precisely so the half nobody models has
-/// somewhere to go. A repository that walked to the bound also **says** it did
-/// — it lands in [`QueuedDemand::truncated`] — so an overrun is visible rather
-/// than silent.
-pub const DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL: u32 = 1;
+/// Not a second primary signal. The module documentation states what it covers
+/// that [`QUEUED_RUN_STATUS`] does not — a `needs:`-gated job entering the queue
+/// after its run has already started — and why the difference is not something
+/// this project has observed its way out of needing.
+pub const IN_PROGRESS_RUN_STATUS: &str = "in_progress";
 
-/// The most pages one repository's demand count may walk when GitHub sends no
-/// `total_count`.
+/// The job `status` that means "waiting for a runner that does not exist yet".
 ///
-/// [`crate::MAX_PAGES`] is the wrong ceiling for this walk and the reasoning is
-/// `c3`'s, in [`crate::rest::MAX_ACTIVITY_FALLBACK_PAGES`]: `MAX_PAGES` exists
-/// to stop a `Link: rel="next"` cycle looping forever and is not a number
-/// anything budgeted for, while this walk is charged against
-/// [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`], which is one.
-///
-/// It matters more here than there. `c3`'s number renders on a dashboard; this
-/// one reaches `clamp()`, so an unbounded walk would spend the whole hourly
-/// ceiling deciding how many runners to start, and a silently clipped one would
-/// under-start. Four pages counts 400 queued runs exactly; past that the answer
-/// stops being exact and says so through [`QueuedDemand::is_truncated`].
-pub const MAX_DEMAND_FALLBACK_PAGES: usize = 4;
+/// This is the value the whole module reduces to. A job in any other state
+/// either has a runner or has finished with one, and counting it would start a
+/// runner for work already being done — the same mistake as reading `c3`'s
+/// in-progress count as demand, one level down.
+pub const QUEUED_JOB_STATUS: &str = "queued";
 
-// Enforced at compile time rather than by a test, for `c3`'s reason: the two
-// ceilings collapsing back into one is the defect itself, not a symptom of one.
-const _: () = assert!(
-    MAX_DEMAND_FALLBACK_PAGES < MAX_PAGES,
-    "the demand page budget must stay below the runaway `Link`-cycle ceiling"
-);
+/// The `filter` for the jobs endpoint: the latest attempt of each job only.
+///
+/// The default is `latest`, and it is sent explicitly because the alternative,
+/// `all`, returns every attempt of every re-run. Under `all` a job re-run three
+/// times contributes three entries, and the two that are historical would be
+/// counted as present demand.
+pub const LATEST_JOBS_FILTER: &str = "latest";
+
+/// Requests one demand poll costs, **per repository**, in steady state.
+///
+/// Four: the two run listings ([`QUEUED_RUN_STATUS`] and
+/// [`IN_PROGRESS_RUN_STATUS`]), plus a job listing for each of the couple of
+/// runs a repository has under way at any moment.
+///
+/// # Why this is a projection and not a measurement, and what bounds it
+///
+/// Under the previous owner decision this constant was `1` and it was exact: one
+/// request per repository, always, because `total_count` on the runs query
+/// answered the whole question. Counting jobs makes the cost depend on how many
+/// runs are active, which is a number no constant can know. So this is the
+/// steady-state figure the budget model prices, in the same spirit as
+/// [`crate::rest::ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH`], which is also
+/// a best case with a documented worse one.
+///
+/// The **worst** case is `2 + MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL +
+/// MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL`, which is what
+/// [`max_demand_requests_per_repository_per_poll`] returns, and it is bounded by
+/// construction rather than by hope: the two caps are hard, and a repository
+/// that reaches them says so through [`QueuedDemand::is_truncated`] rather than
+/// spending more. [`crate::rest::BUDGET_SHARE_DIVISOR`] absorbs the gap between
+/// the two figures — the projection is compared against half the documented
+/// ceiling precisely so that the half nobody models has somewhere to go.
+///
+/// A repository is only at the worst case while it genuinely has that many runs
+/// in flight, which is also exactly when spending requests to scale correctly is
+/// worth more than saving them.
+pub const DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL: u32 = 4;
+
+/// The most `status=queued` runs one repository's job listing may resolve per
+/// poll.
+///
+/// The primary signal gets the larger cap. Past it the reported count is a
+/// **floor** rather than a total, which is safe in the direction that matters:
+/// `e1` clamps demand to `max_capacity` and the host ceiling anyway, so a
+/// repository with more than this many queued runs is one whose real demand
+/// exceeds any realistic host's capacity — the allocation is already pinned at
+/// the ceiling and a larger number would not change it. Successive polls resolve
+/// the rest as the earlier runs drain.
+pub const MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL: usize = 6;
+
+/// The most `status=in_progress` runs one repository's job listing may resolve
+/// per poll.
+///
+/// Smaller than [`MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL`] on purpose: this
+/// pass exists to catch a `needs:`-gated job whose run has already started, and
+/// on the overwhelmingly common shape it finds nothing and costs one request per
+/// run to discover that. Giving the safety net the same budget as the primary
+/// signal would double the worst case to buy a rarer case.
+pub const MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL: usize = 4;
+
+/// The most pages of jobs one run's listing may walk.
+///
+/// A run's job count is bounded by GitHub's own matrix limit of 256, so two
+/// pages at [`PER_PAGE`] cover every legal run with room to spare. The third is
+/// there because a `Link: rel="next"` chain that does not terminate is a
+/// runaway, and this walk is charged against a budget.
+pub const MAX_JOB_PAGES_PER_RUN: usize = 3;
+
+/// The ceiling on what one repository's demand poll may spend.
+///
+/// Stated as a function rather than a constant because it is the sum of three
+/// constants and a reader checking the budget arithmetic should not have to
+/// re-add them — and because `f1` and `f2` render the worst case beside the
+/// projection.
+#[must_use]
+pub const fn max_demand_requests_per_repository_per_poll() -> u32 {
+    // The two run listings, then one job listing per run each cap admits.
+    2 + (MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL as u32)
+        + (MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL as u32)
+}
 
 // A poll that costs nothing is a poll that issued no request, and a budget line
 // of zero would let `f2` admit an unbounded number of targets.
 const _: () = assert!(
     DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL > 0,
-    "a demand poll costs at least the request that fetched the queued runs"
+    "a demand poll costs at least the requests that fetched the run lists"
+);
+
+// The projection has to sit inside the bound, or the bound is not a bound. This
+// is a compile-time check rather than a test because the two numbers drifting
+// apart is the defect itself rather than a symptom of one: a projection above
+// the ceiling would have `f2` refuse configurations that cannot occur, and the
+// arithmetic that produced it would look deliberate.
+const _: () = assert!(
+    DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL <= max_demand_requests_per_repository_per_poll(),
+    "the projected demand cost must fit inside the worst case the caps allow"
+);
+
+// The projection must also cover the two run listings, which every poll issues
+// unconditionally. A projection below that floor would under-price even a
+// completely idle repository, which is the one case the model must get exactly
+// right: it is what `f1`'s printed ceiling and `f2`'s `add` refusals are
+// computed from.
+const _: () = assert!(
+    DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL >= 2,
+    "every poll issues both run listings, so the projection cannot be below two"
+);
+
+// The safety net must not outgrow the signal it is backing up. If these ever
+// invert, the cheaper `in_progress` pass would be resolving more runs than the
+// `queued` pass that actually carries the demand.
+const _: () = assert!(
+    MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL <= MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL,
+    "the in-progress safety net may not be given a larger budget than the primary signal"
 );
 
 /// How far GitHub's `total_count` may exceed the single page it arrived with
@@ -219,39 +324,54 @@ const _: () = assert!(
 /// * The defect being hunted — `total_count` carrying the repository's
 ///   *unfiltered* lifetime total — is gross: thousands over a page of three.
 ///
-/// So the `warn!` fires on any disagreement and the `debug_assert!` only past
-/// this threshold. An assert that fired on both would panic a development build
-/// over a race its own documentation calls legitimate, and a tripwire that cries
-/// wolf is a tripwire the next reader deletes.
+/// # This is now a consistency check rather than a load-bearing one
+///
+/// Under the previous owner decision `total_count` **was** the demand number,
+/// and being wrong about it started the wrong number of runners. It no longer
+/// reaches `clamp()`: demand is counted from the jobs, and `total_count` is read
+/// only to notice that a repository has more runs than the caps will resolve.
+/// So the check stays — it is free, and `c3` reads the same envelope for a
+/// dashboard number — but it is a `warn!` and no longer a `debug_assert!`.
+/// Panicking a development build over a field the decision no longer depends on
+/// would be a tripwire that cries wolf, and those get deleted.
 const MAX_BENIGN_TOTAL_COUNT_SKEW: u64 = 16;
 
-// A zero skew is `total == listed` again, which is the check that panicked on
-// the documented race. At compile time rather than in a test because a test
+// A zero skew is `total == listed` again, which fires on a run leaving the queue
+// mid-serialisation. At compile time rather than in a test because a test
 // deriving its fixture from this constant moves with it and stays green at zero.
 const _: () = assert!(
     MAX_BENIGN_TOTAL_COUNT_SKEW > 0,
-    "a zero skew re-creates the assert that trips on a run leaving the queue mid-serialisation"
+    "a zero skew re-creates the check that trips on a run leaving the queue mid-serialisation"
 );
 
 // ---------------------------------------------------------------------------
 // The demand reading
 // ---------------------------------------------------------------------------
 
-/// Queued workflow runs, per repository and in total.
+/// Queued **jobs**, per repository, each carrying the `runs-on` it requires.
 ///
-/// **This is a count of runs, not of jobs, and it is not filtered by any
-/// policy's routing labels.** Both facts are the module documentation's subject
-/// and are repeated on the type because this is what a caller holds: reading
-/// [`QueuedDemand::total`] as "jobs this policy should serve" is wrong in two
-/// independent directions at once, and nothing downstream can recover either.
+/// **This is a count of jobs, not of runs, and it is not filtered by any
+/// policy's routing labels — but it carries everything needed to filter it.**
+/// Both facts are the module documentation's subject and are repeated on the
+/// type because this is what a caller holds.
+///
+/// The unfiltered totals ([`QueuedDemand::total`],
+/// [`QueuedDemand::for_repository`]) are the raw queue depth, which is what `g2`
+/// renders for an operator: "what is waiting in this repository", independent of
+/// which host could serve it. The number `e1` clamps is **not** either of those.
+/// It comes from tallying [`QueuedDemand::jobs_for`] against one policy's
+/// routing labels, and the difference between the two is exactly the jobs this
+/// host cannot serve.
 ///
 /// # A count can be short in two different ways, and both have to say so
 ///
 /// A repository can fail to answer at all ([`QueuedDemand::unavailable`]), and a
 /// repository can answer with a number that is only a **floor**
-/// ([`QueuedDemand::truncated`]) — the fallback walk stopped at
-/// [`MAX_DEMAND_FALLBACK_PAGES`], or GitHub's own total was wider than the `u32`
-/// this product renders. [`QueuedDemand::is_complete`] is `false` for either.
+/// ([`QueuedDemand::truncated`]) — more runs were active than
+/// [`MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL`] and
+/// [`MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL`] allow resolving, or one
+/// run's job listing walked to [`MAX_JOB_PAGES_PER_RUN`].
+/// [`QueuedDemand::is_complete`] is `false` for either.
 ///
 /// The shape mirrors [`crate::rest::ActivityCount`] deliberately, down to the
 /// method names, because `g2` renders the two side by side and a caller that has
@@ -260,7 +380,7 @@ const _: () = assert!(
 /// a type that can hold either number is a type that will eventually add them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueuedDemand {
-    per_repository: BTreeMap<OwnerRepo, u32>,
+    per_repository: BTreeMap<OwnerRepo, Vec<RunsOn>>,
     unavailable: Vec<UnavailableRepository>,
     /// Repositories whose count is a floor rather than a total.
     truncated: BTreeSet<OwnerRepo>,
@@ -268,7 +388,7 @@ pub struct QueuedDemand {
 
 impl QueuedDemand {
     #[must_use]
-    pub fn new(per_repository: BTreeMap<OwnerRepo, u32>) -> Self {
+    pub fn new(per_repository: BTreeMap<OwnerRepo, Vec<RunsOn>>) -> Self {
         Self {
             per_repository,
             unavailable: Vec::new(),
@@ -276,10 +396,14 @@ impl QueuedDemand {
         }
     }
 
-    /// One repository's count, for the repository-target case and for tests.
+    /// One repository's queued jobs, for the repository-target case and for
+    /// tests.
     #[must_use]
-    pub fn of(repository: OwnerRepo, count: u32) -> Self {
-        Self::new(BTreeMap::from([(repository, count)]))
+    pub fn of(repository: OwnerRepo, jobs: impl IntoIterator<Item = RunsOn>) -> Self {
+        Self::new(BTreeMap::from([(
+            repository,
+            jobs.into_iter().collect::<Vec<_>>(),
+        )]))
     }
 
     /// Record that `repository`'s count is a floor rather than a total.
@@ -302,27 +426,55 @@ impl QueuedDemand {
         self
     }
 
-    /// Queued runs across every repository that answered.
+    /// Queued jobs across every repository that answered, **unfiltered**.
+    ///
+    /// The raw queue depth, not the demand any one policy should serve. See the
+    /// type documentation for the distinction, which is the whole reason
+    /// [`QueuedDemand::jobs`] exists beside this.
     ///
     /// Saturating rather than wrapping: a total wider than a `u32` is not a
     /// number to wrap around zero, and `u32::MAX` runners is refused by the
     /// capacity ceilings long before it means anything.
     #[must_use]
     pub fn total(&self) -> u32 {
-        self.per_repository
-            .values()
-            .fold(0_u32, |sum, count| sum.saturating_add(*count))
+        self.per_repository.values().fold(0_u32, |sum, jobs| {
+            sum.saturating_add(u32::try_from(jobs.len()).unwrap_or(u32::MAX))
+        })
     }
 
     #[must_use]
-    pub fn per_repository(&self) -> &BTreeMap<OwnerRepo, u32> {
+    pub fn per_repository(&self) -> &BTreeMap<OwnerRepo, Vec<RunsOn>> {
         &self.per_repository
     }
 
-    /// One repository's count, or `None` when it did not answer.
+    /// One repository's unfiltered count, or `None` when it did not answer.
     #[must_use]
     pub fn for_repository(&self, repository: &OwnerRepo) -> Option<u32> {
-        self.per_repository.get(repository).copied()
+        self.per_repository
+            .get(repository)
+            .map(|jobs| u32::try_from(jobs.len()).unwrap_or(u32::MAX))
+    }
+
+    /// One repository's queued jobs, as the `runs-on` each requires.
+    ///
+    /// This is the input `b1`'s predicate was written for and never had. An
+    /// empty slice for a repository that answered means it really is idle; a
+    /// repository that did not answer is in [`QueuedDemand::unavailable`]
+    /// instead, and the two must not be conflated.
+    #[must_use]
+    pub fn jobs_for(&self, repository: &OwnerRepo) -> &[RunsOn] {
+        self.per_repository
+            .get(repository)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Every queued job across every repository that answered.
+    ///
+    /// What an organization target tallies, for the reason a repository target
+    /// tallies [`QueuedDemand::jobs_for`]: one policy watching an organization
+    /// serves any repository in it, so its demand is the whole scope's.
+    pub fn jobs(&self) -> impl Iterator<Item = &RunsOn> {
+        self.per_repository.values().flat_map(Vec::as_slice)
     }
 
     #[must_use]
@@ -351,7 +503,7 @@ impl QueuedDemand {
     }
 }
 
-/// Requests one demand poll over `scope` costs.
+/// Requests one demand poll over `scope` costs, in steady state.
 ///
 /// Grows with the repository count, because there is no organization-wide
 /// workflow-runs endpoint and an organization therefore pays per repository the
@@ -359,12 +511,26 @@ impl QueuedDemand {
 /// added repository multiplies this policy's share of the shared hourly ceiling.
 #[must_use]
 pub fn demand_requests_per_poll(scope: &ActivityScope) -> u32 {
-    u32::try_from(scope.repositories().len()).unwrap_or(u32::MAX)
-        * DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL
+    u32::try_from(scope.repositories().len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
 }
 
-/// `scope`'s budget cost with this module's **measured** demand figure
-/// substituted for `c3`'s estimate.
+/// The most requests one demand poll over `scope` may spend.
+///
+/// The companion to [`demand_requests_per_poll`], and the number a reader should
+/// be shown when they ask why a busy hour cost more than the projection. See
+/// [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`] for why the model prices the
+/// steady state and bounds the peak rather than trying to price the peak.
+#[must_use]
+pub fn max_demand_requests_per_poll(scope: &ActivityScope) -> u32 {
+    u32::try_from(scope.repositories().len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(max_demand_requests_per_repository_per_poll())
+}
+
+/// `scope`'s budget cost with this module's demand figure substituted for
+/// `c3`'s estimate.
 ///
 /// This is the reporting seam `c4`'s specification requires — "report the
 /// per-poll request count to `c3`'s budget model rather than estimating it
@@ -372,8 +538,7 @@ pub fn demand_requests_per_poll(scope: &ActivityScope) -> u32 {
 /// `c3` left it open. Callers that project a budget (`f1`'s `host show`, `f2`'s
 /// `repo add` and `org add`, `g3`'s settings) should build their
 /// [`TargetCost`] through this function rather than through
-/// [`TargetCost::from_activity_scope`] directly, or they will project the
-/// pre-decision estimate of two requests per repository.
+/// [`TargetCost::from_activity_scope`] directly.
 #[must_use]
 pub fn target_cost(scope: &ActivityScope) -> TargetCost {
     TargetCost::from_activity_scope(scope)
@@ -554,82 +719,214 @@ impl RestDemand {
         InventoryError::RateLimited(limit)
     }
 
-    /// Queued workflow runs for one repository.
+    /// Queued **jobs** for one repository, each with the `runs-on` it requires.
     ///
-    /// One request in the ordinary case, because GitHub answers the filtered
-    /// query with its own `total_count` and `d18b` established that the number
-    /// is the filtered count.
+    /// Two run listings, then one job listing per run either cap admits. See
+    /// [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`] for what that costs in steady
+    /// state and [`max_demand_requests_per_repository_per_poll`] for the bound.
+    ///
+    /// # The order of the two passes is load-bearing
+    ///
+    /// Queued runs are resolved first and in-progress runs second, because the
+    /// caps are spent in that order and the first pass carries the signal. A
+    /// repository busy enough to exhaust the queued cap gets no in-progress pass
+    /// at all, which is the right trade: its count is already a floor above any
+    /// realistic host ceiling, and one more `needs:`-gated job cannot change the
+    /// allocation.
+    ///
+    /// # Why a run is resolved at most once, though the two queries are disjoint
+    ///
+    /// They are disjoint *at any one instant*, and these are two requests with
+    /// time between them. A run that is `queued` when the first is answered and
+    /// `in_progress` when the second is — which is precisely what happens when
+    /// its last waiting job gets picked up, so it is the common transition
+    /// rather than an exotic one — appears in **both** lists. Listing its jobs
+    /// twice would count every queued job it still holds twice, and demand that
+    /// double-counts starts runners for work that does not exist.
+    ///
+    /// The seen set is what stops that. It is deliberately not an argument that
+    /// the race is too narrow to matter: the window is one HTTP round trip
+    /// against a poll that repeats every sixty seconds forever, and the failure
+    /// it produces is silent inflation rather than an error.
     async fn repository_queued(
         &self,
         repository: &OwnerRepo,
         cancel: &CancelToken,
     ) -> Result<RepositoryDemand, InventoryError> {
+        let mut jobs: Vec<RunsOn> = Vec::new();
+        let mut exact = true;
+        let mut resolved: BTreeSet<u64> = BTreeSet::new();
+
+        for (status, cap) in [
+            (QUEUED_RUN_STATUS, MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL),
+            (
+                IN_PROGRESS_RUN_STATUS,
+                MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL,
+            ),
+        ] {
+            let listing = self.active_runs(repository, status, cap, cancel).await?;
+            exact &= listing.complete;
+
+            for run_id in listing.run_ids {
+                // A run that changed status between the two listings is in both.
+                // Resolving it twice would double every queued job it holds.
+                if !resolved.insert(run_id) {
+                    continue;
+                }
+                let run = self.queued_jobs_of_run(repository, run_id, cancel).await?;
+                exact &= run.complete;
+                jobs.extend(run.jobs);
+            }
+        }
+
+        Ok(RepositoryDemand { jobs, exact })
+    }
+
+    /// The ids of one repository's runs in `status`, up to `cap`.
+    ///
+    /// **One request, never a page walk.** Both caps are far below [`PER_PAGE`],
+    /// so the first page always carries more run ids than this may use, and a
+    /// second page could only contain runs that are already past the cap. That
+    /// is the whole reason the caps are stated in *runs* rather than in pages:
+    /// it turns the run listing back into the fixed one-request cost the
+    /// previous owner decision valued, and spends the variable cost only where
+    /// it buys the job-level count.
+    async fn active_runs(
+        &self,
+        repository: &OwnerRepo,
+        status: &str,
+        cap: usize,
+        cancel: &CancelToken,
+    ) -> Result<RunListing, InventoryError> {
         let request = ApiRequest::get(format!(
             "/repos/{}/{}/actions/runs",
             repository.owner(),
             repository.repo()
         ))
-        .query("status", QUEUED_RUN_STATUS)
+        .query("status", status)
         .query("per_page", PER_PAGE);
 
         let response = self.get(&request, cancel).await?;
+        let has_next_page = response.next_page().is_some();
         let page: QueuedRunsPage = response.json()?;
 
-        if let Some(total) = page.total_count {
-            let listed = page.workflow_runs.len() as u64;
-            if response.next_page().is_none() && total != listed {
+        let listed = page.workflow_runs.len();
+        if let Some(total) = page.total_count
+            && !has_next_page
+            && total != listed as u64
+        {
+            // Free, and no longer load-bearing: see `MAX_BENIGN_TOTAL_COUNT_SKEW`
+            // for why this is a log line and not the `debug_assert!` it was
+            // while `total_count` *was* the demand number. The two levels draw
+            // the same distinction that constant does. A handful over is the
+            // documented race of a run leaving the queue mid-serialisation,
+            // which this module's own documentation calls legitimate — warning
+            // on it every poll is how an operator learns to ignore the warning.
+            // Thousands over is the unfiltered lifetime total, which is a real
+            // finding about the API.
+            if total > (listed as u64).saturating_add(MAX_BENIGN_TOTAL_COUNT_SKEW) {
                 tracing::warn!(
                     repository = %repository,
+                    status,
                     total_count = total,
                     listed,
-                    "GitHub's `total_count` disagrees with the single page it sent for a \
-                     filtered query; this layer reads `total_count` as the count of the \
-                     filtered set, and that reading looks wrong"
+                    "GitHub's `total_count` is far larger than the single page it sent for \
+                     a filtered query, so it is not the filtered count. Demand is counted \
+                     from the jobs and does not depend on this field, but `c3` reads the \
+                     same envelope for a dashboard number and does"
                 );
-                // Asymmetric on purpose; see `MAX_BENIGN_TOTAL_COUNT_SKEW`. A
-                // handful over is the documented race, thousands over is the
-                // unfiltered total this was written to catch — and unlike `c3`'s
-                // copy of this check, the number being read here is the one that
-                // decides how many runner processes start.
-                debug_assert!(
-                    total <= listed.saturating_add(MAX_BENIGN_TOTAL_COUNT_SKEW),
-                    "`total_count` ({total}) exceeds the {listed} queued run(s) on the only \
-                     page of a filtered query by more than {MAX_BENIGN_TOTAL_COUNT_SKEW}, \
-                     which is far past the run-leaving-the-queue race; `total_count` is not \
-                     the filtered count, and demand is being read off the wrong field"
+            } else {
+                tracing::debug!(
+                    repository = %repository,
+                    status,
+                    total_count = total,
+                    listed,
+                    "GitHub's `total_count` disagrees slightly with the page it arrived \
+                     with; this is the documented race of a run leaving the queue while \
+                     the response was being built"
                 );
             }
-            return Ok(RepositoryDemand::from_reported_total(total, repository));
         }
 
-        // No `total_count`: count what is there, following pages. Guessing zero
-        // from a missing field would render a backed-up queue as idle and start
-        // no runners at all.
-        let mut counted = page.workflow_runs.len();
-        let mut pages = 1_usize;
-        let mut next = response
-            .next_page()
-            .map(|url| ApiRequest::get(url.as_str()));
-        while let Some(request) = next.take() {
-            if pages >= MAX_DEMAND_FALLBACK_PAGES {
+        let run_ids: Vec<u64> = page
+            .workflow_runs
+            .iter()
+            .take(cap)
+            .map(|run| run.id)
+            .collect();
+
+        Ok(RunListing {
+            // More runs exist than this pass will resolve, so the job count it
+            // produces is a floor. Both conditions matter: `listed > cap` is the
+            // ordinary case, and `has_next_page` catches a repository whose
+            // first page was itself short of the whole filtered set.
+            complete: listed <= cap && !has_next_page,
+            run_ids,
+        })
+    }
+
+    /// One run's jobs that are still waiting for a runner.
+    ///
+    /// Jobs in any other state are dropped here rather than downstream, because
+    /// "queued" is what makes a job demand and a caller holding a mixed list
+    /// would have to re-derive that. The `runs-on` is rebuilt from the job's
+    /// `labels` array — which is the array form, so [`RunsOn::from_job_labels`]
+    /// is the constructor `b1` provides for exactly this.
+    async fn queued_jobs_of_run(
+        &self,
+        repository: &OwnerRepo,
+        run_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<RunJobs, InventoryError> {
+        let mut request = Some(
+            ApiRequest::get(format!(
+                "/repos/{}/{}/actions/runs/{run_id}/jobs",
+                repository.owner(),
+                repository.repo()
+            ))
+            .query("filter", LATEST_JOBS_FILTER)
+            .query("per_page", PER_PAGE),
+        );
+
+        let mut jobs = Vec::new();
+        let mut pages = 0_usize;
+
+        while let Some(next) = request.take() {
+            if pages >= MAX_JOB_PAGES_PER_RUN {
                 tracing::warn!(
                     repository = %repository,
+                    run_id,
                     pages,
-                    counted,
-                    "stopped counting queued runs at the demand page budget; the count \
-                     reported for this repository is a floor, not a total"
+                    "stopped listing one run's jobs at the page budget; the queued-job \
+                     count for this repository is a floor, not a total"
                 );
-                return Ok(RepositoryDemand::floor(counted));
+                return Ok(RunJobs {
+                    jobs,
+                    complete: false,
+                });
             }
-            let response = self.get(&request, cancel).await?;
-            let page: QueuedRunsPage = response.json()?;
-            counted += page.workflow_runs.len();
-            pages += 1;
-            next = response
+
+            let response = self.get(&next, cancel).await?;
+            let following = response
                 .next_page()
                 .map(|url| ApiRequest::get(url.as_str()));
+            let page: RunJobsPage = response.json()?;
+            pages += 1;
+
+            jobs.extend(
+                page.jobs
+                    .into_iter()
+                    .filter(|job| job.status == QUEUED_JOB_STATUS)
+                    .map(|job| RunsOn::from_job_labels(job.labels)),
+            );
+
+            request = following;
         }
-        Ok(RepositoryDemand::exact(counted))
+
+        Ok(RunJobs {
+            jobs,
+            complete: true,
+        })
     }
 }
 
@@ -672,7 +969,7 @@ impl DemandGateway for RestDemand {
                 Ok(reading) => {
                     demand
                         .per_repository
-                        .insert(repository.clone(), reading.count);
+                        .insert(repository.clone(), reading.jobs);
                     if !reading.exact {
                         // A floor travels with the aggregate rather than being
                         // flattened into it: one truncated repository makes the
@@ -709,70 +1006,69 @@ impl DemandGateway for RestDemand {
 // Wire shapes
 // ---------------------------------------------------------------------------
 
-/// One repository's queued-run count, and whether that number is the whole
-/// truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One repository's queued jobs, and whether that set is the whole truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RepositoryDemand {
-    count: u32,
-    /// `false` when `count` is a **floor**: the page budget stopped the walk, or
-    /// GitHub's own total was wider than the `u32` this product renders.
+    /// The `runs-on` of every job still waiting for a runner.
+    jobs: Vec<RunsOn>,
+    /// `false` when `jobs` is a **floor**: a run cap or a job page budget
+    /// stopped the walk before the whole queue had been seen.
     exact: bool,
 }
 
-impl RepositoryDemand {
-    fn exact(count: usize) -> Self {
-        Self {
-            // A count assembled here one page at a time cannot exceed
-            // `MAX_DEMAND_FALLBACK_PAGES * PER_PAGE`, so the saturation is
-            // unreachable rather than lossy.
-            count: u32::try_from(count).unwrap_or(u32::MAX),
-            exact: true,
-        }
-    }
-
-    fn floor(count: usize) -> Self {
-        Self {
-            count: u32::try_from(count).unwrap_or(u32::MAX),
-            exact: false,
-        }
-    }
-
-    /// GitHub's own `total_count`, narrowed to the width this product uses.
-    ///
-    /// A total that does not fit a `u32` is still a *floor* — the real count is
-    /// larger, not smaller — so it is reported as one rather than saturated
-    /// silently into something that looks like a measurement.
-    fn from_reported_total(total: u64, repository: &OwnerRepo) -> Self {
-        match u32::try_from(total) {
-            Ok(count) => Self { count, exact: true },
-            Err(_) => {
-                tracing::warn!(
-                    repository = %repository,
-                    total_count = total,
-                    "GitHub reported a queued-run total wider than this product uses; it is \
-                     clamped and reported as a floor rather than as a count"
-                );
-                Self {
-                    count: u32::MAX,
-                    exact: false,
-                }
-            }
-        }
-    }
+/// One run listing's ids, and whether the cap left any behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunListing {
+    run_ids: Vec<u64>,
+    complete: bool,
 }
 
-/// One page of `GET …/actions/runs?status=queued`.
+/// One run's queued jobs, and whether the page budget saw all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunJobs {
+    jobs: Vec<RunsOn>,
+    complete: bool,
+}
+
+/// One page of `GET …/actions/runs?status=…`.
 ///
-/// The runs themselves are discarded: this module counts them and reads nothing
-/// out of them. `IgnoredAny` rather than a struct is what makes that literally
-/// true — there is no field here to start depending on, and in particular no
-/// `jobs_url` for a later reader to follow, which is the edit the module
-/// documentation asks nobody to make.
+/// Only the `id` is read, and it is read because the job listing needs it. That
+/// is the field the previous owner decision deliberately did not have — the
+/// module documentation used to point at `jobs_url` and ask nobody to follow it
+/// — and reversing that decision is what put it here.
 #[derive(Debug, Deserialize)]
 struct QueuedRunsPage {
     total_count: Option<u64>,
     #[serde(default)]
-    workflow_runs: Vec<serde::de::IgnoredAny>,
+    workflow_runs: Vec<QueuedRun>,
+}
+
+/// One workflow run, reduced to the identifier its jobs are fetched by.
+#[derive(Debug, Deserialize)]
+struct QueuedRun {
+    id: u64,
+}
+
+/// One page of `GET …/actions/runs/{run_id}/jobs`.
+#[derive(Debug, Deserialize)]
+struct RunJobsPage {
+    #[serde(default)]
+    jobs: Vec<RunJob>,
+}
+
+/// One job of a run: whether it is still waiting, and what it needs.
+///
+/// `labels` is GitHub's flat array form of `runs-on`, which is why
+/// [`RunsOn::from_job_labels`] exists on `b1`'s side. It defaults to empty
+/// rather than being required, because a job with no labels is a real answer —
+/// `b1` reports it as [`runner_manager_domain::policy::UnresolvableRunsOn`] —
+/// and a missing field should not fail the whole repository's poll.
+#[derive(Debug, Deserialize)]
+struct RunJob {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 // The unit tests below are inline rather than in a `src/demand/tests.rs`, and
@@ -785,10 +1081,10 @@ struct QueuedRunsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FIXTURE_TOKEN, Script, TestClock};
+    use crate::testing::{FIXTURE_TOKEN, TestClock};
     use crate::{Endpoints, UserAccessToken};
     use runner_manager_domain::{
-        model::{Arch, HostLabel, Org, Os},
+        model::{Arch, HostLabel, Label, Org, Os},
         policy::{RoutingLabels, RunsOn, RunsOnMatch, UnresolvableRunsOn},
     };
     use secrecy::SecretString;
@@ -825,193 +1121,702 @@ mod tests {
         RestDemand::new(Arc::new(client), Arc::new(TestClock::default()))
     }
 
-    /// A `?status=queued` response carrying its own filtered `total_count`.
-    fn queued_body(total: u64, listed: usize) -> serde_json::Value {
+    // -- fixtures -----------------------------------------------------------
+
+    /// A run list carrying `ids`, and a `total_count` that agrees with it.
+    fn runs_body(ids: &[u64]) -> serde_json::Value {
         json!({
-            "total_count": total,
-            "workflow_runs": (0..listed)
-                .map(|i| json!({ "id": 100 + i, "status": "queued" }))
-                .collect::<Vec<_>>()
+            "total_count": ids.len(),
+            "workflow_runs": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>()
         })
     }
 
-    /// The same shape with **no** `total_count`, which is what forces the
-    /// page-walking fallback.
-    fn queued_body_without_total(listed: usize) -> serde_json::Value {
-        json!({
-            "workflow_runs": (0..listed)
-                .map(|i| json!({ "id": 200 + i, "status": "queued" }))
-                .collect::<Vec<_>>()
-        })
+    /// An empty run list, which is what an idle repository answers.
+    fn no_runs() -> serde_json::Value {
+        runs_body(&[])
     }
 
-    async fn mount_queued(server: &MockServer, repository: &OwnerRepo, body: serde_json::Value) {
+    /// A jobs page: `queued` jobs carrying `labels`, then `running` that do not
+    /// count.
+    fn jobs_body(labels: &[&str], queued: usize, running: usize) -> serde_json::Value {
+        let mut jobs = Vec::new();
+        for _ in 0..queued {
+            jobs.push(json!({ "status": "queued", "labels": labels }));
+        }
+        for _ in 0..running {
+            jobs.push(json!({ "status": "in_progress", "labels": labels }));
+        }
+        json!({ "total_count": jobs.len(), "jobs": jobs })
+    }
+
+    fn runs_path(repository: &OwnerRepo) -> String {
+        format!(
+            "/repos/{}/{}/actions/runs",
+            repository.owner(),
+            repository.repo()
+        )
+    }
+
+    fn jobs_path(repository: &OwnerRepo, run_id: u64) -> String {
+        format!("{}/{run_id}/jobs", runs_path(repository))
+    }
+
+    /// Mount one repository's run list for one status filter.
+    async fn mount_runs(
+        server: &MockServer,
+        repository: &OwnerRepo,
+        status: &str,
+        body: serde_json::Value,
+    ) {
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/{}/actions/runs",
-                repository.owner(),
-                repository.repo()
-            )))
-            .and(query_param("status", QUEUED_RUN_STATUS))
+            .and(path(runs_path(repository)))
+            .and(query_param("status", status))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
     }
 
+    /// Mount one run's job list.
+    async fn mount_jobs(
+        server: &MockServer,
+        repository: &OwnerRepo,
+        run_id: u64,
+        body: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(jobs_path(repository, run_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// The ordinary shape: one queued run of `queued` + `running` jobs, and an
+    /// empty in-progress list.
+    async fn mount_one_queued_run(
+        server: &MockServer,
+        repository: &OwnerRepo,
+        labels: &[&str],
+        queued: usize,
+        running: usize,
+    ) {
+        mount_runs(server, repository, QUEUED_RUN_STATUS, runs_body(&[100])).await;
+        mount_runs(server, repository, IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        mount_jobs(server, repository, 100, jobs_body(labels, queued, running)).await;
+    }
+
+    /// A repository with nothing waiting: two run listings, no job listings.
+    async fn mount_idle(server: &MockServer, repository: &OwnerRepo) {
+        mount_runs(server, repository, QUEUED_RUN_STATUS, no_runs()).await;
+        mount_runs(server, repository, IN_PROGRESS_RUN_STATUS, no_runs()).await;
+    }
+
+    /// The routing labels of a realistic policy on this host.
+    ///
+    /// Deliberately **not** a bare [`RoutingLabels::derive`]. That produces the
+    /// derived host label alone, and a job written `runs-on: [self-hosted,
+    /// windows]` — the shape people actually write — requires labels a bare
+    /// derived set does not carry, so it would not match. An operator adds those
+    /// with `repo add --label`, and a fixture that skipped them would test the
+    /// filtering against a policy nobody configures.
+    fn host_labels() -> RoutingLabels {
+        RoutingLabels::from_parts(
+            Label::new("rm-home-win-x64").expect("a valid label"),
+            [
+                Label::new("self-hosted").expect("a valid label"),
+                Label::new("windows").expect("a valid label"),
+            ],
+        )
+    }
+
     // -- the count itself ---------------------------------------------------
 
-    /// The ordinary path: one request, and the number is GitHub's own filtered
-    /// total.
-    #[tokio::test]
-    async fn a_queued_run_fixture_yields_the_filtered_total_in_one_request() {
-        let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(7, 7)).await;
-        let gateway = gateway(&server);
-
-        let demand = gateway
-            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
-            .await
-            .expect("a queued-run count");
-
-        assert_eq!(demand.total(), 7);
-        assert_eq!(demand.for_repository(&repo()), Some(7));
-        assert!(demand.is_complete());
-        assert_eq!(
-            gateway.requests_issued(),
-            1,
-            "the whole filtered count arrives in one request, which is what \
-             DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL projects"
-        );
-    }
-
-    /// The filter is on the wire, not merely in the doc comment.
+    /// The defect this module was rewritten for, as an executable statement.
     ///
-    /// `status=in_progress` and `status=queued` are one word apart and answer
-    /// opposite questions — an in-progress run already *has* a runner — so a
-    /// gateway that sent the wrong one would return a plausible number that
-    /// starts runners for work already being done. The mock matches on
-    /// `status=queued`, so sending anything else 404s here rather than passing.
+    /// One queued run holding eight matrix jobs. Under the previous owner
+    /// decision this repository reported demand `1`, `e1` started one runner,
+    /// and the other seven jobs waited for a machine that was sitting idle. It
+    /// must now report `8`.
     #[tokio::test]
-    async fn the_request_filters_on_queued_and_not_on_in_progress() {
+    async fn a_matrix_run_of_eight_jobs_is_eight_units_of_demand_and_not_one() {
         let server = MockServer::start().await;
-        // Mounted *only* for `status=queued`. Anything else reaches no mock and
-        // wiremock answers 404, which surfaces as a failure rather than a count.
-        mount_queued(&server, &repo(), queued_body(3, 3)).await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 8, 0).await;
         let gateway = gateway(&server);
 
         let demand = gateway
             .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
             .await
-            .expect("the queued filter is what this gateway sends");
-        assert_eq!(demand.total(), 3);
-
-        let requests = server.received_requests().await.expect("recorded requests");
-        assert_eq!(requests.len(), 1);
-        let query = requests[0].url.query().unwrap_or_default();
-        assert!(
-            query.contains("status=queued"),
-            "the demand poll must filter on queued runs; sent {query:?}"
-        );
-        assert!(
-            !query.contains("in_progress"),
-            "in-progress runs already have a runner and are not demand; sent {query:?}"
-        );
-        assert!(
-            query.contains(&format!("per_page={PER_PAGE}")),
-            "asking for fewer than GitHub's maximum multiplies the request count \
-             against the budget this module projects; sent {query:?}"
-        );
-    }
-
-    // -- pagination ---------------------------------------------------------
-
-    /// A truncated first page never reads as low demand.
-    ///
-    /// With no `total_count` the walk has to follow `Link: rel="next"`. A
-    /// gateway that read page one and stopped would report 100 where the answer
-    /// is 250 — and 100 is a plausible number, so nothing downstream could
-    /// notice.
-    #[tokio::test]
-    async fn a_first_page_is_never_mistaken_for_the_whole_queue() {
-        let server = MockServer::start().await;
-        let base = server.uri();
-        let runs_path = format!("/repos/{}/{}/actions/runs", repo().owner(), repo().repo());
-
-        // Page 1 -> page 2 -> page 3, no `total_count` anywhere.
-        Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
-            .and(query_param("page", "3"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(queued_body_without_total(50)))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
-            .and(query_param("page", "2"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(queued_body_without_total(100))
-                    .insert_header(
-                        "link",
-                        format!("<{base}{runs_path}?status=queued&page=3>; rel=\"next\"").as_str(),
-                    ),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
-            .and(query_param("status", QUEUED_RUN_STATUS))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(queued_body_without_total(100))
-                    .insert_header(
-                        "link",
-                        format!("<{base}{runs_path}?status=queued&page=2>; rel=\"next\"").as_str(),
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        let gateway = gateway(&server);
-        let demand = gateway
-            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
-            .await
-            .expect("a walked count");
+            .expect("a queued-job count");
 
         assert_eq!(
             demand.total(),
-            250,
-            "the walk must sum every page; stopping at the first would report 100"
+            8,
+            "eight jobs in one run are eight runners' worth of work; reading the run \
+             count here is the defect that forced the owner decision back"
         );
-        assert!(
-            demand.is_complete(),
-            "a walk that reached the end of the collection is exact"
+        assert_eq!(demand.for_repository(&repo()), Some(8));
+        assert!(demand.is_complete());
+        assert_eq!(
+            gateway.requests_issued(),
+            3,
+            "two run listings and one job listing for the single active run"
         );
-        assert_eq!(gateway.requests_issued(), 3, "one request per page walked");
     }
 
-    /// The walk is bounded, and stopping at the bound makes the answer inexact
-    /// rather than merely smaller.
+    /// A job that already has a runner is not demand.
+    ///
+    /// The run-level mistake one level down: `status=in_progress` work already
+    /// has a runner, and counting it would start a second for the same job.
     #[tokio::test]
-    async fn a_walk_stopped_at_the_page_budget_reports_a_floor_rather_than_a_total() {
+    async fn only_jobs_still_queued_are_counted() {
+        let server = MockServer::start().await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 3, 5).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(
+            demand.total(),
+            3,
+            "five of the eight jobs already have a runner and are not waiting for one"
+        );
+    }
+
+    /// The labels travel with the job, which is the input `b1`'s predicate never
+    /// had.
+    #[tokio::test]
+    async fn each_queued_job_carries_the_runs_on_it_requires() {
+        let server = MockServer::start().await;
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[100, 101])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        mount_jobs(
+            &server,
+            &repo(),
+            100,
+            jobs_body(&["self-hosted", "windows"], 2, 0),
+        )
+        .await;
+        mount_jobs(&server, &repo(), 101, jobs_body(&["ubuntu-latest"], 4, 0)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(
+            demand.total(),
+            6,
+            "the unfiltered depth is every queued job"
+        );
+
+        // And the number `e1` clamps, which is the unfiltered depth put through
+        // `b1`'s predicate. This gateway does not compute it; it supplies it.
+        let tally = host_labels().tally(demand.jobs_for(&repo()));
+        assert_eq!(
+            tally.demand(),
+            2,
+            "the four `ubuntu-latest` jobs are somebody else's work; before the job \
+             listing existed all six would have driven this policy toward max_capacity"
+        );
+        assert_eq!(tally.not_matched, 4);
+    }
+
+    /// The two run statuses are both on the wire, and the job filter with them.
+    ///
+    /// The queries are one word apart and answer different questions, so a
+    /// gateway that sent the wrong one would return a plausible number. The
+    /// mocks match on the exact status, so sending anything else 404s here
+    /// rather than passing.
+    #[tokio::test]
+    async fn both_run_statuses_are_polled_and_the_jobs_request_asks_for_the_latest_attempt() {
+        let server = MockServer::start().await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 1, 0).await;
+        let gateway = gateway(&server);
+
+        gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("both filters are mounted");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+
+        let queries: Vec<String> = requests
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(
+            queries.iter().any(|q| q.contains("status=queued")),
+            "the primary signal is the queued run list; sent {queries:?}"
+        );
+        assert!(
+            queries.iter().any(|q| q.contains("status=in_progress")),
+            "the safety net catches a `needs:`-gated job whose run has already \
+             started; sent {queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.contains(&format!("filter={LATEST_JOBS_FILTER}"))),
+            "`filter=all` would count every attempt of a re-run job as present \
+             demand; sent {queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .all(|q| q.contains(&format!("per_page={PER_PAGE}"))),
+            "asking for fewer than GitHub's maximum multiplies the request count \
+             against the budget this module projects; sent {queries:?}"
+        );
+    }
+
+    /// The queued run list is read before the in-progress one.
+    ///
+    /// The order is what spends the caps on the signal rather than on the safety
+    /// net, and it is the kind of thing that is only true until somebody
+    /// reorders a literal.
+    #[tokio::test]
+    async fn the_queued_run_list_is_read_before_the_in_progress_one() {
+        let server = MockServer::start().await;
+        mount_idle(&server, &repo()).await;
+        let gateway = gateway(&server);
+
+        gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("an idle repository still answers");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let queries: Vec<String> = requests
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(queries.len(), 2, "an idle repository lists no run's jobs");
+        assert!(
+            queries[0].contains("status=queued"),
+            "the primary signal is read first; sent {queries:?}"
+        );
+        assert!(
+            queries[1].contains("status=in_progress"),
+            "the safety net is read second; sent {queries:?}"
+        );
+    }
+
+    /// An idle repository costs the two listings and nothing more.
+    ///
+    /// The steady-state figure the budget model prices, asserted against what
+    /// the gateway really spends rather than left as a claim in a doc comment.
+    #[tokio::test]
+    async fn an_idle_repository_costs_only_the_two_run_listings() {
+        let server = MockServer::start().await;
+        mount_idle(&server, &repo()).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("an idle repository answers zero rather than failing");
+
+        assert_eq!(demand.total(), 0);
+        assert!(
+            demand.is_complete(),
+            "zero from a repository that answered is a measurement, not a floor"
+        );
+        assert_eq!(gateway.requests_issued(), 2);
+        assert!(
+            gateway.requests_issued() <= u64::from(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL),
+            "the idle case must sit inside the projection, which is the number `f2`'s \
+             refusals are computed from"
+        );
+    }
+
+    /// A run whose jobs have all been dispatched is found and costs one request.
+    ///
+    /// The safety net's ordinary outcome, and the reason it is capped lower than
+    /// the primary signal: on the common shape it finds nothing.
+    #[tokio::test]
+    async fn an_in_progress_run_with_no_queued_job_contributes_only_its_request() {
+        let server = MockServer::start().await;
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, no_runs()).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, runs_body(&[200])).await;
+        mount_jobs(&server, &repo(), 200, jobs_body(&["rm-home-win-x64"], 0, 4)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(demand.total(), 0);
+        assert!(demand.is_complete());
+        assert_eq!(gateway.requests_issued(), 3);
+    }
+
+    /// A run caught mid-transition appears in both listings and is counted once.
+    ///
+    /// The two GitHub queries are disjoint at any one instant and these are two
+    /// requests with time between them. A run whose last waiting job is picked
+    /// up between them is `queued` for the first and `in_progress` for the
+    /// second — the ordinary transition, not an exotic one — so it comes back in
+    /// both lists. Counting its jobs twice would inflate demand silently, which
+    /// is the failure mode with no error to notice.
+    #[tokio::test]
+    async fn a_run_in_both_listings_is_resolved_once_and_not_counted_twice() {
+        let server = MockServer::start().await;
+        // The same run id in both lists, which is what the race produces.
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[100])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, runs_body(&[100])).await;
+        mount_jobs(&server, &repo(), 100, jobs_body(&["rm-home-win-x64"], 3, 0)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(
+            demand.total(),
+            3,
+            "the run holds three queued jobs, and appearing in both listings does not              make it six"
+        );
+        assert_eq!(
+            gateway.requests_issued(),
+            3,
+            "and the duplicate costs no second job listing either"
+        );
+    }
+
+    /// A `needs:`-gated job whose run has already started is still demand.
+    ///
+    /// This is the whole reason the in-progress pass exists. Live sampling of a
+    /// repository using this product never caught GitHub reporting a run as
+    /// `in_progress` while one of its jobs was queued — 44 samples, 25 of them
+    /// with a queued job — so the primary signal covers everything that was
+    /// observed. It does not cover a job that becomes queued *after* its run
+    /// started, which is what `needs:` produces and what this pins.
+    #[tokio::test]
+    async fn a_job_that_enters_the_queue_after_its_run_started_is_still_found() {
+        let server = MockServer::start().await;
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, no_runs()).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, runs_body(&[200])).await;
+        // One job running, one released by `needs:` and now waiting.
+        mount_jobs(&server, &repo(), 200, jobs_body(&["rm-home-win-x64"], 1, 1)).await;
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a queued-job count");
+
+        assert_eq!(
+            demand.total(),
+            1,
+            "polling only `status=queued` runs would report zero here and the \
+             `needs:`-gated job would wait for a machine that is idle"
+        );
+    }
+
+    // -- the wire contract, against payloads GitHub really sent -------------
+
+    /// The deserializers are pinned against **real** GitHub responses, not only
+    /// against fixtures written to match them.
+    ///
+    /// Every other test here builds its own JSON, so all of them would keep
+    /// passing if this module's idea of the wire format were wrong in the same
+    /// way the fixtures are. That is the one failure a mock server cannot catch,
+    /// and it is the failure this change was most exposed to: the previous owner
+    /// decision deliberately read *nothing* out of a run and had no job
+    /// endpoint at all, so `workflow_runs[].id`, `jobs[].status` and
+    /// `jobs[].labels` are all fields this crate had never parsed before.
+    ///
+    /// The payloads below are verbatim excerpts captured from
+    /// `api.github.com` on 2026-09-05 against a repository using this product,
+    /// trimmed only by replacing the `steps` array — which is long, which this
+    /// module does not read, and whose presence is itself part of what is being
+    /// asserted, since a job object carries twenty-odd fields that must all be
+    /// ignored without error.
+    #[test]
+    fn the_wire_shapes_parse_a_payload_github_really_sent() {
+        // GET /repos/{o}/{r}/actions/runs/33938794901/jobs?filter=latest&per_page=100
+        let jobs: RunJobsPage = serde_json::from_value(json!({
+          "total_count": 5,
+          "jobs": [
+            {
+              "id": 101_231_925_899_i64,
+              "run_id": 33_938_794_901_i64,
+              "workflow_name": "tests",
+              "head_branch": "worktree-p1-lock-and-worktree-set",
+              "run_url": "https://api.github.com/repos/o/r/actions/runs/33938794901",
+              "run_attempt": 1,
+              "node_id": "CR_kwDOS_wnss8AAAAXkeSaiw",
+              "head_sha": "e78bc5d1865693aba030d83a2c627dd5515edf45",
+              "url": "https://api.github.com/repos/o/r/actions/jobs/101231925899",
+              "html_url": "https://github.com/o/r/actions/runs/33938794901/job/101231925899",
+              "status": "completed",
+              "conclusion": "success",
+              "created_at": "2026-09-05T02:20:30Z",
+              "started_at": "2026-09-05T02:26:03Z",
+              "completed_at": "2026-09-05T02:28:44Z",
+              "name": "scripts-tests",
+              "steps": [],
+              "check_run_url": "https://api.github.com/repos/o/r/check-runs/101231925899",
+              "labels": ["self-hosted", "windows"],
+              "runner_id": 725,
+              "runner_name": "runner-manager-4bd32f05-088f-4b13-a59c-6900b9142aa1",
+              "runner_group_id": 1,
+              "runner_group_name": "Default"
+            },
+            {
+              "id": 101_231_925_900_i64,
+              "run_id": 33_938_794_901_i64,
+              "status": "queued",
+              "conclusion": serde_json::Value::Null,
+              "started_at": serde_json::Value::Null,
+              "completed_at": serde_json::Value::Null,
+              "name": "pipeline-tests",
+              "steps": [],
+              "labels": ["self-hosted", "windows"],
+              "runner_id": serde_json::Value::Null,
+              "runner_name": "",
+              "runner_group_name": ""
+            },
+            {
+              "id": 101_231_925_901_i64,
+              "status": "queued",
+              "name": "scripts-tests-macos",
+              "labels": ["self-hosted", "macOS", "rm-macmini-osx-arm64"]
+            }
+          ]
+        }))
+        .expect("the jobs page GitHub really sends must deserialize");
+
+        assert_eq!(
+            jobs.jobs.len(),
+            3,
+            "every job is read, whatever else it carries"
+        );
+
+        // What the gateway does with it: keep the queued ones, and turn each
+        // one's `labels` array into the `RunsOn` `b1` matches.
+        let queued: Vec<RunsOn> = jobs
+            .jobs
+            .into_iter()
+            .filter(|job| job.status == QUEUED_JOB_STATUS)
+            .map(|job| RunsOn::from_job_labels(job.labels))
+            .collect();
+
+        assert_eq!(
+            queued,
+            vec![
+                RunsOn::Many(vec!["self-hosted".into(), "windows".into()]),
+                RunsOn::Many(vec![
+                    "self-hosted".into(),
+                    "macOS".into(),
+                    "rm-macmini-osx-arm64".into()
+                ]),
+            ],
+            "the completed job is dropped and the two queued ones keep their labels"
+        );
+
+        // And the demand a Windows policy on that host would clamp: one, not
+        // two, because the macOS job belongs to another machine.
+        let tally = host_labels().tally(&queued);
+        assert_eq!(tally.demand(), 1);
+        assert_eq!(tally.not_matched, 1);
+
+        // GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, as an idle
+        // repository answers it. `total_count` and an empty array, which is the
+        // shape that must read as "nothing waiting" rather than as a failure.
+        let idle: QueuedRunsPage = serde_json::from_value(json!({
+            "total_count": 0,
+            "workflow_runs": []
+        }))
+        .expect("an idle run listing must deserialize");
+        assert_eq!(idle.total_count, Some(0));
+        assert!(idle.workflow_runs.is_empty());
+
+        // And a busy one. A run object carries far more than the id, and the id
+        // is the only field this module reads out of it.
+        let busy: QueuedRunsPage = serde_json::from_value(json!({
+            "total_count": 1,
+            "workflow_runs": [{
+                "id": 33_938_794_901_i64,
+                "name": "tests",
+                "node_id": "WFR_kwLOS_wnss8AAAAH6oSPFQ",
+                "head_branch": "main",
+                "head_sha": "e78bc5d1865693aba030d83a2c627dd5515edf45",
+                "path": ".github/workflows/tests.yml",
+                "run_number": 412,
+                "event": "push",
+                "status": "queued",
+                "conclusion": serde_json::Value::Null,
+                "workflow_id": 213_842_591_i64,
+                "url": "https://api.github.com/repos/o/r/actions/runs/33938794901",
+                "created_at": "2026-09-05T02:20:30Z",
+                "updated_at": "2026-09-05T02:20:31Z"
+            }]
+        }))
+        .expect("a busy run listing must deserialize");
+        assert_eq!(
+            busy.workflow_runs
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![33_938_794_901],
+            "the run id is what the job listing is fetched by, and it is a u64: \
+             GitHub's run ids passed 2^32 long ago, so a u32 here would have \
+             wrapped on every real repository"
+        );
+    }
+
+    // -- the caps -----------------------------------------------------------
+
+    /// More queued runs than the cap resolves makes the answer a floor.
+    #[tokio::test]
+    async fn more_queued_runs_than_the_cap_report_a_floor_rather_than_a_total() {
+        let server = MockServer::start().await;
+        let ids: Vec<u64> = (0..(MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL as u64 + 4))
+            .map(|i| 100 + i)
+            .collect();
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&ids)).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        for id in &ids {
+            mount_jobs(&server, &repo(), *id, jobs_body(&["rm-home-win-x64"], 1, 0)).await;
+        }
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a bounded poll still answers");
+
+        assert_eq!(
+            demand.total() as usize,
+            MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL,
+            "one job resolved per run the cap admits"
+        );
+        assert!(
+            !demand.is_complete(),
+            "a count clipped by the run cap is a floor and must say so; concluding \
+             `idle` from one would be the mistake the flag exists to prevent"
+        );
+        assert!(demand.is_truncated(&repo()));
+    }
+
+    /// The caps bound what one repository can spend, whatever GitHub sends.
+    ///
+    /// The projection is a steady-state figure and the worst case is what keeps
+    /// it honest, so the worst case has to be a real ceiling rather than an
+    /// estimate. A repository with a hundred active runs must not spend a
+    /// hundred requests.
+    #[tokio::test]
+    async fn a_repository_cannot_spend_more_than_the_documented_worst_case() {
+        let server = MockServer::start().await;
+        let queued: Vec<u64> = (0..40).map(|i| 100 + i).collect();
+        let running: Vec<u64> = (0..40).map(|i| 500 + i).collect();
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&queued)).await;
+        mount_runs(
+            &server,
+            &repo(),
+            IN_PROGRESS_RUN_STATUS,
+            runs_body(&running),
+        )
+        .await;
+        for id in queued.iter().chain(running.iter()) {
+            mount_jobs(&server, &repo(), *id, jobs_body(&["rm-home-win-x64"], 2, 0)).await;
+        }
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a bounded poll still answers");
+
+        assert_eq!(
+            gateway.requests_issued(),
+            u64::from(max_demand_requests_per_repository_per_poll()),
+            "the measured ceiling must equal the projected one, or the bound is a \
+             sentence in a doc comment"
+        );
+        assert_eq!(
+            demand.total(),
+            2 * (MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL
+                + MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL) as u32
+        );
+        assert!(!demand.is_complete());
+    }
+
+    /// The queued pass is served before the in-progress one when both are over
+    /// their caps.
+    #[tokio::test]
+    async fn the_primary_signal_is_resolved_before_the_safety_net() {
+        let server = MockServer::start().await;
+        let queued: Vec<u64> = (0..40).map(|i| 100 + i).collect();
+        let running: Vec<u64> = (0..40).map(|i| 500 + i).collect();
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&queued)).await;
+        mount_runs(
+            &server,
+            &repo(),
+            IN_PROGRESS_RUN_STATUS,
+            runs_body(&running),
+        )
+        .await;
+        // Queued runs hold this host's work; in-progress runs hold another
+        // host's. If the caps were spent in the other order the demand would be
+        // made of the wrong jobs.
+        for id in &queued {
+            mount_jobs(&server, &repo(), *id, jobs_body(&["rm-home-win-x64"], 1, 0)).await;
+        }
+        for id in &running {
+            mount_jobs(&server, &repo(), *id, jobs_body(&["ubuntu-latest"], 1, 0)).await;
+        }
+        let gateway = gateway(&server);
+
+        let demand = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a bounded poll still answers");
+
+        let tally = host_labels().tally(demand.jobs_for(&repo()));
+        assert_eq!(
+            tally.demand() as usize,
+            MAX_QUEUED_RUNS_PER_REPOSITORY_PER_POLL,
+            "the queued cap is spent in full on the primary signal"
+        );
+        assert_eq!(
+            tally.not_matched as usize, MAX_IN_PROGRESS_RUNS_PER_REPOSITORY_PER_POLL,
+            "and the safety net gets its own smaller cap, not a share of the first"
+        );
+    }
+
+    /// One run's job listing follows pages, and stops at its budget.
+    #[tokio::test]
+    async fn a_runs_job_listing_walks_pages_and_stops_at_its_budget() {
         let server = MockServer::start().await;
         let base = server.uri();
-        let runs_path = format!("/repos/{}/{}/actions/runs", repo().owner(), repo().repo());
+        let path_100 = jobs_path(&repo(), 100);
 
-        // Every page points at a next page, forever.
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[100])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        // Every page points at another, forever.
         Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
+            .and(path(path_100.clone()))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(queued_body_without_total(100))
+                    .set_body_json(jobs_body(&["rm-home-win-x64"], 100, 0))
                     .insert_header(
                         "link",
-                        format!("<{base}{runs_path}?status=queued&page=9>; rel=\"next\"").as_str(),
+                        format!("<{base}{path_100}?page=9>; rel=\"next\"").as_str(),
                     ),
             )
             .mount(&server)
             .await;
-
         let gateway = gateway(&server);
+
         let demand = gateway
             .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
             .await
@@ -1019,11 +1824,11 @@ mod tests {
 
         assert_eq!(
             gateway.requests_issued() as usize,
-            MAX_DEMAND_FALLBACK_PAGES,
-            "an endless `Link` chain must stop at the demand page budget rather than \
-             spending the hourly ceiling on one repository"
+            2 + MAX_JOB_PAGES_PER_RUN,
+            "an endless `Link` chain must stop at the job page budget rather than \
+             spending the hourly ceiling on one run"
         );
-        assert_eq!(demand.total(), 400);
+        assert_eq!(demand.total() as usize, 100 * MAX_JOB_PAGES_PER_RUN);
         assert!(
             !demand.is_complete(),
             "a count clipped by the page bound is a floor and must say so"
@@ -1036,80 +1841,41 @@ mod tests {
     /// The zero-cost check that `total_count` is the *filtered* count.
     ///
     /// A repository with 3 queued runs out of 5,000 lifetime runs would answer
-    /// `len() == 3`, no `Link`, and `total_count == 5000`. That contradiction is
-    /// visible on the first response and is what `d18b` went to live GitHub to
-    /// rule out; discarding it would leave the assumption falsifiable only by an
-    /// operator noticing that far too many runners started.
+    /// `len() == 3`, no `Link`, and `total_count == 5000`. The demand number no
+    /// longer comes from that field, so the contradiction is a `warn!` rather
+    /// than a `debug_assert!` — but it still means GitHub is not answering the
+    /// question this module asked, and it is free to notice.
     #[tokio::test]
-    #[should_panic(expected = "is not the filtered count")]
-    async fn a_total_count_that_disagrees_with_its_only_page_is_caught() {
+    async fn a_total_count_that_disagrees_with_its_only_page_does_not_derail_the_count() {
         let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(5_000, 3)).await;
-        let gateway = gateway(&server);
-
-        let _ = gateway
-            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
-            .await;
-    }
-
-    /// The documented race is *not* an assertion failure.
-    ///
-    /// A run leaving the queue between GitHub computing `total_count` and
-    /// serialising the page makes `total` exceed `listed` by a handful. Pinned
-    /// to literals rather than to `MAX_BENIGN_TOTAL_COUNT_SKEW` so that widening
-    /// the constant cannot silently widen this test with it.
-    #[tokio::test]
-    async fn a_benign_skew_between_total_count_and_its_page_is_not_a_panic() {
-        let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(12, 4)).await;
+        mount_runs(
+            &server,
+            &repo(),
+            QUEUED_RUN_STATUS,
+            json!({
+                "total_count": 5_000,
+                "workflow_runs": [{ "id": 100 }]
+            }),
+        )
+        .await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        mount_jobs(&server, &repo(), 100, jobs_body(&["rm-home-win-x64"], 2, 0)).await;
         let gateway = gateway(&server);
 
         let demand = gateway
             .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
             .await
-            .expect("a handful of skew is the documented race, not a defect");
+            .expect("a wrong `total_count` no longer decides anything here");
+
         assert_eq!(
             demand.total(),
-            12,
-            "GitHub's own total is still the answer; the skew is in the page, not the count"
+            2,
+            "the count comes from the jobs of the runs that were actually listed, so a \
+             `total_count` carrying the unfiltered lifetime total cannot inflate it"
         );
-    }
-
-    /// A total wider than the width this product uses is a floor, not a
-    /// measurement.
-    #[tokio::test]
-    async fn a_total_wider_than_u32_is_reported_as_a_floor() {
-        let server = MockServer::start().await;
-        let base = server.uri();
-        let runs_path = format!("/repos/{}/{}/actions/runs", repo().owner(), repo().repo());
-        // The `Link: rel="next"` is what makes this fixture coherent rather than
-        // merely convenient: four billion runs do not fit on one page, and
-        // without the header the single-page tripwire would — correctly — fire
-        // on `total_count` disagreeing with the page it arrived with.
-        Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
-            .and(query_param("status", QUEUED_RUN_STATUS))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(queued_body(u64::from(u32::MAX) + 1, 100))
-                    .insert_header(
-                        "link",
-                        format!("<{base}{runs_path}?status=queued&page=2>; rel=\"next\"").as_str(),
-                    ),
-            )
-            .mount(&server)
-            .await;
-        let gateway = gateway(&server);
-
-        let demand = gateway
-            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
-            .await
-            .expect("an over-wide total is still an answer");
-
-        assert_eq!(demand.total(), u32::MAX);
         assert!(
-            !demand.is_complete(),
-            "a clamped total is a floor: the real count is larger, not smaller"
+            demand.is_complete(),
+            "one listed run, no next page, and the cap not reached"
         );
     }
 
@@ -1120,9 +1886,9 @@ mod tests {
     #[tokio::test]
     async fn an_organization_aggregates_its_repositories_and_pays_per_repository() {
         let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(2, 2)).await;
-        mount_queued(&server, &other_repo(), queued_body(5, 5)).await;
-        mount_queued(&server, &third_repo(), queued_body(0, 0)).await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 2, 0).await;
+        mount_one_queued_run(&server, &other_repo(), &["rm-home-win-x64"], 5, 0).await;
+        mount_idle(&server, &third_repo()).await;
         let gateway = gateway(&server);
 
         let two = org_scope([repo(), other_repo()]);
@@ -1130,14 +1896,9 @@ mod tests {
 
         assert_eq!(
             demand_requests_per_poll(&two),
-            2,
+            2 * DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL,
             "there is no organization-wide workflow-runs endpoint, so the cost is \
              per repository"
-        );
-        assert_eq!(
-            demand_requests_per_poll(&three),
-            3,
-            "and it grows with every repository the App is installed on"
         );
         assert!(
             demand_requests_per_poll(&three) > demand_requests_per_poll(&two),
@@ -1160,15 +1921,20 @@ mod tests {
              could not answer at all"
         );
         assert_eq!(
-            gateway.requests_issued(),
-            u64::from(demand_requests_per_poll(&three)),
-            "the measured cost must equal the projected one, or the budget model is \
-             a table in a document"
+            host_labels().tally(demand.jobs()).demand(),
+            7,
+            "an organization policy serves any repository in its scope, so its demand \
+             is the whole aggregate's rather than one repository's"
+        );
+        assert!(
+            gateway.requests_issued() <= u64::from(max_demand_requests_per_poll(&three)),
+            "the measured cost must sit inside the projected ceiling, or the budget \
+             model is a table in a document"
         );
     }
 
     /// The measured cost is reported to `c3`'s budget model through the seam
-    /// `c3` left for it, rather than inheriting the estimate of two.
+    /// `c3` left for it, rather than inheriting the estimate.
     #[test]
     fn the_measured_demand_cost_is_reported_through_c3s_seam() {
         use crate::rest::DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH;
@@ -1179,23 +1945,23 @@ mod tests {
 
         assert_eq!(
             DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH, 2,
-            "`c3`'s estimate priced a jobs request alongside the runs request; if it \
-             ever changes, the sentence in DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL's \
-             documentation explaining the difference has to change with it"
+            "`c3`'s estimate prices the runs request and one jobs request; this module \
+             now issues both, plus the in-progress listing and a jobs request per \
+             additional active run, so the measured figure is higher rather than lower"
         );
         assert_ne!(
             measured, estimated,
             "the seam must actually replace the estimate; a `target_cost` that returned \
              `from_activity_scope` unchanged would report the estimate as measured"
         );
-        // 1 inventory request + 3 repositories * (1 activity + 1 demand).
-        assert_eq!(measured.requests_per_refresh(), 7);
-        // 1 + 3 * (1 + 2), the pre-decision estimate.
+        // 1 inventory request + 3 repositories * (1 activity + 4 demand).
+        assert_eq!(measured.requests_per_refresh(), 16);
+        // 1 + 3 * (1 + 2), `c3`'s estimate.
         assert_eq!(estimated.requests_per_refresh(), 10);
         assert!(
-            measured.requests_per_refresh() < estimated.requests_per_refresh(),
-            "removing the per-run job listing removed requests; a measured cost that \
-             was not lower would mean this module is still spending them"
+            measured.requests_per_refresh() > estimated.requests_per_refresh(),
+            "restoring the per-run job listing added requests; a measured cost that was \
+             not higher would mean this module is not issuing them"
         );
     }
 
@@ -1208,24 +1974,32 @@ mod tests {
     /// [`target_cost`] gets an admission computed from the real cost.
     /// [`crate::rest::BudgetProjection::max_repository_targets`] builds
     /// [`TargetCost::repository`] internally, which cannot see the seam and
-    /// therefore still prices demand at the pre-decision estimate of two.
+    /// therefore still prices demand at `c3`'s estimate of two.
     ///
-    /// The two then disagree, and an operator sees both: the projection says
-    /// "roughly 10 repository targets per host" — the figure
-    /// `04-subsystem-contracts.md` quotes — while `admit` will actually take
-    /// thirteen. The direction is the safe one (the printed limit is
-    /// conservative, so nothing is admitted that should not be), but the numbers
-    /// contradict each other in the same output.
+    /// The two then disagree, and an operator sees both. **The direction of the
+    /// disagreement inverted when this module started counting jobs**, and that
+    /// is why this test matters more than it did: the printed ceiling used to be
+    /// conservative, and is now optimistic. It says a host fits ten repository
+    /// targets when the cost this module really issues fits six, so an operator
+    /// planning against the printed number can configure a host that spends more
+    /// than the projection admitted.
     ///
-    /// It is not fixable from this file. Both remedies —
-    /// changing [`crate::rest::DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`] to
-    /// one, or giving `max_repository_targets` a [`TargetCost`] argument — are
-    /// edits to `crates/github/src/rest.rs`, which `c3` owns. This test records
-    /// the discrepancy with its arithmetic so that whoever holds that file can
-    /// act on it, and fails if it is ever closed, at which point this test and
-    /// the note above should go.
+    /// What keeps that from being a live budget overrun is
+    /// `BUDGET_SHARE_DIVISOR`: the projection is compared against half of
+    /// GitHub's hourly ceiling, so the gap is spent out of the half deliberately
+    /// left unplanned. It is a reporting defect with a safety margin under it,
+    /// not a correctness one — and `f1`'s `host show` prints the caveat beside
+    /// the number.
+    ///
+    /// It is not fixable from this file. Both remedies — changing
+    /// [`crate::rest::DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH`], or giving
+    /// `max_repository_targets` a [`TargetCost`] argument — are edits to
+    /// `crates/github/src/rest.rs`, which `c3` owns. This test records the
+    /// discrepancy with its arithmetic so that whoever holds that file can act on
+    /// it, and fails if it is ever closed, at which point this test and the note
+    /// above should go.
     #[test]
-    fn the_printed_target_ceiling_still_projects_the_pre_decision_estimate() {
+    fn the_printed_target_ceiling_still_projects_c3s_estimate() {
         use crate::rest::{BudgetProjection, budget_allowance};
         use runner_manager_domain::model::RefreshInterval;
 
@@ -1236,24 +2010,24 @@ mod tests {
             .with_demand_requests_per_repository(DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL)
             .requests_per_hour(interval);
 
-        // 4 requests per refresh * 60 refreshes, against 3 * 60.
+        // 4 requests per refresh * 60 refreshes, against 6 * 60.
         assert_eq!(per_hour_estimated, 240);
-        assert_eq!(per_hour_measured, 180);
+        assert_eq!(per_hour_measured, 360);
         assert_eq!(
             printed, 10,
             "the printed ceiling is `04-subsystem-contracts.md`'s figure, computed from \
-             the estimate"
+             `c3`'s estimate"
         );
         assert_eq!(
             budget_allowance() / per_hour_measured,
-            13,
-            "while the cost this module actually issues would allow thirteen"
+            6,
+            "while the cost this module actually issues allows six"
         );
         assert!(
-            printed < budget_allowance() / per_hour_measured,
-            "the gap is in the conservative direction, which is why this is a reporting \
-             discrepancy rather than a budget overrun -- if it ever inverts, the printed \
-             ceiling would be admitting targets the budget cannot pay for"
+            printed > budget_allowance() / per_hour_measured,
+            "the gap now runs in the optimistic direction: the printed ceiling is larger \
+             than the measured cost supports. `BUDGET_SHARE_DIVISOR` is what absorbs it \
+             -- see this test's documentation before treating the inequality as harmless"
         );
     }
 
@@ -1262,13 +2036,9 @@ mod tests {
     #[tokio::test]
     async fn an_organization_steps_over_a_repository_local_failure_without_reading_it_as_zero() {
         let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(4, 4)).await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 4, 0).await;
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/{}/actions/runs",
-                other_repo().owner(),
-                other_repo().repo()
-            )))
+            .and(path(runs_path(&other_repo())))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
             )
@@ -1291,6 +2061,11 @@ mod tests {
              as a zero"
         );
         assert!(
+            demand.jobs_for(&other_repo()).is_empty(),
+            "and its job list is empty rather than absent, so a caller tallying it \
+             cannot accidentally read an unavailable repository as demand"
+        );
+        assert!(
             !demand.is_complete(),
             "an aggregate missing a repository is not a complete reading"
         );
@@ -1305,11 +2080,7 @@ mod tests {
     async fn a_repository_target_propagates_the_failure_rather_than_reporting_zero_demand() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/{}/actions/runs",
-                repo().owner(),
-                repo().repo()
-            )))
+            .and(path(runs_path(&repo())))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
             )
@@ -1327,6 +2098,37 @@ mod tests {
         ));
     }
 
+    /// A failure on the *job* listing is a failure of the whole poll, not a
+    /// silently short count.
+    ///
+    /// The job listing is where the new requests are, so it is where a new way
+    /// to under-count could enter: a gateway that swallowed a failed job listing
+    /// would report the run's jobs as zero, which is indistinguishable from a
+    /// run whose jobs have all been dispatched.
+    #[tokio::test]
+    async fn a_failed_job_listing_is_not_read_as_a_run_with_no_queued_jobs() {
+        let server = MockServer::start().await;
+        mount_runs(&server, &repo(), QUEUED_RUN_STATUS, runs_body(&[100])).await;
+        mount_runs(&server, &repo(), IN_PROGRESS_RUN_STATUS, no_runs()).await;
+        Mock::given(method("GET"))
+            .and(path(jobs_path(&repo(), 100)))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(json!({ "message": "Server Error" })),
+            )
+            .mount(&server)
+            .await;
+        let gateway = gateway(&server);
+
+        let error = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect_err("a job listing that failed is not a run with nothing queued");
+        assert!(matches!(
+            error,
+            InventoryError::Github(GithubError::Status { status: 500, .. })
+        ));
+    }
+
     /// A credential failure aborts the aggregate rather than being stepped over.
     ///
     /// A revoked token is a fact about the credential, not about the repository:
@@ -1335,13 +2137,9 @@ mod tests {
     #[tokio::test]
     async fn a_rate_limit_aborts_the_aggregate_rather_than_being_stepped_over() {
         let server = MockServer::start().await;
-        mount_queued(&server, &repo(), queued_body(1, 1)).await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 1, 0).await;
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/{}/actions/runs",
-                other_repo().owner(),
-                other_repo().repo()
-            )))
+            .and(path(runs_path(&other_repo())))
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("retry-after", "42")
@@ -1366,36 +2164,21 @@ mod tests {
 
     // -- cancellation -------------------------------------------------------
 
-    /// A token flipped between pages stops the walk before the next request.
+    /// A token flipped between requests stops the poll before the next one.
     #[tokio::test]
-    async fn cancellation_between_pages_stops_the_walk() {
+    async fn cancellation_between_requests_stops_the_poll() {
         let server = MockServer::start().await;
-        let base = server.uri();
-        let runs_path = format!("/repos/{}/{}/actions/runs", repo().owner(), repo().repo());
-        Mock::given(method("GET"))
-            .and(path(runs_path.clone()))
-            .respond_with(Script::new(vec![
-                ResponseTemplate::new(200)
-                    .set_body_json(queued_body_without_total(100))
-                    .insert_header(
-                        "link",
-                        format!("<{base}{runs_path}?status=queued&page=2>; rel=\"next\"").as_str(),
-                    ),
-                ResponseTemplate::new(200).set_body_json(queued_body_without_total(100)),
-            ]))
-            .mount(&server)
-            .await;
+        mount_one_queued_run(&server, &repo(), &["rm-home-win-x64"], 3, 0).await;
 
         let gateway = gateway(&server);
         let cancel = CancelToken::new();
 
-        // The first page is fetched, then the caller withdraws.
         let first = gateway
             .repository_queued(&repo(), &cancel)
             .await
-            .is_ok_and(|reading| reading.count == 200);
-        assert!(first, "the uncancelled walk reads both pages");
-        assert_eq!(gateway.requests_issued(), 2);
+            .is_ok_and(|reading| reading.jobs.len() == 3);
+        assert!(first, "the uncancelled poll reads both lists and the jobs");
+        assert_eq!(gateway.requests_issued(), 3);
 
         cancel.cancel();
         let error = gateway
@@ -1405,55 +2188,58 @@ mod tests {
         assert!(error.is_cancelled());
         assert_eq!(
             gateway.requests_issued(),
-            2,
+            3,
             "a cancelled poll must spend nothing; the count is of requests attempted"
         );
     }
 
     // -- the seam this module does not own ---------------------------------
 
-    /// The `runs-on` predicate is `b1`'s, and this module re-implements no part
-    /// of it.
+    /// The `runs-on` predicate is `b1`'s. This module builds its **input** and
+    /// implements no part of the matching.
     ///
     /// # Read this before concluding the test is in the wrong file
     ///
     /// `c4`'s specification asks for "a `runs-on` table covering forms that must
     /// match, forms that must not, and an unresolvable expression, delegating
-    /// the predicate to `b1`", as part of a demand path that resolved each
-    /// queued run's jobs. The owner decision recorded at length in this module's
-    /// documentation removed that job resolution, and a workflow *run* carries
-    /// no `runs-on` — so on the fixed-cost path there is no `RunsOn` to match
-    /// and **the table has no input from this gateway**.
+    /// the predicate to `b1`". For a while that table had no input: an owner
+    /// decision had removed the per-run job listing, a workflow *run* carries no
+    /// `runs-on`, and this gateway therefore produced nothing to match. That
+    /// decision has been reversed — the module documentation says why — so the
+    /// table has its input back and this test asserts both halves of the seam
+    /// rather than only the delegation half.
     ///
-    /// What remains true, and what this pins, is the delegation half: the
-    /// predicate, its three outcomes and its unresolvable taxonomy all live in
-    /// `runner_manager_domain::policy`, this file contains no label comparison of
-    /// its own, and a future `c4` that re-implements one will find this test
-    /// already asserting the opposite. The table is exercised against `b1`
-    /// directly so that the forms are enumerated where `c4` would have needed
-    /// them, and so that the seam is loud rather than absent if the job listing
-    /// is ever restored by a later owner decision.
+    /// The division of labour is: `c4` reads each queued job's `labels` array
+    /// and builds a [`RunsOn`], `b1` decides what matches, and `e1` applies the
+    /// decision per policy. Constructing a `RunsOn` here is the correct side of
+    /// that line; comparing labels here is not.
     ///
     /// # How the second half of that claim is asserted, and how far it reaches
     ///
-    /// By reading this file's own source, because nothing done to `b1` can
-    /// prove anything about what *this* module contains: every assertion in the
-    /// body below would pass unchanged with a full label matcher sitting beside
-    /// it, which is what the claim used to amount to. The scan takes the
-    /// production half — everything above `#[cfg(test)]`, with comment lines
-    /// dropped so that the module documentation may keep explaining the seam —
-    /// and requires that it names none of `b1`'s label vocabulary.
+    /// By reading this file's own source, because nothing done to `b1` can prove
+    /// anything about what *this* module contains: every assertion in the body
+    /// below would pass unchanged with a full label matcher sitting beside it.
+    /// The scan takes the production half — everything above `#[cfg(test)]`,
+    /// with comment lines dropped so that the module documentation may keep
+    /// explaining the seam — and requires that it names none of `b1`'s
+    /// *decision* vocabulary.
     ///
-    /// It forbids the label types and not `runner_manager_domain::policy` as a
-    /// whole, because that module also holds `ScalePolicy` and
-    /// `AutoscaleConfig`, which this file could legitimately come to need. And
-    /// like the needles in
-    /// `nothing_in_this_crate_reserves_or_claims_a_job`, it is a tripwire on the
-    /// obvious shape rather than a proof: a hand-rolled comparison of raw label
-    /// strings that never names a `policy` type would walk past it. Stated
-    /// rather than implied, for the same reason it is stated there.
+    /// `RunsOn` is no longer in the forbidden set, and could not be: this module
+    /// constructs one per queued job, which is the whole point of the reversal.
+    /// What stays forbidden is everything that would mean deciding rather than
+    /// describing — `RoutingLabels`, whose `matches` and `tally` are the
+    /// predicate, and `DemandTally`, which is the predicate's result. A `c4`
+    /// that named either would be filtering, and filtering here would make the
+    /// poll per-policy rather than per-target; the module documentation explains
+    /// why that trade is refused.
+    ///
+    /// Like the needles in `nothing_in_this_crate_reserves_or_claims_a_job`, it
+    /// is a tripwire on the obvious shape rather than a proof: a hand-rolled
+    /// comparison of raw label strings that never names a `policy` type would
+    /// walk past it. Stated rather than implied, for the same reason it is
+    /// stated there.
     #[test]
-    fn the_runs_on_forms_b1_matches_are_the_predicate_this_module_does_not_own() {
+    fn the_runs_on_predicate_is_b1s_and_this_module_only_feeds_it() {
         let labels = RoutingLabels::derive(
             &HostLabel::new("home").expect("a valid host label"),
             Os::Windows,
@@ -1496,8 +2282,7 @@ mod tests {
             RunsOnMatch::Unresolvable(UnresolvableRunsOn::Expression { .. })
         ));
 
-        // And the tally keeps the three apart, which is what `e1` would clamp if
-        // the job listing were ever restored.
+        // And the tally keeps the three apart, which is what `e1` clamps.
         let tally = labels.tally(&[
             RunsOn::Single(host.clone()),
             RunsOn::Single("ubuntu-latest".into()),
@@ -1508,21 +2293,55 @@ mod tests {
         assert_eq!(tally.unresolvable.len(), 1);
         assert_eq!(tally.total_seen(), 3);
 
+        // The form this gateway actually builds is the array one, because that
+        // is the shape the jobs API returns. Pinned so that a `RunsOn` built
+        // from a job's `labels` really is a value `b1`'s predicate accepts,
+        // rather than one that happens to compile.
+        assert_eq!(
+            RunsOn::from_job_labels(["self-hosted", host.as_str()]),
+            RunsOn::Many(vec!["self-hosted".into(), host.clone()])
+        );
+        assert!(
+            labels
+                .matches(&RunsOn::from_job_labels([host.as_str()]))
+                .is_match()
+        );
+        // And the direction that surprises people: a bare derived set does not
+        // carry `self-hosted`, so the shape most workflows are written in --
+        // `runs-on: [self-hosted, windows]` -- does **not** match a policy whose
+        // operator never added those labels. That is `b1`'s superset rule
+        // working as specified rather than a gap, and it is asserted here
+        // because the job listing is what finally made it observable.
+        assert!(
+            !labels
+                .matches(&RunsOn::from_job_labels(["self-hosted", host.as_str()]))
+                .is_match(),
+            "a job requiring `self-hosted` needs a policy carrying `self-hosted`"
+        );
+
         // And the other half of this test's title, which everything above leaves
         // untouched: that the predicate exercised here has no second
         // implementation in this file. See the documentation on this test for
-        // what the scan covers and what it does not.
+        // what the scan covers, what it does not, and why `RunsOn` is absent
+        // from the list.
         let production = this_file_above_its_tests_without_prose();
-        for owned_by_b1 in ["RoutingLabels", "RunsOn", "DemandTally"] {
+        for owned_by_b1 in ["RoutingLabels", "DemandTally"] {
             assert!(
                 !production.contains(owned_by_b1),
-                "the demand gateway names `{owned_by_b1}`, which belongs to `b1`: the \
-                 `runs-on` predicate has exactly one implementation and this module is \
-                 not it. If the job listing was restored by a later owner decision, that \
-                 decision belongs in this module's documentation and in this test before \
-                 it belongs in the code"
+                "the demand gateway names `{owned_by_b1}`, which belongs to `b1`: this \
+                 module builds the predicate's input and does not apply it. Filtering \
+                 here would make the poll per-policy rather than per-target and multiply \
+                 its request cost by the number of policies sharing a target -- if an \
+                 owner decision changed that, it belongs in this module's documentation \
+                 and in this test before it belongs in the code"
             );
         }
+        assert!(
+            production.contains("RunsOn"),
+            "and the gateway must still *build* a `RunsOn` per queued job; a production \
+             half that named none would mean the job listing had been removed again and \
+             the serial-matrix defect restored"
+        );
     }
 
     /// This file's source above its test module, with comment lines dropped.

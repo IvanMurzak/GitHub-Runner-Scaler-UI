@@ -61,6 +61,61 @@ fn one_release_newer() -> String {
     format!("{major}.{minor}.{}", patch + 1)
 }
 
+/// Run `command`, retrying briefly past `ETXTBSY`.
+///
+/// # Why a retry rather than a fix at the copy
+///
+/// Every test here copies the built binary into its own temporary `bin/` and
+/// then executes it. On Linux, `execve` fails with `ETXTBSY` ("Text file busy")
+/// while **any** file descriptor anywhere in the process still holds that file
+/// open for writing — and the writer does not have to be this test. `cargo
+/// test` runs the tests of one binary as threads of a single process, several
+/// `Installed::new` calls overlap, and a `posix_spawn` issued by thread A
+/// inherits the write descriptor thread B is at that instant using to copy
+/// *its* binary. Closing our own file, which `fs::copy` already does before it
+/// returns, cannot prevent that: the descriptor that blocks us belongs to
+/// another test.
+///
+/// So the race is inherent to the shape of the suite rather than to any one
+/// test, and the window is the microseconds between another thread's `copy` and
+/// its `spawn`. A bounded retry closes it without serialising the suite behind a
+/// mutex or giving every test its own process.
+///
+/// The retry is deliberately narrow: only `ETXTBSY`, only for about a second,
+/// and any other spawn failure still panics with the original message. A blanket
+/// "retry the spawn" would hide a binary that genuinely cannot run, which is a
+/// thing these tests exist to catch.
+fn spawn_past_etxtbsy(command: &mut Command) -> std::process::Output {
+    // 50 * 20ms. Long enough for a concurrent copy to finish by orders of
+    // magnitude, short enough that a real failure is not a slow failure.
+    const ATTEMPTS: u32 = 50;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+    for _ in 0..ATTEMPTS {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.raw_os_error() == Some(TEXT_FILE_BUSY) => {
+                std::thread::sleep(BACKOFF);
+            }
+            Err(error) => panic!("the copied binary must run: {error:?}"),
+        }
+    }
+
+    panic!(
+        "the copied binary was still reported busy after {:?}; that is far longer than a \
+         concurrent copy in this suite can hold a write descriptor, so it is a real failure \
+         rather than the race this retry exists for",
+        ATTEMPTS * BACKOFF
+    );
+}
+
+/// `ETXTBSY`. Zero on platforms that do not raise it, which never matches a
+/// real `raw_os_error` and so leaves the retry inert on Windows and macOS.
+#[cfg(target_os = "linux")]
+const TEXT_FILE_BUSY: i32 = 26;
+#[cfg(not(target_os = "linux"))]
+const TEXT_FILE_BUSY: i32 = 0;
+
 /// An installed copy of the binary, in the layout `install.sh` produces.
 struct Installed {
     /// Held so the directory outlives the test.
@@ -113,7 +168,7 @@ impl Installed {
             .arg(&self.data)
             .arg("update")
             .args(arguments);
-        let output = command.output().expect("the copied binary must run");
+        let output = spawn_past_etxtbsy(&mut command);
         Outcome {
             code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),

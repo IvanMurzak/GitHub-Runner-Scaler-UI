@@ -15,6 +15,19 @@ The stop-the-line rule was **not** triggered: the assumption holds, so nothing
 was worked around, and no fallback, redesign or substitute counting strategy
 was written.
 
+> [!IMPORTANT]
+> **Superseded in part, on 2026-09-05.** Everything this spike *measured* still
+> holds: `total_count` on a filtered workflow-runs query is the filtered count.
+> What no longer holds is the **decision built on it** — that demand could be
+> counted in workflow runs and the per-run job listing priced out.
+>
+> A run holds many jobs and each needs its own runner, so the run count
+> under-reported an eight-job matrix as demand `1` and the product served it
+> nearly serially on a host configured for ten concurrent runners.
+> `crates/github/src/demand.rs` now lists each active run's jobs and counts the
+> queued ones. See [`d24-run-status-versus-job-status`](d24-run-status-versus-job-status.md)
+> for the measurement that shaped the replacement.
+
 ## The assumption under test
 
 `c3` landed an in-progress activity count that issues **one request per

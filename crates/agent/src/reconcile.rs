@@ -47,33 +47,55 @@
 //! `tests::nothing_in_this_module_reserves_or_claims_a_job` is a tripwire on the
 //! obvious shape of a reservation being added back.
 //!
-//! # Demand is measured in RUNS, and carries no routing-label filtering
+//! # Demand is measured in JOBS, filtered by this policy's routing labels
 //!
 //! `02-target-architecture.md` writes the formula as *"queued jobs whose
-//! `runs-on` matches this policy's routing labels"*. That is not what the
-//! gateway this module consumes provides, and this module must not try to make
-//! it so.
+//! `runs-on` matches this policy's routing labels"*, and that is now exactly
+//! what this module clamps. It was not always: an earlier owner decision priced
+//! the per-run job listing out and left this module clamping a count of
+//! **runs**, unfiltered. `crates/github/src/demand.rs` records that decision,
+//! why it was reversed, and what the reversal costs in requests.
 //!
-//! A workflow **run** carries no `runs-on` — labels live on **jobs** — and an
-//! owner decision forbids the per-run job listing that would be needed to see
-//! them. So `crates/github/src/demand.rs` counts **queued runs** and applies no
-//! label filtering whatsoever, and this module clamps that number directly. The
-//! owner has accepted both consequences:
+//! What the reversal means here is two changes to one line:
 //!
-//! * an **under-count** — a matrix run of eight jobs reports as one unit of
-//!   demand;
-//! * an **over-count** — a repository whose jobs only ever target
-//!   `ubuntu-latest` or another host's labels still drives its policy toward
-//!   `max_capacity`, and each runner started that way idles until it times out.
+//! * **A run of eight jobs is now eight units of demand, not one.** Under the
+//!   run count a matrix filled one runner per poll while the rest of the matrix
+//!   waited, so a host configured for ten concurrent runners served an
+//!   eight-job matrix nearly serially. That was the defect that forced the
+//!   decision back.
+//! * **A job this host cannot serve is no longer demand.** A repository whose
+//!   jobs target `ubuntu-latest`, or another host's `rm-<host>-…` label, used to
+//!   drive its policy toward `max_capacity` and start runners that idled until
+//!   they timed out. The gateway now returns each queued job's `runs-on`, so
+//!   `b1`'s predicate finally has its input.
 //!
-//! The over-count is not a bug to engineer around here. It travels the same
-//! accepted surplus-runner path described above, and it is bounded by exactly
-//! the two ceilings this module enforces. `b1`'s `RoutingLabels::tally` exists
-//! and is correct, and nothing feeds it today; wiring it in to "complete" the
-//! picture would require the job listing the owner decision removed.
-//! `tests::this_module_owns_no_label_predicate` scans this file's own source and
-//! fails if it starts naming `b1`'s label vocabulary, which is the same tripwire
-//! `c4` carries one layer down.
+//! **The predicate is still `b1`'s and the input is still `c4`'s.** This module
+//! calls [`runner_manager_domain::policy::RoutingLabels`]'s `tally` and
+//! implements no label comparison of its own;
+//! `tests::the_label_predicate_is_b1s_and_this_module_only_applies_it` scans
+//! this file's own source and fails if a second implementation grows here, which
+//! is the same tripwire `c4` carries one layer down.
+//!
+//! # The filtering happens here rather than in the gateway, on purpose
+//!
+//! One target can be watched by more than one policy, each with its own routing
+//! labels, and [`Reconciler`]'s `poll_targets` deliberately polls a target **once**
+//! for all of them. A gateway that filtered would have to be told whose labels to
+//! filter by, which would make the poll per-policy and multiply its request cost
+//! by the number of policies sharing the target — the budget model prices a
+//! target, not a policy. So the gateway returns the jobs and each policy tallies
+//! them against its own labels.
+//!
+//! # What is still approximate
+//!
+//! The surplus-runner path above is narrowed by this change and not closed. A
+//! `runs-on: ${{ matrix.runner }}` cannot be resolved without evaluating the
+//! workflow, so `b1` reports it as unresolvable: never counted as demand, never
+//! silently dropped, and surfaced through
+//! [`LifecycleEvent::DemandObserved::unresolvable`] so that an operator can see
+//! a workflow this host will never serve sitting in the queue. And demand
+//! remains advisory — another host may still take a job this one started a
+//! runner for — which is what the two ceilings bound.
 //!
 //! # What is testable without a network, a filesystem, or a process
 //!
@@ -94,7 +116,7 @@ use runner_manager_domain::capacity::{Allocation, HostAllocator, LimitingFactor}
 use runner_manager_domain::model::{
     AttemptId, Clock, Host, Org, OwnerRepo, PolicyId, RefreshInterval, ScaleTarget, Timestamp,
 };
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{DemandTally, ScalePolicy};
 use runner_manager_github::demand::{DemandGateway, QueuedDemand, demand_requests_per_poll};
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, RateLimitKind, RefreshState,
@@ -1192,7 +1214,23 @@ pub enum LifecycleEvent {
     /// A demand poll answered for one target.
     DemandObserved {
         policy: PolicyId,
+        /// Queued jobs this policy's routing labels match. The number clamped.
         demand: u32,
+        /// Queued jobs whose required labels this policy does not carry.
+        ///
+        /// Never demand. Reported because the difference between this and
+        /// `demand` is the whole value of the label filtering, and an operator
+        /// wondering why a busy repository started no runners is owed it.
+        not_matched: u32,
+        /// Queued jobs whose `runs-on` could not be resolved statically.
+        ///
+        /// `b1` requires these be "reported as unresolvable rather than silently
+        /// counted or silently dropped": counting one would start a runner for a
+        /// job that may not be ours, and dropping it would hide a workflow this
+        /// host can never serve. A count rather than the reasons themselves
+        /// because this type is `Copy`, and `c4` logs the reasons where it
+        /// builds them.
+        unresolvable: u32,
         /// `false` when the count is a floor rather than a total.
         complete: bool,
     },
@@ -1300,10 +1338,22 @@ impl fmt::Display for LifecycleEvent {
             Self::DemandObserved {
                 policy,
                 demand,
+                not_matched,
+                unresolvable,
                 complete,
             } => write!(
                 f,
-                "policy {policy}: {demand} queued runs{}",
+                "policy {policy}: {demand} queued jobs for this host{}{}{}",
+                if *not_matched == 0 {
+                    String::new()
+                } else {
+                    format!(", {not_matched} for other labels")
+                },
+                if *unresolvable == 0 {
+                    String::new()
+                } else {
+                    format!(", {unresolvable} with an unresolvable `runs-on`")
+                },
                 if *complete {
                     ""
                 } else {
@@ -1400,9 +1450,37 @@ impl EventSink for TracingEvents {
             LifecycleEvent::DemandObserved {
                 policy,
                 demand,
+                not_matched,
+                unresolvable,
                 complete,
             } => {
-                tracing::info!(event = name, policy_id = %policy, demand, count = u64::from(complete))
+                tracing::info!(
+                    event = name,
+                    policy_id = %policy,
+                    demand,
+                    not_matched,
+                    unresolvable,
+                    count = u64::from(complete),
+                );
+                // There is deliberately no `warn!` here for the "demand is zero
+                // but jobs were not matched" shape, though it is the one this
+                // change introduced: before demand was filtered, a repository
+                // with work in it always produced some, and now a policy whose
+                // labels do not cover its jobs produces none.
+                //
+                // The reason is that the shape is indistinguishable from a
+                // healthy one. A repository served by a Windows host and a macOS
+                // host has the other host's jobs queued in it constantly, so
+                // each agent would warn on every poll about work that is being
+                // served correctly by the other machine. Telling the two apart
+                // needs to know whether this policy has *ever* matched anything,
+                // which is state across polls that this loop does not keep.
+                //
+                // What an operator gets instead is the `not_matched` count, on
+                // this event and in its `Display`, which `g2` renders. "0 queued
+                // jobs for this host, 5 for other labels" is the diagnosis; a
+                // warning that fired on every healthy minute would be the kind
+                // nobody reads.
             }
             LifecycleEvent::TargetUnreadable { policy, reason } => {
                 tracing::warn!(event = name, policy_id = %policy, reason);
@@ -1898,10 +1976,13 @@ impl Reconciler {
                 }
                 PollOutcome::Ready(demand) => {
                     report.targets_read = report.targets_read.saturating_add(1);
-                    let count = demand_for(&policy.target, demand);
+                    let tally = demand_for(policy, demand);
+                    let count = tally.demand();
                     self.events.emit(LifecycleEvent::DemandObserved {
                         policy: policy.id,
                         demand: count,
+                        not_matched: tally.not_matched,
+                        unresolvable: u32::try_from(tally.unresolvable.len()).unwrap_or(u32::MAX),
                         complete: demand.is_complete(),
                     });
                     self.start_runners(policy, count, &mut report, &mut launched)
@@ -2346,13 +2427,39 @@ impl Reconciler {
 
 /// One policy's demand, from the reading its target answered with.
 ///
-/// A repository target reads its own count; an organization target reads the
-/// aggregate its scope covered. Both are counts of **queued runs**, unfiltered
-/// by any label — see the module documentation.
-fn demand_for(target: &ScaleTarget, reading: &QueuedDemand) -> u32 {
-    match target {
-        ScaleTarget::Repository(repository) => reading.for_repository(repository).unwrap_or(0),
-        ScaleTarget::Organization(_) => reading.total(),
+/// A repository target tallies its own repository's queued jobs; an organization
+/// target tallies every repository its scope covered, because one policy watching
+/// an organization serves any repository in it.
+///
+/// # Why this takes a whole policy rather than a target and a label set
+///
+/// Because both halves have to come from the same policy, and a signature that
+/// took them separately made it possible for them not to. The predecessor took a
+/// `&ScaleTarget` alone and could not filter at all; the obvious repair was to
+/// add a `&RoutingLabels` beside it, and at three call sites — two of them in
+/// tests — nothing would have caught passing one policy's target with another
+/// policy's labels. It compiles, it runs, and it silently serves the wrong
+/// repository's queue.
+///
+/// # A monitor-only policy has no labels, and cannot reach here
+///
+/// [`Reconciler::reconcile`] filters on [`ScalePolicy::owns_runners`] before any
+/// demand request is issued (D19), so the `None` arm is unreachable rather than
+/// merely unlikely. It returns an empty tally instead of unwrapping, because a
+/// panic in the reconciliation loop would take the daemon down over a policy
+/// that was only ever going to start nothing.
+fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand) -> DemandTally {
+    let Some(labels) = policy.routing_labels() else {
+        debug_assert!(
+            false,
+            "a monitor-only policy is skipped before the demand poll (D19)"
+        );
+        return DemandTally::default();
+    };
+
+    match &policy.target {
+        ScaleTarget::Repository(repository) => labels.tally(reading.jobs_for(repository)),
+        ScaleTarget::Organization(_) => labels.tally(reading.jobs()),
     }
 }
 
@@ -2493,6 +2600,8 @@ mod tests {
     }
 
     /// An `active`, enabled autoscale policy on the fixture host.
+    use runner_manager_domain::policy::RunsOn;
+
     fn policy(id: u128, target: &str, max: u16) -> ScalePolicy {
         fixtures::policy()
             .id(PolicyId::from_u128(id))
@@ -2500,6 +2609,23 @@ mod tests {
             .autoscale("home", max)
             .active()
             .build()
+    }
+
+    /// The host label every policy in these tests carries.
+    ///
+    /// `policy` above builds through `fixtures::policy().autoscale("home", …)`,
+    /// which derives `rm-home-win-x64`. A job fixture that did not carry it
+    /// would be filtered out as another host's work, so the two are tied
+    /// together here rather than repeated as a literal at each call site.
+    const HOST_LABEL: &str = "rm-home-win-x64";
+
+    /// `n` queued jobs this host's policies match.
+    ///
+    /// The ordinary demand fixture. Since the reversal of the run-counting
+    /// decision the unit `e1` clamps is a job, so a test wanting demand `n` asks
+    /// for `n` jobs rather than for `n` runs.
+    fn jobs(n: usize) -> Vec<RunsOn> {
+        fixtures::queued_jobs(&[HOST_LABEL], n)
     }
 
     /// `e3`, faked: an attempt table and a launch counter, no process anywhere.
@@ -2671,7 +2797,7 @@ mod tests {
             let fake = Self::default();
             fake.set(PollOutcome::Ready(QueuedDemand::of(
                 repository.clone(),
-                count,
+                jobs(count as usize),
             )));
             fake
         }
@@ -3028,11 +3154,11 @@ mod tests {
         let demand = Arc::new(FakeDemand::default());
         demand.set_for(
             &ScaleTarget::repository("acme/left").unwrap(),
-            PollOutcome::Ready(QueuedDemand::of(repo("acme/left"), 3)),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/left"), jobs(3))),
         );
         demand.set_for(
             &ScaleTarget::repository("acme/right").unwrap(),
-            PollOutcome::Ready(QueuedDemand::of(repo("acme/right"), 3)),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/right"), jobs(3))),
         );
         let mut harness = Harness::build(
             host_with(3),
@@ -3525,7 +3651,7 @@ mod tests {
     /// call it is asked to make.
     #[tokio::test]
     async fn a_monitor_only_policy_under_maximum_demand_starts_nothing_and_polls_nothing() {
-        let gateway = FakeGithub::new().with_queued_runs(repo("acme/app"), 10_000);
+        let gateway = FakeGithub::new().with_queued_jobs(repo("acme/app"), jobs(10_000));
         let gateway = Arc::new(GatewayDemand::new(gateway, CancelToken::new()));
         let launcher = Arc::new(FakeLauncher::new());
         let events = Arc::new(EventLog::new());
@@ -4018,7 +4144,10 @@ mod tests {
         // Recovery: the same job is still queued, and one runner is already
         // serving it. Demand is recomputed from the current queued set rather
         // than accumulated, so the reconnect starts nothing new.
-        demand.set(PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), 2)));
+        demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("acme/app"),
+            jobs(2),
+        )));
         let recovered = harness.reconciler.reconcile(&[policy]).await;
 
         assert!(!recovered.is_offline());
@@ -4046,7 +4175,7 @@ mod tests {
         let mut harness = Harness::simple(8, 0, "acme/app");
         harness.demand.set_for(
             &ScaleTarget::repository("acme/app").unwrap(),
-            PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), 2)),
+            PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), jobs(2))),
         );
         harness.demand.set_for(
             &ScaleTarget::repository("acme/broken").unwrap(),
@@ -4128,7 +4257,10 @@ mod tests {
 
         // Recovery closes the run, so a *later* outage measures from itself
         // rather than from the first one.
-        demand.set(PollOutcome::Ready(QueuedDemand::of(repo("acme/app"), 0)));
+        demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("acme/app"),
+            jobs(0),
+        )));
         let recovered = reconciler.reconcile(std::slice::from_ref(&policy)).await;
         assert!(recovered.offline_state().is_none());
         assert_eq!(reconciler.schedule().offline_for(clock.now()), None);
@@ -4270,7 +4402,11 @@ mod tests {
             .await;
 
         assert_eq!(harness.demand.polls().len(), 1);
-        assert_eq!(report.demand_requests, 1);
+        assert_eq!(
+            report.demand_requests,
+            runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL,
+            "one repository's worth of demand requests, not two policies' worth. Read              from the constant rather than written as a literal so that repricing the              poll cannot silently turn this into an assertion about the wrong thing"
+        );
         assert_eq!(report.started, 4, "and both policies still get their share");
     }
 
@@ -4442,6 +4578,8 @@ mod tests {
             LifecycleEvent::DemandObserved {
                 policy,
                 demand: u32::MAX,
+                not_matched: u32::MAX,
+                unresolvable: u32::MAX,
                 complete: false,
             },
             LifecycleEvent::TargetUnreadable {
@@ -4759,28 +4897,124 @@ mod tests {
         );
     }
 
-    /// The other half of the owner decision this task implements: demand is a
-    /// count of **runs**, and no label filtering happens anywhere on the path.
+    /// This module **applies** `b1`'s label predicate and implements none of it.
     ///
-    /// `b1`'s `RoutingLabels::tally` is correct and nothing feeds it, and this
-    /// module must not be what starts feeding it: doing so would need the
-    /// per-run job listing the owner decision removed. `c4` carries the same
-    /// scan over `crates/github/src/demand.rs`; this is its counterpart in the
-    /// consumer, so that a label predicate cannot be reintroduced one layer up
-    /// instead.
+    /// The counterpart to `c4`'s scan over `crates/github/src/demand.rs`, and it
+    /// checks the opposite thing, because the two modules sit on opposite sides
+    /// of the same seam. `c4` builds a `RunsOn` per queued job and must name no
+    /// `RoutingLabels`; this module holds the policy whose labels decide, so it
+    /// must call `RoutingLabels::tally` and must not re-derive what that call
+    /// answers.
+    ///
+    /// So the scan is in two halves:
+    ///
+    /// * **Present.** `DemandTally` has to appear, because [`demand_for`]
+    ///   returns one. A production half that named it nowhere would mean the
+    ///   filtering had been dropped and every queued job in a watched repository
+    ///   was driving this policy toward `max_capacity` again.
+    /// * **Absent.** The vocabulary of a *second* implementation. `b1` names the
+    ///   three outcomes of matching one job; this module consumes the aggregate
+    ///   and never a single job's verdict, so naming `RunsOnMatch` or
+    ///   `UnresolvableRunsOn` here means a `match` on an outcome that
+    ///   `RoutingLabels::tally` has already decided — which is how two copies of
+    ///   a predicate start.
+    ///
+    /// Like the needles in `nothing_in_this_module_reserves_or_claims_a_job`,
+    /// this is a tripwire on the obvious shape rather than a proof: a hand-rolled
+    /// comparison of raw label strings that never names a `policy` type would
+    /// walk past it. Stated rather than implied, for the same reason it is
+    /// stated there.
     #[test]
-    fn this_module_owns_no_label_predicate() {
+    fn the_label_predicate_is_b1s_and_this_module_only_applies_it() {
         let production = this_file_above_its_tests_without_prose();
-        for owned_by_b1 in ["RoutingLabels", "DemandTally", "RunsOn"] {
+
+        assert!(
+            production.contains("DemandTally"),
+            "the reconciliation loop must tally queued jobs against this policy's routing \
+             labels. A production half that named `DemandTally` nowhere would mean the \
+             label filtering had been removed, and a repository whose jobs target \
+             `ubuntu-latest` would drive its policy toward `max_capacity` again"
+        );
+
+        for second_implementation in ["RunsOnMatch", "UnresolvableRunsOn"] {
             assert!(
-                !production.contains(owned_by_b1),
-                "the reconciliation loop names `{owned_by_b1}`, which belongs to `b1`: the \
-                 demand gateway counts queued *runs* and applies no label filtering, and \
-                 this module clamps that number directly. If the job listing was restored \
-                 by a later owner decision, that decision belongs in this module's \
-                 documentation and in this test before it belongs in the code"
+                !production.contains(second_implementation),
+                "the reconciliation loop names `{second_implementation}`, which is the \
+                 vocabulary of deciding one job's `runs-on` -- and `RoutingLabels::tally` \
+                 has already decided it. This module applies the predicate and does not \
+                 re-implement it; if an owner decision changed that, it belongs in this \
+                 module's documentation and in this test before it belongs in the code"
             );
         }
+    }
+
+    /// The demand this module clamps is the *matched* count, and a job this host
+    /// cannot serve is not demand.
+    ///
+    /// The behaviour the whole reversal was for, asserted end to end through
+    /// `demand_for` rather than through `b1`'s predicate in isolation: a policy
+    /// carrying this host's labels, a reading holding some of its jobs and some
+    /// of somebody else's, and the three counts kept apart.
+    #[test]
+    fn demand_is_the_queued_jobs_this_policy_can_actually_serve() {
+        let policy = policy(1, "acme/app", 10);
+        let reading = QueuedDemand::of(
+            repo("acme/app"),
+            [
+                fixtures::queued_job(&[HOST_LABEL]),
+                fixtures::queued_job(&[HOST_LABEL]),
+                fixtures::queued_job(&["ubuntu-latest"]),
+                fixtures::unresolvable_job(),
+            ],
+        );
+
+        let tally = demand_for(&policy, &reading);
+
+        assert_eq!(
+            tally.demand(),
+            2,
+            "only the jobs whose required labels this policy carries are demand"
+        );
+        assert_eq!(
+            tally.not_matched, 1,
+            "a `ubuntu-latest` job is somebody else's work; counting it would start a \
+             runner that idles until it times out"
+        );
+        assert_eq!(
+            tally.unresolvable.len(),
+            1,
+            "an unresolvable `runs-on` is never demand and never discarded"
+        );
+    }
+
+    /// A repository target reads its own repository; an organization target
+    /// reads the whole scope.
+    #[test]
+    fn an_organization_policy_tallies_every_repository_its_scope_covers() {
+        let mut per_repository = BTreeMap::new();
+        per_repository.insert(repo("acme/left"), fixtures::queued_jobs(&[HOST_LABEL], 3));
+        per_repository.insert(repo("acme/right"), fixtures::queued_jobs(&[HOST_LABEL], 4));
+        let reading = QueuedDemand::new(per_repository);
+
+        let repository_policy = policy(1, "acme/left", 10);
+        assert_eq!(
+            demand_for(&repository_policy, &reading).demand(),
+            3,
+            "a repository target reads its own repository's queue and not the aggregate"
+        );
+
+        let org_policy = fixtures::policy()
+            .id(PolicyId::from_u128(2))
+            .organization("acme")
+            .autoscale("home", 10)
+            .active()
+            .build();
+        assert_eq!(
+            demand_for(&org_policy, &reading).demand(),
+            7,
+            "an organization policy serves any repository in its scope, so its demand is \
+             the whole aggregate's"
+        );
     }
 
     #[test]

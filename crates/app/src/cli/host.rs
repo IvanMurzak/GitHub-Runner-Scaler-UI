@@ -22,16 +22,27 @@
 //! * [`BudgetProjection::admit`] — the call `f2`'s `repo add` makes — takes its
 //!   candidate [`TargetCost`] from the caller, so a caller that builds one
 //!   through `c4`'s seam gets an admission computed from the **measured** cost
-//!   of one demand request per repository per poll.
+//!   of [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`] requests per repository per
+//!   poll.
 //! * [`BudgetProjection::max_repository_targets`] builds `TargetCost::repository()`
 //!   internally. That constructor cannot see the seam, so it still prices demand
-//!   at `c3`'s pre-decision estimate of two.
+//!   at `c3`'s estimate of two.
 //!
-//! At the 60-second default the first would take **13** repository targets and
-//! the second prints **10**. `crates/github`'s own
-//! `the_printed_target_ceiling_still_projects_the_pre_decision_estimate` records
-//! the gap and states that it is not fixable from `c4`'s file: both remedies are
-//! edits to `crates/github/src/rest.rs`, which `c3` owns and this task does not.
+//! At the 60-second default the first takes **6** repository targets and the
+//! second prints **10**. `crates/github`'s own
+//! `the_printed_target_ceiling_still_projects_c3s_estimate` records the gap and
+//! states that it is not fixable from `c4`'s file: both remedies are edits to
+//! `crates/github/src/rest.rs`, which `c3` owns and this task does not.
+//!
+//! **The direction of that disagreement inverted when `c4` started counting
+//! jobs.** While demand was one request per repository the measured cost was
+//! *below* the estimate, so `c3`'s printed ceiling was conservative and the only
+//! harm was a contradiction in the output. Counting jobs made the measured cost
+//! higher than the estimate, so `c3`'s figure is now the optimistic one. What
+//! keeps that from being a budget overrun is `BUDGET_SHARE_DIVISOR` — the
+//! projection is compared against half of GitHub's hourly ceiling, and the gap
+//! is spent out of the half deliberately left unplanned — and the fact that this
+//! file never prints `c3`'s number.
 //!
 //! An operator reading `host show` would see both numbers at once. So this file
 //! prints **neither of c3's two answers separately**: [`measured`] is the single
@@ -45,15 +56,23 @@
 //!
 //! # The projection is a best case, and says so
 //!
-//! Both per-repository classes are priced at **one** request and both can spend
-//! up to [`FALLBACK_COST_MULTIPLE`] when GitHub omits `total_count` and the
-//! count has to walk pages. A ceiling presented as exact would therefore be
-//! optimistic by a factor of four in the worst case, and an operator planning a
-//! host against it deserves to know that before they are refused an eleventh
-//! target. `c3` absorbs the gap with `BUDGET_SHARE_DIVISOR` — the projection is
-//! compared against half the ceiling precisely so the half nobody models has
-//! somewhere to go — and this file states the assumption where the number is
-//! read.
+//! Neither per-repository class is priced at its worst case, and each overruns
+//! for its own reason:
+//!
+//! * The **activity** count is priced at one request and walks pages when
+//!   GitHub omits `total_count`, up to `MAX_ACTIVITY_FALLBACK_PAGES`.
+//! * The **demand** poll is priced at its steady state of
+//!   [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`] — the two run listings plus a
+//!   job listing for each of the couple of runs a repository has under way — and
+//!   costs more while more runs are active, up to `c4`'s hard per-poll caps.
+//!
+//! [`FALLBACK_COST_MULTIPLE`] is the larger of the two overruns, so a ceiling
+//! presented as exact would be optimistic by that factor in the worst case, and
+//! an operator planning a host against it deserves to know before they are
+//! refused a target. `c3` absorbs the gap with `BUDGET_SHARE_DIVISOR` — the
+//! projection is compared against half the ceiling precisely so the half nobody
+//! models has somewhere to go — and this file states the assumption where the
+//! number is read.
 
 use std::io::{self, Write};
 use std::num::NonZeroU16;
@@ -78,12 +97,20 @@ use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, write_
 /// How far one per-repository request class can exceed the price this
 /// projection puts on it.
 ///
-/// `c3` prices the activity count at its best case of one request and states
-/// that a count taking the no-`total_count` fallback costs up to
-/// `MAX_ACTIVITY_FALLBACK_PAGES`; `c4` says exactly the same of the demand poll
-/// and `MAX_DEMAND_FALLBACK_PAGES`. Both bounds are four, and
+/// The **larger** of the two classes' overruns, because the caveat is one
+/// sentence and has to be true of both:
+///
+/// * `c3` prices the activity count at one request and its fallback walk may
+///   spend `MAX_ACTIVITY_FALLBACK_PAGES`, a multiple of four.
+/// * `c4` prices the demand poll at [`DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL`]
+///   and caps it at `max_demand_requests_per_repository_per_poll`, a smaller
+///   multiple — the job listing costs more in absolute requests than the page
+///   walk but is priced closer to what it really spends.
+///
 /// `the_stated_fallback_multiple_is_the_one_the_gateways_can_spend` is what
-/// keeps this constant equal to them rather than merely near them.
+/// keeps this constant at or above both rather than merely near them, and what
+/// catches it drifting *above* what either can actually spend — a caveat that
+/// overstates the risk is its own kind of wrong.
 pub const FALLBACK_COST_MULTIPLE: u32 = 4;
 
 /// `cost` with `c4`'s **measured** demand figure substituted for `c3`'s
@@ -610,7 +637,7 @@ mod tests {
     use super::*;
 
     use runner_manager_domain::model::{Org, OwnerRepo};
-    use runner_manager_github::demand::{self, MAX_DEMAND_FALLBACK_PAGES};
+    use runner_manager_github::demand::{self, max_demand_requests_per_repository_per_poll};
     use runner_manager_github::rest::{
         ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, ActivityScope, MAX_ACTIVITY_FALLBACK_PAGES,
     };
@@ -700,19 +727,28 @@ mod tests {
     ///
     /// `c3`'s [`BudgetProjection::max_repository_targets`] builds
     /// `TargetCost::repository()` internally and so cannot see `c4`'s seam. It
-    /// therefore still prices demand at the pre-decision estimate of two
-    /// requests per repository per refresh, and prints a ceiling that
+    /// therefore still prices demand at its own estimate of two requests per
+    /// repository per refresh, and prints a ceiling that
     /// `BudgetProjection::admit` does not honour.
     ///
     /// This file avoids the contradiction by never calling that function. The
-    /// remedy is in `crates/github/src/rest.rs`, which `c3` owns: either change
-    /// `DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH` to one, or give
-    /// `max_repository_targets` a `TargetCost` argument. When either lands,
+    /// remedy is in `crates/github/src/rest.rs`, which `c3` owns: either bring
+    /// `DEMAND_REQUESTS_PER_REPOSITORY_PER_REFRESH` up to what `c4` measures, or
+    /// give `max_repository_targets` a `TargetCost` argument. When either lands,
     /// this test fails — and at that point it, and the note in the module
-    /// documentation above, should go, and [`max_repository_targets`] can
-    /// become a call into `c3`'s.
+    /// documentation above, should go, and [`max_repository_targets`] can become
+    /// a call into `c3`'s.
+    ///
+    /// # The inequality reversed, and that is the point of asserting it
+    ///
+    /// While `c4` counted runs the measured cost was *below* `c3`'s estimate, so
+    /// the printed ceiling was conservative. Counting jobs put the measured cost
+    /// above the estimate, so `c3`'s printed ceiling now overstates what a host
+    /// can carry. The assertion below states the current direction rather than a
+    /// desired one, so that the next change to either number has to come here
+    /// and say which way it went.
     #[test]
-    fn c3s_ceiling_still_prices_demand_at_the_pre_decision_estimate() {
+    fn c3s_ceiling_still_prices_demand_at_its_own_estimate() {
         let interval = RefreshInterval::default();
 
         assert_eq!(
@@ -722,52 +758,62 @@ mod tests {
         );
         assert_eq!(
             measured(TargetCost::repository()).requests_per_hour(interval),
-            180,
-            "the measured cost: 1 inventory + 1 activity + 1 demand, 60 times an hour"
+            360,
+            "the measured cost: 1 inventory + 1 activity + 4 demand, 60 times an hour"
         );
 
         assert_eq!(
             BudgetProjection::max_repository_targets(interval),
             10,
-            "c3's printed ceiling, computed from the estimate"
+            "c3's printed ceiling, computed from its estimate"
         );
         assert_eq!(
             max_repository_targets(interval),
-            13,
+            6,
             "this CLI's ceiling, computed from the cost `c4` actually issues"
         );
         assert!(
-            BudgetProjection::max_repository_targets(interval) < max_repository_targets(interval),
-            "the gap must stay in the conservative direction. If it ever inverts, c3's \
-             figure would be admitting targets the budget cannot pay for, and the direction \
-             of the fix changes."
+            BudgetProjection::max_repository_targets(interval) > max_repository_targets(interval),
+            "c3's figure is the optimistic one now that demand is counted in jobs. \
+             `BUDGET_SHARE_DIVISOR` is what absorbs the difference; this file printing \
+             only its own number is what keeps an operator from seeing both."
         );
     }
 
     // -- the best-case caveat ----------------------------------------------
 
-    /// [`FALLBACK_COST_MULTIPLE`] is a claim about `c3` and `c4`'s page bounds,
-    /// so it is asserted against them rather than merely written down.
+    /// [`FALLBACK_COST_MULTIPLE`] is a claim about what `c3` and `c4` can
+    /// actually spend, so it is asserted against them rather than merely written
+    /// down.
+    ///
+    /// Both directions are checked. Too *low* and the caveat understates a real
+    /// overrun, which is the failure the constant exists to prevent. Too *high*
+    /// and it warns an operator away from a configuration that would have fitted
+    /// — a caveat nobody can trigger is one they learn to discount, so it is
+    /// pinned at the larger of the two multiples and not merely above both.
     #[test]
     fn the_stated_fallback_multiple_is_the_one_the_gateways_can_spend() {
         assert_eq!(
             ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH, 1,
             "the projection prices the activity count at one request"
         );
+        let activity_multiple = u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap()
+            / ACTIVITY_REQUESTS_PER_REPOSITORY_PER_REFRESH;
+
         assert_eq!(
-            u32::try_from(MAX_ACTIVITY_FALLBACK_PAGES).unwrap(),
-            FALLBACK_COST_MULTIPLE,
-            "and c3's fallback walk may spend this many, which is the multiple the caveat \
-             states"
+            DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL, 4,
+            "the projection prices the demand poll at its steady state: two run listings \
+             plus a job listing for each of the couple of runs a repository has under way"
         );
+        let demand_multiple =
+            max_demand_requests_per_repository_per_poll() / DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
+
         assert_eq!(
-            DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL, 1,
-            "the projection prices the demand poll at one request"
-        );
-        assert_eq!(
-            u32::try_from(MAX_DEMAND_FALLBACK_PAGES).unwrap(),
             FALLBACK_COST_MULTIPLE,
-            "and c4's fallback walk may spend this many"
+            activity_multiple.max(demand_multiple),
+            "the caveat states one multiple for both classes, so it must be the larger of \
+             the two: activity can spend {activity_multiple}x its price and demand \
+             {demand_multiple}x its own"
         );
     }
 
@@ -820,8 +866,8 @@ mod tests {
                 repository("o/three"),
             ],
         );
-        assert_eq!(one.requests_per_hour(), 180);
-        assert_eq!(three.requests_per_hour(), 540);
+        assert_eq!(one.requests_per_hour(), 360);
+        assert_eq!(three.requests_per_hour(), 1_080);
         assert!(
             budget_text(&three).contains("policies priced           3"),
             "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
@@ -853,9 +899,9 @@ mod tests {
     /// `04-subsystem-contracts.md` states both halves.
     ///
     /// The spend is an exact doubling; the ceiling is *not* exactly a halving,
-    /// because it is an integer division and 2500/360 is 6 rather than 6.5.
-    /// Asserting a clean halving would have been asserting arithmetic this
-    /// model does not do.
+    /// because it is an integer division and 2500/720 is 3 rather than 3.5.
+    /// Asserting a clean halving would have been asserting arithmetic this model
+    /// does not do.
     #[test]
     fn halving_the_interval_doubles_the_spend_and_lowers_the_ceiling() {
         let default = RefreshInterval::default();
@@ -872,8 +918,8 @@ mod tests {
             max_repository_targets(floor),
             max_repository_targets(default)
         );
-        assert_eq!(max_repository_targets(floor), 6);
-        assert_eq!(max_repository_targets(default), 13);
+        assert_eq!(max_repository_targets(floor), 3);
+        assert_eq!(max_repository_targets(default), 6);
     }
 
     #[test]

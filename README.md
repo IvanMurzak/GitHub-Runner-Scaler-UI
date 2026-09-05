@@ -353,7 +353,7 @@ Before signing in, review the GitHub App permissions that every installation rec
 | Permission | Level | Used for |
 |---|---|---|
 | Repository → Administration | **Read and write** | Registering a just-in-time runner for a repository. |
-| Repository → Actions | Read | Detecting queued and in-progress workflow runs. |
+| Repository → Actions | Read | Detecting queued jobs and the runs that hold them. |
 | Repository → Metadata | Read | Accessing the repository identity required by GitHub. |
 | Organization → Self-hosted runners | Read and write | Registering runners at organization scope. |
 

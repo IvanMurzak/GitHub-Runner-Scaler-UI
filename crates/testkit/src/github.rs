@@ -29,12 +29,13 @@
 //!   `rel="next"` that is not first, a next-page URL containing a comma, the
 //!   `MAX_PAGES` ceiling — is proven against real HTTP in
 //!   `crates/github/src/rest.rs`, which is the only place it can be proven.
-//! * **Demand.** [`FakeGithub::with_queued_runs`] sets a repository's queued
-//!   workflow-run count — the number `e1` clamps. It is a separate knob from the
-//!   in-progress count for the same reason those two are separate aggregates:
-//!   `status=queued` is work waiting for a runner that does not exist, and
-//!   `status=in_progress` is work that already has one. A consumer that polled
-//!   the wrong one is caught by [`FakeCall`] rather than by a wrong number.
+//! * **Demand.** [`FakeGithub::with_queued_jobs`] sets a repository's queued
+//!   jobs — the set `e1` tallies against a policy's routing labels. It is a
+//!   separate knob from the in-progress count for the same reason those two are
+//!   separate aggregates: a queued job is work waiting for a runner that does
+//!   not exist, and `status=in_progress` is work that already has one. A
+//!   consumer that polled the wrong one is caught by [`FakeCall`] rather than by
+//!   a wrong number.
 //!
 //!   **The count is of runs, not of jobs.** That under-count is an owner
 //!   decision, documented at length in `runner_manager_github::demand`, and this
@@ -42,7 +43,7 @@
 //!   `runs-on` fixtures are `b1`'s — [`crate::fixtures::queued_job`] and its
 //!   neighbours — because after the decision no endpoint here returns jobs.
 //!
-//!   [`FakeGithub::with_truncated_queued_runs`] and
+//!   [`FakeGithub::with_truncated_queued_jobs`] and
 //!   [`FakeGithub::with_unavailable_demand`] produce the two ways a count can be
 //!   short, which a consumer rendering "unknown" rather than "idle" needs.
 //! * **Just-in-time registration.** [`FakeGithub::with_jit_config`] sets what
@@ -74,7 +75,10 @@ use std::{
     time::Duration,
 };
 
-use runner_manager_domain::model::{Clock, OwnerRepo, ScaleTarget, TargetScope, Timestamp};
+use runner_manager_domain::{
+    model::{Clock, OwnerRepo, ScaleTarget, TargetScope, Timestamp},
+    policy::RunsOn,
+};
 use runner_manager_github::{
     GithubError, HeaderMap,
     demand::{DemandGateway, QueuedDemand},
@@ -326,17 +330,25 @@ struct FakeState {
     /// Repositories that cannot be counted at all, and the reason each gives.
     unavailable_activity: BTreeMap<OwnerRepo, String>,
     downloads: Vec<RunnerDownload>,
-    /// Queued workflow **runs** per repository — the demand signal.
+    /// Queued **jobs** per repository, each with the `runs-on` it requires —
+    /// the demand signal.
     ///
     /// Deliberately a separate map from `activity`, and not because the numbers
     /// might differ by accident: they answer different questions. `activity` is
     /// `status=in_progress`, which is work that already has a runner; this is
-    /// `status=queued`, which is work waiting for one that does not exist. A
-    /// fixture that could only set them together could not catch a consumer
-    /// that read the wrong one.
-    queued: BTreeMap<OwnerRepo, u32>,
-    /// Repositories whose queued count is a **floor**, as the bounded fallback
-    /// walk leaves them.
+    /// the set of jobs waiting for one that does not exist. A fixture that could
+    /// only set them together could not catch a consumer that read the wrong
+    /// one.
+    ///
+    /// The unit is a **job** rather than a run, which is what the real gateway
+    /// counts now that the owner decision recorded in
+    /// `runner_manager_github::demand` has been reversed. Each entry carries its
+    /// labels so that a consumer applying `RoutingLabels::tally` can be tested
+    /// against a fixture that really does distinguish this host's jobs from
+    /// another host's.
+    queued: BTreeMap<OwnerRepo, Vec<RunsOn>>,
+    /// Repositories whose queued count is a **floor**, as a run cap or a job
+    /// page budget leaves them.
     truncated_queued: BTreeSet<OwnerRepo>,
     /// Repositories that cannot be polled at all, and the reason each gives.
     unavailable_queued: BTreeMap<OwnerRepo, String>,
@@ -503,45 +515,56 @@ impl FakeGithub {
         self
     }
 
-    /// This repository's queued workflow-run count — its demand signal.
+    /// This repository's queued jobs — its demand signal.
     ///
-    /// # This is a count of runs, not of jobs
+    /// # This is a set of jobs, not a count of runs
     ///
-    /// The real gateway reads `total_count` from `?status=queued`, which counts
-    /// **workflow runs**, and a run can hold many jobs each needing its own
-    /// runner. That under-count is an owner decision and accepted product
-    /// behaviour (`runner_manager_github::demand`), so a fixture that let a test
-    /// set "queued jobs" would be modelling a number the product never sees.
+    /// The real gateway lists each active run's jobs and keeps the ones still
+    /// queued, so the unit `e1` clamps is a job. A run holding eight matrix jobs
+    /// is eight entries here, which is the whole point: under the previous owner
+    /// decision it was `1`, and the resulting serial-matrix defect is what
+    /// `runner_manager_github::demand` now documents at length.
     ///
-    /// Job-level fixtures do exist and are `b1`'s:
+    /// Build the entries with `b1`'s fixtures —
     /// [`crate::fixtures::queued_job`], [`crate::fixtures::queued_jobs`] and
-    /// [`crate::fixtures::unresolvable_job`] build the `RunsOn` values
-    /// `RoutingLabels::tally` matches. They belong to the domain's label
-    /// predicate rather than to this gateway, because after the owner decision
-    /// there is no endpoint here that would return them.
+    /// [`crate::fixtures::unresolvable_job`] — because the labels are what
+    /// `RoutingLabels::tally` matches, and a fixture whose jobs all carried this
+    /// host's labels could not catch a consumer that forgot to filter.
     ///
     /// # Panics
     /// If a previous holder panicked while the state lock was held.
     #[must_use]
-    pub fn with_queued_runs(self, repository: OwnerRepo, count: u32) -> Self {
-        self.lock().queued.insert(repository, count);
+    pub fn with_queued_jobs(
+        self,
+        repository: OwnerRepo,
+        jobs: impl IntoIterator<Item = RunsOn>,
+    ) -> Self {
+        self.lock()
+            .queued
+            .insert(repository, jobs.into_iter().collect());
         self
     }
 
-    /// This repository's queued count as a **floor** rather than a total.
+    /// This repository's queued jobs as a **floor** rather than a total.
     ///
-    /// What the real gateway produces when GitHub sends no `total_count` and the
-    /// fallback walk stops at its page bound. Pair with
-    /// [`Self::with_unavailable_demand`] and keep the two distinct: a floor is a
-    /// lower bound that is safe to scale **up** from, an unavailable repository
-    /// is unknown and is not.
+    /// What the real gateway produces when a repository has more active runs
+    /// than its per-poll caps will resolve, or when one run's job listing walks
+    /// to its page budget. Pair with [`Self::with_unavailable_demand`] and keep
+    /// the two distinct: a floor is a lower bound that is safe to scale **up**
+    /// from, an unavailable repository is unknown and is not.
     ///
     /// # Panics
     /// If a previous holder panicked while the state lock was held.
     #[must_use]
-    pub fn with_truncated_queued_runs(self, repository: OwnerRepo, floor: u32) -> Self {
+    pub fn with_truncated_queued_jobs(
+        self,
+        repository: OwnerRepo,
+        floor: impl IntoIterator<Item = RunsOn>,
+    ) -> Self {
         let mut state = self.lock();
-        state.queued.insert(repository.clone(), floor);
+        state
+            .queued
+            .insert(repository.clone(), floor.into_iter().collect());
         state.truncated_queued.insert(repository);
         drop(state);
         self
@@ -1034,17 +1057,17 @@ impl DemandGateway for FakeGithub {
             }));
         }
 
-        let counts = scope
+        let jobs = scope
             .repositories()
             .iter()
             .filter(|repository| !state.unavailable_queued.contains_key(*repository))
             .map(|repository| {
-                let count = state.queued.get(repository).copied().unwrap_or(0);
-                (repository.clone(), count)
+                let jobs = state.queued.get(repository).cloned().unwrap_or_default();
+                (repository.clone(), jobs)
             })
             .collect();
 
-        let mut demand = QueuedDemand::new(counts);
+        let mut demand = QueuedDemand::new(jobs);
         for repository in scope.repositories() {
             if let Some(reason) = state.unavailable_queued.get(repository) {
                 demand = demand.with_unavailable(repository.clone(), reason.clone());
@@ -1428,8 +1451,14 @@ mod tests {
         use runner_manager_github::jit::JitRunnerRequest;
 
         let gateway = FakeGithub::new()
-            .with_queued_runs(repo(), 5)
-            .with_queued_runs(other_repo(), 2);
+            .with_queued_jobs(
+                repo(),
+                crate::fixtures::queued_jobs(&["rm-home-win-x64"], 5),
+            )
+            .with_queued_jobs(
+                other_repo(),
+                crate::fixtures::queued_jobs(&["rm-home-win-x64"], 2),
+            );
         let scope = org_scope([repo(), other_repo()]);
         let cancel = CancelToken::new();
 
@@ -1504,7 +1533,10 @@ mod tests {
     #[tokio::test]
     async fn queued_demand_and_in_progress_activity_are_different_numbers() {
         let gateway = FakeGithub::new()
-            .with_queued_runs(repo(), 4)
+            .with_queued_jobs(
+                repo(),
+                crate::fixtures::queued_jobs(&["rm-home-win-x64"], 4),
+            )
             .with_in_progress(repo(), 11);
         let scope = ActivityScope::repository(repo());
         let cancel = CancelToken::new();
@@ -1547,7 +1579,10 @@ mod tests {
     #[tokio::test]
     async fn a_demand_reading_can_be_a_floor_or_can_be_missing_a_repository() {
         let gateway = FakeGithub::new()
-            .with_truncated_queued_runs(repo(), 400)
+            .with_truncated_queued_jobs(
+                repo(),
+                crate::fixtures::queued_jobs(&["rm-home-win-x64"], 400),
+            )
             .with_unavailable_demand(other_repo(), "repository archived");
 
         let demand = gateway
@@ -1688,7 +1723,10 @@ mod tests {
     /// would be unwritable.
     #[tokio::test]
     async fn a_registration_can_be_refused_while_demand_still_answers() {
-        let gateway = FakeGithub::new().with_queued_runs(repo(), 3);
+        let gateway = FakeGithub::new().with_queued_jobs(
+            repo(),
+            crate::fixtures::queued_jobs(&["rm-home-win-x64"], 3),
+        );
         gateway.fail_next_registration(FakeFailure::Forbidden {
             message: Some("Resource not accessible by integration".into()),
         });
