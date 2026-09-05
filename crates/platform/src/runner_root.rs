@@ -305,6 +305,24 @@ pub enum RunnerRootError {
     NotWritable { path: PathBuf, remediation: String },
 
     #[error(
+        "the runner root {} cannot be used: this process runs as the superuser, so file \
+         permissions are not what refused {}, and that directory is on a volume macOS \
+         withholds through its privacy controls. Grant Full Disk Access to the program \
+         that runs the service -- System Settings > Privacy & Security > Full Disk \
+         Access -- and start the service again, or configure a directory on the startup \
+         disk with `{remediation}`.",
+        requested.display(),
+        refused.display()
+    )]
+    DeniedByPrivacyPolicy {
+        /// The root the operator asked for, which may not exist yet.
+        requested: PathBuf,
+        /// The deepest existing directory, which is the one that refused.
+        refused: PathBuf,
+        remediation: String,
+    },
+
+    #[error(
         "{} does not exist yet and this account may not create it: its parent {} \
          refuses. Grant this account write access to that directory, or configure a \
          directory it owns with `{remediation}`.",
@@ -453,6 +471,41 @@ pub trait FilesystemProbe {
     /// # Errors
     /// Whatever the platform reported, other than a plain refusal.
     fn is_writable(&self, directory: &Path) -> io::Result<bool>;
+
+    /// Whether this process runs with an identity that file permissions cannot
+    /// refuse.
+    ///
+    /// Asked only to classify a refusal that has already happened, and it is on
+    /// this trait rather than beside it because it is the same kind of question
+    /// as the other two -- something only the operating system can answer, and
+    /// something a test may not arrange for itself: the suite cannot become
+    /// `root` to prove what `root` is told. The default is the real answer, so
+    /// every existing implementation keeps working unchanged.
+    fn runs_as_superuser(&self) -> bool {
+        sys::runs_as_superuser()
+    }
+
+    /// Whether `directory` is on a volume the platform's privacy layer gates.
+    ///
+    /// Here for the same reason as [`FilesystemProbe::runs_as_superuser`]: the
+    /// suite cannot mount an external disk to ask. The default is the real
+    /// answer.
+    fn is_on_privacy_gated_volume(&self, directory: &Path) -> bool {
+        sys::is_on_privacy_gated_volume(directory)
+    }
+
+    /// Whether `directory` is on a filesystem mounted read-only.
+    ///
+    /// Asked because [`FilesystemProbe::is_writable`] cannot answer it: it
+    /// collapses `EACCES`, `EPERM` and `EROFS` into one `false`, so by the time
+    /// a refusal is classified the difference between "this account may not"
+    /// and "nobody may, the volume is read-only" is gone. A read-only mount
+    /// refuses a superuser for an entirely ordinary reason, and a read-only
+    /// disk image mounts under `/Volumes` like any other -- so without this the
+    /// privacy branch below would blame consent for `EROFS`.
+    fn is_read_only(&self, directory: &Path) -> bool {
+        sys::is_read_only(directory)
+    }
 }
 
 /// The real operating system.
@@ -471,6 +524,65 @@ impl FilesystemProbe for HostFilesystem {
 
 /// The default probe, borrowed by [`RootPreflight::new`].
 static HOST_FILESYSTEM: HostFilesystem = HostFilesystem;
+
+impl RunnerRootError {
+    /// Which refusal this is, as a closed-vocabulary token.
+    ///
+    /// The agent's log sink redacts by field name and then by value shape
+    /// (`crate::logging`), and a `RunnerRootError`'s `Display` is mostly
+    /// filesystem paths -- so the sentence an operator needs cannot travel on a
+    /// daemon log line, and the one that tried arrived as `[redacted]`. This is
+    /// the part that *can* travel: a fixed identifier, on an allow-listed field,
+    /// naming which refusal happened. It tells an operator staring at
+    /// `runner_start_failed reason=other` which of a dozen causes they have,
+    /// which is the difference between a diagnosis and a guess.
+    ///
+    /// Every value here must stay a short `snake_case` token, for the reason the
+    /// vocabulary is closed at all: `crate::logging::redact` scrubs anything
+    /// that looks like a path or an opaque run, and a token that acquired a
+    /// slash would be replaced on its way out.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::SystemDirectoryUnavailable { .. } => "system_directory_unavailable",
+            Self::SystemDirectoryUnusable { .. } => "system_directory_unusable",
+            Self::ApplicationRuntimeDirectoryUnusable { .. } => "runtime_directory_unusable",
+            Self::NonUnicode { .. } => "non_unicode",
+            Self::ForeignPlatform { .. } => "foreign_platform",
+            Self::Inspect { .. } => "not_inspectable",
+            Self::ExistingFile { .. } => "existing_file",
+            Self::Symlinked { .. } => "symlinked",
+            Self::MissingParents { .. } => "missing_parents",
+            Self::ParentIsNotADirectory { .. } => "parent_not_a_directory",
+            Self::NotWritable { .. } => "not_writable",
+            Self::DeniedByPrivacyPolicy { .. } => "denied_by_privacy_policy",
+            Self::ParentNotWritable { .. } => "parent_not_writable",
+            Self::RemoteFilesystem { .. } => "remote_filesystem",
+            Self::UnprovableFilesystem { .. } => "unprovable_filesystem",
+            Self::ResolvesToFilesystemRoot { .. } => "resolves_to_filesystem_root",
+            Self::Overlaps { .. } => "overlaps_application_data",
+            Self::Escapes { .. } => "escapes_root",
+            Self::DerivedName { .. } => "underivable_name",
+        }
+    }
+}
+
+/// Whether `path` sits on a volume macOS withholds from a background service.
+///
+/// The question a *configuration* command asks, and deliberately not one
+/// [`RootPreflight`] asks: a second volume is a perfectly good runner root, and
+/// for the account running the command it usually works on the spot. It is the
+/// **service** that may not be able to reach it -- macOS gates these volumes
+/// behind privacy consent that a `launchd` daemon cannot prompt for -- so this
+/// exists to warn the operator at the moment they configure such a path, rather
+/// than leaving the daemon to fail silently once per poll afterwards.
+///
+/// False on every other platform, and false when the filesystem cannot answer:
+/// this drives a warning, and a warning that fires on a failed syscall is noise.
+#[must_use]
+pub fn is_on_privacy_gated_volume(path: &Path) -> bool {
+    sys::is_on_privacy_gated_volume(path)
+}
 
 // ---------------------------------------------------------------------------
 // The platform default
@@ -1043,6 +1155,35 @@ impl<'a> RootPreflight<'a> {
                 source,
             })?;
         if !writable {
+            // A refusal that reached a superuser is not a permission problem,
+            // because there is no permission a superuser lacks. On macOS, and on
+            // a volume the privacy layer gates, the remaining explanation is
+            // that layer: it denies a LaunchDaemon an external or removable
+            // volume until the program is granted Full Disk Access, and a daemon
+            // cannot raise the prompt that would say so, so it fails silently
+            // and forever. Reported apart because the remediation is a different
+            // one entirely: `NotWritable` sends the operator to `chmod`, which
+            // cannot fix this.
+            //
+            // All three conditions, and the volume one matters most: a superuser
+            // refused by a read-only mount, a mounted disk image, or a
+            // SIP-protected directory on the startup disk is refused for an
+            // ordinary reason, and blaming the privacy layer would send the
+            // operator to grant an access that changes nothing.
+            if cfg!(target_os = "macos")
+                && self.probe.runs_as_superuser()
+                && self.probe.is_on_privacy_gated_volume(&projection.anchor)
+                && !self.probe.is_read_only(&projection.anchor)
+            {
+                return Err(RunnerRootError::DeniedByPrivacyPolicy {
+                    // Both paths, because they differ when the leaf does not
+                    // exist yet and it is the parent that refused -- the
+                    // distinction the two variants below exist to keep.
+                    requested: candidate.to_path_buf(),
+                    refused: projection.anchor_as_written.clone(),
+                    remediation: owner.remediation(),
+                });
+            }
             // `05-user-workflows.md` requires an unwritable parent to "show
             // `host set-runtime-root` or `repo set-workspace` remediation",
             // which is what the owner was carried here for.
@@ -1277,6 +1418,26 @@ mod sys {
         })
     }
 
+    /// Always false: Windows has no privacy layer that withholds a local volume
+    /// from a service, so there is nothing for a configuration command to warn
+    /// about.
+    pub(super) const fn is_on_privacy_gated_volume(_path: &Path) -> bool {
+        false
+    }
+
+    /// Never consulted: the only caller gates on macOS first, and Windows has
+    /// no privacy layer that can refuse an administrator a local volume. It
+    /// exists so the trait's default method compiles on every target.
+    pub(super) const fn runs_as_superuser() -> bool {
+        false
+    }
+
+    /// As [`runs_as_superuser`]: present so the trait's default method
+    /// compiles, and reached only through a branch Windows never takes.
+    pub(super) const fn is_read_only(_path: &Path) -> bool {
+        false
+    }
+
     /// Whether this account may create entries in `directory`.
     ///
     /// Opening a *handle* to the directory for `FILE_ADD_SUBDIRECTORY` runs the
@@ -1342,6 +1503,87 @@ mod sys {
         CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::other("a path containing a NUL cannot be given to the operating system")
         })
+    }
+
+    /// Whether `path` sits on a volume the privacy layer gates.
+    ///
+    /// The test is the **mount point**, not the path as written, so a symlink or
+    /// a directory deep inside the volume answers the same as its root.
+    ///
+    /// `/Volumes/` and nothing else, because that is exactly where macOS mounts
+    /// the volumes it gates: external and removable disks, disk images, and
+    /// network shares. The startup disk is deliberately not one path but
+    /// several -- the read-only system volume is at `/`, everything an operator
+    /// actually writes is on the Data volume mounted at `/System/Volumes/Data`,
+    /// and `/Users`, `/tmp` and `/var` all resolve onto it. Asking "is the mount
+    /// point `/`?" therefore answers *yes, gated* for every ordinary home
+    /// directory on the machine, which would fire this warning on almost every
+    /// root anyone configures.
+    #[cfg(target_os = "macos")]
+    pub(super) fn is_on_privacy_gated_volume(path: &Path) -> bool {
+        let Ok(path) = c_path(path) else {
+            return false;
+        };
+        let mut buffer: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is a NUL-terminated C string that outlives the call,
+        // and `buffer` is a live, correctly sized `statfs` this frame owns.
+        if unsafe { libc::statfs(path.as_ptr(), &raw mut buffer) } != 0 {
+            return false;
+        }
+        // SAFETY: `statfs` succeeded, so `f_mntonname` holds a NUL-terminated
+        // mount point inside a buffer this frame owns.
+        let mount = unsafe { std::ffi::CStr::from_ptr(buffer.f_mntonname.as_ptr()) };
+        mount.to_bytes().starts_with(b"/Volumes/")
+    }
+
+    /// Always false: Linux has no privacy layer that withholds a mounted volume
+    /// from a service.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) const fn is_on_privacy_gated_volume(_path: &Path) -> bool {
+        false
+    }
+
+    /// Never consulted: the privacy branch that asks gates on macOS first. It
+    /// exists so the trait's default method compiles on every target.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) const fn is_read_only(_path: &Path) -> bool {
+        false
+    }
+
+    /// Whether `path` is on a filesystem mounted read-only.
+    ///
+    /// `MNT_RDONLY`, which is the mount flag rather than a probe of `path`
+    /// itself: a writable directory cannot exist on a read-only mount, and the
+    /// mount is the thing whose remediation differs.
+    ///
+    /// macOS-only, and the `cfg` is load-bearing rather than tidiness: `f_flags`
+    /// and `MNT_RDONLY` are BSD `statfs`, and Linux's `statfs` has neither --
+    /// it spells the same fact `f_flags`-less, through `statvfs`'s `ST_RDONLY`.
+    /// Only the macOS branch of the caller asks, so the other targets answer
+    /// `false` rather than carrying a second implementation nothing reaches.
+    #[cfg(target_os = "macos")]
+    pub(super) fn is_read_only(path: &Path) -> bool {
+        let Ok(path) = c_path(path) else {
+            return false;
+        };
+        let mut buffer: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is a NUL-terminated C string that outlives the call,
+        // and `buffer` is a live, correctly sized `statfs` this frame owns.
+        if unsafe { libc::statfs(path.as_ptr(), &raw mut buffer) } != 0 {
+            return false;
+        }
+        buffer.f_flags & u32::try_from(libc::MNT_RDONLY).unwrap_or(0) != 0
+    }
+
+    /// Whether this process runs with an identity that file permissions cannot
+    /// refuse.
+    ///
+    /// The *effective* user, because that is the identity the kernel checks
+    /// entries against, and it is the one a service manager sets.
+    pub(super) fn runs_as_superuser() -> bool {
+        // SAFETY: `geteuid` reads this process's own credentials, takes no
+        // pointer, and cannot fail.
+        unsafe { libc::geteuid() == 0 }
     }
 
     /// Whether this account may create entries in `directory`.
@@ -1494,6 +1736,9 @@ mod tests {
     struct StubFilesystem {
         identity: FilesystemIdentity,
         writable: bool,
+        superuser: bool,
+        gated_volume: bool,
+        read_only: bool,
     }
 
     impl StubFilesystem {
@@ -1501,6 +1746,9 @@ mod tests {
             Self {
                 identity,
                 writable: true,
+                superuser: false,
+                gated_volume: false,
+                read_only: false,
             }
         }
 
@@ -1508,6 +1756,47 @@ mod tests {
             Self {
                 identity: FilesystemIdentity::local("a test volume"),
                 writable: false,
+                superuser: false,
+                gated_volume: false,
+                read_only: false,
+            }
+        }
+
+        /// An unwritable directory on a gated volume, refused to a process
+        /// nothing can refuse.
+        ///
+        /// `cfg`-gated with its only callers: a test call site behind
+        /// `#[cfg(target_os = "macos")]` does not keep an associated function
+        /// alive on the other targets, and CI runs `clippy --all-targets -D
+        /// warnings` on all three.
+        #[cfg(target_os = "macos")]
+        fn unwritable_to_the_superuser() -> Self {
+            Self {
+                superuser: true,
+                gated_volume: true,
+                ..Self::unwritable()
+            }
+        }
+
+        /// A superuser refused by an ordinary cause on a volume the privacy
+        /// layer does not gate. `cfg`-gated for the reason above.
+        #[cfg(target_os = "macos")]
+        fn unwritable_to_the_superuser_on_the_startup_disk() -> Self {
+            Self {
+                superuser: true,
+                ..Self::unwritable()
+            }
+        }
+
+        /// A gated volume that is refusing for the most ordinary reason there
+        /// is: it is mounted read-only.
+        #[cfg(target_os = "macos")]
+        fn read_only_gated_volume() -> Self {
+            Self {
+                superuser: true,
+                gated_volume: true,
+                read_only: true,
+                ..Self::unwritable()
             }
         }
     }
@@ -1519,6 +1808,18 @@ mod tests {
 
         fn is_writable(&self, _directory: &Path) -> io::Result<bool> {
             Ok(self.writable)
+        }
+
+        fn runs_as_superuser(&self) -> bool {
+            self.superuser
+        }
+
+        fn is_on_privacy_gated_volume(&self, _directory: &Path) -> bool {
+            self.gated_volume
+        }
+
+        fn is_read_only(&self, _directory: &Path) -> bool {
+            self.read_only
         }
     }
 
@@ -2115,6 +2416,135 @@ mod tests {
             .expect_err("unprovable locality is a refusal, not a shrug");
         assert!(
             matches!(error, RunnerRootError::UnprovableFilesystem { .. }),
+            "got {error}"
+        );
+    }
+
+    /// The regression this pair exists for.
+    ///
+    /// A boot-mode daemon on macOS is denied an external volume by the privacy
+    /// layer, not by the mode bits, and it cannot raise the consent prompt that
+    /// would say so. Reported as `NotWritable`, the refusal sent the operator to
+    /// `chmod` -- which cannot fix it, and which they can keep trying forever
+    /// while every launch fails once per poll.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_the_superuser_received_names_the_privacy_control_not_the_permissions() {
+        let fixture = fixture();
+        let existing = fixture.workspaces.join("rman");
+        std::fs::create_dir(&existing).expect("the root is created");
+        let probe = StubFilesystem::unwritable_to_the_superuser();
+        let preflight = RootPreflight::with_probe(&fixture.paths, &probe);
+
+        let error = preflight
+            .check(&RootOwner::Host, &native(&existing))
+            .expect_err("a root the service cannot write is unusable");
+
+        assert!(
+            matches!(error, RunnerRootError::DeniedByPrivacyPolicy { .. }),
+            "a superuser cannot be refused by file permissions, so this is the \
+             privacy layer: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Full Disk Access"),
+            "the refusal must name the control that grants it: {rendered}"
+        );
+        assert!(
+            rendered.contains(&RootOwner::Host.remediation()),
+            "the refusal must still show the command that moves the root: {rendered}"
+        );
+    }
+
+    /// The over-blaming half of the same branch: a superuser can be refused for
+    /// perfectly ordinary reasons -- a read-only mount, a SIP-protected
+    /// directory -- and telling that operator to grant Full Disk Access sends
+    /// them to a control that cannot fix it while hiding the real diagnosis.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_superuser_refused_on_the_startup_disk_is_not_blamed_on_the_privacy_layer() {
+        let fixture = fixture();
+        let existing = fixture.workspaces.join("rman");
+        std::fs::create_dir(&existing).expect("the root is created");
+        let probe = StubFilesystem::unwritable_to_the_superuser_on_the_startup_disk();
+        let preflight = RootPreflight::with_probe(&fixture.paths, &probe);
+
+        let error = preflight
+            .check(&RootOwner::Host, &native(&existing))
+            .expect_err("an unwritable root is unusable");
+
+        assert!(
+            matches!(error, RunnerRootError::NotWritable { .. }),
+            "the privacy layer gates no directory on the startup disk: {error}"
+        );
+    }
+
+    /// A read-only mount refuses everybody, superuser included, and mounts
+    /// under `/Volumes` like any other volume -- a disk image, a write-protected
+    /// external disk. Granting Full Disk Access cannot make it writable, so
+    /// blaming the privacy layer sends the operator to a control that changes
+    /// nothing and hides the real cause.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_only_volume_is_not_blamed_on_the_privacy_layer() {
+        let fixture = fixture();
+        let existing = fixture.workspaces.join("rman");
+        std::fs::create_dir(&existing).expect("the root is created");
+        let probe = StubFilesystem::read_only_gated_volume();
+        let preflight = RootPreflight::with_probe(&fixture.paths, &probe);
+
+        let error = preflight
+            .check(&RootOwner::Host, &native(&existing))
+            .expect_err("a read-only root is unusable");
+
+        assert!(
+            matches!(error, RunnerRootError::NotWritable { .. }),
+            "consent cannot make a read-only mount writable: {error}"
+        );
+    }
+
+    /// The requested path must survive the privacy branch. It returns before the
+    /// leaf/parent split below, so a leaf that does not exist yet would
+    /// otherwise be replaced by its parent and never named.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_privacy_refusal_names_the_root_that_was_asked_for_and_the_one_that_refused() {
+        let fixture = fixture();
+        let leaf = fixture.workspaces.join("not-created-yet");
+        let probe = StubFilesystem::unwritable_to_the_superuser();
+        let preflight = RootPreflight::with_probe(&fixture.paths, &probe);
+
+        let error = preflight
+            .check(&RootOwner::Host, &native(&leaf))
+            .expect_err("a root the service cannot create is unusable");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not-created-yet"),
+            "the root the operator asked for is missing from the refusal: {rendered}"
+        );
+        assert!(
+            rendered.contains(&fixture.workspaces.display().to_string()),
+            "the directory that actually refused is missing from the refusal: {rendered}"
+        );
+    }
+
+    /// The other half: an ordinary account really is refused by permissions, and
+    /// must keep being told so.
+    #[test]
+    fn a_refusal_an_ordinary_account_received_still_names_file_permissions() {
+        let fixture = fixture();
+        let existing = fixture.workspaces.join("rman");
+        std::fs::create_dir(&existing).expect("the root is created");
+        let probe = StubFilesystem::unwritable();
+        let preflight = RootPreflight::with_probe(&fixture.paths, &probe);
+
+        let error = preflight
+            .check(&RootOwner::Host, &native(&existing))
+            .expect_err("an unwritable root is unusable");
+
+        assert!(
+            matches!(error, RunnerRootError::NotWritable { .. }),
             "got {error}"
         );
     }

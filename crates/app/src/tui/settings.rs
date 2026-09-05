@@ -162,7 +162,13 @@ impl HostSettings {
         raw: Option<&str>,
         out: &mut dyn Write,
     ) -> Result<(), CliError> {
-        cli::host::runtime_root(context, raw, out)
+        // `plain_for_buffer` for the reason every buffered report takes it: the
+        // screen decorates what it is handed, so escape sequences must not be
+        // baked in here. It does not decide whether System Settings opens --
+        // `runtime_root` asks `Styling::for_stdout` for that, so from a terminal
+        // UI the pane does open, which is what an operator who just configured
+        // the root wants. The warning text reaches this buffer either way.
+        cli::host::runtime_root(context, raw, cli::Styling::plain_for_buffer(), out)
     }
 
     /// Edit, reset, save — the three focused actions the runner-root task costs.
@@ -3073,6 +3079,7 @@ mod tests {
             &HostCommand::SetRuntimeRoot(HostSetRuntimeRootArgs {
                 path: host_root.clone(),
             }),
+            cli::Styling::plain_for_buffer(),
             &mut cli_out,
         )
         .unwrap();
@@ -3088,6 +3095,7 @@ mod tests {
         cli::host::dispatch(
             &through_cli.context,
             &HostCommand::ResetRuntimeRoot,
+            cli::Styling::plain_for_buffer(),
             &mut cli_out,
         )
         .unwrap();
@@ -3198,6 +3206,7 @@ mod tests {
                 &HostCommand::SetRuntimeRoot(HostSetRuntimeRootArgs {
                     path: candidate.clone(),
                 }),
+                cli::Styling::plain_for_buffer(),
                 &mut Vec::new(),
             )
             .expect_err("every fixture in this table is refused");

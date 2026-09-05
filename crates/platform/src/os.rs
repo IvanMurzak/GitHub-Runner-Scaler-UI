@@ -468,6 +468,24 @@ pub fn detect() -> Result<HostSupport, UnsupportedHost> {
     validate(os, arch)
 }
 
+// ---------------------------------------------------------------------------
+// Privacy consent
+// ---------------------------------------------------------------------------
+
+/// The macOS settings pane that grants a program Full Disk Access.
+///
+/// A URL rather than a scripted click: `x-apple.systempreferences:` is the
+/// documented way to open one pane of System Settings, it needs no automation
+/// permission of its own, and it lands the operator on the exact list they have
+/// to add the program to.
+///
+/// It lives here rather than beside the command that opens it because it is an
+/// operating-system constant, and this crate is where those are kept. Deciding
+/// *whether* to open anything stays with the caller, which already has one
+/// policy for that.
+pub const FULL_DISK_ACCESS_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
 #[cfg(test)]
 mod tests {
     use super::*;

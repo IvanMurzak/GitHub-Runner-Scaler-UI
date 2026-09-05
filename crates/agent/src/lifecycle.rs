@@ -512,6 +512,29 @@ struct Placement {
 /// are paths, and `03-migration-rollout.md` requires the remediation command to
 /// reach the operator verbatim.
 fn root_failure(error: RunnerRootError) -> LifecycleError {
+    // Logged here because here is the last place this is known at all. A launch
+    // refused by the runner root fails *before* `record_allocation`, so no
+    // attempt row is ever written: `b2` has nothing to carry the failure on and
+    // `g2` has nothing to show it from. The lifecycle event keeps only
+    // `reason=other`, by `failure_reason_kind`'s rule that no free text may
+    // reach an event -- which left the whole refusal reading
+    // `runner_start_failed reason=other`, once per poll, naming nothing.
+    //
+    // What travels is the *kind* and not the sentence, and that is forced rather
+    // than chosen: `crate::logging` redacts every field it does not allow-list
+    // and then scrubs anything path-shaped out of the ones it does, so a
+    // rendered `RunnerRootError` -- which is mostly paths -- reaches the log as
+    // `[redacted]`. `error_kind` is allow-listed and `RunnerRootError::kind` is
+    // a closed vocabulary that survives the scrub, so this names which of a
+    // dozen causes the operator has. The paths and the remediation reach them
+    // through the command line, which is not redacted.
+    tracing::warn!(
+        error_kind = error.kind(),
+        "the runner root refused this launch, so no attempt was created; the host will \
+         retry every poll until the cause is resolved. Re-running `host set-runtime-root` \
+         with the same path re-runs this check and prints the directory and the \
+         remediation in full"
+    );
     LifecycleError::Failed(FailureReason::Other(error.to_string()))
 }
 
@@ -2839,6 +2862,126 @@ mod tests {
     use runner_manager_github::jit::JitRunner;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    /// One event's fields, in the order they were recorded.
+    type CapturedFields = Vec<(String, String)>;
+
+    /// Keeps the `(name, value)` fields of every `tracing` event emitted while
+    /// it is installed.
+    ///
+    /// The names are kept and not just the rendered line, so a test can hold the
+    /// event to `crate::logging`'s two rules -- the field allow-list and the
+    /// value scrub -- instead of asserting that some string was passed to a
+    /// macro.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(std::sync::Arc<std::sync::Mutex<Vec<CapturedFields>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Collect(Vec<(String, String)>);
+            impl tracing::field::Visit for Collect {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // `{value:?}` on a `&str` field would keep the quotes, and
+                    // the redaction rules are about the value, not its literal.
+                    self.0.push((
+                        field.name().to_owned(),
+                        format!("{value:?}").trim_matches('"').to_owned(),
+                    ));
+                }
+            }
+            let mut collected = Collect(Vec::new());
+            event.record(&mut collected);
+            self.0
+                .lock()
+                .expect("the capture mutex is not poisoned")
+                .push(collected.0);
+        }
+    }
+
+    /// The regression behind a three-hour outage that showed nothing an operator
+    /// could act on.
+    ///
+    /// A root the daemon cannot use refuses the launch *before*
+    /// `record_allocation`, so no attempt row is ever written: `b2` has nothing
+    /// to carry the failure on and `g2` has nothing to show it from. The
+    /// lifecycle event keeps only the variant -- `failure_reason_kind` allows no
+    /// free text on an event -- so the whole failure read
+    /// `runner_start_failed reason=other`, once per poll, for hours.
+    ///
+    /// The assertion is deliberately made against the **production redaction
+    /// rules** and not merely against what was emitted. An earlier attempt at
+    /// this fix logged the rendered error on a `detail` field and passed a test
+    /// exactly like this one, while shipping `detail="[redacted]"`: the field
+    /// was not allow-listed, and had it been, the value is mostly paths and
+    /// would have been scrubbed to `[path]`. A test that does not ask
+    /// `crate::logging` what survives is a test that proves nothing.
+    #[test]
+    fn a_launch_the_runner_root_refused_names_the_cause_in_the_log_that_ships() {
+        use runner_manager_platform::logging;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = CapturedEvents::default();
+        let error = RunnerRootError::DeniedByPrivacyPolicy {
+            requested: PathBuf::from("/Volumes/NVME/runners"),
+            refused: PathBuf::from("/Volumes/NVME"),
+            remediation: RootOwner::Host.remediation(),
+        };
+        let kind = error.kind();
+
+        let failure = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(captured.clone()),
+            || root_failure(error),
+        );
+
+        // The reason still carries the whole sentence. Nothing on *this* path
+        // renders it -- there is no attempt row, and the event carries only the
+        // variant -- so this is a guard against a refactor that drops the detail
+        // before some future surface can show it, and not a claim that one does.
+        assert!(
+            matches!(
+                &failure,
+                LifecycleError::Failed(FailureReason::Other(detail))
+                    if detail.contains("/Volumes/NVME/runners")
+                        && detail.contains("Full Disk Access")
+            ),
+            "the reason must still carry the detail: {failure:?}"
+        );
+
+        let events = captured
+            .0
+            .lock()
+            .expect("the capture mutex is not poisoned")
+            .clone();
+        let event = events
+            .iter()
+            .find(|fields| fields.iter().any(|(_, value)| value.contains(kind)))
+            .unwrap_or_else(|| panic!("the refusal did not name its cause: {events:?}"));
+
+        // Held to the rules the real sink applies, by name and by value. An
+        // earlier fix put the rendered error on an unlisted `detail` field and
+        // shipped `[redacted]`; asserting only that something was emitted would
+        // have passed then too.
+        for (name, value) in event {
+            assert!(
+                logging::is_field_allowed(name),
+                "`{name}` is not allow-listed, so it ships as `{}`: {event:?}",
+                logging::REDACTION
+            );
+            assert_eq!(
+                &logging::redact(value),
+                value,
+                "`{name}` does not survive value-shape scrubbing: {event:?}"
+            );
+        }
+    }
 
     /// A slot number, for the tests that name one.
     fn nz(slot: u16) -> NonZeroU16 {

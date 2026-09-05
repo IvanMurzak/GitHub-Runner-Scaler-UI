@@ -1352,7 +1352,7 @@ fn route(
 ) -> Result<(), CliError> {
     match command {
         Command::Auth(command) => auth::dispatch(context, command, styling, out),
-        Command::Host(command) => host::dispatch(context, command, out),
+        Command::Host(command) => host::dispatch(context, command, styling, out),
         Command::Status(args) => status::dispatch(context, args, out),
         Command::Repo(command) => policy::dispatch_repo(context, command, out),
         Command::Org(command) => policy::dispatch_org(context, command, out),
