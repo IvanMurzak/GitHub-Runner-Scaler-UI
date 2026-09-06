@@ -1,0 +1,39 @@
+# ROADMAP — managed WSL host
+
+The table below is the sole live task-state record.
+
+## Gates
+
+- **G1 owner scope:** satisfied 2026-09-06 by D1-D7.
+- **G2 security:** independent device-flow credential, stdin-only handoff and
+  canary leak tests must pass before merge.
+- **G3 production/release:** owner explicitly requested release `0.4.0` and
+  installation on IvanPC. The irreversible release workflow may run only after
+  implementation CI is green.
+- **G4 migration:** do not remove the existing task
+  `GitHub Actions Linux Runner - Ubuntu WSL` until managed status and a live job
+  are green.
+
+## Waves
+
+- Wave 1: platform/provider primitives.
+- Wave 2: CLI orchestration and credential broker.
+- Wave 3: acceptance tests and documentation.
+- Wave 4: release, install, adoption and live verification.
+
+## Board
+
+| Task (spec) | needs | repo/base | imp/cx | model | Status | Run / PR | Updated |
+|---|---|---|---|---|---|---|---|
+| [a1-wsl-platform-adapter](tasks/a1-wsl-platform-adapter.md) | — | ./main | 9/9 | top | ⚪ | — | 2026-09-06 |
+| [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | ⚪ | — | 2026-09-06 |
+| [b2-wsl-cli-orchestration](tasks/b2-wsl-cli-orchestration.md) | a1, b1 | ./main | 10/10 | top | ⚪ | — | 2026-09-06 |
+| [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | ⚪ | — | 2026-09-06 |
+
+## Progress log
+
+| Date | Event |
+|---|---|
+| 2026-09-06 | Architecture set created from repository, workstation, Microsoft WSL and GitHub token-rotation evidence. D1-D7 locked from the owner's explicit requirements. |
+| 2026-09-06 | Review closed P1 lifecycle-shell and pre-login availability gaps plus P2 destructive command naming. Repository evidence and authoritative Microsoft/GitHub constraints otherwise support the design; no owner decision changed. |
+| 2026-09-06 | Immutable task specs created in groups A and B. Independent platform and credential foundations may execute together; orchestration and acceptance follow sequentially. |
