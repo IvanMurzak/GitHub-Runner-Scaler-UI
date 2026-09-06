@@ -500,6 +500,24 @@ pub enum AuthCommand {
     Status(AuthStatusArgs),
     /// Purge the local credential.
     Logout,
+    /// Take a credential document on stdin and store it. Not for people.
+    ///
+    /// ------------------------------------------------------------------
+    /// HIDDEN, AND THE HIDING IS PART OF THE DESIGN.
+    /// ------------------------------------------------------------------
+    /// `02-target-architecture.md` (managed WSL host) makes this the one
+    /// cross-process bridge by which a provider hands a *newly issued*
+    /// credential to a host it controls, without that credential ever being
+    /// written down on the issuing machine. It is not a command an operator
+    /// has any reason to type: `auth login` is how a person authenticates a
+    /// host, and this refuses a terminal precisely so that nobody turns it
+    /// into a paste workflow.
+    ///
+    /// `cli_command_surface.rs` transcribes the *published* surface from the
+    /// design document and asserts `--help` matches it exactly, so a hidden
+    /// command has to be hidden for that test to keep meaning what it says.
+    #[command(hide = true)]
+    Receive(AuthReceiveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -517,6 +535,19 @@ pub struct AuthLoginArgs {
     /// Name every repository the credential reaches, instead of counting them.
     #[arg(long)]
     pub list: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthReceiveArgs {
+    /// Which start mode's credential store to write.
+    ///
+    /// Required rather than defaulted, and deliberately: the caller is another
+    /// process on another machine, and it knows how the daemon it is
+    /// provisioning will start. `auth login` may fall back to the mode this
+    /// host already recorded because a person is there to read the line that
+    /// says which store was chosen; nobody is reading this one.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: StartAt,
 }
 
 #[derive(Debug, Args)]
@@ -947,6 +978,43 @@ impl Context {
             // file underneath the data tree.
             data_root: None,
             endpoints: Self::resolve_endpoints(err)?,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    /// A context rooted at `root` and pointed at a fixture server.
+    ///
+    /// # Why a constructor rather than the environment variable
+    ///
+    /// [`Context::resolve`] takes its endpoints from
+    /// [`GITHUB_BASE_URL_VARIABLE`], which is a *process*-wide value. A unit
+    /// test that set it would be setting it for every other test running in
+    /// the same process at the same time — and in edition 2024
+    /// `std::env::set_var` is `unsafe` for exactly that reason. The integration
+    /// suites can use the variable because each of them is a separate process
+    /// driving the binary; the in-crate tests cannot.
+    ///
+    /// `#[cfg(test)]`, so this is not compiled into the shipped binary and
+    /// there is no way to reach it from one.
+    ///
+    /// # Errors
+    /// [`Failure::LocalState`] when the directories cannot be created.
+    #[cfg(test)]
+    pub(crate) fn rooted_against(
+        paths_root: &Path,
+        endpoints: Endpoints,
+    ) -> Result<Self, CliError> {
+        let paths = AppPaths::rooted_at(paths_root);
+        paths.create_all().map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot create this test's data directories: {source}"),
+            )
+        })?;
+        Ok(Self {
+            paths,
+            data_root: Some(paths_root.to_path_buf()),
+            endpoints,
             clock: Arc::new(SystemClock),
         })
     }

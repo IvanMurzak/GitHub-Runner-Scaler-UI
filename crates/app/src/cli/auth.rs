@@ -45,10 +45,11 @@
 //! `UserAccessToken::secret` straight into `d2`'s store and is never formatted.
 
 use std::fmt::Display;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::Store as _;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
@@ -57,11 +58,12 @@ use runner_manager_github::{
     InstallationDiscovery, RepositorySelection, TokioSleeper, UserAccessToken,
 };
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
-use secrecy::SecretString;
+use secrecy::zeroize::Zeroize as _;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use super::{
-    AuthCommand, AuthStatusArgs, CliError, Context, Failure, NO_OPERATOR_REMEDY, Styling,
-    open_in_browser, write_failed,
+    AuthCommand, AuthReceiveArgs, AuthStatusArgs, CliError, Context, Failure, NO_OPERATOR_REMEDY,
+    Styling, open_in_browser, write_failed,
 };
 
 // ---------------------------------------------------------------------------
@@ -324,6 +326,7 @@ pub fn dispatch(
         AuthCommand::Login(a) => login(context, a.start_at.map(Into::into), a.list, styling, out),
         AuthCommand::Status(a) => status(context, a, styling, out),
         AuthCommand::Logout => logout(context, out),
+        AuthCommand::Receive(a) => receive(context, a, out),
     }
 }
 
@@ -580,16 +583,11 @@ pub fn login(
     // transcript that was cut off.
     write_action_one(out, styling).map_err(failed)?;
 
-    let authorization = runtime
-        .block_on(flow.start())
-        .map_err(|source| device_flow_failure(&source))?;
-
-    write_login_prompt(out, styling, &flow, &authorization).map_err(failed)?;
-    out.flush().map_err(failed)?;
-
-    let token = runtime
-        .block_on(flow.complete(&authorization, &TokioSleeper))
-        .map_err(|source| device_flow_failure(&source))?;
+    // The device flow itself is [`acquire_user_credential`], which persists
+    // nothing: `login` is the caller that decides the credential belongs in
+    // *this* host's store, and the WSL broker is the caller that decides it
+    // belongs somewhere else entirely. See that function's own documentation.
+    let token = acquire_user_credential(&flow, &runtime, styling, out)?;
 
     // The value is exposed exactly once, here, as the argument to `store`, and
     // is never bound to a name that could be formatted, logged, or returned.
@@ -666,6 +664,459 @@ fn write_login_prompt(
         authorization.expires_in(),
         opened,
     )
+}
+
+/// Runs GitHub's device flow to completion in **this** process and hands back
+/// the credential, without writing it anywhere.
+///
+/// # Why acquisition is separable from storing it
+///
+/// Until the managed WSL host there was one caller and one destination, so the
+/// flow and the write lived in the same twenty lines of [`login`]. There are
+/// now two destinations: this host's own store, and a Linux machine store
+/// inside a WSL2 distribution which must hold an *independently issued* pair
+/// (`03-security-and-lifecycle.md`, credential guarantee 1 — GitHub invalidates
+/// both halves of a pair on refresh, so two daemons sharing one document is
+/// deterministic credential loss for whichever renews second).
+///
+/// Splitting it here rather than adding a destination parameter is what makes
+/// the security property structural instead of reviewed: this function is
+/// handed a [`DeviceFlow`] and a place to print to, and there is no secret
+/// store in its signature for it to reach. A staging write is not something it
+/// declines to do; it is something it cannot do.
+///
+/// The prompt is still printed from here, because the operator has to read the
+/// code whichever host the resulting credential is going to.
+///
+/// # Errors
+/// Every [`DeviceFlowError`] class, mapped by [`device_flow_failure`], and
+/// [`Failure::Unclassified`] when the prompt cannot be written.
+pub fn acquire_user_credential(
+    flow: &DeviceFlow,
+    runtime: &tokio::runtime::Runtime,
+    styling: Styling,
+    out: &mut dyn Write,
+) -> Result<UserAccessToken, CliError> {
+    // The same string `login` binds, so that a failure to write the prompt
+    // reads identically whether it happened under `auth login` or under the
+    // broker: this is the sign-in either way, from the operator's side.
+    let failed = write_failed("this sign-in");
+
+    let authorization = runtime
+        .block_on(flow.start())
+        .map_err(|source| device_flow_failure(&source))?;
+
+    write_login_prompt(out, styling, flow, &authorization).map_err(failed)?;
+    out.flush().map_err(failed)?;
+
+    runtime
+        .block_on(flow.complete(&authorization, &TokioSleeper))
+        .map_err(|source| device_flow_failure(&source))
+}
+
+// ---------------------------------------------------------------------------
+// The credential broker
+// ---------------------------------------------------------------------------
+
+/// Somewhere a freshly issued credential document can be delivered that is not
+/// this host's secret store.
+///
+/// # The whole point is that the document is never written down here
+///
+/// `03-security-and-lifecycle.md`: *"The credential document crosses the
+/// Windows/Linux boundary only through an anonymous stdin pipe. It is absent
+/// from argv, environment, provider records, logs, errors, status JSON,
+/// temporary files and scheduled-task XML."* A sink is therefore handed the
+/// document by reference, exactly once, and is expected to write it into a pipe
+/// it already holds — not to a file, not to a second store, and not into a
+/// command line.
+///
+/// The implementation that matters is the WSL one, which spawns
+/// `runner-manager auth receive --start-at boot` inside the distribution and
+/// writes the document to its stdin. It is not here because
+/// `crates/app` does not own WSL process primitives; what is here is the seam,
+/// so that the broker below can be written and tested without one.
+#[allow(
+    dead_code,
+    reason = "the caller is `b2-wsl-cli-orchestration`; `b1` owns this seam"
+)]
+pub trait SecretSink {
+    /// Deliver the document. Called at most once, and never called at all if
+    /// the device flow failed.
+    ///
+    /// # Errors
+    /// [`SecretSinkError`], which must never carry any part of `document`.
+    fn send(&mut self, document: &SecretString) -> Result<(), SecretSinkError>;
+}
+
+/// Why a sink could not take the document.
+///
+/// **No variant carries the document, and none ever may** — the same invariant
+/// `d2` states for [`SecretStoreError`], and for the same reason: these are
+/// rendered into operator-facing text by [`secret_sink_failure`].
+///
+/// Two variants rather than one because they need opposite remedies. A
+/// credential that never left this machine says the *transport* is broken —
+/// the distribution is not running, the binary is not there. One that was
+/// delivered and refused says the *receiving store* is broken, and the fix is
+/// on the other side of the pipe.
+#[allow(
+    dead_code,
+    reason = "the caller is `b2-wsl-cli-orchestration`; `b1` owns this seam"
+)]
+#[derive(Debug, thiserror::Error)]
+pub enum SecretSinkError {
+    /// The document never reached the receiver: nothing to start, nothing
+    /// listening, or the pipe broke mid-write.
+    #[error("the credential could not be delivered to {destination}: {reason}")]
+    Undeliverable { destination: String, reason: String },
+    /// The receiver got the document and would not store it.
+    #[error("{destination} received the credential and refused it: {reason}")]
+    Refused { destination: String, reason: String },
+}
+
+/// What a completed handoff is allowed to say about the credential.
+///
+/// Metadata only: whether the pair can renew itself, and when each half stops
+/// working. `03-security-and-lifecycle.md` guarantee 5 — *"A successful handoff
+/// is read back only as authenticated/unauthenticated metadata"* — is why this
+/// type exists rather than the token being returned to the caller. Deriving
+/// `Debug` is safe here precisely because there is nothing secret in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokeredCredential {
+    /// Whether the App issued a refresh half alongside the access token.
+    pub renewable: bool,
+    /// When the access token stops being accepted, if GitHub stated it.
+    pub access_expires_at: Option<DateTime<Utc>>,
+    /// When the refresh token stops working, if GitHub stated it.
+    pub refresh_expires_at: Option<DateTime<Utc>>,
+}
+
+impl BrokeredCredential {
+    /// Reads the non-secret half of a credential.
+    #[must_use]
+    pub fn of(token: &UserAccessToken) -> Self {
+        let renewal = token.renewal();
+        Self {
+            renewable: renewal.is_some(),
+            access_expires_at: renewal.and_then(|r| r.access_expires_at),
+            refresh_expires_at: renewal.and_then(|r| r.refresh_expires_at),
+        }
+    }
+}
+
+impl Display for BrokeredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.renewable {
+            write!(f, "It renews itself")?;
+            match (self.access_expires_at, self.refresh_expires_at) {
+                (Some(access), Some(refresh)) => write!(
+                    f,
+                    ": the access token expires {access}, the refresh token {refresh}."
+                ),
+                (Some(access), None) => write!(f, ": the access token expires {access}."),
+                (None, Some(refresh)) => write!(f, ": the refresh token expires {refresh}."),
+                (None, None) => write!(f, ", and GitHub stated no expiry."),
+            }
+        } else {
+            write!(
+                f,
+                "It carries no renewal half, so only an interactive sign-in replaces it."
+            )
+        }
+    }
+}
+
+/// Issues a **new** credential in this interactive process and hands it
+/// straight to `sink`.
+///
+/// # This function deliberately cannot read the active credential
+///
+/// `03-security-and-lifecycle.md` guarantee 2 is *"the active Windows
+/// credential is never read for transfer"*, and guarantee 5 is *"a failed
+/// handoff leaves no Windows credential copy"*. Both are properties of what
+/// this function does not have rather than of what it does not do: it takes a
+/// [`Context`] and reaches [`Context::app_registration`] and
+/// [`Context::endpoints`] out of it, and never [`Context::secret_store`]. There
+/// is no staging store to clean up on failure because there is no staging store
+/// at all — which is also why every failure path below is a plain `?`.
+///
+/// The device flow runs *here*, on the machine with the browser, because that
+/// is the half of the handoff a person has to participate in.
+///
+/// # Errors
+/// Everything [`acquire_user_credential`] returns, plus
+/// [`Failure::SecretStore`] when the sink could not take the document.
+#[allow(
+    dead_code,
+    reason = "the caller is `b2-wsl-cli-orchestration`; `b1` owns this seam"
+)]
+pub fn broker_user_credential(
+    context: &Context,
+    styling: Styling,
+    out: &mut dyn Write,
+    sink: &mut dyn SecretSink,
+) -> Result<BrokeredCredential, CliError> {
+    let app = context.app_registration()?;
+    let flow = DeviceFlow::new(app, context.endpoints().clone())
+        .map_err(|source| device_flow_failure(&source))?;
+    let runtime = super::runtime()?;
+
+    let token = acquire_user_credential(&flow, &runtime, styling, out)?;
+    deliver_user_credential(&token, sink)
+}
+
+/// The second half of [`broker_user_credential`], for a caller that already
+/// holds a credential and for the tests that have to fail the sink on purpose.
+///
+/// The document is built as the argument to [`SecretSink::send`] and is never
+/// bound to a name: it exists for the duration of that call and is dropped by
+/// the end of the statement, which is the same discipline `login` uses for its
+/// one `store` call.
+///
+/// # Errors
+/// [`Failure::SecretStore`], carrying what the sink said and nothing else.
+#[allow(
+    dead_code,
+    reason = "the caller is `b2-wsl-cli-orchestration`; `b1` owns this seam"
+)]
+pub fn deliver_user_credential(
+    token: &UserAccessToken,
+    sink: &mut dyn SecretSink,
+) -> Result<BrokeredCredential, CliError> {
+    // Read before the send, so that a sink which somehow consumed the document
+    // cannot change what is reported about it.
+    let metadata = BrokeredCredential::of(token);
+    sink.send(&token.to_stored_document())
+        .map_err(|source| secret_sink_failure(&source))?;
+    Ok(metadata)
+}
+
+// ---------------------------------------------------------------------------
+// auth receive
+// ---------------------------------------------------------------------------
+
+/// The most a credential document may be, in bytes.
+///
+/// `03-security-and-lifecycle.md` guarantee 4: *"The receiving process accepts
+/// at most 64 KiB"*. The real document is a couple of hundred bytes, so this is
+/// not a fit to the data — it is a ceiling on what a process reading an
+/// anonymous pipe will hold in memory before deciding the writer is not the
+/// thing it was expecting.
+pub const RECEIVED_DOCUMENT_LIMIT: usize = 64 * 1024;
+
+/// `auth receive --start-at boot|login`.
+///
+/// The receiving half of the credential broker: the provider on the other side
+/// of the pipe ran the device flow, and this stores what came out of it through
+/// the ordinary [`SecretStore`] for the named start mode. Nothing about the
+/// value is printed.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a terminal, an empty document, one over
+/// [`RECEIVED_DOCUMENT_LIMIT`], and one that is not the credential envelope;
+/// [`Failure::SecretStore`] when the store will not take it.
+pub fn receive(
+    context: &Context,
+    args: &AuthReceiveArgs,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    refuse_a_terminal(io::stdin().is_terminal())?;
+
+    // Read and validated BEFORE the store is even resolved. Nothing that
+    // arrives on this pipe can reach the store without having been the
+    // credential envelope first, which is what "rejects ... without persisting
+    // a usable value" has to mean to be worth asserting.
+    let document = read_credential_document(&mut io::stdin().lock())?;
+
+    let secrets = context.secret_store(args.start_at.into())?;
+    store_received_credential(&secrets, &document, out)
+}
+
+/// The refusal a terminal stdin earns.
+///
+/// Takes the answer rather than asking [`io::stdin`] itself, so that both
+/// branches are reachable from a test: a test process's stdin is whatever the
+/// harness gave it, which is exactly the thing under test here.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] when stdin is a terminal.
+fn refuse_a_terminal(stdin_is_a_terminal: bool) -> Result<(), CliError> {
+    if !stdin_is_a_terminal {
+        return Ok(());
+    }
+    // ------------------------------------------------------------------------
+    // A PASTE PROMPT IS THE FAILURE MODE THIS REFUSAL EXISTS TO PREVENT.
+    // ------------------------------------------------------------------------
+    // A command that reads a credential from a terminal teaches an operator to
+    // paste one, and a pasted credential is in the shell's history, in the
+    // terminal's scrollback, and on the screen behind whoever is standing
+    // there. `02-target-architecture.md`: receive "rejects terminal stdin to
+    // prevent accidental paste workflows and exists solely as the cross-process
+    // platform bridge".
+    Err(CliError::with_remedy(
+        Failure::InvalidArgument,
+        "`auth receive` is a bridge between two processes and takes its input from a pipe. \
+         It refuses a terminal so that nobody is ever invited to type or paste a credential \
+         at a prompt, where it would survive in this shell's history and on this screen.",
+        "runner-manager auth login   (the way a person authenticates this host)",
+    ))
+}
+
+/// Reads at most [`RECEIVED_DOCUMENT_LIMIT`] bytes and proves they are the
+/// credential envelope.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for every way the input can fail to be a
+/// credential document, and for a read that did not complete.
+fn read_credential_document(reader: &mut dyn Read) -> Result<SecretString, CliError> {
+    let refused = |detail: &str| {
+        CliError::with_remedy(
+            Failure::InvalidArgument,
+            format!("the credential document on stdin was refused: {detail}. Nothing was stored."),
+            "runner-manager auth login   (the way a person authenticates this host)",
+        )
+    };
+
+    // One byte past the ceiling, so that "exactly at the limit" and "over it"
+    // are distinguishable. A reader that stops at the limit cannot tell a
+    // 64 KiB document from the first 64 KiB of something much larger, and
+    // would store the truncation.
+    let mut bytes = Vec::new();
+    reader
+        .take(RECEIVED_DOCUMENT_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| {
+            // `source` is an io error, never any of the bytes read.
+            refused(&format!("stdin could not be read ({source})"))
+        })?;
+
+    let length = bytes.len();
+    if length > RECEIVED_DOCUMENT_LIMIT {
+        bytes.zeroize();
+        return Err(refused(&format!(
+            "it is larger than the {RECEIVED_DOCUMENT_LIMIT}-byte ceiling this endpoint accepts"
+        )));
+    }
+    if length == 0 {
+        return Err(refused("it was empty"));
+    }
+
+    // Borrowed rather than consumed, so the byte buffer is still ours to
+    // scrub on both paths -- the same shape `PlatformSecretStore::decode` uses.
+    let document = match std::str::from_utf8(&bytes) {
+        Ok(text) => SecretString::from(text.to_owned()),
+        Err(_) => {
+            bytes.zeroize();
+            return Err(refused(&format!(
+                "the {length} bytes there are not valid UTF-8"
+            )));
+        }
+    };
+    bytes.zeroize();
+
+    validate_credential_envelope(&document).map_err(|detail| refused(&detail))?;
+    Ok(document)
+}
+
+/// Whether `document` is the credential envelope `to_stored_document` writes.
+///
+/// # Why this is stricter than [`UserAccessToken::from_stored_document`]
+///
+/// That function is deliberately permissive: anything that is not the JSON
+/// document is read as a bare access token, because that is what every host
+/// stored before 0.1.11 and upgrading must not log anybody out. It therefore
+/// cannot fail, which makes it exactly the wrong judge of whether an anonymous
+/// pipe just delivered a credential -- it would accept an HTML error page, a
+/// shell prompt, or half a log file as somebody's token and store it.
+///
+/// This endpoint has no legacy to be kind to. Its only caller is a provider of
+/// the same version writing `to_stored_document`'s output, so the envelope is
+/// required.
+///
+/// # Errors
+/// The detail to report, never containing any part of `document`.
+fn validate_credential_envelope(document: &SecretString) -> Result<(), String> {
+    const NOT_THE_DOCUMENT: &str = "it is not the credential document this version writes (a \
+                                    JSON object carrying an `access_token` string)";
+
+    // -----------------------------------------------------------------------
+    // A `Value`, NOT A DERIVED STRUCT, AND THE DIFFERENCE IS MEASURABLE.
+    // -----------------------------------------------------------------------
+    // serde's derived struct deserializer accepts a *sequence* as well as a
+    // map, taking the fields positionally. So `["ghu_..."]` deserializes
+    // cleanly into a `struct Envelope { access_token: String }` -- measured,
+    // not feared -- and an endpoint validating that way would accept a JSON
+    // array off an anonymous pipe as somebody's credential. Requiring the
+    // object explicitly is what makes the shape check mean the shape.
+    //
+    // -----------------------------------------------------------------------
+    // SERDE'S OWN MESSAGE IS DISCARDED, AND THAT IS NOT TIDINESS.
+    // -----------------------------------------------------------------------
+    // A `serde_json` error quotes the input around the offending byte. On a
+    // document that IS a credential but is malformed in some other way -- a
+    // truncated write, a stray byte -- that quotation is the credential, and it
+    // would go straight into an operator-facing error and into this process's
+    // log. So the parse either succeeds or contributes the fixed sentence
+    // above.
+    let mut value = serde_json::from_str::<serde_json::Value>(document.expose_secret())
+        .map_err(|_| NOT_THE_DOCUMENT.to_string())?;
+
+    let outcome = match value.get("access_token") {
+        Some(serde_json::Value::String(token)) if !token.trim().is_empty() => Ok(()),
+        Some(serde_json::Value::String(_)) => Err("its access token is empty".to_string()),
+        Some(_) => Err("its access token is not a string".to_string()),
+        None => Err(NOT_THE_DOCUMENT.to_string()),
+    };
+
+    // The parse produced plain `String`s holding both halves of the credential,
+    // outside any `secrecy` wrapper. Every one of them is scrubbed here rather
+    // than left to drop.
+    if let Some(fields) = value.as_object_mut() {
+        for field in fields.values_mut() {
+            if let serde_json::Value::String(text) = field {
+                text.zeroize();
+            }
+        }
+    }
+    outcome
+}
+
+/// Puts a received document through the ordinary credential type and into the
+/// ordinary store, and reports only what it is safe to report.
+///
+/// The round trip through [`UserAccessToken`] is the point: the value that
+/// reaches the store is `to_stored_document`'s output, the same bytes `auth
+/// login` would have written, rather than whatever shape arrived on the pipe.
+///
+/// # Errors
+/// [`Failure::SecretStore`] when the store refuses the value, and
+/// [`Failure::Unclassified`] when the report cannot be written.
+fn store_received_credential(
+    secrets: &dyn SecretStore,
+    document: &SecretString,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let failed = write_failed("this credential handoff");
+
+    let token = UserAccessToken::from_stored_document(document);
+    let metadata = BrokeredCredential::of(&token);
+
+    secrets
+        .store(&token.to_stored_document())
+        .map_err(|source| secret_store_failure(&source))?;
+
+    // The scope and the location, which is what `auth logout` prints and what
+    // `host show` prints. Never the value, and never any part of it.
+    writeln!(
+        out,
+        "Stored a credential in the {}-scoped store ({}).",
+        secrets.scope(),
+        secrets.location()
+    )
+    .map_err(failed)?;
+    writeln!(out, "{metadata}").map_err(failed)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,6 +1710,42 @@ fn secret_store_failure(source: &SecretStoreError) -> CliError {
             Failure::SecretStore,
             source.to_string(),
             "runner-manager host show   (reports where the store is and what protects it)",
+        ),
+    }
+}
+
+/// Maps a broker handoff failure.
+///
+/// # Why both variants are [`Failure::SecretStore`]
+///
+/// The class an operator acts on is *"the credential did not reach a store"*,
+/// and that is true whether the pipe never opened or the far side refused what
+/// came down it. The two are still told apart, in the remedy: an undeliverable
+/// document is a problem with the host that was supposed to receive it, and a
+/// refused one is a problem inside it. Neither carries any part of the
+/// document — see [`SecretSinkError`].
+#[allow(
+    dead_code,
+    reason = "the caller is `b2-wsl-cli-orchestration`; `b1` owns this seam"
+)]
+fn secret_sink_failure(source: &SecretSinkError) -> CliError {
+    match source {
+        SecretSinkError::Undeliverable { .. } => CliError::with_remedy(
+            Failure::SecretStore,
+            format!(
+                "{source}. No credential was stored on this host either: this handoff writes \
+                 nowhere but the receiving store."
+            ),
+            "check that the receiving host is running and reachable, then run the \
+             provisioning command again",
+        ),
+        SecretSinkError::Refused { .. } => CliError::with_remedy(
+            Failure::SecretStore,
+            format!(
+                "{source}. Nothing was stored on this host, so the credential just issued is \
+                 gone and the next attempt issues a new one."
+            ),
+            "fix the receiving host's secret store, then run the provisioning command again",
         ),
     }
 }
@@ -1919,6 +2406,873 @@ mod tests {
             error.remedy().is_none(),
             "there is no operator command that publishes a GitHub App: {error}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The credential broker and `auth receive`
+    // -----------------------------------------------------------------------
+    //
+    // `b1-credential-broker`'s Definition of Done, and where each clause is
+    // measured:
+    //
+    //   2. receive rejects TTY stdin, empty/oversized/malformed documents and
+    //      wrong store conditions without persisting a usable value
+    //      -- here, plus `crates/app/tests/auth_receive.rs` through the real
+    //      binary and a real pipe.
+    //   3. a valid access/refresh document round-trips into a rooted store with
+    //      its renewal metadata intact -- here.
+    //   4. distinct Windows and WSL canaries prove the active Windows store is
+    //      never loaded and no canary escapes -- here.
+    //   5. failure at every device-flow and sink stage leaves no staging
+    //      credential -- here, one test per stage.
+
+    use std::collections::HashMap;
+    use std::io::{BufRead as _, BufReader};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use runner_manager_github::Endpoints;
+    use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
+
+    // -- canaries ----------------------------------------------------------
+    //
+    // Assembled at run time rather than written as literals, for the reason
+    // `support/mod.rs` and `d2`'s suites give: a literal is in the compiled
+    // artifact, and a scan that looks for it in files this run produced would
+    // then also find it in the test binary that produced them.
+
+    /// The access half of the credential the WINDOWS host already holds. It is
+    /// planted in the active store and must never be read, delivered, or
+    /// printed.
+    fn windows_access_canary() -> String {
+        format!("{}{}", "ghu_", "b1WindowsAccessNeverTransferred")
+    }
+
+    /// The refresh half of the same. More dangerous than the access half: it
+    /// mints access tokens indefinitely, and GitHub kills the pair on use.
+    fn windows_refresh_canary() -> String {
+        format!("{}{}", "ghr_", "b1WindowsRefreshNeverTransferrd")
+    }
+
+    /// The access half of the credential ISSUED FOR the WSL host. It is
+    /// expected in the sink and nowhere else.
+    fn wsl_access_canary() -> String {
+        format!("{}{}", "ghu_", "b1WslAccessIssuedIndependently0")
+    }
+
+    /// The refresh half of the same.
+    fn wsl_refresh_canary() -> String {
+        format!("{}{}", "ghr_", "b1WslRefreshIssuedIndependently")
+    }
+
+    /// Every canary, with the name a failure should call it by.
+    fn every_canary() -> Vec<(&'static str, String)> {
+        vec![
+            ("the Windows access token", windows_access_canary()),
+            ("the Windows refresh token", windows_refresh_canary()),
+            ("the WSL access token", wsl_access_canary()),
+            ("the WSL refresh token", wsl_refresh_canary()),
+        ]
+    }
+
+    /// A credential document as [`UserAccessToken::to_stored_document`] writes
+    /// one, with both halves and both expiry instants.
+    fn document(access: &str, refresh: &str) -> String {
+        format!(
+            r#"{{"access_token":"{access}","refresh_token":"{refresh}",
+                 "access_expires_at":"2026-09-06T20:00:00Z",
+                 "refresh_expires_at":"2027-03-05T12:00:00Z"}}"#
+        )
+    }
+
+    /// Every file under `root`, as text, with the path it came from.
+    fn files_under(root: &Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    found.push((
+                        path.display().to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+            }
+        }
+        found
+    }
+
+    /// Asserts that no canary at all reached anywhere this process could have
+    /// put one: the transcript, every file under `root`, this process's
+    /// environment, and its own argument vector.
+    ///
+    /// `allowed` names the files a canary IS permitted to be in — the secret
+    /// store, which is the one place a credential is supposed to live.
+    fn no_canary_escaped(transcript: &str, root: &Path, allowed: &dyn Fn(&str) -> bool) {
+        let mut found = Vec::new();
+        for (name, canary) in every_canary() {
+            if transcript.contains(&canary) {
+                found.push(format!("{name} appears in the command's own output"));
+            }
+            for (path, text) in files_under(root) {
+                if allowed(&path) {
+                    continue;
+                }
+                if text.contains(&canary) {
+                    found.push(format!("{name} appears in the file {path}"));
+                }
+            }
+            // The environment and argv halves of `03-security-and-lifecycle.md`
+            // guarantee 3. Trivially true for an in-process handoff, and
+            // asserted anyway: the whole reason the document is passed by
+            // reference to a sink is so that the day somebody reaches for a
+            // command line instead, this reddens.
+            for (key, value) in std::env::vars() {
+                if value.contains(&canary) {
+                    found.push(format!("{name} appears in the environment as {key}"));
+                }
+            }
+            for argument in std::env::args() {
+                if argument.contains(&canary) {
+                    found.push(format!("{name} appears in this process's argv"));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "`03-security-and-lifecycle.md` guarantee 3: the credential document is absent \
+             from argv, environment, logs, errors and temporary files. Found:\n  {}",
+            found.join("\n  ")
+        );
+    }
+
+    /// Asserts that neither store under `root` holds a value.
+    ///
+    /// Both scopes, because a rooted store keeps one directory per scope and a
+    /// staging write into the *other* one is exactly the mistake that would
+    /// pass a check of only the scope under discussion.
+    fn no_credential_was_staged(root: &Path) {
+        for scope in [SecretScope::Machine, SecretScope::User] {
+            let store =
+                PlatformSecretStore::rooted_at(scope, root).expect("a rooted store resolves");
+            let held = store.load().unwrap_or(None);
+            assert!(
+                held.is_none(),
+                "`03-security-and-lifecycle.md` guarantee 5: a failed handoff leaves no \
+                 credential copy, and the {scope}-scoped store holds one"
+            );
+        }
+    }
+
+    // -- the sink ----------------------------------------------------------
+
+    /// A sink that records what it was handed, or refuses.
+    struct RecordingSink {
+        /// What [`SecretSink::send`] received, exposed so the test can prove
+        /// which credential was delivered.
+        delivered: Option<String>,
+        calls: usize,
+        refuse: Option<SecretSinkError>,
+    }
+
+    impl RecordingSink {
+        fn accepting() -> Self {
+            Self {
+                delivered: None,
+                calls: 0,
+                refuse: None,
+            }
+        }
+
+        fn refusing(error: SecretSinkError) -> Self {
+            Self {
+                delivered: None,
+                calls: 0,
+                refuse: Some(error),
+            }
+        }
+    }
+
+    impl SecretSink for RecordingSink {
+        fn send(&mut self, document: &SecretString) -> Result<(), SecretSinkError> {
+            self.calls += 1;
+            if let Some(error) = self.refuse.take() {
+                return Err(error);
+            }
+            self.delivered = Some(document.expose_secret().to_string());
+            Ok(())
+        }
+    }
+
+    // -- the device-flow fixture -------------------------------------------
+
+    /// A loopback stand-in for the two device-flow endpoints.
+    ///
+    /// `crates/app` has no `wiremock` dev-dependency and cannot acquire one
+    /// (`a1` owns every manifest), and `tests/support/mod.rs` is unreachable
+    /// from here because this crate has no library target. So this is the same
+    /// answer that module reached, cut down to the two endpoints a broker
+    /// touches: it is not an HTTP server, it is a fixture that answers in
+    /// HTTP/1.1.
+    struct FakeDeviceFlow {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeDeviceFlow {
+        /// Answers `POST /login/device/code` with a code and
+        /// `POST /login/oauth/access_token` with `token_reply`.
+        fn start(token_reply: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is available");
+            let port = listener.local_addr().expect("a bound listener").port();
+            listener
+                .set_nonblocking(true)
+                .expect("the listener must be pollable");
+            let base_url = format!("http://127.0.0.1:{port}/");
+
+            let mut replies = HashMap::new();
+            replies.insert(
+                "/login/device/code".to_string(),
+                format!(
+                    r#"{{"device_code":"b1-fixture-device-code","user_code":"WDJB-MJHT",
+                         "verification_uri":"{base_url}login/device",
+                         "expires_in":900,"interval":0}}"#
+                ),
+            );
+            replies.insert(
+                "/login/oauth/access_token".to_string(),
+                token_reply.to_string(),
+            );
+            let replies = Arc::new(replies);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let worker = {
+                let stop = Arc::clone(&stop);
+                let requests = Arc::clone(&requests);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                // One thread per connection, so a client that
+                                // opens a socket and stalls wedges its own
+                                // request rather than the fixture.
+                                let replies = Arc::clone(&replies);
+                                let requests = Arc::clone(&requests);
+                                std::thread::spawn(move || {
+                                    answer(&stream, &replies, &requests);
+                                });
+                            }
+                            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+
+            Self {
+                base_url,
+                stop,
+                requests,
+                worker: Some(worker),
+            }
+        }
+
+        /// The approving fixture: a pair carrying both WSL canaries.
+        fn approving() -> Self {
+            Self::start(&format!(
+                r#"{{"access_token":"{}","token_type":"bearer","scope":"",
+                     "refresh_token":"{}","expires_in":28800,
+                     "refresh_token_expires_in":15811200}}"#,
+                wsl_access_canary(),
+                wsl_refresh_canary()
+            ))
+        }
+
+        fn endpoints(&self) -> Endpoints {
+            Endpoints::for_test_server(&self.base_url).expect("a loopback base is a valid URL")
+        }
+
+        fn requests_answered(&self) -> usize {
+            self.requests.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for FakeDeviceFlow {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// Reads one HTTP/1.1 request and writes the canned answer.
+    fn answer(stream: &TcpStream, replies: &HashMap<String, String>, requests: &AtomicUsize) {
+        // An accepted socket inherits the listener's non-blocking mode on
+        // Windows and does not on Linux, so it is set explicitly. Without this
+        // the first read returns `WouldBlock`, the fixture answers nothing, and
+        // the failure wears the costume of a flaky product.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+            return;
+        }
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
+        let mut content_length = 0_usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() {
+                return;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        // Drained rather than parsed: the request body carries the device code,
+        // and nothing here has any business looking at it.
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+
+        let response = replies.get(&path).map_or_else(
+            || {
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_string()
+            },
+            |body| {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            },
+        );
+        let mut sink = stream;
+        let _ = sink.write_all(response.as_bytes());
+        let _ = sink.flush();
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+
+    /// A context rooted at `root`, talking to `github`.
+    fn context_against(root: &Path, github: &FakeDeviceFlow) -> Context {
+        Context::rooted_against(root, github.endpoints()).expect("a context rooted at a temp dir")
+    }
+
+    /// A context rooted at `root` with nothing listening on its endpoint.
+    ///
+    /// Port 1 rather than an ephemeral port that was bound and released: a
+    /// released port can be reused by anything else on the machine between the
+    /// release and the test, and this test's whole content is that the
+    /// connection fails.
+    fn context_against_nothing(root: &Path) -> Context {
+        Context::rooted_against(
+            root,
+            Endpoints::for_test_server("http://127.0.0.1:1/").expect("a valid URL"),
+        )
+        .expect("a context rooted at a temp dir")
+    }
+
+    // -- receive: what it refuses ------------------------------------------
+
+    /// The paste workflow this endpoint exists to make impossible.
+    #[test]
+    fn receive_refuses_a_terminal_and_accepts_a_pipe() {
+        let refusal = refuse_a_terminal(true).expect_err("a terminal must be refused");
+        assert_eq!(refusal.class(), Failure::InvalidArgument);
+        assert!(
+            refusal.to_string().contains("pipe"),
+            "the refusal must say what it does take: {refusal}"
+        );
+        assert!(
+            refusal.remedy().is_some_and(|r| r.contains("auth login")),
+            "a person who typed this wanted `auth login`: {refusal:?}"
+        );
+
+        refuse_a_terminal(false).expect("a pipe is the input this endpoint is for");
+    }
+
+    #[test]
+    fn receive_refuses_an_empty_document() {
+        let error = read_credential_document(&mut &b""[..]).expect_err("empty is not a credential");
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert!(error.to_string().contains("empty"), "got: {error}");
+    }
+
+    /// One byte past the ceiling is refused, and the ceiling itself is not.
+    ///
+    /// Both halves, because a limit asserted only from above is indistinguish-
+    /// able from a limit set to zero.
+    #[test]
+    fn receive_refuses_a_document_over_the_ceiling_and_accepts_one_at_it() {
+        let over = vec![b'x'; RECEIVED_DOCUMENT_LIMIT + 1];
+        let error =
+            read_credential_document(&mut over.as_slice()).expect_err("oversized is refused");
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert!(
+            error
+                .to_string()
+                .contains(&RECEIVED_DOCUMENT_LIMIT.to_string()),
+            "the refusal must name the ceiling: {error}"
+        );
+
+        // Exactly at the ceiling, and still a credential: trailing whitespace
+        // is padding JSON permits, so this is the same document at the maximum
+        // size the endpoint accepts.
+        let mut at_the_ceiling = document(&wsl_access_canary(), &wsl_refresh_canary());
+        assert!(at_the_ceiling.len() < RECEIVED_DOCUMENT_LIMIT);
+        at_the_ceiling.push_str(&" ".repeat(RECEIVED_DOCUMENT_LIMIT - at_the_ceiling.len()));
+        assert_eq!(at_the_ceiling.len(), RECEIVED_DOCUMENT_LIMIT);
+        read_credential_document(&mut at_the_ceiling.as_bytes())
+            .expect("a document exactly at the ceiling is within it");
+    }
+
+    /// Every shape that is not the credential envelope, including the two a
+    /// permissive reader would have accepted.
+    #[test]
+    fn receive_refuses_a_malformed_document() {
+        // The one that matters most is the bare token:
+        // `UserAccessToken::from_stored_document` reads any non-JSON value as a
+        // pre-0.1.11 access token and cannot fail, so an endpoint that trusted
+        // it would accept an HTML error page or half a log file as somebody's
+        // credential and store it.
+        let bare_token = format!("{}{}", "ghu_", "looksLikeAToken");
+        let refused: Vec<(&str, &str)> = vec![
+            ("prose", "not a credential at all"),
+            (
+                "an HTML error page",
+                "<html><body>502 Bad Gateway</body></html>",
+            ),
+            ("a bare token", bare_token.as_str()),
+            ("an object with no access token", r#"{"refresh_token":"x"}"#),
+            ("an empty access token", r#"{"access_token":""}"#),
+            ("a blank access token", r#"{"access_token":"   "}"#),
+            // serde's derived struct deserializer takes a sequence
+            // positionally, so this one is accepted by the obvious
+            // implementation and is why the validator reads a `Value`.
+            ("a JSON array", r#"["access_token"]"#),
+            ("a numeric access token", r#"{"access_token":1234}"#),
+            ("a null access token", r#"{"access_token":null}"#),
+            ("a JSON string", r#""just a string""#),
+            ("a truncated document", r#"{"access_token":"gh"#),
+        ];
+        for (what, raw) in refused {
+            let error = read_credential_document(&mut raw.as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused and was accepted"));
+            assert_eq!(error.class(), Failure::InvalidArgument, "{what}: {error}");
+            assert!(
+                error.to_string().contains("Nothing was stored"),
+                "{what} must say that nothing was stored: {error}"
+            );
+        }
+    }
+
+    /// Not valid UTF-8 is refused, and the bytes are reported only by count.
+    #[test]
+    fn receive_refuses_bytes_that_are_not_text() {
+        let error = read_credential_document(&mut &[0xff_u8, 0xfe, 0xfd][..])
+            .expect_err("arbitrary bytes are not a credential document");
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert!(error.to_string().contains("3 bytes"), "got: {error}");
+    }
+
+    /// A refusal never quotes what it refused.
+    ///
+    /// `serde_json` reports the input around the offending byte, and a
+    /// document that fails to parse can still be a credential — a truncated
+    /// write, a stray byte. Quoting it would put the token into an
+    /// operator-facing error and into this process's log, which is the leak
+    /// `03-security-and-lifecycle.md` guarantee 3 forbids.
+    #[test]
+    fn a_refusal_never_quotes_the_document_it_refused() {
+        let truncated = format!(
+            r#"{{"access_token":"{}","refresh_token":"{}"#,
+            wsl_access_canary(),
+            wsl_refresh_canary()
+        );
+        let error = read_credential_document(&mut truncated.as_bytes())
+            .expect_err("a truncated document is refused");
+        let rendered = format!("{error} {error:?} {:?}", error.remedy());
+        for (name, canary) in every_canary() {
+            assert!(
+                !rendered.contains(&canary),
+                "{name} was quoted back by the refusal: {rendered}"
+            );
+        }
+    }
+
+    // -- receive: what it stores -------------------------------------------
+
+    /// `b1` Definition of Done 3.
+    #[test]
+    fn a_valid_pair_round_trips_into_a_rooted_store_with_its_renewal_intact() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted store resolves");
+
+        let received = read_credential_document(
+            &mut document(&wsl_access_canary(), &wsl_refresh_canary()).as_bytes(),
+        )
+        .expect("a well-formed pair is accepted");
+
+        let mut report = Vec::new();
+        store_received_credential(&store, &received, &mut report).expect("the store takes it");
+
+        let held = store
+            .load()
+            .expect("the store reads back")
+            .expect("a credential is there");
+        let token = UserAccessToken::from_stored_document(&held);
+        assert_eq!(token.secret().expose_secret(), wsl_access_canary());
+        let renewal = token.renewal().expect("the refresh half survived the trip");
+        assert_eq!(
+            renewal.refresh_token().expose_secret(),
+            wsl_refresh_canary()
+        );
+        assert_eq!(
+            renewal.access_expires_at.map(|at| at.to_rfc3339()),
+            Some("2026-09-06T20:00:00+00:00".to_string()),
+            "the access token's expiry is renewal metadata and must survive"
+        );
+        assert_eq!(
+            renewal.refresh_expires_at.map(|at| at.to_rfc3339()),
+            Some("2027-03-05T12:00:00+00:00".to_string()),
+            "the refresh token's expiry is what says when an interactive sign-in is due"
+        );
+
+        // The report says it renews and when, and names no part of the value.
+        let report = String::from_utf8(report).expect("the report is text");
+        assert!(report.contains("renews itself"), "got: {report}");
+        no_canary_escaped(&report, root.path(), &|path| path.contains("secrets"));
+    }
+
+    /// A document with no refresh half is still a credential, and says so.
+    #[test]
+    fn a_pair_without_a_refresh_half_is_reported_as_unrenewable() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted store resolves");
+        let received = read_credential_document(
+            &mut format!(r#"{{"access_token":"{}"}}"#, wsl_access_canary()).as_bytes(),
+        )
+        .expect("an access token alone is the shape an App with expiry off issues");
+
+        let mut report = Vec::new();
+        store_received_credential(&store, &received, &mut report).expect("the store takes it");
+        let report = String::from_utf8(report).expect("the report is text");
+        assert!(
+            report.contains("no renewal half") && report.contains("interactive sign-in"),
+            "an unrenewable credential must say what replaces it: {report}"
+        );
+    }
+
+    /// `b1` Definition of Done 2's last clause: a store that will not take the
+    /// value is reported precisely, and nothing usable is left behind.
+    #[test]
+    fn a_store_that_refuses_leaves_nothing_and_says_which_store() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        // The scope's directory, occupied by a file. Every backend puts its
+        // item inside `<root>/secrets/<scope>/`, so creating the directory is
+        // the first thing a write does and it cannot succeed here. Portable:
+        // no permission model is involved, and it needs no privilege to set up.
+        let secrets = root.path().join("secrets");
+        std::fs::create_dir_all(&secrets).expect("the secrets directory is created");
+        std::fs::write(secrets.join("machine"), b"not a directory")
+            .expect("the scope directory is occupied");
+
+        let store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted store still resolves; only the write fails");
+        let received = read_credential_document(
+            &mut document(&wsl_access_canary(), &wsl_refresh_canary()).as_bytes(),
+        )
+        .expect("the document itself is fine");
+
+        let mut report = Vec::new();
+        let error = store_received_credential(&store, &received, &mut report)
+            .expect_err("the store cannot take it");
+        assert_eq!(error.class(), Failure::SecretStore);
+        assert!(
+            error.remedy().is_some(),
+            "a store failure names what to do next: {error:?}"
+        );
+        assert!(
+            report.is_empty(),
+            "nothing is reported about a credential that was not stored"
+        );
+        no_canary_escaped(&format!("{error} {error:?}"), root.path(), &|_| false);
+    }
+
+    // -- the broker: what it delivers --------------------------------------
+
+    /// The handoff itself: the document goes to the sink, and what comes back
+    /// is metadata.
+    #[test]
+    fn the_broker_hands_the_document_to_the_sink_and_returns_only_metadata() {
+        let token = UserAccessToken::from_stored_document(&SecretString::from(document(
+            &wsl_access_canary(),
+            &wsl_refresh_canary(),
+        )));
+        let mut sink = RecordingSink::accepting();
+
+        let metadata = deliver_user_credential(&token, &mut sink).expect("the sink takes it");
+
+        assert_eq!(sink.calls, 1, "the document is sent exactly once");
+        let delivered = sink.delivered.expect("the sink received a document");
+        assert!(delivered.contains(&wsl_access_canary()));
+        assert!(delivered.contains(&wsl_refresh_canary()));
+        assert!(
+            !delivered.contains(&windows_access_canary())
+                && !delivered.contains(&windows_refresh_canary()),
+            "nothing of the Windows credential may travel"
+        );
+
+        assert!(metadata.renewable);
+        assert!(metadata.access_expires_at.is_some());
+        assert!(metadata.refresh_expires_at.is_some());
+        // The metadata is the *whole* of what a caller gets back, and it is
+        // printed by `wsl install`. It must survive being formatted.
+        let rendered = format!("{metadata} {metadata:?}");
+        for (name, canary) in every_canary() {
+            assert!(!rendered.contains(&canary), "{name} reached the metadata");
+        }
+    }
+
+    /// `b1` Definition of Done 4.
+    ///
+    /// The Windows store holds a complete, valid credential throughout. The
+    /// broker issues a different one and delivers it, and the planted pair is
+    /// neither read nor replaced nor printed.
+    #[test]
+    fn the_broker_issues_a_new_pair_and_never_touches_the_active_windows_store() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let windows_store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted store resolves");
+        let planted = document(&windows_access_canary(), &windows_refresh_canary());
+        windows_store
+            .store(&SecretString::from(planted.clone()))
+            .expect("the active Windows credential is in place");
+
+        let github = FakeDeviceFlow::approving();
+        let context = context_against(root.path(), &github);
+        let mut sink = RecordingSink::accepting();
+        let mut transcript = Vec::new();
+
+        let metadata =
+            broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
+                .expect("the broker issues and delivers a credential");
+
+        // What was delivered is the pair GitHub just issued, and only it.
+        let delivered = sink.delivered.expect("the sink received a document");
+        assert!(
+            delivered.contains(&wsl_access_canary()) && delivered.contains(&wsl_refresh_canary()),
+            "the WSL host must receive the pair issued for it"
+        );
+        assert!(
+            !delivered.contains(&windows_access_canary())
+                && !delivered.contains(&windows_refresh_canary()),
+            "`03-security-and-lifecycle.md` guarantee 2: the active Windows credential is \
+             never read for transfer"
+        );
+        assert!(metadata.renewable, "the fixture issued a refresh half");
+
+        // The active store is exactly as it was: not replaced, and not joined
+        // by a staging copy in the other scope.
+        let still_there = windows_store
+            .load()
+            .expect("the active store reads back")
+            .expect("the active credential is still there");
+        assert_eq!(
+            still_there.expose_secret(),
+            planted,
+            "the Windows store was written to by a handoff that has no business touching it"
+        );
+        let user_scope = PlatformSecretStore::rooted_at(SecretScope::User, root.path())
+            .expect("a rooted store resolves");
+        assert!(
+            user_scope.load().unwrap_or(None).is_none(),
+            "the handoff staged a credential in the other scope"
+        );
+
+        // Nothing leaked: not the pair that was issued, and not the pair that
+        // was sitting there. The store is the one place a canary may be.
+        let transcript = String::from_utf8(transcript).expect("the transcript is text");
+        no_canary_escaped(&transcript, root.path(), &|path| path.contains("secrets"));
+    }
+
+    /// The proof that the active store is *never loaded*, rather than merely
+    /// not leaked.
+    ///
+    /// The store is left holding bytes it cannot read back — a corrupt DPAPI
+    /// blob, a corrupt keychain item, a file that is not the value. Any code
+    /// path that consulted the Windows credential on the way to issuing a new
+    /// one would fail here. This one does not notice.
+    #[test]
+    fn the_broker_succeeds_when_the_active_windows_store_cannot_even_be_read() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let windows_store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+            .expect("a rooted store resolves");
+        windows_store
+            .store(&SecretString::from(document(
+                &windows_access_canary(),
+                &windows_refresh_canary(),
+            )))
+            .expect("the active Windows credential is in place");
+        // Overwritten in place, so the store's own location is corrupt rather
+        // than absent: absence would be indistinguishable from a store that was
+        // read successfully and found empty.
+        let guard = windows_store.guard();
+        std::fs::write(&guard, [0x00_u8, 0xff, 0x00, 0xff]).expect("the store is corrupted");
+        assert!(
+            windows_store.load().is_err() || windows_store.load().unwrap_or(None).is_none(),
+            "the corrupted store must not read back as a usable credential"
+        );
+
+        let github = FakeDeviceFlow::approving();
+        let context = context_against(root.path(), &github);
+        let mut sink = RecordingSink::accepting();
+        let mut transcript = Vec::new();
+
+        broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
+            .expect("issuing a new credential does not depend on reading the old one");
+        assert!(
+            sink.delivered
+                .is_some_and(|d| d.contains(&wsl_access_canary())),
+            "the WSL host still receives its own newly issued pair"
+        );
+    }
+
+    // -- the broker: every failing stage -----------------------------------
+
+    /// `b1` Definition of Done 5, stage 1: the device flow cannot start.
+    #[test]
+    fn a_device_flow_that_cannot_reach_github_stages_nothing() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let context = context_against_nothing(root.path());
+        let mut sink = RecordingSink::accepting();
+        let mut transcript = Vec::new();
+
+        let error = broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
+            .expect_err("nothing is listening");
+        assert_eq!(error.class(), Failure::GithubUnavailable);
+        assert_eq!(
+            sink.calls, 0,
+            "a sink is not offered a credential there is none of"
+        );
+        no_credential_was_staged(root.path());
+        no_canary_escaped(
+            &String::from_utf8(transcript).expect("the transcript is text"),
+            root.path(),
+            &|_| false,
+        );
+    }
+
+    /// `b1` Definition of Done 5, stage 2: the login is declined on GitHub.
+    ///
+    /// The prompt has been printed by now and the operator has been to the
+    /// page, which makes this the stage where a staging write would be easiest
+    /// to leave behind.
+    #[test]
+    fn a_declined_login_stages_nothing() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let github = FakeDeviceFlow::start(r#"{"error":"access_denied"}"#);
+        let context = context_against(root.path(), &github);
+        let mut sink = RecordingSink::accepting();
+        let mut transcript = Vec::new();
+
+        let error = broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
+            .expect_err("the login was declined");
+        assert_eq!(error.class(), Failure::AuthenticationDeclined);
+        assert_eq!(sink.calls, 0);
+        assert!(
+            github.requests_answered() >= 2,
+            "the flow must actually have started and been polled, or this proves nothing"
+        );
+        no_credential_was_staged(root.path());
+        no_canary_escaped(
+            &String::from_utf8(transcript).expect("the transcript is text"),
+            root.path(),
+            &|_| false,
+        );
+    }
+
+    /// `b1` Definition of Done 5, stage 3: the sink refuses.
+    ///
+    /// The worst stage: a live, newly issued pair exists in memory and its
+    /// destination has just gone away. The credential is dropped rather than
+    /// written down, which costs one device flow and is the only answer that
+    /// keeps guarantee 5 true.
+    #[test]
+    fn a_sink_that_refuses_stages_nothing() {
+        for refusal in [
+            SecretSinkError::Undeliverable {
+                destination: "the WSL distribution `Ubuntu`".to_string(),
+                reason: "the distribution is not running".to_string(),
+            },
+            SecretSinkError::Refused {
+                destination: "the WSL distribution `Ubuntu`".to_string(),
+                reason: "its secret store is not writable by root".to_string(),
+            },
+        ] {
+            let root = tempfile::tempdir().expect("a temporary directory");
+            let github = FakeDeviceFlow::approving();
+            let context = context_against(root.path(), &github);
+            let mut sink = RecordingSink::refusing(refusal);
+            let mut transcript = Vec::new();
+
+            let error =
+                broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
+                    .expect_err("the sink refused");
+            assert_eq!(error.class(), Failure::SecretStore);
+            assert!(
+                error.remedy().is_some(),
+                "a handoff failure names what to do next: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("Ubuntu"),
+                "the failure names the host that did not get it: {error}"
+            );
+            assert_eq!(sink.calls, 1, "the document was offered exactly once");
+            no_credential_was_staged(root.path());
+            no_canary_escaped(
+                &format!(
+                    "{error} {error:?} {}",
+                    String::from_utf8(transcript).expect("the transcript is text")
+                ),
+                root.path(),
+                &|_| false,
+            );
+        }
     }
 
     // -- logout ------------------------------------------------------------
