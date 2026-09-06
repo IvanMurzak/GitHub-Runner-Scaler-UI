@@ -45,10 +45,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::WslError;
-use super::discovery::validate_distribution_name;
+use super::discovery::{escaped_name_with_digest, validate_distribution_name};
 use crate::paths::AppPaths;
 
 /// The schema this version writes and is willing to read.
@@ -56,12 +55,6 @@ pub const PROVIDER_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// The directory, under the config directory, that holds the records.
 pub const PROVIDER_RECORD_DIR: &str = "wsl-providers";
-
-/// How many characters of the escaped distribution name go into a file name.
-const ESCAPED_NAME_BUDGET: usize = 48;
-
-/// How many hex characters of the name's SHA-256 are appended.
-const DIGEST_SUFFIX_LENGTH: usize = 8;
 
 /// One managed WSL distribution, as this workstation last saw it.
 ///
@@ -107,16 +100,16 @@ impl WslProviderRecord {
 
     /// Where one distribution's record lives.
     ///
-    /// The file name is derived the same way the task name is — escaped for
-    /// readability, then suffixed with a digest so that two distributions
-    /// whose names escape alike cannot share a file.
+    /// The file name is derived the same way the task name is, by the same
+    /// function — [`super::discovery::escaped_name_with_digest`] — so two
+    /// distributions whose names escape alike cannot share a file.
     ///
     /// # Errors
     ///
     /// [`WslError::InvalidName`] for a distribution name that cannot be used.
     pub fn path(paths: &AppPaths, distribution: &str) -> Result<PathBuf, WslError> {
         validate_distribution_name(distribution)?;
-        Ok(Self::directory(paths).join(format!("{}.toml", file_stem(distribution))))
+        Ok(Self::directory(paths).join(format!("{}.toml", escaped_name_with_digest(distribution))))
     }
 
     /// Reads a distribution's record, if there is one.
@@ -285,23 +278,6 @@ impl WslProviderRecord {
     }
 }
 
-/// The file name stem for a distribution: readable, then made injective.
-fn file_stem(distribution: &str) -> String {
-    let escaped: String = distribution
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(ESCAPED_NAME_BUDGET)
-        .collect();
-    let digest = hex::encode(Sha256::digest(distribution.as_bytes()));
-    format!("{escaped}-{}", &digest[..DIGEST_SUFFIX_LENGTH])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,8 +403,8 @@ mod tests {
         // `..`, `/` and `\` are all legal in a WSL distribution name -- WSL
         // itself is happy with `Debian GNU/Linux 12` -- so a file name built
         // from one naively would write outside the record directory. The
-        // escaping in `file_stem` is what stops that, and this is the property
-        // it exists for.
+        // escaping in `escaped_name_with_digest` is what stops that, and this
+        // is the property it exists for.
         let (root, paths) = paths();
         for hostile in [
             "../../escape",

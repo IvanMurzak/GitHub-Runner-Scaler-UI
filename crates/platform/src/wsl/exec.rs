@@ -234,7 +234,12 @@ impl Default for OutputLimits {
 ///
 /// There is no `env`, no `current_dir`, and no shell. See the module
 /// documentation for why each absence is a control rather than an omission.
-#[derive(Default)]
+///
+/// There is no `Default` either, and that absence is the same kind of control:
+/// `Duration`'s default is zero, so a defaulted request would carry a deadline
+/// that has already passed and kill every child at the first poll.
+/// [`CommandRequest::new`] is the only way to build one, and it starts from
+/// [`DEFAULT_TIMEOUT`].
 pub struct CommandRequest {
     program: PathBuf,
     arguments: Vec<OsString>,

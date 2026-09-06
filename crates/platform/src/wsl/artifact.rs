@@ -316,11 +316,21 @@ pub fn sha256_of_file(path: &Path) -> Result<String, WslError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Reads an archive into memory once its digest matches the published one.
+/// Reads an archive into memory and returns it only if it is the published one.
 ///
-/// The order is the whole control: the file is hashed, the hash is compared,
-/// and only then are the bytes loaded to be piped. A mismatch returns before
-/// anything has been sent anywhere.
+/// # The bytes that are hashed are the bytes that are piped
+///
+/// The file is read **once**, and the digest is taken over the buffer that the
+/// caller then hands to `tar`. Hashing the file and re-reading it afterwards
+/// would verify one read and install another: anything that replaced the file
+/// between the two — a shared temporary directory, a half-finished download
+/// still being written — would be installed unverified. Reading once removes
+/// the window rather than narrowing it, and costs one pass over the file
+/// instead of two.
+///
+/// The size is checked from the metadata first, so a caller that hands over a
+/// disk image by mistake is refused with a sentence rather than with a
+/// quarter-gigabyte allocation.
 ///
 /// # Errors
 ///
@@ -331,20 +341,27 @@ pub fn read_verified_archive(
     path: &Path,
     artifact: &PublishedArtifact,
 ) -> Result<Vec<u8>, WslError> {
-    let metadata = std::fs::metadata(path).map_err(|error| WslError::UnreadableArchive {
+    let unreadable = |detail: String| WslError::UnreadableArchive {
         path: path.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+        detail,
+    };
+    let metadata = std::fs::metadata(path).map_err(|error| unreadable(error.to_string()))?;
+    let too_large = |length: u64| {
+        unreadable(format!(
+            "it is {length} bytes, and this refuses to pipe anything larger than \
+             {MAX_ARCHIVE_BYTES}"
+        ))
+    };
     if metadata.len() > MAX_ARCHIVE_BYTES {
-        return Err(WslError::UnreadableArchive {
-            path: path.to_path_buf(),
-            detail: format!(
-                "it is {} bytes, and this refuses to pipe anything larger than {MAX_ARCHIVE_BYTES}",
-                metadata.len()
-            ),
-        });
+        return Err(too_large(metadata.len()));
     }
-    let actual = sha256_of_file(path)?;
+    let bytes = std::fs::read(path).map_err(|error| unreadable(error.to_string()))?;
+    // Checked again against what was really read: the file may have grown
+    // between the metadata call and the read.
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        return Err(too_large(bytes.len() as u64));
+    }
+    let actual = hex::encode(Sha256::digest(&bytes));
     if actual != artifact.digest {
         return Err(WslError::DigestMismatch {
             path: path.to_path_buf(),
@@ -352,10 +369,7 @@ pub fn read_verified_archive(
             actual,
         });
     }
-    std::fs::read(path).map_err(|error| WslError::UnreadableArchive {
-        path: path.to_path_buf(),
-        detail: error.to_string(),
-    })
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +584,11 @@ impl<'invoker> BinaryInstaller<'invoker> {
         artifact: &PublishedArtifact,
         target: &ReleaseTarget,
     ) -> Result<InstalledBinary, WslError> {
-        let staged = format!("{staging}/{}", target.binary());
+        // The member is named with the directory it really sits in. Asking
+        // `tar` for a bare `runner-manager` would match nothing at all and the
+        // install would fail on every real archive; see [`archive_member`].
+        let member = archive_member(artifact, target);
+        let staged = format!("{staging}/{member}");
 
         // `--no-same-owner` because the archive's recorded ownership is the
         // release runner's, not this distribution's, and root would otherwise
@@ -586,7 +604,7 @@ impl<'invoker> BinaryInstaller<'invoker> {
                     "-C",
                     staging,
                     "--no-same-owner",
-                    target.binary(),
+                    member.as_str(),
                 ])
                 .with_input(ChildInput::Piped(PipedInput::from_bytes(bytes)))
                 .with_timeout(EXTRACT_TIMEOUT),
@@ -630,6 +648,29 @@ impl<'invoker> BinaryInstaller<'invoker> {
     fn command(&self, program: &str) -> LinuxCommand {
         LinuxCommand::new(self.distribution.clone(), program)
     }
+}
+
+/// The path of the binary **inside** the published archive.
+///
+/// `release.yml` packages every archive as `tar -czf <stem>.tar.gz -C dist
+/// <stem>`, where the stem is `runner-manager-<version>-<triple>` — so the one
+/// top-level entry is a directory of that name and the binary is directly
+/// inside it. `crates/app/src/cli/update.rs` extracts exactly this path, and
+/// `the_archive_member_is_the_path_the_release_really_packages` below is the
+/// test that keeps the two spellings equal.
+///
+/// Naming the member with its directory is also why the staged file is at
+/// `<staging>/<member>` rather than at `<staging>/runner-manager`: `tar`
+/// recreates the intermediate directory, and the rename onto the destination
+/// is still within the destination's own filesystem, so it is still atomic.
+#[must_use]
+fn archive_member(artifact: &PublishedArtifact, target: &ReleaseTarget) -> String {
+    format!(
+        "runner-manager-{}-{}/{}",
+        artifact.version(),
+        target.triple(),
+        target.binary()
+    )
 }
 
 /// Whether `--version` output names exactly this version.
@@ -808,6 +849,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_archive_member_is_the_path_the_release_really_packages() {
+        // `release.yml` builds `dist/<stem>/runner-manager` and packages it
+        // with `tar -czf <stem>.tar.gz -C dist <stem>`, so the member's
+        // directory is the asset name without its extension. A bare
+        // `runner-manager` matches no member at all, and every install would
+        // then fail at the extract step with "not found in archive".
+        let artifact = select_exact_release(&sums(), &x64(), "0.4.0").expect("published");
+        let member = archive_member(&artifact, &x64());
+        let stem = artifact
+            .asset()
+            .strip_suffix(&format!(".{}", x64().extension()))
+            .expect("the asset name carries the target's extension");
+        assert_eq!(member, format!("{stem}/{}", x64().binary()));
+        assert_eq!(
+            member,
+            "runner-manager-0.4.0-x86_64-unknown-linux-gnu/runner-manager"
+        );
+    }
+
     // -- Digest --------------------------------------------------------------
 
     fn write_archive(directory: &Path, bytes: &[u8]) -> (PathBuf, String) {
@@ -829,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_whose_digest_does_not_match_is_never_read_into_memory() {
+    fn an_archive_whose_digest_does_not_match_is_never_returned_to_be_piped() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let (path, _) = write_archive(directory.path(), b"not the published bytes");
         let artifact = PublishedArtifact {
@@ -937,32 +998,15 @@ mod tests {
         assert_eq!(installed.version(), "0.4.0");
 
         let staging = "/usr/local/bin/.runner-manager-install-token";
+        let member = "runner-manager-0.4.0-x86_64-unknown-linux-gnu/runner-manager";
+        let staged = format!("{staging}/{member}");
+        let staged = staged.as_str();
         let expected: Vec<Vec<String>> = vec![
             vec!["mkdir", "-m", "0700", staging],
-            vec![
-                "tar",
-                "-xzf",
-                "-",
-                "-C",
-                staging,
-                "--no-same-owner",
-                "runner-manager",
-            ],
-            vec![
-                "chmod",
-                "0755",
-                "/usr/local/bin/.runner-manager-install-token/runner-manager",
-            ],
-            vec![
-                "/usr/local/bin/.runner-manager-install-token/runner-manager",
-                "--version",
-            ],
-            vec![
-                "mv",
-                "-T",
-                "/usr/local/bin/.runner-manager-install-token/runner-manager",
-                DEFAULT_LINUX_DESTINATION,
-            ],
+            vec!["tar", "-xzf", "-", "-C", staging, "--no-same-owner", member],
+            vec!["chmod", "0755", staged],
+            vec![staged, "--version"],
+            vec!["mv", "-T", staged, DEFAULT_LINUX_DESTINATION],
             vec!["rm", "-rf", staging],
         ]
         .into_iter()

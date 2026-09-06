@@ -53,6 +53,8 @@
 //! header row falls out of the same rule for free, because `VERSION` does not
 //! parse as a number.
 
+use sha2::{Digest, Sha256};
+
 use super::WslError;
 
 /// How [`decode_console_output`] read the bytes.
@@ -251,6 +253,44 @@ pub fn validate_distribution_name(name: &str) -> Result<(), WslError> {
         );
     }
     Ok(())
+}
+
+/// How many characters of the escaped distribution name go into an identifier
+/// derived from it.
+pub(crate) const ESCAPED_NAME_BUDGET: usize = 48;
+
+/// How many hex characters of the name's SHA-256 are appended to it.
+pub(crate) const DIGEST_SUFFIX_LENGTH: usize = 8;
+
+/// A distribution name turned into an identifier that a file system and Task
+/// Scheduler will both accept: readable, bounded, and injective.
+///
+/// Both halves are load-bearing. Task Scheduler refuses `\ / : * ? " < > |` in
+/// a name and a file name may hold neither those nor `..`, while a
+/// distribution may legitimately contain several of them — `Debian GNU/Linux
+/// 12` does. Escaping alone would map `Debian GNU/Linux` and `Debian GNU:Linux`
+/// onto one identifier, which is two distributions quietly sharing one task and
+/// one record; the digest suffix is what makes the mapping injective, and the
+/// escaped prefix is what makes it readable in `taskschd.msc` and in a
+/// directory listing.
+///
+/// One function rather than one per caller: [`super::task`] and
+/// [`super::record`] must agree about which distribution an identifier belongs
+/// to, and two copies of this rule is how they would stop agreeing.
+pub(crate) fn escaped_name_with_digest(distribution: &str) -> String {
+    let escaped: String = distribution
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(ESCAPED_NAME_BUDGET)
+        .collect();
+    let digest = hex::encode(Sha256::digest(distribution.as_bytes()));
+    format!("{escaped}-{}", &digest[..DIGEST_SUFFIX_LENGTH])
 }
 
 // ---------------------------------------------------------------------------

@@ -53,13 +53,13 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use super::WslError;
-use super::discovery::{decode_console_output, validate_distribution_name};
+use super::discovery::{
+    decode_console_output, escaped_name_with_digest, validate_distribution_name,
+};
 use super::exec::{CommandRequest, CommandRunner};
 use super::probe::{LINUX_USER, WslExecutable, locate_in_system32};
-use crate::service::{TaskPrincipal, quote_argument, xml_escape, xml_unescape};
+use crate::service::{TaskPrincipal, quote_argument, xml_escape, xml_value};
 
 /// The prefix every product-owned lifecycle task name starts with.
 pub const LIFECYCLE_TASK_PREFIX: &str = "runner-manager-wsl";
@@ -78,15 +78,6 @@ pub const PRODUCT_MARKER: &str = "runner-manager-wsl-lifecycle/v1";
 /// signal-aware shutdown so WSL does not retire the distribution".
 pub const HOLD_ARGUMENTS: [&str; 2] = ["wsl-host", "hold"];
 
-/// How many characters of the escaped distribution name go into a task name.
-///
-/// The remainder is covered by the digest suffix, so truncation cannot make
-/// two distributions share a task.
-const ESCAPED_NAME_BUDGET: usize = 48;
-
-/// How many hex characters of the name's SHA-256 are appended.
-const DIGEST_SUFFIX_LENGTH: usize = 8;
-
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -103,35 +94,22 @@ impl LifecycleTaskIdentity {
     ///
     /// # The name is escaped *and* hashed, and both halves are load-bearing
     ///
-    /// Task Scheduler refuses `\ / : * ? " < > |` in a name, and a
-    /// distribution may legitimately contain several of them —
-    /// `Debian GNU/Linux 12` does. Escaping alone would map
+    /// See [`escaped_name_with_digest`], which is also what
+    /// [`super::record`] names its files with: escaping alone would map
     /// `Debian GNU/Linux` and `Debian GNU:Linux` onto one task, which is two
-    /// distributions quietly sharing one keep-alive. The digest suffix is what
-    /// makes the mapping injective; the escaped prefix is what makes the name
-    /// readable in `taskschd.msc`.
+    /// distributions quietly sharing one keep-alive.
     ///
     /// # Errors
     ///
     /// [`WslError::InvalidName`] for a name that cannot be used at all.
     pub fn for_distribution(distribution: &str) -> Result<Self, WslError> {
         validate_distribution_name(distribution)?;
-        let escaped: String = distribution
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .take(ESCAPED_NAME_BUDGET)
-            .collect();
-        let digest = hex::encode(Sha256::digest(distribution.as_bytes()));
-        let suffix = &digest[..DIGEST_SUFFIX_LENGTH];
         Ok(Self {
             distribution: distribution.to_string(),
-            name: format!("{LIFECYCLE_TASK_PREFIX}-{escaped}-{suffix}"),
+            name: format!(
+                "{LIFECYCLE_TASK_PREFIX}-{}",
+                escaped_name_with_digest(distribution)
+            ),
         })
     }
 
@@ -344,11 +322,11 @@ impl RegisteredTask {
     pub fn from_document(name: &str, document: &str, running: bool) -> Self {
         Self {
             name: name.to_string(),
-            command: element(document, "Command").unwrap_or_default(),
-            arguments: element(document, "Arguments").unwrap_or_default(),
-            account: element(document, "UserId"),
-            description: element(document, "Description").unwrap_or_default(),
-            enabled: element(document, "Enabled").as_deref() != Some("false"),
+            command: xml_value(document, "Command").unwrap_or_default(),
+            arguments: xml_value(document, "Arguments").unwrap_or_default(),
+            account: xml_value(document, "UserId"),
+            description: xml_value(document, "Description").unwrap_or_default(),
+            enabled: task_is_enabled(document),
             running,
         }
     }
@@ -415,19 +393,22 @@ impl RegisteredTask {
     }
 }
 
-/// The text of the first `<name>…</name>` element, unescaped.
+/// Whether the *task* is enabled, which is not the first `<Enabled>` in the
+/// document.
 ///
-/// A deliberately small reader rather than an XML parser: the four values this
-/// needs are single-line elements Task Scheduler writes itself, and a
-/// dependency on a full parser to read them would be a much larger surface for
-/// a much smaller job. Anything it cannot find is `None`, which every caller
-/// treats as "the task does not say".
-fn element(document: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = document.find(&open)? + open.len();
-    let end = document[start..].find(&close)? + start;
-    Some(xml_unescape(document[start..end].trim()))
+/// A task has an `<Enabled>` inside its trigger and another inside its
+/// `<Settings>`, in that order, and it is the second one that Task Scheduler
+/// turns to `false` when an operator disables the task. Reading the first
+/// would report a task somebody switched off in `taskschd.msc` as enabled,
+/// which is the opposite of what a status line is for.
+///
+/// A document with no `<Settings>` at all — a hand-made task, or a fragment —
+/// is read as enabled, which is what an absent setting means to Windows.
+fn task_is_enabled(document: &str) -> bool {
+    let settings = document
+        .find("<Settings>")
+        .map_or(document, |start| &document[start..]);
+    xml_value(settings, "Enabled").as_deref() != Some("false")
 }
 
 // ---------------------------------------------------------------------------
@@ -489,10 +470,12 @@ impl<'runner> LifecycleTaskControl<'runner> {
         let output = self.schtasks(&["/Query", "/TN", identity.name(), "/XML", "ONE"])?;
         if !output.success() {
             // `schtasks` reports "no such task" and "Task Scheduler is broken"
-            // with the same non-zero exit and no distinct code. Reading it as
-            // absence is the safe choice: a caller either registers, which
-            // then fails loudly, or reports "not installed", which is what an
-            // operator with no task sees.
+            // with the same non-zero exit and no distinct code, and the
+            // sentence that would tell them apart is localised. Reading it as
+            // absence is what an operator with no task should see -- but it is
+            // only safe because nothing destructive trusts it on its own:
+            // [`Self::register`] asks [`Self::exists`] for a second, export-free
+            // opinion before it replaces anything.
             return Ok(None);
         }
         let document = decode_console_output(output.stdout()).into_text();
@@ -513,24 +496,45 @@ impl<'runner> LifecycleTaskControl<'runner> {
     /// # Errors
     ///
     /// [`WslError::ForeignTask`] when a task of this name exists and is not
-    /// this product's; [`WslError::TaskControl`] when `schtasks` refused;
+    /// this product's, or exists but cannot be exported and so cannot be shown
+    /// to be this product's; [`WslError::TaskControl`] when `schtasks` refused;
     /// [`WslError::Record`] when the document could not be written to a
     /// temporary file for `schtasks /XML` to read.
     pub fn register(&self, task: &LifecycleTask) -> Result<(), WslError> {
         let identity = task.identity();
-        if let Some(existing) = self.query(identity)?
-            && !existing.is_product_owned()
-        {
-            return Err(WslError::ForeignTask {
-                name: identity.name().to_string(),
-                detail: format!(
-                    "a task of this name already exists, its description does not identify it \
-                     as this product's ({PRODUCT_MARKER}), and it starts `{}`. Rename or \
-                     remove it yourself if it is the hand-created keep-alive this feature \
-                     replaces.",
-                    existing.command()
-                ),
-            });
+        match self.query(identity)? {
+            Some(existing) if !existing.is_product_owned() => {
+                return Err(WslError::ForeignTask {
+                    name: identity.name().to_string(),
+                    detail: format!(
+                        "a task of this name already exists, its description does not identify \
+                         it as this product's ({PRODUCT_MARKER}), and it starts `{}`. Rename or \
+                         remove it yourself if it is the hand-created keep-alive this feature \
+                         replaces.",
+                        existing.command()
+                    ),
+                });
+            }
+            Some(_) => {}
+            // `query` reads *any* `/Query /XML` failure as absence, and
+            // `/Create ... /F` replaces rather than refuses -- so a task that
+            // exists but cannot be exported would be overwritten by the very
+            // call the marker guard above exists to prevent. Ask again in the
+            // one form that answers "is there one" without an export, and
+            // refuse when the two answers disagree.
+            None if self.exists(identity) => {
+                return Err(WslError::ForeignTask {
+                    name: identity.name().to_string(),
+                    detail: format!(
+                        "a task of this name exists but Task Scheduler would not export its \
+                         definition, so it cannot be shown to be this product's \
+                         ({PRODUCT_MARKER}) and registering would replace it. Inspect it in \
+                         `taskschd.msc`, and rename or remove it yourself if it is the \
+                         hand-created keep-alive this feature replaces."
+                    ),
+                });
+            }
+            None => {}
         }
 
         let directory = tempfile::tempdir().map_err(|error| WslError::Record {
@@ -657,6 +661,20 @@ impl<'runner> LifecycleTaskControl<'runner> {
         self.runner.run(&request)
     }
 
+    /// Whether Task Scheduler holds anything at all under this name.
+    ///
+    /// The same plain `/Query` [`Self::is_running`] uses, asked for its exit
+    /// status alone. It answers from the task store rather than from an XML
+    /// export, so it still says yes for a task [`Self::query`] cannot read
+    /// back, and it reads a status rather than a message, so it is unaffected
+    /// by the console's language. `schtasks` failing to run at all is read as
+    /// "nothing", which leaves a caller exactly where it stood before this
+    /// second opinion existed.
+    fn exists(&self, identity: &LifecycleTaskIdentity) -> bool {
+        self.schtasks(&["/Query", "/TN", identity.name(), "/FO", "CSV", "/NH"])
+            .is_ok_and(|output| output.success())
+    }
+
     /// Whether Task Scheduler reports the task as running. See
     /// [`RegisteredTask::running`] for why this is best-effort.
     fn is_running(&self, identity: &LifecycleTaskIdentity) -> bool {
@@ -711,6 +729,7 @@ fn write_utf16(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wsl::discovery::{DIGEST_SUFFIX_LENGTH, ESCAPED_NAME_BUDGET};
     use crate::wsl::exec::{CommandOutput, ScriptedRunner};
 
     fn identity(distribution: &str) -> LifecycleTaskIdentity {
@@ -820,7 +839,7 @@ mod tests {
         // The P1 the 2026-09-06 review closed: an action that composed
         // `systemctl` and a keep-alive through shell text.
         let document = task("Ubuntu & echo pwned").xml();
-        let arguments = element(&document, "Arguments").expect("the document has an action");
+        let arguments = xml_value(&document, "Arguments").expect("the document has an action");
         for shell in ["cmd", "powershell", "/c", "&&", "||", ";", "$(", "`"] {
             assert!(
                 !arguments.contains(shell),
@@ -828,7 +847,7 @@ mod tests {
             );
         }
         assert_eq!(
-            element(&document, "Command").as_deref(),
+            xml_value(&document, "Command").as_deref(),
             Some("C:\\Windows\\System32\\wsl.exe")
         );
         // The `&` in the distribution name survived as data, escaped in the
@@ -856,7 +875,7 @@ mod tests {
     #[test]
     fn the_document_carries_the_ownership_marker_and_names_the_distribution() {
         let document = task("Ubuntu").xml();
-        let description = element(&document, "Description").expect("a description");
+        let description = xml_value(&document, "Description").expect("a description");
         assert!(description.contains(PRODUCT_MARKER), "{description}");
         assert!(description.contains("Ubuntu"), "{description}");
         assert!(description.contains("wsl detach"), "{description}");
@@ -874,6 +893,27 @@ mod tests {
             "{}",
             read.arguments()
         );
+    }
+
+    #[test]
+    fn a_task_an_operator_disabled_is_reported_as_disabled() {
+        // Task Scheduler leaves the *trigger's* `<Enabled>` alone and turns
+        // `<Settings><Enabled>` to `false`, and the trigger's is the first one
+        // in the document — so reading the first would report this task as
+        // enabled and a status line would say the keep-alive is fine.
+        // Anchored on the newline and the settings block's indentation, so
+        // that the trigger's own -- more deeply indented -- element is left
+        // exactly as Task Scheduler leaves it.
+        let disabled = task("Ubuntu").xml().replace(
+            "\n    <Enabled>true</Enabled>\n",
+            "\n    <Enabled>false</Enabled>\n",
+        );
+        assert!(
+            disabled.contains("      <Enabled>true</Enabled>"),
+            "the trigger's own <Enabled> must still be true for this to prove anything"
+        );
+        assert!(!RegisteredTask::from_document("whatever", &disabled, false).enabled());
+        assert!(RegisteredTask::from_document("whatever", &task("Ubuntu").xml(), false).enabled());
     }
 
     #[test]
@@ -924,6 +964,35 @@ mod tests {
         control(&runner)
             .register(&task("Ubuntu"))
             .expect("replaced again");
+    }
+
+    #[test]
+    fn registering_over_a_task_that_cannot_be_exported_refuses_and_changes_nothing() {
+        // `/Create ... /F` replaces, so "the XML query failed" must not be
+        // read as "the name is free": a task Task Scheduler will not export --
+        // the hand-created keep-alive among them -- would be destroyed by the
+        // install that the ownership marker exists to make impossible.
+        let runner = ScriptedRunner::new()
+            .always(
+                "/XML",
+                CommandOutput::exited(1, "", "the task image is corrupt"),
+            )
+            .always(
+                "/FO",
+                CommandOutput::exited(0, "\"whatever\",\"N/A\",\"Ready\"", ""),
+            );
+        let error = control(&runner)
+            .register(&task("Ubuntu"))
+            .expect_err("an unexportable task is not a free name");
+        assert!(matches!(error, WslError::ForeignTask { .. }), "{error:?}");
+        assert!(
+            runner
+                .command_lines()
+                .iter()
+                .all(|line| !line.contains("/Create")),
+            "nothing may be written: {:?}",
+            runner.command_lines()
+        );
     }
 
     #[test]
