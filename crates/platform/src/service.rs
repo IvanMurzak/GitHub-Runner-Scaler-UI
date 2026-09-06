@@ -1206,7 +1206,7 @@ fn running_executable() -> Result<PathBuf, ServiceError> {
 /// arguments in a plist array and in a systemd `ExecStart=`, both of which
 /// accept the same quoting, so one rule serves all three rather than three
 /// nearly-identical ones.
-fn quote_argument(argument: &str) -> String {
+pub(crate) fn quote_argument(argument: &str) -> String {
     if !argument.is_empty() && !argument.contains([' ', '"', '\t', '\n']) {
         return argument.to_string();
     }
@@ -1864,7 +1864,11 @@ fn iso8601_minutes(duration: Duration) -> String {
 /// Escapes the five XML entities. Applied to every value that reaches a plist
 /// or a task document, because a Windows account name may legitimately contain
 /// `&` and a path may contain `<`.
-fn xml_escape(value: &str) -> String {
+///
+/// `pub(crate)` rather than private because [`crate::wsl::task`] renders a
+/// second kind of Task Scheduler document and must escape it the same way; two
+/// escapers in one crate is exactly how one of them ends up subtly different.
+pub(crate) fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -1884,7 +1888,7 @@ fn xml_escape(value: &str) -> String {
 /// `&amp;` is replaced last, which is the whole subtlety: replacing it first
 /// would turn a literal `&amp;amp;` into `&` in two passes instead of `&amp;`
 /// in one.
-fn xml_unescape(value: &str) -> String {
+pub(crate) fn xml_unescape(value: &str) -> String {
     value
         .replace("&lt;", "<")
         .replace("&gt;", ">")
