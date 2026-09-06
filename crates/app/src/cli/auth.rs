@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use runner_manager_domain::model::StartMode;
-use runner_manager_domain::store::Store as _;
+use runner_manager_domain::store::Store;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
 use runner_manager_github::{
     AuthenticatedClient, CredentialRenewal, CredentialSource, GithubError, Installation,
@@ -506,17 +506,8 @@ pub fn login(
     // An explicit choice is recorded, so that `repo add`, `auth status` and the
     // daemon all agree with the sign-in that just happened rather than with a
     // default nobody chose.
-    if let Some(mode) = requested_mode
-        && mode != recorded
-    {
-        let mut host = super::host::local_host_or_create(context, &store)?;
-        host.service_start_mode = mode;
-        store.put_host(&host).map_err(|source| {
-            CliError::new(
-                Failure::LocalState,
-                format!("cannot record the start mode this sign-in used: {source}"),
-            )
-        })?;
+    if let Some(mode) = requested_mode {
+        record_start_mode(context, &store, recorded, mode)?;
     }
 
     // ------------------------------------------------------------------------
@@ -628,6 +619,39 @@ pub fn login(
 
     write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
     Ok(())
+}
+
+/// Records the start mode a credential was just written for, when it differs
+/// from the one this host already has recorded.
+///
+/// # Why writing the credential is not the whole of the job
+///
+/// The store a credential lands in is a total function of the *recorded* start
+/// mode -- `auth status`, `repo add` and the daemon all resolve it through
+/// [`Context::recorded_start_mode`]. So a command that writes into the store
+/// for one mode and leaves the record naming the other has stored a valid
+/// credential that nothing on this host will ever look at, and `auth status`
+/// answers `not_authenticated` on a machine that just succeeded.
+///
+/// # Errors
+/// [`Failure::LocalState`] when the host record cannot be read or written.
+fn record_start_mode(
+    context: &Context,
+    store: &dyn Store,
+    recorded: StartMode,
+    chosen: StartMode,
+) -> Result<(), CliError> {
+    if chosen == recorded {
+        return Ok(());
+    }
+    let mut host = super::host::local_host_or_create(context, store)?;
+    host.service_start_mode = chosen;
+    store.put_host(&host).map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot record the start mode this sign-in used: {source}"),
+        )
+    })
 }
 
 /// The device-flow prompt: the canonical page, and the code to type on it.
@@ -915,7 +939,8 @@ pub const RECEIVED_DOCUMENT_LIMIT: usize = 64 * 1024;
 /// # Errors
 /// [`Failure::InvalidArgument`] for a terminal, an empty document, one over
 /// [`RECEIVED_DOCUMENT_LIMIT`], and one that is not the credential envelope;
-/// [`Failure::SecretStore`] when the store will not take it.
+/// [`Failure::SecretStore`] when the store will not take it; and
+/// [`Failure::LocalState`] when the start mode cannot be recorded.
 pub fn receive(
     context: &Context,
     args: &AuthReceiveArgs,
@@ -929,7 +954,18 @@ pub fn receive(
     // a usable value" has to mean to be worth asserting.
     let document = read_credential_document(&mut io::stdin().lock())?;
 
-    let secrets = context.secret_store(args.start_at.into())?;
+    // `--start-at` names the store to write, and it has to name the *recorded*
+    // mode too, for the reason [`record_start_mode`] gives: a document received
+    // for `login` and written to the user-scoped store while this host's record
+    // still says `boot` is a credential `auth status` and the daemon both look
+    // straight past. Recorded before the write, so the two never disagree in
+    // the direction that leaves a credential nothing reads.
+    let store = context.store()?;
+    let recorded = context.recorded_start_mode(&store)?;
+    let start_mode = StartMode::from(args.start_at);
+    record_start_mode(context, &store, recorded, start_mode)?;
+
+    let secrets = context.secret_store(start_mode)?;
     store_received_credential(&secrets, &document, out)
 }
 
@@ -982,7 +1018,12 @@ fn read_credential_document(reader: &mut dyn Read) -> Result<SecretString, CliEr
     // are distinguishable. A reader that stops at the limit cannot tell a
     // 64 KiB document from the first 64 KiB of something much larger, and
     // would store the truncation.
-    let mut bytes = Vec::new();
+    //
+    // The whole ceiling is reserved up front rather than grown into: a `Vec`
+    // that reallocates while it holds a credential copies the bytes and hands
+    // the old allocation back to the allocator unscrubbed, which is exactly the
+    // plaintext copy `bytes.zeroize()` below exists to prevent.
+    let mut bytes = Vec::with_capacity(RECEIVED_DOCUMENT_LIMIT + 1);
     reader
         .take(RECEIVED_DOCUMENT_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
@@ -1063,7 +1104,9 @@ fn validate_credential_envelope(document: &SecretString) -> Result<(), String> {
         .map_err(|_| NOT_THE_DOCUMENT.to_string())?;
 
     let outcome = match value.get("access_token") {
-        Some(serde_json::Value::String(token)) if !token.trim().is_empty() => Ok(()),
+        Some(serde_json::Value::String(token)) if !token.trim().is_empty() => {
+            validate_envelope_remainder(&value)
+        }
         Some(serde_json::Value::String(_)) => Err("its access token is empty".to_string()),
         Some(_) => Err("its access token is not a string".to_string()),
         None => Err(NOT_THE_DOCUMENT.to_string()),
@@ -1071,15 +1114,67 @@ fn validate_credential_envelope(document: &SecretString) -> Result<(), String> {
 
     // The parse produced plain `String`s holding both halves of the credential,
     // outside any `secrecy` wrapper. Every one of them is scrubbed here rather
-    // than left to drop.
-    if let Some(fields) = value.as_object_mut() {
-        for field in fields.values_mut() {
-            if let serde_json::Value::String(text) = field {
-                text.zeroize();
+    // than left to drop -- including the ones a document that is *not* an
+    // object put somewhere else, because a bare JSON string is the shape a
+    // caller reaching for `json.dumps(token)` produces and it holds the whole
+    // credential.
+    scrub_every_string(&mut value);
+    outcome
+}
+
+/// The fields beside `access_token`, checked against the shapes
+/// [`UserAccessToken::from_stored_document`] can actually read back.
+///
+/// # Why the access token is not the whole of the envelope
+///
+/// `from_stored_document` deserializes the *whole* document or none of it: one
+/// field of the wrong type -- a `refresh_token` that is a number, an
+/// `access_expires_at` that is not an instant -- fails the parse, and its
+/// fallback then reads the entire JSON text as a pre-0.1.11 bare access token.
+/// A validator that looked only at `access_token` would wave such a document
+/// through, and this endpoint would answer `Stored a credential ... It carries
+/// no renewal half` while persisting the document-as-token: a credential GitHub
+/// will never accept, with the refresh half silently discarded. Checking every
+/// field the reader parses is what keeps "rejects a malformed document without
+/// persisting a usable value" true.
+///
+/// # Errors
+/// The detail to report, never containing any part of the document.
+fn validate_envelope_remainder(value: &serde_json::Value) -> Result<(), String> {
+    match value.get("refresh_token") {
+        None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => {}
+        Some(_) => return Err("its refresh token is not a string".to_string()),
+    }
+    for field in ["access_expires_at", "refresh_expires_at"] {
+        match value.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            // Only the field *name* reaches the message; the value never does.
+            Some(serde_json::Value::String(instant)) => {
+                if DateTime::parse_from_rfc3339(instant).is_err() {
+                    return Err(format!("its `{field}` is not an RFC 3339 instant"));
+                }
             }
+            Some(_) => return Err(format!("its `{field}` is not an RFC 3339 instant")),
         }
     }
-    outcome
+    Ok(())
+}
+
+/// Zeroizes every string anywhere in `value`.
+///
+/// Recursive rather than one pass over the top-level object, because the
+/// credential is in whatever shape arrived: a bare JSON string, an array, a
+/// nested object. Anything left to `Drop` is a plaintext copy of a credential
+/// released to the allocator.
+fn scrub_every_string(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_every_string),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(scrub_every_string);
+        }
+        _ => {}
+    }
 }
 
 /// Puts a received document through the ordinary credential type and into the
@@ -2516,33 +2611,37 @@ mod tests {
     /// `allowed` names the files a canary IS permitted to be in — the secret
     /// store, which is the one place a credential is supposed to live.
     fn no_canary_escaped(transcript: &str, root: &Path, allowed: &dyn Fn(&str) -> bool) {
+        // The corpus is gathered once and scanned four times, rather than the
+        // tree being walked and the environment enumerated once per canary.
+        let files: Vec<(String, String)> = files_under(root)
+            .into_iter()
+            .filter(|(path, _)| !allowed(path))
+            .collect();
+        // The environment and argv halves of `03-security-and-lifecycle.md`
+        // guarantee 3. Trivially true for an in-process handoff, and asserted
+        // anyway: the whole reason the document is passed by reference to a
+        // sink is so that the day somebody reaches for a command line instead,
+        // this reddens.
+        let environment: Vec<(String, String)> = std::env::vars().collect();
+        let argv: Vec<String> = std::env::args().collect();
+
         let mut found = Vec::new();
         for (name, canary) in every_canary() {
             if transcript.contains(&canary) {
                 found.push(format!("{name} appears in the command's own output"));
             }
-            for (path, text) in files_under(root) {
-                if allowed(&path) {
-                    continue;
-                }
+            for (path, text) in &files {
                 if text.contains(&canary) {
                     found.push(format!("{name} appears in the file {path}"));
                 }
             }
-            // The environment and argv halves of `03-security-and-lifecycle.md`
-            // guarantee 3. Trivially true for an in-process handoff, and
-            // asserted anyway: the whole reason the document is passed by
-            // reference to a sink is so that the day somebody reaches for a
-            // command line instead, this reddens.
-            for (key, value) in std::env::vars() {
+            for (key, value) in &environment {
                 if value.contains(&canary) {
                     found.push(format!("{name} appears in the environment as {key}"));
                 }
             }
-            for argument in std::env::args() {
-                if argument.contains(&canary) {
-                    found.push(format!("{name} appears in this process's argv"));
-                }
+            if argv.iter().any(|argument| argument.contains(&canary)) {
+                found.push(format!("{name} appears in this process's argv"));
             }
         }
         assert!(
@@ -2885,6 +2984,20 @@ mod tests {
             ("a null access token", r#"{"access_token":null}"#),
             ("a JSON string", r#""just a string""#),
             ("a truncated document", r#"{"access_token":"gh"#),
+            // The two that a validator reading only `access_token` waves
+            // through. `from_stored_document` deserializes the whole document
+            // or none of it, so either of these fails its parse and falls back
+            // to reading the entire JSON text as a bare access token: the host
+            // would be told `Stored a credential` and left holding one GitHub
+            // will never accept, with the refresh half thrown away.
+            (
+                "a document whose access expiry is not an instant",
+                r#"{"access_token":"ghu_x","access_expires_at":"tomorrow"}"#,
+            ),
+            (
+                "a document whose refresh token is not a string",
+                r#"{"access_token":"ghu_x","refresh_token":1234}"#,
+            ),
         ];
         for (what, raw) in refused {
             let error = read_credential_document(&mut raw.as_bytes())

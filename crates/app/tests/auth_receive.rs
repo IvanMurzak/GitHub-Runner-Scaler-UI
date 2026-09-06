@@ -175,6 +175,52 @@ fn a_received_credential_is_one_auth_status_reports_as_authenticated() {
     );
 }
 
+/// `--start-at` names the store to write *and* the store this host will read.
+///
+/// Every reader — `auth status`, `repo add`, the daemon — resolves the secret
+/// store from the start mode recorded in the local database, not from the flag
+/// this command was given. A handoff that wrote the user-scoped store and left
+/// the record saying `boot` would put a perfectly good credential somewhere
+/// nothing ever looks, and `auth status` would answer `not_authenticated` on a
+/// host that had just been provisioned successfully.
+#[test]
+fn receiving_for_a_start_mode_records_it_so_the_host_reads_the_store_it_wrote() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+    let github = FakeGithub::start();
+    github.with_installation(11, "acme", "Organization", "selected", &["acme/repo"]);
+
+    let received = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command
+            .args(["auth", "receive", "--start-at", "login"])
+            .write_stdin(document(&fixture_token(), &wsl_refresh_canary()));
+        command
+    });
+    assert_eq!(
+        received.code,
+        0,
+        "the handoff must succeed:\n{}",
+        received.both()
+    );
+    assert!(
+        received.stdout.contains("user-scoped store"),
+        "`--start-at login` writes the user-scoped store: {}",
+        received.stdout
+    );
+
+    let status = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status"]);
+        command
+    });
+    assert_eq!(
+        status.code,
+        0,
+        "the store this host reads must be the one the handoff wrote:\n{}",
+        status.both()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Every refusal, and the state each one leaves behind
 // ---------------------------------------------------------------------------
@@ -205,6 +251,19 @@ fn every_refusal_leaves_the_host_with_nothing_stored() {
         ("a JSON array", r#"["ghu_looksLikeAToken"]"#),
         ("a document one byte over the ceiling", oversized.as_str()),
         ("a truncated document", truncated.as_str()),
+        // A field beside `access_token` of the wrong type fails the whole of
+        // `UserAccessToken::from_stored_document`'s parse, and its pre-0.1.11
+        // fallback then reads the entire JSON text as a bare access token. Both
+        // of these used to be stored, reported as a success, and leave this
+        // host holding a credential GitHub will never accept.
+        (
+            "a document whose access expiry is not an instant",
+            r#"{"access_token":"ghu_x","access_expires_at":"tomorrow"}"#,
+        ),
+        (
+            "a document whose refresh token is not a string",
+            r#"{"access_token":"ghu_x","refresh_token":1234}"#,
+        ),
     ];
 
     for (what, input) in cases {
