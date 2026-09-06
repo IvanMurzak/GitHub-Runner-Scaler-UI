@@ -1,0 +1,20 @@
+crates/app/src/cli/auth.rs
+  s_10c992f688b446::t_c7e5524120af39 1149-1150,1152,1154-1160
+  s_10c992f688b446::t_d360d72d922ebd 3273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "5a461a1bdb406284b8ad4179bb4ce1eb319c3309",
+  "prompts": {},
+  "sessions": {
+    "s_10c992f688b446": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5793fdca-a6d0-4c27-ada2-a24ccbfca27e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
