@@ -26,7 +26,7 @@ The table below is the sole live task-state record.
 | Task (spec) | needs | repo/base | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|---|
 | [a1-wsl-platform-adapter](tasks/a1-wsl-platform-adapter.md) | — | ./main | 9/9 | top | 🔵 | pipeline `01a078d5-1e25-7050-899e-148a4578a38e` | 2026-09-06 |
-| [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | 🔵 | pipeline `01a078d5-1ebc-70bf-9e17-fc4e910cedd4` | 2026-09-06 |
+| [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | ⚪ | withheld after pipeline `01a078d5-1ebc-70bf-9e17-fc4e910cedd4` could not provision | 2026-09-06 |
 | [b2-wsl-cli-orchestration](tasks/b2-wsl-cli-orchestration.md) | a1, b1 | ./main | 10/10 | top | ⚪ | — | 2026-09-06 |
 | [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | ⚪ | — | 2026-09-06 |
 
@@ -38,3 +38,4 @@ The table below is the sole live task-state record.
 | 2026-09-06 | Review closed P1 lifecycle-shell and pre-login availability gaps plus P2 destructive command naming. Repository evidence and authoritative Microsoft/GitHub constraints otherwise support the design; no owner decision changed. |
 | 2026-09-06 | Immutable task specs created in groups A and B. Independent platform and credential foundations may execute together; orchestration and acceptance follow sequentially. |
 | 2026-09-06 | Wave 1 dispatched in two isolated pipeline runs: platform adapter `01a078d5-1e25-7050-899e-148a4578a38e` and credential broker `01a078d5-1ebc-70bf-9e17-fc4e910cedd4`. |
+| 2026-09-06 | Credential run was returned to pending because concurrent native worktree provisioning contended on `.git/config`; no implementation ran and the platform run continues. It will be redispatched after A1 releases the repository worktree lock. |
