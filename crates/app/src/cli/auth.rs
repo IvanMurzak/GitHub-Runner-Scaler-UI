@@ -1146,15 +1146,18 @@ fn validate_envelope_remainder(value: &serde_json::Value) -> Result<(), String> 
         Some(_) => return Err("its refresh token is not a string".to_string()),
     }
     for field in ["access_expires_at", "refresh_expires_at"] {
-        match value.get(field) {
-            None | Some(serde_json::Value::Null) => {}
-            // Only the field *name* reaches the message; the value never does.
+        let readable = match value.get(field) {
+            None | Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::String(instant)) => {
-                if DateTime::parse_from_rfc3339(instant).is_err() {
-                    return Err(format!("its `{field}` is not an RFC 3339 instant"));
-                }
+                DateTime::parse_from_rfc3339(instant).is_ok()
             }
-            Some(_) => return Err(format!("its `{field}` is not an RFC 3339 instant")),
+            Some(_) => false,
+        };
+        if !readable {
+            // Only the field *name* reaches the message; the value never does,
+            // which is why the three ways it can be unreadable share one
+            // sentence rather than describing themselves.
+            return Err(format!("its `{field}` is not an RFC 3339 instant"));
         }
     }
     Ok(())
@@ -3267,7 +3270,7 @@ mod tests {
         let guard = windows_store.guard();
         std::fs::write(&guard, [0x00_u8, 0xff, 0x00, 0xff]).expect("the store is corrupted");
         assert!(
-            windows_store.load().is_err() || windows_store.load().unwrap_or(None).is_none(),
+            !matches!(windows_store.load(), Ok(Some(_))),
             "the corrupted store must not read back as a usable credential"
         );
 
