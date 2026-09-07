@@ -520,7 +520,6 @@ pub fn probe_readiness(
             distribution: name.to_string(),
             detail: match &systemd {
                 SystemdState::Unavailable(word) => {
-                    let word = word.clone();
                     let stderr = systemd_report.stderr_text();
                     if stderr.is_empty() {
                         format!("`systemctl is-system-running` answered `{word}`")

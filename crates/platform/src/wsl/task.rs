@@ -661,30 +661,38 @@ impl<'runner> LifecycleTaskControl<'runner> {
         self.runner.run(&request)
     }
 
+    /// The plain, headerless CSV listing of one task, when Task Scheduler holds
+    /// one and answered.
+    ///
+    /// It answers from the task store rather than from an XML export, so it
+    /// still says yes for a task [`Self::query`] cannot read back. `schtasks`
+    /// failing to run at all is read as "nothing", which leaves a caller
+    /// exactly where it stood before this second opinion existed.
+    ///
+    /// One function for both callers so that the two questions asked of this
+    /// listing — is there a task, and is it running — cannot drift onto
+    /// different `schtasks` invocations.
+    fn query_csv(&self, identity: &LifecycleTaskIdentity) -> Option<super::exec::CommandOutput> {
+        let output = self
+            .schtasks(&["/Query", "/TN", identity.name(), "/FO", "CSV", "/NH"])
+            .ok()?;
+        output.success().then_some(output)
+    }
+
     /// Whether Task Scheduler holds anything at all under this name.
     ///
-    /// The same plain `/Query` [`Self::is_running`] uses, asked for its exit
-    /// status alone. It answers from the task store rather than from an XML
-    /// export, so it still says yes for a task [`Self::query`] cannot read
-    /// back, and it reads a status rather than a message, so it is unaffected
-    /// by the console's language. `schtasks` failing to run at all is read as
-    /// "nothing", which leaves a caller exactly where it stood before this
-    /// second opinion existed.
+    /// Reads an exit status rather than a message, so it is unaffected by the
+    /// console's language.
     fn exists(&self, identity: &LifecycleTaskIdentity) -> bool {
-        self.schtasks(&["/Query", "/TN", identity.name(), "/FO", "CSV", "/NH"])
-            .is_ok_and(|output| output.success())
+        self.query_csv(identity).is_some()
     }
 
     /// Whether Task Scheduler reports the task as running. See
     /// [`RegisteredTask::running`] for why this is best-effort.
     fn is_running(&self, identity: &LifecycleTaskIdentity) -> bool {
-        let Ok(output) = self.schtasks(&["/Query", "/TN", identity.name(), "/FO", "CSV", "/NH"])
-        else {
+        let Some(output) = self.query_csv(identity) else {
             return false;
         };
-        if !output.success() {
-            return false;
-        }
         decode_console_output(output.stdout())
             .into_text()
             .lines()

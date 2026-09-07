@@ -200,9 +200,11 @@ pub const MAX_DISTRIBUTION_NAME: usize = 255;
 /// is the smaller question of whether the string is safe and meaningful to
 /// pass at all, and it fails closed:
 ///
-/// * empty, or only whitespace — there is nothing to select;
+/// * empty — there is nothing to select;
 /// * leading or trailing whitespace — `"Ubuntu "` and `"Ubuntu"` would look
-///   the same to an operator reading a status line and be different keys;
+///   the same to an operator reading a status line and be different keys. A
+///   name that is *only* whitespace breaks this rule too, so it needs no rule
+///   of its own;
 /// * a control character or a NUL — neither can survive an argument vector or
 ///   a task document intact;
 /// * a leading `-` — the one genuinely dangerous shape. `wsl.exe
@@ -227,9 +229,6 @@ pub fn validate_distribution_name(name: &str) -> Result<(), WslError> {
             "it starts or ends with whitespace, which no `wsl --list` row reports and which \
              would make two different names print identically",
         );
-    }
-    if name.trim().is_empty() {
-        return refuse("it is only whitespace, so it names no distribution");
     }
     if name.chars().count() > MAX_DISTRIBUTION_NAME {
         return refuse("it is longer than a distribution name may be here");
