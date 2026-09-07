@@ -1,0 +1,26 @@
+tests/assert-no-shippable-mutants.sh
+  s_29ee6a33d85198::t_a3da206425a1f4 45,55-80
+.github/workflows/release.yml
+  s_29ee6a33d85198::t_d0e8ebadbce4a6 251-272
+crates/app/tests/wsl_operator_documentation.rs
+  s_29ee6a33d85198::t_fc10d6fbabd5b4 380-384,392-396
+  s_29ee6a33d85198::t_2912bff5511576 408-411
+crates/platform/tests/privileged_tests_are_wired_into_ci.rs
+  s_29ee6a33d85198::t_8f1ca1d69edc39 191-218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f4d7eb3f90955b322fb086b8ce4c70b8ac344caa",
+  "prompts": {},
+  "sessions": {
+    "s_29ee6a33d85198": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "105d8b2b-5a41-4523-b841-8b38e3fdcae9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
