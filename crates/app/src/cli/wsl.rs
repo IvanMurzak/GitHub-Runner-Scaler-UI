@@ -1305,25 +1305,21 @@ fn docker_diagnostic(invoker: &WslInvoker<'_>, distribution: &str) -> Diagnostic
     let command = LinuxCommand::new(distribution, "docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .with_timeout(DOCKER_TIMEOUT);
-    match invoker.exec(command) {
-        Ok(output) if output.success() => Diagnostic {
-            name: "docker".to_string(),
-            available: true,
-            detail: format!("engine {}", output.stdout_text()),
-        },
-        Ok(output) => Diagnostic {
-            name: "docker".to_string(),
-            available: false,
-            detail: format!(
+    let (available, detail) = match invoker.exec(command) {
+        Ok(output) if output.success() => (true, format!("engine {}", output.stdout_text())),
+        Ok(output) => (
+            false,
+            format!(
                 "not usable here, so container jobs would fail while ordinary jobs run: {}",
                 output.diagnostic()
             ),
-        },
-        Err(source) => Diagnostic {
-            name: "docker".to_string(),
-            available: false,
-            detail: format!("could not be asked: {source}"),
-        },
+        ),
+        Err(source) => (false, format!("could not be asked: {source}")),
+    };
+    Diagnostic {
+        name: "docker".to_string(),
+        available,
+        detail,
     }
 }
 
@@ -2720,7 +2716,9 @@ mod tests {
         }
 
         fn position(&self, needle: &str) -> Option<usize> {
-            self.entries()
+            self.0
+                .lock()
+                .expect("the journal is not shared across a panic")
                 .iter()
                 .position(|entry| entry.contains(needle))
         }
@@ -2920,6 +2918,21 @@ mod tests {
             .to_string()
     }
 
+    /// The four answers a complete preflight asks for, in the order it asks.
+    ///
+    /// One function rather than one copy per script: every test below that is
+    /// *not* about a refusing preflight needs exactly these four, and a fifth
+    /// transcription of them is a fifth chance to spell `x86_64` wrongly. The
+    /// deliberately truncated scripts in the refusal table are still written
+    /// out, because each of those omits a rule on purpose.
+    fn preflight_script() -> ScriptedRunner {
+        ScriptedRunner::new()
+            .always("--list --verbose", ok("* Ubuntu   Running   2\n"))
+            .always("--exec id -u", ok("0\n"))
+            .always("--exec uname -m", ok("x86_64\n"))
+            .always("--exec systemctl is-system-running", ok("running\n"))
+    }
+
     /// A distribution that is WSL2, root-capable, x86-64 and running systemd.
     ///
     /// The `/XML ONE` and `/FO CSV` sequences are the interaction the
@@ -2927,11 +2940,7 @@ mod tests {
     /// preflight looks, absent again when `register` looks and looks a second
     /// time without an export, and this product's own from then on.
     fn base_script() -> ScriptedRunner {
-        ScriptedRunner::new()
-            .always("--list --verbose", ok("* Ubuntu   Running   2\n"))
-            .always("--exec id -u", ok("0\n"))
-            .always("--exec uname -m", ok("x86_64\n"))
-            .always("--exec systemctl is-system-running", ok("running\n"))
+        preflight_script()
             .always("--exec systemctl is-enabled", ok("disabled\n"))
             .always("--exec systemctl is-active", ok("active\n"))
             .always("--exec docker info", ok("27.1.1\n"))
@@ -2970,58 +2979,21 @@ mod tests {
 
     /// A distribution that is already a healthy managed runner host.
     ///
-    /// Written out rather than layered onto [`base_script`], because
-    /// `ScriptedRunner` answers from the FIRST rule that matches: a second
-    /// rule for the same command line is never reached, so an "override"
-    /// appended to a base script would silently keep the base's answer.
+    /// Layered onto [`preflight_script`] and never onto [`base_script`],
+    /// because `ScriptedRunner` answers from the FIRST rule that matches: a
+    /// second rule for the same command line is never reached, so an
+    /// "override" appended to a base script would silently keep the base's
+    /// answer. The preflight is shared precisely because this script agrees
+    /// with it; every rule that differs is spelled out below.
     fn provisioned_script(docker: CommandOutput) -> ScriptedRunner {
-        ScriptedRunner::new()
-            .always(
-                "--list --verbose",
-                ok("* Ubuntu   Running   2
-"),
-            )
-            .always(
-                "--exec id -u",
-                ok("0
-"),
-            )
-            .always(
-                "--exec uname -m",
-                ok("x86_64
-"),
-            )
-            .always(
-                "--exec systemctl is-system-running",
-                ok("running
-"),
-            )
-            .always(
-                "--exec systemctl is-enabled",
-                ok("enabled
-"),
-            )
-            .always(
-                "--exec systemctl is-active",
-                ok("active
-"),
-            )
+        preflight_script()
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
             .always("--exec docker info", docker)
-            .always(
-                "--version",
-                ok(&format!(
-                    "runner-manager {}
-",
-                    version()
-                )),
-            )
+            .always("--version", ok(&format!("runner-manager {}\n", version())))
             .always("status --json", ok(&linux_status_json(true, 8, version())))
             .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
-            .always(
-                "/FO CSV",
-                ok("\"task\",\"N/A\",\"Running\"
-"),
-            )
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"))
     }
 
     fn wrap(scripted: ScriptedRunner, journal: &Journal) -> (WslHost, Arc<ScriptedRunner>) {
@@ -3034,6 +3006,22 @@ mod tests {
             WslHost::with_runner(Box::new(runner), WslExecutable::at("wsl.exe")),
             inner,
         )
+    }
+
+    /// Plants the record `probe` will read, claiming `version` was installed.
+    ///
+    /// The version is the only thing the five call sites differ in, and it is
+    /// the thing each of them is about -- `9.9.9` over a host that has nothing
+    /// is what makes the drift assertions mean something.
+    fn write_record(paths: &AppPaths, version: &str) {
+        WslProviderRecord::new(
+            DISTRIBUTION,
+            identity_of(DISTRIBUTION).name(),
+            version,
+            Utc::now(),
+        )
+        .write(paths)
+        .expect("a record");
     }
 
     fn fixture_paths() -> (tempfile::TempDir, AppPaths) {
@@ -3113,9 +3101,11 @@ mod tests {
     }
 
     /// Probes a scripted host the way `wsl status` does.
-    fn probe_scripted(
-        script: ScriptedRunner,
-    ) -> (Journal, tempfile::TempDir, AppPaths, WslStatusDocument) {
+    ///
+    /// The [`tempfile::TempDir`] is handed back because dropping it deletes
+    /// the config directory the document was read against; the [`AppPaths`]
+    /// inside it is not, because no caller has anything left to ask it.
+    fn probe_scripted(script: ScriptedRunner) -> (Journal, tempfile::TempDir, WslStatusDocument) {
         let journal = Journal::default();
         let (host, _) = wrap(script, &journal);
         let (root, paths) = fixture_paths();
@@ -3129,7 +3119,7 @@ mod tests {
             Utc::now(),
         )
         .expect("a readable host");
-        (journal, root, paths, document)
+        (journal, root, document)
     }
 
     // -----------------------------------------------------------------------
@@ -3702,11 +3692,7 @@ mod tests {
     #[test]
     fn a_task_somebody_else_made_stops_the_transaction_before_it_changes_anything() {
         let mut fixture = Fixture::over(
-            ScriptedRunner::new()
-                .always("--list --verbose", ok("* Ubuntu   Running   2\n"))
-                .always("--exec id -u", ok("0\n"))
-                .always("--exec uname -m", ok("x86_64\n"))
-                .always("--exec systemctl is-system-running", ok("running\n"))
+            preflight_script()
                 .always("/XML ONE", ok(&foreign_task_xml()))
                 .always("/FO CSV", ok("\"task\",\"N/A\",\"Ready\"\n")),
         );
@@ -3978,7 +3964,7 @@ mod tests {
 
     #[test]
     fn status_reads_the_host_and_reports_every_documented_part() {
-        let (_journal, _root, _paths, document) = probe_scripted(fresh_script());
+        let (_journal, _root, document) = probe_scripted(fresh_script());
 
         assert_eq!(document.schema_version, WSL_STATUS_SCHEMA_VERSION);
         assert!(document.provider_record.is_none(), "nothing manages it yet");
@@ -4015,25 +4001,14 @@ mod tests {
         let journal = Journal::default();
         // A record that claims everything, over a host that has nothing.
         let (host, _) = wrap(
-            ScriptedRunner::new()
-                .always("--list --verbose", ok("* Ubuntu   Running   2\n"))
-                .always("--exec id -u", ok("0\n"))
-                .always("--exec uname -m", ok("x86_64\n"))
-                .always("--exec systemctl is-system-running", ok("running\n"))
+            preflight_script()
                 .always("status --json", refused("not found"))
                 .always("--exec systemctl is-active", ok("inactive\n"))
                 .always("/XML ONE", refused("no such task")),
             &journal,
         );
         let (_root, paths) = fixture_paths();
-        WslProviderRecord::new(
-            DISTRIBUTION,
-            identity_of(DISTRIBUTION).name(),
-            "9.9.9",
-            Utc::now(),
-        )
-        .write(&paths)
-        .expect("a record");
+        write_record(&paths, "9.9.9");
 
         let document = probe(
             &host,
@@ -4058,7 +4033,7 @@ mod tests {
 
     #[test]
     fn an_absent_record_is_not_drift() {
-        let (_journal, _root, _paths, document) = probe_scripted(fresh_script());
+        let (_journal, _root, document) = probe_scripted(fresh_script());
         assert!(
             document.drift.is_empty(),
             "asking about an unmanaged distribution is a legitimate question with a \
@@ -4074,7 +4049,7 @@ mod tests {
         // apart, so it is reported rather than dropped: an operator whose
         // `status --json` cannot read its journal must not be sent to
         // reinstall a binary that is plainly already there.
-        let (_journal, _root, _paths, document) = probe_scripted(base_script().always(
+        let (_journal, _root, document) = probe_scripted(base_script().always(
             "status --json",
             refused("cannot read this host's attempt journal: database disk image is malformed"),
         ));
@@ -4104,28 +4079,13 @@ mod tests {
         let journal = Journal::default();
         let (host, _) = wrap(
             ScriptedRunner::new()
-                .always(
-                    "--list --verbose",
-                    ok("* Ubuntu   Running   1
-"),
-                )
+                .always("--list --verbose", ok("* Ubuntu   Running   1\n"))
                 .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
-                .always(
-                    "/FO CSV",
-                    ok("\"task\",\"N/A\",\"Running\"
-"),
-                ),
+                .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n")),
             &journal,
         );
         let (_root, paths) = fixture_paths();
-        WslProviderRecord::new(
-            DISTRIBUTION,
-            identity_of(DISTRIBUTION).name(),
-            version(),
-            Utc::now(),
-        )
-        .write(&paths)
-        .expect("a record");
+        write_record(&paths, version());
 
         let document = probe(
             &host,
@@ -4160,7 +4120,7 @@ mod tests {
 
     #[test]
     fn docker_is_a_diagnostic_and_never_decides_health() {
-        let (_journal, _root, _paths, document) = probe_scripted(provisioned_script(refused(
+        let (_journal, _root, document) = probe_scripted(provisioned_script(refused(
             "Cannot connect to the Docker daemon",
         )));
 
@@ -4179,7 +4139,7 @@ mod tests {
 
     #[test]
     fn a_distribution_that_is_not_wsl2_is_reported_as_installed_and_not_ready() {
-        let (journal, _root, _paths, document) = probe_scripted(
+        let (journal, _root, document) = probe_scripted(
             ScriptedRunner::new().always("--list --verbose", ok("  Ubuntu   Running   1\n")),
         );
 
@@ -4202,7 +4162,7 @@ mod tests {
 
     #[test]
     fn the_json_document_is_a_document_and_carries_its_version() {
-        let (_journal, _root, _paths, document) = probe_scripted(fresh_script());
+        let (_journal, _root, document) = probe_scripted(fresh_script());
 
         let mut rendered = Vec::new();
         write_json(&mut rendered, &document).expect("it renders");
@@ -4237,7 +4197,7 @@ mod tests {
 
     #[test]
     fn the_text_report_names_every_part_separately() {
-        let (_journal, _root, _paths, document) = probe_scripted(fresh_script());
+        let (_journal, _root, document) = probe_scripted(fresh_script());
 
         let mut rendered = Vec::new();
         write_status_text(&document, &mut rendered).expect("it renders");
@@ -4277,14 +4237,7 @@ mod tests {
             &journal,
         );
         let (_root, paths) = fixture_paths();
-        WslProviderRecord::new(
-            DISTRIBUTION,
-            identity_of(DISTRIBUTION).name(),
-            version(),
-            Utc::now(),
-        )
-        .write(&paths)
-        .expect("a record");
+        write_record(&paths, version());
 
         let mut out = Vec::new();
         list_with(&host, &paths, &mut out).expect("a readable machine");
@@ -4318,9 +4271,7 @@ mod tests {
         let (host, _) = wrap(
             ScriptedRunner::new().always(
                 "--list --verbose",
-                ok("* Ubuntu   Running   2
-  Debian   Stopped   2
-"),
+                ok("* Ubuntu   Running   2\n  Debian   Stopped   2\n"),
             ),
             &journal,
         );
@@ -4336,13 +4287,11 @@ mod tests {
 
         assert!(
             text.contains("Ubuntu") && text.contains("record unreadable"),
-            "the row says what is wrong with it rather than vanishing:
-{text}"
+            "the row says what is wrong with it rather than vanishing:\n{text}"
         );
         assert!(
             text.contains("Debian  WSL2, Stopped (not managed)"),
-            "and every other distribution is still listed:
-{text}"
+            "and every other distribution is still listed:\n{text}"
         );
     }
 
@@ -4376,14 +4325,7 @@ mod tests {
             &journal,
         );
         let (_root, paths) = fixture_paths();
-        WslProviderRecord::new(
-            DISTRIBUTION,
-            identity_of(DISTRIBUTION).name(),
-            version(),
-            Utc::now(),
-        )
-        .write(&paths)
-        .expect("a record");
+        write_record(&paths, version());
 
         let mut out = Vec::new();
         detach_with(&host, &paths, DISTRIBUTION, &mut out).expect("a clean detach");
@@ -4435,14 +4377,7 @@ mod tests {
             &journal,
         );
         let (_root, paths) = fixture_paths();
-        WslProviderRecord::new(
-            DISTRIBUTION,
-            identity_of(DISTRIBUTION).name(),
-            version(),
-            Utc::now(),
-        )
-        .write(&paths)
-        .expect("a record");
+        write_record(&paths, version());
 
         let mut out = Vec::new();
         let refusal =

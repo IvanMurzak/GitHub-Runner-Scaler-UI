@@ -642,9 +642,11 @@ pub enum WslCommand {
 
 /// The `--distribution NAME` every `wsl` subcommand but `list` takes.
 ///
-/// One `Args` struct behind three commands rather than three copies: the value
-/// is matched **exactly** against `wsl --list --verbose`, so a second doc
-/// comment describing it loosely is a second chance to describe it wrongly.
+/// The rule is spelled out in full here and abbreviated to its first line in
+/// [`WslInstallArgs`] and [`WslStatusArgs`], which take the same option: the
+/// value is matched **exactly** against `wsl --list --verbose`, and one full
+/// description rather than three is one chance to describe it wrongly rather
+/// than three.
 #[derive(Debug, Args)]
 pub struct WslDetachArgs {
     /// The distribution's exact name, as `wsl --list --verbose` spells it.
