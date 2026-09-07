@@ -42,7 +42,7 @@ fi
 
 # ----------------------------------------------------------------------------
 # The WSL adapter's test double is a mutant of the same kind, by a different
-# name.
+# name -- and it is checked at its call sites, not in the binary.
 # ----------------------------------------------------------------------------
 # `ScriptedRunner` answers `wsl.exe` and `schtasks.exe` from a table instead of
 # starting them, and `WslHost::with_runner` is the seam that injects it. Both
@@ -52,12 +52,31 @@ fi
 # ran against a fake Task Scheduler" is exactly the class of thing this file
 # exists to make impossible.
 #
-# Today the linker drops both: the binary only ever constructs
-# `HostCommandRunner`, through `WslHost::on_this_host`. This turns that fact
-# into a gate, so a future edit that wires a fake into a shipping code path
-# fails here rather than in production.
-if grep -a -E 'ScriptedRunner|RecordedRequest' "$binary" >/dev/null; then
-  die "the WSL adapter's test double was linked into the shippable binary"
-fi
+# THE LINKED BINARY CANNOT ANSWER THIS QUESTION. A debug build keeps the whole
+# `wsl::exec` codegen unit, dead code included, so the ELF this workspace
+# produces on Linux carries `..ScriptedRunner..` symbols for functions nothing
+# calls, while the same build on Windows carries none only because MSVC keeps
+# those names in the PDB rather than in the executable. Grepping the binary
+# would therefore be a platform quirk reported as a security property.
+#
+# So the rule is asserted where it is decided: every mention of the double or of
+# its injection seam has to sit inside a `#[cfg(test)]` region. Two files name
+# them outside one by design -- `wsl/exec.rs`, which defines them, and
+# `cli/wsl_acceptance.rs`, whose whole file is mounted by
+# `#[cfg(test)] mod acceptance` in `cli/wsl.rs`.
+while IFS= read -r source; do
+  case "$source" in
+  crates/platform/src/wsl/exec.rs | crates/app/src/cli/wsl_acceptance.rs) continue ;;
+  esac
+  # The first mention that is not a comment, and the first `#[cfg(test)]`.
+  use=$(grep -n -E 'ScriptedRunner|WslHost::with_runner' "$source" |
+    grep -v -E '^[0-9]+:[[:space:]]*(//|/\*|\*)' | head -1 | cut -d: -f1 || true)
+  [[ -n "$use" ]] || continue
+  gate=$(grep -n -F '#[cfg(test)]' "$source" | head -1 | cut -d: -f1 || true)
+  if [[ -z "$gate" ]] || ((gate > use)); then
+    die "$source:$use reaches the WSL adapter's test double outside a #[cfg(test)] region"
+  fi
+done < <(grep -R -l -E 'ScriptedRunner|WslHost::with_runner' \
+  crates/app/src crates/platform/src --include='*.rs')
 
 printf 'shippable-mutant-guard: all-features binary is clean\n'

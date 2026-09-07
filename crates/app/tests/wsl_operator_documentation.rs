@@ -377,6 +377,11 @@ fn workspace_version() -> (u64, u64, u64) {
     let line = manifest
         .lines()
         .skip_while(|line| line.trim() != "[workspace.package]")
+        .skip(1)
+        // Stopping at the next table matters: `[workspace.dependencies]` below
+        // is full of `version = ` keys, and a `[workspace.package]` that lost
+        // its own would otherwise be answered with some crate's.
+        .take_while(|line| !line.trim_start().starts_with('['))
         .find_map(|line| line.trim().strip_prefix("version = "))
         .expect("the root manifest must carry a `[workspace.package]` version");
     let text = line.trim().trim_matches('"');
@@ -384,6 +389,11 @@ fn workspace_version() -> (u64, u64, u64) {
         .split('.')
         .map(|part| part.parse().expect("the manifest version is X.Y.Z"))
         .collect();
+    assert_eq!(
+        parts.len(),
+        3,
+        "the manifest version must be `X.Y.Z`, not {text:?}"
+    );
     (parts[0], parts[1], parts[2])
 }
 
@@ -395,8 +405,10 @@ fn the_changelog_documents_this_feature_under_a_version_the_release_can_publish(
     assert!(
         newest >= workspace_version(),
         "the newest changelog entry is {heading}, which is older than the version the \
-         workspace pins. The release workflow sets the version at release time, so the top \
-         entry names the release being prepared and can never fall behind the manifest."
+         workspace pins. release.yml's `validate` job refuses a dispatch whose version is \
+         not the newest entry here, and step 4 is what writes that version into \
+         `Cargo.toml` -- so the only way to reach this state is to have edited one of the \
+         two by hand. Add the entry for {heading}'s successor, or put the manifest back."
     );
 
     // The entry is about this feature, and names the whole surface it added.

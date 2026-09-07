@@ -248,6 +248,28 @@ jobs:
           bash .github/scripts/release.sh check-monotonic \
             "$VERSION" "$MANIFEST_VERSION" "$RELEASE_VERSION"
 
+      # `CHANGELOG.md`'s newest entry is not decoration: the published release
+      # note below sends every operator to it for what changed, and
+      # `crates/app/tests/wsl_operator_documentation.rs` asserts that it never
+      # falls behind `[workspace.package] version`. Step 4 WRITES that version,
+      # and it runs after the test job -- so a release dispatched without an
+      # entry publishes fine and then leaves that test failing on the default
+      # branch for the next unrelated pull request to discover. Refusing here
+      # is the same rule, moved in front of the irreversible step.
+      - name: The changelog's newest entry must name this version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          newest="$(grep -m1 '^## ' CHANGELOG.md | sed 's/^## *//' | tr -d '[:space:]')"
+          echo "CHANGELOG.md's newest entry is: ${newest}"
+          if [ "$newest" != "$VERSION" ]; then
+            echo "REJECTED: CHANGELOG.md's newest entry is '${newest}', not '${VERSION}'." >&2
+            echo "Add a '## ${VERSION}' entry at the top of CHANGELOG.md describing this" >&2
+            echo "release in an operator's terms, then dispatch again." >&2
+            exit 1
+          fi
+          echo "CHANGELOG.md names ${VERSION}"
+
       - name: The tag must not already exist
         env:
           TAG: v${{ inputs.version }}

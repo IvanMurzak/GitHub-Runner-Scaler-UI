@@ -188,6 +188,34 @@ fn every_test_in_a_privileged_file_is_ignored_by_default() {
              {tests} tests and {ignored} ignore attributes."
         );
     }
+
+    // And the list is checked against the directory rather than trusted. Its
+    // whole claim is that "a new privileged file added without an entry here is
+    // a file nothing runs", which is only true if a file missing from it says
+    // so -- otherwise a second WSL or installer suite could be added, never be
+    // asked for by name in ci.yml, never be checked for `#[ignore]`, and
+    // nothing would go red.
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let entries = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("{} must be readable: {error}", directory.display()));
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = file_name.strip_suffix(".rs") else {
+            continue;
+        };
+        // This file is the guard rather than one of the guarded: it runs on
+        // every machine, by design, and registers nothing.
+        if !name.starts_with("privileged_") || name == "privileged_tests_are_wired_into_ci" {
+            continue;
+        }
+        assert!(
+            PRIVILEGED_TESTS.contains(&name),
+            "tests/{file_name} is a privileged test file that `PRIVILEGED_TESTS` does not \
+             name, so nothing checks that it is `#[ignore]`d and nothing checks that \
+             ci.yml's `service-install` job asks for it by name. Add it to the list and \
+             give it a wiring assertion."
+        );
+    }
 }
 
 /// The WSL lifecycle smoke tests (`b3`) are wired the same way the installer
