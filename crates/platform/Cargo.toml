@@ -23,10 +23,17 @@ homepage.workspace = true
 async-trait = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
+# `a1`'s WSL artifact primitives verify a published release archive's SHA-256
+# before any byte of it reaches a distribution, and derive the stable per
+# distribution lifecycle-task suffix from the same digest function. Both are
+# already in `[workspace.dependencies]` and already in the resolved graph, so
+# naming them here adds nothing to `Cargo.lock`.
+hex = { workspace = true }
 runner-manager-domain = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

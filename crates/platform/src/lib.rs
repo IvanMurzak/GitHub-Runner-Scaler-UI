@@ -21,6 +21,7 @@
 //! | [`logging`] | Structured allowlist logging with unconditional redaction | `07-security.md`'s secret-injection log scan |
 //! | [`secrets`] | Machine-scoped secret store (`d2`) | |
 //! | [`service`] | Service and daemon installers (`d3`) | |
+//! | [`wsl`] | Managing a named WSL2 distribution as a second host on a Windows workstation (`a1-wsl-platform-adapter`) | the managed-WSL-host feature's whole platform half |
 //!
 //! # Three properties worth knowing before reading any of it
 //!
@@ -56,3 +57,4 @@ pub mod runner_root;
 pub mod runner_root_access;
 pub mod secrets;
 pub mod service;
+pub mod wsl;

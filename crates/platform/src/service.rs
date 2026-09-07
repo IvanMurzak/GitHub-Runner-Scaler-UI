@@ -1206,7 +1206,7 @@ fn running_executable() -> Result<PathBuf, ServiceError> {
 /// arguments in a plist array and in a systemd `ExecStart=`, both of which
 /// accept the same quoting, so one rule serves all three rather than three
 /// nearly-identical ones.
-fn quote_argument(argument: &str) -> String {
+pub(crate) fn quote_argument(argument: &str) -> String {
     if !argument.is_empty() && !argument.contains([' ', '"', '\t', '\n']) {
         return argument.to_string();
     }
@@ -1864,7 +1864,11 @@ fn iso8601_minutes(duration: Duration) -> String {
 /// Escapes the five XML entities. Applied to every value that reaches a plist
 /// or a task document, because a Windows account name may legitimately contain
 /// `&` and a path may contain `<`.
-fn xml_escape(value: &str) -> String {
+///
+/// `pub(crate)` rather than private because [`crate::wsl::task`] renders a
+/// second kind of Task Scheduler document and must escape it the same way; two
+/// escapers in one crate is exactly how one of them ends up subtly different.
+pub(crate) fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -2650,10 +2654,18 @@ fn split_quoted(value: &str) -> Vec<String> {
     out
 }
 
-/// The text between `<tag>` and `</tag>`, unescaped, for the small, known
-/// documents this module renders. Not a general XML parser and does not pretend
-/// to be one.
-fn xml_value(text: &str, tag: &str) -> Option<String> {
+/// The text between the **first** `<tag>` and its `</tag>`, unescaped, for the
+/// small, known documents this module renders. Not a general XML parser and
+/// does not pretend to be one.
+///
+/// "First" matters for a document that repeats a tag: a Task Scheduler task has
+/// an `<Enabled>` in its trigger *and* one in its settings, so a caller after
+/// the second one passes the slice that starts at `<Settings>`.
+///
+/// `pub(crate)` rather than private because [`crate::wsl::task`] reads back a
+/// second kind of Task Scheduler document; one reader for both is the same
+/// argument [`xml_escape`] makes for one escaper.
+pub(crate) fn xml_value(text: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = text.find(&open)? + open.len();
