@@ -34,7 +34,6 @@ use runner_manager_domain::model::{RefreshInterval, StartMode, Timestamp};
 use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::rest::refreshes_per_hour;
-use runner_manager_platform::secrets::SecretStore;
 use serde::Serialize;
 
 use super::host::{FALLBACK_COST_MULTIPLE, HostBudget, local_host, max_repository_targets};

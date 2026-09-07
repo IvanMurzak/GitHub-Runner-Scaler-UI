@@ -62,7 +62,7 @@ use runner_manager_domain::store::{SqliteStore, Store};
 use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_github::{AppRegistration, Endpoints};
 use runner_manager_platform::paths::AppPaths;
-use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
+use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope, SecretStore};
 
 // ---------------------------------------------------------------------------
 // The published App
@@ -500,6 +500,24 @@ pub enum AuthCommand {
     Status(AuthStatusArgs),
     /// Purge the local credential.
     Logout,
+    /// Take a credential document on stdin and store it. Not for people.
+    ///
+    /// ------------------------------------------------------------------
+    /// HIDDEN, AND THE HIDING IS PART OF THE DESIGN.
+    /// ------------------------------------------------------------------
+    /// `02-target-architecture.md` (managed WSL host) makes this the one
+    /// cross-process bridge by which a provider hands a *newly issued*
+    /// credential to a host it controls, without that credential ever being
+    /// written down on the issuing machine. It is not a command an operator
+    /// has any reason to type: `auth login` is how a person authenticates a
+    /// host, and this refuses a terminal precisely so that nobody turns it
+    /// into a paste workflow.
+    ///
+    /// `cli_command_surface.rs` transcribes the *published* surface from the
+    /// design document and asserts `--help` matches it exactly, so a hidden
+    /// command has to be hidden for that test to keep meaning what it says.
+    #[command(hide = true)]
+    Receive(AuthReceiveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -517,6 +535,19 @@ pub struct AuthLoginArgs {
     /// Name every repository the credential reaches, instead of counting them.
     #[arg(long)]
     pub list: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthReceiveArgs {
+    /// Which start mode's credential store to write.
+    ///
+    /// Required rather than defaulted, and deliberately: the caller is another
+    /// process on another machine, and it knows how the daemon it is
+    /// provisioning will start. `auth login` may fall back to the mode this
+    /// host already recorded because a person is there to read the line that
+    /// says which store was chosen; nobody is reading this one.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: StartAt,
 }
 
 #[derive(Debug, Args)]
@@ -893,6 +924,13 @@ pub struct Context {
     data_root: Option<PathBuf>,
     endpoints: Endpoints,
     clock: Arc<dyn Clock>,
+    /// A stand-in for the platform store, set only by [`Context::with_secret_store`].
+    ///
+    /// `#[cfg(test)]`, so it is not a field of the shipped type and there is no
+    /// way to reach it from a binary: the same reasoning
+    /// [`Context::rooted_against`] gives for being a test-only constructor.
+    #[cfg(test)]
+    secret_store_double: Option<Arc<dyn SecretStore>>,
 }
 
 impl Context {
@@ -928,6 +966,8 @@ impl Context {
             data_root: data_dir.map(Path::to_path_buf),
             endpoints: Self::resolve_endpoints(err)?,
             clock: Arc::new(SystemClock),
+            #[cfg(test)]
+            secret_store_double: None,
         })
     }
 
@@ -948,7 +988,66 @@ impl Context {
             data_root: None,
             endpoints: Self::resolve_endpoints(err)?,
             clock: Arc::new(SystemClock),
+            #[cfg(test)]
+            secret_store_double: None,
         })
+    }
+
+    /// A context rooted at `root` and pointed at a fixture server.
+    ///
+    /// # Why a constructor rather than the environment variable
+    ///
+    /// [`Context::resolve`] takes its endpoints from
+    /// [`GITHUB_BASE_URL_VARIABLE`], which is a *process*-wide value. A unit
+    /// test that set it would be setting it for every other test running in
+    /// the same process at the same time — and in edition 2024
+    /// `std::env::set_var` is `unsafe` for exactly that reason. The integration
+    /// suites can use the variable because each of them is a separate process
+    /// driving the binary; the in-crate tests cannot.
+    ///
+    /// `#[cfg(test)]`, so this is not compiled into the shipped binary and
+    /// there is no way to reach it from one.
+    ///
+    /// # Errors
+    /// [`Failure::LocalState`] when the directories cannot be created.
+    #[cfg(test)]
+    pub(crate) fn rooted_against(
+        paths_root: &Path,
+        endpoints: Endpoints,
+    ) -> Result<Self, CliError> {
+        let paths = AppPaths::rooted_at(paths_root);
+        paths.create_all().map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot create this test's data directories: {source}"),
+            )
+        })?;
+        Ok(Self {
+            paths,
+            data_root: Some(paths_root.to_path_buf()),
+            endpoints,
+            clock: Arc::new(SystemClock),
+            secret_store_double: None,
+        })
+    }
+
+    /// The same context, with `double` standing in for the platform secret
+    /// store that [`Context::secret_store`] would otherwise resolve.
+    ///
+    /// # Why the composition root, and not the call site
+    ///
+    /// The property `b1` has to assert is that the credential broker never
+    /// *reaches* the active host store, and the broker takes a [`Context`] and
+    /// nothing else. A double handed straight to the function under test would
+    /// therefore prove nothing: the only place a regression could pick the
+    /// store up is here, so this is the only place a stand-in catches one.
+    ///
+    /// `#[cfg(test)]` for the reason [`Context::rooted_against`] gives.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_secret_store(mut self, double: Arc<dyn SecretStore>) -> Self {
+        self.secret_store_double = Some(double);
+        self
     }
 
     /// Production GitHub, unless a loopback override says otherwise.
@@ -1074,22 +1173,34 @@ impl Context {
     /// and [`StartMode::default`] — `boot` — is what `service install` defaults
     /// to, so the two agree by construction.
     ///
+    /// Handed out as the [`SecretStore`] port rather than as the concrete
+    /// platform type, because every caller uses it as the port already and
+    /// because a test needs to be able to put a stand-in here; see
+    /// [`Context::with_secret_store`].
+    ///
     /// # Errors
     /// [`Failure::SecretStore`] when the platform cannot say where the store
     /// lives.
-    pub fn secret_store(&self, start_mode: StartMode) -> Result<PlatformSecretStore, CliError> {
+    pub fn secret_store(&self, start_mode: StartMode) -> Result<Arc<dyn SecretStore>, CliError> {
+        #[cfg(test)]
+        if let Some(double) = &self.secret_store_double {
+            return Ok(Arc::clone(double));
+        }
+
         let scope = SecretScope::for_start_mode(start_mode);
         let resolved = match &self.data_root {
             Some(root) => PlatformSecretStore::rooted_at(scope, root),
             None => PlatformSecretStore::standard(scope),
         };
-        resolved.map_err(|source| {
-            CliError::with_remedy(
-                Failure::SecretStore,
-                format!("cannot reach the {scope}-scoped secret store: {source}"),
-                "runner-manager host show",
-            )
-        })
+        resolved
+            .map(|store| Arc::new(store) as Arc<dyn SecretStore>)
+            .map_err(|source| {
+                CliError::with_remedy(
+                    Failure::SecretStore,
+                    format!("cannot reach the {scope}-scoped secret store: {source}"),
+                    "runner-manager host show",
+                )
+            })
     }
 
     /// The start mode recorded for this host, or the default when none is.

@@ -78,8 +78,7 @@ async fn run(
     }
 
     let mode = host.service_start_mode;
-    let secrets: Arc<dyn runner_manager_platform::secrets::SecretStore> =
-        Arc::from(context.secret_store(mode)?);
+    let secrets = context.secret_store(mode)?;
     let secret = secrets
         .load()
         .map_err(|source| {

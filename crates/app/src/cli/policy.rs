@@ -209,7 +209,7 @@ fn add(
     }
     let store = context.store()?;
     let secrets = context.secret_store(context.recorded_start_mode(&store)?)?;
-    let discovery = match super::auth::credential_state(context, &secrets)? {
+    let discovery = match super::auth::credential_state(context, secrets.as_ref())? {
         CredentialState::Authenticated(discovery) => discovery,
         state => {
             return Err(CliError::with_remedy(
