@@ -105,7 +105,7 @@ const CARGO_CRATE: &str = "runner-manager";
 
 /// Where the assets for one release live.
 #[derive(Debug, Clone)]
-enum AssetSource {
+pub(crate) enum AssetSource {
     /// A URL prefix; `<base>/<asset>` is fetched over HTTP.
     Remote { base: String },
     /// A directory holding the assets flat.
@@ -127,7 +127,7 @@ impl AssetSource {
     /// # Errors
     /// [`Failure::InvalidArgument`] when [`UPDATE_BASE_URL_VARIABLE`] holds an
     /// `http(s)` URL this refuses to trust, or a directory that is not there.
-    fn resolve(err: &mut dyn Write) -> Result<Self, CliError> {
+    pub(crate) fn resolve(err: &mut dyn Write) -> Result<Self, CliError> {
         let Some(raw) = std::env::var_os(UPDATE_BASE_URL_VARIABLE) else {
             return Ok(Self::Remote {
                 base: format!(
@@ -180,6 +180,41 @@ impl AssetSource {
         );
         Ok(Self::Remote {
             base: raw.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// The assets of **one exact released version**, for `wsl install`.
+    ///
+    /// # Why not `releases/latest/download`, which is what `update` uses
+    ///
+    /// The two commands are asking different questions. `update` asks "what is
+    /// the newest release", and `latest` is the only URL that answers it
+    /// without the GitHub API. `wsl install` asks for "the Linux release
+    /// artifact whose semantic version exactly matches the controlling Windows
+    /// binary" (`02-target-architecture.md`), and that is a *named* release:
+    /// the release workflow tags `v<X.Y.Z>`, so
+    /// `releases/download/v<X.Y.Z>/SHA256SUMS` is the document that describes
+    /// the same build as the process asking. Reading `latest` here would make
+    /// `wsl install` fail on a workstation one release behind — with "the
+    /// release publishes no archive for version 0.4.0", about a release that is
+    /// perfectly fine — rather than install the matching pair.
+    ///
+    /// [`UPDATE_BASE_URL_VARIABLE`] still wins when it is set, unchanged and
+    /// under the same loopback/local-directory restriction: a fixture serving
+    /// one release's assets flat has no `v<X.Y.Z>` directory to descend into.
+    ///
+    /// # Errors
+    /// As [`AssetSource::resolve`].
+    pub(crate) fn for_version(version: &str, err: &mut dyn Write) -> Result<Self, CliError> {
+        let resolved = Self::resolve(err)?;
+        if std::env::var_os(UPDATE_BASE_URL_VARIABLE).is_some() {
+            return Ok(resolved);
+        }
+        Ok(Self::Remote {
+            base: format!(
+                "{}/releases/download/v{version}",
+                env!("CARGO_PKG_REPOSITORY").trim_end_matches('/')
+            ),
         })
     }
 }
@@ -835,7 +870,7 @@ async fn replace_from_archive(
 }
 
 /// Reads one asset into memory as text. Used only for `SHA256SUMS`.
-async fn fetch_text(source: &AssetSource, asset: &str) -> Result<String, CliError> {
+pub(crate) async fn fetch_text(source: &AssetSource, asset: &str) -> Result<String, CliError> {
     match source {
         AssetSource::Local { directory } => {
             std::fs::read_to_string(directory.join(asset)).map_err(|error| {
@@ -868,7 +903,11 @@ async fn fetch_text(source: &AssetSource, asset: &str) -> Result<String, CliErro
 /// Streamed rather than buffered for the reason the `stream` feature is in this
 /// workspace at all: the archive is tens of megabytes, and a home host should
 /// not have to hold it in RAM to install it.
-async fn fetch_file(source: &AssetSource, asset: &str, into: &Path) -> Result<(), CliError> {
+pub(crate) async fn fetch_file(
+    source: &AssetSource,
+    asset: &str,
+    into: &Path,
+) -> Result<(), CliError> {
     let write_failure = |error: std::io::Error| {
         CliError::new(
             Failure::LocalState,
