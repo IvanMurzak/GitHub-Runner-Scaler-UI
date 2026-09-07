@@ -83,14 +83,22 @@ fn wsl_section(source: &str) -> &str {
     section
 }
 
+/// The section itself, which is what every scan below is about.
+///
+/// Owned rather than borrowed so that a test is one line instead of a `document`
+/// that has to outlive the slice taken out of it.
+fn wsl_procedure() -> String {
+    let source = document("README.md");
+    wsl_section(&source).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Definition of Done 1: nothing is left to the operator to invent
 // ---------------------------------------------------------------------------
 
 #[test]
 fn the_procedure_states_every_prerequisite_a_new_operator_has_to_meet() {
-    let section = document("README.md");
-    let section = wsl_section(&section);
+    let section = wsl_procedure();
 
     for (needle, why) in [
         (
@@ -139,8 +147,7 @@ fn the_procedure_states_every_prerequisite_a_new_operator_has_to_meet() {
 /// feature exists to remove.
 #[test]
 fn the_procedure_promises_the_four_manual_steps_this_feature_removes() {
-    let source = document("README.md");
-    let section = wsl_section(&source);
+    let section = wsl_procedure();
 
     // The promise, in the README's own words.
     for named in [
@@ -188,8 +195,7 @@ fn the_procedure_promises_the_four_manual_steps_this_feature_removes() {
 
 #[test]
 fn the_procedure_says_each_host_signs_in_separately_and_why_sharing_fails() {
-    let source = document("README.md");
-    let section = wsl_section(&source);
+    let section = wsl_procedure();
 
     assert!(
         section.contains("Each host signs in separately")
@@ -226,8 +232,7 @@ fn the_procedure_says_each_host_signs_in_separately_and_why_sharing_fails() {
 
 #[test]
 fn the_procedure_covers_every_topic_the_task_lists() {
-    let source = document("README.md");
-    let section = wsl_section(&source);
+    let section = wsl_procedure();
 
     for (topic, needle) in [
         ("fresh install", "wsl install --distribution Ubuntu"),
@@ -298,9 +303,8 @@ fn arguments_for(line: &str) -> Vec<String> {
 
 #[test]
 fn every_command_the_procedure_prints_is_accepted_by_the_real_parser() {
-    let source = document("README.md");
-    let section = wsl_section(&source);
-    let commands = documented_commands(section);
+    let section = wsl_procedure();
+    let commands = documented_commands(&section);
     assert!(
         commands.len() >= 10,
         "only {} commands were parsed out of the WSL section, which means this scan is \

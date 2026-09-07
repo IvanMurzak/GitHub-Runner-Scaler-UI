@@ -444,15 +444,26 @@ fn adopted_for(
         )
 }
 
-/// The rules every workstation has, whatever its distributions answer.
+/// The rules every workstation has, whatever its distributions answer, added
+/// after whatever `script` already holds.
+///
+/// Taking a script rather than starting one is what lets a journey put an
+/// injected refusal in front of these: a scripted runner answers from the first
+/// rule that matches, so a failing rule appended after them would never be
+/// reached.
 ///
 /// The `--version` rule is global on purpose: the binary installer asks the
 /// *staged* copy for its version, and that copy's path carries a per-run
 /// staging token no distribution-scoped rule could spell.
-fn workstation_script(names: &[&str]) -> ScriptedRunner {
-    ScriptedRunner::new()
+fn workstation_rules(script: ScriptedRunner, names: &[&str]) -> ScriptedRunner {
+    script
         .always("--list --verbose", ok(&distribution_table(names)))
         .always("--version", ok(&format!("runner-manager {}\n", version())))
+}
+
+/// Those rules and nothing else, for a journey that injects no failure.
+fn workstation_script(names: &[&str]) -> ScriptedRunner {
+    workstation_rules(ScriptedRunner::new(), names)
 }
 
 /// One Windows workstation, its scripted controls, and its config directory.
@@ -1037,9 +1048,7 @@ fn every_injected_stage_failure_is_repaired_by_running_the_command_again() {
         if let Some((matches, detail)) = injection.first_failure {
             script = script.sequence(matches, vec![refused(detail), ok("")]);
         }
-        let script = script
-            .always("--list --verbose", ok(&distribution_table(&[UBUNTU])))
-            .always("--version", ok(&format!("runner-manager {}\n", version())));
+        let script = workstation_rules(script, &[UBUNTU]);
         let mut workstation = Workstation::over(fresh_for(script, UBUNTU, ok("27.1.1\n"), 8));
         workstation.assets = FakeAssets::publishing(workstation.journal.clone())
             .refusing_the_next(injection.asset_refusals);
@@ -1244,13 +1253,13 @@ fn no_credential_reaches_stdout_stderr_logs_records_task_xml_argv_or_the_environ
     // credential is delivered and the command then FAILS, so the scan covers a
     // failure message and a rendered stderr, and the rerun then succeeds so it
     // also covers a clean report and the provider record that run wrote.
-    let script = ScriptedRunner::new()
-        .sequence(
+    let script = workstation_rules(
+        ScriptedRunner::new().sequence(
             "/Create /TN",
             vec![refused("ERROR: Access is denied."), ok("")],
-        )
-        .always("--list --verbose", ok(&distribution_table(&[UBUNTU])))
-        .always("--version", ok(&format!("runner-manager {}\n", version())));
+        ),
+        &[UBUNTU],
+    );
     let mut workstation = Workstation::over(fresh_for(script, UBUNTU, ok("27.1.1\n"), 8));
     let issuer = issuer_for(&workstation, UBUNTU);
 
