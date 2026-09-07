@@ -242,10 +242,27 @@ runner-manager service status                                  # Check service h
 runner-manager service uninstall                               # Remove the service but keep local state
 runner-manager tui                                             # Open the terminal dashboard
 runner-manager update [--check]                                # Install the newest release over this one
+
+runner-manager wsl list                                        # Name this machine's WSL distributions
+runner-manager wsl install --distribution NAME [--capacity N]  # Make a WSL2 distribution a second runner host
+runner-manager wsl status --distribution NAME [--json]         # Report that host's real state
+runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
 ```
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.
+
+### Address a managed WSL host
+
+`--host local` is the default and is this machine. On Windows, `--host wsl:NAME` carries any
+command above into a distribution `wsl install` has provisioned, so
+`runner-manager --host wsl:Ubuntu repo list` lists that Linux host's policies. Each host signs
+in separately: `runner-manager --host wsl:Ubuntu auth login` runs the browser sign-in here and
+hands the credential it issues straight to the Linux host, because GitHub invalidates both
+halves of a token pair whenever either one renews and two daemons therefore cannot share one.
+
+The `wsl` family and `--host wsl:...` exist on every platform and refuse, with a reason, on
+anything but Windows.
 
 ## Customize your setup
 

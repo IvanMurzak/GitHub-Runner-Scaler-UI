@@ -23,7 +23,20 @@ use support::{run, runner_manager};
 /// The exhaustive surface, transcribed from `02-target-architecture.md`.
 ///
 /// Top-level commands, and for each family the subcommands under it.
-const SURFACE: [(&str, &[&str]); 9] = [
+///
+/// # Two design documents feed this one list
+///
+/// The first nine families come from
+/// `.taskflow/2026-08-21-local-runner-manager/02-target-architecture.md`. `wsl`
+/// comes from `.taskflow/2026-09-06-managed-wsl-host/02-target-architecture.md`,
+/// which adds it under the same rule -- it prints the four subcommands below
+/// and the global `--host local|wsl:NAME` selector, and nothing else.
+///
+/// `wsl-host` is deliberately absent, exactly as `auth receive` is: both are
+/// hidden cross-process bridges rather than published commands, and
+/// `the_help_text_lists_the_documented_surface_and_nothing_beyond_it` would
+/// fail on either if the hiding ever stopped working.
+const SURFACE: [(&str, &[&str]); 10] = [
     ("auth", &["login", "status", "logout"]),
     (
         "host",
@@ -64,6 +77,7 @@ const SURFACE: [(&str, &[&str]); 9] = [
     ("tui", &[]),
     ("status", &[]),
     ("update", &[]),
+    ("wsl", &["list", "install", "status", "detach"]),
 ];
 
 /// The command names clap lists under `Commands:` in a help page.

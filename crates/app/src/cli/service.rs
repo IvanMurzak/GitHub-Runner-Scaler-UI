@@ -77,7 +77,12 @@ pub(crate) fn operations(context: &Context) -> ServiceOperations {
 /// [`announce_fixture`] is called by every command that touches the identity --
 /// not only [`status`] -- which is what keeps a stray variable in a shell
 /// profile from reading as "the service vanished" or as a successful install.
-fn identity() -> ServiceIdentity {
+///
+/// `pub(super)` so that `wsl-host hold` -- which runs *inside* the distribution
+/// and starts the very unit these commands install -- names the same
+/// registration. A second resolution there would start `runner-manager.service`
+/// while the suite had installed `runner-manager-selftest-<tag>.service`.
+pub(super) fn identity() -> ServiceIdentity {
     match std::env::var(SERVICE_TAG_VARIABLE) {
         Ok(tag) if !tag.trim().is_empty() => ServiceIdentity::fixture(tag.trim()),
         _ => ServiceIdentity::product(),

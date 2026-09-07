@@ -49,6 +49,7 @@ pub mod status;
 pub mod ui;
 pub mod update;
 pub mod workspace;
+pub mod wsl;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -300,6 +301,20 @@ failure_taxonomy! {
     /// The binary in place is the one that was there before -- every path that
     /// raises this either changed nothing or put the previous file back.
     UpdateFailed = 23 => "update_failed",
+    /// A managed WSL host operation ran and did not complete: `wsl.exe` or
+    /// `schtasks.exe` refused, a Linux step exited non-zero, or the final
+    /// read-back found the host only partly provisioned.
+    ///
+    /// Its own class rather than [`Failure::Unclassified`] because the whole
+    /// provisioning transaction is designed to be **rerun**
+    /// (`03-security-and-lifecycle.md`, "Provisioning failure model"): a script
+    /// that meets this knows the remedy is "fix what the report names, then run
+    /// `wsl install` again", which is true of no other class here. The
+    /// preflight refusals are deliberately *not* this — they are
+    /// [`Failure::UnsupportedHost`] and [`Failure::InvalidArgument`], because
+    /// nothing was changed and rerunning without fixing the distribution
+    /// changes nothing either.
+    WslProvisioning = 24 => "wsl_provisioning",
 }
 
 impl Failure {
@@ -459,8 +474,108 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true, env = DATA_DIR_VARIABLE)]
     pub data_dir: Option<PathBuf>,
 
+    /// Which host this command is addressed to: `local`, or `wsl:NAME`.
+    ///
+    /// `local` is the default and is this machine, exactly as before. With
+    /// `wsl:NAME` the command is carried out inside that managed WSL2
+    /// distribution instead, by the copy of runner-manager installed there —
+    /// so `--host wsl:Ubuntu repo list` lists the Linux host's policies.
+    /// `auth login` is the exception: the sign-in happens here, where the
+    /// browser is, and the credential it issues is handed straight to the
+    /// Linux host without being stored on this one.
+    #[arg(
+        long,
+        value_name = "HOST",
+        global = true,
+        default_value = LOCAL_HOST_SELECTOR,
+        value_parser = HostSelector::parse,
+    )]
+    pub host: HostSelector,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The spelling of `--host`'s default.
+pub const LOCAL_HOST_SELECTOR: &str = "local";
+
+/// The prefix that addresses a managed WSL distribution.
+pub const WSL_HOST_PREFIX: &str = "wsl:";
+
+/// The long option `--host` is spelled with, as it appears in an argument
+/// vector.
+///
+/// Named because the proxy has to *remove* it from the vector it forwards, and
+/// a second spelling there would forward a flag the Linux binary does not know.
+pub const HOST_OPTION: &str = "--host";
+
+/// Which host a command is addressed to.
+///
+/// # Why a value and not a `bool`
+///
+/// `02-target-architecture.md` requires that `--host local` "preserves every
+/// existing invocation", and that `wsl` and `--host wsl:…` on a non-Windows
+/// build "fail with an actionable unsupported-platform error rather than
+/// disappearing from help". Both are properties of a value that always parses
+/// and is refused later, by a command that can say *why* — not of a flag that
+/// exists on one platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSelector {
+    /// This machine. The default, and what every invocation written before
+    /// this feature means.
+    Local,
+    /// The named WSL2 distribution on this machine.
+    Wsl(String),
+}
+
+impl HostSelector {
+    /// Parses `local` or `wsl:NAME`.
+    ///
+    /// The distribution name is **not** validated here beyond being non-empty:
+    /// `runner_manager_platform::wsl::discovery::validate_distribution_name`
+    /// owns that rule, it produces a sentence naming the rule that was broken,
+    /// and a clap usage error would replace that sentence with `error: invalid
+    /// value`. So this accepts the shape and the command refuses the name.
+    ///
+    /// # Errors
+    /// A message for clap when the value is neither form.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw == LOCAL_HOST_SELECTOR {
+            return Ok(Self::Local);
+        }
+        if let Some(name) = raw.strip_prefix(WSL_HOST_PREFIX) {
+            if name.is_empty() {
+                return Err(format!(
+                    "`{WSL_HOST_PREFIX}` needs the distribution's name after it, as \
+                     `--host {WSL_HOST_PREFIX}Ubuntu`. `runner-manager wsl list` names the \
+                     ones this machine has."
+                ));
+            }
+            return Ok(Self::Wsl(name.to_string()));
+        }
+        Err(format!(
+            "expected `{LOCAL_HOST_SELECTOR}` or `{WSL_HOST_PREFIX}<distribution>`, not \
+             {raw:?}. `runner-manager wsl list` names the distributions this machine has."
+        ))
+    }
+
+    /// The distribution this addresses, when it is not this machine.
+    #[must_use]
+    pub fn distribution(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Wsl(name) => Some(name),
+        }
+    }
+}
+
+impl fmt::Display for HostSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => f.write_str(LOCAL_HOST_SELECTOR),
+            Self::Wsl(name) => write!(f, "{WSL_HOST_PREFIX}{name}"),
+        }
+    }
 }
 
 /// The whole command surface of `02-target-architecture.md`.
@@ -490,6 +605,89 @@ pub enum Command {
     Status(StatusArgs),
     /// Install the newest release over this one, however it was installed.
     Update(UpdateArgs),
+    /// Manage a WSL2 distribution as a second runner host (Windows).
+    #[command(subcommand)]
+    Wsl(WslCommand),
+    /// Keep this distribution's service alive. Not for people.
+    ///
+    /// ------------------------------------------------------------------
+    /// HIDDEN, AND THE HIDING IS PART OF THE DESIGN.
+    /// ------------------------------------------------------------------
+    /// The Windows lifecycle task's action is
+    /// `wsl.exe --distribution NAME --user root --exec
+    /// /usr/local/bin/runner-manager wsl-host hold`, and this is the other end
+    /// of it: a Linux-only process that starts the systemd unit and then stays
+    /// alive so WSL does not retire the distribution. An operator has no
+    /// reason to type it — `wsl install` registers the task that does — and
+    /// `cli_command_surface.rs` transcribes the *published* surface from the
+    /// design document, so a command not in that document has to be hidden for
+    /// that test to keep meaning what it says.
+    #[command(subcommand, hide = true)]
+    WslHost(WslHostCommand),
+}
+
+// -- the managed WSL host surface --------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum WslCommand {
+    /// Name the WSL distributions this machine has, and which are managed.
+    List,
+    /// Make a distribution a second runner host, or bring one up to date.
+    Install(WslInstallArgs),
+    /// Report a managed distribution's real state, not its record.
+    Status(WslStatusArgs),
+    /// Remove this machine's lifecycle task and record. Deletes no Linux data.
+    Detach(WslDetachArgs),
+}
+
+/// The `--distribution NAME` every `wsl` subcommand but `list` takes.
+///
+/// One `Args` struct behind three commands rather than three copies: the value
+/// is matched **exactly** against `wsl --list --verbose`, so a second doc
+/// comment describing it loosely is a second chance to describe it wrongly.
+#[derive(Debug, Args)]
+pub struct WslDetachArgs {
+    /// The distribution's exact name, as `wsl --list --verbose` spells it.
+    ///
+    /// Matched exactly, including case and spaces: WSL allows two names that
+    /// differ only in case, and guessing between them would be guessing which
+    /// host to change.
+    #[arg(long, value_name = "NAME")]
+    pub distribution: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WslInstallArgs {
+    /// The distribution's exact name, as `wsl --list --verbose` spells it.
+    #[arg(long, value_name = "NAME")]
+    pub distribution: String,
+
+    /// Concurrent runner attempts the Linux host may hold.
+    ///
+    /// Left out, the Linux host keeps whatever it already has, and a host that
+    /// has never been configured gets the product default. This is never
+    /// derived from a runner count or a core count: a capacity comes from an
+    /// observed workload measurement, so the only value this command sets is
+    /// one you typed.
+    #[arg(long, value_name = "N")]
+    pub capacity: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+pub struct WslStatusArgs {
+    /// The distribution's exact name, as `wsl --list --verbose` spells it.
+    #[arg(long, value_name = "NAME")]
+    pub distribution: String,
+
+    /// Emit the versioned, schema-stable JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WslHostCommand {
+    /// Start the Linux service, then stay alive until this process is stopped.
+    Hold,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1292,7 +1490,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// command calls [`crate::tui::run`] and nothing else reaches the terminal UI.
 #[must_use]
 pub fn dispatch() -> ExitCode {
-    let cli = Cli::parse();
+    // The vector is kept, not just parsed. `--host wsl:NAME` forwards *the
+    // original arguments* to the Linux binary, and clap's parsed tree cannot
+    // reproduce them: it has already normalised `--json`/`-j`, dropped the
+    // difference between `--capacity 4` and `--capacity=4`, and expanded
+    // defaults nobody typed. Re-rendering from the tree would forward a
+    // command line the operator did not write.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = Cli::parse_from(&argv);
 
     // A Windows service process is not an ordinary console process. SCM
     // requires its main thread to enter StartServiceCtrlDispatcher, and kills
@@ -1305,6 +1510,19 @@ pub fn dispatch() -> ExitCode {
         Command::Daemon(DaemonCommand::Run(args)) if args.windows_service_host
     ) {
         return dispatch_windows_service(cli);
+    }
+
+    // ------------------------------------------------------------------------
+    // ANOTHER HOST IS DECIDED BEFORE ANYTHING LOCAL IS RESOLVED.
+    // ------------------------------------------------------------------------
+    // A command addressed to `wsl:NAME` is the Linux host's to answer, and
+    // `run` below opens this host's database, its secret store and its log
+    // files on the way to routing one. Deciding here means `--host wsl:Ubuntu
+    // status` reports the Linux host without having touched a single file of
+    // the Windows one -- which is also what makes the proxy's exit code the
+    // child's own rather than something this process decided afterwards.
+    if let Some(distribution) = cli.host.distribution() {
+        return wsl::dispatch_to_selected_host(&cli, distribution, &argv);
     }
 
     // The terminal UI owns the terminal and owns its own exit code, so it is
@@ -1442,6 +1660,11 @@ fn run_with_shutdown(
 fn is_decorated_report(command: &Command) -> bool {
     match command {
         Command::Status(args) => !args.json,
+        // The same rule for the same reason: `wsl status --json` is a
+        // schema-stable document, and `wsl install` streams a device-flow
+        // prompt and a download that an operator waits in front of.
+        Command::Wsl(WslCommand::Status(args)) => !args.json,
+        Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
         Command::Host(_) | Command::Service(_) | Command::Repo(_) | Command::Org(_) => true,
         // `auth status` and `auth logout` are reports; `auth login` is a
         // conversation with a person and streams.
@@ -1470,6 +1693,8 @@ fn route(
         Command::Daemon(command) => daemon::dispatch(context, command, out, service_shutdown),
         Command::Service(command) => service::dispatch(context, command, out),
         Command::Update(args) => update::dispatch(context, args, out),
+        Command::Wsl(command) => wsl::dispatch(context, command, styling, out),
+        Command::WslHost(command) => wsl::dispatch_wsl_host(command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),
