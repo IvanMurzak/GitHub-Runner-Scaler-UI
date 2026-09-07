@@ -8,6 +8,24 @@ if grep -R -E 'RUNNER_MANAGER_TEST_MUTANT|test-mutants' \
   die "a public feature or environment-controlled domain mutant remains in source"
 fi
 
+# ----------------------------------------------------------------------------
+# The same rule, extended to the two crates the managed WSL host feature lives
+# in (b3-acceptance-docs: "extend ... guards for every new private/public
+# command").
+#
+# `crates/agent/src` is deliberately NOT in this list: its mutants are the ones
+# the acceptance suite injects, they live inside `#[cfg(test)]` controls, and the
+# binary scan below is what proves none of them ships. These two crates have no
+# mutant of any kind, and this is what keeps it that way -- `wsl install` is a
+# transaction that installs a binary and issues a credential, and an
+# environment-controlled branch through it would be worth more to an attacker
+# than to a test.
+if grep -R -E 'RUNNER_MANAGER_TEST_MUTANT|test-mutants' \
+  crates/platform/src crates/platform/Cargo.toml \
+  crates/app/src crates/app/Cargo.toml >/dev/null; then
+  die "an environment-controlled mutant or a public mutant feature reached the platform or CLI crate"
+fi
+
 if [[ "${1-}" != --scan-only ]]; then
   cargo build --workspace --all-features
 fi
@@ -21,5 +39,44 @@ if grep -a -E \
   "$binary" >/dev/null; then
   die "a test-only mutant marker was linked into the shippable binary"
 fi
+
+# ----------------------------------------------------------------------------
+# The WSL adapter's test double is a mutant of the same kind, by a different
+# name -- and it is checked at its call sites, not in the binary.
+# ----------------------------------------------------------------------------
+# `ScriptedRunner` answers `wsl.exe` and `schtasks.exe` from a table instead of
+# starting them, and `WslHost::with_runner` is the seam that injects it. Both
+# are ordinary `pub` items rather than `#[cfg(test)]` ones, because the
+# acceptance suites in three crates need them -- so nothing in the type system
+# stops the shipping binary from reaching one, and "the provisioning transaction
+# ran against a fake Task Scheduler" is exactly the class of thing this file
+# exists to make impossible.
+#
+# THE LINKED BINARY CANNOT ANSWER THIS QUESTION. A debug build keeps the whole
+# `wsl::exec` codegen unit, dead code included, so the ELF this workspace
+# produces on Linux carries `..ScriptedRunner..` symbols for functions nothing
+# calls, while the same build on Windows carries none only because MSVC keeps
+# those names in the PDB rather than in the executable. Grepping the binary
+# would therefore be a platform quirk reported as a security property.
+#
+# So the rule is asserted where it is decided: every mention of the double or of
+# its injection seam has to sit inside a `#[cfg(test)]` region. Two files name
+# them outside one by design -- `wsl/exec.rs`, which defines them, and
+# `cli/wsl_acceptance.rs`, whose whole file is mounted by
+# `#[cfg(test)] mod acceptance` in `cli/wsl.rs`.
+while IFS= read -r source; do
+  case "$source" in
+  crates/platform/src/wsl/exec.rs | crates/app/src/cli/wsl_acceptance.rs) continue ;;
+  esac
+  # The first mention that is not a comment, and the first `#[cfg(test)]`.
+  use=$(grep -n -E 'ScriptedRunner|WslHost::with_runner' "$source" |
+    grep -v -E '^[0-9]+:[[:space:]]*(//|/\*|\*)' | head -1 | cut -d: -f1 || true)
+  [[ -n "$use" ]] || continue
+  gate=$(grep -n -F '#[cfg(test)]' "$source" | head -1 | cut -d: -f1 || true)
+  if [[ -z "$gate" ]] || ((gate > use)); then
+    die "$source:$use reaches the WSL adapter's test double outside a #[cfg(test)] region"
+  fi
+done < <(grep -R -l -E 'ScriptedRunner|WslHost::with_runner' \
+  crates/app/src crates/platform/src --include='*.rs')
 
 printf 'shippable-mutant-guard: all-features binary is clean\n'

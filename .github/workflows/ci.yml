@@ -250,10 +250,33 @@ jobs:
           cargo test -p runner-manager-platform \
             --test privileged_service_installer -- --ignored --test-threads=1 --nocapture
 
-      # A leaked privileged service is the worst outcome available to this job,
-      # so the claim that nothing leaks is checked rather than trusted — and it
-      # is checked even when the step above failed, which is exactly when a
-      # fixture would have been left behind.
+      # ----------------------------------------------------------------------
+      # THE MANAGED WSL HOST'S LIFECYCLE TASK (b3).
+      # ----------------------------------------------------------------------
+      # The same reasoning one facility across: `crates/app`'s WSL acceptance
+      # suite drives the whole feature over scripted controls on every leg, and
+      # the one thing a scripted `schtasks.exe` cannot answer is whether Task
+      # Scheduler ACCEPTS the document this build renders. These tests register
+      # a real task under a `runner-manager-selftest-wsl-…` fixture name and
+      # remove it, so the leak check below covers them without needing a rule of
+      # its own. They are `#[ignore]`d for the same reason the installer tests
+      # are, and `privileged_tests_are_wired_into_ci.rs` asserts this step still
+      # exists.
+      #
+      # No distribution is installed, provisioned or started: the fixture
+      # distribution deliberately does not exist, which is what lets this run on
+      # a hosted runner that has no WSL.
+      - name: cargo test --test privileged_wsl_lifecycle -- --ignored
+        run: |
+          cargo test -p runner-manager-platform \
+            --test privileged_wsl_lifecycle -- --ignored --test-threads=1 --nocapture
+
+      # A leaked privileged service or scheduled task is the worst outcome
+      # available to this job, so the claim that nothing leaks is checked rather
+      # than trusted — and it is checked even when a step above failed, which is
+      # exactly when a fixture would have been left behind. The `schtasks` half
+      # covers both facilities: `d3`'s login-mode registration and `b3`'s WSL
+      # lifecycle task are both named `runner-manager-selftest…`.
       - name: Assert no self-test fixture was left on the runner
         if: always()
         shell: pwsh
