@@ -136,6 +136,31 @@ const COMMANDS: &[&[&str]] = &[
     &["tui"],
     &["status"],
     &["status", "--json"],
+    // ------------------------------------------------------------------------
+    // THE MANAGED WSL HOST SURFACE, PUBLIC AND PRIVATE.
+    // ------------------------------------------------------------------------
+    // `b3-acceptance-docs`: the secret-output guard covers "every new
+    // private/public command". Four are public and two are deliberately hidden,
+    // and the hidden pair is the half no other scan in this file would reach:
+    // `auth receive` is the door a credential document goes through, and
+    // `wsl-host hold` is the Linux end of the lifecycle task.
+    //
+    // Reached at their parser boundary, for the same reason `service install`
+    // and `daemon run` are above. `wsl list` drives `wsl.exe` and `wsl install`
+    // drives Task Scheduler and a device flow; this corpus runs on three CI
+    // legs of which at most one has either, so running them for real would
+    // measure the runner rather than the product. Their implemented handlers
+    // are covered by the acceptance suite in `crates/app/src/cli/wsl.rs` and
+    // `wsl_acceptance.rs`, which scans the same three needles over stdout,
+    // stderr, diagnostics, records, task XML, argv and the environment.
+    &["--host", "local", "status"],
+    &["--host", "local", "host", "show"],
+    &["wsl", "list", "--help"],
+    &["wsl", "install", "--help"],
+    &["wsl", "status", "--help"],
+    &["wsl", "detach", "--help"],
+    &["auth", "receive", "--help"],
+    &["wsl-host", "hold", "--help"],
 ];
 
 /// The three values that must never appear, with the name each is known by.

@@ -156,26 +156,73 @@ fn ci_checks_that_the_real_default_runner_root_was_put_back() {
     );
 }
 
-#[test]
-fn every_test_in_the_privileged_file_is_ignored_by_default() {
-    // The complement of the two tests above. They guard the job that runs these
-    // tests; this guards the property that makes the job necessary -- that an
-    // ordinary `cargo test` never registers a service on somebody's machine.
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/privileged_service_installer.rs"),
-    )
-    .expect("the privileged test file is readable");
+/// Every privileged file in this crate, by the name `cargo test --test` selects
+/// it with.
+///
+/// One list rather than one constant per file: the three assertions below are
+/// the same three whichever facility a file touches, and a new privileged file
+/// that is added without an entry here is a file nothing runs.
+const PRIVILEGED_TESTS: [&str; 2] = ["privileged_service_installer", "privileged_wsl_lifecycle"];
 
-    let tests = source.matches("\n#[test]").count();
-    let ignored = source.matches("\n#[ignore").count();
+#[test]
+fn every_test_in_a_privileged_file_is_ignored_by_default() {
+    // The complement of the tests above. They guard the job that runs these
+    // tests; this guards the property that makes the job necessary -- that an
+    // ordinary `cargo test` never registers a service, or a scheduled task, on
+    // somebody's machine.
+    for name in PRIVILEGED_TESTS {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/{name}.rs"));
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+
+        let tests = source.matches("\n#[test]").count();
+        let ignored = source.matches("\n#[ignore").count();
+        assert!(
+            tests > 0,
+            "no `#[test]` found in {name}; this test would assert nothing"
+        );
+        assert_eq!(
+            tests, ignored,
+            "every test in {name} that changes this machine must be `#[ignore]`d, or \
+             `cargo test --workspace` starts doing it on developers' machines. Found \
+             {tests} tests and {ignored} ignore attributes."
+        );
+    }
+}
+
+/// The WSL lifecycle smoke tests (`b3`) are wired the same way the installer
+/// ones are, and are covered by the same leak check.
+///
+/// The second half is the load-bearing one. A `runner-manager-wsl-…` task that
+/// survived a failed run would be invisible to a leak check that greps for
+/// `runner-manager-selftest`, so the fixture distribution name those tests
+/// derive their task name from has to carry that string. Asserting it here,
+/// against the file itself, is what keeps the two from drifting apart.
+#[test]
+fn ci_runs_the_privileged_wsl_lifecycle_tests_and_the_leak_check_can_see_their_fixtures() {
+    let (path, source) = ci_workflow();
     assert!(
-        tests > 0,
-        "no `#[test]` found; this test would assert nothing"
+        source.contains("--test privileged_wsl_lifecycle"),
+        "{} must run the WSL lifecycle smoke tests by name. They are the only place in \
+         this repository where Task Scheduler is asked to accept the document \
+         `LifecycleTask::xml` renders, and being `#[ignore]`d they run nowhere else.",
+        path.display()
     );
-    assert_eq!(
-        tests, ignored,
-        "every test that registers a real service must be `#[ignore]`d, or `cargo test \
-         --workspace` starts doing it on developers' machines. Found {tests} tests and \
-         {ignored} ignore attributes."
+
+    let wsl = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/privileged_wsl_lifecycle.rs"),
+    )
+    .expect("the privileged WSL test file is readable");
+    assert!(
+        wsl.contains("const FIXTURE_PREFIX: &str = \"runner-manager-selftest-wsl-\";"),
+        "the WSL fixture prefix must start with `runner-manager-selftest`, which is what \
+         {}'s leak check greps for. A fixture named anything else could survive a failed \
+         run and nothing would say so.",
+        path.display()
+    );
+    assert!(
+        source.contains("runner-manager-selftest"),
+        "{}'s leak check must still grep for the fixture marker",
+        path.display()
     );
 }

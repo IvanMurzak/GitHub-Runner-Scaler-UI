@@ -827,6 +827,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > dist/NOTES.md <<'NOTES'
+          ## What changed
+
+          `CHANGELOG.md` in this repository carries the entry for this version,
+          in the terms an operator upgrading would care about. The rest of this
+          note is about the artifacts below, which is the same every release.
+
           ## Verify what you downloaded
 
           Every asset is listed in `SHA256SUMS`.

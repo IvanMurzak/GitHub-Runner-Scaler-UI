@@ -4777,3 +4777,20 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The acceptance suite
+// ---------------------------------------------------------------------------
+// `b3-acceptance-docs`'s end-to-end journeys live in their own file rather than
+// in the module above, and are a CHILD of this module rather than a sibling so
+// that they can drive `install`, `probe`, `list_with` and `detach_with` -- the
+// last two of which are private, because nothing outside this module has any
+// business calling them.
+//
+// They build their own fakes rather than sharing the ones in `mod tests`. That
+// is deliberate: the tests above measure parts against fixtures written for
+// those parts, and an acceptance suite that inherited them would inherit their
+// assumptions too.
+#[cfg(test)]
+#[path = "wsl_acceptance.rs"]
+mod acceptance;

@@ -252,17 +252,140 @@ runner-manager wsl detach --distribution NAME                  # Stop managing i
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.
 
-### Address a managed WSL host
+## Run Linux jobs too: manage a WSL2 distribution
 
-`--host local` is the default and is this machine. On Windows, `--host wsl:NAME` carries any
-command above into a distribution `wsl install` has provisioned, so
-`runner-manager --host wsl:Ubuntu repo list` lists that Linux host's policies. Each host signs
-in separately: `runner-manager --host wsl:Ubuntu auth login` runs the browser sign-in here and
-hands the credential it issues straight to the Linux host, because GitHub invalidates both
-halves of a token pair whenever either one renews and two daemons therefore cannot share one.
+One Windows workstation can serve Windows jobs and Linux jobs at the same time. On Windows,
+`runner-manager wsl install` turns a WSL2 distribution you already have into a second managed
+host: it installs the matching Linux binary, signs that host in with its own GitHub credential,
+installs the Linux service, and registers a Windows task that keeps the distribution running.
+Each host then has its own capacity, its own policies and its own runner label.
 
-The `wsl` family and `--host wsl:...` exist on every platform and refuse, with a reason, on
-anything but Windows.
+You never create a staging folder, copy a token out of a Windows credential store, hand-write a
+systemd unit, or make a scheduled task yourself. If a step of this section asks you to,
+it is a defect in the product.
+
+### Before you start
+
+- **Windows.** The `wsl` family and `--host wsl:...` exist on every platform and refuse, with a
+  reason, on anything but Windows.
+- **An installed WSL2 distribution** with any name. Check with `runner-manager wsl list`, which
+  prints the exact spelling each command needs. WSL1 is refused and names the conversion command.
+- **systemd inside it.** Put `systemd=true` under `[boot]` in that distribution's `/etc/wsl.conf`
+  and run `wsl --terminate NAME`. Without systemd there is no Linux service to install, and the
+  preflight refuses before anything is changed.
+- **Root inside it,** which is the default for a distribution you have not reconfigured.
+- **x86-64 or 64-bit ARM.** Those are the Linux architectures this project publishes.
+- **A browser on this Windows machine,** for the one sign-in described below.
+
+Nothing here installs a distribution, edits `.wslconfig`, or touches the registry.
+
+### Make it a runner host
+
+```powershell
+runner-manager wsl list
+runner-manager wsl install --distribution Ubuntu --capacity 8
+```
+
+`wsl install` runs eight stages in order and prints what each one did:
+
+1. Preflight: WSL2, root, architecture, systemd, and whether the task name is free.
+2. The release archive matching this Windows build's exact version, checksum verified.
+3. The Linux binary, replaced atomically.
+4. The credential, issued only if that distribution does not already hold one.
+5. Capacity, only when you passed `--capacity`.
+6. The Linux systemd service.
+7. The Windows login task that keeps the distribution alive.
+8. A read-back of the real state, which is what decides whether the command succeeded.
+
+Nothing is changed and no sign-in happens until the preflight has passed.
+
+### Adopting a distribution that already runs runner-manager
+
+The same command. `wsl install` is convergent, so it probes before it writes and adopts what
+is already correct: a valid credential is kept, an enabled service unit is
+adopted rather than reinstalled, and policies, the runtime root and in-flight work are left
+alone. Capacity changes only when you pass `--capacity`. Re-running it on a healthy host
+changes nothing, and is the documented way to upgrade that host after you update on the
+Windows side.
+
+### Each host signs in separately
+
+`runner-manager --host wsl:Ubuntu auth login` runs the browser sign-in on Windows, where the
+browser is, and hands the credential it issues straight into the Linux host's own machine store
+over a pipe. The credential is never written down on Windows.
+
+Each host needs its own sign-in, and copying one is not an option that merely looks untidy: it
+does not work. GitHub invalidates both halves of a token pair whenever either half is renewed,
+so two daemons sharing one credential take turns logging each other out. `wsl install` does the
+sign-in for you when the distribution holds no credential of its own, and skips it when it does.
+
+### Configure it with the commands you already use
+
+`--host local` is the default and is this machine. `--host wsl:NAME` carries any command in the
+list above into that distribution instead:
+
+```powershell
+runner-manager --host wsl:Ubuntu repo add OWNER/REPO --host-label home --max-capacity 4
+runner-manager --host wsl:Ubuntu repo set-scale OWNER/REPO --enabled true
+runner-manager --host wsl:Ubuntu repo list
+runner-manager --host wsl:Ubuntu host set-capacity 4
+runner-manager --host wsl:Ubuntu status
+```
+
+The Linux host reserves its own routing label, such as `rm-home-linux-x64`, so a workflow picks
+Windows or Linux by choosing which label it runs on. `--capacity` on `wsl install` and
+`--host wsl:NAME host set-capacity N` set the same number; use whichever fits the moment.
+
+### Check what is really there
+
+```powershell
+runner-manager wsl status --distribution Ubuntu
+runner-manager wsl status --distribution Ubuntu --json
+```
+
+Every line is read from the distribution and from Task Scheduler, never from this machine's
+record of it, and the record is reported separately as drift when the two disagree. The report
+names the WSL version, the Linux binary, the credential, the systemd unit, the lifecycle task,
+the capacity, and the workload diagnostics below. `--json` is versioned and safe to script
+against.
+
+**When this host is available.** WSL distributions are registered per Windows user, so this
+feature promises unattended Linux availability **after that user logs on**, not between a
+Windows reboot and the first interactive logon. `wsl status` says so on every run rather than
+leaving you to discover it after a restart.
+
+**Docker is diagnosed, not installed.** If the distribution runs a Docker engine, status reports
+its version; if not, status says container jobs would fail while ordinary jobs still run. It is
+never a reason to refuse provisioning, and this tool never installs a workload dependency for
+you.
+
+### When something goes wrong
+
+Every failure names the stage it happened in and whether anything was changed.
+A preflight failure changed nothing at all. Any later failure leaves the earlier stages
+standing, and the remedy is always the same: fix what the message names and then
+run `wsl install` again. It will skip whatever is already correct.
+
+```powershell
+runner-manager wsl status --distribution Ubuntu   # what is actually in place
+runner-manager wsl install --distribution Ubuntu  # converge the rest
+```
+
+A scheduled task of this product's name that this product did not create is never modified or
+removed. If you made a keep-alive task by hand, `wsl install` stops and asks you to rename or
+remove it first.
+
+### Stop managing it
+
+```powershell
+runner-manager wsl detach --distribution Ubuntu
+```
+
+`detach` removes this machine's lifecycle task and its record of the host, and nothing else. It
+is deliberately not called `uninstall`: the distribution stays registered with WSL, and its
+runner-manager, service, credential, policies, workspaces and packages all stay exactly where
+they are. The command prints the explicit Linux commands to run inside the distribution if you
+want to undo that half as well.
 
 ## Customize your setup
 

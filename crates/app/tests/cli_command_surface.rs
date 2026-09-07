@@ -234,6 +234,95 @@ fn every_documented_command_is_reachable() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// THE TWO HIDDEN BRIDGES ARE PART OF THE SURFACE CONTRACT, BY BEING ABSENT
+// FROM IT.
+// ----------------------------------------------------------------------------
+// `SURFACE` above is the *published* list, and the two assertions it drives
+// would pass just as well if `auth receive` and `wsl-host hold` had stopped
+// existing altogether. They are not published, and they are also not optional:
+// `auth receive` is the only door a credential document goes through on its way
+// into a WSL distribution, and `wsl-host hold` is what the Windows lifecycle
+// task starts. So both directions are pinned here -- reachable, and hidden --
+// which is `b3-acceptance-docs`'s "command-surface guards for every new
+// private/public command".
+
+/// The hidden cross-process bridges, and the family each is hidden inside.
+const HIDDEN_BRIDGES: [(&str, &[&str]); 2] =
+    [("auth", &["auth", "receive"]), ("", &["wsl-host", "hold"])];
+
+#[test]
+fn every_hidden_bridge_still_parses_and_is_still_absent_from_help() {
+    for (family, path) in HIDDEN_BRIDGES {
+        // Reachable: the parser resolves the whole path and prints a usage
+        // line, so a bridge that had been renamed or dropped fails here rather
+        // than at the moment a provisioning run needs it.
+        let help = help_for(path);
+        assert!(
+            help.contains("Usage:"),
+            "`{}` must still be a command this binary accepts",
+            path.join(" ")
+        );
+
+        // Hidden: it is not listed where an operator would find it. For
+        // `wsl-host` that is the top-level page; for `receive` it is `auth`'s.
+        let listing = if family.is_empty() {
+            commands_in(&help_for(&[]))
+        } else {
+            commands_in(&help_for(&[family]))
+        };
+        let name = if family.is_empty() { path[0] } else { path[1] };
+        assert!(
+            !listing.iter().any(|listed| listed == name),
+            "`{name}` is a cross-process bridge and must stay hidden. \
+             `the_help_text_lists_the_documented_surface_and_nothing_beyond_it` and \
+             `every_documented_family_lists_exactly_its_documented_subcommands` transcribe \
+             the published surface from the design document, and a bridge that started \
+             advertising itself would make one of them fail for a reason that reads like a \
+             transcription error. Listing was: {listing:?}"
+        );
+    }
+}
+
+/// The global host selector: one option, on every command, refusing anything
+/// that is neither `local` nor `wsl:NAME`.
+#[test]
+fn the_host_selector_is_global_and_takes_only_the_two_documented_spellings() {
+    let root = help_for(&[]);
+    assert!(
+        root.contains("--host <HOST>"),
+        "`--host` must be on the root help page: it is global, and it is how every \
+         existing command reaches a managed WSL host. Page was:\n{root}"
+    );
+
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    for accepted in ["local", "wsl:Ubuntu", "wsl:Debian GNU/Linux 12"] {
+        let outcome = run({
+            let mut command = runner_manager(temporary.path());
+            command.args(["--host", accepted, "repo", "list", "--help"]);
+            command
+        });
+        assert_eq!(
+            outcome.code, 0,
+            "`--host {accepted}` must parse; stderr: {}",
+            outcome.stderr
+        );
+    }
+
+    // And a spelling that addresses nothing is a usage error rather than a
+    // command quietly run against this machine.
+    let outcome = run({
+        let mut command = runner_manager(temporary.path());
+        command.args(["--host", "vm:Ubuntu", "repo", "list"]);
+        command
+    });
+    assert_eq!(
+        outcome.code, 2,
+        "an unspellable host must be clap's usage error, not a local run; stderr: {}",
+        outcome.stderr
+    );
+}
+
 /// A command the design does not list must be a usage error, not a surprise.
 #[test]
 fn an_undocumented_command_is_refused() {
