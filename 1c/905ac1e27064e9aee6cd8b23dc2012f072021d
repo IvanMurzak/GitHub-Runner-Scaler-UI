@@ -1,0 +1,22 @@
+.taskflow/2026-09-06-managed-wsl-host/tasks/r2-windows-line-ending-test-correction.md
+  s_92e74af38f2870::t_050505416eaab1 1-42
+.taskflow/2026-09-06-managed-wsl-host/ROADMAP.md
+  s_92e74af38f2870::t_d5f5189e638b64 32
+  s_92e74af38f2870::t_050505416eaab1 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "1c905ac1e27064e9aee6cd8b23dc2012f072021d",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
