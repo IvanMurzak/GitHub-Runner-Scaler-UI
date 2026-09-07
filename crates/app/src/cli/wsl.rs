@@ -933,6 +933,10 @@ pub struct ServiceSnapshot {
     pub enabled: Option<String>,
     /// `systemctl is-active` in its own word.
     pub active: Option<String>,
+    /// The version reported by the product-owned binary registered for the
+    /// service, when the Linux status command could inspect it.
+    pub binary_version: Option<String>,
+    pub matches_expected: bool,
     pub healthy: bool,
 }
 
@@ -1011,9 +1015,14 @@ impl WslStatusDocument {
         }
         if !self.service.healthy {
             parts.push(format!(
-                "the systemd unit {} is {}",
+                "the systemd unit {} is {}; its binary is {} (expected {})",
                 self.service.unit,
-                self.service.active.as_deref().unwrap_or("not readable")
+                self.service.active.as_deref().unwrap_or("not readable"),
+                self.service
+                    .binary_version
+                    .as_deref()
+                    .unwrap_or("not readable"),
+                self.expected_version,
             ));
         }
         if !self.lifecycle_task.registered {
@@ -1053,6 +1062,8 @@ struct LinuxStatus {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct LinuxProduct {
     version: String,
+    #[serde(default)]
+    service_binary_version: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1114,6 +1125,8 @@ pub fn probe(
         unit: unit.to_string(),
         enabled: None,
         active: None,
+        binary_version: None,
+        matches_expected: false,
         healthy: false,
     };
     let mut capacity = None;
@@ -1125,6 +1138,9 @@ pub fn probe(
                 binary.installed = true;
                 binary.matches_expected = status.product.version == expected_version;
                 binary.version = Some(status.product.version);
+                service.matches_expected =
+                    status.product.service_binary_version.as_deref() == Some(expected_version);
+                service.binary_version = status.product.service_binary_version;
                 credential.present = status.credential.present;
                 credential.unreadable = status.credential.unreadable;
                 credential.store_scope = status.credential.store_scope;
@@ -1144,7 +1160,7 @@ pub fn probe(
 
         service.enabled = systemctl_word(&invoker, distribution, &["is-enabled", unit]);
         service.active = systemctl_word(&invoker, distribution, &["is-active", unit]);
-        service.healthy = service.active.as_deref() == Some("active");
+        service.healthy = service.active.as_deref() == Some("active") && service.matches_expected;
 
         diagnostics.push(docker_diagnostic(&invoker, distribution));
     }
@@ -1833,13 +1849,31 @@ impl Provisioner<'_> {
         let failed = write_failed("this install");
         let enabled = systemctl_word(invoker, distribution, &["is-enabled", &self.unit]);
         if enabled.as_deref() == Some("enabled") {
-            writeln!(
-                out,
-                "The systemd unit {} is already enabled; it is adopted rather than \
-                 reinstalled, and the daemon takes the new binary on its own handover.",
-                self.unit
-            )
-            .map_err(failed)?;
+            let active = systemctl_word(invoker, distribution, &["is-active", &self.unit]);
+            if active.as_deref() == Some("active") {
+                writeln!(
+                    out,
+                    "The systemd unit {} is already enabled and active; it is adopted rather than \
+                     reinstalled, and the daemon takes the new binary on its own handover.",
+                    self.unit
+                )
+                .map_err(failed)?;
+            } else {
+                invoker
+                    .exec_ok(
+                        "start the adopted Linux service",
+                        LinuxCommand::new(distribution, "systemctl")
+                            .args(["start", self.unit.as_str()])
+                            .with_timeout(SERVICE_TIMEOUT),
+                    )
+                    .map_err(|source| self.stage_failure(Stage::Service, &source))?;
+                writeln!(
+                    out,
+                    "The systemd unit {} was already enabled but not active; it was adopted and started.",
+                    self.unit
+                )
+                .map_err(failed)?;
+            }
             return Ok(false);
         }
 
@@ -2321,9 +2355,19 @@ fn write_status_text(document: &WslStatusDocument, out: &mut dyn Write) -> Resul
     .map_err(failed)?;
     writeln!(
         out,
-        "  linux service             {} is {}",
+        "  linux service             {} is {}; binary {}{}",
         document.service.unit,
-        document.service.active.as_deref().unwrap_or("not readable")
+        document.service.active.as_deref().unwrap_or("not readable"),
+        document
+            .service
+            .binary_version
+            .as_deref()
+            .unwrap_or("not readable"),
+        if document.service.matches_expected {
+            String::new()
+        } else {
+            format!(" (expected {})", document.expected_version)
+        }
     )
     .map_err(failed)?;
     writeln!(
@@ -2879,9 +2923,19 @@ mod tests {
 
     /// `status --json` as the Linux binary would answer it.
     fn linux_status_json(credential: bool, capacity: u16, reported: &str) -> String {
+        linux_status_json_with_service(credential, capacity, reported, reported)
+    }
+
+    fn linux_status_json_with_service(
+        credential: bool,
+        capacity: u16,
+        reported: &str,
+        service_reported: &str,
+    ) -> String {
         format!(
             "{{\"schema_version\":1,\"product\":{{\"name\":\"runner-manager\",\
-             \"version\":\"{reported}\"}},\"credential\":{{\"present\":{credential},\
+             \"version\":\"{reported}\",\"service_binary_version\":\"{service_reported}\"}},\
+             \"credential\":{{\"present\":{credential},\
              \"unreadable\":null,\"store_scope\":\"machine\"}},\
              \"host\":{{\"capacity\":{capacity}}}}}"
         )
@@ -2990,6 +3044,23 @@ mod tests {
             .always("--exec systemctl is-enabled", ok("enabled\n"))
             .always("--exec systemctl is-active", ok("active\n"))
             .always("--exec docker info", docker)
+            .always("--version", ok(&format!("runner-manager {}\n", version())))
+            .always("status --json", ok(&linux_status_json(true, 8, version())))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"))
+    }
+
+    /// A previously installed unit that systemd knows about but is not
+    /// running yet. The second `is-active` answer is the install read-back
+    /// after the adoption stage starts it.
+    fn provisioned_inactive_script() -> ScriptedRunner {
+        preflight_script()
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .sequence(
+                "--exec systemctl is-active",
+                vec![ok("inactive\n"), ok("active\n")],
+            )
+            .always("--exec docker info", ok("27.1.1\n"))
             .always("--version", ok(&format!("runner-manager {}\n", version())))
             .always("status --json", ok(&linux_status_json(true, 8, version())))
             .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
@@ -3848,6 +3919,24 @@ mod tests {
     }
 
     #[test]
+    fn an_enabled_but_inactive_unit_is_started_when_it_is_adopted() {
+        let mut fixture = Fixture::over(provisioned_inactive_script());
+        let (document, outcome) = fixture.install(None).expect("an inactive adoption");
+
+        assert!(document.healthy, "{document:#?}");
+        assert!(!outcome.service_installed);
+        fixture.journal.never("service install");
+        fixture
+            .journal
+            .at("--exec systemctl start runner-manager.service");
+        assert!(
+            fixture.output().contains("adopted and started"),
+            "{}",
+            fixture.output()
+        );
+    }
+
+    #[test]
     fn capacity_is_changed_only_when_it_was_supplied() {
         let mut without = Fixture::fresh();
         let (_, outcome) = without.install(None).expect("a clean provisioning");
@@ -4033,6 +4122,31 @@ mod tests {
                 "{expected} must be named: {parts}"
             );
         }
+    }
+
+    #[test]
+    fn status_is_unhealthy_when_the_running_service_copy_is_an_older_version() {
+        let script = preflight_script()
+            .always(
+                "status --json",
+                ok(&linux_status_json_with_service(true, 8, version(), "0.3.2")),
+            )
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
+            .always("--exec docker info", ok("27.1.1\n"))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"));
+        let (_journal, _root, document) = probe_scripted(script);
+
+        assert!(!document.healthy);
+        assert_eq!(document.service.binary_version.as_deref(), Some("0.3.2"));
+        assert!(!document.service.matches_expected);
+        assert!(
+            document
+                .unhealthy_parts()
+                .join("; ")
+                .contains("its binary is 0.3.2")
+        );
     }
 
     #[test]

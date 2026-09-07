@@ -7,6 +7,19 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.1
+
+### WSL adoption and policy recovery fixes
+
+- An enabled but inactive systemd unit is now started when `wsl install`
+  adopts it, so a convergent install cannot report success while leaving the
+  Linux daemon stopped.
+- A daemon now detects an already-newer source binary immediately at startup,
+  allowing its service-owned copy to hand over even when the package was
+  upgraded while the daemon was stopped.
+- Repeating `set-scale --enabled false` after the last busy runner exits now
+  completes `draining` to `disabled`; the policy can then be enabled normally.
+
 ## 0.4.0
 
 ### A WSL2 distribution can now be a second managed runner host (Windows)

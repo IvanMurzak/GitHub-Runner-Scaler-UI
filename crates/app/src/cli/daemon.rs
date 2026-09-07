@@ -459,6 +459,9 @@ async fn wait_for_upgrade(path: std::path::PathBuf) -> String {
     // The stamp this daemon started from. A binary replaced *before* the first
     // look is still caught, because the version comparison below is against
     // what this process was compiled as rather than against the file.
+    if let Some(version) = upgraded_version(&path) {
+        return version;
+    }
     let mut known = BinaryStamp::of(&path);
     loop {
         tokio::time::sleep(UPGRADE_CHECK_INTERVAL).await;
