@@ -1121,7 +1121,7 @@ pub fn probe(
 
     if wsl.ready {
         match linux_status(&invoker, distribution, linux_binary) {
-            Ok(Some(status)) => {
+            Ok(LinuxAnswer::Reported(status)) => {
                 binary.installed = true;
                 binary.matches_expected = status.product.version == expected_version;
                 binary.version = Some(status.product.version);
@@ -1130,9 +1130,13 @@ pub fn probe(
                 credential.store_scope = status.credential.store_scope;
                 capacity = Some(status.host.capacity);
             }
-            Ok(None) => {
+            // The child's diagnostic, not a claim about the file: a binary
+            // that is there and refused would otherwise be reported as absent,
+            // and the operator sent to reinstall something already installed.
+            Ok(LinuxAnswer::Unusable(why)) => {
                 binary.problem = Some(format!(
-                    "there is no runner-manager at {linux_binary} inside {distribution}"
+                    "there is no usable runner-manager at {linux_binary} inside \
+                     {distribution}: {why}"
                 ));
             }
             Err(problem) => binary.problem = Some(problem),
@@ -1158,7 +1162,13 @@ pub fn probe(
         && lifecycle_task.product_owned
         && lifecycle_task.enabled;
 
-    let drift = drift_between(record.as_ref(), &binary, &lifecycle_task, distribution);
+    let drift = drift_between(
+        record.as_ref(),
+        wsl.ready,
+        &binary,
+        &lifecycle_task,
+        distribution,
+    );
 
     Ok(WslStatusDocument {
         schema_version: WSL_STATUS_SCHEMA_VERSION,
@@ -1218,7 +1228,26 @@ fn wsl_snapshot(
     }
 }
 
-/// The Linux binary's own `status --json`, or `None` when there is no binary.
+/// What the Linux binary said when it was asked for `status --json`.
+///
+/// # Why `Unusable` carries a sentence rather than being an absence
+///
+/// A missing program and a program that ran and refused are the same exit
+/// status to this process, and a caller that read either as "there is no
+/// runner-manager here" would state, about a binary that is plainly installed,
+/// that it is not. The child's own diagnostic is the only thing that tells the
+/// two apart, so it is carried rather than dropped: every caller reports it,
+/// and [`Provisioner::settle_the_credential`] refuses on it instead of reading
+/// "could not ask" as "holds no credential".
+#[derive(Debug)]
+enum LinuxAnswer {
+    /// It answered, and this build could read the answer.
+    Reported(LinuxStatus),
+    /// There is no usable runner-manager there, in the child's own words.
+    Unusable(String),
+}
+
+/// The Linux binary's own `status --json`.
 ///
 /// # Errors
 /// A sentence for [`BinarySnapshot::problem`] when the binary is there and its
@@ -1227,20 +1256,17 @@ fn linux_status(
     invoker: &WslInvoker<'_>,
     distribution: &str,
     binary: &str,
-) -> Result<Option<LinuxStatus>, String> {
+) -> Result<LinuxAnswer, String> {
     let command = LinuxCommand::new(distribution, binary).args(["status", "--json"]);
     let output = match invoker.exec(command) {
         Ok(output) => output,
         Err(source) => return Err(source.to_string()),
     };
     if !output.success() {
-        // A missing program and a program that refused are told apart by the
-        // caller only in prose; both mean "not usable", and the child's own
-        // diagnostic is the better sentence for either.
-        return Ok(None);
+        return Ok(LinuxAnswer::Unusable(output.diagnostic()));
     }
     serde_json::from_slice::<LinuxStatus>(output.stdout())
-        .map(Some)
+        .map(LinuxAnswer::Reported)
         .map_err(|source| {
             format!(
                 "the runner-manager at {binary} in {distribution} answered `status --json` with \
@@ -1330,8 +1356,17 @@ fn task_snapshot(name: &str, task: Option<&RegisteredTask>) -> TaskSnapshot {
 /// An absent record is **not** drift: `wsl status` on an unmanaged
 /// distribution is a legitimate question with a legitimate answer, and a
 /// record is never the authority for anything here.
+///
+/// Neither is a question that was never asked. `wsl_ready` is
+/// [`WslSnapshot::ready`], and when it is false the distribution was never
+/// interrogated about its binary — so an absent [`BinarySnapshot::version`]
+/// says nothing about the host. Reporting it as drift is the same fabrication
+/// [`WslStatusDocument::unhealthy_parts`] exists to avoid: it would tell the
+/// operator of a WSL1 or systemd-less distribution that their Linux binary is
+/// gone, which nothing here has looked for.
 fn drift_between(
     record: Option<&WslProviderRecord>,
+    wsl_ready: bool,
     binary: &BinarySnapshot,
     task: &TaskSnapshot,
     distribution: &str,
@@ -1363,12 +1398,12 @@ fn drift_between(
             "the record says runner-manager {} was installed and the distribution reports {version}",
             record.installed_version
         )),
-        None => drift.push(format!(
+        None if wsl_ready => drift.push(format!(
             "the record says runner-manager {} was installed and the distribution has no \
              readable binary at {}",
             record.installed_version, binary.path
         )),
-        Some(_) => {}
+        _ => {}
     }
     drift
 }
@@ -1540,9 +1575,11 @@ impl Provisioner<'_> {
         // -- Stage 3: the binary -------------------------------------------
         // Asked *before* the install so the report can say "already 0.4.0"
         // rather than describe a replacement that replaced nothing.
-        let installed_before = linux_status(&invoker, &distribution, &self.linux_binary)
-            .ok()
-            .flatten();
+        let installed_before = match linux_status(&invoker, &distribution, &self.linux_binary) {
+            Ok(LinuxAnswer::Reported(status)) => Some(status),
+            // Nothing usable answered, so there is nothing to leave alone.
+            Ok(LinuxAnswer::Unusable(_)) | Err(_) => None,
+        };
         let binary_replaced = installed_before
             .as_ref()
             .is_none_or(|status| status.product.version != self.version);
@@ -1704,7 +1741,7 @@ impl Provisioner<'_> {
         out: &mut dyn Write,
     ) -> Result<bool, CliError> {
         let failed = write_failed("this install");
-        let status =
+        let answer =
             linux_status(invoker, distribution, &self.linux_binary).map_err(|problem| {
                 CliError::new(
                     Failure::WslProvisioning,
@@ -1712,9 +1749,31 @@ impl Provisioner<'_> {
                 )
             })?;
 
-        if let Some(status) = &status
-            && status.credential.present
-        {
+        // The binary landed one stage ago, so a refusal here is not "there is
+        // no host to ask" -- it is "the host would not say". Guarantee 1 is
+        // about not issuing over a credential this cannot see, and a status
+        // that never answered hides one exactly as an unreadable store does.
+        // Reading it as absence would mint a second credential and, because
+        // GitHub invalidates both halves of a pair when either renews, destroy
+        // the one the distribution was already working with.
+        let status = match answer {
+            LinuxAnswer::Reported(status) => status,
+            LinuxAnswer::Unusable(why) => {
+                return Err(CliError::with_remedy(
+                    Failure::WslProvisioning,
+                    format!(
+                        "{}: the runner-manager at {} in {distribution} would not answer \
+                         `status --json`, so this cannot tell whether the distribution already \
+                         holds a credential and will not issue one blind: {why}",
+                        stage_prefix(Stage::Credential),
+                        self.linux_binary
+                    ),
+                    "runner-manager wsl status --distribution <NAME>",
+                ));
+            }
+        };
+
+        if status.credential.present {
             writeln!(
                 out,
                 "{distribution} already holds its own credential; it is left untouched."
@@ -1722,10 +1781,7 @@ impl Provisioner<'_> {
             .map_err(failed)?;
             return Ok(false);
         }
-        if let Some(why) = status
-            .as_ref()
-            .and_then(|s| s.credential.unreadable.clone())
-        {
+        if let Some(why) = status.credential.unreadable {
             return Err(CliError::with_remedy(
                 Failure::SecretStore,
                 format!(
@@ -1943,11 +1999,15 @@ fn list_with(host: &WslHost, paths: &AppPaths, out: &mut dyn Write) -> Result<()
         // Read per entry rather than listed once: `WslProviderRecord::all`
         // would report a record whose distribution has since been
         // unregistered, and this column is about the rows WSL really has.
-        let managed = match WslProviderRecord::read(paths, entry.name())
-            .map_err(|source| wsl_failure(&source))?
-        {
-            Some(record) => format!("managed, runner-manager {}", record.installed_version),
-            None => "not managed".to_string(),
+        let managed = match WslProviderRecord::read(paths, entry.name()) {
+            Ok(Some(record)) => format!("managed, runner-manager {}", record.installed_version),
+            Ok(None) => "not managed".to_string(),
+            // Reported in its row rather than raised. `wsl list` is the remedy
+            // every other failure in this module points an operator at, and a
+            // record is advisory in any case -- one file this build cannot
+            // parse must not be able to hide every distribution the machine
+            // has, which is the one thing this command exists to say.
+            Err(source) => format!("record unreadable: {source}"),
         };
         let default = if entry.is_default() { ", default" } else { "" };
         writeln!(
@@ -3683,6 +3743,52 @@ mod tests {
     }
 
     #[test]
+    fn a_status_that_will_not_answer_refuses_rather_than_issuing_a_second_credential() {
+        // The binary landed one stage ago, so a refusal here is not "there is
+        // no host to ask" -- it is "the host would not say". Reading it as
+        // absence would mint a credential over one this cannot see, and
+        // GitHub invalidates both halves of a pair when either renews, so the
+        // credential the distribution was working with would be destroyed.
+        let mut fixture = Fixture::over(base_script().sequence(
+            "status --json",
+            vec![
+                // Stage 3: there is no binary yet, so one is installed.
+                refused("/usr/local/bin/runner-manager: not found"),
+                // Stage 4: the binary that just landed will not answer.
+                refused("cannot open the local database at /var/lib/runner-manager/state.db"),
+            ],
+        ));
+
+        let refusal = fixture
+            .install(None)
+            .expect_err("a status that will not answer is not an absent credential");
+
+        assert_eq!(refusal.class(), Failure::WslProvisioning);
+        let message = refusal.to_string();
+        assert!(
+            message.contains("credential"),
+            "the failure must name its stage: {message}"
+        );
+        assert!(
+            message.contains("cannot open the local database"),
+            "and it must carry the child's own reason rather than invent one: {message}"
+        );
+        assert!(
+            refusal.remedy().is_some(),
+            "and it must name a command: {message}"
+        );
+        fixture.journal.never("device flow");
+        fixture.journal.never("auth receive");
+        fixture.journal.never("/Create");
+        assert!(
+            WslProviderRecord::read(&fixture.paths, DISTRIBUTION)
+                .expect("a readable directory")
+                .is_none(),
+            "and nothing may claim the host is managed"
+        );
+    }
+
+    #[test]
     fn a_declined_sign_in_leaves_what_landed_and_registers_nothing() {
         let mut fixture = Fixture::fresh();
         fixture.issuer = FakeIssuer::issuing(fixture.journal.clone())
@@ -3962,6 +4068,97 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_that_refuses_is_reported_in_its_own_words_and_not_called_absent() {
+        // A missing program and an installed one that refused are the same
+        // exit status to this process. Only the child's diagnostic tells them
+        // apart, so it is reported rather than dropped: an operator whose
+        // `status --json` cannot read its journal must not be sent to
+        // reinstall a binary that is plainly already there.
+        let (_journal, _root, _paths, document) = probe_scripted(base_script().always(
+            "status --json",
+            refused("cannot read this host's attempt journal: database disk image is malformed"),
+        ));
+
+        let problem = document
+            .binary
+            .problem
+            .as_deref()
+            .expect("a binary that will not answer is a problem");
+        assert!(
+            problem.contains("database disk image is malformed"),
+            "the child's own reason must survive: {problem}"
+        );
+        assert!(
+            !document.binary.installed,
+            "nothing usable answered, so nothing may be treated as installed"
+        );
+        assert!(!document.healthy);
+    }
+
+    #[test]
+    fn a_question_that_was_never_asked_is_not_drift() {
+        // WSL1 has neither systemd nor a Linux kernel, so `probe` never asks
+        // the distribution about its binary. Reporting the resulting absence
+        // as drift would tell the operator their Linux binary is gone, which
+        // nothing here has looked for.
+        let journal = Journal::default();
+        let (host, _) = wrap(
+            ScriptedRunner::new()
+                .always(
+                    "--list --verbose",
+                    ok("* Ubuntu   Running   1
+"),
+                )
+                .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+                .always(
+                    "/FO CSV",
+                    ok("\"task\",\"N/A\",\"Running\"
+"),
+                ),
+            &journal,
+        );
+        let (_root, paths) = fixture_paths();
+        WslProviderRecord::new(
+            DISTRIBUTION,
+            identity_of(DISTRIBUTION).name(),
+            version(),
+            Utc::now(),
+        )
+        .write(&paths)
+        .expect("a record");
+
+        let document = probe(
+            &host,
+            &paths,
+            DISTRIBUTION,
+            DEFAULT_LINUX_DESTINATION,
+            UNIT,
+            version(),
+            Utc::now(),
+        )
+        .expect("a readable host");
+
+        assert!(!document.wsl.ready, "WSL1 is not usable");
+        assert!(
+            !document
+                .drift
+                .iter()
+                .any(|line| line.contains("readable binary")),
+            "the binary was never asked about, so its absence is not evidence: {:?}",
+            document.drift
+        );
+        assert!(
+            document.drift.is_empty(),
+            "and nothing else disagrees either: {:?}",
+            document.drift
+        );
+        assert!(
+            !document.healthy,
+            "the distribution is still not a usable host, which is what `wsl` says"
+        );
+    }
+
+    #[test]
     fn docker_is_a_diagnostic_and_never_decides_health() {
         let (_journal, _root, _paths, document) = probe_scripted(provisioned_script(refused(
             "Cannot connect to the Docker daemon",
@@ -4108,6 +4305,44 @@ mod tests {
             text.contains("Legacy  WSL1, Stopped (not managed)"),
             "and a WSL1 distribution is listed rather than hidden, because `wsl install` \
              is the command that explains why it cannot be used:\n{text}"
+        );
+    }
+
+    #[test]
+    fn one_unreadable_record_does_not_hide_the_machines_distributions() {
+        // `wsl list` is the remedy every other failure in this module points
+        // an operator at, and a record is advisory in any case. One file this
+        // build cannot parse must not be able to hide every distribution the
+        // machine has, which is the one thing this command exists to say.
+        let journal = Journal::default();
+        let (host, _) = wrap(
+            ScriptedRunner::new().always(
+                "--list --verbose",
+                ok("* Ubuntu   Running   2
+  Debian   Stopped   2
+"),
+            ),
+            &journal,
+        );
+        let (_root, paths) = fixture_paths();
+        let path = WslProviderRecord::path(&paths, DISTRIBUTION).expect("a record path");
+        std::fs::create_dir_all(WslProviderRecord::directory(&paths))
+            .expect("the record directory");
+        std::fs::write(&path, "this is not a provider record").expect("a fixture record");
+
+        let mut out = Vec::new();
+        list_with(&host, &paths, &mut out).expect("one bad file is not a failure of the listing");
+        let text = String::from_utf8(out).expect("utf-8");
+
+        assert!(
+            text.contains("Ubuntu") && text.contains("record unreadable"),
+            "the row says what is wrong with it rather than vanishing:
+{text}"
+        );
+        assert!(
+            text.contains("Debian  WSL2, Stopped (not managed)"),
+            "and every other distribution is still listed:
+{text}"
         );
     }
 
