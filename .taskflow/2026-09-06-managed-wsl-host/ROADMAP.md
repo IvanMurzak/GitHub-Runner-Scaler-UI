@@ -26,8 +26,8 @@ The table below is the sole live task-state record.
 | Task (spec) | needs | repo/base | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|---|
 | [a1-wsl-platform-adapter](tasks/a1-wsl-platform-adapter.md) | — | ./main | 9/9 | top | ✅ | [PR #53](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/53), `f983cd3` | 2026-09-06 |
-| [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | 🔵 | [PR #52](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/52), macOS correction R1 | 2026-09-06 |
-| [r1-macos-credential-test-correction](tasks/r1-macos-credential-test-correction.md) | — | ./worktree-01a078d9… | 9/3 | mid | 🔵 | PR #52 recovery | 2026-09-06 |
+| [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | ✅ | [PR #52](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/52), `ffb5f37` | 2026-09-06 |
+| [r1-macos-credential-test-correction](tasks/r1-macos-credential-test-correction.md) | — | ./worktree-01a078d9… | 9/3 | mid | ✅ | `7d301cd`, PR #52 | 2026-09-06 |
 | [b2-wsl-cli-orchestration](tasks/b2-wsl-cli-orchestration.md) | a1, b1 | ./main | 10/10 | top | ⚪ | — | 2026-09-06 |
 | [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | ⚪ | — | 2026-09-06 |
 
@@ -43,3 +43,4 @@ The table below is the sole live task-state record.
 | 2026-09-06 | Credential broker redispatched as `01a078d9-cdbe-70f3-a422-49f05296c1c8` after the one-time platform worktree provisioning phase completed. |
 | 2026-09-06 | A1 passed implementation, independent review, simplification and every PR check; PR #53 merged as `f983cd3`. Pipeline teardown timed out, so exact worktree cleanup remains. |
 | 2026-09-06 | B1 PR #52 passed Linux, Windows, both E2E jobs and privileged Windows smoke, but macOS exposed a test-only Keychain caching assumption. No merge occurred. R1 dispatched against the preserved clean PR worktree to replace that oracle with an injected failing store and rerun all checks. |
+| 2026-09-06 | R1 replaced the platform-file corruption assumption with an injected unreadable store and proved zero active-store calls. All seven PR checks passed, including macOS arm64 and the 13-minute Windows workspace suite; PR #52 merged as `ffb5f37`. A1 and B1 foundations are complete. |
