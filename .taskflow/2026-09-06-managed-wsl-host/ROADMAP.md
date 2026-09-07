@@ -29,6 +29,7 @@ The table below is the sole live task-state record.
 | [b1-credential-broker](tasks/b1-credential-broker.md) | — | ./main | 10/8 | top | ✅ | [PR #52](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/52), `ffb5f37` | 2026-09-06 |
 | [r1-macos-credential-test-correction](tasks/r1-macos-credential-test-correction.md) | — | ./worktree-01a078d9… | 9/3 | mid | ✅ | `7d301cd`, PR #52 | 2026-09-06 |
 | [b2-wsl-cli-orchestration](tasks/b2-wsl-cli-orchestration.md) | a1, b1 | ./main | 10/10 | top | 🔵 | pipeline `01a079e2-e745-7045-8702-c95dd27ee27c` | 2026-09-06 |
+| [r2-windows-line-ending-test-correction](tasks/r2-windows-line-ending-test-correction.md) | — | ./worktree-01a079e2… | 8/2 | mid | 🔵 | pipeline `01a07adf-0c69-7057-89ea-1adf544bb99d` | 2026-09-06 |
 | [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | ⚪ | — | 2026-09-06 |
 
 ## Progress log
@@ -45,3 +46,4 @@ The table below is the sole live task-state record.
 | 2026-09-06 | B1 PR #52 passed Linux, Windows, both E2E jobs and privileged Windows smoke, but macOS exposed a test-only Keychain caching assumption. No merge occurred. R1 dispatched against the preserved clean PR worktree to replace that oracle with an injected failing store and rerun all checks. |
 | 2026-09-06 | R1 replaced the platform-file corruption assumption with an injected unreadable store and proved zero active-store calls. All seven PR checks passed, including macOS arm64 and the 13-minute Windows workspace suite; PR #52 merged as `ffb5f37`. A1 and B1 foundations are complete. |
 | 2026-09-06 | B2 public CLI/orchestration dispatched in isolated pipeline run `01a079e2-e745-7045-8702-c95dd27ee27c` after both foundation dependencies merged. |
+| 2026-09-06 | B2 PR #54 passed six checks, but its source-shape test assumed LF and failed on the Windows CRLF checkout. R2 records the narrow correction against the preserved PR branch; production behavior remains unchanged. |
