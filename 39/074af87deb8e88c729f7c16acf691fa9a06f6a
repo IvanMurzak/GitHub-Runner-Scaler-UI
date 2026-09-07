@@ -1,0 +1,19 @@
+.taskflow/2026-09-06-managed-wsl-host/ROADMAP.md
+  s_92e74af38f2870::t_f0f3c1f8e6c75b 29-30,46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "39074af87deb8e88c729f7c16acf691fa9a06f6a",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
