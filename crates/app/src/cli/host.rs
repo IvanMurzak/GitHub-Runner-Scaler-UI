@@ -85,7 +85,6 @@ use runner_manager_github::rest::{
     BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
 };
 use runner_manager_platform::runner_root::RootOwner;
-use runner_manager_platform::secrets::SecretStore;
 
 use super::workspace;
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, Styling, write_failed};

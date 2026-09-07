@@ -36,7 +36,6 @@ use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, InventoryGateway, RefreshState, RestInventory,
 };
 use runner_manager_github::{AuthenticatedClient, UserAccessToken};
-use runner_manager_platform::secrets::SecretStore as _;
 
 use super::screens::{
     self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,

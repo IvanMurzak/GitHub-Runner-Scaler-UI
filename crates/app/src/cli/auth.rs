@@ -966,7 +966,7 @@ pub fn receive(
     record_start_mode(context, &store, recorded, start_mode)?;
 
     let secrets = context.secret_store(start_mode)?;
-    store_received_credential(&secrets, &document, out)
+    store_received_credential(secrets.as_ref(), &document, out)
 }
 
 /// The refusal a terminal stdin earns.
@@ -1373,7 +1373,7 @@ pub fn status(
     let store = context.store()?;
     let start_mode = context.recorded_start_mode(&store)?;
     let secrets = context.secret_store(start_mode)?;
-    let state = credential_state(context, &secrets)?;
+    let state = credential_state(context, secrets.as_ref())?;
 
     writeln!(out, "Credential: {}", state.as_str()).map_err(failed)?;
     writeln!(out, "Store:      {}", secrets.location()).map_err(failed)?;
@@ -2527,11 +2527,12 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufRead as _, BufReader};
     use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use runner_manager_github::Endpoints;
-    use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope};
+    use runner_manager_platform::process::HandoffError;
+    use runner_manager_platform::secrets::{PlatformSecretStore, Protection, SecretScope};
 
     // -- canaries ----------------------------------------------------------
     //
@@ -2710,6 +2711,137 @@ mod tests {
             }
             self.delivered = Some(document.expose_secret().to_string());
             Ok(())
+        }
+    }
+
+    // -- the active store, as a port ---------------------------------------
+
+    /// The store the Windows host's active credential is already in, standing
+    /// in for the platform one at the seam [`Context::secret_store`] hands out.
+    ///
+    /// It counts every call and refuses every operation. `load` returning a
+    /// failure rather than the value it holds is the deliberate part: this is
+    /// the store `broker_user_credential` is forbidden to consult, so the only
+    /// correct number of calls is zero, and a caller that made one is told no
+    /// rather than handed a credential.
+    ///
+    /// # Why a port rather than a corrupted file
+    ///
+    /// The assertion this exists for used to be made by planting a credential
+    /// in a real rooted store and then overwriting the store's backing file
+    /// with bytes it could not decode. That is a sound oracle on Windows and
+    /// Linux, where the file *is* the store. It is not one on macOS, where the
+    /// store is a keychain: an item can still be served through a keychain
+    /// handle the process already holds after the database underneath it has
+    /// been overwritten, so the setup could not promise the store was
+    /// unreadable at the moment the broker ran. `d2`'s own corruption tests
+    /// are `#[cfg(not(target_os = "macos"))]` or live in its `windows` and
+    /// `linux` modules for exactly that reason; this one had no such guard and
+    /// no business needing one. A store that refuses on principle refuses
+    /// identically on all three, and it also answers the stronger question --
+    /// *was it reached at all* -- which no amount of corrupting a file can.
+    #[derive(Debug)]
+    struct UnreadableStore {
+        /// What the Windows host is holding. Never handed to anybody.
+        held: String,
+        loads: AtomicUsize,
+        writes: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+
+    impl UnreadableStore {
+        /// A store holding `document` and refusing to say so.
+        fn holding(document: &str) -> Self {
+            Self {
+                held: document.to_string(),
+                loads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+            }
+        }
+
+        /// How many times the active credential was read for.
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+
+        /// How many times something tried to write over it.
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+
+        /// How many times something tried to remove it.
+        fn deletes(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
+        }
+
+        /// What it still holds, for the test to compare against what it was
+        /// given.
+        fn held(&self) -> &str {
+            &self.held
+        }
+
+        /// The refusal every operation earns. It names no part of the value:
+        /// this error is formatted into a `CliError` by every caller, and a
+        /// canary in it would be a leak of exactly the kind
+        /// [`no_canary_escaped`] exists to catch.
+        fn refusal() -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "this store is not the credential broker's to touch",
+            )
+        }
+    }
+
+    impl SecretStore for UnreadableStore {
+        fn scope(&self) -> SecretScope {
+            SecretScope::Machine
+        }
+
+        fn location(&self) -> String {
+            "the machine-scoped store this host is already signed in to".to_string()
+        }
+
+        fn store(&self, _secret: &SecretString) -> Result<(), SecretStoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(SecretStoreError::Store {
+                scope: self.scope(),
+                location: self.location(),
+                source: Self::refusal(),
+            })
+        }
+
+        fn load(&self) -> Result<Option<SecretString>, SecretStoreError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Err(SecretStoreError::Load {
+                scope: self.scope(),
+                location: self.location(),
+                source: Self::refusal(),
+            })
+        }
+
+        fn delete(&self) -> Result<Removal, SecretStoreError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Err(SecretStoreError::Delete {
+                scope: self.scope(),
+                location: self.location(),
+                source: Self::refusal(),
+            })
+        }
+
+        fn protection(&self) -> Result<Protection, SecretStoreError> {
+            // `Protection` has no public constructor, which is the right shape
+            // for a value only a real platform inspection can produce -- so
+            // this refuses like the rest. Nothing in the broker path asks.
+            let guard = PathBuf::from("(a test double: there is no file behind this store)");
+            Err(SecretStoreError::Inspect {
+                scope: self.scope(),
+                guard: guard.clone(),
+                source: HandoffError::Inspect {
+                    path: guard,
+                    source: Self::refusal(),
+                },
+            })
         }
     }
 
@@ -3249,43 +3381,74 @@ mod tests {
     /// The proof that the active store is *never loaded*, rather than merely
     /// not leaked.
     ///
-    /// The store is left holding bytes it cannot read back — a corrupt DPAPI
-    /// blob, a corrupt keychain item, a file that is not the value. Any code
-    /// path that consulted the Windows credential on the way to issuing a new
-    /// one would fail here. This one does not notice.
+    /// The store the composition root would hand out is [`UnreadableStore`]:
+    /// it holds the credential this Windows host is signed in with, it counts
+    /// every call, and it refuses every one. Any code path that consulted the
+    /// Windows credential on the way to issuing a new one both fails and is
+    /// counted. This one does not go near it.
+    ///
+    /// The two canaries stay distinct, and stay distinct all the way through:
+    /// what the sink receives is the WSL pair and only the WSL pair, and the
+    /// Windows pair is still sitting untouched in the store afterwards.
     #[test]
     fn the_broker_succeeds_when_the_active_windows_store_cannot_even_be_read() {
         let root = tempfile::tempdir().expect("a temporary directory");
-        let windows_store = PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
-            .expect("a rooted store resolves");
-        windows_store
-            .store(&SecretString::from(document(
-                &windows_access_canary(),
-                &windows_refresh_canary(),
-            )))
-            .expect("the active Windows credential is in place");
-        // Overwritten in place, so the store's own location is corrupt rather
-        // than absent: absence would be indistinguishable from a store that was
-        // read successfully and found empty.
-        let guard = windows_store.guard();
-        std::fs::write(&guard, [0x00_u8, 0xff, 0x00, 0xff]).expect("the store is corrupted");
-        assert!(
-            !matches!(windows_store.load(), Ok(Some(_))),
-            "the corrupted store must not read back as a usable credential"
-        );
+        let planted = document(&windows_access_canary(), &windows_refresh_canary());
+        let windows_store = Arc::new(UnreadableStore::holding(&planted));
 
         let github = FakeDeviceFlow::approving();
-        let context = context_against(root.path(), &github);
+        let context = context_against(root.path(), &github)
+            .with_secret_store(Arc::clone(&windows_store) as Arc<dyn SecretStore>);
         let mut sink = RecordingSink::accepting();
         let mut transcript = Vec::new();
 
         broker_user_credential(&context, Styling::plain(), &mut transcript, &mut sink)
             .expect("issuing a new credential does not depend on reading the old one");
+
+        // A fresh WSL credential was delivered ...
+        let delivered = sink.delivered.expect("the sink received a document");
         assert!(
-            sink.delivered
-                .is_some_and(|d| d.contains(&wsl_access_canary())),
+            delivered.contains(&wsl_access_canary()) && delivered.contains(&wsl_refresh_canary()),
             "the WSL host still receives its own newly issued pair"
         );
+        assert!(
+            !delivered.contains(&windows_access_canary())
+                && !delivered.contains(&windows_refresh_canary()),
+            "`03-security-and-lifecycle.md` guarantee 2: the active Windows credential is \
+             never read for transfer"
+        );
+
+        // ... and producing it did not reach the active store at all. Zero,
+        // not "did not leak what it read": the load is the guarantee, and a
+        // count is the only thing that states it.
+        assert_eq!(
+            windows_store.loads(),
+            0,
+            "`03-security-and-lifecycle.md` guarantee 2: the active Windows credential is \
+             never read for transfer, and the broker read it"
+        );
+        assert_eq!(
+            windows_store.writes(),
+            0,
+            "`03-security-and-lifecycle.md` guarantee 5: the handoff wrote to the active \
+             Windows store, which it has no business touching"
+        );
+        assert_eq!(
+            windows_store.deletes(),
+            0,
+            "the handoff removed the active Windows credential"
+        );
+        assert_eq!(
+            windows_store.held(),
+            planted,
+            "the Windows host's own credential is not what it was"
+        );
+
+        // Nothing under the root either: this store keeps its value in memory,
+        // so unlike the planted-store test above there is no file a canary is
+        // allowed to be in.
+        let transcript = String::from_utf8(transcript).expect("the transcript is text");
+        no_canary_escaped(&transcript, root.path(), &|_| false);
     }
 
     // -- the broker: every failing stage -----------------------------------
