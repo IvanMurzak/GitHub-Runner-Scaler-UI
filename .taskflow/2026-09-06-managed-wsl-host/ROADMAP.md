@@ -30,7 +30,7 @@ The table below is the sole live task-state record.
 | [r1-macos-credential-test-correction](tasks/r1-macos-credential-test-correction.md) | — | ./worktree-01a078d9… | 9/3 | mid | ✅ | `7d301cd`, PR #52 | 2026-09-06 |
 | [b2-wsl-cli-orchestration](tasks/b2-wsl-cli-orchestration.md) | a1, b1 | ./main | 10/10 | top | ✅ | [PR #54](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/54), `eaf8abd` | 2026-09-07 |
 | [r2-windows-line-ending-test-correction](tasks/r2-windows-line-ending-test-correction.md) | — | ./worktree-01a079e2… | 8/2 | mid | ✅ | `4578db5`, PR #54 | 2026-09-07 |
-| [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | 🔵 | pipeline `01a07b21-eb3e-7090-ad90-05ad46f1bf57` | 2026-09-07 |
+| [b3-acceptance-docs](tasks/b3-acceptance-docs.md) | b2 | ./main | 8/6 | top | ✅ | [PR #55](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/55), `ca74c71` | 2026-09-07 |
 
 ## Progress log
 
@@ -49,3 +49,4 @@ The table below is the sole live task-state record.
 | 2026-09-06 | B2 PR #54 passed six checks, but its source-shape test assumed LF and failed on the Windows CRLF checkout. R2 records the narrow correction against the preserved PR branch; production behavior remains unchanged. |
 | 2026-09-07 | R2 made the source-shape test CRLF-independent. Independent review also closed B2 preflight-capacity, adopted-unit activation and credential-scope reporting gaps. All seven checks passed, including the 13-minute Windows suite; PR #54 merged as `eaf8abd`. |
 | 2026-09-07 | Wave 3 acceptance tests and operator documentation dispatched after B2 merged green. |
+| 2026-09-07 | B3 added isolated CLI acceptance, secret-output canaries, privileged Windows/WSL lifecycle coverage, operator docs and deterministic release/changelog guards. All seven checks passed; PR #55 merged as `ca74c71`. Source implementation is release-ready. |
