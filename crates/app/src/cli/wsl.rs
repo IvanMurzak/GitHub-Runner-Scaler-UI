@@ -3364,7 +3364,20 @@ mod tests {
 
     /// The body of a function, from its signature to the closing brace at the
     /// indentation the signature was written at.
+    ///
+    /// The source is normalised to LF first, because the end of the body is
+    /// found by a needle that spells the line break itself. `include_str!`
+    /// hands over the bytes that are on disk, and a Windows checkout with
+    /// `core.autocrlf=true` -- the default Git for Windows installs, and what
+    /// GitHub's windows runner image uses -- has rewritten every `\n` in this
+    /// file to `\r\n` by the time it is compiled. Without this the closing
+    /// brace is never found on that platform and the caller panics on source
+    /// the compiler was perfectly happy with. Normalising here rather than
+    /// pinning `*.rs` in `.gitattributes` keeps the fix to the one assertion
+    /// that reads its own file, and the needles the callers search for carry
+    /// no line break of their own.
     fn body_of(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("`{signature}` must exist for this test to mean anything"));
@@ -3375,6 +3388,32 @@ mod tests {
             .find(&closing)
             .unwrap_or_else(|| panic!("`{signature}` must be closed"));
         rest[..end].to_string()
+    }
+
+    /// `body_of` reads a CRLF checkout exactly as it reads an LF one.
+    ///
+    /// The regression this pins is the one that failed only on the Windows
+    /// leg: the same source, differing solely in line endings, must yield the
+    /// same body -- otherwise the stream assertion above cannot run there at
+    /// all, and a proxy that piped a stream would go unnoticed on the one
+    /// platform that actually runs `wsl.exe`.
+    #[test]
+    fn the_source_shape_helper_does_not_depend_on_line_endings() {
+        let signature = "    fn sample(&self) -> u8 {";
+        let lf = format!("impl Thing {{\n{signature}\n        1\n    }}\n}}\n");
+        let crlf = lf.replace('\n', "\r\n");
+
+        let from_lf = body_of(&lf, signature);
+        let from_crlf = body_of(&crlf, signature);
+
+        assert_eq!(
+            from_lf, from_crlf,
+            "a CRLF checkout must produce the same body as an LF one"
+        );
+        assert!(
+            from_lf.contains("        1"),
+            "the body must actually reach the statement inside it, not stop at the signature"
+        );
     }
 
     /// A plan that runs one line of shell, for the exit-code proofs.
