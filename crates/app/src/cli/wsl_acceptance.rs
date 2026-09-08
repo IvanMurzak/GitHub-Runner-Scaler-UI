@@ -341,7 +341,8 @@ fn our_task_xml(distribution: &str) -> String {
 fn linux_status_json(credential: bool, capacity: u16, reported: &str) -> String {
     format!(
         "{{\"schema_version\":1,\"product\":{{\"name\":\"runner-manager\",\
-         \"version\":\"{reported}\"}},\"credential\":{{\"present\":{credential},\
+         \"version\":\"{reported}\",\"service_binary_version\":\"{reported}\"}},\
+         \"credential\":{{\"present\":{credential},\
          \"unreadable\":null,\"store_scope\":\"machine\"}},\
          \"host\":{{\"capacity\":{capacity}}}}}"
     )

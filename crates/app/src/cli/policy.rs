@@ -1023,9 +1023,16 @@ pub fn apply_policy_mutation(
                 }
                 policy.activate().map_err(invalid)?;
             }
-        } else if policy.enabled() {
-            policy.request_disable().map_err(invalid)?;
-            if active == 0 {
+        } else {
+            if policy.enabled() {
+                policy.request_disable().map_err(invalid)?;
+            }
+            // A previous disable may have entered `draining` while work was
+            // still active. Repeating the desired-state command after the last
+            // attempt has gone must finish that transition; otherwise the
+            // policy is permanently unable to reach `disabled` and therefore
+            // cannot be enabled again.
+            if policy.state() == PolicyState::Draining && active == 0 {
                 policy.drain_completed(0).map_err(invalid)?;
             }
         }
@@ -1869,6 +1876,49 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("draining with 2 active runner(s)"), "{text}");
         assert!(text.contains("busy runners were not terminated"), "{text}");
+    }
+
+    #[test]
+    fn repeating_disable_after_the_last_runner_finishes_completes_the_drain() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        policy.request_disable().unwrap();
+        store.insert_policy(&policy).unwrap();
+        drop(store);
+
+        let mut output = Vec::new();
+        apply_scale_confirmed(&context, &target, false, None, &mut output).unwrap();
+
+        let stored = find_policy(&context.store().unwrap(), &target).unwrap();
+        assert_eq!(stored.state(), PolicyState::Disabled);
+        assert!(!stored.enabled());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("disabled with 0 active runner(s)")
+        );
     }
 
     #[test]

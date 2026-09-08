@@ -415,11 +415,14 @@ fn the_changelog_documents_this_feature_under_a_version_the_release_can_publish(
          two by hand. Add the entry for {heading}'s successor, or put the manifest back."
     );
 
-    // The entry is about this feature, and names the whole surface it added.
+    // The 0.4.0 entry introduced this feature and must keep naming its whole
+    // surface. A later patch entry describes only its patch; requiring every
+    // future newest entry to repeat this release note would prevent the
+    // changelog from advancing at all.
     let entry = changelog
         .split("\n## ")
-        .nth(1)
-        .expect("the newest entry has a body");
+        .find(|entry| entry.starts_with("0.4.0\n"))
+        .expect("the 0.4.0 WSL feature entry remains in the changelog");
     for named in [
         "wsl list",
         "wsl install",
