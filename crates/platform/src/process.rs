@@ -554,6 +554,9 @@ impl SpawnSpec {
         extra_env: Option<(&OsStr, &OsStr)>,
     ) -> Result<ChildProcess, ProcessError> {
         let mut command = Command::new(&self.program);
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+
         command.args(&self.args);
         for (key, value) in &self.envs {
             command.env(key, value);
@@ -1286,6 +1289,12 @@ mod sys {
     }
 
     pub(super) fn force_stop(pid: u32) -> io::Result<()> {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
             .map_err(|error| io_error(&error))?;
         let result = unsafe { TerminateProcess(handle, 1) };
@@ -1582,7 +1591,8 @@ mod sys {
         // this program owns. The PID is checked for liveness by the caller
         // immediately beforehand, and every caller either holds the child
         // handle or has just re-verified the process identity.
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        // We use `-pid` to send the signal to the entire process group.
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
         if result == 0 {
             return Ok(true);
         }
@@ -1597,7 +1607,7 @@ mod sys {
 
     pub(super) fn force_stop(pid: u32) -> io::Result<()> {
         // SAFETY: as `request_stop`.
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
         if result == 0 {
             return Ok(());
         }

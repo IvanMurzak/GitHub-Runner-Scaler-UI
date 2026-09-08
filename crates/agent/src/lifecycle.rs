@@ -98,7 +98,14 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// supplies that input from the restrictive handoff; the listener command line
 /// must contain only the supported `run` command.
 fn runner_listener_spec(program: PathBuf, runtime: &Path) -> SpawnSpec {
-    SpawnSpec::new(program).arg("run").working_dir(runtime)
+    let tmp = runtime.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    SpawnSpec::new(program)
+        .arg("run")
+        .working_dir(runtime)
+        .env("TMPDIR", &tmp)
+        .env("TEMP", &tmp)
+        .env("TMP", &tmp)
 }
 
 /// Retry bounds for failures that can resolve without operator action.
