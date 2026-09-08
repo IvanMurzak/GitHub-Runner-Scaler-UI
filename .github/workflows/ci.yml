@@ -133,6 +133,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "cargo-${{ runner.os }}-${{ runner.arch }}"
+          cache-bin: false
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
@@ -206,6 +207,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "cargo-${{ runner.os }}-${{ runner.arch }}"
+          cache-bin: false
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
