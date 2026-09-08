@@ -38,7 +38,7 @@ use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -1893,7 +1893,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool)
         .into_iter()
         .map(|row| {
             let focused = row.control == Some(ui.focus);
-            focus_line(focused, row.text)
+            styled_form_line(ui, &row, focused)
         })
         .collect();
     if let Some(message) = &ui.message {
@@ -1905,11 +1905,28 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, ui: &SettingsUi, compact: bool)
             message
                 .lines()
                 .flat_map(|line| wrap(line, width))
-                .map(Line::from),
+                .map(|line| {
+                    let colour = if line.to_ascii_lowercase().starts_with("error") {
+                        Color::Red
+                    } else {
+                        Color::Green
+                    };
+                    Line::from(Span::styled(line, Style::default().fg(colour)))
+                }),
         );
     }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().title("Settings").borders(Borders::ALL)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    "Settings",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
         area,
     );
 }
@@ -1923,13 +1940,60 @@ pub fn content_width(area_width: u16) -> usize {
     usize::from(area_width.saturating_sub(2)).max(1)
 }
 
-fn focus_line<'a>(focused: bool, text: impl Into<String>) -> Line<'a> {
-    let style = if focused {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
+fn styled_form_line<'a>(ui: &SettingsUi, row: &FormLine, focused: bool) -> Line<'a> {
+    let control = row
+        .control
+        .and_then(|index| ui.controls().into_iter().nth(index));
+    let mut style = match control {
+        Some(
+            Control::HostSave
+            | Control::HostRootSave
+            | Control::PolicySave
+            | Control::PolicyLabelsSave
+            | Control::WorkspaceSave,
+        ) => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        Some(Control::HostRootReset) => Style::default().fg(Color::Yellow),
+        Some(_) => Style::default().fg(Color::Cyan),
+        None => Style::default(),
     };
-    Line::from(Span::styled(text.into(), style))
+    if focused {
+        style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    }
+    if control.is_some() {
+        return Line::from(Span::styled(row.text.clone(), style));
+    }
+
+    let lower = row.text.to_ascii_lowercase();
+    if row.text == "Host settings" || row.text.starts_with("Target: ") {
+        return Line::from(Span::styled(
+            row.text.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if lower.contains("warning:")
+        || lower.starts_with("disabling means")
+        || lower.starts_with("left in place:")
+        || lower.contains("trust boundary")
+    {
+        return Line::from(Span::styled(
+            row.text.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some((label, value)) = row.text.split_once(':') {
+        return Line::from(vec![
+            Span::styled(format!("{label}:"), Style::default().fg(Color::DarkGray)),
+            Span::styled(value.to_owned(), Style::default().fg(Color::Gray)),
+        ]);
+    }
+    Line::from(Span::styled(
+        row.text.clone(),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 #[cfg(test)]
@@ -2105,6 +2169,49 @@ mod tests {
         let host = HostSettings::load(&context).unwrap();
         assert_eq!((host.current_capacity, host.current_in_use), (4, 0));
         assert!(host.focused_action_count() <= MAX_FOCUSED_FORM_ACTIONS);
+    }
+
+    #[test]
+    fn host_and_repository_settings_use_semantic_colours() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadHost);
+        let host_rows = ui.rows(118, false);
+        let host_heading = host_rows
+            .iter()
+            .find(|row| row.text == "Host settings")
+            .unwrap();
+        let host_save = host_rows
+            .iter()
+            .find(|row| row.text.starts_with("Save host settings"))
+            .unwrap();
+        assert_eq!(
+            styled_form_line(&ui, host_heading, false).spans[0].style.fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            styled_form_line(&ui, host_save, false).spans[0].style.fg,
+            Some(Color::Green)
+        );
+
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        let repository_rows = ui.rows(118, false);
+        let target = repository_rows
+            .iter()
+            .find(|row| row.text.starts_with("Target:"))
+            .unwrap();
+        let policy_save = repository_rows
+            .iter()
+            .find(|row| row.text.starts_with("Confirm policy"))
+            .unwrap();
+        assert_eq!(
+            styled_form_line(&ui, target, false).spans[0].style.fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            styled_form_line(&ui, policy_save, false).spans[0].style.fg,
+            Some(Color::Green)
+        );
     }
 
     #[test]

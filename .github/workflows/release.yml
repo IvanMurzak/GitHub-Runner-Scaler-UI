@@ -939,18 +939,22 @@ jobs:
     name: update the distribution channels (step 8)
     needs: [validate, tag, publish]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     # ------------------------------------------------------------------------
     # `id-token: write` IS HERE ON PURPOSE, AND IT REPLACES A SECRET.
     # ------------------------------------------------------------------------
-    # It was refused across this whole workflow until npm trusted publishing
-    # existed, on the reasoning that the one job holding a publishing
+    # It was refused across this whole workflow until registry trusted
+    # publishing existed, on the reasoning that the one job holding a publishing
     # credential must not also be able to mint credentials. Trusted publishing
-    # inverts that trade: npm authenticates this job by its OIDC claims --
-    # repository, workflow FILE NAME, ref -- and there is no NPM_TOKEN in the
-    # repository at all any more. The long-lived secret that could be exfil-
+    # inverts that trade: crates.io and npm authenticate this job by its OIDC
+    # claims -- repository, workflow FILE NAME, ref -- and neither registry has
+    # a publishing secret in the repository. The long-lived token that could be exfil-
     # trated, leaked in a log, or used from anywhere was the larger exposure;
     # a token minted for this workflow, valid for minutes, is the smaller one.
+    #
+    # So `id-token: write` here is NOT a relaxation of the workflow-level ban;
+    # it is the exchange of two permanent registry secrets for tokens bound to
+    # this job.
     #
     # The scope stays on THIS job. `crates/app/tests/workflow_triggers.rs`
     # keeps refusing `id-token: write` at the top level and in every other job,
@@ -984,8 +988,17 @@ jobs:
           # that counts.
           persist-credentials: false
 
+
+      # crates.io exchanges this job's GitHub OIDC assertion for a token that
+      # expires within minutes. The action also revokes it in its post step, so
+      # no long-lived crates.io credential is stored in this repository.
+      - name: Authenticate to crates.io with Trusted Publishing
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Refuse to start without the credentials this job needs
         env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPOSITORY: ${{ vars.RUNNER_MANAGER_TAP_REPOSITORY || 'IvanMurzak/homebrew-tap' }}
           TAP_BRANCH: ${{ vars.RUNNER_MANAGER_TAP_BRANCH || 'main' }}
@@ -1007,10 +1020,14 @@ jobs:
           # what this file puts there, so the expression would interpolate an
           # empty string and this check would pass exactly when OIDC is missing.
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
-            echo "MISSING: the Actions OIDC endpoint (npm trusted publishing)" >&2
+            echo "MISSING: the Actions OIDC endpoint (registry trusted publishing)" >&2
             echo "  This job declares \`id-token: write\`; if that is still true" >&2
             echo "  and the variable is empty, OIDC is disabled for the" >&2
             echo "  repository or the organisation." >&2
+            missing=1
+          fi
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "MISSING: the short-lived crates.io Trusted Publishing token" >&2
             missing=1
           fi
           if [ -z "${TAP_TOKEN}" ]; then
@@ -1023,7 +1040,7 @@ jobs:
             echo "above and re-run THIS JOB. Do not re-dispatch the workflow." >&2
             exit 1
           fi
-          echo "npm authenticates through OIDC; the tap credential is present"
+          echo "crates.io and npm authenticate through OIDC; the tap credential is present"
 
           # --------------------------------------------------------------
           # PRESENT IS NOT THE SAME AS WORKING, AND THE TAP IS VALIDATED LAST.
@@ -1120,6 +1137,17 @@ jobs:
             exit 1
           fi
           echo "README.md documents '${documented}'"
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      - name: Step 8 - publish the Cargo workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: bash .github/scripts/channels.sh cargo-publish "${VERSION}"
 
       - name: Step 8 - bring back down what was actually published
         env:
@@ -1333,7 +1361,7 @@ jobs:
             echo "- install script: \`releases/latest/download/install.sh\` and \`install.ps1\`"
             echo "- npm: \`@ivan-murzak/runner-manager@${VERSION}\` plus five platform packages"
             echo "- Homebrew: \`${TAP_REPOSITORY}\` Formula/runner-manager.rb"
-            echo "- cargo: NOT published to crates.io by this workflow. \`cargo install runner-manager\` still resolves nothing; building from a checkout is the source path that works."
+            echo "- cargo: \`runner-manager@${VERSION}\` plus four workspace library crates"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the rendered channel manifests

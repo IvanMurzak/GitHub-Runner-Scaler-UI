@@ -151,6 +151,8 @@ pub struct PresentationState {
     pub diagnostics: Vec<String>,
     pub health: Health,
     pub privacy_access_denied: bool,
+    /// Version reported by the binary registered for the local service.
+    pub service_version: Option<String>,
     pub access_token: Option<String>,
     pub jit_configuration: Option<String>,
 }
@@ -163,6 +165,7 @@ impl Default for PresentationState {
             diagnostics: vec!["No activity recorded.".to_owned()],
             health: Health::Ready,
             privacy_access_denied: false,
+            service_version: None,
             access_token: None,
             jit_configuration: None,
         }
@@ -201,6 +204,9 @@ pub struct AgentEvent {
     /// The daemon's durable root-refusal record says macOS denied Full Disk
     /// Access to a boot service on a privacy-gated volume.
     pub privacy_access_denied: bool,
+    /// The registered service binary's own `--version` result. Older or
+    /// unreadable installations intentionally report `None`.
+    pub service_version: Option<String>,
     /// A fully collected GitHub inventory snapshot when the embedding agent
     /// has one. The standalone local journal reader supplies `None`; it never
     /// invents GitHub workload counts from local attempt counts.
@@ -369,6 +375,7 @@ fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> Age
                 summary: format!("GitHub inventory runtime could not start: {error}"),
                 health: Health::Error,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: None,
             };
         }
@@ -391,6 +398,7 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                             ),
                             health: Health::Error,
                             privacy_access_denied: false,
+                            service_version: local.product.service_binary_version.clone(),
                             snapshot: None,
                         };
                     }
@@ -409,12 +417,14 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                     },
                     summary,
                     privacy_access_denied,
+                    service_version: local.product.service_binary_version.clone(),
                     snapshot: Some(snapshot),
                 },
                 Err((availability, detail)) => AgentEvent {
                     summary: format!("{summary} GitHub inventory refresh failed: {detail}"),
                     health: Health::Error,
                     privacy_access_denied,
+                    service_version: local.product.service_binary_version.clone(),
                     snapshot: Some(Snapshot {
                         activity: production_activity(context)
                             .unwrap_or_default()
@@ -435,6 +445,7 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
             summary: format!("Local agent journal could not be read: {error}"),
             health: Health::Error,
             privacy_access_denied: false,
+            service_version: None,
             snapshot: None,
         },
     }
@@ -575,6 +586,8 @@ async fn production_screen_snapshot(
                     .routing_labels
                     .iter()
                     .all(|label| runner.has_label(label));
+            let (ephemeral, ownership) =
+                classify_runner(&runner.name, runner.ephemeral, locally_owned);
             busy_runners = busy_runners.saturating_add(u32::from(runner.busy));
             assigned_jobs = assigned_jobs.saturating_add(u32::from(runner.busy && locally_owned));
             online_runners = online_runners.saturating_add(u32::from(runner.status.is_online()));
@@ -586,12 +599,8 @@ async fn production_screen_snapshot(
                 labels: runner.labels.clone(),
                 online: runner.status.is_online(),
                 busy: runner.busy,
-                ephemeral: runner.ephemeral.unwrap_or(false),
-                ownership: if locally_owned {
-                    RunnerOwnership::Local
-                } else {
-                    RunnerOwnership::External
-                },
+                ephemeral,
+                ownership,
             });
         }
     }
@@ -610,6 +619,36 @@ async fn production_screen_snapshot(
         runners,
         activity,
     })
+}
+
+/// Recognise the exact name emitted by `agent::lifecycle::runner_name`.
+///
+/// Checking the UUID as well as the prefix prevents an arbitrary legacy name
+/// such as `runner-manager-backup` from being presented as product-managed.
+fn is_runner_manager_name(name: &str) -> bool {
+    name.strip_prefix("runner-manager-")
+        .is_some_and(|attempt| uuid::Uuid::parse_str(attempt).is_ok())
+}
+
+/// Preserve GitHub's lifetime fact, filling only the omission for a runner
+/// whose name has the exact product-generated shape. Ownership stays relative
+/// to the current host: a recognised product runner from WSL is managed, but
+/// remote, when it appears in the Windows host's inventory.
+fn classify_runner(
+    name: &str,
+    github_ephemeral: Option<bool>,
+    locally_owned: bool,
+) -> (Option<bool>, RunnerOwnership) {
+    let managed_runner = is_runner_manager_name(name);
+    let ephemeral = github_ephemeral.or(managed_runner.then_some(true));
+    let ownership = if locally_owned {
+        RunnerOwnership::Local
+    } else if managed_runner {
+        RunnerOwnership::ManagedRemote
+    } else {
+        RunnerOwnership::External
+    };
+    (ephemeral, ownership)
 }
 
 fn production_activity(context: &crate::cli::Context) -> Result<Vec<screens::ActivityRow>, String> {
@@ -633,10 +672,11 @@ fn activity_rows(
             .get(&attempt.policy_id)
             .map_or("removed policy", String::as_str);
         let attempt_id = attempt.id.to_string();
-        let occurred_at = attempt
-            .terminal_at()
-            .unwrap_or_else(|| attempt.last_state_change_at())
-            .to_rfc3339();
+        let occurred_at = compact_activity_time(
+            attempt
+                .terminal_at()
+                .unwrap_or_else(|| attempt.last_state_change_at()),
+        );
         match attempt.outcome() {
             Some(AttemptOutcome::CompletedJob) => rows.push(screens::ActivityRow {
                 id: format!("{attempt_id}:outcome"),
@@ -697,7 +737,7 @@ fn activity_rows(
         if attempt.state() == AttemptState::Cleaned {
             rows.push(screens::ActivityRow {
                 id: format!("{attempt_id}:cleanup"),
-                occurred_at: attempt.last_state_change_at().to_rfc3339(),
+                occurred_at: compact_activity_time(attempt.last_state_change_at()),
                 outcome: screens::ActivityOutcome::CleanupComplete,
                 summary: format!("Runtime cleanup completed for attempt {attempt_id} ({target})."),
                 remediation: "No remediation required; local resources were released.".into(),
@@ -764,11 +804,17 @@ fn refresh_activity(
             "github-inventory-refresh:{}",
             occurred_at.timestamp_nanos_opt().unwrap_or_default()
         ),
-        occurred_at: occurred_at.to_rfc3339(),
+        occurred_at: compact_activity_time(occurred_at),
         outcome,
         summary: screens::copy_safe(detail),
         remediation: remediation.into(),
     }
+}
+
+/// Compact, unambiguous UTC time for the narrow Activity table. Its
+/// year-first shape also preserves the existing lexical newest-first sort.
+fn compact_activity_time(at: runner_manager_domain::model::Timestamp) -> String {
+    at.format("%Y-%m-%d %H:%M:%SZ").to_string()
 }
 
 fn inventory_failure(
@@ -978,6 +1024,11 @@ const fn settings_content_rows(size: Rect) -> u16 {
     size.height.saturating_sub(SETTINGS_FIRST_ROW + 2)
 }
 
+/// Full-screen list capacity after the shell header, navigation, and footer.
+fn read_only_list_rows(size: Rect) -> usize {
+    screens::list_viewport_rows(size.height.saturating_sub(3))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
     pub screen: Screen,
@@ -1002,12 +1053,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(presentation: PresentationState, width: u16, height: u16) -> Self {
+        let size = Rect::new(0, 0, width, height);
+        let mut screen_model = ScreenModel::new(Snapshot::default());
+        screen_model.apply(ScreenAction::SetViewportRows(read_only_list_rows(size)));
         Self {
             screen: Screen::Dashboard,
             focus: Focus::Content,
             presentation,
-            screen_model: ScreenModel::new(Snapshot::default()),
-            size: Rect::new(0, 0, width, height),
+            screen_model,
+            size,
             help_open: false,
             filtering: false,
             filter: String::new(),
@@ -1059,6 +1113,11 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         AppEvent::Resize(width, height) => {
             state.size = Rect::new(0, 0, width, height);
             state.relayout();
+            state
+                .screen_model
+                .apply(ScreenAction::SetViewportRows(read_only_list_rows(
+                    state.size,
+                )));
             Vec::new()
         }
         AppEvent::Paste(text) => {
@@ -1093,6 +1152,7 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         AppEvent::Agent(agent) => {
             state.presentation.health = agent.health;
             state.presentation.privacy_access_denied = agent.privacy_access_denied;
+            state.presentation.service_version = agent.service_version;
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
             if let Some(mut snapshot) = agent.snapshot {
@@ -1364,6 +1424,30 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                     )
                 {
                     return vec![Effect::OpenFullDiskAccess];
+                } else if state.screen == Screen::Dashboard
+                    && !state.presentation.privacy_access_denied
+                    && let Some((table, column)) = screens::dashboard_sort_column_at(
+                        &state.screen_model,
+                        &state.skin,
+                        state.size.width,
+                        state.size.height,
+                        mouse.column,
+                        mouse.row,
+                    )
+                {
+                    state
+                        .screen_model
+                        .apply(ScreenAction::SortDashboardColumn(table, column));
+                } else if matches!(state.screen, Screen::Repositories | Screen::Runners)
+                    && mouse.row == screens::INVENTORY_HEADER_ROW
+                    && let Some(column) = screens::inventory_sort_column_at(
+                        &state.screen_model,
+                        &state.skin,
+                        state.size.width,
+                        mouse.column,
+                    )
+                {
+                    state.screen_model.apply(ScreenAction::SortColumn(column));
                 } else if state.screen == Screen::Repositories {
                     let content_first_row = screens::REPOSITORY_ROW_ORIGIN;
                     if mouse.row >= content_first_row
@@ -1468,6 +1552,22 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             ),
             Span::styled(format!("{icon} {health}"), Style::default().fg(colour)),
         ])),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(
+                "service v{}  app v{} ",
+                state
+                    .presentation
+                    .service_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                env!("CARGO_PKG_VERSION"),
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Right),
         rows[0],
     );
 
@@ -2024,6 +2124,42 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn only_the_exact_product_uuid_name_is_recognised_as_managed() {
+        assert!(is_runner_manager_name(
+            "runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2"
+        ));
+        for unrelated in [
+            "runner-manager-backup",
+            "runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2-extra",
+            "my-runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2",
+        ] {
+            assert!(!is_runner_manager_name(unrelated), "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn omitted_lifetime_for_a_managed_runner_is_ephemeral_and_remote_not_external() {
+        let managed = "runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2";
+        assert_eq!(
+            classify_runner(managed, None, false),
+            (Some(true), RunnerOwnership::ManagedRemote)
+        );
+        assert_eq!(
+            classify_runner(managed, None, true),
+            (Some(true), RunnerOwnership::Local)
+        );
+        assert_eq!(
+            classify_runner("legacy-runner", None, false),
+            (None, RunnerOwnership::External)
+        );
+        assert_eq!(
+            classify_runner(managed, Some(false), false),
+            (Some(false), RunnerOwnership::ManagedRemote),
+            "an explicit GitHub fact wins over the name-based fallback"
+        );
+    }
+
     fn crossterm_key(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
@@ -2050,6 +2186,40 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
         super::super::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn header_shows_client_and_service_versions_compactly() {
+        let state = AppState::new(
+            PresentationState {
+                service_version: Some("0.4.4".into()),
+                ..PresentationState::default()
+            },
+            120,
+            30,
+        );
+        let frame = rendered(120, 30, &state);
+        let header = frame.lines().next().unwrap();
+        let service = header.find("service v0.4.4").unwrap();
+        let application = header
+            .find(concat!("app v", env!("CARGO_PKG_VERSION")))
+            .unwrap();
+        assert!(service < application, "{header}");
+        assert!(
+            application > 90,
+            "the app version must be right-aligned: {header}"
+        );
+    }
+
+    #[test]
+    fn activity_time_is_short_utc_and_lexically_sortable() {
+        let earlier = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000).unwrap();
+        let later = chrono::DateTime::from_timestamp(1_700_000_060, 0).unwrap();
+        let earlier = compact_activity_time(earlier);
+        let later = compact_activity_time(later);
+        assert_eq!(earlier, "2023-11-14 22:13:20Z");
+        assert!(earlier < later);
+        assert_eq!(earlier.len(), 20);
     }
 
     #[test]
@@ -2089,6 +2259,7 @@ mod tests {
                 summary: "runner busy".to_owned(),
                 health: Health::Busy,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: None,
             }),
         );
@@ -2412,6 +2583,7 @@ mod tests {
                     summary: format!("production refresh {refresh}"),
                     health: Health::Ready,
                     privacy_access_denied: false,
+                    service_version: None,
                     snapshot: Some(snapshot),
                 }
             },
@@ -2824,6 +2996,7 @@ mod tests {
                 summary: "GitHub inventory refreshed".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: Some(snapshot),
             }),
         );
@@ -2876,7 +3049,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: true,
                     busy: false,
-                    ephemeral: true,
+                    ephemeral: Some(true),
                     ownership: RunnerOwnership::Local,
                 },
                 RunnerRow {
@@ -2887,7 +3060,7 @@ mod tests {
                     labels: vec!["external".into()],
                     online: false,
                     busy: false,
-                    ephemeral: false,
+                    ephemeral: Some(false),
                     ownership: RunnerOwnership::External,
                 },
             ],
@@ -2907,6 +3080,7 @@ mod tests {
                 summary: "production snapshot".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: Some(snapshot),
             }),
         );
@@ -2932,6 +3106,162 @@ mod tests {
         let activity = screens::render_text(&state.screen_model);
         assert!(activity.contains("[acknowledged]"), "{activity}");
         assert!(!activity.contains("> [new]"), "{activity}");
+    }
+
+    #[test]
+    fn clicking_an_inventory_header_selects_a_column_and_toggles_its_direction() {
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.screen_model.apply(ScreenAction::Refresh(Snapshot {
+            availability: Availability::Ready,
+            repositories: vec![
+                RepositoryRow {
+                    id: "busy".into(),
+                    target: "acme/busy".into(),
+                    in_progress_workflows: 9,
+                    mode: PolicyMode::Autoscale,
+                    max_capacity: Some(2),
+                    health: AgentHealth::Healthy,
+                    host_label: Some("rm-home-win-x64".into()),
+                    extra_labels: vec![],
+                },
+                RepositoryRow {
+                    id: "idle".into(),
+                    target: "acme/idle".into(),
+                    in_progress_workflows: 0,
+                    mode: PolicyMode::MonitorOnly,
+                    max_capacity: None,
+                    health: AgentHealth::Degraded,
+                    host_label: None,
+                    extra_labels: vec![],
+                },
+            ],
+            runners: vec![
+                RunnerRow {
+                    id: "z-owner".into(),
+                    name: "runner-a".into(),
+                    owner: "zeta/repo".into(),
+                    os: "linux".into(),
+                    labels: vec!["self-hosted".into()],
+                    online: true,
+                    busy: false,
+                    ephemeral: Some(true),
+                    ownership: RunnerOwnership::Local,
+                },
+                RunnerRow {
+                    id: "a-owner".into(),
+                    name: "runner-z".into(),
+                    owner: "alpha/repo".into(),
+                    os: "windows".into(),
+                    labels: vec!["self-hosted".into()],
+                    online: false,
+                    busy: false,
+                    ephemeral: Some(false),
+                    ownership: RunnerOwnership::External,
+                },
+            ],
+            ..Snapshot::default()
+        }));
+
+        reduce(&mut state, key(KeyCode::Char('r')));
+        let frame = rendered(120, 30, &state);
+        let workflows = frame
+            .lines()
+            .nth(usize::from(screens::INVENTORY_HEADER_ROW))
+            .unwrap()
+            .find("Workflows")
+            .unwrap() as u16;
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                workflows,
+                screens::INVENTORY_HEADER_ROW,
+            ),
+        );
+        assert_eq!(state.screen_model.repositories.sort_column, 1);
+        assert!(!state.screen_model.repositories.sort_descending);
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                workflows,
+                screens::INVENTORY_HEADER_ROW,
+            ),
+        );
+        assert!(state.screen_model.repositories.sort_descending);
+
+        reduce(&mut state, key(KeyCode::Char('n')));
+        let frame = rendered(120, 30, &state);
+        let repository = frame
+            .lines()
+            .nth(usize::from(screens::INVENTORY_HEADER_ROW))
+            .unwrap()
+            .find("Repository")
+            .unwrap() as u16;
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                repository,
+                screens::INVENTORY_HEADER_ROW,
+            ),
+        );
+        assert_eq!(state.screen_model.runners.sort_column, 0);
+        assert!(!state.screen_model.runners.sort_descending);
+
+        state.skin = Skin::ASCII;
+        reduce(&mut state, key(KeyCode::Char('d')));
+        let frame = rendered(120, 30, &state);
+        let (repository_header_row, workflows) = frame
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("Workflows")
+                    .map(|column| (u16::try_from(row).unwrap(), column as u16))
+            })
+            .unwrap();
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                workflows,
+                repository_header_row,
+            ),
+        );
+        assert_eq!(state.screen_model.dashboard_repository_sort, (1, false));
+        let sorted = rendered(120, 30, &state);
+        assert!(sorted.contains("Workflows ^"), "{sorted}");
+
+        let (runner_header_row, status) = sorted
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                (line.contains("Runner") && line.contains("Status")).then(|| {
+                    (
+                        u16::try_from(row).unwrap(),
+                        line.find("Status").unwrap() as u16,
+                    )
+                })
+            })
+            .unwrap();
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                status,
+                runner_header_row,
+            ),
+        );
+        assert_eq!(state.screen_model.dashboard_runner_sort, (1, false));
+        reduce(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                status,
+                runner_header_row,
+            ),
+        );
+        assert_eq!(state.screen_model.dashboard_runner_sort, (1, true));
     }
 
     #[test]
@@ -3032,6 +3362,7 @@ mod tests {
                 summary: "rate limited".into(),
                 health: Health::Error,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: Some(Snapshot {
                     availability: Availability::RateLimited {
                         retry_after_seconds: 90,
@@ -3062,6 +3393,7 @@ mod tests {
                 summary: "ready again".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
+                service_version: None,
                 snapshot: Some(Snapshot {
                     availability: Availability::Ready,
                     ..Snapshot::default()
@@ -3098,6 +3430,7 @@ mod tests {
                         summary: format!("collection {number}"),
                         health: Health::Ready,
                         privacy_access_denied: false,
+                        service_version: None,
                         snapshot: None,
                     }
                 },
@@ -3158,6 +3491,7 @@ mod tests {
                     summary: "cancelled blocked preflight".into(),
                     health: Health::Ready,
                     privacy_access_denied: false,
+                    service_version: None,
                     snapshot: None,
                 }
             },

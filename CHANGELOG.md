@@ -7,6 +7,26 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.6
+
+### TUI inventory and diagnostics improvements
+
+- Managed runner names whose GitHub inventory omits the lifetime flag are now
+  shown as ephemeral and managed by another host instead of persistent and
+  external.
+- Repository and runner selection now scrolls only at viewport edges, while
+  Dashboard previews remain independent of full-screen selection, filtering,
+  and scrolling.
+- Repository and runner tables, including both Dashboard previews, can be
+  sorted in either direction by clicking any visible column header.
+- Repository and host settings use semantic colours, and Activity timestamps
+  use a shorter UTC format.
+- The header shows the current TUI and registered service-binary versions at
+  the upper right and refreshes the service version with the local snapshot.
+- Releases now publish the application and its four internal libraries to
+  crates.io through short-lived OIDC credentials, making the documented
+  `cargo install runner-manager` channel real.
+
 ## 0.4.5
 
 ### Resource Leak Fixes & CI Optimizations

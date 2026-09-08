@@ -1,5 +1,11 @@
 # runner-manager
 
+[![npm version](https://img.shields.io/npm/v/@ivan-murzak/runner-manager.svg?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/@ivan-murzak/runner-manager)
+[![Crates.io](https://img.shields.io/crates/v/runner-manager?style=for-the-badge&logo=rust)](https://crates.io/crates/runner-manager)
+[![GitHub Release](https://img.shields.io/github/v/release/IvanMurzak/GitHub-Runner-Scaler-UI?style=for-the-badge&logo=github)](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/releases)
+[![Release Status](https://img.shields.io/github/actions/workflow/status/IvanMurzak/GitHub-Runner-Scaler-UI/release.yml?style=for-the-badge&logo=github)](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
 **Local-first autoscaling for ephemeral GitHub Actions self-hosted runners.**
 
 Use your own Windows, macOS or Linux machine to pick up GitHub Actions jobs only when work

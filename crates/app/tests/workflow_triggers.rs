@@ -18,8 +18,9 @@
 // changes the trigger block, so neither should make this file fail.
 //
 // `id-token: write` in a release job used to red this file outright. It is now
-// allowed in exactly one job — `channels`, for npm trusted publishing, which
-// removed the `NPM_TOKEN` it replaces — and refused everywhere else, including
+// allowed in exactly one job — `channels`, for crates.io and npm trusted
+// publishing, which removed the registry tokens it replaces — and refused
+// everywhere else, including
 // at the top level. The reasoning is on the assertion itself.
 //
 // This file belongs to a1 and to the A group. It is not part of the CLI
@@ -379,17 +380,18 @@ fn release_workflow_requests_contents_write_and_nothing_else() {
         // --------------------------------------------------------------------
         // ONE JOB MAY MINT AN OIDC TOKEN, AND ONLY BECAUSE IT HOLDS NO SECRET.
         // --------------------------------------------------------------------
-        // `id-token: write` was refused everywhere while npm publishing used a
-        // long-lived `NPM_TOKEN`: adding it would have given the job that held
+        // `id-token: write` was refused everywhere while registry publishing
+        // used long-lived tokens: adding it would have given the job that held
         // a publishing credential the ability to mint more.
         //
-        // npm trusted publishing removed the other half of that sentence. The
-        // `channels` job authenticates to npm by its OIDC claims -- repository,
-        // workflow file name, ref -- and `NPM_TOKEN` no longer exists in this
-        // repository. Trading a permanent secret for a token that lives for
-        // minutes and is bound to this workflow is the reason the exception is
-        // here, so it is deliberately NOT a general relaxation: every other
-        // job, and the top-level block above, still gets `contents` only.
+        // crates.io and npm trusted publishing removed the other half of that
+        // sentence. The `channels` job authenticates by its OIDC claims --
+        // repository, workflow file name, ref -- and no registry publishing
+        // secret exists in this repository. Trading permanent secrets for
+        // tokens that live for minutes and are bound to this workflow is the
+        // reason the exception is here, so it is deliberately NOT a general
+        // relaxation: every other job, and the top-level block above, still
+        // gets `contents` only.
         const OIDC_JOB: &str = "channels";
 
         for (_, text) in &permissions.block {
@@ -404,7 +406,7 @@ fn release_workflow_requests_contents_write_and_nothing_else() {
                 "release.yml job `{job}` requests `{text}`. A release job may \
                  request `contents: write` (or `contents: read`) and nothing \
                  else, except `{OIDC_JOB}`, which may also request \
-                 `id-token: write` for npm trusted publishing. `packages: \
+                 `id-token: write` for registry trusted publishing. `packages: \
                  write` -- and `id-token: write` in any other job -- would let \
                  the workflow that publishes mint credentials of its own \
                  (`07-security.md`)."

@@ -72,6 +72,10 @@ Usage: bash .github/scripts/channels.sh <subcommand> [args]
       matching platform package. Writes <output-directory>/PUBLISH_ORDER.
       Aborts, having published nothing, if any archive is missing or its
       digest does not match.
+
+  cargo-publish <version>
+      Publish the workspace crates in dependency order using crates.io Trusted
+      Publishing. Checks the HTTP API first to skip already published crates.
 USAGE
 }
 
@@ -553,6 +557,83 @@ cmd_npm_stage() {
 }
 
 # ----------------------------------------------------------------------------
+# Cargo publish loop.
+# ----------------------------------------------------------------------------
+cmd_cargo_publish() {
+    local version="${1-}"
+    require_semver "$version"
+
+    if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+        die "cargo-publish: CARGO_REGISTRY_TOKEN is not set"
+    fi
+
+    # A published crate cannot depend on an unpublished path dependency.
+    # Publish leaves-to-root, and wait for each registry record before
+    # asking Cargo to verify the next package in an isolated directory.
+    local packages=(
+        runner-manager-domain
+        runner-manager-github
+        runner-manager-platform
+        runner-manager-agent
+        runner-manager
+    )
+
+    registry_status() {
+        local package="$1"
+        curl --silent --show-error --output crates-io-response.json \
+            --write-out '%{http_code}' \
+            --user-agent "IvanMurzak/GitHub-Runner-Scaler-UI release workflow" \
+            "https://crates.io/api/v1/crates/${package}/${version}"
+    }
+
+    local package status visible attempt
+    for package in "${packages[@]}"; do
+        status="$(registry_status "$package")"
+        case "$status" in
+        200)
+            printf 'already published: %s@%s\n' "$package" "$version"
+            continue
+            ;;
+        404)
+            ;;
+        *)
+            printf 'REJECTED: crates.io returned HTTP %s while checking %s@%s.\n' "$status" "$package" "$version" >&2
+            cat crates-io-response.json >&2
+            exit 1
+            ;;
+        esac
+
+        printf '--- publishing %s@%s\n' "$package" "$version"
+        cargo publish --locked -p "$package"
+
+        # Cargo polls the index, but the HTTP API can trail it. Waiting here
+        # makes the dependency edge explicit and bounds eventual consistency.
+        visible=0
+        for attempt in $(seq 1 24); do
+            status="$(registry_status "$package")"
+            if [ "$status" = 200 ]; then
+                visible=1
+                break
+            fi
+            if [ "$status" != 404 ]; then
+                printf 'REJECTED: crates.io returned HTTP %s after publishing %s@%s.\n' "$status" "$package" "$version" >&2
+                cat crates-io-response.json >&2
+                exit 1
+            fi
+            printf 'waiting for crates.io to expose %s@%s (%s/24)\n' "$package" "$version" "$attempt"
+            sleep 5
+        done
+        if [ "$visible" -ne 1 ]; then
+            printf 'REJECTED: %s@%s was accepted but did not become visible within 120 seconds.\n' "$package" "$version" >&2
+            printf 'Re-run only the failed channels job; published versions are skipped.\n' >&2
+            exit 1
+        fi
+    done
+
+    printf 'Cargo channel is at %s\n' "$version"
+}
+
+# ----------------------------------------------------------------------------
 
 main() {
     local subcommand="${1-}"
@@ -569,6 +650,7 @@ main() {
     brew-formula) cmd_brew_formula "$@" ;;
     npm-manifests) cmd_npm_manifests "$@" ;;
     npm-stage) cmd_npm_stage "$@" ;;
+    cargo-publish) cmd_cargo_publish "$@" ;;
     -h | --help | help) usage ;;
     *)
         printf '%s: unknown subcommand: %s\n\n' "$PROGRAM" "$subcommand" >&2
@@ -579,3 +661,4 @@ main() {
 }
 
 main "$@"
+

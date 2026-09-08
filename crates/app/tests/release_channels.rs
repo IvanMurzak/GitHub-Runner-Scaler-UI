@@ -1410,6 +1410,11 @@ fn step_eight_pins_the_channels_to_what_was_actually_published() {
             "the publish loop must read the recorded order, not a directory \
              listing: the root package has to go last",
         ),
+        (
+            "channels.sh cargo-publish",
+            "the documented cargo-install channel must publish the workspace, \
+             rather than leave the crates.io badge pointing at a missing crate",
+        ),
     ] {
         assert!(
             executable.contains(required),
@@ -1450,6 +1455,63 @@ fn step_eight_pins_the_channels_to_what_was_actually_published() {
         assert!(
             !executable.contains(forbidden),
             "a `run:` body in the channels job executes `{forbidden}`. {why}"
+        );
+    }
+}
+
+#[test]
+fn cargo_channel_uses_trusted_publishing_in_dependency_order() {
+    let block = job_block("channels");
+    assert!(
+        block.contains("uses: rust-lang/crates-io-auth-action@v1"),
+        "the Cargo channel must exchange the job's OIDC assertion for a \
+         short-lived crates.io token:\n{block}"
+    );
+    assert!(
+        block.contains("CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}"),
+        "cargo publish must receive the short-lived token emitted by the \
+         official crates.io authentication action:\n{block}"
+    );
+    assert!(
+        !block.contains("secrets.CRATES_IO") && !block.contains("secrets.CARGO_REGISTRY"),
+        "the release must not retain a long-lived crates.io publishing secret:\n{block}"
+    );
+
+    let executable = run_bodies(&block).join("\n");
+    assert!(
+        executable.contains("channels.sh cargo-publish"),
+        "the channels job must delegate to channels.sh cargo-publish:\n{executable}"
+    );
+
+    let script = read(&channels_script());
+    let publish = script
+        .find("cargo publish --locked -p")
+        .expect("channels.sh must execute cargo publish");
+    let before_publish = &script[..publish];
+    let mut previous = 0usize;
+    for package in [
+        "runner-manager-domain",
+        "runner-manager-github",
+        "runner-manager-platform",
+        "runner-manager-agent",
+        "runner-manager",
+    ] {
+        let offset = before_publish[previous..]
+            .find(package)
+            .unwrap_or_else(|| panic!("Cargo publish order omits {package}:\n{before_publish}"));
+        previous += offset + package.len();
+    }
+
+    for required in [
+        "https://crates.io/api/v1/crates/",
+        "already published:",
+        "sleep 5",
+    ] {
+        assert!(
+            script.contains(required),
+            "channels.sh cargo-publish lacks `{required}`, so a partial publication \
+             cannot be retried safely or a dependent crate can race registry \
+             visibility:\n{script}"
         );
     }
 }
@@ -1544,10 +1606,9 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     // FIRST, before anything is uploaded or pushed, so a missing credential
     // costs no partial update.
     //
-    // npm's half is no longer a secret. Trusted publishing authenticates the
-    // job by its OIDC claims, so what the guard checks for npm is the presence
-    // of the minting endpoint -- `ACTIONS_ID_TOKEN_REQUEST_URL`, which the
-    // runner sets only under `id-token: write`.
+    // Registry publishing uses no long-lived secret. Trusted publishing
+    // authenticates the job by its OIDC claims, so the guard checks both the
+    // minting endpoint and the short-lived crates.io token produced from it.
     let block = job_block("channels");
     let bodies = run_bodies(&block);
     assert!(!bodies.is_empty(), "no run bodies parsed:\n{block}");
@@ -1555,12 +1616,14 @@ fn step_eight_refuses_to_start_without_the_credentials_it_needs() {
     let guard = bodies
         .iter()
         .position(|body| {
-            body.contains("ACTIONS_ID_TOKEN_REQUEST_URL") && body.contains("HOMEBREW_TAP_TOKEN")
+            body.contains("ACTIONS_ID_TOKEN_REQUEST_URL")
+                && body.contains("CARGO_REGISTRY_TOKEN")
+                && body.contains("HOMEBREW_TAP_TOKEN")
         })
         .expect(
-            "the channels job must check both channel credentials -- the OIDC \
-             endpoint npm publishes through and the tap token -- in one step \
-             before it does anything else",
+            "the channels job must check the OIDC endpoint, the short-lived \
+             crates.io token and the tap token in one step before it does \
+             anything else",
         );
     assert_eq!(
         guard, 0,

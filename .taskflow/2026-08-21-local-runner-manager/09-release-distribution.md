@@ -108,6 +108,12 @@ removed direct-download buttons, **every documented install path is a terminal
 path**, so no user meets a security prompt on any supported OS and no
 certificate is needed to avoid one.
 
+The Cargo channel publishes `runner-manager-domain`, `runner-manager-github`,
+`runner-manager-platform`, `runner-manager-agent`, then `runner-manager`, in
+dependency order. The release workflow authenticates with crates.io Trusted
+Publishing and stores no long-lived registry token. A partial channel run is
+safe to retry: versions already visible in the registry are skipped.
+
 Two things remain mandatory and are free:
 
 - **Ad-hoc signature on arm64 macOS binaries.** macOS refuses to execute
