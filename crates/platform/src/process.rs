@@ -1295,13 +1295,29 @@ mod sys {
             .stderr(std::process::Stdio::null())
             .status();
 
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
-            .map_err(|error| io_error(&error))?;
-        let result = unsafe { TerminateProcess(handle, 1) };
-        unsafe {
-            let _ = CloseHandle(handle);
+        match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+            Ok(handle) => {
+                let result = unsafe { TerminateProcess(handle, 1) };
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                if let Err(error) = result {
+                    let code = error.code().0 as u32;
+                    if code != 0x80070005 && code != 0x80070057 {
+                        return Err(io_error(&error));
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let code = error.code().0 as u32;
+                if code == 0x80070005 || code == 0x80070057 {
+                    Ok(())
+                } else {
+                    Err(io_error(&error))
+                }
+            }
         }
-        result.map_err(|error| io_error(&error))
     }
 
     /// The current account's SID in string form, for the DACL below.
