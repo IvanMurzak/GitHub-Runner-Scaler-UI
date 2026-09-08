@@ -100,3 +100,25 @@ fn external_workflow_actions_use_the_supported_node_24_majors() {
         "the audited action inventory changed; removing an action must not make its version assertion disappear unnoticed"
     );
 }
+
+#[test]
+fn nextest_installation_is_isolated_between_ephemeral_runners() {
+    let path = workflows_directory().join("ci.yml");
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let isolated_install = r#"uses: taiki-e/install-action@nextest
+        # install-action uses ~/.install-action/tmp for downloads. Multiple
+        # ephemeral runners on one physical Windows host share the account's
+        # real HOME, so concurrent CI/release jobs otherwise overwrite the
+        # same `tmp` file and one of their checksum checks fails. Both values
+        # are needed: main.sh reads HOME, while the action's Windows wrapper
+        # looks for its startup sentinel below USERPROFILE.
+        env:
+          HOME: ${{ runner.temp }}/install-action-home
+          USERPROFILE: ${{ runner.temp }}/install-action-home"#;
+
+    assert!(
+        source.contains(isolated_install),
+        "ci.yml must give install-action a per-runner HOME and USERPROFILE; its default ~/.install-action/tmp is shared by concurrent ephemeral runners on one Windows account"
+    );
+}
