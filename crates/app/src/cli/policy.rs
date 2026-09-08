@@ -1922,6 +1922,46 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_policy_can_be_enabled_again() {
+        let root = tempfile::TempDir::new().unwrap();
+        let context = Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let local = host("home");
+        store.put_host(&local).unwrap();
+        let target = targets()[0].clone();
+        let mut policy = ScalePolicy::new(
+            PolicyId::new_random(),
+            target.clone(),
+            77,
+            local.id,
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").unwrap(),
+                    local.os,
+                    local.architecture,
+                ),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        policy.activate().unwrap();
+        policy.request_disable().unwrap();
+        policy.drain_completed(0).unwrap();
+        store.insert_policy(&policy).unwrap();
+        drop(store);
+
+        let mut output = Vec::new();
+        apply_scale_confirmed(&context, &target, true, None, &mut output).unwrap();
+
+        let stored = find_policy(&context.store().unwrap(), &target).unwrap();
+        assert_eq!(stored.state(), PolicyState::Active);
+        assert!(stored.enabled());
+        assert!(String::from_utf8(output).unwrap().contains("enabled"));
+    }
+
+    #[test]
     fn active_runner_confirmation_defaults_to_no_and_names_the_count() {
         let mut output = Vec::new();
         assert!(!confirm_disable(3, &mut output, &mut io::Cursor::new(b"\n")).unwrap());

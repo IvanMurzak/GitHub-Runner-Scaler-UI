@@ -846,7 +846,7 @@ impl PolicyMode {
 ///
 /// ```text
 /// pending -> active | repair_required
-/// active  -> draining -> disabled
+/// active  -> draining -> disabled -> pending
 /// any     -> authentication_failed        (recoverable by re-authentication)
 /// ```
 ///
@@ -856,12 +856,9 @@ impl PolicyMode {
 ///
 /// * `RepairRequired` has no outgoing edge except the `any` rule. A policy that
 ///   enters it can never return to `Active` through this state machine.
-/// * `Disabled` likewise has no outgoing edge, so a policy that finished
-///   draining cannot be re-enabled through `state`. What `set-scale --enabled
-///   true` changes is [`ScalePolicy::enabled`], which the contract keeps
-///   deliberately independent of `state` ("`enabled` records operator intent;
-///   `state` records observed lifecycle"), but nothing in the diagram then moves
-///   `state` back.
+/// * `Disabled -> Pending` begins a fresh lifecycle when an operator re-enables
+///   a policy that previously finished draining. Activation remains a separate
+///   `Pending -> Active` transition, preserving the normal entry-state checks.
 ///
 /// The one edge here that the diagram does not draw as an arrow is
 /// `AuthenticationFailed -> Pending`, which is the parenthetical "(recoverable
@@ -895,6 +892,7 @@ impl PolicyState {
         (PolicyState::Pending, PolicyState::RepairRequired),
         (PolicyState::Active, PolicyState::Draining),
         (PolicyState::Draining, PolicyState::Disabled),
+        (PolicyState::Disabled, PolicyState::Pending),
         // `any -> authentication_failed`.
         (PolicyState::Pending, PolicyState::AuthenticationFailed),
         (PolicyState::Active, PolicyState::AuthenticationFailed),
@@ -2383,7 +2381,7 @@ mod tests {
     ///
     /// ```text
     /// pending -> active | repair_required
-    /// active  -> draining -> disabled
+    /// active  -> draining -> disabled -> pending
     /// any     -> authentication_failed        (recoverable by re-authentication)
     /// ```
     fn diagram_edges() -> Vec<(PolicyState, PolicyState)> {
@@ -2393,6 +2391,7 @@ mod tests {
             (Pending, RepairRequired),
             (Active, Draining),
             (Draining, Disabled),
+            (Disabled, Pending),
             // The recovery edge for "(recoverable by re-authentication)".
             (AuthenticationFailed, Pending),
         ];
@@ -2407,12 +2406,12 @@ mod tests {
 
     #[test]
     fn every_policy_state_transition_is_legal_exactly_where_the_diagram_says() {
-        // Both directions, over the full 6x6 product: each of the 10 legal pairs
-        // succeeds, each of the other 26 is rejected.
+        // Both directions, over the full 6x6 product: each of the 11 legal pairs
+        // succeeds, each of the other 25 is rejected.
         let expected = diagram_edges();
         assert_eq!(
             expected.len(),
-            10,
+            11,
             "the transcription itself changed; check it against the diagram"
         );
 
@@ -2451,8 +2450,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_seen, 10);
-        assert_eq!(illegal_seen, 36 - 10);
+        assert_eq!(legal_seen, 11);
+        assert_eq!(illegal_seen, 36 - 11);
 
         // And the published constant matches the transcription, so a caller
         // reading `PolicyState::LEGAL` sees the same machine the tests exercise.

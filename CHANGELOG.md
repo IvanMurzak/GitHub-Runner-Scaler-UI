@@ -7,6 +7,13 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.2
+
+### Policy re-enable fix
+
+- A fully drained and disabled scaling policy can now be enabled again through
+  the normal `set-scale --enabled true` command.
+
 ## 0.4.1
 
 ### WSL adoption and policy recovery fixes
