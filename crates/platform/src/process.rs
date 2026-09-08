@@ -1983,12 +1983,12 @@ mod tests {
         // other test in this module: a token that is the same constant for
         // everything. Such a token would make a recycled PID indistinguishable
         // from the original process.
-        // 
+        //
         // Under cargo-nextest, this test process and its child start so close
         // together that they can share the same clock tick on Linux (10ms resolution).
         // Sleep for a tick to ensure they have distinct start times.
         std::thread::sleep(Duration::from_millis(20));
-        
+
         let mut child = long_running().spawn().expect("the child starts");
         let mine = ProcessIdentity::of_current_process().expect("this process can see itself");
 
