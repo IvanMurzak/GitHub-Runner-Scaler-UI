@@ -105,7 +105,8 @@ fn external_workflow_actions_use_the_supported_node_24_majors() {
 fn nextest_installation_is_isolated_between_ephemeral_runners() {
     let path = workflows_directory().join("ci.yml");
     let source = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .replace("\r\n", "\n");
     let isolated_install = r#"uses: taiki-e/install-action@nextest
         # install-action uses ~/.install-action/tmp for downloads. Multiple
         # ephemeral runners on one physical Windows host share the account's
