@@ -64,17 +64,35 @@ async fn run(
     let targets = active_autoscale_targets(store.policies().map_err(local_store_failure)?);
     let failed = write_failed("the daemon state");
 
+    // The service runs a private copy so package managers can replace their
+    // source while it is running. Resolve that source before the idle branch:
+    // a host with every policy disabled still has to take upgrades.
+    let own_binary = InstallRecord::read(context.paths())
+        .ok()
+        .flatten()
+        .and_then(|record| record.source_binary);
+
     writeln!(out, "daemon running (pid {})", std::process::id()).map_err(failed)?;
 
     // A host with no policies owns no GitHub work. It still holds the lock and
     // behaves as a real daemon, but it neither demands a credential nor opens a
-    // network connection while waiting to be configured or stopped.
+    // network connection while waiting to be configured, upgraded, or stopped.
     if targets.is_empty() {
-        wait_for_shutdown(service_shutdown)
-            .await
-            .map_err(signal_failure)?;
-        writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
-        return Ok(());
+        tokio::select! {
+            signal = wait_for_shutdown(service_shutdown) => {
+                signal.map_err(signal_failure)?;
+                writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
+                return Ok(());
+            }
+            version = async {
+                match own_binary.clone() {
+                    Some(path) => wait_for_upgrade(path).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                return stop_for_upgrade(own_binary.as_deref(), &version, out);
+            }
+        }
     }
 
     let mode = host.service_start_mode;
@@ -266,10 +284,6 @@ async fn run(
     // file that changes on an upgrade is the source, and the copy never
     // changes on its own. `None` for a daemon started by hand, or for a
     // registration made before copies existed, and then nothing is watched.
-    let own_binary = InstallRecord::read(context.paths())
-        .ok()
-        .flatten()
-        .and_then(|record| record.source_binary);
     let mut upgraded_to = None;
     let mut restart_reason: Option<&'static str> = None;
     let early = tokio::select! {
@@ -324,32 +338,7 @@ async fn run(
         // same one, and putting a file in place for it would be a write nobody
         // asked for.
         if let Some(version) = upgraded_to {
-            // The copy is replaced here, by the daemon, because nothing else
-            // can: a package manager updates the source and never touches this
-            // path. The old file is renamed rather than deleted -- Windows
-            // refuses to unlink an executable that is running, which this one
-            // still is, but allows it to be renamed out of the way.
-            if let Some(source) = own_binary.as_deref()
-                && let Err(error) = replace_own_binary(source)
-            {
-                tracing::warn!(
-                    %error,
-                    "the new binary could not be put in place; the service manager will restart                      the version already there"
-                );
-                writeln!(out, "warning: {error}").map_err(failed)?;
-            }
-            writeln!(
-                out,
-                "every runner finished; stopping so {version} can take over"
-            )
-            .map_err(failed)?;
-            return Err(CliError::with_remedy(
-                Failure::UpgradePending,
-                format!(
-                    "a newer runner-manager ({version}) is installed and every runner this                      daemon held has finished; stopping so the service manager starts the new one"
-                ),
-                "runner-manager service status",
-            ));
+            return stop_for_upgrade(own_binary.as_deref(), &version, out);
         }
         let reason = restart_reason.unwrap_or("this daemon was asked to reload");
         writeln!(out, "every runner finished; reloading").map_err(failed)?;
@@ -385,6 +374,34 @@ async fn run(
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(())
+}
+
+fn stop_for_upgrade(
+    source: Option<&std::path::Path>,
+    version: &str,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    if let Some(source) = source
+        && let Err(error) = replace_own_binary(source)
+    {
+        tracing::warn!(
+            %error,
+            "the new binary could not be put in place; the service manager will restart the version already there"
+        );
+        writeln!(out, "warning: {error}").map_err(write_failed("the daemon state"))?;
+    }
+    writeln!(
+        out,
+        "every runner finished; stopping so {version} can take over"
+    )
+    .map_err(write_failed("the daemon state"))?;
+    Err(CliError::with_remedy(
+        Failure::UpgradePending,
+        format!(
+            "a newer runner-manager ({version}) is installed and every runner this daemon held has finished; stopping so the service manager starts the new one"
+        ),
+        "runner-manager service status",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,6 +1656,17 @@ mod tests {
             upgraded_version(std::path::Path::new("no-such-binary")).is_none(),
             "a path that cannot be executed is never reported as an upgrade"
         );
+    }
+
+    #[test]
+    fn an_idle_host_uses_the_normal_upgrade_handover() {
+        let mut output = Vec::new();
+        let error = stop_for_upgrade(None, "9.9.9", &mut output)
+            .expect_err("an upgrade exits for the service manager to restart it");
+        assert_eq!(error.class(), Failure::UpgradePending);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("9.9.9"), "{output}");
+        assert!(output.contains("every runner finished"), "{output}");
     }
 
     #[derive(Default)]

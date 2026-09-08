@@ -7,6 +7,13 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.3
+
+### Idle host upgrade fix
+
+- A daemon whose policies are all disabled now watches its service source for
+  upgrades, so Windows and WSL services hand over without a manual restart.
+
 ## 0.4.2
 
 ### Policy re-enable fix
