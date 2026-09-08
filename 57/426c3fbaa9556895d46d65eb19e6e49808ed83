@@ -1,0 +1,20 @@
+.github/workflows/ci.yml
+  s_5332f62e0ed5a7::t_a0e8f9c02d0bc3 129-131,133,135-138,154-161,202-204,206,208-211
+  s_5332f62e0ed5a7::t_9a99890123880b 297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "57426c3fbaa9556895d46d65eb19e6e49808ed83",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
