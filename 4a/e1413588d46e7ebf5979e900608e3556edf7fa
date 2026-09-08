@@ -1,0 +1,19 @@
+HANDOFF-managed-wsl-runner.md
+  s_92e74af38f2870::t_8db82bd3072db3 3-87,90-95,98-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "4ae1413588d46e7ebf5979e900608e3556edf7fa",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
