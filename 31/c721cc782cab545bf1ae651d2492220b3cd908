@@ -1,0 +1,19 @@
+crates/app/tests/workflow_action_versions.rs
+  s_77f02d5e98abcb::t_0e8c55df1f8e56 108-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "31c721cc782cab545bf1ae651d2492220b3cd908",
+  "prompts": {},
+  "sessions": {
+    "s_77f02d5e98abcb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a080f5-6938-7ee3-84e3-ca565e93cc94",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
