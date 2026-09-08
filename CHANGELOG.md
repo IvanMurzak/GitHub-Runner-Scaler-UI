@@ -23,6 +23,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   use a shorter UTC format.
 - The header shows the current TUI and registered service-binary versions at
   the upper right and refreshes the service version with the local snapshot.
+- Releases now publish the application and its four internal libraries to
+  crates.io through short-lived OIDC credentials, making the documented
+  `cargo install runner-manager` channel real.
 
 ## 0.4.5
 
