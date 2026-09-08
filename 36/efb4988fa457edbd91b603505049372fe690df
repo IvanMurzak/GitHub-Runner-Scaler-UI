@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_92e74af38f2870::t_206557fae6f01b 10-15
+  s_92e74af38f2870::t_cbfc6312712bf1 16
+crates/app/src/cli/daemon.rs
+  s_92e74af38f2870::t_206557fae6f01b 67-74,79,81-95,341,379-406
+  s_92e74af38f2870::t_19a88d8b712dc7 1661-1671
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "36efb4988fa457edbd91b603505049372fe690df",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
