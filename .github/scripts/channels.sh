@@ -603,7 +603,7 @@ cmd_cargo_publish() {
             ;;
         esac
 
-        printf '--- publishing %s@%s\n' "$package" "$version"
+        printf -- '--- publishing %s@%s\n' "$package" "$version"
         cargo publish --locked -p "$package"
 
         # Cargo polls the index, but the HTTP API can trail it. Waiting here
