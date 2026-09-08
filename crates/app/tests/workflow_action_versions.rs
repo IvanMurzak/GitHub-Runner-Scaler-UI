@@ -79,6 +79,9 @@ fn external_workflow_actions_use_the_supported_node_24_majors() {
         "actions/download-artifact@v8",
         "actions/setup-node@v7",
         "actions/upload-artifact@v7",
+        "Swatinem/rust-cache@v2",
+        "taiki-e/install-action@nextest",
+        "mozilla-actions/sccache-action@v0.0.11",
     ]);
 
     for (workflow, action_ref) in &refs {
