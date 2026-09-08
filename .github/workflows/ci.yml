@@ -93,26 +93,8 @@ jobs:
           #   workflows should not run on a personal host. Approving a fork PR
           #   on this repository is therefore a decision about that machine.
           # ------------------------------------------------------------------
-          # TEMPORARILY BACK ON A HOSTED RUNNER. RESTORE AFTER 0.1.11 SHIPS.
-          # ------------------------------------------------------------------
-          # This leg belongs on `rm-ivanpc-win-x64` -- see the note below, which
-          # is still the intent. It is parked here to break a loop the note
-          # itself predicted:
-          #
-          #   the local runner serves this leg using the *installed* agent;
-          #   the fix that leg needs is the workspace layout in this branch;
-          #   the release that installs it runs this workflow to get out.
-          #
-          # So the agent could not check out a repository whose path it made too
-          # long, and the fix for that could not ship past the check it was
-          # breaking. One release on a hosted runner is the way out, exactly as
-          # the recovery note said.
-          #
-          # Restore `os: rm-ivanpc-win-x64` once 0.1.11 is installed on that
-          # host. Passing afterwards is the real proof the layout fix works,
-          # which is a better test than this branch could have run.
           - name: windows-x86_64
-            os: windows-latest
+            os: rm-ivanpc-win-x64
           # macos-latest is Apple Silicon, so the platform the persona actually
           # uses is the platform that is tested. The `uname` assertion below
           # keeps that true if GitHub ever repoints the label.
@@ -144,17 +126,16 @@ jobs:
           cargo fmt --version
           cargo clippy --version
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache the cargo registry and build artifacts
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-
+          shared-key: "cargo-${{ runner.os }}-${{ runner.arch }}"
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Verify that the committed Cargo.lock is current
         run: cargo metadata --locked --format-version 1 > /dev/null
@@ -170,8 +151,14 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: cargo nextest run --workspace
+        run: cargo nextest run --workspace
+
+      - name: cargo test --doc
+        run: cargo test --doc --workspace
 
   # ---------------------------------------------------------------------------
   # The privileged installer smoke tests (d3).
@@ -212,17 +199,16 @@ jobs:
           rustup toolchain install --no-self-update
           rustup show active-toolchain
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache the cargo registry and build artifacts
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-
+          shared-key: "cargo-${{ runner.os }}-${{ runner.arch }}"
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       # THIS STEP IS LOAD-BEARING AND ITS ABSENCE IS NOT OBVIOUS.
       #
@@ -307,4 +293,5 @@ jobs:
             exit 1
           }
           Write-Output "$root does not exist, as it did not before"
+
 

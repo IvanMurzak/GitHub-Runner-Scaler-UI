@@ -554,6 +554,9 @@ impl SpawnSpec {
         extra_env: Option<(&OsStr, &OsStr)>,
     ) -> Result<ChildProcess, ProcessError> {
         let mut command = Command::new(&self.program);
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+
         command.args(&self.args);
         for (key, value) in &self.envs {
             command.env(key, value);
@@ -1286,13 +1289,35 @@ mod sys {
     }
 
     pub(super) fn force_stop(pid: u32) -> io::Result<()> {
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
-            .map_err(|error| io_error(&error))?;
-        let result = unsafe { TerminateProcess(handle, 1) };
-        unsafe {
-            let _ = CloseHandle(handle);
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+            Ok(handle) => {
+                let result = unsafe { TerminateProcess(handle, 1) };
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                if let Err(error) = result {
+                    let code = error.code().0 as u32;
+                    if code != 0x80070005 && code != 0x80070057 {
+                        return Err(io_error(&error));
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let code = error.code().0 as u32;
+                if code == 0x80070005 || code == 0x80070057 {
+                    Ok(())
+                } else {
+                    Err(io_error(&error))
+                }
+            }
         }
-        result.map_err(|error| io_error(&error))
     }
 
     /// The current account's SID in string form, for the DACL below.
@@ -1582,7 +1607,8 @@ mod sys {
         // this program owns. The PID is checked for liveness by the caller
         // immediately beforehand, and every caller either holds the child
         // handle or has just re-verified the process identity.
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        // We use `-pid` to send the signal to the entire process group.
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
         if result == 0 {
             return Ok(true);
         }
@@ -1597,7 +1623,7 @@ mod sys {
 
     pub(super) fn force_stop(pid: u32) -> io::Result<()> {
         // SAFETY: as `request_stop`.
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
         if result == 0 {
             return Ok(());
         }
@@ -1957,6 +1983,12 @@ mod tests {
         // other test in this module: a token that is the same constant for
         // everything. Such a token would make a recycled PID indistinguishable
         // from the original process.
+        //
+        // Under cargo-nextest, this test process and its child start so close
+        // together that they can share the same clock tick on Linux (10ms resolution).
+        // Sleep for a tick to ensure they have distinct start times.
+        std::thread::sleep(Duration::from_millis(20));
+
         let mut child = long_running().spawn().expect("the child starts");
         let mine = ProcessIdentity::of_current_process().expect("this process can see itself");
 
