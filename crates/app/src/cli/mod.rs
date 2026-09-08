@@ -1888,7 +1888,7 @@ impl Styling {
 /// out of CI, and out of the integration tests that drive `auth login` against
 /// a fake GitHub — a test suite that spawned a browser per run would be a bug
 /// nobody would thank us for.
-fn open_in_browser(url: &str, styling: Styling) -> bool {
+pub(crate) fn open_in_browser(url: &str, styling: Styling) -> bool {
     if !styling.enabled {
         return false;
     }

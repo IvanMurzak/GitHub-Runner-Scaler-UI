@@ -7,6 +7,14 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.4
+
+### macOS runner-volume access guidance
+
+- The Dashboard now highlights a macOS Full Disk Access denial for the
+  boot-service runner volume and opens the relevant System Settings pane from
+  the warning.
+
 ## 0.4.3
 
 ### Idle host upgrade fix

@@ -61,6 +61,25 @@ pub enum Screen {
     Activity,
 }
 
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+const DASHBOARD_PRIVACY_WARNING_HEIGHT: u16 = 5;
+
+fn dashboard_privacy_warning_area(size: Rect) -> Rect {
+    let content = Rect::new(
+        size.x,
+        size.y.saturating_add(2),
+        size.width,
+        size.height.saturating_sub(3),
+    );
+    Rect {
+        height: content.height.min(DASHBOARD_PRIVACY_WARNING_HEIGHT),
+        ..content
+    }
+}
+
 impl Screen {
     pub const ALL: [Self; 6] = [
         Self::Dashboard,
@@ -131,6 +150,7 @@ pub struct PresentationState {
     pub body: Vec<String>,
     pub diagnostics: Vec<String>,
     pub health: Health,
+    pub privacy_access_denied: bool,
     pub access_token: Option<String>,
     pub jit_configuration: Option<String>,
 }
@@ -142,6 +162,7 @@ impl Default for PresentationState {
             body: vec!["Waiting for the first local status snapshot...".to_owned()],
             diagnostics: vec!["No activity recorded.".to_owned()],
             health: Health::Ready,
+            privacy_access_denied: false,
             access_token: None,
             jit_configuration: None,
         }
@@ -177,6 +198,9 @@ impl PresentationState {
 pub struct AgentEvent {
     pub summary: String,
     pub health: Health,
+    /// The daemon's durable root-refusal record says macOS denied Full Disk
+    /// Access to a boot service on a privacy-gated volume.
+    pub privacy_access_denied: bool,
     /// A fully collected GitHub inventory snapshot when the embedding agent
     /// has one. The standalone local journal reader supplies `None`; it never
     /// invents GitHub workload counts from local attempt counts.
@@ -344,6 +368,7 @@ fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> Age
             return AgentEvent {
                 summary: format!("GitHub inventory runtime could not start: {error}"),
                 health: Health::Error,
+                privacy_access_denied: false,
                 snapshot: None,
             };
         }
@@ -354,6 +379,22 @@ fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> Age
 async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> AgentEvent {
     match crate::cli::status::snapshot(context) {
         Ok(local) => {
+            let privacy_access_denied =
+                match runner_manager_platform::service::runner_root_refusals(context.paths()) {
+                    Ok(refusals) => refusals
+                        .iter()
+                        .any(|refusal| refusal.kind == "denied_by_privacy_policy"),
+                    Err(error) => {
+                        return AgentEvent {
+                            summary: format!(
+                                "Local runner-root refusal record could not be read: {error}"
+                            ),
+                            health: Health::Error,
+                            privacy_access_denied: false,
+                            snapshot: None,
+                        };
+                    }
+                };
             let summary = format!(
                 "Local agent journal: {} active runner attempt(s), {} configured policy/policies.",
                 local.host.in_use,
@@ -367,11 +408,13 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                         Health::Ready
                     },
                     summary,
+                    privacy_access_denied,
                     snapshot: Some(snapshot),
                 },
                 Err((availability, detail)) => AgentEvent {
                     summary: format!("{summary} GitHub inventory refresh failed: {detail}"),
                     health: Health::Error,
+                    privacy_access_denied,
                     snapshot: Some(Snapshot {
                         activity: production_activity(context)
                             .unwrap_or_default()
@@ -391,6 +434,7 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
         Err(error) => AgentEvent {
             summary: format!("Local agent journal could not be read: {error}"),
             health: Health::Error,
+            privacy_access_denied: false,
             snapshot: None,
         },
     }
@@ -813,6 +857,7 @@ pub enum Effect {
     Refresh,
     Copy(String),
     SetMouseCapture(bool),
+    OpenFullDiskAccess,
     ActivateFocusedControl,
     Settings(SettingsCommand),
 }
@@ -1047,6 +1092,7 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         }
         AppEvent::Agent(agent) => {
             state.presentation.health = agent.health;
+            state.presentation.privacy_access_denied = agent.privacy_access_denied;
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
             if let Some(mut snapshot) = agent.snapshot {
@@ -1192,6 +1238,11 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             return vec![Effect::Settings(SettingsCommand::LoadHost)];
         }
         KeyCode::Char('a') => state.open_screen(Screen::Activity),
+        KeyCode::Char('p')
+            if state.screen == Screen::Dashboard && state.presentation.privacy_access_denied =>
+        {
+            return vec![Effect::OpenFullDiskAccess];
+        }
         KeyCode::Char('o') => {
             let current = match state.screen_model.screen {
                 ReadOnlyScreen::Repositories => state.screen_model.repositories.sort_order,
@@ -1304,7 +1355,16 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 };
             } else {
                 state.focus = Focus::Content;
-                if state.screen == Screen::Repositories {
+                if state.screen == Screen::Dashboard
+                    && state.presentation.privacy_access_denied
+                    && contains(
+                        dashboard_privacy_warning_area(state.size),
+                        mouse.column,
+                        mouse.row,
+                    )
+                {
+                    return vec![Effect::OpenFullDiskAccess];
+                } else if state.screen == Screen::Repositories {
                     let content_first_row = screens::REPOSITORY_ROW_ORIGIN;
                     if mouse.row >= content_first_row
                         && let Some(id) =
@@ -1427,9 +1487,44 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     ) {
         settings::render(frame, rows[2], &state.settings, compact);
     } else if let Some(read_only) = read_only_screen(state.screen) {
+        let content =
+            if state.screen == Screen::Dashboard && state.presentation.privacy_access_denied {
+                let warning = dashboard_privacy_warning_area(state.size);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "FULL DISK ACCESS REQUIRED",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from("macOS denied the boot service access to the runner volume."),
+                        Line::from(Span::styled(
+                            "[p] Open Full Disk Access settings",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                        )),
+                    ])
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    )
+                    .wrap(Wrap { trim: true }),
+                    warning,
+                );
+                Rect {
+                    y: warning.bottom(),
+                    height: rows[2].bottom().saturating_sub(warning.bottom()),
+                    ..rows[2]
+                }
+            } else {
+                rows[2]
+            };
         let mut model = state.screen_model.clone();
         model.apply(ScreenAction::Open(read_only));
-        screens::render(frame, rows[2], &model, &state.skin);
+        screens::render(frame, content, &model, &state.skin);
     } else {
         let content = if compact {
             let filter = if state.filtering {
@@ -1485,7 +1580,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         format!("? help | q quit | {capture}")
     } else {
         format!(
-            "Tab/arrows focus | Enter activate | / filter | o sort | F5 refresh | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
+            "Tab/arrows focus | Enter activate | / filter | o sort | F5 refresh | p privacy settings | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
         )
     };
     frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[3]);
@@ -1825,6 +1920,12 @@ where
                 Effect::SetMouseCapture(enabled) => session.set_mouse_capture(enabled)?,
                 Effect::Copy(text) => copy_to_terminal_clipboard(&mut io::stdout(), &text)?,
                 Effect::Refresh => refresh.request_refresh()?,
+                Effect::OpenFullDiskAccess => {
+                    crate::cli::open_in_browser(
+                        runner_manager_platform::os::FULL_DISK_ACCESS_SETTINGS_URL,
+                        crate::cli::Styling::for_stdout(),
+                    );
+                }
                 Effect::ActivateFocusedControl => {
                     // Read-only controls activate in the reducer.
                 }
@@ -1987,6 +2088,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "runner busy".to_owned(),
                 health: Health::Busy,
+                privacy_access_denied: false,
                 snapshot: None,
             }),
         );
@@ -1995,6 +2097,56 @@ mod tests {
         assert!(!state.terminal_focused);
         reduce(&mut state, AppEvent::from(Event::FocusGained));
         assert!(state.terminal_focused);
+    }
+
+    #[test]
+    fn dashboard_privacy_warning_is_yellow_and_opens_settings_from_key_or_click() {
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.presentation.privacy_access_denied = true;
+
+        let frame = rendered(120, 30, &state);
+        assert!(
+            frame.contains("FULL DISK ACCESS REQUIRED"),
+            "dashboard must name the actionable macOS access failure: {frame}"
+        );
+        assert!(
+            frame.contains("[p] Open Full Disk Access settings"),
+            "dashboard must render the settings action: {frame}"
+        );
+        assert_eq!(
+            reduce(&mut state, key(KeyCode::Char('p'))),
+            [Effect::OpenFullDiskAccess]
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 4, 4),
+            ),
+            [Effect::OpenFullDiskAccess]
+        );
+    }
+
+    #[test]
+    fn dashboard_hides_privacy_warning_and_disables_its_action_after_access_is_restored() {
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+
+        let frame = rendered(120, 30, &state);
+        assert!(
+            !frame.contains("FULL DISK ACCESS REQUIRED"),
+            "a healthy host must not show a stale privacy warning: {frame}"
+        );
+        assert!(
+            reduce(&mut state, key(KeyCode::Char('p'))).is_empty(),
+            "the settings action must not be available without a recorded denial"
+        );
+        assert!(
+            reduce(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 4, 4),
+            )
+            .is_empty(),
+            "the dashboard warning hitbox must not be active when it is not drawn"
+        );
     }
 
     #[test]
@@ -2259,6 +2411,7 @@ mod tests {
                 AgentEvent {
                     summary: format!("production refresh {refresh}"),
                     health: Health::Ready,
+                    privacy_access_denied: false,
                     snapshot: Some(snapshot),
                 }
             },
@@ -2670,6 +2823,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "GitHub inventory refreshed".into(),
                 health: Health::Ready,
+                privacy_access_denied: false,
                 snapshot: Some(snapshot),
             }),
         );
@@ -2752,6 +2906,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "production snapshot".into(),
                 health: Health::Ready,
+                privacy_access_denied: false,
                 snapshot: Some(snapshot),
             }),
         );
@@ -2876,6 +3031,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "rate limited".into(),
                 health: Health::Error,
+                privacy_access_denied: false,
                 snapshot: Some(Snapshot {
                     availability: Availability::RateLimited {
                         retry_after_seconds: 90,
@@ -2905,6 +3061,7 @@ mod tests {
             AppEvent::Agent(AgentEvent {
                 summary: "ready again".into(),
                 health: Health::Ready,
+                privacy_access_denied: false,
                 snapshot: Some(Snapshot {
                     availability: Availability::Ready,
                     ..Snapshot::default()
@@ -2940,6 +3097,7 @@ mod tests {
                     AgentEvent {
                         summary: format!("collection {number}"),
                         health: Health::Ready,
+                        privacy_access_denied: false,
                         snapshot: None,
                     }
                 },
@@ -2999,6 +3157,7 @@ mod tests {
                 AgentEvent {
                     summary: "cancelled blocked preflight".into(),
                     health: Health::Ready,
+                    privacy_access_denied: false,
                     snapshot: None,
                 }
             },
