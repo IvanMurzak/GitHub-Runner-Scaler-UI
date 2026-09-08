@@ -82,6 +82,7 @@ fn external_workflow_actions_use_the_supported_node_24_majors() {
         "Swatinem/rust-cache@v2",
         "taiki-e/install-action@nextest",
         "mozilla-actions/sccache-action@v0.0.11",
+        "rust-lang/crates-io-auth-action@v1",
     ]);
 
     for (workflow, action_ref) in &refs {
