@@ -7,6 +7,16 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.5
+
+### Resource Leak Fixes & CI Optimizations
+
+- Fixed severe ephemeral workspace accumulation in the fallback `C:\rman` directory.
+- Resolved a Windows process-tree zombie leak caused by race conditions during force termination.
+- Optimized the CI build matrix using `cargo-nextest`, `rust-cache`, and `sccache`,
+  while excluding Cargo's bin directory so cache cleanup cannot delete the
+  `rustup` proxies from a persistent self-hosted runner.
+
 ## 0.4.4
 
 ### macOS runner-volume access guidance
