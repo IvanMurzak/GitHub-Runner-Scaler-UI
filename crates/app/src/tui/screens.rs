@@ -138,12 +138,14 @@ impl AgentHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerOwnership {
     Local,
+    ManagedRemote,
     External,
 }
 impl RunnerOwnership {
     const fn marker(self) -> &'static str {
         match self {
             Self::Local => "[local-owned]",
+            Self::ManagedRemote => "[managed-other-host]",
             Self::External => "[external-read-only]",
         }
     }
@@ -223,7 +225,9 @@ pub struct RunnerRow {
     pub labels: Vec<String>,
     pub online: bool,
     pub busy: bool,
-    pub ephemeral: bool,
+    /// GitHub omits this field from some runner-inventory responses. `None`
+    /// must remain unknown instead of being presented as persistent.
+    pub ephemeral: Option<bool>,
     pub ownership: RunnerOwnership,
 }
 
@@ -271,12 +275,23 @@ pub enum SortOrder {
     WorkloadDescending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardTable {
+    Repositories,
+    Runners,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableViewState {
     pub focus: TableFocus,
     pub selected_id: Option<String>,
     pub sort_order: SortOrder,
+    pub sort_column: usize,
+    pub sort_descending: bool,
     pub scroll: usize,
+    /// Data rows the full-screen table can currently draw. Selection uses it
+    /// to move the viewport only when it reaches an edge.
+    pub viewport_rows: usize,
     pub filter: String,
 }
 impl Default for TableViewState {
@@ -285,7 +300,10 @@ impl Default for TableViewState {
             focus: TableFocus::Rows,
             selected_id: None,
             sort_order: SortOrder::NameAscending,
+            sort_column: 0,
+            sort_descending: false,
             scroll: 0,
+            viewport_rows: TABLE_VIEWPORT_ROWS,
             filter: String::new(),
         }
     }
@@ -298,6 +316,8 @@ pub struct ScreenModel {
     pub repositories: TableViewState,
     pub runners: TableViewState,
     pub activity: TableViewState,
+    pub dashboard_repository_sort: (usize, bool),
+    pub dashboard_runner_sort: (usize, bool),
     pub repository_detail: Option<String>,
     pub runner_detail: Option<String>,
     pub acknowledged_activity: HashSet<String>,
@@ -310,7 +330,10 @@ pub enum ScreenAction {
     Filter(String),
     MoveSelection(isize),
     SetSort(SortOrder),
+    SortColumn(usize),
+    SortDashboardColumn(DashboardTable, usize),
     SetFocus(TableFocus),
+    SetViewportRows(usize),
     Activate,
     CloseRepositoryDetail,
     OpenRepositoryByMouse(String),
@@ -325,10 +348,14 @@ impl ScreenModel {
             repositories: TableViewState::default(),
             runners: TableViewState::default(),
             activity: TableViewState::default(),
+            dashboard_repository_sort: (0, false),
+            dashboard_runner_sort: (2, false),
             repository_detail: None,
             runner_detail: None,
             acknowledged_activity: HashSet::new(),
         };
+        model.runners.sort_column = 2;
+        model.activity.sort_column = 1;
         model.reconcile_all(None);
         model
     }
@@ -346,15 +373,52 @@ impl ScreenModel {
             }
             ScreenAction::MoveSelection(delta) => self.move_selection(delta),
             ScreenAction::SetSort(order) => {
+                let screen = self.screen;
                 if let Some(table) = self.current_table_mut() {
-                    table.sort_order = order;
+                    set_legacy_sort(table, screen, order);
                     self.reconcile_current(None);
+                }
+            }
+            ScreenAction::SortColumn(column) => {
+                let screen = self.screen;
+                if let Some(table) = self.current_table_mut() {
+                    if table.sort_column == column {
+                        table.sort_descending = !table.sort_descending;
+                    } else {
+                        table.sort_column = column;
+                        table.sort_descending = false;
+                    }
+                    table.sort_order =
+                        legacy_sort(screen, table.sort_column, table.sort_descending);
+                    self.reconcile_current(None);
+                }
+            }
+            ScreenAction::SortDashboardColumn(table, column) => {
+                let sort = match table {
+                    DashboardTable::Repositories => &mut self.dashboard_repository_sort,
+                    DashboardTable::Runners => &mut self.dashboard_runner_sort,
+                };
+                if sort.0 == column {
+                    sort.1 = !sort.1;
+                } else {
+                    *sort = (column, false);
                 }
             }
             ScreenAction::SetFocus(focus) => {
                 if let Some(table) = self.current_table_mut() {
                     table.focus = focus
                 }
+            }
+            ScreenAction::SetViewportRows(rows) => {
+                let rows = rows.max(1);
+                for table in [
+                    &mut self.repositories,
+                    &mut self.runners,
+                    &mut self.activity,
+                ] {
+                    table.viewport_rows = rows;
+                }
+                self.reconcile_all(None);
             }
             ScreenAction::Activate => match self.screen {
                 ReadOnlyScreen::Repositories => {
@@ -467,7 +531,7 @@ impl ScreenModel {
             .unwrap_or(0);
         let next = current.saturating_add_signed(delta).min(ids.len() - 1);
         table.selected_id = Some(ids[next].clone());
-        table.scroll = next;
+        keep_selection_visible(table, next, ids.len());
     }
 
     /// The repositories a reader can currently see, in the order they appear.
@@ -480,7 +544,14 @@ impl ScreenModel {
             .iter()
             .filter(|row| contains_folded(&row.target, &self.repositories.filter))
             .collect();
-        rows.sort_by(|a, b| repository_cmp(a, b, self.repositories.sort_order));
+        rows.sort_by(|a, b| {
+            repository_cmp(
+                a,
+                b,
+                self.repositories.sort_column,
+                self.repositories.sort_descending,
+            )
+        });
         rows
     }
 
@@ -507,12 +578,52 @@ impl ScreenModel {
                         .any(|label| contains_folded(label, &self.runners.filter))
             })
             .collect();
-        rows.sort_by(|a, b| named_cmp(&a.name, &b.name, self.runners.sort_order));
+        rows.sort_by(|a, b| {
+            runner_cmp(a, b, self.runners.sort_column, self.runners.sort_descending)
+        });
         rows
     }
 
     fn visible_runner_ids(&self) -> Vec<String> {
         ids(self.visible_runners().into_iter().map(|row| &row.id))
+    }
+
+    fn current_table(&self) -> Option<&TableViewState> {
+        match self.screen {
+            ReadOnlyScreen::Dashboard => None,
+            ReadOnlyScreen::Repositories => Some(&self.repositories),
+            ReadOnlyScreen::Runners => Some(&self.runners),
+            ReadOnlyScreen::Activity => Some(&self.activity),
+        }
+    }
+
+    /// Dashboard previews are not the interactive tables. They always start
+    /// from the complete, default-ordered inventory and therefore cannot
+    /// inherit a full-screen filter, sort, selection, or viewport offset.
+    fn dashboard_repositories(&self) -> Vec<&RepositoryRow> {
+        let mut rows: Vec<_> = self.snapshot.repositories.iter().collect();
+        rows.sort_by(|a, b| {
+            repository_cmp(
+                a,
+                b,
+                self.dashboard_repository_sort.0,
+                self.dashboard_repository_sort.1,
+            )
+        });
+        rows
+    }
+
+    fn dashboard_runners(&self) -> Vec<&RunnerRow> {
+        let mut rows: Vec<_> = self.snapshot.runners.iter().collect();
+        rows.sort_by(|a, b| {
+            runner_cmp(
+                a,
+                b,
+                self.dashboard_runner_sort.0,
+                self.dashboard_runner_sort.1,
+            )
+        });
+        rows
     }
 
     fn visible_activity(&self) -> Vec<&ActivityRow> {
@@ -525,7 +636,12 @@ impl ScreenModel {
                     || contains_folded(&row.remediation, &self.activity.filter)
             })
             .collect();
-        rows.sort_by(|a, b| named_cmp(&a.occurred_at, &b.occurred_at, self.activity.sort_order));
+        rows.sort_by(|a, b| {
+            directed(
+                a.occurred_at.cmp(&b.occurred_at),
+                self.activity.sort_descending,
+            )
+        });
         rows
     }
 
@@ -541,20 +657,61 @@ fn ids<'a>(rows: impl Iterator<Item = &'a String>) -> Vec<String> {
 fn contains_folded(value: &str, query: &str) -> bool {
     query.is_empty() || value.to_lowercase().contains(&query.to_lowercase())
 }
-fn named_cmp(a: &str, b: &str, order: SortOrder) -> Ordering {
-    match order {
-        SortOrder::NameAscending => a.cmp(b),
-        _ => b.cmp(a),
-    }
+fn directed(order: Ordering, descending: bool) -> Ordering {
+    if descending { order.reverse() } else { order }
 }
-fn repository_cmp(a: &RepositoryRow, b: &RepositoryRow, order: SortOrder) -> Ordering {
-    match order {
-        SortOrder::NameAscending => a.target.cmp(&b.target),
-        SortOrder::NameDescending => b.target.cmp(&a.target),
-        SortOrder::WorkloadDescending => b
-            .in_progress_workflows
-            .cmp(&a.in_progress_workflows)
-            .then_with(|| a.target.cmp(&b.target)),
+
+fn repository_cmp(
+    a: &RepositoryRow,
+    b: &RepositoryRow,
+    column: usize,
+    descending: bool,
+) -> Ordering {
+    let order = match column {
+        1 => a.in_progress_workflows.cmp(&b.in_progress_workflows),
+        2 => a.mode.marker().cmp(b.mode.marker()),
+        3 => a.max_capacity.cmp(&b.max_capacity),
+        4 => a.health.marker().cmp(&b.health.marker()),
+        5 => (&a.host_label, &a.extra_labels).cmp(&(&b.host_label, &b.extra_labels)),
+        _ => a.target.cmp(&b.target),
+    };
+    directed(order, descending).then_with(|| a.target.cmp(&b.target))
+}
+
+fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> Ordering {
+    let state = |row: &RunnerRow| (!row.online, row.busy, row.ephemeral, row.ownership.marker());
+    let order = match column {
+        0 => a.owner.cmp(&b.owner),
+        1 => state(a).cmp(&state(b)),
+        3 => a.os.cmp(&b.os),
+        4 => a.labels.cmp(&b.labels),
+        _ => a.name.cmp(&b.name),
+    };
+    directed(order, descending).then_with(|| a.name.cmp(&b.name))
+}
+
+fn set_legacy_sort(table: &mut TableViewState, screen: ReadOnlyScreen, order: SortOrder) {
+    let (column, descending) = match (screen, order) {
+        (ReadOnlyScreen::Repositories, SortOrder::WorkloadDescending) => (1, true),
+        (ReadOnlyScreen::Runners, SortOrder::NameAscending) => (2, false),
+        (ReadOnlyScreen::Runners, SortOrder::NameDescending) => (2, true),
+        (ReadOnlyScreen::Activity, SortOrder::NameAscending) => (1, false),
+        (ReadOnlyScreen::Activity, _) => (1, true),
+        (_, SortOrder::NameDescending) => (0, true),
+        _ => (0, false),
+    };
+    table.sort_order = order;
+    table.sort_column = column;
+    table.sort_descending = descending;
+}
+
+fn legacy_sort(screen: ReadOnlyScreen, column: usize, descending: bool) -> SortOrder {
+    if screen == ReadOnlyScreen::Repositories && column == 1 && descending {
+        SortOrder::WorkloadDescending
+    } else if descending {
+        SortOrder::NameDescending
+    } else {
+        SortOrder::NameAscending
     }
 }
 
@@ -569,13 +726,51 @@ fn reconcile_table(table: &mut TableViewState, ids: &[String], old_len: Option<u
         .as_ref()
         .is_some_and(|selected| ids.contains(selected))
     {
-        table.scroll = table.scroll.min(ids.len() - 1);
+        let selected = ids
+            .iter()
+            .position(|id| Some(id) == table.selected_id.as_ref())
+            .expect("the selected id was just found in this list");
+        keep_selection_visible(table, selected, ids.len());
         return;
     }
     let old_last = old_len.unwrap_or(ids.len()).saturating_sub(1);
     let index = table.scroll.min(old_last).min(ids.len() - 1);
     table.selected_id = Some(ids[index].clone());
-    table.scroll = index;
+    keep_selection_visible(table, index, ids.len());
+}
+
+/// Keep a one-row look-ahead around selection where the viewport has room.
+/// Short lists never scroll; long ones move only when selection reaches an
+/// edge, rather than pinning the selected row to the top on every key press.
+fn keep_selection_visible(table: &mut TableViewState, selected: usize, len: usize) {
+    let viewport = table.viewport_rows.max(1);
+    if len <= viewport {
+        table.scroll = 0;
+        return;
+    }
+    let max_scroll = len.saturating_sub(viewport);
+    table.scroll = table.scroll.min(max_scroll);
+    let margin = usize::from(viewport >= 3);
+    let lower = table.scroll.saturating_add(margin);
+    let upper = table
+        .scroll
+        .saturating_add(viewport.saturating_sub(1 + margin));
+    if selected < lower {
+        table.scroll = selected.saturating_sub(margin);
+    } else if selected > upper {
+        table.scroll = selected
+            .saturating_add(margin)
+            .saturating_add(1)
+            .saturating_sub(viewport);
+    }
+    table.scroll = table.scroll.min(max_scroll);
+}
+
+/// Data-row capacity of a full-screen read-only list inside its content area.
+pub fn list_viewport_rows(area_height: u16) -> usize {
+    usize::from(area_height)
+        .saturating_sub(2 + 1 + table::GRID_CHROME)
+        .max(1)
 }
 
 /// One block of a screen. Prose is reflowed to the terminal it lands on; a
@@ -653,6 +848,114 @@ pub const REPOSITORY_ROW_ORIGIN: u16 = 3 // title bar, navigation, content borde
     + 1 // the filter and sort status line, which never wraps
     + table::GRID_CHROME as u16
     - 1; // the grid's top border, header, and rule
+
+/// Header row shared by the two full-screen inventory grids.
+pub const INVENTORY_HEADER_ROW: u16 = REPOSITORY_ROW_ORIGIN - 2;
+
+/// Map a terminal x coordinate to a sortable inventory column using the same
+/// width solver that renders the header. Hidden narrow-screen columns cannot
+/// accidentally be selected.
+pub fn inventory_sort_column_at(
+    model: &ScreenModel,
+    skin: &Skin,
+    terminal_width: u16,
+    terminal_column: u16,
+) -> Option<usize> {
+    // The screen block spends one column on its border and one on horizontal
+    // padding at either side.
+    let grid_width = terminal_width.saturating_sub(4);
+    let offset = terminal_column.saturating_sub(2);
+    let rows = model
+        .current_table()
+        .map_or(TABLE_VIEWPORT_ROWS, |table| table.viewport_rows);
+    let grid = match model.screen {
+        ReadOnlyScreen::Repositories => repository_grid(
+            model,
+            skin,
+            "",
+            &model.visible_repositories(),
+            rows,
+            &REPOSITORY_COLUMNS,
+            GridPresentation::interactive((
+                model.repositories.sort_column,
+                model.repositories.sort_descending,
+            )),
+        ),
+        ReadOnlyScreen::Runners => runner_grid(
+            model,
+            skin,
+            "",
+            &model.visible_runners(),
+            rows,
+            &RUNNER_COLUMNS,
+            GridPresentation::interactive((
+                model.runners.sort_column,
+                model.runners.sort_descending,
+            )),
+        ),
+        ReadOnlyScreen::Dashboard | ReadOnlyScreen::Activity => return None,
+    };
+    grid.column_at(grid_width, offset)
+}
+
+/// Resolve either Dashboard grid header using the same measured sections and
+/// row allotment as the renderer. This stays correct when the terminal height
+/// or the number of repository preview rows changes the Runners header's y.
+pub fn dashboard_sort_column_at(
+    model: &ScreenModel,
+    skin: &Skin,
+    terminal_width: u16,
+    terminal_height: u16,
+    terminal_column: u16,
+    terminal_row: u16,
+) -> Option<(DashboardTable, usize)> {
+    if model.screen != ReadOnlyScreen::Dashboard
+        || model.snapshot.availability != Availability::Ready
+    {
+        return None;
+    }
+    let inner = Rect::new(
+        2,
+        3,
+        terminal_width.saturating_sub(4),
+        terminal_height.saturating_sub(5),
+    );
+    if terminal_column < inner.x || terminal_column >= inner.right() {
+        return None;
+    }
+    let height = usize::from(inner.height);
+    let mut laid: Vec<Laid> = sections(model, skin, height)
+        .into_iter()
+        .map(|section| Laid::measured(section, inner.width))
+        .collect();
+    allot(&mut laid, height);
+    let mut y = inner.y;
+    let mut grid_index = 0usize;
+    for section in laid {
+        match section {
+            Laid::Fixed(lines) => {
+                y = y.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            }
+            Laid::Grid(grid) => {
+                if terminal_row == y.saturating_add(1) {
+                    let table = match grid_index {
+                        0 => DashboardTable::Repositories,
+                        1 => DashboardTable::Runners,
+                        _ => return None,
+                    };
+                    let column =
+                        grid.column_at(inner.width, terminal_column.saturating_sub(inner.x))?;
+                    return Some((table, column));
+                }
+                y = y.saturating_add(
+                    u16::try_from(grid.compose(skin, Some(inner.width)).len()).unwrap_or(u16::MAX),
+                );
+                grid_index += 1;
+            }
+        }
+    }
+    None
+}
 
 /// Draw into the content area owned by `shell.rs`.
 pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel, skin: &Skin) {
@@ -1073,27 +1376,31 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
         ),
         Line::default(),
     ]);
+    let repositories = model.dashboard_repositories();
+    let runners = model.dashboard_runners();
     vec![
         head,
         Section::Grid(repository_grid(
             model,
             skin,
             "Repositories",
-            &model.visible_repositories(),
+            &repositories,
             rows,
             // The dashboard is a summary beside a second grid, so it stops at
             // `Agent`; the Repositories screen owns the whole width and draws
             // the label set as well.
             &REPOSITORY_COLUMNS[..5],
+            GridPresentation::preview(model.dashboard_repository_sort),
         )),
         Section::Prose(vec![Line::default()]),
         Section::Grid(runner_grid(
             model,
             skin,
             "Runners",
-            &model.visible_runners(),
+            &runners,
             rows,
             &RUNNER_COLUMNS[..3],
+            GridPresentation::preview(model.dashboard_runner_sort),
         )),
     ]
 }
@@ -1170,6 +1477,10 @@ fn repository_sections(
             visible,
             rows,
             &REPOSITORY_COLUMNS,
+            GridPresentation::interactive((
+                model.repositories.sort_column,
+                model.repositories.sort_descending,
+            )),
         )),
     ]
 }
@@ -1202,14 +1513,34 @@ fn runner_sections(
                 ("Labels: ", row.labels.join(","), Tone::Muted),
                 ("Online: ", row.online.to_string(), online_tone(row.online)),
                 ("Busy: ", row.busy.to_string(), Tone::Plain),
-                ("Ephemeral: ", row.ephemeral.to_string(), Tone::Plain),
+                (
+                    "Lifetime: ",
+                    match row.ephemeral {
+                        Some(true) => "ephemeral",
+                        Some(false) => "persistent",
+                        None => "unknown",
+                    }
+                    .to_owned(),
+                    Tone::Plain,
+                ),
             ],
             "Action: Esc returns to the runner list",
         )];
     }
     vec![
         table_status(skin, &model.runners),
-        Section::Grid(runner_grid(model, skin, "", visible, rows, &RUNNER_COLUMNS)),
+        Section::Grid(runner_grid(
+            model,
+            skin,
+            "",
+            visible,
+            rows,
+            &RUNNER_COLUMNS,
+            GridPresentation::interactive((
+                model.runners.sort_column,
+                model.runners.sort_descending,
+            )),
+        )),
     ]
 }
 
@@ -1323,6 +1654,28 @@ fn label_cell(row: &RepositoryRow) -> Cell {
     Cell::compound(parts)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GridPresentation {
+    selects_rows: bool,
+    sorted: Option<(usize, bool)>,
+}
+
+impl GridPresentation {
+    const fn interactive(sorted: (usize, bool)) -> Self {
+        Self {
+            selects_rows: true,
+            sorted: Some(sorted),
+        }
+    }
+
+    const fn preview(sorted: (usize, bool)) -> Self {
+        Self {
+            selects_rows: false,
+            sorted: Some(sorted),
+        }
+    }
+}
+
 fn repository_grid(
     model: &ScreenModel,
     skin: &Skin,
@@ -1330,11 +1683,18 @@ fn repository_grid(
     visible: &[&RepositoryRow],
     rows: usize,
     columns: &[Column],
+    presentation: GridPresentation,
 ) -> Grid {
-    let body = window(visible, model.repositories.scroll, rows)
+    let scroll = if presentation.selects_rows {
+        model.repositories.scroll
+    } else {
+        0
+    };
+    let body = window(visible, scroll, rows)
         .iter()
         .map(|row| {
-            let selected = model.repositories.selected_id.as_deref() == Some(row.id.as_str());
+            let selected = presentation.selects_rows
+                && model.repositories.selected_id.as_deref() == Some(row.id.as_str());
             GridRow {
                 selected,
                 cells: vec![
@@ -1361,11 +1721,7 @@ fn repository_grid(
         caption: caption.to_owned(),
         columns: columns.to_vec(),
         rows: body,
-        sorted: Some(match model.repositories.sort_order {
-            SortOrder::NameAscending => (0, false),
-            SortOrder::NameDescending => (0, true),
-            SortOrder::WorkloadDescending => (1, true),
-        }),
+        sorted: presentation.sorted,
     }
 }
 
@@ -1376,11 +1732,18 @@ fn runner_grid(
     visible: &[&RunnerRow],
     rows: usize,
     columns: &[Column],
+    presentation: GridPresentation,
 ) -> Grid {
-    let body = window(visible, model.runners.scroll, rows)
+    let scroll = if presentation.selects_rows {
+        model.runners.scroll
+    } else {
+        0
+    };
+    let body = window(visible, scroll, rows)
         .iter()
         .map(|row| {
-            let selected = model.runners.selected_id.as_deref() == Some(row.id.as_str());
+            let selected = presentation.selects_rows
+                && model.runners.selected_id.as_deref() == Some(row.id.as_str());
             GridRow {
                 selected,
                 cells: vec![
@@ -1400,7 +1763,7 @@ fn runner_grid(
         caption: caption.to_owned(),
         columns: columns.to_vec(),
         rows: body,
-        sorted: Some((2, model.runners.sort_order != SortOrder::NameAscending)),
+        sorted: presentation.sorted,
     }
 }
 
@@ -1417,13 +1780,14 @@ fn runner_status(row: &RunnerRow, skin: &Skin) -> Cell {
     } else {
         (skin.pick("\u{25cb}", "o"), "offline", Tone::Bad)
     };
-    let (mark, lifetime) = if row.ephemeral {
-        (skin.pick("\u{25c7}", ""), "ephemeral")
-    } else {
-        (skin.pick("\u{25c6}", ""), "persistent")
+    let (mark, lifetime) = match row.ephemeral {
+        Some(true) => (skin.pick("\u{25c7}", ""), "ephemeral"),
+        Some(false) => (skin.pick("\u{25c6}", ""), "persistent"),
+        None => (skin.pick("?", "?"), "unknown"),
     };
     let ownership = match row.ownership {
         RunnerOwnership::Local => "local",
+        RunnerOwnership::ManagedRemote => "managed-remote",
         RunnerOwnership::External => "external",
     };
     Cell::compound(vec![
@@ -1497,7 +1861,7 @@ mod tests {
                     labels: vec!["self-hosted".into(), "rm-home-win-x64".into()],
                     online: true,
                     busy: true,
-                    ephemeral: true,
+                    ephemeral: Some(true),
                     ownership: RunnerOwnership::Local,
                 },
                 RunnerRow {
@@ -1508,7 +1872,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: true,
                     busy: false,
-                    ephemeral: false,
+                    ephemeral: Some(false),
                     ownership: RunnerOwnership::External,
                 },
             ],
@@ -1601,7 +1965,7 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=20 bytes=1004 fnv=3b9b67f438345697 | HEALTH: OK live snapshot
+        Dashboard/populated: lines=20 bytes=1004 fnv=497a3012da50a54f | HEALTH: OK live snapshot
         Dashboard/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
@@ -1831,6 +2195,31 @@ mod tests {
     }
 
     #[test]
+    fn an_omitted_github_lifetime_is_unknown_not_persistent() {
+        let mut row = populated().runners.remove(0);
+        row.id = "managed-remote".into();
+        row.name = "runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2".into();
+        row.ephemeral = None;
+        row.ownership = RunnerOwnership::ManagedRemote;
+        let mut model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            runners: vec![row],
+            ..Snapshot::default()
+        });
+        model.screen = ReadOnlyScreen::Runners;
+
+        let list = render_text(&model);
+        assert!(list.contains("unknown"), "{list}");
+        assert!(list.contains("managed-remote"), "{list}");
+        assert!(!list.contains("persistent"), "{list}");
+
+        model.runner_detail = Some("managed-remote".into());
+        let detail = render_text(&model);
+        assert!(detail.contains("Lifetime: unknown"), "{detail}");
+        assert!(detail.contains("[managed-other-host]"), "{detail}");
+    }
+
+    #[test]
     fn idle_without_work_is_not_rendered_as_failure() {
         let mut model = ScreenModel::new(populated());
         model.screen = ReadOnlyScreen::Activity;
@@ -1915,10 +2304,10 @@ mod tests {
         model.apply(ScreenAction::SetSort(SortOrder::WorkloadDescending));
         model.apply(ScreenAction::MoveSelection(1));
         assert_eq!(model.repositories.selected_id.as_deref(), Some("observe"));
-        assert_eq!(model.repositories.scroll, 1);
+        assert_eq!(model.repositories.scroll, 0);
         model.apply(ScreenAction::Refresh(populated()));
         assert_eq!(model.repositories.selected_id.as_deref(), Some("observe"));
-        assert_eq!(model.repositories.scroll, 1);
+        assert_eq!(model.repositories.scroll, 0);
         assert_eq!(model.repositories.focus, TableFocus::Footer);
         assert_eq!(model.repositories.sort_order, SortOrder::WorkloadDescending);
         let mut removed = populated();
@@ -1928,6 +2317,90 @@ mod tests {
         assert_eq!(model.repositories.scroll, 0);
         assert_eq!(model.repositories.focus, TableFocus::Footer);
         assert_eq!(model.repositories.sort_order, SortOrder::WorkloadDescending);
+    }
+
+    #[test]
+    fn selection_scrolls_only_at_the_viewport_margin_and_never_for_a_short_list() {
+        let mut short = populated();
+        short.repositories.extend((2..4).map(|index| RepositoryRow {
+            id: format!("short-{index}"),
+            target: format!("acme/short-{index}"),
+            in_progress_workflows: 0,
+            mode: PolicyMode::MonitorOnly,
+            max_capacity: None,
+            health: AgentHealth::Healthy,
+            host_label: None,
+            extra_labels: vec![],
+        }));
+        let mut model = ScreenModel::new(short);
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        for _ in 0..3 {
+            model.apply(ScreenAction::MoveSelection(1));
+        }
+        assert_eq!(model.repositories.scroll, 0);
+
+        model
+            .snapshot
+            .repositories
+            .extend((4..10).map(|index| RepositoryRow {
+                id: format!("long-{index}"),
+                target: format!("acme/long-{index}"),
+                in_progress_workflows: 0,
+                mode: PolicyMode::MonitorOnly,
+                max_capacity: None,
+                health: AgentHealth::Healthy,
+                host_label: None,
+                extra_labels: vec![],
+            }));
+        model.apply(ScreenAction::SetViewportRows(4));
+        model.repositories.selected_id = model.visible_repository_ids().first().cloned();
+        model.repositories.scroll = 0;
+        model.apply(ScreenAction::MoveSelection(1));
+        model.apply(ScreenAction::MoveSelection(1));
+        assert_eq!(model.repositories.scroll, 0);
+        model.apply(ScreenAction::MoveSelection(1));
+        assert_eq!(model.repositories.scroll, 1);
+    }
+
+    #[test]
+    fn dashboard_previews_ignore_interactive_table_state() {
+        let mut model = ScreenModel::new(populated());
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::Filter("observe".into()));
+        model.repositories.scroll = 7;
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Runners));
+        model.apply(ScreenAction::Filter("external".into()));
+        model.runners.scroll = 9;
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Dashboard));
+
+        let dashboard = render_text(&model);
+        assert!(dashboard.contains("acme/alpha"), "{dashboard}");
+        assert!(dashboard.contains("acme/observe"), "{dashboard}");
+        assert!(dashboard.contains("rm-home-1"), "{dashboard}");
+        assert!(dashboard.contains("legacy-office"), "{dashboard}");
+        assert!(
+            !dashboard.lines().any(|line| line.contains("| > ")),
+            "{dashboard}"
+        );
+    }
+
+    #[test]
+    fn inventory_columns_sort_ascending_then_toggle_descending() {
+        let mut model = ScreenModel::new(populated());
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::SortColumn(1));
+        assert_eq!(model.repositories.sort_column, 1);
+        assert!(!model.repositories.sort_descending);
+        assert_eq!(model.visible_repository_ids(), vec!["observe", "alpha"]);
+        model.apply(ScreenAction::SortColumn(1));
+        assert!(model.repositories.sort_descending);
+        assert_eq!(model.visible_repository_ids(), vec!["alpha", "observe"]);
+
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Runners));
+        model.apply(ScreenAction::SortColumn(0));
+        assert_eq!(model.visible_runner_ids(), vec!["local", "legacy"]);
+        model.apply(ScreenAction::SortColumn(0));
+        assert_eq!(model.visible_runner_ids(), vec!["legacy", "local"]);
     }
 
     #[test]
@@ -2018,9 +2491,10 @@ mod tests {
         model.apply(ScreenAction::MoveSelection(10));
         let rendered = render_text(&model);
         assert!(rendered.contains("> acme/repository-10"), "{rendered}");
-        assert!(rendered.contains("acme/repository-17"), "{rendered}");
-        assert!(!rendered.contains("acme/repository-09"), "{rendered}");
-        assert!(!rendered.contains("acme/repository-18"), "{rendered}");
+        assert!(rendered.contains("acme/repository-04"), "{rendered}");
+        assert!(rendered.contains("acme/repository-11"), "{rendered}");
+        assert!(!rendered.contains("acme/repository-03"), "{rendered}");
+        assert!(!rendered.contains("acme/repository-12"), "{rendered}");
 
         model.apply(ScreenAction::Filter("does-not-exist".into()));
         let no_matches = render_text(&model);

@@ -389,6 +389,22 @@ pub fn text_of(lines: &[Line<'_>]) -> String {
 }
 
 impl Grid {
+    /// Resolve a horizontal offset in the rendered grid to its source column.
+    /// Borders and separators are deliberately not clickable.
+    pub fn column_at(&self, width: u16, offset: u16) -> Option<usize> {
+        let fits = self.solve(Some(width));
+        let mut cursor = 1u16; // left border
+        for fit in fits {
+            cursor = cursor.saturating_add(1); // leading cell padding
+            let end = cursor.saturating_add(fit.width);
+            if offset >= cursor && offset < end {
+                return Some(fit.index);
+            }
+            cursor = end.saturating_add(2); // trailing padding and separator
+        }
+        None
+    }
+
     /// Plain text at natural width: nothing is dropped and nothing is
     /// shortened, which is what makes this safe to put on the clipboard.
     pub fn to_text(&self, skin: &Skin) -> String {
