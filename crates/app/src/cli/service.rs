@@ -285,6 +285,11 @@ pub fn install(
         && durable_mode(&store).ok().flatten() != Some(mode)
     {
         let rollback = operations.uninstall();
+        // The registration rollback above may have removed the new unit, but
+        // it cannot put back the private executable this command swapped
+        // before registration. Restore it too: otherwise a failed install can
+        // leave a later service start running a version the command rejected.
+        owned.restore();
         return Err(rollback_failure("install", source, rollback.err()));
     }
 

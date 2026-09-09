@@ -1534,6 +1534,10 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
 
     out.push_str("\n[Service]\n");
     out.push_str("Type=simple\n");
+    // A runner is a child of the daemon. In particular, systemd must not
+    // signal it merely because a cooperative daemon handover replaces the
+    // manager process; startup recovery supervises any survivor instead.
+    out.push_str("KillMode=process\n");
     out.push_str(&format!("ExecStart={}\n", plan.command_line()));
     out.push_str(&format!(
         "WorkingDirectory={}\n",
@@ -6640,6 +6644,7 @@ mod tests {
     #[test]
     fn the_boot_unit_restarts_on_failure_after_the_bounded_delay() {
         let unit = systemd_unit(&linux_plan(StartMode::Boot));
+        assert!(unit.contains("KillMode=process\n"), "{unit}");
         assert!(unit.contains("Restart=on-failure\n"), "{unit}");
         assert!(unit.contains("RestartSec=15\n"), "{unit}");
         assert!(unit.contains("StartLimitIntervalSec=600\n"), "{unit}");

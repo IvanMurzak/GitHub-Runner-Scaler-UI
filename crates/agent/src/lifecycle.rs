@@ -1155,10 +1155,11 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
             .arg(format!("{}/.", source.display()))
             .arg(destination)
             .status()?;
-        if !status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed"));
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("cp failed"))
         }
-        return Ok(());
     }
     #[cfg(not(unix))]
     copy_package_entries(source, destination, true)

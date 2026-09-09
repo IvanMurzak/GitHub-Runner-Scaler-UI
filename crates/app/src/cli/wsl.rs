@@ -55,6 +55,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use runner_manager_domain::model::Clock;
@@ -112,6 +113,23 @@ const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Longer than the default: it writes a unit, reloads systemd and starts a
 /// daemon that opens a database.
 const SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The first release whose private service copy watches its source binary and
+/// performs the unbounded, journal-backed upgrade drain itself.
+///
+/// A WSL installer must never substitute `systemctl stop` for that protocol:
+/// systemd's ordinary stop is a bounded shutdown and can signal the runner
+/// child with the service cgroup. Versions before this one cannot be asked to
+/// hand over safely, so an active one is left alone.
+const FIRST_COOPERATIVE_SERVICE_HANDOVER: [u64; 3] = [0, 1, 8];
+
+/// The controller only observes a handover. The daemon owns its duration,
+/// waiting on its local journal without a deadline; this modest pause prevents
+/// observation from turning that wait into a tight WSL process loop.
+#[cfg(not(test))]
+const HANDOVER_OBSERVE_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const HANDOVER_OBSERVE_INTERVAL: Duration = Duration::ZERO;
 
 // ---------------------------------------------------------------------------
 // Turning a platform failure into an operator-facing one
@@ -1311,6 +1329,68 @@ fn systemctl_word(
     Some(word)
 }
 
+/// The version of systemd's main service process, not merely the executable
+/// currently registered for the next start.
+///
+/// During a cooperative handover the daemon replaces its private executable
+/// just before it exits. Looking only at `status --json` can therefore observe
+/// the new file while the old daemon is still the unit's main process. `/proc`
+/// follows the live process and makes the controller wait for systemd's restart
+/// before it says the host resumed service.
+fn service_main_version(
+    invoker: &WslInvoker<'_>,
+    distribution: &str,
+    unit: &str,
+) -> Option<String> {
+    let pid = systemctl_word(
+        invoker,
+        distribution,
+        &["show", "--property=MainPID", "--value", unit],
+    )?
+    .parse::<u32>()
+    .ok()
+    .filter(|pid| *pid != 0)?;
+    let output = invoker
+        .exec(LinuxCommand::new(distribution, format!("/proc/{pid}/exe")).args(["--version"]))
+        .ok()?;
+    if !output.success() {
+        return None;
+    }
+    output
+        .stdout_text()
+        .split_whitespace()
+        .last()
+        .map(str::to_owned)
+}
+
+/// Whether a release contains the daemon's source-watch handover protocol.
+///
+/// Status reports release versions, which are normal SemVer releases here.
+/// Unknown forms are intentionally treated as legacy: guessing that an active
+/// daemon can drain would be less safe than declining the update.
+fn supports_cooperative_service_handover(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    if core != version {
+        return false;
+    }
+    let mut parts = core.split('.');
+    let parsed = [
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+    ];
+    if parts.next().is_some() {
+        return false;
+    }
+    let [Some(major), Some(minor), Some(patch)] = parsed else {
+        return false;
+    };
+    [major, minor, patch] >= FIRST_COOPERATIVE_SERVICE_HANDOVER
+}
+
 /// Whether Docker can run a container in this distribution.
 ///
 /// **A diagnostic and never a gate.** Nothing in the provisioning transaction
@@ -1595,6 +1675,35 @@ impl Provisioner<'_> {
         let binary_replaced = installed_before
             .as_ref()
             .is_none_or(|status| status.product.version != self.version);
+        let service_was_active =
+            systemctl_word(&invoker, &distribution, &["is-active", &self.unit]).as_deref()
+                == Some("active");
+        let service_version = installed_before
+            .as_ref()
+            .and_then(|status| status.product.service_binary_version.as_deref());
+        // A version present before the source is changed is enough to reject a
+        // known legacy service without changing anything in the distribution.
+        // Older source binaries did not report the private-copy version at
+        // all, so that case is re-checked after their source is atomically
+        // updated below. Updating the source cannot signal or stop a legacy
+        // service and is safe to leave in place when its private copy is
+        // subsequently refused.
+        if service_was_active
+            && service_version.is_some_and(|version| version != self.version)
+            && !supports_cooperative_service_handover(service_version)
+        {
+            return Err(CliError::with_remedy(
+                Failure::WslProvisioning,
+                format!(
+                    "the active systemd unit {} runs service binary {} which predates the \
+                     cooperative upgrade handover. It was not stopped, and neither the Linux \
+                     binary nor its service copy was replaced.",
+                    self.unit,
+                    service_version.unwrap_or("of an unknown version"),
+                ),
+                "runner-manager wsl status --distribution <NAME>",
+            ));
+        }
 
         if binary_replaced {
             writeln!(out, "Installing {} into {distribution}", artifact.asset()).map_err(failed)?;
@@ -1614,6 +1723,65 @@ impl Provisioner<'_> {
                 self.version
             )
             .map_err(failed)?;
+        }
+
+        let service_needs_handover = if service_was_active {
+            let service_version = match linux_status(&invoker, &distribution, &self.linux_binary) {
+                Ok(LinuxAnswer::Reported(status)) => status.product.service_binary_version,
+                Ok(LinuxAnswer::Unusable(why)) => {
+                    return Err(CliError::with_remedy(
+                        Failure::WslProvisioning,
+                        format!(
+                            "{}: the updated Linux binary would not report the active service \
+                             copy, so this cannot prove that it supports a safe handover: {why}",
+                            stage_prefix(Stage::Service)
+                        ),
+                        "runner-manager wsl status --distribution <NAME>",
+                    ));
+                }
+                Err(why) => {
+                    return Err(CliError::with_remedy(
+                        Failure::WslProvisioning,
+                        format!(
+                            "{}: cannot read the active service copy after replacing the Linux \
+                             source binary: {why}",
+                            stage_prefix(Stage::Service)
+                        ),
+                        "runner-manager wsl status --distribution <NAME>",
+                    ));
+                }
+            };
+            if service_version.as_deref() == Some(self.version.as_str()) {
+                false
+            } else if !supports_cooperative_service_handover(service_version.as_deref()) {
+                return Err(CliError::with_remedy(
+                    Failure::WslProvisioning,
+                    format!(
+                        "the active systemd unit {} runs service binary {} which predates the \
+                         cooperative upgrade handover. It was not stopped and its private copy \
+                         was not replaced; the Linux source binary is safe to leave in place.",
+                        self.unit,
+                        service_version
+                            .as_deref()
+                            .unwrap_or("of an unknown version"),
+                    ),
+                    "runner-manager wsl status --distribution <NAME>",
+                ));
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        // An active private service copy upgrades itself: replacing its source
+        // causes the daemon to stop admitting jobs, wait for the local attempt
+        // journal to become empty with no deadline, replace its own copy and
+        // exit for systemd to restart it. This controller deliberately never
+        // uses `systemctl stop`; that is a different, sixty-second shutdown
+        // path and systemd may signal the runner child in the service cgroup.
+        if service_needs_handover {
+            self.wait_for_cooperative_service_handover(&invoker, &distribution, out)?;
         }
 
         // -- Stage 4: the credential ---------------------------------------
@@ -1830,16 +1998,79 @@ impl Provisioner<'_> {
         Ok(sink.delivered() > 0)
     }
 
-    /// Stage 6: adopt an enabled unit, or run the Linux `service install`.
+    /// Waits until systemd is running the replacement after its daemon-owned
+    /// cooperative handover.
+    ///
+    /// The service's source-file watch is the request and its `Upgrade` drain
+    /// is the acknowledgement. It waits on the local journal in the daemon;
+    /// this observer has no deadline because no timeout is worth terminating a
+    /// workflow. The running-process check is necessary because the private
+    /// file changes immediately before the old daemon exits.
+    fn wait_for_cooperative_service_handover(
+        &self,
+        invoker: &WslInvoker<'_>,
+        distribution: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), CliError> {
+        let failed = write_failed("this install");
+        writeln!(
+            out,
+            "The active service copy is taking its cooperative upgrade handover: it accepts \
+             no new jobs and waits for its local journal to drain before systemd restarts it."
+        )
+        .map_err(failed)?;
+        out.flush().map_err(failed)?;
+
+        loop {
+            let status =
+                linux_status(invoker, distribution, &self.linux_binary).map_err(|source| {
+                    CliError::new(
+                        Failure::WslProvisioning,
+                        format!(
+                            "{}: cannot observe the cooperative service handover: {source}",
+                            stage_prefix(Stage::Service)
+                        ),
+                    )
+                })?;
+            let active = systemctl_word(invoker, distribution, &["is-active", &self.unit]);
+            if active.as_deref() == Some("failed") {
+                return Err(CliError::with_remedy(
+                    Failure::WslProvisioning,
+                    format!(
+                        "{}: the cooperative handover stopped {} but systemd reported it \
+                         failed before the replacement could resume. No forced stop was used.",
+                        stage_prefix(Stage::Service),
+                        self.unit
+                    ),
+                    "runner-manager wsl status --distribution <NAME>",
+                ));
+            }
+            if let LinuxAnswer::Reported(status) = status
+                && status.product.service_binary_version.as_deref() == Some(self.version.as_str())
+                && active.as_deref() == Some("active")
+                && service_main_version(invoker, distribution, &self.unit).as_deref()
+                    == Some(self.version.as_str())
+            {
+                writeln!(
+                    out,
+                    "The service drained, replaced its private copy, and systemd restarted it."
+                )
+                .map_err(failed)?;
+                return Ok(());
+            }
+            std::thread::sleep(HANDOVER_OBSERVE_INTERVAL);
+        }
+    }
+
+    /// Stage 6: adopt an active unit, or install and start the Linux service.
     ///
     /// # Why an enabled unit is adopted rather than reinstalled
     ///
-    /// `service install` takes this host's single-instance lock, and on a
-    /// working host that lock is held by the daemon it installed. Reinstalling
-    /// there would refuse — correctly, and for a reason that has nothing to do
-    /// with this transaction. The binary was replaced two stages ago, and the
-    /// daemon's own upgrade handover is what picks it up
-    /// (`Failure::UpgradePending`), so the unit needs no help from here.
+    /// `service install` takes this host's single-instance lock, and an active
+    /// unit holds it. Reinstalling one would refuse and, more importantly,
+    /// would be an attempt to replace a daemon that is deliberately managing
+    /// its own drain. A disabled-but-active unit is still active: it is
+    /// re-enabled after adoption rather than treated as safe to replace.
     fn settle_the_service(
         &self,
         invoker: &WslInvoker<'_>,
@@ -1848,32 +2079,50 @@ impl Provisioner<'_> {
     ) -> Result<bool, CliError> {
         let failed = write_failed("this install");
         let enabled = systemctl_word(invoker, distribution, &["is-enabled", &self.unit]);
-        if enabled.as_deref() == Some("enabled") {
-            let active = systemctl_word(invoker, distribution, &["is-active", &self.unit]);
-            if active.as_deref() == Some("active") {
-                writeln!(
-                    out,
-                    "The systemd unit {} is already enabled and active; it is adopted rather than \
-                     reinstalled, and the daemon takes the new binary on its own handover.",
-                    self.unit
-                )
-                .map_err(failed)?;
-            } else {
+        let active = systemctl_word(invoker, distribution, &["is-active", &self.unit]);
+        if active.as_deref() == Some("active") {
+            if enabled.as_deref() != Some("enabled") {
                 invoker
                     .exec_ok(
-                        "start the adopted Linux service",
+                        "enable the adopted Linux service",
                         LinuxCommand::new(distribution, "systemctl")
-                            .args(["start", self.unit.as_str()])
+                            .args(["enable", self.unit.as_str()])
                             .with_timeout(SERVICE_TIMEOUT),
                     )
                     .map_err(|source| self.stage_failure(Stage::Service, &source))?;
                 writeln!(
                     out,
-                    "The systemd unit {} was already enabled but not active; it was adopted and started.",
+                    "The active systemd unit {} was adopted and enabled at boot.",
+                    self.unit
+                )
+                .map_err(failed)?;
+            } else {
+                writeln!(
+                    out,
+                    "The systemd unit {} is already enabled and active; it is adopted rather than \
+                     reinstalled.",
                     self.unit
                 )
                 .map_err(failed)?;
             }
+            return Ok(false);
+        }
+
+        if enabled.as_deref() == Some("enabled") {
+            invoker
+                .exec_ok(
+                    "start the adopted Linux service",
+                    LinuxCommand::new(distribution, "systemctl")
+                        .args(["start", self.unit.as_str()])
+                        .with_timeout(SERVICE_TIMEOUT),
+                )
+                .map_err(|source| self.stage_failure(Stage::Service, &source))?;
+            writeln!(
+                out,
+                "The systemd unit {} was already enabled but not active; it was adopted and started.",
+                self.unit
+            )
+            .map_err(failed)?;
             return Ok(false);
         }
 
@@ -1882,6 +2131,14 @@ impl Provisioner<'_> {
                 "install the Linux service",
                 self.linux(distribution)
                     .args(["service", "install", "--start-at", "boot"])
+                    .with_timeout(SERVICE_TIMEOUT),
+            )
+            .map_err(|source| self.stage_failure(Stage::Service, &source))?;
+        invoker
+            .exec_ok(
+                "start the installed Linux service",
+                LinuxCommand::new(distribution, "systemctl")
+                    .args(["start", self.unit.as_str()])
                     .with_timeout(SERVICE_TIMEOUT),
             )
             .map_err(|source| self.stage_failure(Stage::Service, &source))?;
@@ -2996,7 +3253,10 @@ mod tests {
     fn base_script() -> ScriptedRunner {
         preflight_script()
             .always("--exec systemctl is-enabled", ok("disabled\n"))
-            .always("--exec systemctl is-active", ok("active\n"))
+            .sequence(
+                "--exec systemctl is-active",
+                vec![ok("inactive\n"), ok("inactive\n"), ok("active\n")],
+            )
             .always("--exec docker info", ok("27.1.1\n"))
             .always("--version", ok(&format!("runner-manager {}\n", version())))
             .sequence(
@@ -3051,14 +3311,14 @@ mod tests {
     }
 
     /// A previously installed unit that systemd knows about but is not
-    /// running yet. The second `is-active` answer is the install read-back
-    /// after the adoption stage starts it.
+    /// running yet. The first two answers see the inactive unit before the
+    /// adoption stage starts it; the third is the install read-back.
     fn provisioned_inactive_script() -> ScriptedRunner {
         preflight_script()
             .always("--exec systemctl is-enabled", ok("enabled\n"))
             .sequence(
                 "--exec systemctl is-active",
-                vec![ok("inactive\n"), ok("active\n")],
+                vec![ok("inactive\n"), ok("inactive\n"), ok("active\n")],
             )
             .always("--exec docker info", ok("27.1.1\n"))
             .always("--version", ok(&format!("runner-manager {}\n", version())))
@@ -3836,6 +4096,232 @@ mod tests {
             "and it says so: {}",
             fixture.output()
         );
+    }
+
+    #[test]
+    fn an_active_outdated_service_hands_over_without_a_systemctl_stop() {
+        let old = "0.3.2";
+        let script = preflight_script()
+            .sequence(
+                "status --json",
+                vec![
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json(true, 8, version())),
+                    ok(&linux_status_json(true, 8, version())),
+                    ok(&linux_status_json(true, 8, version())),
+                    ok(&linux_status_json(true, 8, version())),
+                ],
+            )
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
+            .sequence(
+                "--exec systemctl show --property=MainPID --value",
+                vec![ok("123\n"), ok("124\n")],
+            )
+            .sequence(
+                "--exec /proc/123/exe --version",
+                vec![ok(&format!("runner-manager {old}\n"))],
+            )
+            .always(
+                "--exec /proc/124/exe --version",
+                ok(&format!("runner-manager {}\n", version())),
+            )
+            .always("--exec docker info", ok("27.1.1\n"))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"));
+        let mut fixture = Fixture::over(script);
+
+        let (document, outcome) = fixture
+            .install(None)
+            .expect("the daemon-owned handover completes");
+
+        assert!(document.healthy, "{document:#?}");
+        assert!(!outcome.binary_replaced);
+        assert!(!outcome.service_installed);
+        fixture.journal.never("--exec systemctl stop");
+        fixture.journal.never("service install");
+        fixture.journal.in_order(&[
+            "--exec /proc/123/exe --version",
+            "--exec /proc/124/exe --version",
+        ]);
+        assert!(
+            fixture.output().contains("cooperative upgrade handover"),
+            "{}",
+            fixture.output()
+        );
+        assert!(
+            fixture.output().contains("systemd restarted it"),
+            "{}",
+            fixture.output()
+        );
+    }
+
+    #[test]
+    fn replacing_an_active_services_source_requests_its_safe_handover() {
+        let old = "0.3.2";
+        let script = preflight_script()
+            .sequence(
+                "status --json",
+                vec![
+                    ok(&linux_status_json(true, 8, old)),
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json(true, 8, version())),
+                ],
+            )
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
+            .always(
+                "--exec systemctl show --property=MainPID --value",
+                ok("123\n"),
+            )
+            .always(
+                "--exec /proc/123/exe --version",
+                ok(&format!("runner-manager {}\n", version())),
+            )
+            .always("--exec docker info", ok("27.1.1\n"))
+            .always("--version", ok(&format!("runner-manager {}\n", version())))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"));
+        let mut fixture = Fixture::over(script);
+
+        let (document, outcome) = fixture
+            .install(None)
+            .expect("the source change lets the daemon hand itself over");
+
+        assert!(document.healthy, "{document:#?}");
+        assert!(outcome.binary_replaced);
+        assert!(!outcome.service_installed);
+        fixture.journal.never("--exec systemctl stop");
+        fixture.journal.never("service install");
+        fixture
+            .journal
+            .in_order(&["--exec mv", "--exec /proc/123/exe --version"]);
+    }
+
+    #[test]
+    fn a_failed_cooperative_restart_is_reported_without_forcing_the_service() {
+        let old = "0.3.2";
+        let script = preflight_script()
+            .sequence(
+                "status --json",
+                vec![
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json(true, 8, version())),
+                ],
+            )
+            .sequence(
+                "--exec systemctl is-active",
+                vec![ok("active\n"), ok("failed\n")],
+            )
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)));
+        let mut fixture = Fixture::over(script);
+
+        let refusal = fixture
+            .install(None)
+            .expect_err("a unit that cannot restart must not be reported healthy");
+
+        assert_eq!(refusal.class(), Failure::WslProvisioning);
+        assert!(refusal.to_string().contains("systemd reported it failed"));
+        fixture.journal.never("--exec systemctl stop");
+        fixture.journal.never("service install");
+        fixture.journal.never("--exec systemctl start");
+    }
+
+    #[test]
+    fn an_active_disabled_service_is_drained_before_it_is_enabled() {
+        let old = "0.3.2";
+        let script = preflight_script()
+            .sequence(
+                "status --json",
+                vec![
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json_with_service(true, 8, version(), old)),
+                    ok(&linux_status_json(true, 8, version())),
+                ],
+            )
+            .always("--exec systemctl is-enabled", ok("disabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
+            .always(
+                "--exec systemctl show --property=MainPID --value",
+                ok("123\n"),
+            )
+            .always(
+                "--exec /proc/123/exe --version",
+                ok(&format!("runner-manager {}\n", version())),
+            )
+            .always("--exec systemctl enable", ok(""))
+            .always("--exec docker info", ok("27.1.1\n"))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+            .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"));
+        let mut fixture = Fixture::over(script);
+
+        let (document, outcome) = fixture
+            .install(None)
+            .expect("the disabled unit is safely repaired");
+
+        assert!(document.healthy, "{document:#?}");
+        assert!(!outcome.service_installed);
+        fixture.journal.never("--exec systemctl stop");
+        fixture.journal.never("service install");
+        fixture.journal.in_order(&[
+            "--exec /proc/123/exe --version",
+            "--exec systemctl enable runner-manager.service",
+        ]);
+    }
+
+    #[test]
+    fn a_legacy_active_service_is_left_untouched() {
+        let script = preflight_script()
+            .always(
+                "status --json",
+                ok(&linux_status_json_with_service(true, 8, version(), "0.1.7")),
+            )
+            .always("--exec systemctl is-active", ok("active\n"))
+            .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)));
+        let mut fixture = Fixture::over(script);
+
+        let refusal = fixture
+            .install(None)
+            .expect_err("a legacy daemon cannot prove it will drain safely");
+
+        assert_eq!(refusal.class(), Failure::WslProvisioning);
+        assert!(refusal.to_string().contains("predates"), "{refusal}");
+        assert!(refusal.to_string().contains("not stopped"), "{refusal}");
+        for unsafe_or_mutating in [
+            "--exec systemctl stop",
+            "--exec mkdir",
+            "--exec tar",
+            "--exec mv",
+            "service install",
+            "--exec systemctl start",
+        ] {
+            fixture.journal.never(unsafe_or_mutating);
+        }
+    }
+
+    #[test]
+    fn only_known_source_handover_releases_are_accepted() {
+        for version in ["0.1.8", "0.3.2", "1.0.0"] {
+            assert!(
+                supports_cooperative_service_handover(Some(version)),
+                "{version} contains the source-watch handover"
+            );
+        }
+        for version in [
+            None,
+            Some(""),
+            Some("0.1.7"),
+            Some("0.1.8-rc.1"),
+            Some("0.1"),
+            Some("release-0.3.2"),
+        ] {
+            assert!(
+                !supports_cooperative_service_handover(version),
+                "{version:?} must not be guessed safe"
+            );
+        }
     }
 
     #[test]

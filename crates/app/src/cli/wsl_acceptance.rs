@@ -374,9 +374,10 @@ fn preflight_for(script: ScriptedRunner, distribution: &str) -> ScriptedRunner {
 ///
 /// The sequences are the interaction the transaction really has, in order:
 /// `status --json` refuses before the binary lands, then reports a host with no
-/// credential of its own, then reports the provisioned host; the task is absent
-/// when the preflight looks and absent again when `register` looks, and this
-/// product's own from then on.
+/// credential of its own, then reports the provisioned host. The unit is
+/// inactive before installation and becomes active only after the installer
+/// starts it. The task is absent when the preflight looks and absent again when
+/// `register` looks, and this product's own from then on.
 fn fresh_for(
     script: ScriptedRunner,
     distribution: &str,
@@ -389,9 +390,9 @@ fn fresh_for(
             &inside(distribution, &format!("systemctl is-enabled {UNIT}")),
             vec![ok("disabled\n"), ok("enabled\n")],
         )
-        .always(
+        .sequence(
             &inside(distribution, &format!("systemctl is-active {UNIT}")),
-            ok("active\n"),
+            vec![ok("inactive\n"), ok("inactive\n"), ok("active\n")],
         )
         .always(&inside(distribution, "docker info"), docker)
         .sequence(

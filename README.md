@@ -299,7 +299,12 @@ runner-manager wsl install --distribution Ubuntu --capacity 8
 3. The Linux binary, replaced atomically.
 4. The credential, issued only if that distribution does not already hold one.
 5. Capacity, only when you passed `--capacity`.
-6. The Linux systemd service.
+6. The Linux systemd service. If its active private copy is older, its daemon
+   cooperatively stops accepting new jobs, waits without a deadline for its local
+   work journal to drain, replaces the copy, and lets systemd restart it. The
+   installer waits for that restarted process before continuing; it never uses a
+   systemd stop to upgrade a running service. A legacy copy that cannot provide
+   this handover is left running and the upgrade refuses rather than risking a job.
 7. The Windows login task that keeps the distribution alive.
 8. A read-back of the real state, which is what decides whether the command succeeded.
 
@@ -308,11 +313,12 @@ Nothing is changed and no sign-in happens until the preflight has passed.
 ### Adopting a distribution that already runs runner-manager
 
 The same command. `wsl install` is convergent, so it probes before it writes and adopts what
-is already correct: a valid credential is kept, an enabled service unit is
-adopted rather than reinstalled, and policies, the runtime root and in-flight work are left
-alone. Capacity changes only when you pass `--capacity`. Re-running it on a healthy host
-changes nothing, and is the documented way to upgrade that host after you update on the
-Windows side.
+is already correct: a valid credential is kept, and an active service is adopted rather than reinstalled.
+Policies, the runtime root and in-flight work are left alone.
+An active out-of-date service takes the cooperative handover above; a disabled active
+unit is handled the same way before it is enabled again. Capacity changes only when
+you pass `--capacity`. Re-running it on a healthy host changes nothing, and is the
+documented way to upgrade that host after you update on the Windows side.
 
 ### Each host signs in separately
 
