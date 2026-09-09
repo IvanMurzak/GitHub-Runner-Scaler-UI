@@ -1165,6 +1165,7 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     copy_package_entries(source, destination, true)
 }
 
+#[cfg(not(unix))]
 fn copy_package_entries(source: &Path, destination: &Path, top_level: bool) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
