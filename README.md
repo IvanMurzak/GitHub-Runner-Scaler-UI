@@ -331,6 +331,33 @@ does not work. GitHub invalidates both halves of a token pair whenever either ha
 so two daemons sharing one credential take turns logging each other out. `wsl install` does the
 sign-in for you when the distribution holds no credential of its own, and skips it when it does.
 
+#### If direct sign-in in WSL keeps waiting after browser approval
+
+Use the brokered Windows command instead of running `sudo runner-manager auth login` inside the
+distribution:
+
+```powershell
+runner-manager --host wsl:Ubuntu auth login
+```
+
+It performs GitHub's device flow from Windows and delivers the resulting credential directly to
+Ubuntu's machine store over stdin; it neither writes the credential to Windows disk nor requires
+`sudo`. This is useful when GitHub's device-flow poll for a direct Linux login remains at
+`Waiting for approval...` (or reports `slow_down`) after the browser says the device is connected.
+
+Verify that the Linux host received the replacement:
+
+```powershell
+runner-manager --host wsl:Ubuntu auth status
+```
+
+If a running Linux daemon continues to report `unauthorized` for a credential that this command
+has replaced, restart that daemon once so it reads the new credential:
+
+```powershell
+wsl --distribution Ubuntu --user root --exec systemctl restart runner-manager.service
+```
+
 ### Configure it with the commands you already use
 
 `--host local` is the default and is this machine. `--host wsl:NAME` carries any command in the

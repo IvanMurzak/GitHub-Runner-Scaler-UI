@@ -1788,10 +1788,23 @@ impl AuthenticatedClient {
         // operator runs `auth login`, because it never looks at the store
         // again. Consulting it here is what makes the obvious remedy work.
         //
-        // Second, not first: renewal is this client's own pair and costs no
-        // disk, while a reload is a keychain or DPAPI read that would run on
-        // every 401 of a genuinely revoked credential.
-        if self.renew_once().await || self.reload_once().await {
+        // First, not second: if multiple processes (e.g., daemon and TUI) share the
+        // same token, they will both get 401 at the same time. The first one to renew
+        // will write the new token to disk. If the second process tries to renew with
+        // its in-memory refresh token *before* reloading, GitHub will detect a refresh
+        // token replay and instantly revoke the entire token chain. So we must always
+        // check disk for a newer token first.
+        //
+        // To further prevent a race condition if two processes hit 401 at the exact
+        // same millisecond, we introduce a pseudo-random jitter based on the OS
+        // process ID. This ensures one process wakes up first, finishes the renewal,
+        // and writes to disk, so the second process sees the new file during its
+        // `reload_once()`. All threads in the *same* process compute the exact same
+        // jitter, preserving their ability to coalesce behind `revalidation_gate`.
+        let jitter = (std::process::id() % 1500) as u64 + 50;
+        tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+
+        if self.reload_once().await || self.renew_once().await {
             let second = self.send_raw(request).await?;
             return match self.classify(request, &second, Attempt::Retry) {
                 Classified::Ok => Ok(second),
@@ -4935,5 +4948,54 @@ mod tests {
                  at line {expected}. The gap is code that claims to be scanned and is not."
             );
         }
+    }
+
+    #[derive(Debug)]
+    struct SpyRenewal {
+        invocations: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl CredentialRenewal for SpyRenewal {
+        async fn renew(&self, _refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+            self.invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(UserAccessToken::new(SecretString::from("ghu_renewed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_happens_before_renew_to_prevent_cross_process_races() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer ghu_initial"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer ghu_reloaded"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let renewal = Arc::new(SpyRenewal {
+            invocations: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let document = serde_json::json!({
+            "access_token": "ghu_initial",
+            "refresh_token": "ghr_initial",
+        });
+        let initial_token = UserAccessToken::from_stored_document(&SecretString::from(document.to_string()));
+
+        let client = AuthenticatedClient::new(Endpoints::for_test_server(&server.uri()).unwrap(), initial_token, Arc::new(TestClock::default())).unwrap()
+            .with_credential_source(Arc::new(StoreHolding(Some("ghu_reloaded"))))
+            .with_renewal(renewal.clone());
+
+        let response = client.get_json::<serde_json::Value>("/repos/acme/app").await.expect("the reloaded token should succeed");
+        assert_eq!(response["id"], 1);
+        assert_eq!(renewal.invocations.load(std::sync::atomic::Ordering::SeqCst), 0, "renew should not be called because reload succeeded");
     }
 }
