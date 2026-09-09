@@ -7,6 +7,12 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.8
+
+### Fixes
+
+- Fixed a race condition where multiple concurrent processes (e.g., a background daemon and a foreground TUI) attempting to renew an expired token could trigger a replay attack block from GitHub.
+
 ## 0.4.7
 
 ### Performance
