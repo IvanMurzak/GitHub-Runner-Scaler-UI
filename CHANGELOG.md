@@ -7,6 +7,12 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.7
+
+### Performance
+
+- The runner package materialization step now uses an optimized `cp -a` on Unix platforms (including WSL) instead of sequential file copying, reducing the runner startup delay from ~30 seconds to practically zero.
+
 ## 0.4.6
 
 ### TUI inventory and diagnostics improvements

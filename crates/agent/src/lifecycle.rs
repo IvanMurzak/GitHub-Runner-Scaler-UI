@@ -1139,6 +1139,28 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 ///   because the retained directory is a direct child of the slot; a `_work`
 ///   nested inside the package's own tree is an ordinary name.
 fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if source.join(DEFAULT_WORK_FOLDER).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a cached runner package contains a _work folder, which means it was used \
+             to run a job before it was archived; the cache must only contain clean \
+             extracts to prevent data leakage",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(format!("{}/.", source.display()))
+            .arg(destination)
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed"));
+        }
+        return Ok(());
+    }
+    #[cfg(not(unix))]
     copy_package_entries(source, destination, true)
 }
 
@@ -6489,5 +6511,47 @@ mod tests {
                 refusal.class()
             );
         }
+    }
+
+    #[test]
+    fn copy_package_tree_copies_files_and_preserves_paths_with_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source with spaces");
+        let dest = root.path().join("dest with spaces");
+        
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file1.txt"), b"hello").unwrap();
+        
+        let nested = source.join("nested dir");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file2.txt"), b"world").unwrap();
+        
+        // This is not a top-level `_work`, so it should be allowed
+        let nested_work = nested.join(DEFAULT_WORK_FOLDER);
+        fs::create_dir_all(&nested_work).unwrap();
+        fs::write(nested_work.join("allowed.txt"), b"allowed").unwrap();
+
+        copy_package_tree(&source, &dest).unwrap();
+        
+        assert_eq!(fs::read_to_string(dest.join("file1.txt")).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(dest.join("nested dir").join("file2.txt")).unwrap(), "world");
+        assert_eq!(fs::read_to_string(dest.join("nested dir").join(DEFAULT_WORK_FOLDER).join("allowed.txt")).unwrap(), "allowed");
+    }
+
+    #[test]
+    fn copy_package_tree_refuses_top_level_work_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file1.txt"), b"hello").unwrap();
+        
+        // Top-level `_work` should be refused
+        let top_work = source.join(DEFAULT_WORK_FOLDER);
+        fs::create_dir_all(&top_work).unwrap();
+
+        let err = copy_package_tree(&source, &dest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
