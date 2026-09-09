@@ -6518,24 +6518,35 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source with spaces");
         let dest = root.path().join("dest with spaces");
-        
+
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("file1.txt"), b"hello").unwrap();
-        
+
         let nested = source.join("nested dir");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("file2.txt"), b"world").unwrap();
-        
+
         // This is not a top-level `_work`, so it should be allowed
         let nested_work = nested.join(DEFAULT_WORK_FOLDER);
         fs::create_dir_all(&nested_work).unwrap();
         fs::write(nested_work.join("allowed.txt"), b"allowed").unwrap();
 
         copy_package_tree(&source, &dest).unwrap();
-        
+
         assert_eq!(fs::read_to_string(dest.join("file1.txt")).unwrap(), "hello");
-        assert_eq!(fs::read_to_string(dest.join("nested dir").join("file2.txt")).unwrap(), "world");
-        assert_eq!(fs::read_to_string(dest.join("nested dir").join(DEFAULT_WORK_FOLDER).join("allowed.txt")).unwrap(), "allowed");
+        assert_eq!(
+            fs::read_to_string(dest.join("nested dir").join("file2.txt")).unwrap(),
+            "world"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                dest.join("nested dir")
+                    .join(DEFAULT_WORK_FOLDER)
+                    .join("allowed.txt")
+            )
+            .unwrap(),
+            "allowed"
+        );
     }
 
     #[test]
@@ -6543,10 +6554,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let dest = root.path().join("dest");
-        
+
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("file1.txt"), b"hello").unwrap();
-        
+
         // Top-level `_work` should be refused
         let top_work = source.join(DEFAULT_WORK_FOLDER);
         fs::create_dir_all(&top_work).unwrap();
