@@ -4957,7 +4957,8 @@ mod tests {
     #[async_trait::async_trait]
     impl CredentialRenewal for SpyRenewal {
         async fn renew(&self, _refresh_token: &SecretString) -> Result<UserAccessToken, String> {
-            self.invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(UserAccessToken::new(SecretString::from("ghu_renewed")))
         }
     }
@@ -4988,14 +4989,29 @@ mod tests {
             "access_token": "ghu_initial",
             "refresh_token": "ghr_initial",
         });
-        let initial_token = UserAccessToken::from_stored_document(&SecretString::from(document.to_string()));
+        let initial_token =
+            UserAccessToken::from_stored_document(&SecretString::from(document.to_string()));
 
-        let client = AuthenticatedClient::new(Endpoints::for_test_server(&server.uri()).unwrap(), initial_token, Arc::new(TestClock::default())).unwrap()
-            .with_credential_source(Arc::new(StoreHolding(Some("ghu_reloaded"))))
-            .with_renewal(renewal.clone());
+        let client = AuthenticatedClient::new(
+            Endpoints::for_test_server(&server.uri()).unwrap(),
+            initial_token,
+            Arc::new(TestClock::default()),
+        )
+        .unwrap()
+        .with_credential_source(Arc::new(StoreHolding(Some("ghu_reloaded"))))
+        .with_renewal(renewal.clone());
 
-        let response = client.get_json::<serde_json::Value>("/repos/acme/app").await.expect("the reloaded token should succeed");
+        let response = client
+            .get_json::<serde_json::Value>("/repos/acme/app")
+            .await
+            .expect("the reloaded token should succeed");
         assert_eq!(response["id"], 1);
-        assert_eq!(renewal.invocations.load(std::sync::atomic::Ordering::SeqCst), 0, "renew should not be called because reload succeeded");
+        assert_eq!(
+            renewal
+                .invocations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "renew should not be called because reload succeeded"
+        );
     }
 }
