@@ -13,7 +13,7 @@ is waiting. `runner-manager` registers a just-in-time runner, lets it complete o
 removes it afterwards. You get local compute without an idle runner or an inbound network
 service.
 
-<!-- GIF placeholder: overview of the runner-manager terminal UI and a job lifecycle. -->
+![Preview](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/blob/main/docs/img/preview.png?raw=true)
 
 ## Features
 
