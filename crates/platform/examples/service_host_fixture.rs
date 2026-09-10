@@ -114,7 +114,7 @@ fn exercise_workspace(root: &std::path::Path) -> std::io::Result<()> {
     let child = root.join(format!("selftest-{}", std::process::id()));
     std::fs::create_dir(&child)?;
     std::fs::write(child.join("marker"), b"a job would put its checkout here")?;
-    std::fs::remove_dir_all(&child)
+    remove_dir_all::remove_dir_all(&child)
 }
 
 /// Records what [`exercise_workspace`] did, including why it could not.

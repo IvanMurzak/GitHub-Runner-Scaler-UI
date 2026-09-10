@@ -56,6 +56,7 @@ runner-manager-agent = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }
 runner-manager-platform = { workspace = true }
+remove_dir_all = { workspace = true }
 # `f1` hands the user access token to the `d2` secret store, and it must carry
 # it in the redacting wrapper the whole way (`07-security.md`).
 secrecy = { workspace = true }

@@ -340,6 +340,23 @@ fn run_on_selected_host(
         return Ok(0);
     }
 
+    // -----------------------------------------------------------------------
+    // `update` ON A WSL HOST IS CARRIED OUT BY WINDOWS
+    // -----------------------------------------------------------------------
+    // The user typed `runner-manager --host wsl:<NAME> update`.
+    // The Windows host owns the version matching; updating the Linux binary
+    // directly leaves the Windows host behind and does not restart the service.
+    // Instead, this is translated to `runner-manager wsl install --distribution <NAME>`.
+    if let Command::Update(_) = &cli.command {
+        let context = Context::resolve(cli.data_dir.as_deref(), err)?;
+        let install_args = WslInstallArgs {
+            distribution: distribution.to_string(),
+            capacity: None,
+        };
+        dispatch(&context, &WslCommand::Install(install_args), Styling::for_stdout(), out)?;
+        return Ok(0);
+    }
+
     let plan = ProxyPlan::new(
         host.executable(),
         distribution,

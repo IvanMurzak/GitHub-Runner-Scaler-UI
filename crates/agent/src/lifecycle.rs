@@ -713,7 +713,7 @@ fn is_retainable_work_folder(name: &OsStr, metadata: &fs::Metadata) -> bool {
 /// (`02-target-architecture.md`, "Persistent repository").
 fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
     match attempt.workspace() {
-        AttemptWorkspace::Ephemeral => fs::remove_dir_all(attempt.runtime_path()),
+        AttemptWorkspace::Ephemeral => remove_dir_all::remove_dir_all(attempt.runtime_path()),
         AttemptWorkspace::PersistentSlot { .. } => scrub_slot_entries(attempt.runtime_path())
             .map_err(|quarantine| std::io::Error::other(quarantine.to_string())),
     }
@@ -1003,7 +1003,7 @@ fn remove_slot_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()
         // Windows junction needs `remove_dir`. Neither follows the link.
         fs::remove_file(path).or_else(|_| fs::remove_dir(path))
     } else if metadata.is_dir() {
-        fs::remove_dir_all(path)
+        remove_dir_all::remove_dir_all(path)
     } else {
         fs::remove_file(path)
     };
@@ -2255,7 +2255,7 @@ impl LifecycleLauncher {
             }
         }
         match attempt.workspace() {
-            AttemptWorkspace::Ephemeral => match fs::remove_dir_all(attempt.runtime_path()) {
+            AttemptWorkspace::Ephemeral => match remove_dir_all::remove_dir_all(attempt.runtime_path()) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
