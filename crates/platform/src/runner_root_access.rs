@@ -1881,7 +1881,7 @@ mod tests {
         let child = directory.join("s1");
         std::fs::create_dir(&child).expect("a child below the root");
         std::fs::write(child.join("marker"), b"job").expect("content inside the child");
-        std::fs::remove_dir_all(&child).expect("the child is removable again");
+        remove_dir_all::remove_dir_all(&child).expect("the child is removable again");
     }
 
     #[cfg(windows)]

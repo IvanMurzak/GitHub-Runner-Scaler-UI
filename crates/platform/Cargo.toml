@@ -29,6 +29,7 @@ directories = { workspace = true }
 # already in `[workspace.dependencies]` and already in the resolved graph, so
 # naming them here adds nothing to `Cargo.lock`.
 hex = { workspace = true }
+remove_dir_all = { workspace = true }
 runner-manager-domain = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

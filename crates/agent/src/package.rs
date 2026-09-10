@@ -1778,7 +1778,7 @@ impl PackageCache {
         }
 
         let dir = self.version_dir(version);
-        fs::remove_dir_all(&dir).map_err(|source| PackageError::Io {
+        remove_dir_all::remove_dir_all(&dir).map_err(|source| PackageError::Io {
             what: "remove a cached runner package",
             path: dir,
             source,
@@ -1823,7 +1823,7 @@ impl PackageCache {
             // Both shapes live here: `download-<uuid>.archive` files and
             // `<uuid>/` extraction directories.
             let removed = if path.is_dir() {
-                fs::remove_dir_all(&path).is_ok()
+                remove_dir_all::remove_dir_all(&path).is_ok()
             } else {
                 fs::remove_file(&path).is_ok()
             };
@@ -1855,7 +1855,7 @@ impl StagingGuard {
     /// ordinary litter and is removed on the spot rather than on unwind.
     fn disarm_into_sweep(mut self) {
         if let Some(dir) = self.dir.take() {
-            let _ = fs::remove_dir_all(dir);
+            let _ = remove_dir_all::remove_dir_all(dir);
         }
     }
 }
@@ -1863,7 +1863,7 @@ impl StagingGuard {
 impl Drop for StagingGuard {
     fn drop(&mut self) {
         if let Some(dir) = self.dir.take() {
-            let _ = fs::remove_dir_all(dir);
+            let _ = remove_dir_all::remove_dir_all(dir);
         }
     }
 }
@@ -4681,7 +4681,7 @@ mod tests {
         fs::write(&good, tar_gz_bytes(&package_entries())).unwrap();
         extract(&good, ArchiveKind::TarGz, &target).expect("a legitimate archive extracts");
         assert!(target.join("run.sh").is_file());
-        fs::remove_dir_all(&target).unwrap();
+        remove_dir_all::remove_dir_all(&target).unwrap();
 
         for (label, bytes, kind) in [
             (
@@ -4702,7 +4702,7 @@ mod tests {
         ] {
             let archive = dir.path().join(format!("{label}.archive"));
             fs::write(&archive, &bytes).unwrap();
-            let _ = fs::remove_dir_all(&target);
+            let _ = remove_dir_all::remove_dir_all(&target);
 
             let result = extract(&archive, kind, &target);
 

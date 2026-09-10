@@ -23,6 +23,7 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+remove_dir_all = { workspace = true }
 reqwest = { workspace = true }
 runner-manager-domain = { workspace = true }
 runner-manager-github = { workspace = true }

@@ -1151,7 +1151,7 @@ fn remove(
     if purge && store.policies().map_err(store_failure)?.is_empty() {
         let cache = context.paths().state_dir().join("packages");
         if cache.exists() {
-            std::fs::remove_dir_all(&cache).map_err(|source| CliError::new(Failure::LocalState, format!("the policy was removed, but its shared package cache at {} could not be purged: {source}", cache.display())))?;
+            remove_dir_all::remove_dir_all(&cache).map_err(|source| CliError::new(Failure::LocalState, format!("the policy was removed, but its shared package cache at {} could not be purged: {source}", cache.display())))?;
         }
         cache_purged = true;
     }
