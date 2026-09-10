@@ -1,0 +1,46 @@
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/README.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-9
+.taskflow/2026-09-10-cli-chains-acceptance/03-coverage-model.md
+  s_4c3d0e4e0195d8::t_627c6e7edf13aa 1-72
+.taskflow/2026-09-10-cli-chains-acceptance/ROADMAP.md
+  s_4c3d0e4e0195d8::t_548d29679e0ab4 3-5,8-13,40-58
+  s_4c3d0e4e0195d8::t_a59d5fcae372aa 59
+  s_4c3d0e4e0195d8::t_8abf9c9d3b511e 6-7,14-31,34-39,60
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/b1-local-model-corpus.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-46
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/b2-local-chain-runner.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-48
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/a1-command-accountability.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-45
+.taskflow/2026-09-10-cli-chains-acceptance/README.md
+  s_4c3d0e4e0195d8::t_a59d5fcae372aa 21-22,41-42
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 3-5
+  s_4c3d0e4e0195d8::t_20a57ca5dddd4d 6,9-13,17-20,23-40,43-45,47-50
+.taskflow/2026-09-10-cli-chains-acceptance/02-target-architecture.md
+  s_4c3d0e4e0195d8::t_c7217ff0e5c5c8 3,5-8,10-123,127-140
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 124-126
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/b3-local-corpus-security.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-47
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/c1-wsl-chain-corpus.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-48
+.taskflow/2026-09-10-cli-chains-acceptance/tasks/d1-cross-track-gates.md
+  s_4c3d0e4e0195d8::t_d0cd5ba82e3e62 1-54
+.taskflow/2026-09-10-cli-chains-acceptance/01-current-architecture.md
+  s_4c3d0e4e0195d8::t_0c036dfd5e6403 3,5-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dc41be8f891b936199623d0cfb25c9a668e55695",
+  "prompts": {},
+  "sessions": {
+    "s_4c3d0e4e0195d8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d7a-ed7c-71e1-9f13-0e66f64fbd63",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
