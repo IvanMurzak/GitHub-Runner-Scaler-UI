@@ -353,7 +353,12 @@ fn run_on_selected_host(
             distribution: distribution.to_string(),
             capacity: None,
         };
-        dispatch(&context, &WslCommand::Install(install_args), Styling::for_stdout(), out)?;
+        dispatch(
+            &context,
+            &WslCommand::Install(install_args),
+            Styling::for_stdout(),
+            out,
+        )?;
         return Ok(0);
     }
 

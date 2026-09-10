@@ -2255,13 +2255,15 @@ impl LifecycleLauncher {
             }
         }
         match attempt.workspace() {
-            AttemptWorkspace::Ephemeral => match remove_dir_all::remove_dir_all(attempt.runtime_path()) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
-                    "attempt workspace could not be removed".into(),
-                ))),
-            },
+            AttemptWorkspace::Ephemeral => {
+                match remove_dir_all::remove_dir_all(attempt.runtime_path()) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
+                        "attempt workspace could not be removed".into(),
+                    ))),
+                }
+            }
             AttemptWorkspace::PersistentSlot { slot } => self.scrub_persistent_slot(attempt, slot),
         }
     }
