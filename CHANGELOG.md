@@ -7,6 +7,13 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.9
+
+### Fixes
+
+- Fixed an issue where `runner-manager update` did not correctly hand over the service upgrade to the WSL instance when invoked via proxy.
+- Fixed caching logic bugs on Windows that led to frozen folders by using an improved directory removal algorithm to circumvent locks on read-only package manager files.
+
 ## 0.4.8
 
 ### Fixes
@@ -156,3 +163,4 @@ prints the explicit Linux commands to run if you want to undo that half too.
 Every existing local command, file, service registration and `status --json`
 document is unchanged. `--host local` is the default, so nothing you have
 scripted needs editing.
+
