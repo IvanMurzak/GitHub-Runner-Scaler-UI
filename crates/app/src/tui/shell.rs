@@ -1990,7 +1990,21 @@ where
     let mut state = AppState::new(PresentationState::default(), size.width, size.height);
     let mut timer = tokio::time::interval(TICK_RATE);
     let mut agent_events_open = true;
+    let mut current_window_title = String::new();
     loop {
+        let metrics = &state.screen_model.snapshot.metrics;
+        let new_title = format!(
+            "💻 {}/{} Local ◂ 🟢 {} Online ◂ ⚡ {} Busy",
+            metrics.host_capacity_used,
+            metrics.host_capacity_total,
+            metrics.online_runners,
+            metrics.busy_runners
+        );
+        if new_title != current_window_title {
+            let _ = crossterm::execute!(io::stdout(), crossterm::terminal::SetTitle(&new_title));
+            current_window_title = new_title;
+        }
+
         terminal
             .draw(|frame| render(frame, &state))
             .map_err(io::Error::other)?;
