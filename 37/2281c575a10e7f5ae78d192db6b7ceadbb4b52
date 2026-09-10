@@ -1,0 +1,21 @@
+Cargo.lock
+  s_5332f62e0ed5a7::t_271a7cd853ead0 2569,2609,2642,2660,2687,2711,2743
+Cargo.toml
+  s_5332f62e0ed5a7::t_8348a577c14f80 42,55-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "372281c575a10e7f5ae78d192db6b7ceadbb4b52",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
