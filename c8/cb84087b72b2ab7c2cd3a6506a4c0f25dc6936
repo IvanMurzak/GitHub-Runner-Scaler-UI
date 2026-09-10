@@ -1,0 +1,19 @@
+CHANGELOG.md
+  s_4c3d0e4e0195d8::t_de9fefc83f8364 10-16,166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c8cb84087b72b2ab7c2cd3a6506a4c0f25dc6936",
+  "prompts": {},
+  "sessions": {
+    "s_4c3d0e4e0195d8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d7a-ed7c-71e1-9f13-0e66f64fbd63",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
