@@ -1,0 +1,31 @@
+Cargo.lock
+  s_5332f62e0ed5a7::t_2116f4c0fcec5b 2569,2609,2642,2660,2687,2711,2743
+Cargo.toml
+  s_5332f62e0ed5a7::t_8dc738712297f7 42,55-58
+crates/app/src/tui/shell.rs
+  s_ed79f8843352e6::t_dff0b4a1858bc4 1993,1995-2007
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "185c836c6a5457f545455da4f6a22c9ee3d3b1cc",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ed79f8843352e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dd6444e-46d7-4ff2-8ee2-5baa2bb6a927",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
