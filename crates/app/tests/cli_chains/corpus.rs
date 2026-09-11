@@ -18,6 +18,9 @@
 //! 4. **Readbacks** — a relevant read after each mutation not yet read back in
 //!    a fresh process.
 //!
+//! Curated journeys written after the inventory was first pinned are offered
+//! last, so they append cases rather than renumber the ones above.
+//!
 //! A candidate is kept only if it witnesses a unit no kept case did, and the
 //! units it newly witnesses are recorded as its contribution. A candidate that
 //! adds nothing is counted as rejected padding and dropped.
@@ -1129,6 +1132,29 @@ fn curated() -> Vec<Candidate> {
     ]
 }
 
+/// Hand-written journeys added after the corpus was first pinned.
+///
+/// Offered after every other source, so adding one appends a case to the
+/// inventory instead of renumbering every case generated after the curated
+/// block.
+fn appended_curated() -> Vec<Candidate> {
+    vec![curated_case(
+        "case-variant-owner-meets-its-own-persistent-root",
+        Installation::Standard,
+        vec![
+            CREDENTIAL,
+            run(auto(repo(R::Widgets))),
+            run(persistent(R::Widgets, P::Alpha)),
+        ],
+        vec![
+            run(persistent(R::WidgetsCase, P::Alpha)),
+            repo_list(),
+            status(),
+        ],
+        &["deviation:owner-compared-case-sensitively"],
+    )]
+}
+
 // ---------------------------------------------------------------------------
 // Value probes
 // ---------------------------------------------------------------------------
@@ -1725,6 +1751,9 @@ pub fn generate() -> Corpus {
         if let Some(candidate) = readback_case(mutation, read, &mut rng) {
             offer(candidate, &mut covered, &mut kept, &mut rejected);
         }
+    }
+    for candidate in appended_curated() {
+        offer(candidate, &mut covered, &mut kept, &mut rejected);
     }
 
     let cases = kept

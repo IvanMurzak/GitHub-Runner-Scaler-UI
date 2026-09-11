@@ -278,6 +278,9 @@ pub fn units(trace: &Trace) -> BTreeSet<String> {
             transition,
         } = entry
         else {
+            // A seeded fact changes the state between two reads, so a read on
+            // either side of it is not a repeat of the same read.
+            previous_read = None;
             continue;
         };
         let kind = action.kind();

@@ -350,6 +350,7 @@ fn only_allowlisted_commands_are_generated() {
 #[test]
 fn the_model_never_imports_production_code_or_spawns_a_process() {
     let sources = [
+        ("mod.rs", include_str!("cli_chains/mod.rs")),
         ("action.rs", include_str!("cli_chains/action.rs")),
         ("corpus.rs", include_str!("cli_chains/corpus.rs")),
         ("coverage.rs", include_str!("cli_chains/coverage.rs")),
@@ -538,7 +539,8 @@ fn refusals_leave_the_model_unchanged_except_for_named_deviations() {
         seen,
         BTreeSet::from([
             Deviation::HostMaterializedByRefusal,
-            Deviation::PartialCommitOnEnable
+            Deviation::PartialCommitOnEnable,
+            Deviation::OwnerComparedCaseSensitively,
         ]),
         "the corpus must exercise exactly the deviations it documents"
     );

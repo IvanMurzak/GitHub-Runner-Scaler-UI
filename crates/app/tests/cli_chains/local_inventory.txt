@@ -1,5 +1,5 @@
 # Local CLI chain inventory -- GENERATED, DO NOT EDIT BY HAND.
-# corpus version 1, seed 0x5eed0c11c4a10001, 284 cases, 114 rejected candidates
+# corpus version 1, seed 0x5eed0c11c4a10001, 285 cases, 114 rejected candidates
 # Regenerate: CLI_CHAINS_BLESS=1 cargo test -p runner-manager --test cli_chains_model
 # Paths are relative to the scenario's <roots> and <data>; rm-<host>-<os>-<arch> is the derived label.
 
@@ -2481,3 +2481,13 @@ local-0284 fp=676e005e3a4e9c76 origin=pair fixture=standard
    3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
    4. org remove acme --purge => ok(0)
    5. org remove globex --purge => ok(0)
+
+local-0285 fp=3e04f4acd26b0495 origin=curated fixture=standard
+  name: case-variant-owner-meets-its-own-persistent-root
+  contributes: deviation:owner-compared-case-sensitively
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   4. repo set-workspace Acme/Widgets --mode=persistent --path=<roots>/alpha => invalid_argument(9) overlaps-repository-root [deviation: owner-compared-case-sensitively]
+   5. repo list => ok(0)
+   6. status --json => ok(0)
