@@ -82,6 +82,9 @@ pub struct CaseRun<'c> {
     pub github_base: String,
     /// The resolver the case's paths and labels were rendered with.
     pub resolver: RealResolver,
+    /// The scenario read back before its first step, so a refusal at step 1
+    /// has an observation to be compared against like every later one.
+    pub initial: Result<ObservedState, String>,
     /// Steps in order, ending at the first divergence if there was one.
     pub records: Vec<StepRecord>,
     /// Every request the case's fake GitHub answered, in order.
@@ -170,6 +173,7 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
     let started = Instant::now();
     let scenario = Scenario::new(case.id, case.installation);
     let mut identities = Identities::default();
+    let initial = observe(&scenario, &mut identities);
     let mut model = Model::fresh(case.installation);
     let mut records = Vec::with_capacity(case.steps.len());
 
@@ -240,6 +244,7 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
         service_tag: scenario.tag.clone(),
         github_base: scenario.github.base_url().to_string(),
         resolver: scenario.resolver.clone(),
+        initial,
         records,
         history: scenario.github.seen(),
         elapsed: started.elapsed(),

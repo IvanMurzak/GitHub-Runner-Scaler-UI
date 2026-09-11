@@ -33,7 +33,7 @@ use crate::cli_chains::action::TargetKey;
 use crate::cli_chains::model::{HostModel, Mode, Model, Policy, PolicyState, Tally};
 use crate::cli_chains::values::PathValue;
 
-use super::scenario::{OCCUPIED_CONTENTS, Scenario, key_of};
+use super::scenario::{DATABASE, OCCUPIED_CONTENTS, Scenario, key_of};
 
 /// The persisted state after one step, in the model's shape.
 #[derive(Debug, Clone)]
@@ -47,8 +47,8 @@ pub struct ObservedState {
     /// modelled command may leave. Any entry is a divergence.
     pub stray: Vec<String>,
     /// Every path inside the scenario, relative and sorted, except the ones
-    /// every process rewrites whatever it does: the operator log and SQLite's
-    /// own sidecar files. Compared whole across a refused mutation.
+    /// every process may create or rewrite whatever it does (see `is_churn`).
+    /// Compared whole across a refused mutation.
     pub tree: Vec<String>,
 }
 
@@ -292,15 +292,23 @@ pub fn stray_entries(scenario: &Scenario) -> Vec<String> {
     stray
 }
 
-/// Paths every invocation may touch regardless of what it does: the four
-/// application-data directories the composition root creates before routing
-/// any command (reads included), the operator log inside `logs/`, and SQLite's
-/// own sidecar files. Their *contents* still count, except the log's.
+/// Paths every invocation may touch regardless of what it does: the data root
+/// and the four application-data directories the composition root creates
+/// before routing any command (reads included), the database file, which any
+/// command that opens the store (`status`, `host show` and `list` included)
+/// creates empty, the operator log inside `logs/`, and SQLite's own sidecar
+/// files. Their *contents* still count, except the log's: the database's
+/// through the public `Store` projection every observation carries, so an
+/// empty store and an absent one are the same modelled state and anything a
+/// command wrote into it is not.
 fn is_churn(path: &str) -> bool {
     matches!(
         path,
-        "data/config" | "data/state" | "data/runtime" | "data/logs"
-    ) || path.starts_with("data/logs/")
+        "data" | "data/config" | "data/state" | "data/runtime" | "data/logs"
+    ) || path
+        .strip_prefix("data/")
+        .is_some_and(|inside| inside.split('/').eq(DATABASE))
+        || path.starts_with("data/logs/")
         || path.ends_with("-wal")
         || path.ends_with("-shm")
         || path.ends_with("-journal")

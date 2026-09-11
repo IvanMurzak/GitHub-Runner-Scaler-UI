@@ -373,9 +373,15 @@ fn refused_mutations_leave_database_and_filesystem_observations_unchanged() {
     assert_all_agree(&runs);
 
     let mut refusals = 0;
+    let mut first_step_refusals = 0;
     for run in &runs {
-        for pair in run.records.windows(2) {
-            let (previous, record) = (&pair[0], &pair[1]);
+        // Each step is compared with the observation before it; for step 1
+        // that is the scenario read back before any process ran, so a journey
+        // that opens with a refusal is held to the same rule as the rest.
+        let mut previous = run.initial.as_ref().expect("a fresh scenario is readable");
+        for record in &run.records {
+            let after = record.observed.as_ref().expect("readable after");
+            let before = std::mem::replace(&mut previous, after);
             let (Step::Run(action), Expected::Action(transition)) =
                 (&record.step, &record.expected)
             else {
@@ -384,13 +390,16 @@ fn refused_mutations_leave_database_and_filesystem_observations_unchanged() {
             if action.kind().is_read() || transition.exit.is_success() {
                 continue;
             }
-            refusals += 1;
-            let before = previous.observed.as_ref().expect("readable before");
-            let after = record.observed.as_ref().expect("readable after");
             if transition.deviation.is_some() {
                 // A named deviation is the product leaving something behind on
                 // purpose; the oracle already held it to the permitted delta.
                 continue;
+            }
+            // Counted only once it is actually compared below, so the floor
+            // asserted after the loop measures refusals this test checked.
+            refusals += 1;
+            if record.index == 0 {
+                first_step_refusals += 1;
             }
             assert_eq!(
                 before.model,
@@ -414,6 +423,10 @@ fn refused_mutations_leave_database_and_filesystem_observations_unchanged() {
     assert!(
         refusals >= 20,
         "the refusal journeys must actually refuse; only {refusals} refusals ran"
+    );
+    assert!(
+        first_step_refusals > 0,
+        "a refusal on a fresh data root, before any other process ran, must be compared"
     );
 }
 
