@@ -31,11 +31,11 @@ may overlap only when their `depends_on` entries are satisfied.
 
 | Task (spec) | needs | repo/base | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---|---|---|---|---|---|
-| [a1-command-accountability](tasks/a1-command-accountability.md) | — | ./main | 8/4 | mid | Pending | — | 2026-09-10 |
-| [b1-local-model-corpus](tasks/b1-local-model-corpus.md) | — | ./main | 9/7 | top | Pending | — | 2026-09-10 |
+| [a1-command-accountability](tasks/a1-command-accountability.md) | — | ./main | 8/4 | mid | 🔵 | implement-task manager | 2026-09-10 |
+| [b1-local-model-corpus](tasks/b1-local-model-corpus.md) | — | ./main | 9/7 | top | 🔵 | implement-task manager | 2026-09-10 |
 | [b2-local-chain-runner](tasks/b2-local-chain-runner.md) | b1 | ./main | 10/8 | top | Pending | — | 2026-09-10 |
 | [b3-local-corpus-security](tasks/b3-local-corpus-security.md) | b2 | ./main | 10/8 | top | Pending | — | 2026-09-10 |
-| [c1-wsl-chain-corpus](tasks/c1-wsl-chain-corpus.md) | — | ./main | 9/7 | top | Pending | — | 2026-09-10 |
+| [c1-wsl-chain-corpus](tasks/c1-wsl-chain-corpus.md) | — | ./main | 9/7 | top | 🔵 | implement-task manager | 2026-09-10 |
 | [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | Pending | — | 2026-09-10 |
 
 ## Review findings
@@ -58,3 +58,4 @@ may overlap only when their `depends_on` entries are satisfied.
 | 2026-09-10 | Adversarial review closed F1-F7. Repository feasibility, current GitHub-hosted image facts, nextest discovery, command safety, security oracles, deterministic replay, and cross-document consistency were reconciled. No product decision changed. |
 | 2026-09-10 | Owner explicitly confirmed the proposed split between real CLI chains and mocked WSL scenarios, the 256+32 minimum inventories, and the all-command accountability map; D3 and D4 are locked. |
 | 2026-09-10 | `taskflow-tasks` derived six immutable specs in four conflict domains. Wave 1 can run A1, B1, and C1 concurrently; B2/B3 are sequential; D1 is the final join gate. |
+| 2026-09-10 | Execution wave 1 dispatched through the `implement-task` pipeline in manager mode with parallelism 3. |
