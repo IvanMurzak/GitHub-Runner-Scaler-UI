@@ -1,0 +1,36 @@
+crates/app/tests/workflow_triggers.rs
+  s_1e228ed696a2a7::t_555d10b029daf1 72
+  s_1e228ed696a2a7::t_fbacdafb06ad90 462-474,479,485-497,503
+  s_1e228ed696a2a7::t_c7b97ea7e361a7 476-478,480,482-484,499-502,504-507
+  s_1e228ed696a2a7::t_7c750972e84a7f 461,475,481,498
+crates/app/tests/command_accountability/mod.rs
+  s_1e228ed696a2a7::t_041cc546997e78 34,36-40,80,103-105,142-143,153-199
+  s_1e228ed696a2a7::t_e56723e92cff11 208,211,222-227,229,231-234,236-243,245-251
+  s_1e228ed696a2a7::t_0a16efe02d18d6 366,387,394,398,410-411
+crates/app/tests/cli_command_surface.rs
+  s_1e228ed696a2a7::t_8e103e36700b95 23-25,27-29,939-1001
+  s_1e228ed696a2a7::t_06087014c2427a 19
+crates/app/src/tui/settings.rs
+  s_1e228ed696a2a7::t_2f9b03590cf28b 3814-3823
+README.md
+  s_1e228ed696a2a7::t_7fab97cc610833 569-595
+  s_1e228ed696a2a7::t_9a078bd085ad58 596-597
+.taskflow/2026-09-10-cli-chains-acceptance/ROADMAP.md
+  s_1e228ed696a2a7::t_7fab97cc610833 27-42,84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bdd60d579c9b017f01e72fec81a22c09e65eed38",
+  "prompts": {},
+  "sessions": {
+    "s_1e228ed696a2a7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d9d-0521-7cb3-85ef-6c14a5306720",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
