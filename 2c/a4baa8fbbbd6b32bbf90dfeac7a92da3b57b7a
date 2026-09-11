@@ -1,0 +1,38 @@
+crates/app/tests/cli_chains/corpus.rs
+  s_85f949c10a0914::t_e4a396e1eaeb0b 1566-1574
+  s_85f949c10a0914::t_748a7e495c933d 1677
+  s_85f949c10a0914::t_5a2e691a2c2459 1654
+crates/app/tests/cli_chains/transition.rs
+  s_85f949c10a0914::t_dabf0e20031044 734,746-757
+  s_85f949c10a0914::t_1dfcaee15ab969 1033-1035
+  s_85f949c10a0914::t_d3f5b718d25b42 1425-1429
+  s_85f949c10a0914::t_97628d8d521e56 993
+  s_85f949c10a0914::t_a1950a95281b97 1117-1119
+  s_85f949c10a0914::t_1982ca98720b4b 1496
+  s_85f949c10a0914::t_ac349beadf1471 1003-1007,1017-1023
+  s_85f949c10a0914::t_9828ec9a6e2947 1569
+  s_85f949c10a0914::t_46246b27410fbc 1599-1609
+  s_85f949c10a0914::t_307ed957573715 1579
+  s_85f949c10a0914::t_b4568eab0a5715 35
+  s_85f949c10a0914::t_bc73b6403321b5 1306-1308
+  s_85f949c10a0914::t_021c3637cdceec 1561
+  s_85f949c10a0914::t_ab91f058ec3dc3 1114
+  s_85f949c10a0914::t_63ecd9d1d7474d 880-881,885-892,896-897
+  s_85f949c10a0914::t_28ebb918097b9f 1024-1025
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2ca4baa8fbbbd6b32bbf90dfeac7a92da3b57b7a",
+  "prompts": {},
+  "sessions": {
+    "s_85f949c10a0914": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58d27996-6d4e-4091-a382-953aed624552",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
