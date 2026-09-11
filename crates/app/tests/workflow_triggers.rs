@@ -69,7 +69,6 @@
 // teach the scanner or to take the YAML dependency — not to relax a positive
 // assertion.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn workflow_path(name: &str) -> PathBuf {
@@ -461,9 +460,10 @@ fn ci_workflow_has_no_release_trigger() {
 #[test]
 fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point() {
     let source = read_workflow("ci.yml");
-    let trigger_set: BTreeSet<String> = triggers(&source).into_iter().collect();
     assert!(
-        trigger_set.contains("workflow_call"),
+        triggers(&source)
+            .into_iter()
+            .any(|trigger| trigger == "workflow_call"),
         "release.yml reaches the ordinary gates through ci.yml's workflow_call entry point"
     );
 
