@@ -32,6 +32,7 @@ use crate::cli_chains::transition::{self, Transition};
 use super::observe::{Identities, ObservedState, observe};
 use super::oracle::{Mismatch, judge_action, judge_state};
 use super::scenario::{Invocation, RealResolver, Scenario};
+use super::security;
 
 /// What the model expected of one step.
 #[derive(Debug, Clone)]
@@ -178,7 +179,7 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
     let mut records = Vec::with_capacity(case.steps.len());
 
     for (index, step) in case.steps.iter().enumerate() {
-        let (expected, invocation, observed, mismatches) = match step {
+        let (expected, invocation, observed, mut mismatches) = match step {
             Step::Seed(seed) => {
                 let expected = transition::seed(&model, seed).unwrap_or_else(|problem| {
                     panic!(
@@ -215,6 +216,14 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
                 )
             }
         };
+        match security::collect(&scenario, invocation.as_ref()) {
+            Ok(fragments) => mismatches.extend(
+                security::findings(&fragments)
+                    .into_iter()
+                    .map(Mismatch::security),
+            ),
+            Err(problem) => mismatches.push(Mismatch::security(problem)),
+        }
         // The model's own next state, never the observation.
         let next = expected.next().clone();
         let record = StepRecord {

@@ -28,18 +28,54 @@
 use std::env::VarError;
 
 use crate::cli_chains::action::{Action, ActionKind};
-use crate::cli_chains::corpus::{self, Case, Origin};
+use crate::cli_chains::corpus::{self, Case, MINIMUM_LOCAL_CASES};
 use crate::cli_chains::coverage::Entry;
 use crate::cli_chains::ids::{CaseId, SELECT_VARIABLE};
 
 /// Every case the default run executes, in inventory order.
 #[must_use]
 pub fn default_selection() -> Vec<&'static Case> {
-    corpus::corpus()
-        .cases
-        .iter()
-        .filter(|case| case.origin == Origin::Curated)
-        .collect()
+    corpus::corpus().cases.iter().collect()
+}
+
+/// Why `cases` is not the complete checked-in corpus in inventory order.
+///
+/// Kept independent of [`default_selection`] so the mutation control can prove
+/// that dropping one case is detected rather than comparing a function with
+/// itself.
+#[must_use]
+pub fn completeness_problems(cases: &[&Case]) -> Vec<String> {
+    let inventory = &corpus::corpus().cases;
+    let mut problems = Vec::new();
+    if cases.len() < MINIMUM_LOCAL_CASES {
+        problems.push(format!(
+            "only {} cases execute; at least {MINIMUM_LOCAL_CASES} are required",
+            cases.len()
+        ));
+    }
+    if cases.len() != inventory.len() {
+        problems.push(format!(
+            "execution count {} does not equal inventory count {}",
+            cases.len(),
+            inventory.len()
+        ));
+    }
+    for (index, expected) in inventory.iter().enumerate() {
+        match cases.get(index) {
+            Some(observed)
+                if observed.id == expected.id && observed.fingerprint == expected.fingerprint => {}
+            Some(observed) => problems.push(format!(
+                "inventory position {} expected {} fp={:016x}, observed {} fp={:016x}",
+                index + 1,
+                expected.id,
+                expected.fingerprint,
+                observed.id,
+                observed.fingerprint
+            )),
+            None => problems.push(format!("{} is not selected", expected.id)),
+        }
+    }
+    problems
 }
 
 /// The case [`SELECT_VARIABLE`] names, `None` when it is unset.
