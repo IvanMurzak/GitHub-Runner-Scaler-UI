@@ -50,3 +50,4 @@ The table below is the sole live task-state record.
 | 2026-09-07 | R2 made the source-shape test CRLF-independent. Independent review also closed B2 preflight-capacity, adopted-unit activation and credential-scope reporting gaps. All seven checks passed, including the 13-minute Windows suite; PR #54 merged as `eaf8abd`. |
 | 2026-09-07 | Wave 3 acceptance tests and operator documentation dispatched after B2 merged green. |
 | 2026-09-07 | B3 added isolated CLI acceptance, secret-output canaries, privileged Windows/WSL lifecycle coverage, operator docs and deterministic release/changelog guards. All seven checks passed; PR #55 merged as `ca74c71`. Source implementation is release-ready. |
+| 2026-09-11 | Completion re-verified against `main`: every board entry is green, PRs #52-#55 are merged, and the feature shipped in release 0.4.0. Taskflow archived. |

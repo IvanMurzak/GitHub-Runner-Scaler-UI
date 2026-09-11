@@ -1,6 +1,7 @@
 # Managed WSL host
 
-Status: reviewed; owner decisions locked; ready for task decomposition.
+Status: completed 2026-09-07; all derived tasks merged with green checks and
+the feature subsequently shipped in release 0.4.0. Archived 2026-09-11.
 
 ## Problem
 
