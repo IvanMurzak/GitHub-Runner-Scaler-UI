@@ -845,22 +845,29 @@ fn every_classification_cites_real_evidence_and_a_concrete_boundary() {
     );
 }
 
+/// Every leaf under `path` in the live `--help` tree, however deep: a command
+/// that grows its own subcommands stops being a leaf, and its row goes stale.
+fn live_leaves(path: &mut Vec<String>, leaves: &mut Vec<String>) {
+    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+    let children = commands_in(&help_for(&segments));
+    if children.is_empty() {
+        leaves.push(path.join(" "));
+        return;
+    }
+    for child in children {
+        path.push(child);
+        live_leaves(path, leaves);
+        path.pop();
+    }
+}
+
 /// The manifest against clap's own tree, not only against `SURFACE`: were both
 /// transcriptions to drift together, this still reads the binary.
 #[test]
 fn the_live_help_tree_is_classified_leaf_for_leaf() {
     let mut live: Vec<String> = Vec::new();
     for family in commands_in(&help_for(&[])) {
-        let subcommands = commands_in(&help_for(&[family.as_str()]));
-        if subcommands.is_empty() {
-            live.push(family);
-        } else {
-            live.extend(
-                subcommands
-                    .iter()
-                    .map(|subcommand| format!("{family} {subcommand}")),
-            );
-        }
+        live_leaves(&mut vec![family], &mut live);
     }
     live.sort();
 

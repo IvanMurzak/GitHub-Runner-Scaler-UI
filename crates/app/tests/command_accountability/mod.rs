@@ -140,7 +140,6 @@ const AUTH_STATES: &str = "crates/app/tests/auth_states.rs";
 const HOST_STATUS: &str = "crates/app/tests/host_capacity_and_status.rs";
 const WORKSPACE: &str = "crates/app/tests/workspace_commands.rs";
 const POLICY: &str = "crates/app/tests/policy_commands.rs";
-const POLICY_UNIT: &str = "crates/app/src/cli/policy.rs";
 const NO_SECRET: &str = "crates/app/tests/no_secret_reaches_command_output.rs";
 const SURFACE_TESTS: &str = "crates/app/tests/cli_command_surface.rs";
 const DAEMON_UNIT: &str = "crates/app/src/cli/daemon.rs";
@@ -300,8 +299,8 @@ pub const MANIFEST: &[Classification] = &[
         leaf: "repo add-label",
         coverage: Coverage::Generated,
         evidence: &[at(
-            POLICY_UNIT,
-            "extra_labels_join_the_derived_host_label_and_the_host_label_survives_removal",
+            POLICY,
+            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
         )],
         exclusion: None,
     },
@@ -309,8 +308,8 @@ pub const MANIFEST: &[Classification] = &[
         leaf: "repo remove-label",
         coverage: Coverage::Generated,
         evidence: &[at(
-            POLICY_UNIT,
-            "extra_labels_join_the_derived_host_label_and_the_host_label_survives_removal",
+            POLICY,
+            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
         )],
         exclusion: None,
     },
@@ -376,8 +375,8 @@ pub const MANIFEST: &[Classification] = &[
         leaf: "org add-label",
         coverage: Coverage::Generated,
         evidence: &[at(
-            POLICY_UNIT,
-            "extra_labels_join_the_derived_host_label_and_the_host_label_survives_removal",
+            POLICY,
+            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
         )],
         exclusion: None,
     },
@@ -385,8 +384,8 @@ pub const MANIFEST: &[Classification] = &[
         leaf: "org remove-label",
         coverage: Coverage::Generated,
         evidence: &[at(
-            POLICY_UNIT,
-            "extra_labels_join_the_derived_host_label_and_the_host_label_survives_removal",
+            POLICY,
+            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
         )],
         exclusion: None,
     },
@@ -552,7 +551,7 @@ pub const MANIFEST: &[Classification] = &[
             ),
             at(
                 WSL_ACCEPTANCE,
-                "a_distribution_that_already_runs_the_product_is_adopted_and_not_rebuilt",
+                "no_credential_reaches_stdout_stderr_logs_records_task_xml_argv_or_the_environment",
             ),
         ],
         exclusion: Some(Exclusion {
@@ -970,6 +969,8 @@ pub fn check_evidence(
 ///
 /// Comments and step names are not command lines: a `- name:` that mentions
 /// `--ignored` over a step that no longer passes it must not count as wiring.
+/// Nor does a line whose libtest filters leave this test out: a positional
+/// filter or `--skip` after ` -- ` narrows the run by name.
 pub fn is_wired(evidence: &Evidence, workflows: &str) -> bool {
     if !evidence.file.contains("/tests/") {
         // Only an integration-test target can be selected with `--test`.
@@ -992,7 +993,50 @@ pub fn is_wired(evidence: &Evidence, workflows: &str) -> bool {
                 !line[offset + flag.len()..]
                     .starts_with(|next: char| next.is_ascii_alphanumeric() || next == '_')
             })
+            && harness_selects(line, evidence.test)
     })
+}
+
+/// Whether the libtest arguments after ` -- ` on `line` keep `test` in the
+/// run. A positional filter keeps only names containing it, `--skip` drops
+/// names containing its value, and `--exact` makes both whole-name matches.
+fn harness_selects(line: &str, test: &str) -> bool {
+    let Some((_, harness)) = line.split_once(" -- ") else {
+        return true;
+    };
+    let mut tokens = harness
+        .split_whitespace()
+        .take_while(|token| !matches!(*token, "&&" | "||" | ";" | "|"));
+    let mut filters = Vec::new();
+    let mut skips = Vec::new();
+    let mut exact = false;
+    while let Some(token) = tokens.next() {
+        match token {
+            "--exact" => exact = true,
+            "--skip" => skips.extend(tokens.next()),
+            // libtest options that take their value as the next word.
+            "--test-threads" | "--logfile" | "--color" | "--format" | "--shuffle-seed" | "-Z" => {
+                tokens.next();
+            }
+            "\\" => {}
+            option if option.starts_with('-') => {}
+            filter => filters.push(filter),
+        }
+    }
+    let unquote = |pattern: &str| {
+        pattern
+            .trim_matches(|quote| quote == '\'' || quote == '"')
+            .to_string()
+    };
+    let matches = |pattern: &&str| {
+        let pattern = unquote(pattern);
+        if exact {
+            test == pattern
+        } else {
+            test.contains(&pattern)
+        }
+    };
+    (filters.is_empty() || filters.iter().any(matches)) && !skips.iter().any(matches)
 }
 
 /// Phrases that restate "not covered" rather than naming a boundary.
@@ -1384,6 +1428,10 @@ fn looks_unconditional() {}
             "        # cargo test --test fixture -- --ignored\n",
             // A different target whose name merely starts with this one.
             "        run: cargo test --test fixture_other -- --ignored\n",
+            // The target runs, but a libtest filter leaves this test out.
+            "        run: cargo test --test fixture -- --ignored another_case\n",
+            "        run: cargo test --test fixture -- --ignored --skip privileged\n",
+            "        run: cargo test --test fixture -- --ignored --exact privileged\n",
         ] {
             let defects = defects_of(
                 row(Coverage::Privileged, privileged, exclusion),
@@ -1401,6 +1449,23 @@ fn looks_unconditional() {}
                     },
                 ],
                 "with workflows {workflows:?} the privileged test runs nowhere"
+            );
+        }
+
+        // Filters that keep the test in the run are still wiring.
+        for workflows in [
+            "        run: cargo test --test fixture -- --ignored privileged\n",
+            "        run: cargo test --test fixture -- --ignored --exact privileged_case --test-threads 1\n",
+            "        run: cargo test --test fixture -- --ignored --skip another_case\n",
+        ] {
+            let defects = defects_of(
+                row(Coverage::Privileged, privileged, exclusion),
+                &Table { workflows },
+            );
+            assert!(
+                defects.is_empty(),
+                "with workflows {workflows:?} the privileged test runs; got:\n{}",
+                report(&defects)
             );
         }
 
