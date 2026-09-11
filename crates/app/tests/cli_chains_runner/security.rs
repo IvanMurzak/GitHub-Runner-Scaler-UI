@@ -11,9 +11,7 @@ use std::path::Path;
 
 use runner_manager_domain::store::SqliteStore;
 
-use crate::support::{
-    file_contains, files_under, fixture_device_code, fixture_token, is_the_secret_store,
-};
+use crate::support::{fixture_device_code, fixture_token, is_the_secret_store};
 
 use super::scenario::{Invocation, Scenario};
 
@@ -114,20 +112,21 @@ pub fn collect(
         });
     }
 
-    for path in files_under(&scenario.data) {
-        if is_the_secret_store(&path) {
-            // A rooted platform secret store is the one approved persistence
-            // location for the fixture token. Every other file is scanned.
-            continue;
-        }
+    let protected = protected_values();
+    for path in scannable_files(&scenario.data)? {
         let relative = path.strip_prefix(&scenario.data).unwrap_or(&path);
         let plane = if relative.starts_with(Path::new("logs")) {
             SecurityPlane::Logs
         } else {
             SecurityPlane::DataTree
         };
-        for (name, needle) in protected_values() {
-            if file_contains(&path, &needle) {
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("cannot scan {}: {error}", path.display()))?;
+        for (name, needle) in &protected {
+            if bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+            {
                 fragments.push(Fragment {
                     plane,
                     origin: path.display().to_string(),
@@ -148,6 +147,39 @@ pub fn collect(
         });
     }
     Ok(fragments)
+}
+
+/// Every regular artifact beneath `root`, failing closed when the tree cannot
+/// be enumerated. The rooted secret store is the one approved persistence
+/// location for the fixture token and is deliberately excluded as a subtree.
+fn scannable_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot enumerate {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("cannot enumerate {}: {error}", directory.display()))?;
+            let path = entry.path();
+            if is_the_secret_store(&path) {
+                continue;
+            }
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn dump(store: &SqliteStore) -> Result<String, String> {

@@ -50,7 +50,9 @@ use cli_chains::values::PathValue;
 use cli_chains_runner::confinement::{StandardFootprint, invocation_problems};
 use cli_chains_runner::oracle::Plane;
 use cli_chains_runner::run::{self, CaseRun, Expected};
+use cli_chains_runner::scenario::{Invocation, Scenario};
 use cli_chains_runner::{report, security, selection};
+use runner_manager_domain::store::{SqliteStore, Store};
 
 const SOFT_RUNTIME_TARGET: Duration = Duration::from_secs(60);
 
@@ -273,18 +275,49 @@ fn every_coverage_model_invariant_has_named_corpus_evidence() {
 
 #[test]
 fn every_protected_value_is_detected_on_every_scanned_plane() {
-    for plane in security::SecurityPlane::ALL {
-        for (name, value) in security::protected_values() {
-            let fragments = [security::Fragment {
-                plane,
-                origin: format!("a planted {} artifact", plane.name()),
-                text: format!("before {value} after"),
-            }];
-            let found = security::findings(&fragments);
-            assert_eq!(
-                found.len(),
-                1,
-                "planting {name} in {} must fail exactly once: {found:?}",
+    for (name, value) in security::protected_values() {
+        let scenario = Scenario::new(
+            CaseId::parse("local-0001").expect("a valid fixture case id"),
+            Installation::None,
+        );
+        let logs = scenario.data.join("logs");
+        std::fs::create_dir_all(&logs).expect("the planted log directory");
+        std::fs::write(logs.join("planted.log"), format!("before {value} after"))
+            .expect("the planted log");
+        std::fs::write(
+            scenario.data.join("planted.txt"),
+            format!("before {value} after"),
+        )
+        .expect("the planted data artifact");
+
+        let database = scenario.database_path();
+        std::fs::create_dir_all(database.parent().expect("the database parent"))
+            .expect("the planted database directory");
+        let store = SqliteStore::open(&database).expect("the planted database");
+        store
+            .put_host(
+                &runner_manager_testkit::fixtures::host()
+                    .display_name(&value)
+                    .build(),
+            )
+            .expect("the protected value can be planted in SQLite");
+        drop(store);
+
+        let invocation = Invocation {
+            argv: Vec::new(),
+            code: 0,
+            stdout: format!("before {value} after"),
+            stderr: format!("before {value} after"),
+            requests: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+        let fragments = security::collect(&scenario, Some(&invocation))
+            .expect("every planted artifact is scannable");
+        let found = security::findings(&fragments);
+        for plane in security::SecurityPlane::ALL {
+            assert!(
+                found.iter().any(|finding| finding.contains(plane.name())),
+                "planting {name} in {} must be collected and rejected: {found:?}",
                 plane.name()
             );
         }
