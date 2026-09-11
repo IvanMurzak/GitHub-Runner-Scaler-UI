@@ -491,15 +491,24 @@ pub fn probe_readiness(
     // every locale and `whoami`'s is a name that a localised system may
     // translate.
     let identity = invoker.exec(LinuxCommand::new(name, "id").args(["-u"]))?;
+    if !identity.success() {
+        // A failed `wsl.exe --user root --exec id -u` does not establish
+        // anything about root. In particular, WSL service/VM startup errors
+        // are returned as this command's stderr and used to be mislabeled as
+        // a permanently ineligible distribution. Preserve the transport
+        // failure as a retryable provisioning error instead.
+        return Err(WslError::CommandFailed {
+            what: "verify root access in the distribution",
+            program: PathBuf::from("id"),
+            exit_code: identity.exit_code(),
+            detail: identity.diagnostic(),
+        });
+    }
     let reported = identity.stdout_text();
-    if !identity.success() || reported != "0" {
+    if reported != "0" {
         return Err(WslError::NoRootAccess {
             distribution: name.to_string(),
-            detail: if identity.success() {
-                format!("`id -u` answered {reported}, not 0")
-            } else {
-                identity.diagnostic()
-            },
+            detail: format!("`id -u` answered {reported}, not 0"),
         });
     }
 
@@ -725,6 +734,37 @@ mod tests {
             panic!("unexpected error: {error:?}");
         };
         assert!(detail.contains("1000"), "{detail}");
+    }
+
+    #[test]
+    fn a_wsl_startup_failure_is_not_mislabeled_as_missing_root_access() {
+        let diagnostic = concat!(
+            "A connection attempt failed because the connected party did not respond.\n",
+            "Error code: Wsl/Service/0x8007274c\n",
+        );
+        let runner = ScriptedRunner::new()
+            .always("--list --verbose", table())
+            .always("--exec id -u", CommandOutput::exited(-1, "", diagnostic));
+        let executable = executable();
+        let error = probe_readiness(&WslInvoker::new(&runner, &executable), "Ubuntu")
+            .expect_err("WSL startup failed");
+
+        let WslError::CommandFailed {
+            what,
+            exit_code,
+            detail,
+            ..
+        } = &error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(*what, "verify root access in the distribution");
+        assert_eq!(*exit_code, Some(-1));
+        assert!(detail.contains("Wsl/Service/0x8007274c"), "{detail}");
+        assert!(
+            !error.to_string().contains("does not start as root"),
+            "{error}"
+        );
     }
 
     #[test]
