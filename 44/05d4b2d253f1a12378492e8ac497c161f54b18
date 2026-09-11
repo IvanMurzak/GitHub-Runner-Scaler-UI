@@ -1,0 +1,31 @@
+crates/app/tests/cli_chains_runner/observe.rs
+  s_f0095ead781cdd::t_71e8da33fe9515 239
+  s_f0095ead781cdd::t_1a32497df79a30 59,64,68
+  s_f0095ead781cdd::t_5e557f57835b97 151,155
+crates/app/tests/cli_chains_runner/confinement.rs
+  s_f0095ead781cdd::t_ad4ea3c63fbc60 120-124
+crates/app/tests/cli_chains_acceptance.rs
+  s_f0095ead781cdd::t_3b7bbe76fd7e55 262-270,276,282-285,367
+crates/app/tests/cli_chains_runner/scenario.rs
+  s_f0095ead781cdd::t_5db005411220ee 293
+crates/app/tests/cli_chains_runner/oracle.rs
+  s_f0095ead781cdd::t_861eb0424eeb6a 380-385
+crates/app/tests/cli_chains_runner/run.rs
+  s_f0095ead781cdd::t_2e325c323d3fde 181,194,210-212,215,218-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4405d4b2d253f1a12378492e8ac497c161f54b18",
+  "prompts": {},
+  "sessions": {
+    "s_f0095ead781cdd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9e88292e-3620-4b89-92cb-cf548bcaef93",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
