@@ -1,0 +1,21 @@
+.taskflow/archive/2026-09-06-managed-wsl-host/README.md
+  s_dd85195b844264::t_2cbc2e34f32089 3-4
+.taskflow/archive/2026-09-06-managed-wsl-host/ROADMAP.md
+  s_dd85195b844264::t_2cbc2e34f32089 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dfe7b5852abc1c1edf7dd6b7d0de4ca1dbeee505",
+  "prompts": {},
+  "sessions": {
+    "s_dd85195b844264": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08fe0-edd1-7ec3-bcd3-a592b2bcafb4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
