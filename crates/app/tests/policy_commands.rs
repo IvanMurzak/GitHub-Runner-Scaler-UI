@@ -296,3 +296,85 @@ fn explicit_boole_reach_repo_and_org_runtime_and_failures_redact_the_credential(
     assert!(!unavailable.both().contains(&fixture_token()));
     assert!(database(data_dir.path()).policies().unwrap().is_empty());
 }
+
+/// `add-label` and `remove-label`, for both scopes, through the real binary:
+/// the stored label set moves, a repeat is a no-op, and the derived host label
+/// cannot be removed.
+#[test]
+fn add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes() {
+    for (scope, target) in [("repo", "octo/one"), ("org", "octo")] {
+        let data_dir = tempfile::tempdir().unwrap();
+        signed_in(data_dir.path());
+        let github = FakeGithub::start();
+        github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+        let added = run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args([
+                scope,
+                "add",
+                target,
+                "--host-label",
+                "home",
+                "--max-capacity",
+                "2",
+            ]);
+            command
+        });
+        assert_eq!(added.code, 0, "{scope} add: {}", added.both());
+
+        let stored = || -> Vec<String> {
+            let policy = database(data_dir.path()).policies().unwrap().remove(0);
+            policy
+                .routing_labels()
+                .expect("an autoscale policy")
+                .iter()
+                .map(|label| label.as_str().to_string())
+                .collect()
+        };
+        let label = |change: &str, label: &str| {
+            run({
+                let mut command = runner_manager(data_dir.path());
+                command.args([scope, change, target, "--label", label]);
+                command
+            })
+        };
+
+        let add = label("add-label", "gpu");
+        assert_eq!(add.code, 0, "{scope} add-label: {}", add.both());
+        assert!(add.stdout.contains("now answers: gpu"), "{}", add.stdout);
+        let labels = stored();
+        assert!(labels.iter().any(|label| label == "gpu"), "{labels:?}");
+
+        let again = label("add-label", "gpu");
+        assert_eq!(again.code, 0, "{scope} add-label again: {}", again.both());
+        assert!(
+            again.stdout.contains("No label changed"),
+            "{}",
+            again.stdout
+        );
+
+        let host_label = stored()
+            .into_iter()
+            .find(|label| label.starts_with("rm-home-"))
+            .expect("the derived host label is stored");
+        let refused = label("remove-label", &host_label);
+        assert_eq!(
+            refused.code,
+            9,
+            "{scope} remove-label must refuse the host label: {}",
+            refused.both()
+        );
+        let labels = stored();
+        assert!(labels.contains(&host_label), "{labels:?}");
+
+        let remove = label("remove-label", "gpu");
+        assert_eq!(remove.code, 0, "{scope} remove-label: {}", remove.both());
+        assert!(
+            remove.stdout.contains("no longer answers: gpu"),
+            "{}",
+            remove.stdout
+        );
+        let labels = stored();
+        assert!(!labels.iter().any(|label| label == "gpu"), "{labels:?}");
+    }
+}
