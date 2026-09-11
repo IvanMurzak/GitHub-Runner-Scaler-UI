@@ -1,0 +1,26 @@
+crates/app/tests/cli_command_surface.rs
+  s_dfc901a72373f1::t_36782cec3b4fea 848-863,870
+crates/app/tests/command_accountability/mod.rs
+  s_dfc901a72373f1::t_6789cfa752a2f9 996,1000-1035
+  s_dfc901a72373f1::t_3f33e7a6853caf 1431-1434,1455-1467,1471
+  s_dfc901a72373f1::t_1af0fee938ee7d 972-973
+  s_dfc901a72373f1::t_a349a39c8be372 302-303,311-312,378-379,387-388,554,1036-1041,1468-1470
+crates/app/tests/policy_commands.rs
+  s_dfc901a72373f1::t_2828005cd87a45 299-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e01e597539f0ab589889633ec4f167fd04f05ec2",
+  "prompts": {},
+  "sessions": {
+    "s_dfc901a72373f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1fb981b0-72e9-4474-bd08-16512435bb4c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
