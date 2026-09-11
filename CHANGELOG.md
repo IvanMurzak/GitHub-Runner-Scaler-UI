@@ -7,6 +7,10 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.11
+
+### Features
+- Added dynamic system metrics (local capacity, online runners, busy runners) to the terminal window title.
 ## 0.4.9
 
 ### Fixes
@@ -163,4 +167,6 @@ prints the explicit Linux commands to run if you want to undo that half too.
 Every existing local command, file, service registration and `status --json`
 document is unchanged. `--host local` is the default, so nothing you have
 scripted needs editing.
+
+
 
