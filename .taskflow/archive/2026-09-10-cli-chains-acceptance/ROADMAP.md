@@ -52,7 +52,7 @@ may overlap only when their `depends_on` entries are satisfied.
 | [b2-local-chain-runner](tasks/b2-local-chain-runner.md) | b1 | ./main | 10/8 | top | ✅ | [PR #67](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/67) | 2026-09-10 |
 | [b3-local-corpus-security](tasks/b3-local-corpus-security.md) | b2 | ./main | 10/8 | top | ✅ | [PR #68](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/68) | 2026-09-11 |
 | [c1-wsl-chain-corpus](tasks/c1-wsl-chain-corpus.md) | — | ./main | 9/7 | top | ✅ | [PR #65](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/65) | 2026-09-10 |
-| [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | 🔵 | implement-task manager | 2026-09-11 |
+| [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | ✅ | [PR #69](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/69) | 2026-09-11 |
 
 ## Review findings
 
@@ -82,3 +82,4 @@ may overlap only when their `depends_on` entries are satisfied.
 | 2026-09-11 | Execution wave 3 completed on green: B3 merged in PR #68 after review fixes and all seven CI/E2E checks passed. |
 | 2026-09-11 | Execution wave 4 dispatched final cross-track task D1 through the `implement-task` pipeline in Codex-native manager mode. |
 | 2026-09-11 | D1 implementation replaced provisional manifest citations with the delivered local and WSL corpus tests, added typed inventory and three-OS workflow join contracts, and documented full-suite and stable-case replay commands. |
+| 2026-09-11 | Execution wave 4 completed on green: D1 merged in PR #69 after review fixes and all seven CI/E2E checks passed. All six implementation tasks are complete. |

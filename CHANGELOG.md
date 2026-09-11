@@ -7,6 +7,17 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.12
+
+### Quality and compatibility
+
+- Added fail-closed accountability for every published CLI command leaf.
+- Added deterministic local and mocked-WSL command-chain corpora with
+  real-process execution, replayable case IDs, security and leak scans,
+  mutation controls, and cross-track CI and release gates.
+- Corrected the documented exact WSL replay command and hardened CI contract
+  checks across Windows, macOS, and Linux.
+
 ## 0.4.11
 
 ### Features
