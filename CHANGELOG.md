@@ -7,6 +7,14 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.13
+
+### Fixes
+
+- WSL service and distribution startup failures during the root preflight are
+  now reported as retryable provisioning failures instead of incorrectly
+  claiming that the distribution cannot start as root.
+
 ## 0.4.12
 
 ### Quality and compatibility
