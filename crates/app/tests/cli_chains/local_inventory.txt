@@ -1,0 +1,2493 @@
+# Local CLI chain inventory -- GENERATED, DO NOT EDIT BY HAND.
+# corpus version 1, seed 0x5eed0c11c4a10001, 285 cases, 114 rejected candidates
+# Regenerate: CLI_CHAINS_BLESS=1 cargo test -p runner-manager --test cli_chains_model
+# Paths are relative to the scenario's <roots> and <data>; rm-<host>-<os>-<arch> is the derived label.
+
+local-0001 fp=eb46da8a486183de origin=curated fixture=standard
+  name: fresh-data-root-reads-are-idempotent
+  contributes: invariant:idempotent-read:host.show, invariant:idempotent-read:status.json
+   1. status --json => ok(0)
+   2. status --json => ok(0)
+   3. host show => ok(0)
+   4. host show => ok(0)
+   5. repo list => ok(0)
+   6. org list => ok(0)
+
+local-0002 fp=fc0d57e2cbc98bf2 origin=curated fixture=standard
+  name: sign-in-then-resume-without-a-new-code
+  contributes: invariant:login-resumes-without-a-new-code, pair:auth.login>auth.login, readback:auth.login>status.json
+   1. auth login => ok(0)
+   2. auth login => ok(0)
+   3. status --json => ok(0)
+
+local-0003 fp=ef07c198d176adcb origin=curated fixture=standard
+  name: logout-leaves-policies-in-place
+  contributes: invariant:logout-leaves-policies, invariant:logout-without-a-credential-is-a-no-op, pair:auth.logout>auth.logout, pair:repo.add>auth.logout, readback:auth.logout>status.json, value:repo.add:enable=false, value:repo.add:host-label=ordinary, value:repo.add:label=ordinary, value:repo.add:max-capacity=normal, value:repo.add:target=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. repo list => ok(0)
+   5. status --json => ok(0)
+   6. auth logout => ok(0)
+
+local-0004 fp=de2e38177baf4e98 origin=curated fixture=standard
+  name: add-without-a-credential-is-refused-for-both-scopes
+  contributes: refusal:org.add:not-authenticated, refusal:repo.add:not-authenticated, value:org.add:enable=false, value:org.add:host-label=ordinary, value:org.add:label=ordinary, value:org.add:max-capacity=normal, value:org.add:target=ordinary
+   1. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => not_authenticated(3) not-authenticated
+   2. org add acme --host-label=home --max-capacity=2 --label=gpu => not_authenticated(3) not-authenticated
+   3. status --json => ok(0)
+
+local-0005 fp=2a400ba8498f88b0 origin=curated fixture=no-installation
+  name: signed-in-but-app-not-installed
+  contributes: refusal:org.add:app-not-installed, refusal:repo.add:app-not-installed
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => not_found(10) app-not-installed
+   3. org add acme --host-label=home --max-capacity=2 --label=gpu => not_found(10) app-not-installed
+   4. auth login => ok(0)
+   5. status --json => ok(0)
+
+local-0006 fp=8c38dfc6cdefe294 origin=curated fixture=standard
+  name: targets-outside-every-installation
+  contributes: refusal:org.add:target-not-installed, refusal:repo.add:target-not-installed, value:org.add:target=not-installed, value:repo.add:target=budget-fleet, value:repo.add:target=not-installed
+   1. setup seed credential
+   2. repo add outside/tools --host-label=home --max-capacity=2 --label=gpu => not_found(10) target-not-installed
+   3. org add outside --host-label=home --max-capacity=2 --label=gpu => not_found(10) target-not-installed
+   4. repo add acme/fleet-01 --host-label=home --max-capacity=2 --label=gpu => not_found(10) target-not-installed
+   5. status --json => ok(0)
+
+local-0007 fp=c7e780e8e126f6dc origin=curated fixture=standard
+  name: duplicate-add-neither-replaces-nor-arms
+  contributes: cross:repository-and-organization-policies-coexist, invariant:duplicate-add-keeps-the-existing-policy, pair:repo.add>org.add, refusal:org.add:duplicate-target, refusal:repo.add:duplicate-target, value:org.add:enable=true, value:org.add:label=none, value:org.add:max-capacity=normal-other, value:org.add:target=case-variant, value:repo.add:enable=true, value:repo.add:label=none, value:repo.add:max-capacity=normal-other, value:repo.add:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo add Acme/Widgets --host-label=office --max-capacity=5 --enable => conflict(11) duplicate-target
+   5. org add ACME --host-label=office --max-capacity=5 --enable => conflict(11) duplicate-target
+   6. repo list => ok(0)
+   7. org list => ok(0)
+
+local-0008 fp=73d926659b68dd0e origin=curated fixture=standard
+  name: repository-monitor-only-is-promoted-before-labels-or-arming
+  contributes: boundary:monitor-only-promoted, pair:repo.set-capacity>repo.add-label, refusal:repo.add-label:labels-on-monitor-only, refusal:repo.add:labels-need-autoscale, refusal:repo.set-scale:enable-monitor-only, value:repo.add-label:label=ordinary, value:repo.add-label:target=ordinary, value:repo.add:max-capacity=absent-monitor-only, value:repo.set-capacity:max-capacity=normal-other, value:repo.set-capacity:target=ordinary, value:repo.set-scale:enabled=true, value:repo.set-scale:target=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home => ok(0)
+   3. repo add acme/gadgets --host-label=home --label=gpu => invalid_argument(9) labels-need-autoscale
+   4. repo add-label acme/widgets --label=gpu => invalid_argument(9) labels-on-monitor-only
+   5. repo set-scale acme/widgets --enabled=true => invalid_argument(9) enable-monitor-only
+   6. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   7. repo add-label acme/widgets --label=gpu => ok(0)
+   8. repo list => ok(0)
+
+local-0009 fp=c16d76d519e6b13f origin=curated fixture=standard
+  name: organization-monitor-only-is-promoted-before-labels-or-arming
+  contributes: pair:org.set-capacity>org.set-scale, readback:org.set-scale>org.list, refusal:org.remove-label:labels-on-monitor-only, refusal:org.set-scale:enable-monitor-only, value:org.add:max-capacity=absent-monitor-only, value:org.remove-label:label=ordinary, value:org.remove-label:target=ordinary, value:org.set-capacity:max-capacity=normal, value:org.set-capacity:target=ordinary, value:org.set-scale:enabled=true, value:org.set-scale:target=ordinary
+   1. setup seed credential
+   2. setup org add acme --host-label=home => ok(0)
+   3. org remove-label acme --label=gpu => invalid_argument(9) labels-on-monitor-only
+   4. org set-scale acme --enabled=true => invalid_argument(9) enable-monitor-only
+   5. org set-capacity acme --max-capacity=2 => ok(0)
+   6. org set-scale acme --enabled=true => ok(0)
+   7. org list => ok(0)
+
+local-0010 fp=344b881e9e6600a2 origin=curated fixture=standard
+  name: arming-cycle-through-disabled
+  contributes: invariant:disabled-policy-can-be-re-armed, invariant:disabling-an-unarmed-policy-is-a-no-op, invariant:repeat-enable-is-idempotent, pair:repo.add>repo.set-scale, pair:repo.set-scale>repo.set-scale, readback:repo.set-scale>repo.list, readback:repo.set-scale>status.json, value:repo.set-scale:enabled=false
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=false => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. repo set-scale acme/widgets --enabled=true => ok(0)
+   6. repo set-scale acme/widgets --enabled=false => ok(0)
+   7. repo set-scale acme/widgets --enabled=false => ok(0)
+   8. repo set-scale acme/widgets --enabled=true => ok(0)
+   9. repo list => ok(0)
+  10. status --json => ok(0)
+
+local-0011 fp=ffbc4a7777e4d416 origin=curated fixture=standard
+  name: derived-label-removal-refusal-is-atomic
+  contributes: invariant:multi-label-refusal-is-atomic, refusal:repo.remove-label:derived-label-not-removable, value:repo.remove-label:label-count=several, value:repo.remove-label:label=derived-host-label, value:repo.remove-label:label=derived-host-label-case-variant, value:repo.remove-label:label=ordinary, value:repo.remove-label:target=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu --label=large-disk => ok(0)
+   3. repo remove-label acme/widgets --label=gpu --label=rm-home-<os>-<arch> => invalid_argument(9) derived-label-not-removable
+   4. repo list => ok(0)
+   5. status --json => ok(0)
+   6. repo remove-label acme/widgets --label=RM-HOME-<OS>-<ARCH> => invalid_argument(9) derived-label-not-removable
+   7. status --json => ok(0)
+
+local-0012 fp=4f8ff8f558e0624d origin=curated fixture=standard
+  name: organization-derived-label-removal-refusal-is-atomic
+  contributes: invariant:label-change-is-idempotent, invariant:labels-fold-case, readback:org.add-label>status.json, refusal:org.remove-label:derived-label-not-removable, value:org.add-label:label=case-variant, value:org.add-label:target=ordinary, value:org.add:label=github-default-name, value:org.remove-label:label-count=several, value:org.remove-label:label=derived-host-label, value:org.remove-label:label=github-default-name
+   1. setup seed credential
+   2. setup org add acme --host-label=office --max-capacity=2 --label=gpu --label=self-hosted => ok(0)
+   3. org remove-label acme --label=self-hosted --label=rm-office-<os>-<arch> => invalid_argument(9) derived-label-not-removable
+   4. org add-label acme --label=GPU => ok(0)
+   5. org list => ok(0)
+   6. status --json => ok(0)
+
+local-0013 fp=65122d2115c08a1d origin=curated fixture=standard
+  name: labels-fold-case-and-repeat-idempotently
+  contributes: invariant:derived-label-is-never-duplicated, pair:repo.add-label>repo.add-label, pair:repo.add-label>repo.remove-label, pair:repo.add>repo.add-label, pair:repo.remove-label>repo.remove-label, readback:repo.remove-label>status.json, value:repo.add-label:label-count=several, value:repo.add-label:label=case-variant, value:repo.add-label:label=derived-host-label, value:repo.add-label:label=github-default-name
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=GPU => ok(0)
+   4. repo add-label acme/widgets --label=rm-home-<os>-<arch> => ok(0)
+   5. repo add-label acme/widgets --label=large-disk --label=self-hosted => ok(0)
+   6. repo remove-label acme/widgets --label=large-disk => ok(0)
+   7. repo remove-label acme/widgets --label=large-disk => ok(0)
+   8. status --json => ok(0)
+
+local-0014 fp=8e25e602627fd5ef origin=curated fixture=standard
+  name: label-length-and-character-boundaries
+  contributes: boundary:label-256, refusal:repo.add-label:invalid-label, refusal:repo.remove-label:invalid-label, value:repo.add-label:label=boundary-256, value:repo.add-label:label=separator, value:repo.add-label:label=too-long-257, value:repo.remove-label:label=blank
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=<l*256> => ok(0)
+   4. repo add-label acme/widgets --label=<l*257> => invalid_argument(9) invalid-label
+   5. repo add-label acme/widgets --label=gpu,fast => invalid_argument(9) invalid-label
+   6. repo remove-label acme/widgets '--label=   ' => invalid_argument(9) invalid-label
+   7. status --json => ok(0)
+
+local-0015 fp=482166c8c0cfa4e4 origin=curated fixture=standard
+  name: host-label-length-character-and-case-rules
+  contributes: boundary:host-label-64, invariant:host-label-folds-case, readback:repo.add>status.json, refusal:repo.add:invalid-host-label, value:repo.add:host-label=boundary-64, value:repo.add:host-label=case-variant, value:repo.add:host-label=illegal-character, value:repo.add:host-label=illegal-edge, value:repo.add:host-label=too-long-65, value:repo.add:label=boundary-256
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=host-<x*59> --max-capacity=2 --label=<l*256> => ok(0)
+   3. repo add acme/gadgets --host-label=host-<x*60> --max-capacity=2 => invalid_argument(9) invalid-host-label
+   4. repo add acme/gadgets '--host-label=home pc' --max-capacity=2 => invalid_argument(9) invalid-host-label
+   5. repo add acme/gadgets --host-label=home- --max-capacity=2 => invalid_argument(9) invalid-host-label
+   6. repo add acme/gadgets --host-label=Home --max-capacity=2 => ok(0)
+   7. status --json => ok(0)
+
+local-0016 fp=ec208cad2b2243ad origin=curated fixture=standard
+  name: host-capacity-boundaries
+  contributes: boundary:host-capacity-product-default, boundary:host-capacity-u16-max, invariant:host-capacity-rewrite-is-idempotent, pair:host.set-capacity>host.set-capacity, readback:host.set-capacity>status.json, refusal:host.set-capacity:zero-host-capacity, value:host.set-capacity:capacity=one-product-default, value:host.set-capacity:capacity=u16-max, value:host.set-capacity:capacity=zero
+   1. host set-capacity 0 => invalid_argument(9) zero-host-capacity
+   2. host show => ok(0)
+   3. host set-capacity 65535 => ok(0)
+   4. host set-capacity 1 => ok(0)
+   5. host set-capacity 1 => ok(0)
+   6. status --json => ok(0)
+
+local-0017 fp=169f2809f1bc9630 origin=curated fixture=standard
+  name: policy-capacity-boundaries
+  contributes: boundary:policy-capacity-one, boundary:policy-capacity-u16-max, invariant:capacity-rewrite-is-idempotent, invariant:missing-target-is-reported-before-a-zero-capacity, pair:repo.set-capacity>repo.set-capacity, refusal:repo.set-capacity:missing-policy, refusal:repo.set-capacity:zero-max-capacity, value:repo.set-capacity:max-capacity=one-product-default, value:repo.set-capacity:max-capacity=u16-max, value:repo.set-capacity:max-capacity=zero
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=0 => invalid_argument(9) zero-max-capacity
+   4. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   6. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   7. repo set-capacity acme/gadgets --max-capacity=0 => not_found(10) missing-policy
+   8. repo list => ok(0)
+
+local-0018 fp=36b4cf58a2358282 origin=curated fixture=standard
+  name: repository-and-organization-policies-coexist
+  contributes: cross:removal-leaves-the-other-scope-policy, pair:org.add>org.remove, readback:org.add>org.list, readback:org.add>status.json, readback:org.remove>status.json, value:org.remove:purge=false, value:org.remove:target=ordinary
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo list => ok(0)
+   5. org list => ok(0)
+   6. status --json => ok(0)
+   7. org remove acme => ok(0)
+   8. repo list => ok(0)
+   9. status --json => ok(0)
+
+local-0019 fp=4d87c579705fb5c0 origin=curated fixture=wide
+  name: repository-targets-fill-the-rest-budget
+  contributes: boundary:budget-ceiling, boundary:budget-filled, invariant:monitor-only-survives-unrelated-commands, pair:repo.add>repo.add, refusal:repo.add:budget-exceeded
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home => ok(0)
+   3. repo add acme/gadgets --host-label=home => ok(0)
+   4. repo add acme/fleet-01 --host-label=home => ok(0)
+   5. repo add acme/fleet-02 --host-label=home => ok(0)
+   6. repo add acme/fleet-03 --host-label=home => ok(0)
+   7. repo add acme/fleet-04 --host-label=home => ok(0)
+   8. repo add acme/fleet-05 --host-label=home => ok(0)
+   9. repo add acme/fleet-06 --host-label=home => ok(0)
+  10. repo add acme/fleet-07 --host-label=home => ok(0)
+  11. repo add acme/fleet-08 --host-label=home => ok(0)
+  12. repo add acme/fleet-09 --host-label=home => budget_refused(12) budget-exceeded
+  13. status --json => ok(0)
+  14. host show => ok(0)
+
+local-0020 fp=018ec313c2e4fb7b origin=curated fixture=wide
+  name: the-rest-budget-counts-both-scopes
+  contributes: cross:budget-counts-the-other-scope, pair:org.remove>repo.add, refusal:org.add:budget-exceeded, value:org.remove:purge=true
+   1. setup seed credential
+   2. org add acme --host-label=home => ok(0)
+   3. repo add acme/widgets --host-label=home => budget_refused(12) budget-exceeded
+   4. org remove acme --purge => ok(0)
+   5. repo add acme/widgets --host-label=home => ok(0)
+   6. org add acme --host-label=home => budget_refused(12) budget-exceeded
+   7. status --json => ok(0)
+
+local-0021 fp=e9c4e4c9733b2ed2 origin=curated fixture=standard
+  name: purge-keeps-the-package-cache-for-the-other-scope
+  contributes: cross:purge-keeps-the-cache-for-the-other-scope, pair:org.add>repo.remove, pair:repo.remove>org.remove, readback:repo.remove>status.json, value:repo.remove:purge=true, value:repo.remove:target=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. setup seed package cache
+   5. setup seed cleaned attempt for repo acme/widgets
+   6. repo remove acme/widgets --purge => ok(0)
+   7. status --json => ok(0)
+   8. org remove acme --purge => ok(0)
+   9. status --json => ok(0)
+
+local-0022 fp=df169a93aee49761 origin=curated fixture=standard
+  name: purge-keeps-a-package-cache-still-in-use
+  contributes: invariant:purge-keeps-a-shared-cache-in-use, pair:repo.add>repo.remove, pair:repo.remove>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. setup seed package cache
+   5. repo remove acme/widgets --purge => ok(0)
+   6. repo remove acme/gadgets --purge => ok(0)
+   7. status --json => ok(0)
+
+local-0023 fp=e78baf0f259dbf68 origin=curated fixture=standard
+  name: non-purge-removal-retains-diagnostics-across-a-re-add
+  contributes: cross:retained-attempts-block-the-host-root, invariant:non-purge-removal-retains-diagnostics, invariant:re-added-target-starts-fresh, pair:repo.add>repo.set-workspace, pair:repo.remove>repo.add, refusal:host.set-runtime-root:attempts-own-host-root, value:host.set-runtime-root:path=fresh-leaf, value:repo.remove:purge=false, value:repo.set-workspace:mode=persistent, value:repo.set-workspace:path=fresh-leaf, value:repo.set-workspace:target=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup seed cleaned attempt for repo acme/widgets
+   4. setup seed awaiting-cleanup attempt for repo acme/widgets
+   5. repo remove acme/widgets => ok(0)
+   6. status --json => ok(0)
+   7. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   8. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   9. host set-runtime-root --path=<roots>/beta => conflict(11) attempts-own-host-root
+  10. status --json => ok(0)
+
+local-0024 fp=a164463cce57e778 origin=curated fixture=standard
+  name: active-attempts-guard-disable-purge-and-the-host-root
+  contributes: cross:removed-policy-attempts-still-count-host-wide, invariant:enabled-survives-unrelated-commands, pair:host.set-capacity>repo.remove, refusal:host.reset-runtime-root:attempts-own-host-root, refusal:repo.remove:purge-with-active-attempts, refusal:repo.set-scale:disable-needs-confirmation
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-scale acme/widgets --enabled=true => ok(0)
+   4. setup seed active attempt for repo acme/widgets
+   5. repo set-scale acme/widgets --enabled=false => conflict(11) disable-needs-confirmation
+   6. repo remove acme/widgets --purge => conflict(11) purge-with-active-attempts
+   7. host set-capacity 1 => ok(0)
+   8. repo remove acme/widgets => ok(0)
+   9. status --json => ok(0)
+  10. host reset-runtime-root => conflict(11) attempts-own-host-root
+  11. host show => ok(0)
+
+local-0025 fp=f11e7f6733a3a617 origin=curated fixture=standard
+  name: organization-active-attempts-guard-disable-and-purge
+  contributes: refusal:org.remove:purge-with-active-attempts, refusal:org.set-scale:disable-needs-confirmation, value:org.set-scale:enabled=false
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --enable => ok(0)
+   3. setup seed active attempt for org acme
+   4. org set-scale acme --enabled=false => conflict(11) disable-needs-confirmation
+   5. org remove acme --purge => conflict(11) purge-with-active-attempts
+   6. org list => ok(0)
+   7. org remove acme => ok(0)
+   8. status --json => ok(0)
+
+local-0026 fp=fee76e5990cd6ed9 origin=curated fixture=standard
+  name: host-capacity-below-attempts-in-use
+  contributes: boundary:host-capacity-below-in-use, pair:org.add>host.set-capacity, readback:host.set-capacity>host.show
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. setup seed active attempt for repo acme/widgets
+   5. setup seed active attempt for org acme
+   6. host set-capacity 1 => ok(0)
+   7. host show => ok(0)
+   8. status --json => ok(0)
+
+local-0027 fp=d6da212a04633c2e origin=curated fixture=standard
+  name: repair-required-survives-unrelated-commands
+  contributes: invariant:repair-required-survives-unrelated-commands, pair:host.set-capacity>repo.set-capacity, pair:repo.set-capacity>repo.remove, readback:repo.set-capacity>repo.list, refusal:repo.set-scale:illegal-state-transition, value:host.set-capacity:capacity=normal-other
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup seed repair_required for repo acme/widgets
+   4. repo set-scale acme/widgets --enabled=true => invalid_argument(9) illegal-state-transition
+   5. host set-capacity 5 => ok(0)
+   6. repo list => ok(0)
+   7. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   8. repo list => ok(0)
+   9. repo remove acme/widgets --purge => ok(0)
+  10. status --json => ok(0)
+
+local-0028 fp=c1c9b7ea2fc86248 origin=curated fixture=standard
+  name: draining-survives-then-a-repeated-disable-completes-it
+  contributes: invariant:draining-survives-unrelated-commands, invariant:repeated-disable-completes-a-drain, pair:repo.set-scale>org.add
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-scale acme/widgets --enabled=true => ok(0)
+   4. setup seed draining for repo acme/widgets
+   5. org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   6. repo set-scale acme/widgets --enabled=true => invalid_argument(9) illegal-state-transition
+   7. repo set-scale acme/widgets --enabled=false => ok(0)
+   8. repo list => ok(0)
+   9. status --json => ok(0)
+
+local-0029 fp=3dca86219d444004 origin=curated fixture=standard
+  name: monitor-only-and-enabled-survive-unrelated-commands
+  contributes: pair:host.set-capacity>repo.add, pair:org.add>org.set-scale, pair:org.set-scale>host.set-capacity, readback:repo.add>repo.list, value:host.set-capacity:capacity=normal
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. setup org set-scale acme --enabled=true => ok(0)
+   5. host set-capacity 2 => ok(0)
+   6. repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   7. repo list => ok(0)
+   8. org list => ok(0)
+
+local-0030 fp=96dce0d2c333e200 origin=curated fixture=standard
+  name: host-runner-root-lifecycle
+  contributes: invariant:host-root-change-leaves-the-old-directory, invariant:host-root-rewrite-is-idempotent, pair:host.reset-runtime-root>host.reset-runtime-root, pair:host.reset-runtime-root>host.set-runtime-root, pair:host.set-runtime-root>host.reset-runtime-root, pair:host.set-runtime-root>host.set-runtime-root, readback:host.set-runtime-root>host.show, readback:host.set-runtime-root>status.json, value:host.set-runtime-root:path=nested-leaf
+   1. host set-runtime-root --path=<roots>/alpha => ok(0)
+   2. host show => ok(0)
+   3. host set-runtime-root --path=<roots>/alpha => ok(0)
+   4. host reset-runtime-root => ok(0)
+   5. host reset-runtime-root => ok(0)
+   6. host set-runtime-root --path=<roots>/alpha => ok(0)
+   7. host set-runtime-root --path=<roots>/alpha/inner => ok(0)
+   8. status --json => ok(0)
+
+local-0031 fp=3dc7bfe438723da5 origin=curated fixture=standard
+  name: host-runner-root-refusals-on-a-fresh-data-root
+  contributes: deviation:host-materialized-by-refusal, invariant:refused-path-creates-nothing, refusal:host.set-runtime-root:existing-file, refusal:host.set-runtime-root:missing-parents, refusal:host.set-runtime-root:overlaps-application-data, refusal:host.set-runtime-root:relative-path, value:host.set-runtime-root:path=existing-file, value:host.set-runtime-root:path=inside-app-data, value:host.set-runtime-root:path=missing-parents, value:host.set-runtime-root:path=relative
+   1. host set-runtime-root --path=relative/root => invalid_argument(9) relative-path
+   2. status --json => ok(0)
+   3. host set-runtime-root --path=<roots>/missing/deep => invalid_argument(9) missing-parents [deviation: host-materialized-by-refusal]
+   4. host set-runtime-root --path=<roots>/occupied.txt => invalid_argument(9) existing-file
+   5. host set-runtime-root --path=<data>/state/rman => invalid_argument(9) overlaps-application-data
+   6. host set-runtime-root --path=<roots>/alpha/inner => invalid_argument(9) missing-parents
+   7. host show => ok(0)
+   8. status --json => ok(0)
+
+local-0032 fp=c519f3c764a8f3b0 origin=curated fixture=standard
+  name: host-runner-root-reset-on-a-fresh-data-root
+  contributes: readback:host.reset-runtime-root>host.show, readback:host.reset-runtime-root>status.json
+   1. host reset-runtime-root => ok(0)
+   2. host show => ok(0)
+   3. status --json => ok(0)
+
+local-0033 fp=84efb930437db76a origin=curated fixture=standard
+  name: host-root-refused-where-it-overlaps-a-repository-root
+  contributes: cross:host-root-overlaps-a-repository-root, refusal:host.set-runtime-root:overlaps-repository-root, value:host.set-runtime-root:path=existing-parent
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   4. host set-runtime-root --path=<roots> => invalid_argument(9) overlaps-repository-root
+   5. host set-runtime-root --path=<roots>/alpha => invalid_argument(9) overlaps-repository-root
+   6. host set-runtime-root --path=<roots>/alpha/inner => invalid_argument(9) overlaps-repository-root
+   7. host set-runtime-root --path=<roots>/beta => ok(0)
+   8. status --json => ok(0)
+
+local-0034 fp=f302611a7b0af392 origin=curated fixture=standard
+  name: repository-root-refused-where-it-overlaps-the-host-root
+  contributes: cross:repository-root-overlaps-the-host-root, pair:host.set-runtime-root>repo.set-workspace, pair:repo.add>host.set-runtime-root, readback:repo.set-workspace>repo.list, readback:repo.set-workspace>status.json, refusal:repo.set-workspace:overlaps-host-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots> => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => invalid_argument(9) overlaps-host-root
+   5. host set-runtime-root --path=<roots>/beta => ok(0)
+   6. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   7. repo list => ok(0)
+   8. status --json => ok(0)
+
+local-0035 fp=b86059abf3dc6f5a origin=curated fixture=standard
+  name: repository-roots-never-overlap-and-changes-leave-directories
+  contributes: invariant:repository-roots-never-overlap, invariant:workspace-change-leaves-the-old-root, invariant:workspace-rewrite-is-idempotent, pair:repo.set-workspace>repo.set-workspace, refusal:repo.set-workspace:overlaps-repository-root, value:repo.set-workspace:mode=ephemeral, value:repo.set-workspace:path=nested-leaf
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   5. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/alpha => invalid_argument(9) overlaps-repository-root
+   6. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/alpha/inner => invalid_argument(9) overlaps-repository-root
+   7. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/beta => ok(0)
+   8. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   9. repo set-workspace acme/widgets --mode=ephemeral => ok(0)
+  10. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/alpha => ok(0)
+  11. status --json => ok(0)
+
+local-0036 fp=ba36925af84c1ecb origin=curated fixture=standard
+  name: uncleaned-attempts-guard-workspace-and-host-root
+  contributes: refusal:repo.set-workspace:attempts-own-workspace
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup seed awaiting-cleanup attempt for repo acme/widgets
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => conflict(11) attempts-own-workspace
+   5. repo set-workspace acme/widgets --mode=ephemeral => conflict(11) attempts-own-workspace
+   6. host set-runtime-root --path=<roots>/beta => conflict(11) attempts-own-host-root
+   7. repo list => ok(0)
+   8. status --json => ok(0)
+
+local-0037 fp=b486ee0ff8f5f593 origin=curated fixture=standard
+  name: workspace-argument-and-path-rules
+  contributes: refusal:repo.set-workspace:ephemeral-rejects-path, refusal:repo.set-workspace:existing-file, refusal:repo.set-workspace:invalid-target, refusal:repo.set-workspace:missing-parents, refusal:repo.set-workspace:missing-policy, refusal:repo.set-workspace:overlaps-application-data, refusal:repo.set-workspace:relative-path, value:repo.set-workspace:mode=ephemeral-with-path, value:repo.set-workspace:path=existing-file, value:repo.set-workspace:path=inside-app-data, value:repo.set-workspace:path=missing-parents, value:repo.set-workspace:path=relative, value:repo.set-workspace:target=malformed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace acme/widgets --mode=ephemeral --path=<roots>/alpha => invalid_argument(9) ephemeral-rejects-path
+   4. repo set-workspace acme/widgets --mode=persistent --path=relative/root => invalid_argument(9) relative-path
+   5. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/alpha => not_found(10) missing-policy
+   6. repo set-workspace acme --mode=persistent --path=<roots>/alpha => invalid_argument(9) invalid-target
+   7. repo set-workspace acme/widgets --mode=persistent --path=<roots>/occupied.txt => invalid_argument(9) existing-file
+   8. repo set-workspace acme/widgets --mode=persistent --path=<roots>/missing/deep => invalid_argument(9) missing-parents
+   9. repo set-workspace acme/widgets --mode=persistent --path=<data>/state/rman => invalid_argument(9) overlaps-application-data
+  10. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha/inner => invalid_argument(9) missing-parents
+  11. status --json => ok(0)
+
+local-0038 fp=48c9da00051e4cb2 origin=curated fixture=standard
+  name: add-and-enable-in-one-command
+  contributes: value:org.add:max-capacity=u16-max, value:repo.add:label=github-default-name
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=self-hosted --enable => ok(0)
+   3. org add acme --host-label=office --max-capacity=65535 --enable => ok(0)
+   4. status --json => ok(0)
+   5. repo list => ok(0)
+   6. org list => ok(0)
+
+local-0039 fp=e7184b47e2ee16fe origin=curated fixture=standard
+  name: add-enable-on-monitor-only-stores-then-refuses
+  contributes: deviation:partial-commit-on-enable, refusal:repo.add:enable-monitor-only
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --enable => invalid_argument(9) enable-monitor-only [deviation: partial-commit-on-enable]
+   3. repo list => ok(0)
+   4. status --json => ok(0)
+   5. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => conflict(11) duplicate-target
+
+local-0040 fp=17ee17f946a37316 origin=curated fixture=standard
+  name: malformed-targets-are-refused-before-any-lookup
+  contributes: refusal:org.add:invalid-target, refusal:org.remove:invalid-target, refusal:repo.add:invalid-target, refusal:repo.set-capacity:invalid-target, refusal:repo.set-scale:invalid-target, value:org.add:target=illegal-edge, value:org.remove:target=illegal-edge, value:repo.add:target=illegal-character, value:repo.add:target=malformed, value:repo.set-capacity:max-capacity=normal, value:repo.set-capacity:target=malformed, value:repo.set-scale:target=illegal-character
+   1. setup seed credential
+   2. repo add acme --host-label=home --max-capacity=2 --label=gpu => invalid_argument(9) invalid-target
+   3. repo add 'acme/wid gets' --host-label=home --max-capacity=2 --label=gpu => invalid_argument(9) invalid-target
+   4. org add acme- --host-label=home --max-capacity=2 --label=gpu => invalid_argument(9) invalid-target
+   5. repo set-capacity acme --max-capacity=2 => invalid_argument(9) invalid-target
+   6. org remove acme- --purge => invalid_argument(9) invalid-target
+   7. repo set-scale 'acme/wid gets' --enabled=true => invalid_argument(9) invalid-target
+   8. status --json => ok(0)
+
+local-0041 fp=fc791f085e9dfeae origin=curated fixture=standard
+  name: commands-on-missing-policies-are-not-found
+  contributes: refusal:org.add-label:missing-policy, refusal:org.remove-label:missing-policy, refusal:org.remove:missing-policy, refusal:org.set-capacity:missing-policy, refusal:org.set-scale:missing-policy, refusal:repo.add-label:missing-policy, refusal:repo.remove-label:missing-policy, refusal:repo.remove:missing-policy, refusal:repo.set-scale:missing-policy, value:org.add-label:label=ordinary
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/gadgets --enabled=true => not_found(10) missing-policy
+   4. repo remove acme/gadgets => not_found(10) missing-policy
+   5. org set-capacity acme --max-capacity=2 => not_found(10) missing-policy
+   6. org add-label acme --label=gpu => not_found(10) missing-policy
+   7. org remove-label acme --label=gpu => not_found(10) missing-policy
+   8. repo remove-label acme/gadgets --label=gpu => not_found(10) missing-policy
+   9. repo add-label acme/gadgets --label=gpu => not_found(10) missing-policy
+  10. org set-scale acme --enabled=false => not_found(10) missing-policy
+  11. org remove acme --purge => not_found(10) missing-policy
+  12. status --json => ok(0)
+
+local-0042 fp=3fe9e34e63454f77 origin=curated fixture=standard
+  name: targets-are-case-insensitive-and-keep-their-spelling
+  contributes: pair:repo.add-label>org.add, pair:repo.add>repo.set-capacity, readback:org.set-scale>status.json, value:repo.add-label:target=case-variant
+   1. setup seed credential
+   2. repo add Acme/Widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   4. repo add-label Acme/Widgets --label=large-disk => ok(0)
+   5. repo list => ok(0)
+   6. org add ACME --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   7. org set-scale acme --enabled=true => ok(0)
+   8. org list => ok(0)
+   9. status --json => ok(0)
+
+local-0043 fp=69ff092b8abc5025 origin=curated fixture=standard
+  name: removal-then-re-add-starts-a-fresh-policy
+  contributes: pair:repo.set-workspace>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   4. repo remove acme/widgets => ok(0)
+   5. repo add acme/widgets --host-label=home => ok(0)
+   6. repo list => ok(0)
+   7. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   8. status --json => ok(0)
+
+local-0044 fp=b91d08ecb726d89d origin=curated fixture=standard
+  name: sign-out-then-sign-in-restores-add
+  contributes: pair:auth.login>repo.add
+   1. setup seed credential
+   2. auth logout => ok(0)
+   3. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => not_authenticated(3) not-authenticated
+   4. auth login => ok(0)
+   5. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   6. status --json => ok(0)
+
+local-0045 fp=c2564ab42ef530e1 origin=value fixture=standard
+  name: repo-add-target-second-account
+  contributes: value:repo.add:target=second-account
+   1. setup seed credential
+   2. repo add globex/portal --host-label=home --max-capacity=2 --label=gpu => ok(0)
+
+local-0046 fp=6fa7dbb8d8603ce4 origin=value fixture=standard
+  name: repo-add-max-capacity-zero
+  contributes: refusal:repo.add:zero-max-capacity, value:repo.add:max-capacity=zero
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=0 => invalid_argument(9) zero-max-capacity
+
+local-0047 fp=6fa7dcb8d8603e97 origin=value fixture=standard
+  name: repo-add-max-capacity-one-product-default
+  contributes: value:repo.add:max-capacity=one-product-default
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=1 => ok(0)
+
+local-0048 fp=1a8c3c1b6ae64da8 origin=value fixture=standard
+  name: repo-add-max-capacity-u16-max
+  contributes: value:repo.add:max-capacity=u16-max
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=65535 => ok(0)
+
+local-0049 fp=0897cd76e6aff435 origin=value fixture=standard
+  name: repo-add-with-label-case-variant
+  contributes: value:repo.add:label=case-variant
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=GPU => ok(0)
+
+local-0050 fp=dbfb8a1f37985149 origin=value fixture=standard
+  name: repo-add-with-label-too-long-257
+  contributes: refusal:repo.add:invalid-label, value:repo.add:label=too-long-257
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=<l*257> => invalid_argument(9) invalid-label
+
+local-0051 fp=9c9fc21bbbe83a65 origin=value fixture=standard
+  name: repo-add-with-label-separator
+  contributes: value:repo.add:label=separator
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu,fast => invalid_argument(9) invalid-label
+
+local-0052 fp=80e0919df1c2ce0d origin=value fixture=standard
+  name: repo-add-with-label-blank
+  contributes: value:repo.add:label=blank
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 '--label=   ' => invalid_argument(9) invalid-label
+
+local-0053 fp=309e1d08f3abb584 origin=value fixture=standard
+  name: repo-add-with-label-derived-host-label
+  contributes: value:repo.add:label=derived-host-label
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=rm-home-<os>-<arch> => ok(0)
+
+local-0054 fp=15746db23605aec4 origin=value fixture=standard
+  name: repo-add-with-label-derived-host-label-case-variant
+  contributes: value:repo.add:label=derived-host-label-case-variant
+   1. setup seed credential
+   2. repo add acme/widgets --host-label=home --max-capacity=2 --label=RM-HOME-<OS>-<ARCH> => ok(0)
+
+local-0055 fp=079f3cb076b7d4b3 origin=value fixture=standard
+  name: repo-set-capacity-target-second-account
+  contributes: value:repo.set-capacity:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity globex/portal --max-capacity=5 => not_found(10) missing-policy
+
+local-0056 fp=edf202e77bfbc149 origin=value fixture=standard
+  name: repo-set-capacity-target-case-variant
+  contributes: value:repo.set-capacity:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity Acme/Widgets --max-capacity=5 => ok(0)
+
+local-0057 fp=a3ff2c82f6aa7d28 origin=value fixture=standard
+  name: repo-set-capacity-target-budget-fleet
+  contributes: value:repo.set-capacity:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/fleet-01 --max-capacity=5 => not_found(10) missing-policy
+
+local-0058 fp=67b06d4d037feff8 origin=value fixture=standard
+  name: repo-set-capacity-target-not-installed
+  contributes: value:repo.set-capacity:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity outside/tools --max-capacity=5 => not_found(10) missing-policy
+
+local-0059 fp=1257e75a8cdc562b origin=value fixture=standard
+  name: repo-set-capacity-target-illegal-character
+  contributes: value:repo.set-capacity:target=illegal-character
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity 'acme/wid gets' --max-capacity=5 => invalid_argument(9) invalid-target
+
+local-0060 fp=9d4dedd50300bbfe origin=value fixture=standard
+  name: repo-set-scale-target-second-account
+  contributes: value:repo.set-scale:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale globex/portal --enabled=true => not_found(10) missing-policy
+
+local-0061 fp=60f0e9df469127e8 origin=value fixture=standard
+  name: repo-set-scale-target-case-variant
+  contributes: value:repo.set-scale:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale Acme/Widgets --enabled=true => ok(0)
+
+local-0062 fp=2fd4404f1c9cd351 origin=value fixture=standard
+  name: repo-set-scale-target-budget-fleet
+  contributes: value:repo.set-scale:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/fleet-01 --enabled=true => not_found(10) missing-policy
+
+local-0063 fp=ab38a5e816df4315 origin=value fixture=standard
+  name: repo-set-scale-target-not-installed
+  contributes: value:repo.set-scale:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale outside/tools --enabled=true => not_found(10) missing-policy
+
+local-0064 fp=6491f314b81fb80e origin=value fixture=standard
+  name: repo-set-scale-target-malformed
+  contributes: value:repo.set-scale:target=malformed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme --enabled=true => invalid_argument(9) invalid-target
+
+local-0065 fp=d5c7837786a8ee03 origin=value fixture=standard
+  name: repo-remove-label-ordinary
+  contributes: pair:repo.add>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0066 fp=c02b4376e94c7d23 origin=value fixture=standard
+  name: repo-remove-label-case-variant
+  contributes: value:repo.remove-label:label=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=GPU => ok(0)
+
+local-0067 fp=20427cd1c07346b3 origin=value fixture=standard
+  name: repo-remove-label-github-default-name
+  contributes: value:repo.remove-label:label=github-default-name
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=self-hosted => ok(0)
+
+local-0068 fp=a952874aa0deb9fe origin=value fixture=standard
+  name: repo-remove-label-boundary-256
+  contributes: value:repo.remove-label:label=boundary-256
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=<l*256> => ok(0)
+
+local-0069 fp=a956094aa0e1ccbb origin=value fixture=standard
+  name: repo-remove-label-too-long-257
+  contributes: value:repo.remove-label:label=too-long-257
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=<l*257> => invalid_argument(9) invalid-label
+
+local-0070 fp=d3edb203638b4b27 origin=value fixture=standard
+  name: repo-remove-label-separator
+  contributes: value:repo.remove-label:label=separator
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu,fast => invalid_argument(9) invalid-label
+
+local-0071 fp=38cb6ec94e48a51c origin=value fixture=standard
+  name: repo-add-label-blank
+  contributes: value:repo.add-label:label=blank
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets '--label=   ' => invalid_argument(9) invalid-label
+
+local-0072 fp=d963d05a113c963d origin=value fixture=standard
+  name: repo-add-label-derived-host-label-case-variant
+  contributes: value:repo.add-label:label=derived-host-label-case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=RM-HOME-<OS>-<ARCH> => ok(0)
+
+local-0073 fp=e101b05ed06c36f9 origin=value fixture=standard
+  name: repo-add-label-target-second-account
+  contributes: value:repo.add-label:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label globex/portal --label=large-disk => not_found(10) missing-policy
+
+local-0074 fp=6e20736a4283a781 origin=value fixture=standard
+  name: repo-remove-label-target-second-account
+  contributes: value:repo.remove-label:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label globex/portal --label=gpu => not_found(10) missing-policy
+
+local-0075 fp=cfafb006e6e730fd origin=value fixture=standard
+  name: repo-remove-target-second-account
+  contributes: value:repo.remove:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove globex/portal => not_found(10) missing-policy
+
+local-0076 fp=a28668c778955e03 origin=value fixture=standard
+  name: repo-remove-label-target-case-variant
+  contributes: value:repo.remove-label:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label Acme/Widgets --label=gpu => ok(0)
+
+local-0077 fp=063da86fcab8cae1 origin=value fixture=standard
+  name: repo-remove-target-case-variant
+  contributes: value:repo.remove:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove Acme/Widgets => ok(0)
+
+local-0078 fp=aedec85a1f21fa6a origin=value fixture=standard
+  name: repo-add-label-target-budget-fleet
+  contributes: value:repo.add-label:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/fleet-01 --label=large-disk => not_found(10) missing-policy
+
+local-0079 fp=e63d7020838fece8 origin=value fixture=standard
+  name: repo-remove-label-target-budget-fleet
+  contributes: value:repo.remove-label:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/fleet-01 --label=gpu => not_found(10) missing-policy
+
+local-0080 fp=a0904fa34a70d974 origin=value fixture=standard
+  name: repo-remove-target-budget-fleet
+  contributes: value:repo.remove:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove acme/fleet-01 => not_found(10) missing-policy
+
+local-0081 fp=82b6ab631d4e7d0e origin=value fixture=standard
+  name: repo-add-label-target-not-installed
+  contributes: value:repo.add-label:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label outside/tools --label=large-disk => not_found(10) missing-policy
+
+local-0082 fp=0727fc4c53e993b0 origin=value fixture=standard
+  name: repo-remove-label-target-not-installed
+  contributes: value:repo.remove-label:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label outside/tools --label=gpu => not_found(10) missing-policy
+
+local-0083 fp=883b1002e829f02c origin=value fixture=standard
+  name: repo-remove-target-not-installed
+  contributes: value:repo.remove:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove outside/tools => not_found(10) missing-policy
+
+local-0084 fp=454db38f0a415acf origin=value fixture=standard
+  name: repo-add-label-target-malformed
+  contributes: refusal:repo.add-label:invalid-target, value:repo.add-label:target=malformed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme --label=large-disk => invalid_argument(9) invalid-target
+
+local-0085 fp=a8d7c126564b5271 origin=value fixture=standard
+  name: repo-remove-label-target-malformed
+  contributes: refusal:repo.remove-label:invalid-target, value:repo.remove-label:target=malformed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme --label=gpu => invalid_argument(9) invalid-target
+
+local-0086 fp=15a680e5b714e473 origin=value fixture=standard
+  name: repo-remove-target-malformed
+  contributes: refusal:repo.remove:invalid-target, value:repo.remove:target=malformed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove acme => invalid_argument(9) invalid-target
+
+local-0087 fp=a782254e1b176039 origin=value fixture=standard
+  name: repo-add-label-target-illegal-character
+  contributes: value:repo.add-label:target=illegal-character
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label 'acme/wid gets' --label=large-disk => invalid_argument(9) invalid-target
+
+local-0088 fp=f37019151a44fc59 origin=value fixture=standard
+  name: repo-remove-label-target-illegal-character
+  contributes: value:repo.remove-label:target=illegal-character
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label 'acme/wid gets' --label=gpu => invalid_argument(9) invalid-target
+
+local-0089 fp=50e861146bdfde91 origin=value fixture=standard
+  name: repo-remove-target-illegal-character
+  contributes: value:repo.remove:target=illegal-character
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove 'acme/wid gets' => invalid_argument(9) invalid-target
+
+local-0090 fp=4bd55a0bf98a9ce2 origin=value fixture=standard
+  name: org-add-target-second-account
+  contributes: value:org.add:target=second-account
+   1. setup seed credential
+   2. org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+
+local-0091 fp=c510c210eed56af6 origin=value fixture=standard
+  name: org-add-host-label-case-variant
+  contributes: value:org.add:host-label=case-variant
+   1. setup seed credential
+   2. org add acme --host-label=Home --max-capacity=2 => ok(0)
+
+local-0092 fp=81215d62a0e6971c origin=value fixture=standard
+  name: org-add-host-label-boundary-64
+  contributes: value:org.add:host-label=boundary-64
+   1. setup seed credential
+   2. org add acme --host-label=host-<x*59> --max-capacity=2 => ok(0)
+
+local-0093 fp=b3fc313ef3cac2b8 origin=value fixture=standard
+  name: org-add-host-label-too-long-65
+  contributes: refusal:org.add:invalid-host-label, value:org.add:host-label=too-long-65
+   1. setup seed credential
+   2. org add acme --host-label=host-<x*60> --max-capacity=2 => invalid_argument(9) invalid-host-label
+
+local-0094 fp=608cec8c939e4fe3 origin=value fixture=standard
+  name: org-add-host-label-illegal-character
+  contributes: value:org.add:host-label=illegal-character
+   1. setup seed credential
+   2. org add acme '--host-label=home pc' --max-capacity=2 => invalid_argument(9) invalid-host-label
+
+local-0095 fp=5de254cb2424744f origin=value fixture=standard
+  name: org-add-host-label-illegal-edge
+  contributes: value:org.add:host-label=illegal-edge
+   1. setup seed credential
+   2. org add acme --host-label=home- --max-capacity=2 => invalid_argument(9) invalid-host-label
+
+local-0096 fp=764f6698c1f1f7b0 origin=value fixture=standard
+  name: org-add-max-capacity-zero
+  contributes: refusal:org.add:zero-max-capacity, value:org.add:max-capacity=zero
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=0 => invalid_argument(9) zero-max-capacity
+
+local-0097 fp=764f6798c1f1f963 origin=value fixture=standard
+  name: org-add-max-capacity-one-product-default
+  contributes: value:org.add:max-capacity=one-product-default
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=1 => ok(0)
+
+local-0098 fp=369ece9af3182141 origin=value fixture=standard
+  name: org-add-with-label-case-variant
+  contributes: value:org.add:label=case-variant
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=GPU => ok(0)
+
+local-0099 fp=d613af90098a7a60 origin=value fixture=standard
+  name: org-add-with-label-boundary-256
+  contributes: value:org.add:label=boundary-256
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=<l*256> => ok(0)
+
+local-0100 fp=d6173190098d8d1d origin=value fixture=standard
+  name: org-add-with-label-too-long-257
+  contributes: refusal:org.add:invalid-label, value:org.add:label=too-long-257
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=<l*257> => invalid_argument(9) invalid-label
+
+local-0101 fp=f61fb752cc607041 origin=value fixture=standard
+  name: org-add-with-label-separator
+  contributes: value:org.add:label=separator
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=gpu,fast => invalid_argument(9) invalid-label
+
+local-0102 fp=e6332cd1bd80cf29 origin=value fixture=standard
+  name: org-add-with-label-blank
+  contributes: value:org.add:label=blank
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 '--label=   ' => invalid_argument(9) invalid-label
+
+local-0103 fp=88a5fba745050e60 origin=value fixture=standard
+  name: org-add-with-label-derived-host-label
+  contributes: value:org.add:label=derived-host-label
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=rm-home-<os>-<arch> => ok(0)
+
+local-0104 fp=4ff0e1c2a766b320 origin=value fixture=standard
+  name: org-add-with-label-derived-host-label-case-variant
+  contributes: value:org.add:label=derived-host-label-case-variant
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=2 --label=RM-HOME-<OS>-<ARCH> => ok(0)
+
+local-0105 fp=c2112d66edc473bc origin=value fixture=standard
+  name: org-set-capacity-zero
+  contributes: refusal:org.set-capacity:zero-max-capacity, value:org.set-capacity:max-capacity=zero
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=0 => invalid_argument(9) zero-max-capacity
+
+local-0106 fp=c2112e66edc4756f origin=value fixture=standard
+  name: org-set-capacity-one-product-default
+  contributes: pair:org.add>org.set-capacity, value:org.set-capacity:max-capacity=one-product-default
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=1 => ok(0)
+
+local-0107 fp=c2112a66edc46ea3 origin=value fixture=standard
+  name: org-set-capacity-normal-other
+  contributes: value:org.set-capacity:max-capacity=normal-other
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=5 => ok(0)
+
+local-0108 fp=3925a86c985e21a0 origin=value fixture=standard
+  name: org-set-capacity-u16-max
+  contributes: value:org.set-capacity:max-capacity=u16-max
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=65535 => ok(0)
+
+local-0109 fp=c95f01963d58e30c origin=value fixture=standard
+  name: org-set-capacity-target-second-account
+  contributes: value:org.set-capacity:target=second-account
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity globex --max-capacity=5 => not_found(10) missing-policy
+
+local-0110 fp=b4622d60ad8e75e3 origin=value fixture=standard
+  name: org-set-capacity-target-case-variant
+  contributes: value:org.set-capacity:target=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity ACME --max-capacity=5 => ok(0)
+
+local-0111 fp=ffe05cc1ae92225c origin=value fixture=standard
+  name: org-set-capacity-target-not-installed
+  contributes: value:org.set-capacity:target=not-installed
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity outside --max-capacity=5 => not_found(10) missing-policy
+
+local-0112 fp=e28db610f82a314a origin=value fixture=standard
+  name: org-set-capacity-target-illegal-edge
+  contributes: refusal:org.set-capacity:invalid-target, value:org.set-capacity:target=illegal-edge
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme- --max-capacity=5 => invalid_argument(9) invalid-target
+
+local-0113 fp=f9b02dfc5eea0179 origin=value fixture=standard
+  name: org-set-scale-target-second-account
+  contributes: value:org.set-scale:target=second-account
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale globex --enabled=true => not_found(10) missing-policy
+
+local-0114 fp=be5b4be748762b86 origin=value fixture=standard
+  name: org-set-scale-target-case-variant
+  contributes: value:org.set-scale:target=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale ACME --enabled=true => ok(0)
+
+local-0115 fp=fc4338f8e82fc539 origin=value fixture=standard
+  name: org-set-scale-target-not-installed
+  contributes: value:org.set-scale:target=not-installed
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale outside --enabled=true => not_found(10) missing-policy
+
+local-0116 fp=6dd79882d80b409f origin=value fixture=standard
+  name: org-set-scale-target-illegal-edge
+  contributes: refusal:org.set-scale:invalid-target, value:org.set-scale:target=illegal-edge
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale acme- --enabled=true => invalid_argument(9) invalid-target
+
+local-0117 fp=f42c76e7126b1402 origin=value fixture=standard
+  name: org-add-label-ordinary
+  contributes: pair:org.add>org.add-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=gpu => ok(0)
+
+local-0118 fp=7dd9b31ce90be759 origin=value fixture=standard
+  name: org-remove-label-ordinary
+  contributes: pair:org.add>org.remove-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=gpu => ok(0)
+
+local-0119 fp=683db31c4bafe339 origin=value fixture=standard
+  name: org-remove-label-case-variant
+  contributes: value:org.remove-label:label=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=GPU => ok(0)
+
+local-0120 fp=98f7203613f46f82 origin=value fixture=standard
+  name: org-add-label-github-default-name
+  contributes: value:org.add-label:label=github-default-name
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=self-hosted => ok(0)
+
+local-0121 fp=0e892ef4d703bea7 origin=value fixture=standard
+  name: org-add-label-boundary-256
+  contributes: value:org.add-label:label=boundary-256
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=<l*256> => ok(0)
+
+local-0122 fp=8cb6302655384bd8 origin=value fixture=standard
+  name: org-remove-label-boundary-256
+  contributes: value:org.remove-label:label=boundary-256
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=<l*256> => ok(0)
+
+local-0123 fp=0e85acf4d700abea origin=value fixture=standard
+  name: org-add-label-too-long-257
+  contributes: refusal:org.add-label:invalid-label, value:org.add-label:label=too-long-257
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=<l*257> => invalid_argument(9) invalid-label
+
+local-0124 fp=8cb9b226553b5e95 origin=value fixture=standard
+  name: org-remove-label-too-long-257
+  contributes: refusal:org.remove-label:invalid-label, value:org.remove-label:label=too-long-257
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=<l*257> => invalid_argument(9) invalid-label
+
+local-0125 fp=90c4c88a3b268cf0 origin=value fixture=standard
+  name: org-add-label-separator
+  contributes: value:org.add-label:label=separator
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=gpu,fast => invalid_argument(9) invalid-label
+
+local-0126 fp=184ad15367d4c479 origin=value fixture=standard
+  name: org-remove-label-separator
+  contributes: value:org.remove-label:label=separator
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=gpu,fast => invalid_argument(9) invalid-label
+
+local-0127 fp=ff853c0e78e71862 origin=value fixture=standard
+  name: org-add-label-blank
+  contributes: value:org.add-label:label=blank
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme '--label=   ' => invalid_argument(9) invalid-label
+
+local-0128 fp=4a837d35a2d0df21 origin=value fixture=standard
+  name: org-remove-label-blank
+  contributes: value:org.remove-label:label=blank
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme '--label=   ' => invalid_argument(9) invalid-label
+
+local-0129 fp=df2dbf1d7cc0f21b origin=value fixture=standard
+  name: org-add-label-derived-host-label
+  contributes: value:org.add-label:label=derived-host-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=rm-home-<os>-<arch> => ok(0)
+
+local-0130 fp=801d1a3e1e36eadb origin=value fixture=standard
+  name: org-add-label-derived-host-label-case-variant
+  contributes: value:org.add-label:label=derived-host-label-case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=RM-HOME-<OS>-<ARCH> => ok(0)
+
+local-0131 fp=403e3f6d5dafd428 origin=value fixture=standard
+  name: org-remove-label-derived-host-label-case-variant
+  contributes: value:org.remove-label:label=derived-host-label-case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=RM-HOME-<OS>-<ARCH> => invalid_argument(9) derived-label-not-removable
+
+local-0132 fp=e8503a875f87cdc0 origin=value fixture=standard
+  name: org-add-several-labels
+  contributes: value:org.add-label:label-count=several
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=large-disk --label=self-hosted => ok(0)
+
+local-0133 fp=95171d73c46483f4 origin=value fixture=standard
+  name: org-add-label-target-second-account
+  contributes: value:org.add-label:target=second-account
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label globex --label=large-disk => not_found(10) missing-policy
+
+local-0134 fp=c08078ca45b6afbc origin=value fixture=standard
+  name: org-remove-label-target-second-account
+  contributes: value:org.remove-label:target=second-account
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label globex --label=gpu => not_found(10) missing-policy
+
+local-0135 fp=69ab2bbae72be88a origin=value fixture=standard
+  name: org-remove-target-second-account
+  contributes: value:org.remove:target=second-account
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove globex => not_found(10) missing-policy
+
+local-0136 fp=2beb314f40a171f7 origin=value fixture=standard
+  name: org-add-label-target-case-variant
+  contributes: value:org.add-label:target=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label ACME --label=large-disk => ok(0)
+
+local-0137 fp=0b07049a76f08619 origin=value fixture=standard
+  name: org-remove-label-target-case-variant
+  contributes: value:org.remove-label:target=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label ACME --label=gpu => ok(0)
+
+local-0138 fp=abab96126a7d037b origin=value fixture=standard
+  name: org-remove-target-case-variant
+  contributes: value:org.remove:target=case-variant
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove ACME => ok(0)
+
+local-0139 fp=058a99dc7f774802 origin=value fixture=standard
+  name: org-add-label-target-not-installed
+  contributes: value:org.add-label:target=not-installed
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label outside --label=large-disk => not_found(10) missing-policy
+
+local-0140 fp=ef245a550f90970c origin=value fixture=standard
+  name: org-remove-label-target-not-installed
+  contributes: value:org.remove-label:target=not-installed
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label outside --label=gpu => not_found(10) missing-policy
+
+local-0141 fp=a430d51b9078df40 origin=value fixture=standard
+  name: org-remove-target-not-installed
+  contributes: value:org.remove:target=not-installed
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove outside => not_found(10) missing-policy
+
+local-0142 fp=c68f29d305691af0 origin=value fixture=standard
+  name: org-add-label-target-illegal-edge
+  contributes: refusal:org.add-label:invalid-target, value:org.add-label:target=illegal-edge
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme- --label=large-disk => invalid_argument(9) invalid-target
+
+local-0143 fp=6f622f267cca7556 origin=value fixture=standard
+  name: org-remove-label-target-illegal-edge
+  contributes: refusal:org.remove-label:invalid-target, value:org.remove-label:target=illegal-edge
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme- --label=gpu => invalid_argument(9) invalid-target
+
+local-0144 fp=5804fd4fe8fac16f origin=value fixture=standard
+  name: repo-set-workspace-persistent-existing-parent
+  contributes: value:repo.set-workspace:path=existing-parent
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace acme/widgets --mode=persistent --path=<roots> => ok(0)
+
+local-0145 fp=44ffe132df2e4096 origin=value fixture=standard
+  name: repo-set-workspace-target-second-account
+  contributes: value:repo.set-workspace:target=second-account
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace globex/portal --mode=persistent --path=<roots>/beta => not_found(10) missing-policy
+
+local-0146 fp=88bb8c5f975f77c2 origin=value fixture=standard
+  name: repo-set-workspace-target-case-variant
+  contributes: value:repo.set-workspace:target=case-variant
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace Acme/Widgets --mode=persistent --path=<roots>/beta => ok(0)
+
+local-0147 fp=61f611cdd0364043 origin=value fixture=standard
+  name: repo-set-workspace-target-budget-fleet
+  contributes: value:repo.set-workspace:target=budget-fleet
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace acme/fleet-01 --mode=persistent --path=<roots>/beta => not_found(10) missing-policy
+
+local-0148 fp=1cc43e6d67857b17 origin=value fixture=standard
+  name: repo-set-workspace-target-not-installed
+  contributes: value:repo.set-workspace:target=not-installed
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace outside/tools --mode=persistent --path=<roots>/beta => not_found(10) missing-policy
+
+local-0149 fp=4774c73dd6678206 origin=value fixture=standard
+  name: repo-set-workspace-target-illegal-character
+  contributes: value:repo.set-workspace:target=illegal-character
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace 'acme/wid gets' --mode=persistent --path=<roots>/beta => invalid_argument(9) invalid-target
+
+local-0150 fp=76d1e05122b98658 origin=pair fixture=standard
+  name: chain auth.login > auth.logout > auth.login > host.set-capacity from fresh
+  contributes: pair:auth.login>auth.logout, pair:auth.login>host.set-capacity, pair:auth.logout>auth.login
+   1. auth login => ok(0)
+   2. auth logout => ok(0)
+   3. auth login => ok(0)
+   4. host set-capacity 1 => ok(0)
+
+local-0151 fp=90a3254e66c248d9 origin=pair fixture=standard
+  name: chain auth.login > host.set-runtime-root > auth.login > host.reset-runtime-root from fresh
+  contributes: pair:auth.login>host.reset-runtime-root, pair:auth.login>host.set-runtime-root, pair:host.set-runtime-root>auth.login, readback:host.reset-runtime-root>repo.list
+   1. auth login => ok(0)
+   2. host set-runtime-root --path=<roots>/alpha => ok(0)
+   3. auth login => ok(0)
+   4. host reset-runtime-root => ok(0)
+   5. repo list => ok(0)
+
+local-0152 fp=f1ebc9c80359e04e origin=pair fixture=standard
+  name: chain auth.login > repo.set-capacity > auth.login > repo.set-scale from one-repository
+  contributes: pair:auth.login>repo.set-capacity, pair:auth.login>repo.set-scale, pair:repo.add>auth.login, pair:repo.set-capacity>auth.login
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   5. auth login => ok(0)
+   6. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0153 fp=b2bb40942d404cc9 origin=pair fixture=standard
+  name: chain auth.login > repo.add-label > auth.login > repo.remove-label from one-repository
+  contributes: pair:auth.login>repo.add-label, pair:auth.login>repo.remove-label, pair:repo.add-label>auth.login
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. repo add-label acme/widgets --label=<l*256> => ok(0)
+   5. auth login => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0154 fp=be205d39928d1bf4 origin=pair fixture=standard
+  name: chain auth.login > repo.set-workspace > auth.login > repo.remove from one-repository
+  contributes: pair:auth.login>repo.remove, pair:auth.login>repo.set-workspace, pair:repo.set-workspace>auth.login, readback:repo.remove>host.show
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   5. auth login => ok(0)
+   6. repo remove acme/widgets --purge => ok(0)
+   7. host show => ok(0)
+
+local-0155 fp=6d30d03e3a17c3b5 origin=pair fixture=standard
+  name: chain auth.login > org.add > auth.login > org.set-capacity from fresh
+  contributes: pair:auth.login>org.add, pair:auth.login>org.set-capacity, pair:org.add>auth.login, readback:org.set-capacity>org.list
+   1. auth login => ok(0)
+   2. org add acme --host-label=home --max-capacity=1 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. org set-capacity acme --max-capacity=2 => ok(0)
+   5. org list => ok(0)
+
+local-0156 fp=65b04cf6b0b04c96 origin=pair fixture=standard
+  name: chain auth.login > org.set-scale > auth.login > org.add-label from one-organization
+  contributes: pair:auth.login>org.add-label, pair:auth.login>org.set-scale, pair:org.set-scale>auth.login
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. auth login => ok(0)
+   6. org add-label acme --label=<l*256> => ok(0)
+
+local-0157 fp=26d6c11fc0650a55 origin=pair fixture=standard
+  name: chain auth.login > org.remove-label > auth.login > org.remove from one-organization
+  contributes: pair:auth.login>org.remove, pair:auth.login>org.remove-label, pair:org.remove-label>auth.login, readback:org.remove>host.show
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth login => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. auth login => ok(0)
+   6. org remove acme --purge => ok(0)
+   7. host show => ok(0)
+
+local-0158 fp=0023223a4cd3d62b origin=pair fixture=standard
+  name: chain auth.logout > host.set-capacity > auth.login from fresh
+  contributes: pair:auth.logout>host.set-capacity, pair:host.set-capacity>auth.login
+   1. auth logout => ok(0)
+   2. host set-capacity 5 => ok(0)
+   3. auth login => ok(0)
+
+local-0159 fp=32017cae7e6f801c origin=pair fixture=standard
+  name: chain auth.logout > host.set-runtime-root > auth.logout > host.reset-runtime-root from fresh
+  contributes: pair:auth.logout>host.reset-runtime-root, pair:auth.logout>host.set-runtime-root, pair:host.set-runtime-root>auth.logout, readback:host.reset-runtime-root>org.list
+   1. auth logout => ok(0)
+   2. host set-runtime-root --path=<roots> => ok(0)
+   3. auth logout => ok(0)
+   4. host reset-runtime-root => ok(0)
+   5. org list => ok(0)
+
+local-0160 fp=2c6439e82bea7edc origin=pair fixture=standard
+  name: chain auth.logout > repo.set-capacity > auth.logout > repo.set-scale from one-repository
+  contributes: pair:auth.logout>repo.set-capacity, pair:auth.logout>repo.set-scale, pair:repo.set-capacity>auth.logout
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   5. auth logout => ok(0)
+   6. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0161 fp=c63915638cb08ccc origin=pair fixture=standard
+  name: chain auth.logout > repo.add-label > auth.logout > repo.remove-label from one-repository
+  contributes: pair:auth.logout>repo.add-label, pair:auth.logout>repo.remove-label, pair:repo.add-label>auth.logout
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. repo add-label acme/widgets --label=self-hosted => ok(0)
+   5. auth logout => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0162 fp=84c7abf46c6ff19b origin=pair fixture=standard
+  name: chain auth.logout > repo.set-workspace > auth.logout > repo.remove from one-repository
+  contributes: pair:auth.logout>repo.remove, pair:auth.logout>repo.set-workspace, pair:repo.set-workspace>auth.logout, readback:repo.remove>repo.list
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. auth logout => ok(0)
+   6. repo remove acme/widgets --purge => ok(0)
+   7. repo list => ok(0)
+
+local-0163 fp=2207846ecc444b6f origin=pair fixture=standard
+  name: chain auth.logout > org.set-capacity > auth.login from one-organization
+  contributes: pair:auth.logout>org.set-capacity, pair:org.add>auth.logout, pair:org.set-capacity>auth.login
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+   5. auth login => ok(0)
+
+local-0164 fp=1bc0e1c256de724e origin=pair fixture=standard
+  name: chain auth.logout > org.set-scale > auth.logout > org.add-label from one-organization
+  contributes: pair:auth.logout>org.add-label, pair:auth.logout>org.set-scale, pair:org.set-scale>auth.logout
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. auth logout => ok(0)
+   6. org add-label acme --label=<l*256> => ok(0)
+
+local-0165 fp=0339afd3e8667f6a origin=pair fixture=standard
+  name: chain auth.logout > org.remove-label > auth.logout > org.remove from one-organization
+  contributes: pair:auth.logout>org.remove, pair:auth.logout>org.remove-label, pair:org.remove-label>auth.logout, readback:org.remove>org.list
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. auth logout => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. auth logout => ok(0)
+   6. org remove acme --purge => ok(0)
+   7. org list => ok(0)
+
+local-0166 fp=ada0de5f61009547 origin=pair fixture=standard
+  name: chain host.set-capacity > auth.logout from fresh
+  contributes: pair:host.set-capacity>auth.logout
+   1. host set-capacity 2 => ok(0)
+   2. auth logout => ok(0)
+
+local-0167 fp=4a0f5cb24d3b8bea origin=pair fixture=standard
+  name: chain host.set-capacity > host.set-runtime-root > host.set-capacity > host.reset-runtime-root from fresh
+  contributes: pair:host.set-capacity>host.reset-runtime-root, pair:host.set-capacity>host.set-runtime-root, pair:host.set-runtime-root>host.set-capacity
+   1. host set-capacity 65535 => ok(0)
+   2. host set-runtime-root --path=<roots>/alpha => ok(0)
+   3. host set-capacity 5 => ok(0)
+   4. host reset-runtime-root => ok(0)
+
+local-0168 fp=62b8f74c99ea1e4c origin=pair fixture=standard
+  name: chain host.set-capacity > repo.set-scale > auth.login from one-repository
+  contributes: pair:host.set-capacity>repo.set-scale, pair:repo.add>host.set-capacity, pair:repo.set-scale>auth.login
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. auth login => ok(0)
+
+local-0169 fp=010d88db11f7ff00 origin=pair fixture=standard
+  name: chain host.set-capacity > repo.add-label > host.set-capacity > repo.remove-label from one-repository
+  contributes: pair:host.set-capacity>repo.add-label, pair:host.set-capacity>repo.remove-label, pair:repo.add-label>host.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. repo add-label acme/widgets --label=<l*256> => ok(0)
+   5. host set-capacity 1 => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0170 fp=bc85bc68dcd0e2d3 origin=pair fixture=standard
+  name: chain host.set-capacity > repo.set-workspace > host.set-capacity > org.add from one-repository
+  contributes: pair:host.set-capacity>org.add, pair:host.set-capacity>repo.set-workspace, pair:repo.set-workspace>host.set-capacity, readback:org.add>host.show
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 5 => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. host set-capacity 2 => ok(0)
+   6. org add acme --host-label=office --max-capacity=5 --label=gpu => ok(0)
+   7. host show => ok(0)
+
+local-0171 fp=b550827a0e5a3231 origin=pair fixture=standard
+  name: chain host.set-capacity > org.set-capacity > auth.logout from one-organization
+  contributes: pair:host.set-capacity>org.set-capacity, pair:org.set-capacity>auth.logout
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+   5. auth logout => ok(0)
+
+local-0172 fp=518fd06460a4d351 origin=pair fixture=standard
+  name: chain host.set-capacity > org.set-scale > host.set-runtime-root > repo.add from one-organization
+  contributes: pair:host.set-capacity>org.set-scale, pair:host.set-runtime-root>repo.add, pair:org.set-scale>host.set-runtime-root, readback:repo.add>host.show
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. host set-runtime-root --path=<roots>/beta => ok(0)
+   6. repo add acme/widgets --host-label=office --max-capacity=1 --label=gpu => ok(0)
+   7. host show => ok(0)
+
+local-0173 fp=2bf8c2afd9f0f7a3 origin=pair fixture=standard
+  name: chain host.set-capacity > org.add-label > auth.login from one-organization
+  contributes: pair:host.set-capacity>org.add-label, pair:org.add-label>auth.login
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. org add-label acme --label=large-disk => ok(0)
+   5. auth login => ok(0)
+
+local-0174 fp=4bd1e5d713d594b3 origin=pair fixture=standard
+  name: chain host.set-capacity > org.remove-label > host.set-capacity > org.remove from one-organization
+  contributes: pair:host.set-capacity>org.remove, pair:host.set-capacity>org.remove-label, pair:org.remove-label>host.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-capacity 2 => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. host set-capacity 5 => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0175 fp=86099dcaf1129002 origin=pair fixture=standard
+  name: chain host.set-runtime-root > repo.set-capacity > host.set-capacity from one-repository
+  contributes: pair:host.set-runtime-root>repo.set-capacity, pair:repo.set-capacity>host.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots>/alpha => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   5. host set-capacity 5 => ok(0)
+
+local-0176 fp=2f169ee38f14df6b origin=pair fixture=standard
+  name: chain host.set-runtime-root > repo.set-scale > auth.logout from one-repository
+  contributes: pair:host.set-runtime-root>repo.set-scale, pair:repo.set-scale>auth.logout
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots> => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. auth logout => ok(0)
+
+local-0177 fp=e4134a3587cdd68f origin=pair fixture=standard
+  name: chain host.set-runtime-root > repo.add-label > host.set-runtime-root > repo.remove-label from one-repository
+  contributes: pair:host.set-runtime-root>repo.add-label, pair:host.set-runtime-root>repo.remove-label, pair:repo.add-label>host.set-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots>/alpha => ok(0)
+   4. repo add-label acme/widgets --label=self-hosted => ok(0)
+   5. host set-runtime-root --path=<roots> => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0178 fp=3b0fd5f68acaea01 origin=pair fixture=standard
+  name: chain host.set-runtime-root > repo.remove > auth.login from one-repository
+  contributes: pair:host.set-runtime-root>repo.remove, pair:repo.remove>auth.login
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots>/beta => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. auth login => ok(0)
+
+local-0179 fp=d18535a7da769ca9 origin=pair fixture=standard
+  name: chain host.set-runtime-root > org.add > host.set-runtime-root > org.set-capacity from signed-in
+  contributes: pair:host.set-runtime-root>org.add, pair:host.set-runtime-root>org.set-capacity, pair:org.add>host.set-runtime-root, readback:org.set-capacity>status.json
+   1. setup seed credential
+   2. host set-runtime-root --path=<roots>/alpha => ok(0)
+   3. org add acme --host-label=office --max-capacity=5 --label=gpu => ok(0)
+   4. host set-runtime-root --path=<roots> => ok(0)
+   5. org set-capacity acme --max-capacity=2 => ok(0)
+   6. status --json => ok(0)
+
+local-0180 fp=d04f3d229b78fcb8 origin=pair fixture=standard
+  name: chain host.set-runtime-root > org.set-scale > host.reset-runtime-root > auth.login from one-organization
+  contributes: pair:host.reset-runtime-root>auth.login, pair:host.set-runtime-root>org.set-scale, pair:org.set-scale>host.reset-runtime-root
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots>/alpha => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. host reset-runtime-root => ok(0)
+   6. auth login => ok(0)
+
+local-0181 fp=6e43c79a992626bc origin=pair fixture=standard
+  name: chain host.set-runtime-root > org.add-label > auth.logout from one-organization
+  contributes: pair:host.set-runtime-root>org.add-label, pair:org.add-label>auth.logout
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots>/alpha => ok(0)
+   4. org add-label acme --label=self-hosted => ok(0)
+   5. auth logout => ok(0)
+
+local-0182 fp=88803315ceba46cd origin=pair fixture=standard
+  name: chain host.set-runtime-root > org.remove-label > host.set-runtime-root > org.remove from one-organization
+  contributes: pair:host.set-runtime-root>org.remove, pair:host.set-runtime-root>org.remove-label, pair:org.remove-label>host.set-runtime-root
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host set-runtime-root --path=<roots> => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. host set-runtime-root --path=<roots>/beta => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0183 fp=2568e10edc75da57 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > auth.logout from fresh
+  contributes: pair:host.reset-runtime-root>auth.logout
+   1. host reset-runtime-root => ok(0)
+   2. auth logout => ok(0)
+
+local-0184 fp=d15bbeb17b2385ac origin=pair fixture=standard
+  name: chain host.reset-runtime-root > host.set-capacity from fresh
+  contributes: pair:host.reset-runtime-root>host.set-capacity
+   1. host reset-runtime-root => ok(0)
+   2. host set-capacity 2 => ok(0)
+
+local-0185 fp=be9c86a827343947 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > repo.add > host.reset-runtime-root > repo.set-capacity from signed-in
+  contributes: pair:host.reset-runtime-root>repo.add, pair:host.reset-runtime-root>repo.set-capacity, pair:repo.add>host.reset-runtime-root, readback:repo.set-capacity>status.json
+   1. setup seed credential
+   2. host reset-runtime-root => ok(0)
+   3. repo add acme/widgets --host-label=home --max-capacity=5 --label=gpu => ok(0)
+   4. host reset-runtime-root => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=2 => ok(0)
+   6. status --json => ok(0)
+
+local-0186 fp=12af87b720081527 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > repo.set-scale > host.set-capacity from one-repository
+  contributes: pair:host.reset-runtime-root>repo.set-scale, pair:repo.set-scale>host.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. host set-capacity 5 => ok(0)
+
+local-0187 fp=5e9bc0afc431bcd5 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > repo.add-label > host.reset-runtime-root > repo.remove-label from one-repository
+  contributes: pair:host.reset-runtime-root>repo.add-label, pair:host.reset-runtime-root>repo.remove-label, pair:repo.add-label>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. repo add-label acme/widgets --label=large-disk => ok(0)
+   5. host reset-runtime-root => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0188 fp=d709106441fb6f51 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > repo.set-workspace > host.set-runtime-root from one-repository
+  contributes: pair:host.reset-runtime-root>repo.set-workspace, pair:repo.set-workspace>host.set-runtime-root, readback:host.set-runtime-root>repo.list
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. host set-runtime-root --path=<roots>/alpha => ok(0)
+   6. repo list => ok(0)
+
+local-0189 fp=da92fe430c2ca065 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > repo.remove > auth.logout from one-repository
+  contributes: pair:host.reset-runtime-root>repo.remove, pair:repo.remove>auth.logout
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. auth logout => ok(0)
+
+local-0190 fp=f64d58691c61d65d origin=pair fixture=standard
+  name: chain host.reset-runtime-root > org.add > host.reset-runtime-root > org.set-capacity from signed-in
+  contributes: pair:host.reset-runtime-root>org.add, pair:host.reset-runtime-root>org.set-capacity, pair:org.add>host.reset-runtime-root
+   1. setup seed credential
+   2. host reset-runtime-root => ok(0)
+   3. org add acme --host-label=home --max-capacity=5 --label=gpu => ok(0)
+   4. host reset-runtime-root => ok(0)
+   5. org set-capacity acme --max-capacity=2 => ok(0)
+
+local-0191 fp=34f40a2455cbe4d1 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > org.set-scale > repo.add > org.set-capacity from one-organization
+  contributes: pair:host.reset-runtime-root>org.set-scale, pair:org.set-scale>repo.add, pair:repo.add>org.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. repo add acme/widgets --host-label=office --max-capacity=65535 --label=gpu => ok(0)
+   6. org set-capacity acme --max-capacity=1 => ok(0)
+
+local-0192 fp=ea418d298b0d81b4 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > org.add-label > host.set-capacity from one-organization
+  contributes: pair:host.reset-runtime-root>org.add-label, pair:org.add-label>host.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. org add-label acme --label=self-hosted => ok(0)
+   5. host set-capacity 2 => ok(0)
+
+local-0193 fp=e98f9b010baae1e6 origin=pair fixture=standard
+  name: chain host.reset-runtime-root > org.remove-label > host.reset-runtime-root > org.remove from one-organization
+  contributes: pair:host.reset-runtime-root>org.remove, pair:host.reset-runtime-root>org.remove-label, pair:org.remove-label>host.reset-runtime-root
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. host reset-runtime-root => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. host reset-runtime-root => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0194 fp=ddc50b2faef93676 origin=pair fixture=standard
+  name: chain repo.add > org.set-scale > repo.set-capacity > host.set-runtime-root from one-organization
+  contributes: pair:org.add>repo.add, pair:org.set-scale>repo.set-capacity, pair:repo.add>org.set-scale, pair:repo.set-capacity>host.set-runtime-root, readback:host.set-runtime-root>org.list
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add acme/widgets --host-label=office --max-capacity=5 --label=gpu => ok(0)
+   4. org set-scale acme --enabled=true => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   6. host set-runtime-root --path=<roots> => ok(0)
+   7. org list => ok(0)
+
+local-0195 fp=3de0251e28d35079 origin=pair fixture=standard
+  name: chain repo.add > org.add-label > host.set-runtime-root from one-organization
+  contributes: pair:org.add-label>host.set-runtime-root, pair:repo.add>org.add-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add acme/widgets --host-label=home --max-capacity=5 --label=gpu => ok(0)
+   4. org add-label acme --label=large-disk => ok(0)
+   5. host set-runtime-root --path=<roots>/beta => ok(0)
+
+local-0196 fp=28650ac594d68f20 origin=pair fixture=standard
+  name: chain repo.add > org.remove-label > repo.add > org.remove from one-organization
+  contributes: pair:org.remove-label>repo.add, pair:repo.add>org.remove, pair:repo.add>org.remove-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add acme/widgets --host-label=office --max-capacity=1 --label=gpu => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. repo add acme/gadgets --host-label=office --max-capacity=1 --label=gpu => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0197 fp=632d82f8e08bdadf origin=pair fixture=standard
+  name: chain repo.set-capacity > host.reset-runtime-root from one-repository
+  contributes: pair:repo.set-capacity>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   4. host reset-runtime-root => ok(0)
+
+local-0198 fp=7e875db6784d1b22 origin=pair fixture=standard
+  name: chain repo.set-capacity > repo.add from one-repository
+  contributes: pair:repo.set-capacity>repo.add
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   4. repo add acme/gadgets --host-label=office --max-capacity=1 --label=gpu => ok(0)
+
+local-0199 fp=e2ec5b15f91e26dc origin=pair fixture=standard
+  name: chain repo.set-capacity > repo.set-scale > host.set-runtime-root from one-repository
+  contributes: pair:repo.set-capacity>repo.set-scale, pair:repo.set-scale>host.set-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. host set-runtime-root --path=<roots>/beta => ok(0)
+
+local-0200 fp=93747f183ba0d38f origin=pair fixture=standard
+  name: chain repo.set-capacity > repo.remove-label > auth.login from one-repository
+  contributes: pair:repo.remove-label>auth.login, pair:repo.set-capacity>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+   5. auth login => ok(0)
+
+local-0201 fp=7637774f464f6520 origin=pair fixture=standard
+  name: chain repo.set-capacity > repo.set-workspace > host.reset-runtime-root from one-repository
+  contributes: pair:repo.set-capacity>repo.set-workspace, pair:repo.set-workspace>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   5. host reset-runtime-root => ok(0)
+
+local-0202 fp=b0227aef926fc96c origin=pair fixture=standard
+  name: chain repo.set-capacity > org.add > repo.set-capacity > org.set-capacity from one-repository
+  contributes: pair:org.add>repo.set-capacity, pair:repo.set-capacity>org.add, pair:repo.set-capacity>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   4. org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   6. org set-capacity acme --max-capacity=5 => ok(0)
+
+local-0203 fp=5befb89caec48eee origin=pair fixture=standard
+  name: chain repo.set-capacity > org.set-scale > repo.set-scale > host.reset-runtime-root from repository-and-organization
+  contributes: pair:org.set-scale>repo.set-scale, pair:repo.set-capacity>org.set-scale, pair:repo.set-scale>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. repo set-scale acme/widgets --enabled=true => ok(0)
+   7. host reset-runtime-root => ok(0)
+
+local-0204 fp=e822474b07897cdf origin=pair fixture=standard
+  name: chain repo.set-capacity > org.add-label > host.reset-runtime-root from repository-and-organization
+  contributes: pair:org.add-label>host.reset-runtime-root, pair:repo.set-capacity>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. host reset-runtime-root => ok(0)
+
+local-0205 fp=5eefd004e77fecd0 origin=pair fixture=standard
+  name: chain repo.set-capacity > org.remove-label > repo.set-capacity > org.remove from repository-and-organization
+  contributes: pair:org.remove-label>repo.set-capacity, pair:repo.set-capacity>org.remove, pair:repo.set-capacity>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+   7. org remove acme --purge => ok(0)
+
+local-0206 fp=951f3e1d1e8c3b46 origin=pair fixture=standard
+  name: chain repo.set-scale > repo.add from one-repository
+  contributes: pair:repo.set-scale>repo.add
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo add acme/gadgets --host-label=office --max-capacity=65535 --label=gpu => ok(0)
+
+local-0207 fp=0154d468493b5553 origin=pair fixture=standard
+  name: chain repo.set-scale > repo.set-capacity from one-repository
+  contributes: pair:repo.set-scale>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=65535 => ok(0)
+
+local-0208 fp=d2cbc8f86252e386 origin=pair fixture=standard
+  name: chain repo.set-scale > repo.add-label > repo.add from one-repository
+  contributes: pair:repo.add-label>repo.add, pair:repo.set-scale>repo.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo add-label acme/widgets --label=self-hosted => ok(0)
+   5. repo add acme/gadgets --host-label=office --max-capacity=5 --label=gpu => ok(0)
+
+local-0209 fp=0f2d75ae85046582 origin=pair fixture=standard
+  name: chain repo.set-scale > repo.remove-label > auth.logout from one-repository
+  contributes: pair:repo.remove-label>auth.logout, pair:repo.set-scale>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+   5. auth logout => ok(0)
+
+local-0210 fp=4c588bdd1bef38ac origin=pair fixture=standard
+  name: chain repo.set-scale > repo.set-workspace > repo.add from one-repository
+  contributes: pair:repo.set-scale>repo.set-workspace, pair:repo.set-workspace>repo.add
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. repo add acme/gadgets --host-label=office --max-capacity=5 --label=gpu => ok(0)
+
+local-0211 fp=720c3f587facf088 origin=pair fixture=standard
+  name: chain repo.set-scale > repo.remove > host.set-capacity from one-repository
+  contributes: pair:repo.remove>host.set-capacity, pair:repo.set-scale>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-scale acme/widgets --enabled=true => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. host set-capacity 65535 => ok(0)
+
+local-0212 fp=d144960dbc8d8381 origin=pair fixture=standard
+  name: chain repo.set-scale > org.set-capacity > host.set-capacity from repository-and-organization
+  contributes: pair:org.add>repo.set-scale, pair:org.set-capacity>host.set-capacity, pair:repo.set-scale>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. org set-capacity acme --max-capacity=65535 => ok(0)
+   6. host set-capacity 65535 => ok(0)
+
+local-0213 fp=baf88637c0f213fd origin=pair fixture=standard
+  name: chain repo.set-scale > org.set-scale > repo.add-label > repo.set-capacity from repository-and-organization
+  contributes: pair:org.set-scale>repo.add-label, pair:repo.add-label>repo.set-capacity, pair:repo.set-scale>org.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. repo add-label acme/widgets --label=self-hosted => ok(0)
+   7. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+
+local-0214 fp=c009975cbb29f6d3 origin=pair fixture=standard
+  name: chain repo.set-scale > org.add-label > repo.add from repository-and-organization
+  contributes: pair:org.add-label>repo.add, pair:repo.set-scale>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. repo add acme/gadgets --host-label=home --max-capacity=1 --label=gpu => ok(0)
+
+local-0215 fp=62ad41b5beebfa8e origin=pair fixture=standard
+  name: chain repo.set-scale > org.remove-label > repo.set-scale > org.remove from repository-and-organization
+  contributes: invariant:disabled-survives-unrelated-commands, pair:org.remove-label>repo.set-scale, pair:repo.set-scale>org.remove, pair:repo.set-scale>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. repo set-scale acme/widgets --enabled=false => ok(0)
+   7. org remove acme --purge => ok(0)
+
+local-0216 fp=16c71c086d314b48 origin=pair fixture=standard
+  name: chain repo.add-label > repo.set-scale from one-repository
+  contributes: pair:repo.add-label>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=large-disk => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0217 fp=fb233dd192c9f137 origin=pair fixture=standard
+  name: chain repo.add-label > repo.set-workspace > repo.set-capacity from one-repository
+  contributes: pair:repo.add-label>repo.set-workspace, pair:repo.set-workspace>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=self-hosted => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+
+local-0218 fp=5e0358e95c7d234c origin=pair fixture=standard
+  name: chain repo.add-label > repo.remove > host.set-runtime-root from one-repository
+  contributes: pair:repo.add-label>repo.remove, pair:repo.remove>host.set-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo add-label acme/widgets --label=self-hosted => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. host set-runtime-root --path=<roots> => ok(0)
+
+local-0219 fp=aca2e90ea2fc6900 origin=pair fixture=standard
+  name: chain repo.add-label > org.set-capacity > host.set-runtime-root from repository-and-organization
+  contributes: pair:org.add>repo.add-label, pair:org.set-capacity>host.set-runtime-root, pair:repo.add-label>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo add-label acme/widgets --label=<l*256> => ok(0)
+   5. org set-capacity acme --max-capacity=1 => ok(0)
+   6. host set-runtime-root --path=<roots>/beta => ok(0)
+
+local-0220 fp=fe47656902720278 origin=pair fixture=standard
+  name: chain repo.add-label > org.set-scale > repo.remove-label > host.set-capacity from repository-and-organization
+  contributes: pair:org.set-scale>repo.remove-label, pair:repo.add-label>org.set-scale, pair:repo.remove-label>host.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo add-label acme/widgets --label=large-disk => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+   7. host set-capacity 65535 => ok(0)
+
+local-0221 fp=d46c49a0da1cf3c8 origin=pair fixture=standard
+  name: chain repo.add-label > org.add-label > repo.set-capacity from repository-and-organization
+  contributes: pair:org.add-label>repo.set-capacity, pair:repo.add-label>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo add-label acme/widgets --label=<l*256> => ok(0)
+   5. org add-label acme --label=<l*256> => ok(0)
+   6. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+
+local-0222 fp=cdbacdc49479a724 origin=pair fixture=standard
+  name: chain repo.add-label > org.remove-label > repo.add-label > org.remove from repository-and-organization
+  contributes: pair:org.remove-label>repo.add-label, pair:repo.add-label>org.remove, pair:repo.add-label>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo add-label acme/widgets --label=large-disk => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. repo add-label acme/widgets --label=self-hosted => ok(0)
+   7. org remove acme --purge => ok(0)
+
+local-0223 fp=f23c8a6fc27fb5f0 origin=pair fixture=standard
+  name: chain repo.remove-label > host.set-runtime-root from one-repository
+  contributes: pair:repo.remove-label>host.set-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. host set-runtime-root --path=<roots> => ok(0)
+
+local-0224 fp=788a58ccfcf54692 origin=pair fixture=standard
+  name: chain repo.remove-label > host.reset-runtime-root from one-repository
+  contributes: pair:repo.remove-label>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. host reset-runtime-root => ok(0)
+
+local-0225 fp=0c7eb64e6bd23411 origin=pair fixture=standard
+  name: chain repo.remove-label > repo.add from one-repository
+  contributes: pair:repo.remove-label>repo.add
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo add acme/gadgets --host-label=office --max-capacity=2 --label=gpu => ok(0)
+
+local-0226 fp=9f1e69980daf4467 origin=pair fixture=standard
+  name: chain repo.remove-label > repo.set-capacity from one-repository
+  contributes: pair:repo.remove-label>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+
+local-0227 fp=4352651670ea5f42 origin=pair fixture=standard
+  name: chain repo.remove-label > repo.set-scale from one-repository
+  contributes: pair:repo.remove-label>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0228 fp=ccc16a67f006870e origin=pair fixture=standard
+  name: chain repo.remove-label > repo.add-label from one-repository
+  contributes: pair:repo.remove-label>repo.add-label, readback:repo.add-label>status.json
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo add-label acme/widgets --label=self-hosted => ok(0)
+   5. status --json => ok(0)
+
+local-0229 fp=370389ceb830b5a5 origin=pair fixture=standard
+  name: chain repo.remove-label > repo.set-workspace > repo.set-scale from one-repository
+  contributes: pair:repo.remove-label>repo.set-workspace, pair:repo.set-workspace>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   5. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0230 fp=189aaf8c944a20f3 origin=pair fixture=standard
+  name: chain repo.remove-label > repo.remove > host.reset-runtime-root from one-repository
+  contributes: pair:repo.remove-label>repo.remove, pair:repo.remove>host.reset-runtime-root
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. host reset-runtime-root => ok(0)
+
+local-0231 fp=131b9eba6ad7b33a origin=pair fixture=standard
+  name: chain repo.remove-label > org.add > repo.remove-label > org.set-capacity from one-repository
+  contributes: pair:org.add>repo.remove-label, pair:repo.remove-label>org.add, pair:repo.remove-label>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo remove-label acme/widgets --label=gpu => ok(0)
+   4. org add acme --host-label=home --max-capacity=5 --label=gpu => ok(0)
+   5. repo remove-label acme/widgets --label=gpu => ok(0)
+   6. org set-capacity acme --max-capacity=2 => ok(0)
+
+local-0232 fp=e4aaedb871ce7b82 origin=pair fixture=standard
+  name: chain repo.remove-label > org.set-scale > repo.set-workspace > repo.add-label from repository-and-organization
+  contributes: pair:org.set-scale>repo.set-workspace, pair:repo.remove-label>org.set-scale, pair:repo.set-workspace>repo.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   7. repo add-label acme/widgets --label=large-disk => ok(0)
+
+local-0233 fp=18376c56912d4724 origin=pair fixture=standard
+  name: chain repo.remove-label > org.add-label > repo.set-scale from repository-and-organization
+  contributes: pair:org.add-label>repo.set-scale, pair:repo.remove-label>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+   5. org add-label acme --label=self-hosted => ok(0)
+   6. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0234 fp=2192e636a7328663 origin=pair fixture=standard
+  name: chain repo.remove-label > org.remove-label > repo.remove-label > org.remove from repository-and-organization
+  contributes: pair:org.remove-label>repo.remove-label, pair:repo.remove-label>org.remove, pair:repo.remove-label>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. repo remove-label acme/widgets --label=gpu => ok(0)
+   7. org remove acme --purge => ok(0)
+
+local-0235 fp=f7b0a1534c24d4c6 origin=pair fixture=standard
+  name: chain repo.set-workspace > repo.remove-label from one-repository
+  contributes: pair:repo.set-workspace>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   4. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0236 fp=950e36feb463e9ce origin=pair fixture=standard
+  name: chain repo.set-workspace > org.add > repo.set-workspace > org.set-capacity from one-repository
+  contributes: pair:org.add>repo.set-workspace, pair:repo.set-workspace>org.add, pair:repo.set-workspace>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   4. org add acme --host-label=office --max-capacity=65535 --label=gpu => ok(0)
+   5. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   6. org set-capacity acme --max-capacity=2 => ok(0)
+
+local-0237 fp=b7c0e5e8fffa975c origin=pair fixture=standard
+  name: chain repo.set-workspace > org.set-scale > repo.remove > org.add from repository-and-organization
+  contributes: pair:org.set-scale>repo.remove, pair:repo.remove>org.add, pair:repo.set-workspace>org.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. repo remove acme/widgets --purge => ok(0)
+   7. org add globex --host-label=office --max-capacity=2 --label=gpu => ok(0)
+
+local-0238 fp=338a3ae189c4a1b1 origin=pair fixture=standard
+  name: chain repo.set-workspace > org.add-label > repo.add-label from repository-and-organization
+  contributes: pair:org.add-label>repo.add-label, pair:repo.set-workspace>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. repo add-label acme/widgets --label=large-disk => ok(0)
+
+local-0239 fp=16901e2996d4fa95 origin=pair fixture=standard
+  name: chain repo.set-workspace > org.remove-label > repo.set-workspace > org.remove from repository-and-organization
+  contributes: pair:org.remove-label>repo.set-workspace, pair:repo.set-workspace>org.remove, pair:repo.set-workspace>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   7. org remove acme --purge => ok(0)
+
+local-0240 fp=e5ba5fb772a354aa origin=pair fixture=standard
+  name: chain repo.remove > repo.set-capacity from two-repositories
+  contributes: pair:repo.remove>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. repo set-capacity acme/gadgets --max-capacity=65535 => ok(0)
+
+local-0241 fp=9b2e26448a47db84 origin=pair fixture=standard
+  name: chain repo.remove > repo.set-scale from two-repositories
+  contributes: pair:repo.remove>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. repo set-scale acme/gadgets --enabled=true => ok(0)
+
+local-0242 fp=d530556acf235938 origin=pair fixture=standard
+  name: chain repo.remove > repo.add-label from two-repositories
+  contributes: pair:repo.remove>repo.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. repo add-label acme/gadgets --label=self-hosted => ok(0)
+
+local-0243 fp=d74dea2f9af9a907 origin=pair fixture=standard
+  name: chain repo.remove > repo.remove-label from two-repositories
+  contributes: pair:repo.remove>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. repo remove-label acme/gadgets --label=gpu => ok(0)
+
+local-0244 fp=bc3edb15c7157776 origin=pair fixture=standard
+  name: chain repo.remove > repo.set-workspace from two-repositories
+  contributes: pair:repo.remove>repo.set-workspace
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo add acme/gadgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. repo set-workspace acme/gadgets --mode=persistent --path=<roots>/beta => ok(0)
+
+local-0245 fp=7c12a46e090974bf origin=pair fixture=standard
+  name: chain repo.remove > org.set-capacity > host.reset-runtime-root from repository-and-organization
+  contributes: pair:org.set-capacity>host.reset-runtime-root, pair:repo.remove>org.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. org set-capacity acme --max-capacity=65535 => ok(0)
+   6. host reset-runtime-root => ok(0)
+
+local-0246 fp=d465d204159a9383 origin=pair fixture=standard
+  name: chain repo.remove > org.set-scale > org.add from repository-and-organization
+  contributes: pair:org.set-scale>org.add, pair:repo.remove>org.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. org set-scale acme --enabled=true => ok(0)
+   6. org add globex --host-label=home --max-capacity=1 --label=gpu => ok(0)
+
+local-0247 fp=df7fb8b605988040 origin=pair fixture=standard
+  name: chain repo.remove > org.add-label > org.add from repository-and-organization
+  contributes: pair:org.add-label>org.add, pair:repo.remove>org.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. org add globex --host-label=office --max-capacity=65535 --label=gpu => ok(0)
+
+local-0248 fp=69de690b16c507a2 origin=pair fixture=standard
+  name: chain repo.remove > org.remove-label > org.add from repository-and-organization
+  contributes: pair:org.remove-label>org.add, pair:repo.remove>org.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. repo remove acme/widgets --purge => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. org add globex --host-label=office --max-capacity=65535 --label=gpu => ok(0)
+
+local-0249 fp=6f2ed679c00f5f4a origin=pair fixture=standard
+  name: chain org.add > org.add from signed-in
+  contributes: pair:org.add>org.add
+   1. setup seed credential
+   2. org add acme --host-label=home --max-capacity=1 --label=gpu => ok(0)
+   3. org add globex --host-label=office --max-capacity=5 --label=gpu => ok(0)
+
+local-0250 fp=ad23a1bff4d4e781 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.add from one-organization
+  contributes: pair:org.set-capacity>repo.add
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=65535 => ok(0)
+   4. repo add acme/widgets --host-label=office --max-capacity=1 --label=gpu => ok(0)
+
+local-0251 fp=496e2509c75bdf70 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.set-capacity from repository-and-organization
+  contributes: pair:org.set-capacity>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=5 => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=1 => ok(0)
+
+local-0252 fp=40ff0354cfb7cb67 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.set-scale from repository-and-organization
+  contributes: pair:org.set-capacity>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=1 => ok(0)
+   5. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0253 fp=3dbd51226900fd53 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.add-label from repository-and-organization
+  contributes: pair:org.set-capacity>repo.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+   5. repo add-label acme/widgets --label=<l*256> => ok(0)
+
+local-0254 fp=f364c6f971ba6340 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.remove-label from repository-and-organization
+  contributes: pair:org.set-capacity>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=5 => ok(0)
+   5. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0255 fp=02103d853a79fcf2 origin=pair fixture=standard
+  name: chain org.set-capacity > repo.set-workspace from repository-and-organization
+  contributes: pair:org.set-capacity>repo.set-workspace
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+   5. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+
+local-0256 fp=e807bdc1f5e567ae origin=pair fixture=standard
+  name: chain org.set-capacity > repo.remove from repository-and-organization
+  contributes: pair:org.set-capacity>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+   5. repo remove acme/widgets --purge => ok(0)
+
+local-0257 fp=fc8fc9e7be25fff8 origin=pair fixture=standard
+  name: chain org.set-capacity > org.add from one-organization
+  contributes: pair:org.set-capacity>org.add
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=5 => ok(0)
+   4. org add globex --host-label=home --max-capacity=5 --label=gpu => ok(0)
+
+local-0258 fp=b9cfc230fd063519 origin=pair fixture=standard
+  name: chain org.set-capacity > org.set-capacity > org.add-label > org.set-capacity from one-organization
+  contributes: pair:org.add-label>org.set-capacity, pair:org.set-capacity>org.add-label, pair:org.set-capacity>org.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=5 => ok(0)
+   4. org set-capacity acme --max-capacity=2 => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. org set-capacity acme --max-capacity=65535 => ok(0)
+
+local-0259 fp=28d6158419e9b967 origin=pair fixture=standard
+  name: chain org.set-capacity > org.remove-label > org.set-capacity > org.remove from one-organization
+  contributes: pair:org.remove-label>org.set-capacity, pair:org.set-capacity>org.remove, pair:org.set-capacity>org.remove-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-capacity acme --max-capacity=65535 => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. org set-capacity acme --max-capacity=1 => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0260 fp=8295b7618f25a211 origin=pair fixture=standard
+  name: chain org.set-scale > org.set-capacity from one-organization
+  contributes: pair:org.set-scale>org.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale acme --enabled=true => ok(0)
+   4. org set-capacity acme --max-capacity=65535 => ok(0)
+
+local-0261 fp=eaa5b1b824984bc9 origin=pair fixture=standard
+  name: chain org.set-scale > org.set-scale > org.add-label > org.set-scale from one-organization
+  contributes: pair:org.add-label>org.set-scale, pair:org.set-scale>org.add-label, pair:org.set-scale>org.set-scale
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale acme --enabled=true => ok(0)
+   4. org set-scale acme --enabled=false => ok(0)
+   5. org add-label acme --label=large-disk => ok(0)
+   6. org set-scale acme --enabled=true => ok(0)
+
+local-0262 fp=9f21c47dfcfe8397 origin=pair fixture=standard
+  name: chain org.set-scale > org.remove-label > org.set-scale > org.remove from one-organization
+  contributes: pair:org.remove-label>org.set-scale, pair:org.set-scale>org.remove, pair:org.set-scale>org.remove-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org set-scale acme --enabled=true => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. org set-scale acme --enabled=false => ok(0)
+   6. org remove acme --purge => ok(0)
+
+local-0263 fp=ac19baa779966b2f origin=pair fixture=standard
+  name: chain org.add-label > repo.remove-label from repository-and-organization
+  contributes: pair:org.add-label>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org add-label acme --label=self-hosted => ok(0)
+   5. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0264 fp=08e36de8cfd860f9 origin=pair fixture=standard
+  name: chain org.add-label > repo.set-workspace from repository-and-organization
+  contributes: pair:org.add-label>repo.set-workspace
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org add-label acme --label=large-disk => ok(0)
+   5. repo set-workspace acme/widgets --mode=persistent --path=<roots>/beta => ok(0)
+
+local-0265 fp=a26087112a41d068 origin=pair fixture=standard
+  name: chain org.add-label > repo.remove from repository-and-organization
+  contributes: pair:org.add-label>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org add-label acme --label=self-hosted => ok(0)
+   5. repo remove acme/widgets --purge => ok(0)
+
+local-0266 fp=78721cfd17d65372 origin=pair fixture=standard
+  name: chain org.add-label > org.add-label > org.remove-label > org.add-label from one-organization
+  contributes: pair:org.add-label>org.add-label, pair:org.add-label>org.remove-label, pair:org.remove-label>org.add-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=<l*256> => ok(0)
+   4. org add-label acme --label=self-hosted => ok(0)
+   5. org remove-label acme --label=gpu => ok(0)
+   6. org add-label acme --label=large-disk => ok(0)
+
+local-0267 fp=7ffb7ef88a22efca origin=pair fixture=standard
+  name: chain org.add-label > org.remove > auth.login from one-organization
+  contributes: pair:org.add-label>org.remove, pair:org.remove>auth.login
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org add-label acme --label=self-hosted => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. auth login => ok(0)
+
+local-0268 fp=3ab045fce61efbb3 origin=pair fixture=standard
+  name: chain org.remove-label > repo.remove from repository-and-organization
+  contributes: pair:org.remove-label>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. repo remove acme/widgets --purge => ok(0)
+
+local-0269 fp=788779b0f9c4d3a0 origin=pair fixture=standard
+  name: chain org.remove-label > org.remove-label > org.remove > auth.logout from one-organization
+  contributes: pair:org.remove-label>org.remove, pair:org.remove-label>org.remove-label, pair:org.remove>auth.logout
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove-label acme --label=gpu => ok(0)
+   4. org remove-label acme --label=gpu => ok(0)
+   5. org remove acme --purge => ok(0)
+   6. auth logout => ok(0)
+
+local-0270 fp=e3c37c1069892ff2 origin=pair fixture=standard
+  name: chain org.remove > host.set-capacity from one-organization
+  contributes: pair:org.remove>host.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove acme --purge => ok(0)
+   4. host set-capacity 5 => ok(0)
+
+local-0271 fp=d67b7df28ef44acf origin=pair fixture=standard
+  name: chain org.remove > host.set-runtime-root from one-organization
+  contributes: pair:org.remove>host.set-runtime-root
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove acme --purge => ok(0)
+   4. host set-runtime-root --path=<roots> => ok(0)
+
+local-0272 fp=431f78eee093ec4f origin=pair fixture=standard
+  name: chain org.remove > host.reset-runtime-root from one-organization
+  contributes: pair:org.remove>host.reset-runtime-root
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove acme --purge => ok(0)
+   4. host reset-runtime-root => ok(0)
+
+local-0273 fp=6c23bd5c0c297133 origin=pair fixture=standard
+  name: chain org.remove > repo.set-capacity from repository-and-organization
+  contributes: pair:org.remove>repo.set-capacity
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo set-capacity acme/widgets --max-capacity=5 => ok(0)
+
+local-0274 fp=b8636e341a1b50ca origin=pair fixture=standard
+  name: chain org.remove > repo.set-scale from repository-and-organization
+  contributes: pair:org.remove>repo.set-scale
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo set-scale acme/widgets --enabled=true => ok(0)
+
+local-0275 fp=a82491755aac467f origin=pair fixture=standard
+  name: chain org.remove > repo.add-label from repository-and-organization
+  contributes: pair:org.remove>repo.add-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo add-label acme/widgets --label=<l*256> => ok(0)
+
+local-0276 fp=70309b47417aa86d origin=pair fixture=standard
+  name: chain org.remove > repo.remove-label from repository-and-organization
+  contributes: pair:org.remove>repo.remove-label
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo remove-label acme/widgets --label=gpu => ok(0)
+
+local-0277 fp=7c0f034d6a02d5c6 origin=pair fixture=standard
+  name: chain org.remove > repo.set-workspace from repository-and-organization
+  contributes: pair:org.remove>repo.set-workspace
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+
+local-0278 fp=7cc691ac1435750a origin=pair fixture=standard
+  name: chain org.remove > repo.remove from repository-and-organization
+  contributes: pair:org.remove>repo.remove
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. repo remove acme/widgets --purge => ok(0)
+
+local-0279 fp=12bf0f4ef8046d91 origin=pair fixture=standard
+  name: chain org.remove > org.add from one-organization
+  contributes: pair:org.remove>org.add
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. org remove acme --purge => ok(0)
+   4. org add acme --host-label=home --max-capacity=65535 --label=gpu => ok(0)
+
+local-0280 fp=0bb9e23e67df7d74 origin=pair fixture=standard
+  name: chain org.remove > org.set-capacity from two-organizations
+  contributes: pair:org.remove>org.set-capacity
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. org set-capacity globex --max-capacity=65535 => ok(0)
+
+local-0281 fp=d891b30bc78c2628 origin=pair fixture=standard
+  name: chain org.remove > org.set-scale from two-organizations
+  contributes: pair:org.remove>org.set-scale
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. org set-scale globex --enabled=true => ok(0)
+
+local-0282 fp=eb95fb463a451b61 origin=pair fixture=standard
+  name: chain org.remove > org.add-label from two-organizations
+  contributes: pair:org.remove>org.add-label
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. org add-label globex --label=<l*256> => ok(0)
+
+local-0283 fp=69734a646e8f13e5 origin=pair fixture=standard
+  name: chain org.remove > org.remove-label from two-organizations
+  contributes: pair:org.remove>org.remove-label, readback:org.remove-label>status.json
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. org remove-label globex --label=gpu => ok(0)
+   6. status --json => ok(0)
+
+local-0284 fp=676e005e3a4e9c76 origin=pair fixture=standard
+  name: chain org.remove > org.remove from two-organizations
+  contributes: pair:org.remove>org.remove
+   1. setup seed credential
+   2. setup org add acme --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup org add globex --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   4. org remove acme --purge => ok(0)
+   5. org remove globex --purge => ok(0)
+
+local-0285 fp=3e04f4acd26b0495 origin=curated fixture=standard
+  name: case-variant-owner-meets-its-own-persistent-root
+  contributes: deviation:owner-compared-case-sensitively
+   1. setup seed credential
+   2. setup repo add acme/widgets --host-label=home --max-capacity=2 --label=gpu => ok(0)
+   3. setup repo set-workspace acme/widgets --mode=persistent --path=<roots>/alpha => ok(0)
+   4. repo set-workspace Acme/Widgets --mode=persistent --path=<roots>/alpha => invalid_argument(9) overlaps-repository-root [deviation: owner-compared-case-sensitively]
+   5. repo list => ok(0)
+   6. status --json => ok(0)
