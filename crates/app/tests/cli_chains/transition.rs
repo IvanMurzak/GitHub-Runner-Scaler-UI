@@ -32,7 +32,7 @@ use super::model::{
     BUDGET_ALLOWANCE_PER_HOUR, DEFAULT_HOST_CAPACITY, HostModel, Installation, Mode, Model, Policy,
     PolicyState, Tally,
 };
-use super::values::{Capacity, LabelValue, OrgName, PathValue, Relation, RepoName, Scope};
+use super::values::{Capacity, HostLabelValue, LabelValue, PathValue, Relation, RepoName, Scope};
 
 // ---------------------------------------------------------------------------
 // Exit classes
@@ -731,9 +731,7 @@ impl<'a> Draft<'a> {
 
     /// A refusal. Every change drafted so far is discarded unless it is one
     /// the product really leaves behind, which is named as a deviation.
-    fn refuse(mut self, reason: Reason, fragment: impl Into<String>) -> Transition {
-        self.stderr.push("error: ".to_string());
-        self.stderr.push(fragment.into());
+    fn refuse(self, reason: Reason, fragment: impl Into<String>) -> Transition {
         let deviation = if self.deltas.is_empty() {
             None
         } else if self
@@ -745,6 +743,18 @@ impl<'a> Draft<'a> {
         } else {
             Some(Deviation::PartialCommitOnEnable)
         };
+        self.refuse_with(reason, fragment, deviation)
+    }
+
+    /// A refusal carrying an explicitly named deviation (or none).
+    fn refuse_with(
+        mut self,
+        reason: Reason,
+        fragment: impl Into<String>,
+        deviation: Option<Deviation>,
+    ) -> Transition {
+        self.stderr.push("error: ".to_string());
+        self.stderr.push(fragment.into());
         if let Some(deviation) = deviation {
             self.tags.push(format!("deviation:{}", deviation.slug()));
         }
@@ -867,26 +877,24 @@ fn root_refusal(
             });
         }
     }
-    match candidate {
-        PathValue::OccupiedFile => Some((
+    if candidate == PathValue::OccupiedFile {
+        return Some((
             Reason::ExistingFile,
             "already exists and is not a directory".to_string(),
             None,
-        )),
-        PathValue::DeepMissing => Some((
+        ));
+    }
+    let parents_missing = candidate == PathValue::DeepMissing
+        || candidate
+            .creatable_parent()
+            .is_some_and(|parent| !model.directory_exists(parent));
+    parents_missing.then(|| {
+        (
             Reason::MissingParents,
             "more than its last component is missing".to_string(),
             None,
-        )),
-        _ => match candidate.creatable_parent() {
-            Some(parent) if !model.directory_exists(parent) => Some((
-                Reason::MissingParents,
-                "more than its last component is missing".to_string(),
-                None,
-            )),
-            _ => None,
-        },
-    }
+        )
+    })
 }
 
 /// Who a root in the overlap set belongs to.
@@ -982,7 +990,7 @@ fn invalid_target(draft: Draft<'_>, target: Target) -> Transition {
     let fragment = match target {
         Target::Repo(RepoName::Malformed) => "OWNER/REPO",
         Target::Repo(_) => "a repository name",
-        Target::Org(OrgName::TrailingDash) | Target::Org(_) => "an organization login",
+        Target::Org(_) => "an organization login",
     };
     draft.refuse(Reason::InvalidTarget, fragment)
 }
@@ -990,6 +998,11 @@ fn invalid_target(draft: Draft<'_>, target: Target) -> Transition {
 fn missing_policy(draft: Draft<'_>, target: Target) -> Transition {
     let fragment = format!("no policy for {} exists", target.token());
     draft.refuse(Reason::MissingPolicy, fragment)
+}
+
+/// Every label folded, or `None` when the product refuses any one of them.
+fn fold_labels(labels: &[LabelValue]) -> Option<Vec<String>> {
+    labels.iter().map(|label| label.canonical()).collect()
 }
 
 /// The account a target belongs to: the owner of a repository, or the
@@ -1001,6 +1014,15 @@ fn account_of(key: &TargetKey) -> &str {
     }
 }
 
+/// Whether `model` holds a policy of the other scope in `key`'s account.
+fn other_scope_shares_account(model: &Model, key: &TargetKey) -> bool {
+    let account = account_of(key);
+    model
+        .policies
+        .keys()
+        .any(|other| other.scope != key.scope && account_of(other) == account)
+}
+
 fn add(mut draft: Draft<'_>, args: &AddArgs) -> Transition {
     let Some(key) = args.target.key() else {
         return invalid_target(draft, args.target);
@@ -1008,13 +1030,9 @@ fn add(mut draft: Draft<'_>, args: &AddArgs) -> Transition {
     let Some(host_label) = args.host_label.canonical() else {
         return draft.refuse(Reason::InvalidHostLabel, "a host label");
     };
-    let mut labels = Vec::new();
-    for label in &args.labels {
-        match label.canonical() {
-            Some(folded) => labels.push(folded),
-            None => return draft.refuse(Reason::InvalidLabel, "a label"),
-        }
-    }
+    let Some(labels) = fold_labels(&args.labels) else {
+        return draft.refuse(Reason::InvalidLabel, "a label");
+    };
     if args.max_capacity == Some(Capacity::Zero) {
         return draft.refuse(Reason::ZeroMaxCapacity, "max capacity must be at least 1");
     }
@@ -1093,18 +1111,12 @@ fn add(mut draft: Draft<'_>, args: &AddArgs) -> Transition {
     if draft.before.retained.contains_key(&key) {
         draft.tag("invariant:re-added-target-starts-fresh");
     }
-    let account = account_of(&key).to_string();
-    if draft
-        .before
-        .policies
-        .keys()
-        .any(|other| other.scope != key.scope && account_of(other) == account)
-    {
+    if other_scope_shares_account(draft.before, &key) {
         draft.tag("cross:repository-and-organization-policies-coexist");
     }
-    match args.host_label.class() {
-        "boundary-64" => draft.tag("boundary:host-label-64"),
-        "case-variant" => draft.tag("invariant:host-label-folds-case"),
+    match args.host_label {
+        HostLabelValue::Max64 => draft.tag("boundary:host-label-64"),
+        HostLabelValue::HomeCase => draft.tag("invariant:host-label-folds-case"),
         _ => {}
     }
     if args.labels.contains(&LabelValue::Max256) {
@@ -1291,13 +1303,9 @@ fn mutate_labels(
     let Some(key) = target.key() else {
         return invalid_target(draft, target);
     };
-    let mut folded = Vec::new();
-    for label in labels.values() {
-        match label.canonical() {
-            Some(value) => folded.push(value),
-            None => return draft.refuse(Reason::InvalidLabel, "a label"),
-        }
-    }
+    let Some(folded) = fold_labels(labels.values()) else {
+        return draft.refuse(Reason::InvalidLabel, "a label");
+    };
     let Some(policy) = draft.before.policies.get(&key).cloned() else {
         return missing_policy(draft, target);
     };
@@ -1414,14 +1422,11 @@ fn set_workspace(mut draft: Draft<'_>, repo: RepoName, setting: WorkspaceSetting
                 Some(RootOwner::Host) => draft.tag("cross:repository-root-overlaps-the-host-root"),
                 Some(RootOwner::Repository(display)) => {
                     if *display == policy.display {
-                        let mut refused = draft.refuse(reason, fragment);
-                        refused.deviation = Some(Deviation::OwnerComparedCaseSensitively);
-                        refused.tags.push(format!(
-                            "deviation:{}",
-                            Deviation::OwnerComparedCaseSensitively.slug()
-                        ));
-                        refused.tags.sort();
-                        return refused;
+                        return draft.refuse_with(
+                            reason,
+                            fragment,
+                            Some(Deviation::OwnerComparedCaseSensitively),
+                        );
                     }
                     draft.tag("invariant:repository-roots-never-overlap");
                 }
@@ -1488,13 +1493,7 @@ fn remove(mut draft: Draft<'_>, target: Target, purge: bool) -> Transition {
         key: key.clone(),
         policy,
     });
-    let account = account_of(&key).to_string();
-    if draft
-        .next
-        .policies
-        .keys()
-        .any(|other| other.scope != key.scope && account_of(other) == account)
-    {
+    if other_scope_shares_account(&draft.next, &key) {
         draft.tag("cross:removal-leaves-the-other-scope-policy");
     }
     if purge {
@@ -1551,16 +1550,6 @@ fn remove(mut draft: Draft<'_>, target: Target, purge: bool) -> Transition {
 /// not an arbitrary edit.
 pub fn seed(model: &Model, seed: &Seed) -> Result<Model, String> {
     let mut next = model.clone();
-    let policy_of = |next: &mut Model, target: &Target| -> Result<TargetKey, String> {
-        let key = target
-            .key()
-            .ok_or_else(|| format!("{} is not a valid target", target.token()))?;
-        if next.policies.contains_key(&key) {
-            Ok(key)
-        } else {
-            Err(format!("no policy for {key} to seed"))
-        }
-    };
     match seed {
         Seed::Credential => {
             if next.credential {
@@ -1569,8 +1558,7 @@ pub fn seed(model: &Model, seed: &Seed) -> Result<Model, String> {
             next.credential = true;
         }
         Seed::Attempt { target, kind } => {
-            let key = policy_of(&mut next, target)?;
-            let attempts = &mut next.policies.get_mut(&key).expect("checked").attempts;
+            let attempts = &mut seeded_policy(&mut next, target)?.attempts;
             match kind {
                 AttemptKind::Active => attempts.active += 1,
                 AttemptKind::AwaitingCleanup => attempts.awaiting_cleanup += 1,
@@ -1578,8 +1566,7 @@ pub fn seed(model: &Model, seed: &Seed) -> Result<Model, String> {
             }
         }
         Seed::RepairRequired(target) => {
-            let key = policy_of(&mut next, target)?;
-            let policy = next.policies.get_mut(&key).expect("checked");
+            let policy = seeded_policy(&mut next, target)?;
             if policy.state != PolicyState::Pending {
                 return Err(format!(
                     "only a pending policy can become repair_required, not {}",
@@ -1589,8 +1576,7 @@ pub fn seed(model: &Model, seed: &Seed) -> Result<Model, String> {
             policy.state = PolicyState::RepairRequired;
         }
         Seed::Drain(target) => {
-            let key = policy_of(&mut next, target)?;
-            let policy = next.policies.get_mut(&key).expect("checked");
+            let policy = seeded_policy(&mut next, target)?;
             if policy.state != PolicyState::Active {
                 return Err(format!(
                     "only an active policy can drain, not {}",
@@ -1608,6 +1594,17 @@ pub fn seed(model: &Model, seed: &Seed) -> Result<Model, String> {
         }
     }
     Ok(next)
+}
+
+/// The existing policy a seed addresses.
+fn seeded_policy<'m>(model: &'m mut Model, target: &Target) -> Result<&'m mut Policy, String> {
+    let key = target
+        .key()
+        .ok_or_else(|| format!("{} is not a valid target", target.token()))?;
+    model
+        .policies
+        .get_mut(&key)
+        .ok_or_else(|| format!("no policy for {key} to seed"))
 }
 
 // ---------------------------------------------------------------------------

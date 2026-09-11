@@ -1563,6 +1563,15 @@ fn action_candidates(kind: ActionKind, rng: &mut Rng) -> Vec<Action> {
     actions
 }
 
+/// The one spelling of a read leaf. Goes through [`action_candidates`] so the
+/// seeded generator advances exactly as it would for any other leaf.
+fn read_action(read: ActionKind, rng: &mut Rng) -> Action {
+    action_candidates(read, rng)
+        .into_iter()
+        .next()
+        .expect("every read has one spelling")
+}
+
 /// A successful action on `model`, preferring one that addresses `anchor` and
 /// one that changes something.
 fn best_success(
@@ -1642,10 +1651,7 @@ fn pair_chain(
             coverage::readback_relevant(current_kind, *read)
                 && !covered.contains(&coverage::readback_unit(current_kind, *read))
         }) {
-            steps.push(run(action_candidates(read, rng)
-                .into_iter()
-                .next()
-                .expect("every read has one spelling")));
+            steps.push(run(read_action(read, rng)));
         }
         let names: Vec<&str> = chain.iter().map(|kind| kind.name()).collect();
         return Some(Candidate {
@@ -1668,10 +1674,7 @@ fn readback_case(mutation: ActionKind, read: ActionKind, rng: &mut Rng) -> Optio
         let Some((action, _)) = best_success(&start, mutation, None, rng) else {
             continue;
         };
-        let reader = action_candidates(read, rng)
-            .into_iter()
-            .next()
-            .expect("every read has one spelling");
+        let reader = read_action(read, rng);
         return Some(Candidate {
             name: format!("readback {mutation} then {read} from {baseline}"),
             origin: Origin::Readback,
