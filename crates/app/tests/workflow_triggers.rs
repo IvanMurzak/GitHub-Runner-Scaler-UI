@@ -69,6 +69,7 @@
 // teach the scanner or to take the YAML dependency — not to relax a positive
 // assertion.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn workflow_path(name: &str) -> PathBuf {
@@ -455,6 +456,53 @@ fn ci_workflow_has_no_release_trigger() {
         "ci.yml must not trigger on pushed tags: that is a release trigger \
          under another name"
     );
+}
+
+#[test]
+fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point() {
+    let source = read_workflow("ci.yml");
+    let trigger_set: BTreeSet<String> = triggers(&source).into_iter().collect();
+    assert!(
+        trigger_set.contains("workflow_call"),
+        "release.yml reaches the ordinary gates through ci.yml's workflow_call entry point"
+    );
+
+    for (name, runner) in [
+        ("windows-x86_64", "windows-latest"),
+        ("macos-arm64", "macos-latest"),
+        ("linux-x86_64", "ubuntu-latest"),
+    ] {
+        assert!(
+            source
+                .lines()
+                .any(|line| line.trim() == format!("- name: {name}")),
+            "ci.yml's ordinary matrix is missing {name}"
+        );
+        assert!(
+            source
+                .lines()
+                .any(|line| line.trim() == format!("os: {runner}")),
+            "ci.yml's ordinary matrix is missing runner {runner}"
+        );
+    }
+
+    for command in [
+        "cargo metadata --locked --format-version 1 > /dev/null",
+        "cargo fmt --check",
+        "cargo build --workspace --all-features",
+        "bash tests/assert-no-shippable-mutants.sh --scan-only",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo nextest run --workspace",
+        "cargo test --doc --workspace",
+    ] {
+        assert!(
+            source.lines().any(|line| {
+                let line = line.trim();
+                line == command || line.strip_prefix("run: ") == Some(command)
+            }),
+            "ci.yml's ordinary three-OS job no longer runs `{command}`"
+        );
+    }
 }
 
 #[test]

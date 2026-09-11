@@ -31,14 +31,13 @@
 //    unconditionally, in the default `cargo nextest run --workspace`.
 //
 // ----------------------------------------------------------------------------
-// PROVISIONAL EVIDENCE FOR `Generated` ROWS.
+// FINAL CROSS-TRACK EVIDENCE.
 // ----------------------------------------------------------------------------
-// The generated local-chain suite (`crates/app/tests/cli_chains_acceptance.rs`,
-// tasks b2/b3) does not exist yet. Until it does, a `Generated` row cites the
-// existing real-process or in-process test that exercises the same leaf today;
-// `d1-cross-track-gates` replaces those paths with the exact generated-corpus
-// tests. They are still checked like every other row: a provisional path that
-// names no real test is as much a defect as a final one.
+// Every `Generated` row cites the default 256+ case real-process run plus the
+// checked-in inventory and pairwise-witness contracts. Every `Scripted` row
+// cites the default 32+ case WSL run plus its inventory contract. These shared
+// constants keep a leaf from quietly retaining pre-corpus evidence after the
+// corpus or its authoritative test is renamed.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -78,6 +77,7 @@ pub enum Boundary {
     SelfReplacingDownload,
     TerminalOwnership,
     WslPlatform,
+    LivePermissionProbe,
 }
 
 impl Boundary {
@@ -99,6 +99,9 @@ impl Boundary {
             Self::WslPlatform => {
                 "addresses real wsl.exe, distribution, and Task Scheduler state unless \
                  driven through the scripted WSL seam"
+            }
+            Self::LivePermissionProbe => {
+                "queries live GitHub permission state rather than only local persisted state"
             }
         }
     }
@@ -135,12 +138,9 @@ const fn at(file: &'static str, test: &'static str) -> Evidence {
     Evidence { file, test }
 }
 
-const AUTH_ONBOARDING: &str = "crates/app/tests/auth_onboarding.rs";
 const AUTH_STATES: &str = "crates/app/tests/auth_states.rs";
-const HOST_STATUS: &str = "crates/app/tests/host_capacity_and_status.rs";
-const WORKSPACE: &str = "crates/app/tests/workspace_commands.rs";
-const POLICY: &str = "crates/app/tests/policy_commands.rs";
-const NO_SECRET: &str = "crates/app/tests/no_secret_reaches_command_output.rs";
+const LOCAL_CHAIN_ACCEPTANCE: &str = "crates/app/tests/cli_chains_acceptance.rs";
+const LOCAL_CHAIN_MODEL: &str = "crates/app/tests/cli_chains_model.rs";
 const SURFACE_TESTS: &str = "crates/app/tests/cli_command_surface.rs";
 const DAEMON_UNIT: &str = "crates/app/src/cli/daemon.rs";
 const SERVICE_UNIT: &str = "crates/app/src/cli/service.rs";
@@ -150,6 +150,53 @@ const TUI_SHELL: &str = "crates/app/src/tui/shell.rs";
 const UPDATE: &str = "crates/app/tests/update_command.rs";
 const WSL_ACCEPTANCE: &str = "crates/app/src/cli/wsl_acceptance.rs";
 
+pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
+    at(
+        LOCAL_CHAIN_ACCEPTANCE,
+        "the_complete_local_corpus_agrees_with_the_model_through_real_processes",
+    ),
+    at(
+        LOCAL_CHAIN_MODEL,
+        "the_inventory_holds_at_least_256_meaningful_local_cases",
+    ),
+    at(
+        LOCAL_CHAIN_MODEL,
+        "every_compatible_mutating_pair_has_a_named_witness",
+    ),
+];
+
+pub const WSL_CHAIN_EVIDENCE: &[Evidence] = &[
+    at(
+        WSL_ACCEPTANCE,
+        "the_inventory_holds_at_least_32_distinct_named_cases_covering_every_state",
+    ),
+    at(
+        WSL_ACCEPTANCE,
+        "every_case_in_the_inventory_runs_exactly_once_and_matches_its_transitions",
+    ),
+];
+
+const fn generated(leaf: &'static str) -> Classification {
+    Classification {
+        leaf,
+        coverage: Coverage::Generated,
+        evidence: LOCAL_CHAIN_EVIDENCE,
+        exclusion: None,
+    }
+}
+
+const fn scripted(leaf: &'static str) -> Classification {
+    Classification {
+        leaf,
+        coverage: Coverage::Scripted,
+        evidence: WSL_CHAIN_EVIDENCE,
+        exclusion: Some(Exclusion {
+            boundary: Boundary::WslPlatform,
+            reason: WSL_REASON,
+        }),
+    }
+}
+
 const WSL_REASON: &str = "Every `wsl` leaf drives `wsl.exe` on the host (and `install` also \
      Task Scheduler and a credential device flow). Ordinary CI legs have no provisioned \
      distribution, so these run only through the scripted `Workstation` seam, never as \
@@ -158,24 +205,10 @@ const WSL_REASON: &str = "Every `wsl` leaf drives `wsl.exe` on the host (and `in
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
     // -- auth: sign-in state is modelled as credential presence -------------
-    Classification {
-        leaf: "auth login",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                AUTH_ONBOARDING,
-                "a_clean_machine_reaches_an_authenticated_tool_in_three_actions",
-            ),
-            at(
-                AUTH_ONBOARDING,
-                "the_login_shows_the_user_code_and_never_the_device_code",
-            ),
-        ],
-        exclusion: None,
-    },
+    generated("auth login"),
     Classification {
         leaf: "auth status",
-        coverage: Coverage::Generated,
+        coverage: Coverage::Dedicated,
         evidence: &[
             at(
                 AUTH_STATES,
@@ -186,215 +219,36 @@ pub const MANIFEST: &[Classification] = &[
                 "an_accepted_credential_reports_what_it_can_reach",
             ),
         ],
-        exclusion: None,
+        exclusion: Some(Exclusion {
+            boundary: Boundary::LivePermissionProbe,
+            reason: "Unlike the local model's credential-presence setup, `auth status` performs \
+                     live GitHub permission probes. Its dedicated loopback tests exercise those \
+                     responses without making the generated local corpus depend on GitHub.",
+        }),
     },
-    Classification {
-        leaf: "auth logout",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                AUTH_STATES,
-                "logout_leaves_no_token_and_names_the_authoritative_revocation",
-            ),
-            at(
-                AUTH_STATES,
-                "logout_on_a_host_that_was_never_signed_in_succeeds",
-            ),
-        ],
-        exclusion: None,
-    },
+    generated("auth logout"),
     // -- host ----------------------------------------------------------------
-    Classification {
-        leaf: "host set-capacity",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(HOST_STATUS, "set_capacity_persists_and_show_displays_it"),
-            at(
-                HOST_STATUS,
-                "set_capacity_refuses_zero_with_its_own_exit_code",
-            ),
-        ],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "host set-runtime-root",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                WORKSPACE,
-                "the_host_runner_root_round_trips_through_a_restarted_process",
-            ),
-            at(WORKSPACE, "two_configured_roots_may_not_overlap"),
-        ],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "host reset-runtime-root",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            WORKSPACE,
-            "the_host_runner_root_round_trips_through_a_restarted_process",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "host show",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            HOST_STATUS,
-            "host_show_displays_every_field_the_specification_names",
-        )],
-        exclusion: None,
-    },
+    generated("host set-capacity"),
+    generated("host set-runtime-root"),
+    generated("host reset-runtime-root"),
+    generated("host show"),
     // -- repo ----------------------------------------------------------------
-    Classification {
-        leaf: "repo add",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                POLICY,
-                "repository_and_organization_add_share_the_gateway_path_and_emit_label_specific_routing",
-            ),
-            at(
-                POLICY,
-                "scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label",
-            ),
-        ],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo list",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo set-capacity",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo set-scale",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                POLICY,
-                "scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label",
-            ),
-            at(
-                POLICY,
-                "explicit_boole_reach_repo_and_org_runtime_and_failures_redact_the_credential",
-            ),
-        ],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo add-label",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo remove-label",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo set-workspace",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                WORKSPACE,
-                "a_repository_round_trips_persistent_and_ephemeral_modes",
-            ),
-            at(
-                WORKSPACE,
-                "a_repository_workspace_change_is_refused_by_an_uncleaned_attempt_alone",
-            ),
-        ],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "repo remove",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "scripted_policy_flow_uses_read_only_github_and_preserves_each_requested_label",
-        )],
-        exclusion: None,
-    },
+    generated("repo add"),
+    generated("repo list"),
+    generated("repo set-capacity"),
+    generated("repo set-scale"),
+    generated("repo add-label"),
+    generated("repo remove-label"),
+    generated("repo set-workspace"),
+    generated("repo remove"),
     // -- org -----------------------------------------------------------------
-    Classification {
-        leaf: "org add",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "repository_and_organization_add_share_the_gateway_path_and_emit_label_specific_routing",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org list",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            WORKSPACE,
-            "persistent_configuration_is_absent_from_the_organization_commands",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org set-capacity",
-        coverage: Coverage::Generated,
-        evidence: &[at(NO_SECRET, "no_secret_reaches_the_output_of_any_command")],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org set-scale",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "explicit_boole_reach_repo_and_org_runtime_and_failures_redact_the_credential",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org add-label",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org remove-label",
-        coverage: Coverage::Generated,
-        evidence: &[at(
-            POLICY,
-            "add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes",
-        )],
-        exclusion: None,
-    },
-    Classification {
-        leaf: "org remove",
-        coverage: Coverage::Generated,
-        evidence: &[at(NO_SECRET, "no_secret_reaches_the_output_of_any_command")],
-        exclusion: None,
-    },
+    generated("org add"),
+    generated("org list"),
+    generated("org set-capacity"),
+    generated("org set-scale"),
+    generated("org add-label"),
+    generated("org remove-label"),
+    generated("org remove"),
     // -- daemon --------------------------------------------------------------
     Classification {
         leaf: "daemon run",
@@ -509,18 +363,7 @@ pub const MANIFEST: &[Classification] = &[
         }),
     },
     // -- status: the modelled readback ---------------------------------------
-    Classification {
-        leaf: "status",
-        coverage: Coverage::Generated,
-        evidence: &[
-            at(
-                HOST_STATUS,
-                "status_json_is_versioned_and_carries_no_credential",
-            ),
-            at(HOST_STATUS, "the_two_renderings_agree_about_the_same_host"),
-        ],
-        exclusion: None,
-    },
+    generated("status"),
     // -- update --------------------------------------------------------------
     Classification {
         leaf: "update",
@@ -541,39 +384,18 @@ pub const MANIFEST: &[Classification] = &[
         }),
     },
     // -- wsl: the scripted seam ----------------------------------------------
-    Classification {
-        leaf: "wsl list",
-        coverage: Coverage::Scripted,
-        evidence: &[
-            at(
-                WSL_ACCEPTANCE,
-                "a_fresh_distribution_becomes_a_healthy_managed_runner_host",
-            ),
-            at(
-                WSL_ACCEPTANCE,
-                "no_credential_reaches_stdout_stderr_logs_records_task_xml_argv_or_the_environment",
-            ),
-        ],
-        exclusion: Some(Exclusion {
-            boundary: Boundary::WslPlatform,
-            reason: WSL_REASON,
-        }),
-    },
+    scripted("wsl list"),
     Classification {
         leaf: "wsl install",
         coverage: Coverage::Scripted,
         evidence: &[
             at(
                 WSL_ACCEPTANCE,
-                "a_fresh_distribution_becomes_a_healthy_managed_runner_host",
+                "the_inventory_holds_at_least_32_distinct_named_cases_covering_every_state",
             ),
             at(
                 WSL_ACCEPTANCE,
-                "a_second_run_over_the_same_workstation_converges_and_changes_nothing",
-            ),
-            at(
-                WSL_ACCEPTANCE,
-                "every_injected_stage_failure_is_repaired_by_running_the_command_again",
+                "every_case_in_the_inventory_runs_exactly_once_and_matches_its_transitions",
             ),
             at(
                 PRIVILEGED_WSL,
@@ -585,30 +407,8 @@ pub const MANIFEST: &[Classification] = &[
             reason: WSL_REASON,
         }),
     },
-    Classification {
-        leaf: "wsl status",
-        coverage: Coverage::Scripted,
-        evidence: &[at(
-            WSL_ACCEPTANCE,
-            "status_states_the_login_availability_constraint_rather_than_leaving_it_to_a_reboot",
-        )],
-        exclusion: Some(Exclusion {
-            boundary: Boundary::WslPlatform,
-            reason: WSL_REASON,
-        }),
-    },
-    Classification {
-        leaf: "wsl detach",
-        coverage: Coverage::Scripted,
-        evidence: &[at(
-            WSL_ACCEPTANCE,
-            "detach_removes_the_windows_half_and_states_what_it_left_inside_linux",
-        )],
-        exclusion: Some(Exclusion {
-            boundary: Boundary::WslPlatform,
-            reason: WSL_REASON,
-        }),
-    },
+    scripted("wsl status"),
+    scripted("wsl detach"),
 ];
 
 /// The surface test that proves the hidden bridges stay reachable and hidden.
