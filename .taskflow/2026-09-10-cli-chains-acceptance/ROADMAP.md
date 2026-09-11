@@ -34,9 +34,9 @@ may overlap only when their `depends_on` entries are satisfied.
 | [a1-command-accountability](tasks/a1-command-accountability.md) | — | ./main | 8/4 | mid | ✅ | [PR #63](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/63) | 2026-09-10 |
 | [b1-local-model-corpus](tasks/b1-local-model-corpus.md) | — | ./main | 9/7 | top | ✅ | [PR #64](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/64) | 2026-09-10 |
 | [b2-local-chain-runner](tasks/b2-local-chain-runner.md) | b1 | ./main | 10/8 | top | ✅ | [PR #67](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/67) | 2026-09-10 |
-| [b3-local-corpus-security](tasks/b3-local-corpus-security.md) | b2 | ./main | 10/8 | top | 🔵 | implement-task manager | 2026-09-10 |
+| [b3-local-corpus-security](tasks/b3-local-corpus-security.md) | b2 | ./main | 10/8 | top | ✅ | [PR #68](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/68) | 2026-09-11 |
 | [c1-wsl-chain-corpus](tasks/c1-wsl-chain-corpus.md) | — | ./main | 9/7 | top | ✅ | [PR #65](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/65) | 2026-09-10 |
-| [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | Pending | — | 2026-09-10 |
+| [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | 🔵 | implement-task manager | 2026-09-11 |
 
 ## Review findings
 
@@ -63,3 +63,5 @@ may overlap only when their `depends_on` entries are satisfied.
 | 2026-09-10 | Execution wave 2 dispatched B2 through the `implement-task` pipeline in manager mode. |
 | 2026-09-10 | Execution wave 2 completed on green: B2 merged in PR #67 after the complete CI and E2E check rollup passed. |
 | 2026-09-10 | Execution wave 3 dispatched B3 through the `implement-task` pipeline in Codex-native manager mode. |
+| 2026-09-11 | Execution wave 3 completed on green: B3 merged in PR #68 after review fixes and all seven CI/E2E checks passed. |
+| 2026-09-11 | Execution wave 4 dispatched final cross-track task D1 through the `implement-task` pipeline in Codex-native manager mode. |
