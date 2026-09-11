@@ -566,6 +566,36 @@ runner-manager auth status --permissions
 | macOS | Apple Silicon, Intel |
 | Linux | x64, ARM64 (glibc; on musl, build from source) |
 
+## Development checks
+
+The ordinary local gate is the same one the Windows x64, macOS ARM64, and
+Linux x64 CI matrix runs for pull requests, pushes to `main`, and the release
+call path:
+
+```sh
+cargo metadata --locked --format-version 1 >/dev/null
+cargo fmt --check
+cargo build --workspace --all-features
+bash tests/assert-no-shippable-mutants.sh --scan-only
+cargo clippy --all-targets -- -D warnings
+cargo nextest run --workspace
+cargo test --doc --workspace
+```
+
+The default nextest command always runs the complete deterministic inventories:
+at least 256 local real-process chains and 32 mocked WSL chains. A selector can
+only add an ignored diagnostic replay; it cannot narrow the CI run. Replay one
+stable case with its first-divergence diagnostics and action transcript:
+
+```sh
+CLI_CHAINS_CASE=local-0007 cargo test -p runner-manager \
+  --test cli_chains_acceptance -- --ignored --exact replay_selected_case --nocapture
+
+RUNNER_MANAGER_WSL_CHAIN_CASE=wsl-0007 cargo test -p runner-manager \
+  --bin runner-manager cli::wsl::acceptance::chains::replay_one_wsl_chain_case \
+  -- --ignored --exact --nocapture
+```
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

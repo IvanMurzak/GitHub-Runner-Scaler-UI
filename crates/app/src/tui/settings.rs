@@ -3811,7 +3811,16 @@ mod tests {
         let message = ui.message.clone().expect("the success block");
         assert!(message.lines().count() > 1, "{message}");
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let width = 100;
+        let content_width = super::content_width(width);
+        let height = ui.rows(content_width, false).len()
+            + message
+                .lines()
+                .flat_map(|line| wrap(line, content_width))
+                .count()
+            + 2; // the bordered Settings block
+        let height = u16::try_from(height).expect("the test viewport fits in a u16");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| render(frame, frame.area(), &ui, false))
             .unwrap();

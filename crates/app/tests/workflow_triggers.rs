@@ -458,6 +458,66 @@ fn ci_workflow_has_no_release_trigger() {
 }
 
 #[test]
+fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point() {
+    let source = read_workflow("ci.yml");
+    assert!(
+        triggers(&source)
+            .into_iter()
+            .any(|trigger| trigger == "workflow_call"),
+        "release.yml reaches the ordinary gates through ci.yml's workflow_call entry point"
+    );
+
+    let check = locate(&source, &["jobs", "check"])
+        .expect("ci.yml must keep the ordinary three-OS gates in its `check` job");
+    assert!(
+        check.inline.is_empty() && !check.block.is_empty(),
+        "ci.yml's `check` job must be a non-empty block"
+    );
+    assert!(
+        check
+            .block
+            .iter()
+            .any(|(_, line)| line == "runs-on: ${{ matrix.os }}"),
+        "ci.yml's ordinary check job must actually run on its OS matrix"
+    );
+
+    for (name, runner) in [
+        ("windows-x86_64", "windows-latest"),
+        ("macos-arm64", "macos-latest"),
+        ("linux-x86_64", "ubuntu-latest"),
+    ] {
+        assert!(
+            check.block.windows(2).any(|pair| {
+                let [(name_indent, name_line), (runner_indent, runner_line)] = pair else {
+                    unreachable!("windows(2) always returns two entries")
+                };
+                name_line == &format!("- name: {name}")
+                    && runner_line == &format!("os: {runner}")
+                    && *runner_indent == *name_indent + 2
+            }),
+            "ci.yml's ordinary matrix is missing the {name} / {runner} entry"
+        );
+    }
+
+    for command in [
+        "cargo metadata --locked --format-version 1 > /dev/null",
+        "cargo fmt --check",
+        "cargo build --workspace --all-features",
+        "bash tests/assert-no-shippable-mutants.sh --scan-only",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo nextest run --workspace",
+        "cargo test --doc --workspace",
+    ] {
+        assert!(
+            check.block.iter().any(|(_, line)| {
+                line == command || line.strip_prefix("run: ") == Some(command)
+            }),
+            "ci.yml's ordinary `check` job no longer runs `{command}`"
+        );
+    }
+}
+
+#[test]
 fn e2e_workflow_has_no_release_trigger_and_runs_when_ci_runs() {
     let source = read_workflow("e2e.yml");
 

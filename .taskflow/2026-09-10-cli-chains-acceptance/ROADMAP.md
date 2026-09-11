@@ -24,6 +24,22 @@ The shared checkout is reserved for scheduling, review records, and this file.
 4. **Wave 4 — cross-track closure:** D1 starts only after A1, B3, and C1 are
    complete, then reconciles exact evidence mappings and all repository gates.
 
+## Cross-track evidence
+
+- The command-accountability manifest's generated rows cite the complete local
+  real-process corpus, its 256-case inventory contract, and its compatible-pair
+  witness contract. Its scripted rows cite the WSL inventory and exact-once
+  32-case corpus run; privileged service and Task Scheduler evidence remains in
+  the existing dedicated tests.
+- A join contract compares the generated manifest rows directly with the typed
+  local `ActionKind` inventory and the scripted rows with all four published WSL
+  leaves. The corpus tests themselves compare inventory IDs with executed IDs,
+  enforce stable identifiers and counts, and do not parse nextest output.
+- The ordinary workspace workflow runs the locked metadata, format, all-feature
+  build, mutation scan, clippy, nextest, and doc-test gates on Windows x64,
+  macOS ARM64, and Linux x64 for pull requests and main pushes. The release
+  workflow calls that same CI workflow rather than copying its matrix.
+
 Within group B, tasks run by ascending sequence and never overlap. Other groups
 may overlap only when their `depends_on` entries are satisfied.
 
@@ -65,3 +81,4 @@ may overlap only when their `depends_on` entries are satisfied.
 | 2026-09-10 | Execution wave 3 dispatched B3 through the `implement-task` pipeline in Codex-native manager mode. |
 | 2026-09-11 | Execution wave 3 completed on green: B3 merged in PR #68 after review fixes and all seven CI/E2E checks passed. |
 | 2026-09-11 | Execution wave 4 dispatched final cross-track task D1 through the `implement-task` pipeline in Codex-native manager mode. |
+| 2026-09-11 | D1 implementation replaced provisional manifest citations with the delivered local and WSL corpus tests, added typed inventory and three-OS workflow join contracts, and documented full-suite and stable-case replay commands. |

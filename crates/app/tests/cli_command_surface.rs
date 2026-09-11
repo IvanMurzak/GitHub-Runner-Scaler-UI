@@ -16,13 +16,17 @@
 // Deriving it from the clap tree would make this test agree with whatever the
 // tree says, which is the one thing it must not do.
 
+mod cli_chains;
 mod command_accountability;
 mod support;
 
+use std::collections::BTreeSet;
+
+use cli_chains::action::ActionKind;
 use command_accountability::{
-    Classification, Coverage, Defect, HIDDEN_BRIDGE_EVIDENCE, MANIFEST, NEVER_GENERATED,
-    Repository, architecture_defects, check_evidence, inventory_defects, justification_defects,
-    report,
+    Classification, Coverage, Defect, HIDDEN_BRIDGE_EVIDENCE, LOCAL_CHAIN_EVIDENCE, MANIFEST,
+    NEVER_GENERATED, Repository, WSL_CHAIN_EVIDENCE, architecture_defects, check_evidence,
+    inventory_defects, justification_defects, report,
 };
 use support::{run, runner_manager};
 
@@ -930,6 +934,69 @@ fn nothing_the_architecture_keeps_out_of_the_generator_is_classified_generated()
     }
     let defects = architecture_defects(MANIFEST);
     assert!(defects.is_empty(), "{}", report(&defects));
+}
+
+/// The final join between A's manifest and B/C's delivered inventories.
+///
+/// This compares typed/static contracts rather than nextest's console output:
+/// B and C's cited tests themselves own inventory size, stable identifiers,
+/// exact-once execution, and pairwise completeness.
+#[test]
+fn final_chain_evidence_matches_the_modelled_and_scripted_leaf_inventories() {
+    let modelled: BTreeSet<String> = ActionKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let [family, command] = kind.command_path();
+            if family == "status" {
+                family.to_string()
+            } else {
+                format!("{family} {command}")
+            }
+        })
+        .collect();
+    let classified: BTreeSet<String> = MANIFEST
+        .iter()
+        .filter(|row| row.coverage == Coverage::Generated)
+        .map(|row| row.leaf.to_string())
+        .collect();
+    assert_eq!(
+        classified, modelled,
+        "the Generated manifest rows must be exactly the typed local action grammar"
+    );
+
+    for row in MANIFEST
+        .iter()
+        .filter(|row| row.coverage == Coverage::Generated)
+    {
+        assert_eq!(
+            row.evidence, LOCAL_CHAIN_EVIDENCE,
+            "{} retained provisional pre-corpus evidence",
+            row.leaf
+        );
+    }
+
+    let scripted: BTreeSet<&str> = MANIFEST
+        .iter()
+        .filter(|row| row.coverage == Coverage::Scripted)
+        .map(|row| row.leaf)
+        .collect();
+    assert_eq!(
+        scripted,
+        BTreeSet::from(["wsl list", "wsl install", "wsl status", "wsl detach"]),
+        "the Scripted rows must be exactly the published WSL command leaves"
+    );
+    for row in MANIFEST
+        .iter()
+        .filter(|row| row.coverage == Coverage::Scripted)
+    {
+        for evidence in WSL_CHAIN_EVIDENCE {
+            assert!(
+                row.evidence.contains(evidence),
+                "{} does not cite the WSL inventory and exact-once corpus run",
+                row.leaf
+            );
+        }
+    }
 }
 
 // Controls. The real manifest passes the checks above, which proves nothing
