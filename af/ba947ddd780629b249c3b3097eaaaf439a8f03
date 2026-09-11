@@ -1,0 +1,51 @@
+crates/app/tests/cli_chains_acceptance.rs
+  s_f0095ead781cdd::t_5ebce9e5362348 1-536,540-541
+  s_f0095ead781cdd::t_25259e8ce66492 537-539,542-574
+crates/app/tests/cli_chains_runner/scenario.rs
+  s_f0095ead781cdd::t_d27c02a68513a9 1-501
+crates/app/tests/cli_chains_runner/observe.rs
+  s_f0095ead781cdd::t_401da1fafc976c 33
+  s_f0095ead781cdd::t_cf59fc80a0b8a2 1-32,34-324
+  s_f0095ead781cdd::t_76ad9b67b6c6a9 325-346
+crates/app/tests/cli_chains_runner/run.rs
+  s_f0095ead781cdd::t_4c3fe405f725df 1-280
+  s_f0095ead781cdd::t_e01943af782397 281-287
+crates/app/tests/support/mod.rs
+  s_f0095ead781cdd::t_e1931a09c04d7b 233-245
+  s_f0095ead781cdd::t_c1fd218ae826e1 390-407,409-419,423,425-427,429-446
+crates/app/tests/cli_chains_runner/report.rs
+  s_f0095ead781cdd::t_2d7efac9577a74 1-186,188
+  s_f0095ead781cdd::t_6f19434c8792ba 187,189-194
+crates/app/tests/cli_chains_runner/oracle.rs
+  s_f0095ead781cdd::t_14a6458ba8093c 1-469
+  s_f0095ead781cdd::t_47ad4f59a38bc5 470-479
+crates/app/tests/cli_chains_runner/mod.rs
+  s_f0095ead781cdd::t_11118e4f2f5b1a 1-43
+crates/app/tests/cli_chains_runner/confinement.rs
+  s_f0095ead781cdd::t_00fd8128f72304 67-77
+  s_f0095ead781cdd::t_4adb6e83f022b9 1-34,36-66,78-143
+  s_f0095ead781cdd::t_01bbcc2f1cdc6a 35
+  s_f0095ead781cdd::t_eba777cd064837 144-159
+crates/app/tests/cli_chains_runner/selection.rs
+  s_f0095ead781cdd::t_0648e1dabcc920 1-8,13-50,61-178,180-183,185-186
+  s_f0095ead781cdd::t_55f9a9a59d5e69 51-60
+  s_f0095ead781cdd::t_f8a362bf4681e4 9-12
+  s_f0095ead781cdd::t_bfd82ce79bf845 179
+  s_f0095ead781cdd::t_59dae5b89b1f76 184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "afba947ddd780629b249c3b3097eaaaf439a8f03",
+  "prompts": {},
+  "sessions": {
+    "s_f0095ead781cdd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9e88292e-3620-4b89-92cb-cf548bcaef93",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
