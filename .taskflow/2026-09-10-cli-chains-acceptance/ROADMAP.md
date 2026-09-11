@@ -33,7 +33,7 @@ may overlap only when their `depends_on` entries are satisfied.
 |---|---|---|---|---|---|---|---|
 | [a1-command-accountability](tasks/a1-command-accountability.md) | — | ./main | 8/4 | mid | ✅ | [PR #63](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/63) | 2026-09-10 |
 | [b1-local-model-corpus](tasks/b1-local-model-corpus.md) | — | ./main | 9/7 | top | ✅ | [PR #64](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/64) | 2026-09-10 |
-| [b2-local-chain-runner](tasks/b2-local-chain-runner.md) | b1 | ./main | 10/8 | top | Pending | — | 2026-09-10 |
+| [b2-local-chain-runner](tasks/b2-local-chain-runner.md) | b1 | ./main | 10/8 | top | 🔵 | implement-task manager | 2026-09-10 |
 | [b3-local-corpus-security](tasks/b3-local-corpus-security.md) | b2 | ./main | 10/8 | top | Pending | — | 2026-09-10 |
 | [c1-wsl-chain-corpus](tasks/c1-wsl-chain-corpus.md) | — | ./main | 9/7 | top | ✅ | [PR #65](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/65) | 2026-09-10 |
 | [d1-cross-track-gates](tasks/d1-cross-track-gates.md) | a1, b3, c1 | ./main | 9/5 | top | Pending | — | 2026-09-10 |
@@ -60,3 +60,4 @@ may overlap only when their `depends_on` entries are satisfied.
 | 2026-09-10 | `taskflow-tasks` derived six immutable specs in four conflict domains. Wave 1 can run A1, B1, and C1 concurrently; B2/B3 are sequential; D1 is the final join gate. |
 | 2026-09-10 | Execution wave 1 dispatched through the `implement-task` pipeline in manager mode with parallelism 3. |
 | 2026-09-10 | Execution wave 1 completed on green: A1 merged in PR #63, B1 in PR #64, and C1 in PR #65. Baseline blocker #66 was superseded by upstream release commit c63780c and closed without landing duplicate work. |
+| 2026-09-10 | Execution wave 2 dispatched B2 through the `implement-task` pipeline in manager mode. |
