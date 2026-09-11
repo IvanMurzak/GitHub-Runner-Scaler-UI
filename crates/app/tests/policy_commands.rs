@@ -342,11 +342,8 @@ fn add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes()
         let add = label("add-label", "gpu");
         assert_eq!(add.code, 0, "{scope} add-label: {}", add.both());
         assert!(add.stdout.contains("now answers: gpu"), "{}", add.stdout);
-        assert!(
-            stored().iter().any(|label| label == "gpu"),
-            "{:?}",
-            stored()
-        );
+        let labels = stored();
+        assert!(labels.iter().any(|label| label == "gpu"), "{labels:?}");
 
         let again = label("add-label", "gpu");
         assert_eq!(again.code, 0, "{scope} add-label again: {}", again.both());
@@ -367,7 +364,8 @@ fn add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes()
             "{scope} remove-label must refuse the host label: {}",
             refused.both()
         );
-        assert!(stored().contains(&host_label), "{:?}", stored());
+        let labels = stored();
+        assert!(labels.contains(&host_label), "{labels:?}");
 
         let remove = label("remove-label", "gpu");
         assert_eq!(remove.code, 0, "{scope} remove-label: {}", remove.both());
@@ -376,10 +374,7 @@ fn add_label_and_remove_label_change_the_stored_routing_labels_for_both_scopes()
             "{}",
             remove.stdout
         );
-        assert!(
-            !stored().iter().any(|label| label == "gpu"),
-            "{:?}",
-            stored()
-        );
+        let labels = stored();
+        assert!(!labels.iter().any(|label| label == "gpu"), "{labels:?}");
     }
 }

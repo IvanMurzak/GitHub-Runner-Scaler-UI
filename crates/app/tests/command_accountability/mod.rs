@@ -1023,17 +1023,12 @@ fn harness_selects(line: &str, test: &str) -> bool {
             filter => filters.push(filter),
         }
     }
-    let unquote = |pattern: &str| {
-        pattern
-            .trim_matches(|quote| quote == '\'' || quote == '"')
-            .to_string()
-    };
     let matches = |pattern: &&str| {
-        let pattern = unquote(pattern);
+        let pattern = pattern.trim_matches(['\'', '"']);
         if exact {
             test == pattern
         } else {
-            test.contains(&pattern)
+            test.contains(pattern)
         }
     };
     (filters.is_empty() || filters.iter().any(matches)) && !skips.iter().any(matches)

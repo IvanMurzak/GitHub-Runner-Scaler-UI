@@ -819,6 +819,13 @@ fn inventory(manifest: &[Classification]) -> Vec<Defect> {
     inventory_defects(&published_leaves(), &hidden_leaves(), manifest)
 }
 
+/// The checked-out repository, which the evidence checks read.
+fn repository() -> Repository {
+    Repository {
+        root: repository_root(),
+    }
+}
+
 #[test]
 fn every_published_leaf_has_exactly_one_reviewed_classification() {
     let published = published_leaves();
@@ -833,10 +840,7 @@ fn every_published_leaf_has_exactly_one_reviewed_classification() {
 
 #[test]
 fn every_classification_cites_real_evidence_and_a_concrete_boundary() {
-    let repository = Repository {
-        root: repository_root(),
-    };
-    let defects = justification_defects(MANIFEST, &repository);
+    let defects = justification_defects(MANIFEST, &repository());
     assert!(
         defects.is_empty(),
         "every row must cite existing tests, and every exclusion from generated \
@@ -896,10 +900,7 @@ fn the_hidden_bridges_are_covered_outside_the_public_inventory() {
         );
     }
 
-    let repository = Repository {
-        root: repository_root(),
-    };
-    let test = check_evidence(&HIDDEN_BRIDGE_EVIDENCE, &repository).unwrap_or_else(|why| {
+    let test = check_evidence(&HIDDEN_BRIDGE_EVIDENCE, &repository()).unwrap_or_else(|why| {
         panic!(
             "the hidden bridges' evidence `{}::{}` is not a real test: {why}",
             HIDDEN_BRIDGE_EVIDENCE.file, HIDDEN_BRIDGE_EVIDENCE.test
@@ -1051,10 +1052,7 @@ fn flipping_an_excluded_leaf_to_generated_is_caught() {
         }
     });
     assert!(inventory(&flipped).is_empty());
-    let repository = Repository {
-        root: repository_root(),
-    };
-    assert!(justification_defects(&flipped, &repository).is_empty());
+    assert!(justification_defects(&flipped, &repository()).is_empty());
     assert_eq!(
         architecture_defects(&flipped),
         [Defect::GeneratedAgainstArchitecture {
