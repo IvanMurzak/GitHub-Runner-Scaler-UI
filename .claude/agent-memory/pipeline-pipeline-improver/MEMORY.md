@@ -1,0 +1,1 @@
+- [implement-task is fully frozen](project_implement_task_frozen.md) — all steps self_improve:false; retro passes no frozen_files; refuse + relay fixes for main
