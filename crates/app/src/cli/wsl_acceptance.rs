@@ -2086,26 +2086,27 @@ mod chains {
                 .last()
                 .map(|recorded| recorded.stdin.clone())
                 .unwrap_or_default();
-            let program = request
-                .program()
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
             Ok(self
                 .model()
-                .answer(&program, &request.argument_strings(), &stdin))
+                .answer(&program_name(request), &request.argument_strings(), &stdin))
         }
+    }
+
+    /// The file name of the program a request starts, which is all the model
+    /// and the journal go by.
+    fn program_name(request: &CommandRequest) -> String {
+        request
+            .program()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// One journal line for a request: the program's file name and its
     /// arguments, with the two values that differ per run replaced by a
     /// placeholder, so that a history can be compared literally.
     fn normalised_line(request: &CommandRequest) -> String {
-        let mut line = request
-            .program()
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let mut line = program_name(request);
         let mut previous = String::new();
         for argument in request.argument_strings() {
             line.push(' ');
@@ -2725,11 +2726,6 @@ mod chains {
         order
     }
 
-    fn runs_all(mut expect: Expect, needles: &[String]) -> Expect {
-        expect.runs.extend(needles.iter().cloned());
-        expect
-    }
-
     /// A first install that provisions a healthy host.
     fn provisioned(distribution: &str, capacity: Option<u16>) -> Expect {
         let settled = capacity.unwrap_or(crate::cli::DEFAULT_HOST_CAPACITY);
@@ -2737,37 +2733,36 @@ mod chains {
             Some(capacity) => format!("set to {capacity}"),
             None => "unchanged (none was supplied)".to_string(),
         };
-        runs_all(
-            Expect::succeeds()
-                .healthy(true)
-                .drift(false)
-                .capacity(settled)
-                .credentials(1)
-                .record(distribution, true)
-                .says(&[
-                    &format!("Installing runner-manager-{}-{TRIPLE}.tar.gz", version()),
-                    &format!("installed {}", version()),
-                    "issued independently and delivered on a pipe",
-                    &report_capacity,
-                    "Linux service installed and started at boot.",
-                    &format!("{distribution} is a healthy managed runner host."),
-                ])
-                .linux(distribution, binary(version()))
-                .linux(distribution, credential_of(distribution))
-                .linux(distribution, Fact::Received(1))
-                .linux(distribution, Fact::Capacity(settled))
-                .linux(
-                    distribution,
-                    Fact::Unit {
-                        enabled: true,
-                        active: true,
-                    },
-                )
-                .linux(distribution, Fact::ServiceCopy(Some(version().to_string())))
-                .linux(distribution, our_task(true))
-                .linux(distribution, Fact::Staging(0)),
-            &fresh_order(distribution, capacity),
-        )
+        let mut expect = Expect::succeeds()
+            .healthy(true)
+            .drift(false)
+            .capacity(settled)
+            .credentials(1)
+            .record(distribution, true)
+            .says(&[
+                &format!("Installing runner-manager-{}-{TRIPLE}.tar.gz", version()),
+                &format!("installed {}", version()),
+                "issued independently and delivered on a pipe",
+                &report_capacity,
+                "Linux service installed and started at boot.",
+                &format!("{distribution} is a healthy managed runner host."),
+            ])
+            .linux(distribution, binary(version()))
+            .linux(distribution, credential_of(distribution))
+            .linux(distribution, Fact::Received(1))
+            .linux(distribution, Fact::Capacity(settled))
+            .linux(
+                distribution,
+                Fact::Unit {
+                    enabled: true,
+                    active: true,
+                },
+            )
+            .linux(distribution, Fact::ServiceCopy(Some(version().to_string())))
+            .linux(distribution, our_task(true))
+            .linux(distribution, Fact::Staging(0));
+        expect.runs.extend(fresh_order(distribution, capacity));
+        expect
     }
 
     /// A rerun over a host that is already what it should be.
@@ -4357,17 +4352,17 @@ mod chains {
                     });
                     // `Workstation::install` renders its own failures, the
                     // partial-host one included, exactly as the command does.
-                    match self.station.install(distribution, *capacity, issuer) {
-                        Ok((read_back, outcome)) => {
-                            let partial = refuse_a_partial_host(&read_back).err();
+                    self.station
+                        .install(distribution, *capacity, issuer)
+                        .and_then(|(read_back, outcome)| {
+                            let verdict =
+                                refuse_a_partial_host(&read_back).map(|()| Outcome::Succeeded);
                             document = Some(read_back);
                             install = Some(outcome);
-                            partial.map_or(Ok(Outcome::Succeeded), Err)
-                        }
-                        Err(failure) => Err(failure),
-                    }
+                            verdict
+                        })
                 }
-                Action::Status { distribution } => match probe(
+                Action::Status { distribution } => probe(
                     &self.station.host,
                     &self.station.paths,
                     distribution,
@@ -4375,15 +4370,13 @@ mod chains {
                     UNIT,
                     version(),
                     status_instant(),
-                ) {
-                    Ok(read) => {
-                        write_status_text(&read, &mut self.station.out).expect("a text report");
-                        write_json(&mut self.station.out, &read).expect("a JSON document");
-                        document = Some(read);
-                        Ok(Outcome::Succeeded)
-                    }
-                    Err(failure) => Err(failure),
-                },
+                )
+                .map(|read| {
+                    write_status_text(&read, &mut self.station.out).expect("a text report");
+                    write_json(&mut self.station.out, &read).expect("a JSON document");
+                    document = Some(read);
+                    Outcome::Succeeded
+                }),
                 Action::Detach { distribution } => detach_with(
                     &self.station.host,
                     &self.station.paths,
@@ -4794,35 +4787,32 @@ mod chains {
     }
 
     fn check_fact(model: &HostModel, distribution: &str, fact: &Fact) -> Result<(), String> {
-        let actual = if let Fact::Task(_) = fact {
-            Fact::Task(
-                model
-                    .tasks
-                    .get(&task_name(distribution))
-                    .map(|task| TaskFact {
-                        owned: task.document.contains(PRODUCT_MARKER),
-                        running: task.running,
-                    }),
-            )
-        } else {
-            let Some(distro) = model.distro(distribution) else {
-                return Err(format!(
-                    "the host model has no distribution {distribution:?}"
-                ));
-            };
-            match fact {
-                Fact::Binary(_) => Fact::Binary(distro.binary.clone()),
-                Fact::Credential(_) => Fact::Credential(distro.credential.clone()),
-                Fact::Received(_) => Fact::Received(distro.credentials_received),
-                Fact::Capacity(_) => Fact::Capacity(distro.capacity),
-                Fact::Unit { .. } => Fact::Unit {
+        let distro = || {
+            model
+                .distro(distribution)
+                .ok_or_else(|| format!("the host model has no distribution {distribution:?}"))
+        };
+        let actual = match fact {
+            Fact::Task(_) => {
+                let task = model.tasks.get(&task_name(distribution));
+                Fact::Task(task.map(|task| TaskFact {
+                    owned: task.document.contains(PRODUCT_MARKER),
+                    running: task.running,
+                }))
+            }
+            Fact::Binary(_) => Fact::Binary(distro()?.binary.clone()),
+            Fact::Credential(_) => Fact::Credential(distro()?.credential.clone()),
+            Fact::Received(_) => Fact::Received(distro()?.credentials_received),
+            Fact::Capacity(_) => Fact::Capacity(distro()?.capacity),
+            Fact::Unit { .. } => {
+                let distro = distro()?;
+                Fact::Unit {
                     enabled: distro.unit_enabled,
                     active: distro.unit_active,
-                },
-                Fact::ServiceCopy(_) => Fact::ServiceCopy(distro.service_copy.clone()),
-                Fact::Staging(_) => Fact::Staging(distro.staging.len()),
-                Fact::Task(_) => unreachable!("answered above"),
+                }
             }
+            Fact::ServiceCopy(_) => Fact::ServiceCopy(distro()?.service_copy.clone()),
+            Fact::Staging(_) => Fact::Staging(distro()?.staging.len()),
         };
         if actual == *fact {
             Ok(())
@@ -4997,27 +4987,29 @@ mod chains {
         steps: usize,
     }
 
-    /// Runs `body` with every diagnostic it emits captured into `logs`, so the
-    /// canary scan's "diagnostics" channel reads logs that were really
-    /// produced. The corpus run and the replay both go through here; a replay
-    /// without it would scan an empty log and pass a case the corpus fails.
-    fn capturing_logs<T>(logs: &CapturedLogs, body: impl FnOnce() -> T) -> T {
+    /// Runs one case to its end or to its first divergence, handing `watch`
+    /// every step's observation before it is judged, and returns how many
+    /// steps ran.
+    ///
+    /// Every diagnostic the case emits is captured, so the canary scan's
+    /// "diagnostics" channel reads logs that were really produced. The corpus
+    /// run and the replay both go through here, so a replay cannot scan an
+    /// empty log and pass a case the corpus fails.
+    fn run_steps(
+        case: &Case,
+        mut watch: impl FnMut(usize, &Action, &Observed),
+    ) -> Result<usize, String> {
+        let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, body)
-    }
-
-    /// Runs one case to its end or to its first divergence.
-    fn run_case(case: &Case) -> Result<Ran, String> {
-        let started = Instant::now();
-        let logs = CapturedLogs::default();
-        let steps = capturing_logs(&logs, || {
+        tracing::subscriber::with_default(subscriber, || {
             let mut chain = Chain::new(case, logs.clone());
             for (index, (action, expect)) in case.steps.iter().enumerate() {
                 let observed = chain.perform(action);
+                watch(index, action, &observed);
                 if let Err(divergence) = chain.judge(action, expect, &observed) {
                     return Err(chain.report(index, action, expect, &observed, &divergence));
                 }
@@ -5026,7 +5018,13 @@ mod chains {
                     .push(format!("{}. {action}  =>  {}", index + 1, observed.outcome));
             }
             Ok(chain.transcript.len())
-        })?;
+        })
+    }
+
+    /// Runs one case to its end or to its first divergence.
+    fn run_case(case: &Case) -> Result<Ran, String> {
+        let started = Instant::now();
+        let steps = run_steps(case, |_, _, _| {})?;
         Ok(Ran {
             elapsed: started.elapsed(),
             steps,
@@ -5205,34 +5203,23 @@ mod chains {
             );
         };
         let case = case_named(&id);
-        let logs = CapturedLogs::default();
         eprintln!(
             "{} {:?}\n  corpus {CORPUS}\n  initial workstation: {:#?}",
             case.id, case.title, case.world
         );
-        capturing_logs(&logs, || {
-            let mut chain = Chain::new(&case, logs.clone());
-            for (index, (action, expect)) in case.steps.iter().enumerate() {
-                let observed = chain.perform(action);
-                eprintln!(
-                    "\nstep {}: {action}\n  observed: {}\n  stdout:\n{}\n  stderr:\n{}\n  requests and events:\n{}",
-                    index + 1,
-                    observed.outcome,
-                    indented_text(&observed.stdout),
-                    indented_text(&observed.stderr),
-                    indented(&observed.history)
-                );
-                if let Err(divergence) = chain.judge(action, expect, &observed) {
-                    panic!(
-                        "{}",
-                        chain.report(index, action, expect, &observed, &divergence)
-                    );
-                }
-                chain
-                    .transcript
-                    .push(format!("{}. {action}  =>  {}", index + 1, observed.outcome));
-            }
+        let replayed = run_steps(&case, |index, action, observed| {
+            eprintln!(
+                "\nstep {}: {action}\n  observed: {}\n  stdout:\n{}\n  stderr:\n{}\n  requests and events:\n{}",
+                index + 1,
+                observed.outcome,
+                indented_text(&observed.stdout),
+                indented_text(&observed.stderr),
+                indented(&observed.history)
+            );
         });
+        if let Err(report) = replayed {
+            panic!("{report}");
+        }
     }
 
     // -----------------------------------------------------------------------
