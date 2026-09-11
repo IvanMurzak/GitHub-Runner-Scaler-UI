@@ -230,6 +230,19 @@ struct Shared {
     seen: Vec<String>,
 }
 
+/// One GitHub App installation, as [`FakeGithub::with_installations`] lists it.
+#[derive(Debug, Clone, Copy)]
+pub struct Installation<'a> {
+    pub id: u64,
+    pub account: &'a str,
+    /// `Organization` or `User`.
+    pub account_type: &'a str,
+    /// `selected` or `all`.
+    pub selection: &'a str,
+    /// `owner/name` full names.
+    pub repositories: &'a [&'a str],
+}
+
 /// A loopback stand-in for `api.github.com` and `github.com`.
 pub struct FakeGithub {
     base_url: String,
@@ -374,29 +387,63 @@ impl FakeGithub {
         selection: &str,
         repositories: &[&str],
     ) -> &Self {
+        self.with_installations(&[Installation {
+            id,
+            account,
+            account_type,
+            selection,
+            repositories,
+        }])
+    }
+
+    /// Several installations answered by **one** `GET /user/installations`,
+    /// each with its own repository listing.
+    ///
+    /// Not [`FakeGithub::with_installation`] called twice: a second call queues
+    /// a second *reply* for the same route, so the first listing would name only
+    /// the first installation and the second only the second -- two different
+    /// GitHubs on consecutive requests rather than one GitHub with two grants.
+    pub fn with_installations(&self, installations: &[Installation<'_>]) -> &Self {
+        let listed: Vec<String> = installations
+            .iter()
+            .map(|installation| {
+                format!(
+                    r#"{{"id":{},"account":{{"login":"{}","type":"{}"}},
+                       "repository_selection":"{}",
+                       "permissions":{{"administration":"write","actions":"read"}}}}"#,
+                    installation.id,
+                    installation.account,
+                    installation.account_type,
+                    installation.selection
+                )
+            })
+            .collect();
         self.route(
             "GET",
             "/user/installations",
             Reply::ok(format!(
-                r#"{{"total_count":1,"installations":[
-                     {{"id":{id},"account":{{"login":"{account}","type":"{account_type}"}},
-                       "repository_selection":"{selection}",
-                       "permissions":{{"administration":"write","actions":"read"}}}}]}}"#
+                r#"{{"total_count":{},"installations":[{}]}}"#,
+                listed.len(),
+                listed.join(",")
             )),
         );
-        let entries: Vec<String> = repositories
-            .iter()
-            .map(|full_name| format!(r#"{{"full_name":"{full_name}"}}"#))
-            .collect();
-        self.route(
-            "GET",
-            &format!("/user/installations/{id}/repositories"),
-            Reply::ok(format!(
-                r#"{{"total_count":{},"repositories":[{}]}}"#,
-                entries.len(),
-                entries.join(",")
-            )),
-        )
+        for installation in installations {
+            let entries: Vec<String> = installation
+                .repositories
+                .iter()
+                .map(|full_name| format!(r#"{{"full_name":"{full_name}"}}"#))
+                .collect();
+            self.route(
+                "GET",
+                &format!("/user/installations/{}/repositories", installation.id),
+                Reply::ok(format!(
+                    r#"{{"total_count":{},"repositories":[{}]}}"#,
+                    entries.len(),
+                    entries.join(",")
+                )),
+            );
+        }
+        self
     }
 
     /// GitHub's temporary authentication lockout, as `c2` recognises it: a
