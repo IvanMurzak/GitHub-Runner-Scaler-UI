@@ -1,0 +1,23 @@
+crates/app/tests/cli_chains_acceptance.rs
+  s_1e228ed696a2a7::t_fcc3816046f5d7 53,55,278-316
+  s_1e228ed696a2a7::t_f65a403d00b32b 317-320
+crates/app/tests/cli_chains_runner/security.rs
+  s_1e228ed696a2a7::t_fcc3816046f5d7 14,115-116,123-129,152-182
+  s_1e228ed696a2a7::t_aa7e5d802e97e6 183-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8a7976818c697a2326f1f1a233dc32ace8745cf7",
+  "prompts": {},
+  "sessions": {
+    "s_1e228ed696a2a7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d9d-0521-7cb3-85ef-6c14a5306720",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
