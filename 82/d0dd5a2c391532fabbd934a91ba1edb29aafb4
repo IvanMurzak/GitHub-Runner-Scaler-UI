@@ -1,0 +1,34 @@
+.pipeline/workflows/implement-task/steps/simplify.md
+  s_68be4dd0558d22::t_afd94a362a588d 16-20
+.pipeline/workflows/implement-task/_shared/worktree-preamble.md
+  s_68be4dd0558d22::t_9673dcbd60d122 43,46-52
+  s_1e228ed696a2a7::t_e4ca9619d4b4ec 53
+.pipeline/workflows/implement-task/steps/code-review.md
+  s_68be4dd0558d22::t_f9d5365a4a9aa3 20,22-25
+.pipeline/workflows/implement-task/steps/land.md
+  s_68be4dd0558d22::t_8f1f688638ddda 63-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82d0dd5a2c391532fabbd934a91ba1edb29aafb4",
+  "prompts": {},
+  "sessions": {
+    "s_1e228ed696a2a7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d9d-0521-7cb3-85ef-6c14a5306720",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_68be4dd0558d22": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f072c6cb-9927-460b-8849-a32e0d942cec",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
