@@ -1,0 +1,55 @@
+crates/app/tests/cli_chains/mod.rs
+  s_85f949c10a0914::t_5eae5be5013100 1-30
+crates/app/tests/cli_chains/ids.rs
+  s_85f949c10a0914::t_eba3871efd15e3 1-57
+crates/app/tests/cli_chains_model.rs
+  s_85f949c10a0914::t_58d487fc9873b9 3-24,28-29,31-135,137,139-143,145-1299,1302,1304-1305,1312,1314,1320
+  s_85f949c10a0914::t_998c8168072b28 1-2,25-27,30,136,138,144,1300
+  s_85f949c10a0914::t_7348932bbabebd 1301,1303,1306-1311,1313,1315-1319,1321-2028
+crates/app/tests/cli_chains/action.rs
+  s_85f949c10a0914::t_a59347f4b8480f 1-623,628-630,637-638,665-666
+  s_85f949c10a0914::t_2b944e79d69abe 624-627,631-636,639-664
+  s_85f949c10a0914::t_0a67d70cd55ddb 667-673
+crates/app/tests/cli_chains/model.rs
+  s_85f949c10a0914::t_73d772361da557 47-54
+  s_85f949c10a0914::t_2110df15da5ab1 289-292
+  s_85f949c10a0914::t_ee696389a95863 1-32,41-46,55-125,127-137,139,141-288,293-308,310-331,443-464,468-604
+  s_85f949c10a0914::t_e250918410c7c4 309
+  s_85f949c10a0914::t_0aab68264e63ee 465-467
+  s_85f949c10a0914::t_d84031b612158b 332-442
+  s_85f949c10a0914::t_77a35072877af9 126
+  s_85f949c10a0914::t_fc80cea5959209 33-40
+  s_85f949c10a0914::t_6330f3377da0b5 138
+  s_85f949c10a0914::t_25e9257bd56997 140
+crates/app/tests/cli_chains/corpus.rs
+  s_85f949c10a0914::t_8fe9a17c058187 1-1652,1654-1656,1658
+  s_85f949c10a0914::t_b758e281b94cbc 1653,1657,1659-1820
+crates/app/tests/cli_chains/transition.rs
+  s_85f949c10a0914::t_efe6be17af7498 1049
+  s_85f949c10a0914::t_292fffd35c2f79 1-528,533-1048,1050-1656
+  s_85f949c10a0914::t_d3df7ed92398fd 529-532
+  s_85f949c10a0914::t_a71ded3f2a8230 1657-1708
+crates/app/tests/cli_chains/coverage.rs
+  s_85f949c10a0914::t_fc78d24b7305f1 1-321
+  s_85f949c10a0914::t_426b13cf3748fe 322-324
+crates/app/tests/cli_chains/values.rs
+  s_85f949c10a0914::t_f25a9e367b6d2e 1-562
+crates/app/tests/cli_chains/local_inventory.txt
+  s_85f949c10a0914::t_a1e9f71f394e74 1-2483
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fe152606ab283baa3efb63c8074fb8c5a910f186",
+  "prompts": {},
+  "sessions": {
+    "s_85f949c10a0914": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58d27996-6d4e-4091-a382-953aed624552",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
