@@ -1,0 +1,31 @@
+crates/platform/src/wsl/probe.rs
+  s_3b4ec16afb6578::t_674c6106cbbdd8 494-506,508,511,739-763
+  s_3b4ec16afb6578::t_4b9eeb27101167 764-769
+CHANGELOG.md
+  s_3b4ec16afb6578::t_37f192e69ceb80 10-16
+  s_dd85195b844264::t_9b2a96371c5bbe 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4b9f039a278f05f2b25760e0a7e1ddbebc8d9a0a",
+  "prompts": {},
+  "sessions": {
+    "s_3b4ec16afb6578": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08fea-3137-7d51-b478-7f2888452a7e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_dd85195b844264": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08fe0-edd1-7ec3-bcd3-a592b2bcafb4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
