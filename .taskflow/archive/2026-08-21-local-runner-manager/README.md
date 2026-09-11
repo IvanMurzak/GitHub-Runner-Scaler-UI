@@ -1,11 +1,10 @@
 # Local Runner Manager
 
-**Status:** Tasks re-derived 2026-08-21 (`/taskflow-tasks`) against the
-D4-revised design; ready for `/taskflow-execute`. 23 immutable specifications in
-`tasks/`, 9 conflict-domain groups; waves, human gates, and live state are in
-`ROADMAP.md`.
-**Design status:** Reviewed twice 2026-08-21 (`/taskflow-review`); D4 REVISED,
-D17 RESOLVED GREEN
+**Status:** Completed 2026-09-11. All 23 specifications are done; H1 and human
+gate 5 were accepted under the owner-revised operational-evidence policy D22.
+The final implementation ledger and evidence record are in `ROADMAP.md`.
+**Design status:** Reviewed twice 2026-08-21 (`/taskflow-review`); D4 and D22
+REVISED, D17 RESOLVED GREEN
 **Scope:** This repository — `IvanMurzak/GitHub-Runner-Scaler-UI` (public, MIT).
 The taskflow was drafted in the separate `IvanMurzak/ai-pipeline` repository and
 transferred here. It proposes no change to `ai-pipeline`, and implementation
@@ -46,6 +45,7 @@ D1-D8 with rationale but never carries decision status.
 | D19 | A policy may be **monitor-only**: `repo add`/`org add` without `--max-capacity` creates a policy that shows runners and workflow counts and never starts a runner. | Locked 2026-08-21 | Owner decision 2026-08-21; matches the repository description, which presents autoscaling as optional. **Consequence:** a GitHub App declares one permission set for every installation, so a monitor-only user still grants `Administration: Read and write`. Least privilege for monitor-only would require a second published App; see the open question in `02-target-architecture.md`. |
 | D20 | `repo add`/`org add` create a policy in `pending` and never enable scaling; enabling is an explicit `set-scale`. | Locked 2026-08-21 | Owner confirmed 2026-08-21. Creating a policy never arms a host, at the cost of one extra command in Journey 1. |
 | D21 | The project publishes exactly **one** GitHub App. A second, read-only App for monitor-only users is rejected. | Locked 2026-08-21 | Owner decision 2026-08-21, resolving the open question in `02-target-architecture.md`. **Accepted consequence:** because an App grants its whole declared permission set per installation, a monitor-only user (D19) also grants `Administration: Read and write`, which permits deleting, renaming, and transferring the repository. This must be disclosed in the README and by the CLI at install time, not left to GitHub's consent screen. Narrowing it later would force every installation to re-consent. |
+| D22 | H1/gate-5 acceptance uses the merged cross-platform security suite plus retained operational evidence and owner attestation; it does not require launching a new disposable `8 scenarios × 3 OS` run after the product has already been exercised extensively. | **REVISED 2026-09-11** (was mandatory fresh per-OS scripted execution and report) | Owner confirmed the task complete, explicitly asked not to launch more Actions, attested successful macOS use on another machine, and directed review of retained Windows and Ubuntu/WSL evidence. This closes H1 without pretending that the original per-scenario reports can be reconstructed retrospectively. The accepted evidence and its limitations are recorded in `ROADMAP.md`. |
 | D17 | Before any other authentication work, a spike proves that a user-to-server token drives the GitHub credential chain. | **RESOLVED GREEN 2026-08-21** | Executed; result in `docs/spikes/d17-user-to-server-scale-set-chain.md`. A `ghu_` token minted a runner registration token and completed the Actions-service admin exchange at **both** repository and organization scope, with the same scopes and a 20-minute admin-token TTL as a `gho_` credential. D3 is confirmed and the per-user-App contingency in `07-security.md` is not needed. The same run disproved D4, which is a separate result. |
 
 ## Summary

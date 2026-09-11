@@ -7,15 +7,12 @@
 **Task status:** Re-derived 2026-08-21 (`/taskflow-tasks`) against the corrected
 design. 23 immutable specifications in [`tasks/`](tasks/), 9 conflict-domain
 groups, waves 0-4.
-**Implementation status:** **Stopped 2026-08-22 at the owner's request; nothing
-in flight.** 16 of 23 tasks done. Today's run (`--parallel=6 --review=medium
---scope=all --merge=on-green`) merged `c4`, `d2`, `e1`, `f1` and `e2`, and fixed
-`main`, which had been red on every push since `a3` merged. `d3` is complete and
-held at `🟣` — green on all seven checks, but it is the one task that has not
-had a review round. **Resume by reviewing `d3`, then dispatching `e3`, `f2` and
-`g1`, which are three ready group heads and the widest this graph gets.** The
-constraints their briefs must carry are in the last progress-log entry.
-**Last updated:** 2026-08-22
+**Implementation status:** **Complete 2026-09-11.** All 23 tasks are done and
+nothing is in flight. H1's implementation merged in PR #21 with all seven checks
+green; human gate 5 was subsequently accepted under owner-revised decision D22
+from retained operational evidence and owner attestation, without launching new
+GitHub Actions runs.
+**Last updated:** 2026-09-11
 
 **Execution host:** this repository, `IvanMurzak/GitHub-Runner-Scaler-UI`. The
 transfer from `ai-pipeline` is complete, so `/taskflow-execute` runs here
@@ -149,7 +146,7 @@ worker branch to reach `origin`.
 | [g2-tui-screens](tasks/g2-tui-screens.md) | g1, c3 | 8/6 | mid | ✅ done | `f7ef73a` (PR [#17](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/17)) | 2026-08-23 |
 | [g3-tui-settings-parity](tasks/g3-tui-settings-parity.md) | g2, f2 | 8/6 | mid | ✅ done | `f3930e0` (PR [#19](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/19)) | 2026-08-23 |
 | **Wave 4** | | | | | | |
-| [h1-e2e-security-acceptance](tasks/h1-e2e-security-acceptance.md) | f3, g3, d3, v1 | 9/7 | top | 🔵 in progress | owner-authorized bounded recovery in isolated worktree; PR [#21](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/21) | 2026-08-24 |
+| [h1-e2e-security-acceptance](tasks/h1-e2e-security-acceptance.md) | f3, g3, d3, v1 | 9/7 | top | ✅ done | `9f00045` (PR [#21](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/21)); gate 5 accepted under D22 | 2026-09-11 |
 | [a2-release-workflow](tasks/a2-release-workflow.md) | a1 | 8/6 | top | ✅ done | `6bcb34b` | 2026-08-21 |
 | [a3-distribution-and-readme](tasks/a3-distribution-and-readme.md) | a2 | 8/6 | top | ✅ done | `629a6b6` (Node-24 action correction PR [#15](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/15)) | 2026-08-23 |
 
@@ -338,3 +335,4 @@ failure`.
 | 2026-08-23 | **A3 reopened in parallel for GitHub Actions' Node 20 deprecation warnings observed in CI run [32675263747](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/actions/runs/32675263747).** The current workflows still use `actions/cache@v4`, and the owner requested the workflow steps be upgraded to current official majors. The audit covers every external `uses:` entry across CI, E2E, and release workflows, verifies each candidate against the action's official latest release and migration notes, and must preserve all trigger, permission, concurrency, checksum, artifact, release, and skip semantics. It runs concurrently with D3 because A and D are distinct conflict groups. |
 | 2026-08-23 | **A3 action-runtime correction paused before its first edit after preflight exposed a real file conflict with the active D3 correction.** D3 legitimately extends `.github/workflows/ci.yml` so the privileged job builds and exercises the production service entrypoint; A3 must update the same file's action majors. Although A and D are normally distinct conflict groups, this correction crosses that planned boundary. A3 is returned to pending with its clean worktree retained and will be refreshed/resumed immediately after D3 merges. |
 | 2026-08-23 | **D3 gate-3 correction merged as `5cc7160` (PR [#14](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/14)); all seven checks green and independent re-review clean.** The production Windows binary now enters SCM on the main thread only when a boot-registration marker is present, reports RUNNING/STOP_PENDING/STOPPED, and converts STOP/SHUTDOWN into the daemon's existing graceful drain. Windows login mode omits that marker and runs normally under Task Scheduler. Native privileged tests install and execute the actual shipping binary in both modes, hold boot beyond SCM's former 30-second timeout, prove login remains alive rather than exiting 14, stop cleanly, and assert no fixture registration survives. Review caught and closed the login/SCM cross-wire and an LF-only CI assertion; fresh Linux, macOS, Windows, privileged Windows, and three E2E checks all passed. The live pilot service was not touched during implementation. A3's clean worktree was fast-forwarded to this merge and its action-runtime correction resumed. |
+| 2026-09-11 | **D22 REVISED; H1 and human gate 5 accepted, completing the Taskflow.** The owner confirmed the task complete, asked that no new Actions runs be launched, attested that the manager worked successfully on the separate macOS host, and selected retained operational evidence as the acceptance record. Repository truth corroborates that decision: PR [#21](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/21) actually merged as `9f00045` on 2026-08-24 with all seven Windows/macOS/Linux CI, E2E, and privileged-Windows checks green; the focused acceptance crate has 17 passing tests plus the live fixture test that cleanly skips when inputs are absent. The Windows production database and per-attempt journals retain 1,486 terminal attempts from 2026-08-24 through 2026-09-10 — 768 `completed_job`, 236 `exited_idle_without_work`, 456 process failures, and 26 orphan recoveries — and every database row is now `cleaned`. That demonstrates sustained JIT allocation, successful work, bounded surplus/idle exit, failure/orphan recovery, and terminal cleanup; the earlier gate-3 record separately proves reboot/no-login startup and capacity enforcement. For Ubuntu, the local provider manifest records v0.4.3 verified 2026-09-08, its scheduled `wsl-host hold` task is running, and 62 successful recent `ai-pipeline` jobs used `runner-manager-<attempt-id>` runners whose IDs are absent from the Windows attempt database; with Ubuntu as the only configured external provider, this is corroborating WSL execution evidence. **Explicit limitations accepted by the owner:** the original eight-scenario-per-OS reports, exact outage/JIT-expiry/org/monitor-only/rollback receipts, and macOS logs are not retrospectively available; three Windows workspace roots also remain on disk (two non-empty, associated with a failed and an orphaned terminal attempt) although the runtime directory is empty and all database attempts are cleaned. These facts are recorded rather than presented as stronger evidence than they are. Under D22 they do not require fresh workflows or block closure. |
