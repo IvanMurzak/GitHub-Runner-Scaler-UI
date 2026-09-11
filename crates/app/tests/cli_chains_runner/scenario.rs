@@ -45,7 +45,6 @@ use runner_manager_domain::model::{AttemptId, ScaleTarget, StartMode};
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::{SqliteStore, Store};
 use runner_manager_platform::secrets::{PlatformSecretStore, SecretScope, SecretStore};
-use runner_manager_platform::service::ServiceIdentity;
 use runner_manager_testkit::fixtures;
 use secrecy::SecretString;
 
@@ -289,27 +288,9 @@ impl Scenario {
         }
     }
 
-    /// The service identity every process of this case addresses.
-    #[must_use]
-    pub fn service_identity(&self) -> ServiceIdentity {
-        ServiceIdentity::fixture(&self.tag)
-    }
-
-    /// The literal argument vector for an action, `--data-dir` first.
-    #[must_use]
-    pub fn argv(&self, action: &Action) -> Vec<String> {
-        let mut argv = vec![
-            "--data-dir".to_string(),
-            self.data.to_string_lossy().into_owned(),
-        ];
-        argv.extend(action.argv(&self.resolver));
-        argv
-    }
-
     /// Runs one typed action as a fresh `runner-manager` process.
     pub fn run_action(&self, action: &Action) -> Invocation {
-        let arguments = action.argv(&self.resolver);
-        self.invoke(&arguments)
+        self.invoke(&action.argv(&self.resolver))
     }
 
     /// Starts the binary. Private: the only caller is [`Self::run_action`], so

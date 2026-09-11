@@ -56,16 +56,16 @@ pub struct ObservedState {
 /// was removed can still be attributed to the target it belonged to.
 #[derive(Debug, Clone, Default)]
 pub struct Identities {
-    known: BTreeMap<String, TargetKey>,
+    known: BTreeMap<PolicyId, TargetKey>,
 }
 
 impl Identities {
     fn remember(&mut self, id: PolicyId, key: &TargetKey) {
-        self.known.insert(id.to_string(), key.clone());
+        self.known.insert(id, key.clone());
     }
 
     fn of(&self, id: PolicyId) -> Option<&TargetKey> {
-        self.known.get(&id.to_string())
+        self.known.get(&id)
     }
 }
 
@@ -148,11 +148,11 @@ fn read_store(
     let policies = store
         .policies()
         .map_err(|error| format!("cannot read policies: {error}"))?;
-    let mut live: BTreeMap<String, TargetKey> = BTreeMap::new();
+    let mut live: BTreeMap<PolicyId, TargetKey> = BTreeMap::new();
     for policy in &policies {
         let key = key_of(&policy.target);
         identities.remember(policy.id, &key);
-        live.insert(policy.id.to_string(), key.clone());
+        live.insert(policy.id, key.clone());
         let host_label = policy.requested_host_label.as_str().to_string();
         let mode = match policy.mode() {
             PolicyMode::MonitorOnly => Mode::MonitorOnly,
@@ -236,7 +236,7 @@ fn read_store(
                 tally.awaiting_cleanup += 1;
             }
         };
-        if let Some(key) = live.get(&attempt.policy_id.to_string()) {
+        if let Some(key) = live.get(&attempt.policy_id) {
             if let Some(policy) = model.policies.get_mut(key) {
                 tally(&mut policy.attempts);
             }

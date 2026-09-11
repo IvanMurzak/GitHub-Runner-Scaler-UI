@@ -117,6 +117,11 @@ pub fn invocation_problems(run: &CaseRun<'_>) -> Vec<String> {
         .iter()
         .map(|kind| kind.command_path())
         .collect();
+    // The product's own announcement, printed by the composition root before
+    // any command is routed and only once it has refused every override that
+    // is not loopback: the endpoint this process would have talked to was this
+    // case's fixture.
+    let announcement = format!("talking to {} instead of GitHub", run.github_base);
     for invocation in run.invocations() {
         let argv = &invocation.argv;
         if argv.len() < 4 || argv[0] != "--data-dir" || argv[1] != data {
@@ -129,11 +134,6 @@ pub fn invocation_problems(run: &CaseRun<'_>) -> Vec<String> {
         if !allowed.contains(&leaf) {
             problems.push(format!("{argv:?} runs a command outside the allowlist"));
         }
-        // The product's own announcement, printed by the composition root
-        // before any command is routed and only once it has refused every
-        // override that is not loopback: the endpoint this process would have
-        // talked to was this case's fixture.
-        let announcement = format!("talking to {} instead of GitHub", run.github_base);
         if !invocation.stderr.contains(&announcement) {
             problems.push(format!(
                 "{argv:?} did not report talking to the case's loopback fixture {}",

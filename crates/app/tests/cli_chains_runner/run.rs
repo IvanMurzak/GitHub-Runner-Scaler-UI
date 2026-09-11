@@ -178,8 +178,7 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
     let mut records = Vec::with_capacity(case.steps.len());
 
     for (index, step) in case.steps.iter().enumerate() {
-        let before = model.clone();
-        let record = match step {
+        let (expected, invocation, observed, mismatches) = match step {
             Step::Seed(seed) => {
                 let expected = transition::seed(&model, seed).unwrap_or_else(|problem| {
                     panic!(
@@ -192,17 +191,7 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
                     .apply_seed(seed)
                     .and_then(|()| observe(&scenario, &mut identities));
                 let mismatches = judge_state(&expected, &observed);
-                model = expected.clone();
-                StepRecord {
-                    index,
-                    step: step.clone(),
-                    setup: index < case.setup_len,
-                    before,
-                    expected: Expected::Seed(expected),
-                    invocation: None,
-                    observed,
-                    mismatches,
-                }
+                (Expected::Seed(expected), None, observed, mismatches)
             }
             Step::Run(action) => {
                 // The expectation first. The process has not run yet.
@@ -218,18 +207,25 @@ pub fn execute_with<'c>(case: &'c Case, corrupt: &Corruption<'_>) -> CaseRun<'c>
                     &observed,
                     &scenario.resolver,
                 );
-                model = expected.next.clone();
-                StepRecord {
-                    index,
-                    step: step.clone(),
-                    setup: index < case.setup_len,
-                    before,
-                    expected: Expected::Action(Box::new(expected)),
-                    invocation: Some(invocation),
+                (
+                    Expected::Action(Box::new(expected)),
+                    Some(invocation),
                     observed,
                     mismatches,
-                }
+                )
             }
+        };
+        // The model's own next state, never the observation.
+        let next = expected.next().clone();
+        let record = StepRecord {
+            index,
+            step: step.clone(),
+            setup: index < case.setup_len,
+            before: std::mem::replace(&mut model, next),
+            expected,
+            invocation,
+            observed,
+            mismatches,
         };
         let diverged = !record.mismatches.is_empty();
         records.push(record);

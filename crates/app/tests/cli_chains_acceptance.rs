@@ -259,27 +259,30 @@ fn replay_selected_case() {
 // DoD 2: confinement
 // ---------------------------------------------------------------------------
 
+/// The corpus case called `name`; every name used here is a curated journey.
+fn case_named(name: &str) -> &'static Case {
+    corpus::corpus()
+        .cases
+        .iter()
+        .find(|case| case.name == name)
+        .unwrap_or_else(|| panic!("{name} is a curated journey"))
+}
+
 /// The case the confinement and corruption tests drive: from a seeded
 /// credential it adds a repository through discovery, configures a host root
 /// and a persistent workspace, meets a refusal, and reads back through `list`
 /// and `status --json` -- one step on every plane.
 fn journey() -> &'static Case {
-    corpus::corpus()
-        .cases
-        .iter()
-        .find(|case| case.name == "repository-root-refused-where-it-overlaps-the-host-root")
-        .expect("the curated journey is in the corpus")
+    case_named("repository-root-refused-where-it-overlaps-the-host-root")
 }
 
 #[test]
 fn every_process_is_confined_to_its_scenario_and_its_loopback_endpoint() {
     let footprint = StandardFootprint::snapshot();
-    let signing_in = corpus::corpus()
-        .cases
-        .iter()
-        .find(|case| case.name == "sign-in-then-resume-without-a-new-code")
-        .expect("the curated journey is in the corpus");
-    let cases = [journey(), signing_in];
+    let cases = [
+        journey(),
+        case_named("sign-in-then-resume-without-a-new-code"),
+    ];
     let runs = run::execute_all(&cases, 2);
     assert_all_agree(&runs);
 
@@ -361,13 +364,7 @@ const REFUSAL_JOURNEYS: [&str; 8] = [
 fn refused_mutations_leave_database_and_filesystem_observations_unchanged() {
     let cases: Vec<&Case> = REFUSAL_JOURNEYS
         .iter()
-        .map(|name| {
-            corpus::corpus()
-                .cases
-                .iter()
-                .find(|case| case.name == *name)
-                .unwrap_or_else(|| panic!("{name} is a curated journey"))
-        })
+        .map(|name| case_named(name))
         .collect();
     let runs = run::execute_all(&cases, run::default_workers());
     assert_all_agree(&runs);

@@ -377,19 +377,12 @@ fn status_differences(
     for key in keys {
         let label = format!("status.policies[{}:{}]", key.0, key.1);
         let (Some(want), Some(have)) = (wanted.get(&key), observed.get(&key)) else {
-            found.push(format!(
-                "{label}: {} but not {}",
-                if wanted.contains_key(&key) {
-                    "expected"
-                } else {
-                    "reported"
-                },
-                if wanted.contains_key(&key) {
-                    "reported"
-                } else {
-                    "expected"
-                }
-            ));
+            let (present, absent) = if wanted.contains_key(&key) {
+                ("expected", "reported")
+            } else {
+                ("reported", "expected")
+            };
+            found.push(format!("{label}: {present} but not {absent}"));
             continue;
         };
         let mut compare = |name: &str, want: Value| {
