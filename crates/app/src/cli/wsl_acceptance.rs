@@ -2209,11 +2209,20 @@ mod chains {
                 .injections
                 .iter()
                 .map(|injection| {
-                    format!(
-                        "{:?} answered by {} scripted response(s), then the host model",
-                        injection.needle,
-                        injection.responses.len().saturating_sub(1)
-                    )
+                    // `inject` ends its list with the hand-back sentinel;
+                    // `inject_always` never hands a match back to the model.
+                    if injection.responses.last() == Some(&the_model_answers()) {
+                        format!(
+                            "{:?} answered by {} scripted response(s), then the host model",
+                            injection.needle,
+                            injection.responses.len().saturating_sub(1)
+                        )
+                    } else {
+                        format!(
+                            "{:?} answered by the same scripted response every time",
+                            injection.needle
+                        )
+                    }
                 })
                 .collect();
             f.debug_struct("World")
@@ -4988,16 +4997,24 @@ mod chains {
         steps: usize,
     }
 
-    /// Runs one case to its end or to its first divergence.
-    fn run_case(case: &Case) -> Result<Ran, String> {
-        let started = Instant::now();
-        let logs = CapturedLogs::default();
+    /// Runs `body` with every diagnostic it emits captured into `logs`, so the
+    /// canary scan's "diagnostics" channel reads logs that were really
+    /// produced. The corpus run and the replay both go through here; a replay
+    /// without it would scan an empty log and pass a case the corpus fails.
+    fn capturing_logs<T>(logs: &CapturedLogs, body: impl FnOnce() -> T) -> T {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish();
-        let steps = tracing::subscriber::with_default(subscriber, || {
+        tracing::subscriber::with_default(subscriber, body)
+    }
+
+    /// Runs one case to its end or to its first divergence.
+    fn run_case(case: &Case) -> Result<Ran, String> {
+        let started = Instant::now();
+        let logs = CapturedLogs::default();
+        let steps = capturing_logs(&logs, || {
             let mut chain = Chain::new(case, logs.clone());
             for (index, (action, expect)) in case.steps.iter().enumerate() {
                 let observed = chain.perform(action);
@@ -5189,31 +5206,33 @@ mod chains {
         };
         let case = case_named(&id);
         let logs = CapturedLogs::default();
-        let mut chain = Chain::new(&case, logs);
         eprintln!(
             "{} {:?}\n  corpus {CORPUS}\n  initial workstation: {:#?}",
             case.id, case.title, case.world
         );
-        for (index, (action, expect)) in case.steps.iter().enumerate() {
-            let observed = chain.perform(action);
-            eprintln!(
-                "\nstep {}: {action}\n  observed: {}\n  stdout:\n{}\n  stderr:\n{}\n  requests and events:\n{}",
-                index + 1,
-                observed.outcome,
-                indented_text(&observed.stdout),
-                indented_text(&observed.stderr),
-                indented(&observed.history)
-            );
-            if let Err(divergence) = chain.judge(action, expect, &observed) {
-                panic!(
-                    "{}",
-                    chain.report(index, action, expect, &observed, &divergence)
+        capturing_logs(&logs, || {
+            let mut chain = Chain::new(&case, logs.clone());
+            for (index, (action, expect)) in case.steps.iter().enumerate() {
+                let observed = chain.perform(action);
+                eprintln!(
+                    "\nstep {}: {action}\n  observed: {}\n  stdout:\n{}\n  stderr:\n{}\n  requests and events:\n{}",
+                    index + 1,
+                    observed.outcome,
+                    indented_text(&observed.stdout),
+                    indented_text(&observed.stderr),
+                    indented(&observed.history)
                 );
+                if let Err(divergence) = chain.judge(action, expect, &observed) {
+                    panic!(
+                        "{}",
+                        chain.report(index, action, expect, &observed, &divergence)
+                    );
+                }
+                chain
+                    .transcript
+                    .push(format!("{}. {action}  =>  {}", index + 1, observed.outcome));
             }
-            chain
-                .transcript
-                .push(format!("{}. {action}  =>  {}", index + 1, observed.outcome));
-        }
+        });
     }
 
     // -----------------------------------------------------------------------
