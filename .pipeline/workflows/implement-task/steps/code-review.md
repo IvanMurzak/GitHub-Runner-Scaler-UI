@@ -17,10 +17,12 @@ branch diff, validate every applied fix, and commit the fixes locally.
    worktree path is mandatory because a skill may start from the main checkout.
    Wait for the skill's final result; do not treat a background launch message
    as completion.
-3. Confirm from the skill's scope report that it reviewed
+3. Confirm from the skill's report that it reviewed
    `origin/main...HEAD` in this worktree. `main...HEAD` is acceptable only when
-   local `main` and `origin/main` resolve to the same commit. Re-run with the
-   explicit path if the scope is wrong.
+   local `main` and `origin/main` resolve to the same commit. If the report
+   names reviewed commits instead of a range, they must match
+   `git log --oneline origin/main..HEAD`. Re-run with the explicit path if the
+   scope is wrong.
 4. Inspect `git status`, `git diff`, and `git rev-parse --show-toplevel` after
    the review. Ensure all edits are in the worktree. Remove any mutation planted
    only to test the review (flipped conditions, disabled assertions, markers, or

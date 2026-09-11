@@ -60,6 +60,11 @@ passes.
    when `code=3` (still pending). Interpret terminal codes as follows:
    - `0`: all reported checks passed; continue to merge.
    - `1`: a check failed; do not merge. Report failed check names and links.
+     If the check also fails the same way on `main` itself (its latest run in
+     `gh run list --branch main` fails that check with the same error), this
+     branch did not cause it: do not fix it here or re-run `ci-wait`; treat it
+     as a case (c) out-of-scope blocker under the step-executor's
+     Nested-Blocker Delegation protocol.
    - `2`: CLI/usage/`gh` failure; report the output and stop.
    - `3`: repeat, up to the bounded limit; then report pending checks and stop.
    - `4`: no checks appeared within the grace period; verify Actions triggered,
