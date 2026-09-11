@@ -47,9 +47,13 @@ pub enum Plane {
     Filesystem,
     /// The fake GitHub's request history for this step.
     Requests,
+    /// Protected values in output, logs, files, or a SQLite textual dump.
+    Security,
 }
 
 impl Plane {
+    /// Behavioral expectation planes. Security has its own protected-value by
+    /// scanned-plane mutation matrix.
     pub const ALL: [Plane; 5] = [
         Plane::Exit,
         Plane::Output,
@@ -66,6 +70,7 @@ impl Plane {
             Plane::Store => "store",
             Plane::Filesystem => "filesystem",
             Plane::Requests => "requests",
+            Plane::Security => "security",
         }
     }
 }
@@ -89,6 +94,12 @@ impl Mismatch {
             plane,
             detail: detail.into(),
         }
+    }
+
+    /// A protected value reached a scanned artifact.
+    #[must_use]
+    pub fn security(detail: impl Into<String>) -> Self {
+        Self::new(Plane::Security, detail)
     }
 }
 

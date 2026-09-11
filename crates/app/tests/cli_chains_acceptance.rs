@@ -1,4 +1,4 @@
-// owner: b2-local-chain-runner
+// owner: b3-local-corpus-security
 //
 // ----------------------------------------------------------------------------
 // THE LOCAL CLI CHAINS, EXECUTED: ONE REAL PROCESS PER ACTION, JUDGED BY THE
@@ -50,7 +50,11 @@ use cli_chains::values::PathValue;
 use cli_chains_runner::confinement::{StandardFootprint, invocation_problems};
 use cli_chains_runner::oracle::Plane;
 use cli_chains_runner::run::{self, CaseRun, Expected};
-use cli_chains_runner::{report, selection};
+use cli_chains_runner::scenario::{Invocation, Scenario};
+use cli_chains_runner::{report, security, selection};
+use runner_manager_domain::store::{SqliteStore, Store};
+
+const SOFT_RUNTIME_TARGET: Duration = Duration::from_secs(60);
 
 /// Panics with the report of every diverging run, first divergence first.
 fn assert_all_agree(runs: &[CaseRun<'_>]) {
@@ -94,6 +98,20 @@ fn summarise(what: &str, runs: &[CaseRun<'_>], wall: Duration) {
         wall.as_secs_f64(),
         slowest.join(", ")
     );
+    if wall > SOFT_RUNTIME_TARGET {
+        eprintln!(
+            "SOFT RUNTIME OVERAGE: {:.1}s exceeds the {:.0}s target by {:.1}s; investigate the listed slowest cases",
+            wall.as_secs_f64(),
+            SOFT_RUNTIME_TARGET.as_secs_f64(),
+            (wall - SOFT_RUNTIME_TARGET).as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "soft runtime target met: {:.1}s <= {:.0}s",
+            wall.as_secs_f64(),
+            SOFT_RUNTIME_TARGET.as_secs_f64()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,8 +122,14 @@ fn summarise(what: &str, runs: &[CaseRun<'_>], wall: Duration) {
 /// every step -- and every process of every case confined, and no standard
 /// location created while they ran.
 #[test]
-fn representative_journeys_agree_with_the_model_through_real_processes() {
+fn the_complete_local_corpus_agrees_with_the_model_through_real_processes() {
     let selected = selection::default_selection();
+    let selection_problems = selection::completeness_problems(&selected);
+    assert!(
+        selection_problems.is_empty(),
+        "the default selection is incomplete:\n  {}",
+        selection_problems.join("\n  ")
+    );
     let footprint = StandardFootprint::snapshot();
     let started = std::time::Instant::now();
     let runs = run::execute_all(&selected, run::default_workers());
@@ -195,6 +219,118 @@ fn the_default_selection_is_representative_and_takes_no_input() {
             fixture.name()
         );
     }
+}
+
+#[test]
+fn omitting_any_inventory_case_fails_the_default_selection_check() {
+    let mut selected = selection::default_selection();
+    assert!(selection::completeness_problems(&selected).is_empty());
+    let omitted = selected.remove(selected.len() / 2);
+    let problems = selection::completeness_problems(&selected);
+    assert!(
+        !problems.is_empty()
+            && problems
+                .iter()
+                .any(|problem| problem.contains(&omitted.id.to_string())),
+        "dropping {} must be detected by name: {problems:?}",
+        omitted.id
+    );
+}
+
+#[test]
+fn every_coverage_model_invariant_has_named_corpus_evidence() {
+    let units: BTreeSet<String> = corpus::corpus()
+        .cases
+        .iter()
+        .flat_map(|case| cli_chains::coverage::units(&case.trace()))
+        .collect();
+    // Security and confinement are runtime observations in the complete-corpus
+    // test above. These are the state-machine invariants whose evidence lives
+    // in the immutable inventory.
+    for evidence in [
+        "invariant:multi-label-refusal-is-atomic",
+        "invariant:idempotent-read:status.json",
+        "invariant:idempotent-read:host.show",
+        "cross:repository-and-organization-policies-coexist",
+        "invariant:duplicate-add-keeps-the-existing-policy",
+        "invariant:monitor-only-survives-unrelated-commands",
+        "invariant:disabled-survives-unrelated-commands",
+        "invariant:enabled-survives-unrelated-commands",
+        "invariant:draining-survives-unrelated-commands",
+        "invariant:repair-required-survives-unrelated-commands",
+        "invariant:derived-label-is-never-duplicated",
+        "refusal:repo.remove-label:derived-label-not-removable",
+        "refusal:host.set-runtime-root:attempts-own-host-root",
+        "refusal:repo.set-workspace:attempts-own-workspace",
+        "cross:repository-root-overlaps-the-host-root",
+        "invariant:non-purge-removal-retains-diagnostics",
+        "refusal:repo.remove:purge-with-active-attempts",
+    ] {
+        assert!(
+            units.contains(evidence),
+            "no named case witnesses {evidence}"
+        );
+    }
+}
+
+#[test]
+fn every_protected_value_is_detected_on_every_scanned_plane() {
+    for (name, value) in security::protected_values() {
+        let scenario = Scenario::new(
+            CaseId::parse("local-0001").expect("a valid fixture case id"),
+            Installation::None,
+        );
+        let logs = scenario.data.join("logs");
+        std::fs::create_dir_all(&logs).expect("the planted log directory");
+        std::fs::write(logs.join("planted.log"), format!("before {value} after"))
+            .expect("the planted log");
+        std::fs::write(
+            scenario.data.join("planted.txt"),
+            format!("before {value} after"),
+        )
+        .expect("the planted data artifact");
+
+        let database = scenario.database_path();
+        std::fs::create_dir_all(database.parent().expect("the database parent"))
+            .expect("the planted database directory");
+        let store = SqliteStore::open(&database).expect("the planted database");
+        store
+            .put_host(
+                &runner_manager_testkit::fixtures::host()
+                    .display_name(&value)
+                    .build(),
+            )
+            .expect("the protected value can be planted in SQLite");
+        drop(store);
+
+        let invocation = Invocation {
+            argv: Vec::new(),
+            code: 0,
+            stdout: format!("before {value} after"),
+            stderr: format!("before {value} after"),
+            requests: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+        let fragments = security::collect(&scenario, Some(&invocation))
+            .expect("every planted artifact is scannable");
+        let found = security::findings(&fragments);
+        for plane in security::SecurityPlane::ALL {
+            assert!(
+                found.iter().any(|finding| finding.contains(plane.name())),
+                "planting {name} in {} must be collected and rejected: {found:?}",
+                plane.name()
+            );
+        }
+    }
+    assert!(
+        security::findings(&[security::Fragment {
+            plane: security::SecurityPlane::Stdout,
+            origin: "a clean fragment".to_string(),
+            text: "ordinary operator output".to_string(),
+        }])
+        .is_empty(),
+        "ordinary text must not create a false-positive leak"
+    );
 }
 
 #[test]
@@ -510,7 +646,7 @@ fn a_wrong_expectation_on_each_plane_fails_at_the_responsible_action() {
     assert_eq!(
         planted_planes,
         BTreeSet::from(Plane::ALL),
-        "every plane the oracle judges is planted"
+        "every behavioral expectation plane the oracle judges is planted"
     );
     let planted_steps: BTreeSet<usize> = plants.iter().map(|(_, step, _)| *step).collect();
     assert_eq!(

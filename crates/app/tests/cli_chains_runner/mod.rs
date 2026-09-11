@@ -40,4 +40,5 @@ pub mod oracle;
 pub mod report;
 pub mod run;
 pub mod scenario;
+pub mod security;
 pub mod selection;
