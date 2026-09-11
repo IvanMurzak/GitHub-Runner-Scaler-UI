@@ -1,0 +1,19 @@
+.taskflow/2026-09-10-cli-chains-acceptance/ROADMAP.md
+  s_1e228ed696a2a7::t_9b4a0c206ebc48 37,65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b8a95afbbc75a5782536b162e802933ab96a2b7d",
+  "prompts": {},
+  "sessions": {
+    "s_1e228ed696a2a7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d9d-0521-7cb3-85ef-6c14a5306720",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
