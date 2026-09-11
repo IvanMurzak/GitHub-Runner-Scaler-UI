@@ -16,8 +16,14 @@
 // Deriving it from the clap tree would make this test agree with whatever the
 // tree says, which is the one thing it must not do.
 
+mod command_accountability;
 mod support;
 
+use command_accountability::{
+    Classification, Coverage, Defect, HIDDEN_BRIDGE_EVIDENCE, MANIFEST, NEVER_GENERATED,
+    Repository, architecture_defects, check_evidence, inventory_defects, justification_defects,
+    report,
+};
 use support::{run, runner_manager};
 
 /// The exhaustive surface, transcribed from `02-target-architecture.md`.
@@ -769,5 +775,283 @@ fn the_readme_documents_exactly_the_commands_the_help_text_lists() {
         "the README's `## Commands` block and `--help` must name the same \
          commands. A command only in `--help` is one no user can discover; a \
          command only in the README is a promise the binary does not keep."
+    );
+}
+
+// ----------------------------------------------------------------------------
+// EVERY PUBLISHED LEAF IS ACCOUNTED FOR BY A REVIEWED ROW.
+// ----------------------------------------------------------------------------
+// owner: a1-command-accountability
+//
+// `command_accountability::MANIFEST` classifies each leaf `SURFACE` publishes as
+// generated, scripted, dedicated, privileged or surface-only, and names the
+// tests that carry it. The inventory below is `SURFACE` itself -- not a second
+// transcription -- so the chain is: clap's tree is pinned to `SURFACE` by the
+// tests above, and `SURFACE` is pinned to the manifest here. A leaf added to
+// either fails until somebody writes and reviews its row.
+
+/// `SURFACE` as leaves, spelled `family` or `family subcommand`.
+fn published_leaves() -> Vec<String> {
+    SURFACE
+        .iter()
+        .flat_map(|(family, subcommands)| {
+            if subcommands.is_empty() {
+                vec![(*family).to_string()]
+            } else {
+                subcommands
+                    .iter()
+                    .map(|subcommand| format!("{family} {subcommand}"))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// `HIDDEN_BRIDGES` as leaves, in the same spelling.
+fn hidden_leaves() -> Vec<String> {
+    HIDDEN_BRIDGES
+        .iter()
+        .map(|(_, path)| path.join(" "))
+        .collect()
+}
+
+fn inventory(manifest: &[Classification]) -> Vec<Defect> {
+    inventory_defects(&published_leaves(), &hidden_leaves(), manifest)
+}
+
+#[test]
+fn every_published_leaf_has_exactly_one_reviewed_classification() {
+    let published = published_leaves();
+    let defects = inventory(MANIFEST);
+    assert!(
+        defects.is_empty(),
+        "the command-accountability manifest disagrees with the published surface:\n{}",
+        report(&defects)
+    );
+    assert_eq!(MANIFEST.len(), published.len(), "one row per leaf, no more");
+}
+
+#[test]
+fn every_classification_cites_real_evidence_and_a_concrete_boundary() {
+    let repository = Repository {
+        root: repository_root(),
+    };
+    let defects = justification_defects(MANIFEST, &repository);
+    assert!(
+        defects.is_empty(),
+        "every row must cite existing tests, and every exclusion from generated \
+         execution a concrete safety boundary:\n{}",
+        report(&defects)
+    );
+}
+
+/// The manifest against clap's own tree, not only against `SURFACE`: were both
+/// transcriptions to drift together, this still reads the binary.
+#[test]
+fn the_live_help_tree_is_classified_leaf_for_leaf() {
+    let mut live: Vec<String> = Vec::new();
+    for family in commands_in(&help_for(&[])) {
+        let subcommands = commands_in(&help_for(&[family.as_str()]));
+        if subcommands.is_empty() {
+            live.push(family);
+        } else {
+            live.extend(
+                subcommands
+                    .iter()
+                    .map(|subcommand| format!("{family} {subcommand}")),
+            );
+        }
+    }
+    live.sort();
+
+    let mut classified: Vec<String> = MANIFEST.iter().map(|row| row.leaf.to_string()).collect();
+    classified.sort();
+
+    assert!(
+        !live.is_empty(),
+        "no leaves were read out of `--help`, so this comparison would be vacuous"
+    );
+    assert_eq!(
+        classified, live,
+        "every leaf `--help` publishes needs exactly one reviewed classification, and \
+         no row may outlive its command"
+    );
+}
+
+/// Hidden bridges stay out of the public inventory, and what covers them is a
+/// real, default-run test in this file.
+#[test]
+fn the_hidden_bridges_are_covered_outside_the_public_inventory() {
+    for hidden in hidden_leaves() {
+        assert!(
+            !MANIFEST.iter().any(|row| row.leaf == hidden),
+            "`{hidden}` is hidden and must not be classified as a published leaf"
+        );
+    }
+
+    let repository = Repository {
+        root: repository_root(),
+    };
+    let test = check_evidence(&HIDDEN_BRIDGE_EVIDENCE, &repository).unwrap_or_else(|why| {
+        panic!(
+            "the hidden bridges' evidence `{}::{}` is not a real test: {why}",
+            HIDDEN_BRIDGE_EVIDENCE.file, HIDDEN_BRIDGE_EVIDENCE.test
+        )
+    });
+    assert!(
+        !test.ignored && !test.conditional,
+        "the hidden-bridge surface test must run on every leg of the default test run"
+    );
+    assert_eq!(
+        HIDDEN_BRIDGE_EVIDENCE.file, "crates/app/tests/cli_command_surface.rs",
+        "the hidden-bridge evidence must be this file's test, where `HIDDEN_BRIDGES` lives"
+    );
+}
+
+/// The design's safety boundary, checked against the rows: nothing it names as
+/// never executed by the generator may be classified `Generated`.
+#[test]
+fn nothing_the_architecture_keeps_out_of_the_generator_is_classified_generated() {
+    let published = published_leaves();
+    for leaf in NEVER_GENERATED {
+        assert!(
+            published.iter().any(|published| published == leaf),
+            "`{leaf}` is in `NEVER_GENERATED` but is not published; the transcription \
+             from `02-target-architecture.md` ¶4 is stale"
+        );
+    }
+    let defects = architecture_defects(MANIFEST);
+    assert!(defects.is_empty(), "{}", report(&defects));
+}
+
+// Controls. The real manifest passes the checks above, which proves nothing
+// about the checks: each control plants one defect in a copy of the real rows
+// and asserts the inventory reports exactly that defect.
+
+/// `MANIFEST` with `edit` applied.
+fn edited(edit: impl FnOnce(&mut Vec<Classification>)) -> Vec<Classification> {
+    let mut rows = MANIFEST.to_vec();
+    edit(&mut rows);
+    rows
+}
+
+fn row_for(leaf: &str) -> Classification {
+    *MANIFEST
+        .iter()
+        .find(|row| row.leaf == leaf)
+        .unwrap_or_else(|| panic!("`{leaf}` has a row"))
+}
+
+#[test]
+fn a_synthetic_unclassified_leaf_fails_the_inventory() {
+    let mut published = published_leaves();
+    published.push("host teleport".to_string());
+    assert_eq!(
+        inventory_defects(&published, &hidden_leaves(), MANIFEST),
+        [Defect::Unclassified {
+            leaf: "host teleport".to_string()
+        }],
+        "a published leaf without a row must fail the guard"
+    );
+
+    // A row that is simply deleted is the same defect from the other side.
+    assert_eq!(
+        inventory(&edited(|rows| rows.retain(|row| row.leaf != "status"))),
+        [Defect::Unclassified {
+            leaf: "status".to_string()
+        }],
+    );
+}
+
+#[test]
+fn a_stale_or_renamed_row_fails_the_inventory() {
+    let mut teleport = row_for("host show");
+    teleport.leaf = "host teleport";
+    assert_eq!(
+        inventory(&edited(|rows| rows.push(teleport))),
+        [Defect::Stale {
+            leaf: "host teleport".to_string()
+        }],
+        "a row for a command that is not published must fail the guard"
+    );
+
+    assert_eq!(
+        inventory(&edited(|rows| {
+            for row in rows.iter_mut().filter(|row| row.leaf == "repo list") {
+                row.leaf = "repo ls";
+            }
+        })),
+        [
+            Defect::Unclassified {
+                leaf: "repo list".to_string()
+            },
+            Defect::Stale {
+                leaf: "repo ls".to_string()
+            },
+        ],
+        "a renamed row leaves its real leaf unclassified and its new name stale"
+    );
+}
+
+#[test]
+fn a_duplicate_row_fails_the_inventory() {
+    assert_eq!(
+        inventory(&edited(|rows| rows.push(row_for("wsl status")))),
+        [Defect::Duplicate {
+            leaf: "wsl status".to_string(),
+            rows: 2
+        }],
+        "a leaf has exactly one classification"
+    );
+
+    // Also when the second row disagrees with the first about the class.
+    let mut generated = row_for("tui");
+    generated.coverage = Coverage::Generated;
+    generated.exclusion = None;
+    assert_eq!(
+        inventory(&edited(|rows| rows.push(generated))),
+        [Defect::Duplicate {
+            leaf: "tui".to_string(),
+            rows: 2
+        }],
+    );
+}
+
+#[test]
+fn a_row_for_a_hidden_bridge_fails_the_inventory() {
+    for hidden in ["auth receive", "wsl-host hold"] {
+        let mut bridge = row_for("auth login");
+        bridge.leaf = hidden;
+        assert_eq!(
+            inventory(&edited(|rows| rows.push(bridge))),
+            [Defect::HiddenLeafClassified {
+                leaf: hidden.to_string()
+            }],
+            "hidden commands stay out of the public inventory"
+        );
+    }
+}
+
+/// A row flipped to `Generated` with its exclusion removed passes the inventory
+/// and the justification check alike -- its evidence still exists and runs by
+/// default -- so the architecture check is the one that has to stop it.
+#[test]
+fn flipping_an_excluded_leaf_to_generated_is_caught() {
+    let flipped = edited(|rows| {
+        for row in rows.iter_mut().filter(|row| row.leaf == "daemon run") {
+            row.coverage = Coverage::Generated;
+            row.exclusion = None;
+        }
+    });
+    assert!(inventory(&flipped).is_empty());
+    let repository = Repository {
+        root: repository_root(),
+    };
+    assert!(justification_defects(&flipped, &repository).is_empty());
+    assert_eq!(
+        architecture_defects(&flipped),
+        [Defect::GeneratedAgainstArchitecture {
+            leaf: "daemon run".to_string()
+        }],
     );
 }
