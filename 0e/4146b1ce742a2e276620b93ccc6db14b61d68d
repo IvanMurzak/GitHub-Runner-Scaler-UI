@@ -1,0 +1,21 @@
+.taskflow/archive/2026-08-21-local-runner-manager/README.md
+  s_dd85195b844264::t_3af3b6a1bf9d08 3-7,48
+.taskflow/archive/2026-08-21-local-runner-manager/ROADMAP.md
+  s_dd85195b844264::t_3af3b6a1bf9d08 10-15,149,338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0e4146b1ce742a2e276620b93ccc6db14b61d68d",
+  "prompts": {},
+  "sessions": {
+    "s_dd85195b844264": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08fe0-edd1-7ec3-bcd3-a592b2bcafb4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
