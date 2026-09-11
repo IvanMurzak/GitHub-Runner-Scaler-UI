@@ -592,7 +592,8 @@ CLI_CHAINS_CASE=local-0007 cargo test -p runner-manager \
   --test cli_chains_acceptance -- --ignored --exact replay_selected_case --nocapture
 
 RUNNER_MANAGER_WSL_CHAIN_CASE=wsl-0007 cargo test -p runner-manager \
-  --bin runner-manager replay_one_wsl_chain_case -- --ignored --exact --nocapture
+  --bin runner-manager cli::wsl::acceptance::chains::replay_one_wsl_chain_case \
+  -- --ignored --exact --nocapture
 ```
 
 ## Licence

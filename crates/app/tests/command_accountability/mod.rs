@@ -161,6 +161,10 @@ pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     ),
     at(
         LOCAL_CHAIN_MODEL,
+        "case_identifiers_are_sequential_unique_and_round_trip",
+    ),
+    at(
+        LOCAL_CHAIN_MODEL,
         "every_compatible_mutating_pair_has_a_named_witness",
     ),
 ];
