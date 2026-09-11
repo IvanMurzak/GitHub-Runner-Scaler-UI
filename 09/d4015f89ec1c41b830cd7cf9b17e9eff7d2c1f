@@ -1,0 +1,38 @@
+crates/app/tests/cli_chains_runner/selection.rs
+  s_1e228ed696a2a7::t_5ac9ebf0fe36b9 31,38-77
+  s_1e228ed696a2a7::t_bd58dccd875415 78
+crates/app/tests/cli_chains_runner/run.rs
+  s_1e228ed696a2a7::t_5ac9ebf0fe36b9 35,182,219-225
+  s_1e228ed696a2a7::t_24d42a37b2d5ef 226
+crates/app/tests/cli_chains_runner/mod.rs
+  s_1e228ed696a2a7::t_5ac9ebf0fe36b9 43
+crates/app/tests/cli_chains_acceptance.rs
+  s_1e228ed696a2a7::t_6d831b852b8920 130,229-232,240-243,267-270,272,300-302
+  s_1e228ed696a2a7::t_db31a9f2d34a26 1,53-55,99-112,123,125-129,223-227,233-239,244-249,252-266,275-299
+  s_1e228ed696a2a7::t_c1da1398cedcb5 616
+  s_1e228ed696a2a7::t_b925428490dee8 250-251
+  s_1e228ed696a2a7::t_e829c6e17bf6a1 222,228,271,273-274
+crates/app/tests/cli_chains_runner/security.rs
+  s_1e228ed696a2a7::t_5ac9ebf0fe36b9 1-157
+crates/app/tests/cli_chains_runner/oracle.rs
+  s_1e228ed696a2a7::t_a393e407cde554 50-51,73,102
+  s_1e228ed696a2a7::t_5ac9ebf0fe36b9 99-101
+  s_1e228ed696a2a7::t_c1da1398cedcb5 55-56
+  s_1e228ed696a2a7::t_b66d75d341836a 98,103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "09d4015f89ec1c41b830cd7cf9b17e9eff7d2c1f",
+  "prompts": {},
+  "sessions": {
+    "s_1e228ed696a2a7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08d9d-0521-7cb3-85ef-6c14a5306720",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
