@@ -1,0 +1,71 @@
+.taskflow/2026-09-11-windows-service-wsl-self-healing/03-windows-service-lifecycle.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-22,32-58
+  s_ac5a13ce404118::t_3d4057494b48cb 23-31,59-63
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/c2-wsl-tui-collection.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-33
+.taskflow/2026-09-11-windows-service-wsl-self-healing/01-current-architecture.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-83
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/README.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-17
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/a1-windows-launcher-spike.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/04-wsl-recovery-safety.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-14,17-45,51-89
+  s_ac5a13ce404118::t_140834a504811a 15-16,46-50,90-95
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/a5-service-health.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-33
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/b5-wsl-task-migration-status.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-33
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/b1-wsl-safety-spikes.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/d1-acceptance-security-packaging.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/b2-guest-heartbeat-fence.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/d2-docs-release.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-16,18-32
+  s_ac5a13ce404118::t_b4a4059d7fced9 17
+.taskflow/2026-09-11-windows-service-wsl-self-healing/ROADMAP.md
+  s_ac5a13ce404118::t_140834a504811a 3-4,11-14,71-73,109-127
+  s_ac5a13ce404118::t_84dbf7920be56d 1-2,8-10,15-19,21-23,31-70,74-78,93-97,99-108
+  s_ac5a13ce404118::t_f31ccf7a2a459f 7,98
+  s_ac5a13ce404118::t_bd77527c8aac6d 5-6,20,24-30,79-92,128-134
+.taskflow/2026-09-11-windows-service-wsl-self-healing/05-tui-status-ux.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-6,12-39,46-49
+  s_ac5a13ce404118::t_140834a504811a 7-11,40-45
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/a2-supervisor-core.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-35
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/c1-wsl-tui-model-render.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-31
+.taskflow/2026-09-11-windows-service-wsl-self-healing/README.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-2,5-51,62-80
+  s_ac5a13ce404118::t_f31ccf7a2a459f 3-4
+  s_ac5a13ce404118::t_3d4057494b48cb 52-61
+.taskflow/2026-09-11-windows-service-wsl-self-healing/02-target-architecture.md
+  s_ac5a13ce404118::t_84dbf7920be56d 1-24,29-83,87-91
+  s_ac5a13ce404118::t_3d4057494b48cb 25-28,84-86
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/a4-service-install-start.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/b4-wsl-windows-supervisor.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/a3-daemon-reload-contract.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+.taskflow/2026-09-11-windows-service-wsl-self-healing/tasks/b3-wsl-recovery-model.md
+  s_ac5a13ce404118::t_bd77527c8aac6d 1-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a63f068ecc2a3873955a66cf4cde0ff52849a3df",
+  "prompts": {},
+  "sessions": {
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
