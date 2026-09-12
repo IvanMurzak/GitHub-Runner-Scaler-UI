@@ -3998,17 +3998,22 @@ mod tests {
         // so the smallest one is the closest to the cost being asserted. A
         // render that genuinely got slow fails every sample and still reds.
         let _warm_up = rendered(120, 40, &state);
-        let fastest = (0..5)
+        // Keep enough samples to span a short scheduler time slice. `nextest`
+        // deliberately runs this process beside many other test processes, so
+        // five back-to-back samples can all land inside the same burst of CPU
+        // contention even when the renderer itself remains below budget.
+        const FRAME_SAMPLES: usize = 25;
+        let fastest = (0..FRAME_SAMPLES)
             .map(|_| {
                 let started = Instant::now();
                 let _ = rendered(120, 40, &state);
                 started.elapsed()
             })
             .min()
-            .expect("five samples");
+            .expect("frame samples");
         assert!(
             fastest < FRAME_BUDGET,
-            "frame exceeded {FRAME_BUDGET:?}: fastest of five renders took {fastest:?}"
+            "frame exceeded {FRAME_BUDGET:?}: fastest of {FRAME_SAMPLES} renders took {fastest:?}"
         );
         let _structural_proof: fn(&mut Frame<'_>, &AppState) = render;
 
