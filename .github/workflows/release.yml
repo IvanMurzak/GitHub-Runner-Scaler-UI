@@ -1284,11 +1284,18 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           # PUBLISH_ORDER puts the five platform packages first and the root
-          # package last. The root declares each of them at an exact version,
-          # so publishing it first leaves it installable for the minutes before
-          # its dependencies exist -- and every install in that window fails.
+          # package last. `npm publish` may return while a package is still being
+          # processed and invisible to installs, especially for the Windows
+          # archive. Upload every platform package first, wait until the registry
+          # can resolve all five exact versions, and only then expose the root.
+          root_package="@ivan-murzak/runner-manager"
+          platform_packages=()
           while read -r package; do
             [ -n "$package" ] || continue
+            if [ "$package" = "$root_package" ]; then
+              continue
+            fi
+            platform_packages+=("$package")
 
             # `npm view` answers from the registry, so "already published" is
             # decided by the registry rather than by whether this job has run
@@ -1315,7 +1322,47 @@ jobs:
             ( cd "dist-npm/${package}" && npm publish --access public )
           done < dist-npm/PUBLISH_ORDER
 
-          echo "npm channel is at ${VERSION}"
+          if [ "${#platform_packages[@]}" -ne 5 ]; then
+            echo "expected five npm platform packages, found ${#platform_packages[@]}" >&2
+            exit 1
+          fi
+
+          wait_until_visible() {
+            package="$1"
+            for attempt in $(seq 1 60); do
+              if observed="$(npm view "${package}@${VERSION}" version --prefer-online 2>/dev/null)" \
+                && [ "$observed" = "$VERSION" ]; then
+                echo "registry visible: ${package}@${VERSION}"
+                return 0
+              fi
+              echo "waiting for npm registry: ${package}@${VERSION} (${attempt}/60)"
+              sleep 10
+            done
+            echo "npm accepted ${package}@${VERSION}, but it was not installable after 10 minutes" >&2
+            return 1
+          }
+
+          for package in "${platform_packages[@]}"; do
+            wait_until_visible "$package"
+          done
+
+          if npm view "${root_package}@${VERSION}" version --prefer-online >/dev/null 2>&1; then
+            echo "already published: ${root_package}@${VERSION}"
+          else
+            echo "--- publishing ${root_package}@${VERSION}"
+            ( cd "dist-npm/${root_package}" && npm publish --access public )
+          fi
+          wait_until_visible "$root_package"
+
+          # Exercise npm's actual optionalDependency selection in a clean prefix.
+          # A metadata-only `npm view` cannot prove that the wrapper pulls down
+          # the platform binary which makes the command runnable.
+          smoke_prefix="$(mktemp -d)"
+          npm install --global --prefix "$smoke_prefix" \
+            "${root_package}@${VERSION}" --include=optional --prefer-online
+          "$smoke_prefix/bin/runner-manager" --version
+
+          echo "npm channel is installable at ${VERSION}"
 
       - name: Step 8 - update the Homebrew tap
         env:

@@ -1420,6 +1420,22 @@ fn step_eight_pins_the_channels_to_what_was_actually_published() {
              listing: the root package has to go last",
         ),
         (
+            "wait_until_visible \"$package\"",
+            "`npm publish` can return while a platform package is still being \
+             processed. The root must remain unpublished until every exact \
+             optionalDependency resolves from the registry",
+        ),
+        (
+            "\"${root_package}@${VERSION}\" --include=optional --prefer-online",
+            "metadata visibility is not enough: the release must perform a clean \
+             npm install which exercises platform optionalDependency selection",
+        ),
+        (
+            "\"$smoke_prefix/bin/runner-manager\" --version",
+            "the clean npm install must execute the selected platform binary, or \
+             a wrapper-only installation can still be reported as healthy",
+        ),
+        (
             "channels.sh cargo-publish",
             "the documented cargo-install channel must publish the workspace, \
              rather than leave the crates.io badge pointing at a missing crate",

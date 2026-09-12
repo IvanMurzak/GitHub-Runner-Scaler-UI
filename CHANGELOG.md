@@ -7,6 +7,16 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.17
+
+### Fixes
+
+- The release workflow now waits until npm can resolve all five platform
+  packages before publishing the root wrapper. It then performs a clean install
+  with optional dependencies enabled and executes the installed binary, so an
+  npm package that is still being processed cannot leave a temporarily broken
+  `runner-manager` command while the workflow reports success.
+
 ## 0.4.16
 
 ### Fixes
