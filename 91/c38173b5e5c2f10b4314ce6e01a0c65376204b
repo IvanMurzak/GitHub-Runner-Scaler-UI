@@ -1,0 +1,19 @@
+.taskflow/2026-09-11-windows-service-wsl-self-healing/ROADMAP.md
+  s_ac5a13ce404118::t_741b2e484ba39b 7,79,135-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "91c38173b5e5c2f10b4314ce6e01a0c65376204b",
+  "prompts": {},
+  "sessions": {
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
