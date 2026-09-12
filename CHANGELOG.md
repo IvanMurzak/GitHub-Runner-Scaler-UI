@@ -7,10 +7,14 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
-## 0.4.13
+## 0.4.14
 
 ### Reliability
 
+- Windows login-mode service installation now starts the agent immediately
+  through a windowless supervisor, restarts unexpected daemon failures with
+  bounded backoff, and reloads planned policy changes without consuming the
+  Task Scheduler retry budget.
 - The Windows daemon can now self-heal a failed managed WSL2 distribution after
   a five-minute failure threshold, but only with a cross-boundary launch fence,
   an acknowledged idle drain, complete GitHub inventory, and no unmanaged
@@ -19,6 +23,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   and recovery-blocked WSL states.
 - WSL lifecycle tasks now configure the guest heartbeat and shared launch
   fence required by safe recovery.
+
+## 0.4.13
 
 ### Fixes
 
