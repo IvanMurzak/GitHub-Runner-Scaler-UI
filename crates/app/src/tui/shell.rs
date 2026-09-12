@@ -32,16 +32,17 @@ use tokio::sync::mpsc;
 use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
 use runner_manager_domain::model::{Org, OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::store::Store as _;
+use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, InventoryGateway, RefreshState, RestInventory,
 };
-use runner_manager_github::{AuthenticatedClient, UserAccessToken};
+use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
+use runner_manager_platform::lock::LockKind;
 
-#[cfg(windows)]
-use super::screens::WslHostState;
 use super::screens::{
-    self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,
-    RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot, WslCapability, WslHostRow,
+    self, AgentHealth, Availability, DashboardMetrics, OperationalReadiness, PolicyMode,
+    ReadOnlyScreen, RepositoryRow, RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
+    WslCapability, WslHostRow, WslHostState,
 };
 use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
 use super::table::Skin;
@@ -50,6 +51,7 @@ use super::table::Skin;
 pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
 pub const TICK_RATE: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_POLL_RATE: Duration = Duration::from_secs(60);
+const CREDENTIAL_RENEWAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 const MAX_ACTIVITY_HISTORY: usize = 256;
 const REDACTED: &str = "[REDACTED]";
 
@@ -129,6 +131,7 @@ impl Focus {
 pub enum Health {
     Ready,
     Busy,
+    Degraded,
     Offline,
     Error,
 }
@@ -138,6 +141,11 @@ impl Health {
         match self {
             Self::Ready => ("OK", "Ready", Color::Green),
             Self::Busy => ("*", "Busy", Color::Yellow),
+            Self::Degraded => (
+                "!",
+                "Degraded - open Activity for remediation",
+                Color::Yellow,
+            ),
             Self::Offline => ("!", "Offline - no new runners will start", Color::Gray),
             Self::Error => ("X", "Error - open Activity for remediation", Color::Red),
         }
@@ -410,33 +418,46 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                 local.host.in_use,
                 local.policies.len()
             );
-            match production_screen_snapshot(context, &local, cancel).await {
-                Ok(snapshot) => AgentEvent {
-                    health: if snapshot.metrics.busy_runners > 0 {
-                        Health::Busy
-                    } else {
-                        Health::Ready
-                    },
-                    summary,
-                    privacy_access_denied,
-                    service_version: local.product.service_binary_version.clone(),
-                    snapshot: Some(snapshot),
-                },
+            let (wsl_capability, wsl_hosts) = wsl_overview(context);
+            let readiness = operational_readiness(context, &local, &wsl_hosts);
+            match production_screen_snapshot(context, &local, cancel, wsl_capability, wsl_hosts)
+                .await
+            {
+                Ok(mut snapshot) => {
+                    snapshot.readiness = readiness.state;
+                    snapshot.readiness_summary = readiness.summary.clone();
+                    snapshot.activity.splice(0..0, readiness.activity);
+                    AgentEvent {
+                        health: readiness_health(
+                            snapshot.readiness,
+                            snapshot.metrics.busy_runners > 0,
+                        ),
+                        summary: format!("{summary} {}", snapshot.readiness_summary),
+                        privacy_access_denied,
+                        service_version: local.product.service_binary_version.clone(),
+                        snapshot: Some(snapshot),
+                    }
+                }
                 Err((availability, detail)) => AgentEvent {
                     summary: format!("{summary} GitHub inventory refresh failed: {detail}"),
                     health: Health::Error,
                     privacy_access_denied,
                     service_version: local.product.service_binary_version.clone(),
                     snapshot: Some(Snapshot {
-                        activity: production_activity(context)
-                            .unwrap_or_default()
+                        activity: readiness
+                            .activity
                             .into_iter()
+                            .chain(production_activity(context).unwrap_or_default())
                             .chain(std::iter::once(refresh_activity(
                                 &availability,
                                 &detail,
                                 context.clock().now(),
                             )))
                             .collect(),
+                        readiness: OperationalReadiness::Blocked,
+                        readiness_summary: format!(
+                            "The next job is blocked: GitHub readiness check failed ({detail})."
+                        ),
                         availability,
                         ..Snapshot::default()
                     }),
@@ -453,12 +474,247 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
     }
 }
 
+#[derive(Debug)]
+struct ReadinessAssessment {
+    state: OperationalReadiness,
+    summary: String,
+    activity: Vec<screens::ActivityRow>,
+}
+
+#[derive(Debug)]
+struct LocalServiceReadiness {
+    installed: bool,
+    running: bool,
+    start_mode: Option<StartMode>,
+    log_file: String,
+    problems: Vec<(String, String)>,
+    legacy_windows_action: bool,
+}
+
+fn readiness_health(readiness: OperationalReadiness, busy: bool) -> Health {
+    match readiness {
+        OperationalReadiness::Blocked => Health::Error,
+        OperationalReadiness::Degraded | OperationalReadiness::Unknown => Health::Degraded,
+        OperationalReadiness::Ready if busy => Health::Busy,
+        OperationalReadiness::Ready => Health::Ready,
+    }
+}
+
+fn operational_readiness(
+    context: &crate::cli::Context,
+    local: &crate::cli::status::StatusDocument,
+    wsl_hosts: &[WslHostRow],
+) -> ReadinessAssessment {
+    let service = inspect_local_service(context);
+    readiness_from_facts(
+        service,
+        local
+            .policies
+            .iter()
+            .any(|policy| policy.enabled && policy.mode == "autoscale"),
+        wsl_hosts,
+        compact_activity_time(context.clock().now()),
+    )
+}
+
+fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceReadiness, String> {
+    let service = crate::cli::service::operations(context)
+        .status()
+        .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    let legacy_windows_action = service.registration().is_some_and(|registration| {
+        registration.manager
+            == runner_manager_platform::service::DefinitionKind::WindowsScheduledTask
+            && registration.binary().is_some_and(|binary| {
+                !binary
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("runner-manager-supervisor.exe"))
+            })
+    });
+    #[cfg(not(windows))]
+    let legacy_windows_action = false;
+    Ok(LocalServiceReadiness {
+        installed: service.is_installed(),
+        running: service.is_running(),
+        start_mode: service.start_mode(),
+        log_file: service.log_file().display().to_string(),
+        problems: service
+            .problems()
+            .iter()
+            .map(|problem| (problem.subject.to_owned(), problem.detail.clone()))
+            .collect(),
+        legacy_windows_action,
+    })
+}
+
+fn readiness_from_facts(
+    service: Result<LocalServiceReadiness, String>,
+    autoscale_enabled: bool,
+    wsl_hosts: &[WslHostRow],
+    now: String,
+) -> ReadinessAssessment {
+    let mut state = OperationalReadiness::Ready;
+    let mut activity = Vec::new();
+    let mut raise = |next| {
+        let rank = |value| match value {
+            OperationalReadiness::Ready => 0,
+            OperationalReadiness::Unknown => 1,
+            OperationalReadiness::Degraded => 2,
+            OperationalReadiness::Blocked => 3,
+        };
+        if rank(next) > rank(state) {
+            state = next;
+        }
+    };
+    let mut issue =
+        |id: &str, severity: OperationalReadiness, summary: String, remediation: String| {
+            raise(severity);
+            activity.push(screens::ActivityRow {
+                id: format!("readiness:{id}"),
+                occurred_at: now.clone(),
+                outcome: if severity == OperationalReadiness::Blocked {
+                    screens::ActivityOutcome::Failed
+                } else {
+                    screens::ActivityOutcome::Retry
+                },
+                summary,
+                remediation,
+            });
+        };
+
+    match service {
+        Ok(service) if !service.installed => issue(
+            "local:service-missing",
+            if autoscale_enabled {
+                OperationalReadiness::Blocked
+            } else {
+                OperationalReadiness::Degraded
+            },
+            "Local service is not installed; no background agent will accept jobs.".into(),
+            "Run `runner-manager service install`; use `--start-at boot` for machine-on operation."
+                .into(),
+        ),
+        Ok(service) => {
+            if !service.running {
+                issue(
+                    "local:service-stopped",
+                    OperationalReadiness::Blocked,
+                    format!(
+                        "Local service is registered but stopped; inspect {}.",
+                        service.log_file
+                    ),
+                    "Run `runner-manager service start`; if it stops again, inspect Activity and the service log."
+                        .into(),
+                );
+            }
+            for (subject, detail) in service.problems {
+                if !service.running && subject == "runtime" {
+                    continue;
+                }
+                issue(
+                    &format!("local:{}", subject.replace(' ', "-")),
+                    OperationalReadiness::Blocked,
+                    format!("Local service {subject}: {detail}"),
+                    "Run `runner-manager service status`, then follow its reported remediation."
+                        .into(),
+                );
+            }
+            if service.start_mode == Some(StartMode::Login) {
+                issue(
+                    "local:login-only",
+                    OperationalReadiness::Degraded,
+                    "Local service starts only after this user signs in; it will not cover an unattended reboot."
+                        .into(),
+                    "For machine-on operation, move the service and credential to `--start-at boot` from an elevated terminal."
+                        .into(),
+                );
+            }
+            if service.legacy_windows_action {
+                issue(
+                    "local:supervisor-missing",
+                    OperationalReadiness::Degraded,
+                    "Windows Task Scheduler launches the daemon directly without the restart supervisor; a future failure or upgrade can exhaust its finite restart count."
+                        .into(),
+                    "Run `runner-manager service install --start-at login` from an elevated terminal if Task Scheduler denies replacement."
+                        .into(),
+                );
+            }
+        }
+        Err(error) => issue(
+            "local:service-unknown",
+            OperationalReadiness::Unknown,
+            format!("Local service readiness could not be inspected: {error}"),
+            "Run `runner-manager service status` and resolve the reported access or service-manager error."
+                .into(),
+        ),
+    }
+
+    for host in wsl_hosts {
+        match host.state {
+            WslHostState::Healthy | WslHostState::Unmanaged => {}
+            WslHostState::Draining | WslHostState::Recovering | WslHostState::Backoff => issue(
+                &format!("wsl:{}", host.distribution),
+                OperationalReadiness::Degraded,
+                format!(
+                    "WSL {} is {}: {}",
+                    host.distribution,
+                    host.state.label(),
+                    host.detail
+                ),
+                format!(
+                    "Run `runner-manager wsl status --distribution \"{}\"` for current recovery details.",
+                    host.distribution
+                ),
+            ),
+            WslHostState::Degraded | WslHostState::Unreachable | WslHostState::RecoveryBlocked => {
+                issue(
+                    &format!("wsl:{}", host.distribution),
+                    OperationalReadiness::Blocked,
+                    format!(
+                        "WSL {} is {}: {}",
+                        host.distribution,
+                        host.state.label(),
+                        host.detail
+                    ),
+                    format!(
+                        "Run `runner-manager wsl status --distribution \"{}\"` and follow its remediation.",
+                        host.distribution
+                    ),
+                )
+            }
+        }
+    }
+
+    let summary = match state {
+        OperationalReadiness::Ready => {
+            "Local service and every managed WSL host are ready for the next job.".to_owned()
+        }
+        OperationalReadiness::Degraded => format!(
+            "The host can run, but {} readiness warning(s) need attention.",
+            activity.len()
+        ),
+        OperationalReadiness::Blocked => format!(
+            "The next job may not start; {} blocking or degraded condition(s) were found.",
+            activity.len()
+        ),
+        OperationalReadiness::Unknown => {
+            "The next job cannot be guaranteed because readiness inspection failed.".to_owned()
+        }
+    };
+    ReadinessAssessment {
+        state,
+        summary,
+        activity,
+    }
+}
+
 async fn production_screen_snapshot(
     context: &crate::cli::Context,
     local: &crate::cli::status::StatusDocument,
     cancel: &CancelToken,
+    wsl_capability: WslCapability,
+    wsl_hosts: Vec<WslHostRow>,
 ) -> Result<Snapshot, (Availability, String)> {
-    let (wsl_capability, wsl_hosts) = wsl_overview(context);
     let activity =
         production_activity(context).map_err(|detail| offline_failure(context, detail))?;
     let start_mode = StartMode::from_str(&local.host.service_start_mode).map_err(|error| {
@@ -476,6 +732,39 @@ async fn production_screen_snapshot(
             "no GitHub credential is stored; run `runner-manager auth login`".into(),
         ));
     };
+    let clock = context.clock();
+    let app = context
+        .app_registration()
+        .map_err(|error| (Availability::Unauthorized, error.to_string()))?;
+    let flow = DeviceFlow::new(app.clone(), context.endpoints().clone())
+        .map_err(|error| offline_failure(context, error.to_string()))?;
+    let renewal: Arc<dyn CredentialRenewal> = Arc::new(crate::cli::auth::StoringRenewal::new(
+        flow,
+        Arc::clone(&secrets),
+        context
+            .paths()
+            .state_dir()
+            .join(LockKind::CredentialRenewal.file_name()),
+    ));
+    let client = Arc::new(
+        AuthenticatedClient::new(
+            context.endpoints().clone(),
+            UserAccessToken::from_stored(secret),
+            Arc::clone(&clock),
+        )
+        .map_err(|error| offline_failure(context, error.to_string()))?
+        .with_renewal(renewal)
+        .with_credential_source(Arc::new(crate::cli::auth::StoredCredential::new(
+            Arc::clone(&secrets),
+        ))),
+    );
+    client
+        .renew_if_expiring_within(CREDENTIAL_RENEWAL_WINDOW)
+        .await;
+
+    // A TUI-only host still owns a credential when no policies exist. Keep
+    // renewal ahead of this local-only fast path so that an idle installation
+    // remains authenticated without a service.
     if local.policies.is_empty() {
         return Ok(Snapshot {
             availability: Availability::Ready,
@@ -486,24 +775,12 @@ async fn production_screen_snapshot(
         });
     }
 
-    let clock = context.clock();
-    let client = Arc::new(
-        AuthenticatedClient::new(
-            context.endpoints().clone(),
-            UserAccessToken::from_stored(secret),
-            Arc::clone(&clock),
-        )
-        .map_err(|error| offline_failure(context, error.to_string()))?,
-    );
     let inventory = RestInventory::new(Arc::clone(&client), Arc::clone(&clock));
     let reachable = if local
         .policies
         .iter()
         .any(|policy| policy.scope == "organization")
     {
-        let app = context
-            .app_registration()
-            .map_err(|error| (Availability::Unauthorized, error.to_string()))?;
         Some(
             cancel
                 .run(async {
@@ -623,6 +900,8 @@ async fn production_screen_snapshot(
         repositories,
         runners,
         activity,
+        readiness: OperationalReadiness::Unknown,
+        readiness_summary: "Host readiness is being combined with this snapshot.".into(),
         wsl_capability,
         wsl_hosts,
     })
@@ -2552,6 +2831,33 @@ mod tests {
         assert!(tui_source.contains("shell::run_terminal(context)"));
     }
 
+    #[test]
+    fn tui_owns_credential_renewal_even_without_a_service_or_policies() {
+        let source = include_str!("shell.rs");
+        let snapshot = source
+            .split_once("async fn production_screen_snapshot")
+            .expect("the production snapshot exists")
+            .1
+            .split_once("fn offline_failure")
+            .expect("the snapshot has a following helper")
+            .0;
+
+        assert!(
+            snapshot.contains(".with_renewal(renewal)"),
+            "the TUI's own GitHub client must be renewable"
+        );
+        let maintenance = snapshot
+            .find("renew_if_expiring_within")
+            .expect("the TUI proactively maintains an idle credential");
+        let empty_host = snapshot
+            .find("local.policies.is_empty()")
+            .expect("the empty-policy fast path remains explicit");
+        assert!(
+            maintenance < empty_host,
+            "credential maintenance must run before an empty-policy host returns"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -4169,4 +4475,80 @@ mod tests {
             );
         }
     }
+}
+#[cfg(test)]
+fn ready_service() -> LocalServiceReadiness {
+    LocalServiceReadiness {
+        installed: true,
+        running: true,
+        start_mode: Some(StartMode::Boot),
+        log_file: "service.log".into(),
+        problems: vec![],
+        legacy_windows_action: false,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
+    let ready = readiness_from_facts(Ok(ready_service()), true, &[], "12:00:00Z".into());
+    assert_eq!(ready.state, OperationalReadiness::Ready);
+    assert!(ready.activity.is_empty());
+
+    let missing = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            installed: false,
+            running: false,
+            start_mode: None,
+            log_file: "service.log".into(),
+            problems: vec![],
+            legacy_windows_action: false,
+        }),
+        false,
+        &[],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(missing.state, OperationalReadiness::Degraded);
+    assert!(missing.activity[0].summary.contains("not installed"));
+
+    let mut stopped = ready_service();
+    stopped.running = false;
+    stopped.start_mode = Some(StartMode::Login);
+    stopped.legacy_windows_action = true;
+    stopped
+        .problems
+        .push(("runtime".into(), "daemon is stopped".into()));
+    let blocked = readiness_from_facts(
+        Ok(stopped),
+        true,
+        &[WslHostRow {
+            distribution: "Ubuntu".into(),
+            state: WslHostState::Degraded,
+            detail: "credential rejected".into(),
+        }],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(blocked.state, OperationalReadiness::Blocked);
+    let text = blocked
+        .activity
+        .iter()
+        .map(|row| format!("{} {}", row.summary, row.remediation))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("registered but stopped"), "{text}");
+    assert!(text.contains("supervisor"), "{text}");
+    assert!(text.contains("elevated terminal"), "{text}");
+    assert!(text.contains("WSL Ubuntu"), "{text}");
+
+    let unknown = readiness_from_facts(Err("access denied".into()), true, &[], "12:00:00Z".into());
+    assert_eq!(unknown.state, OperationalReadiness::Unknown);
+    assert!(unknown.activity[0].summary.contains("access denied"));
+    assert_eq!(
+        readiness_health(OperationalReadiness::Blocked, false),
+        Health::Error
+    );
+    assert_eq!(
+        readiness_health(OperationalReadiness::Degraded, false),
+        Health::Degraded
+    );
 }

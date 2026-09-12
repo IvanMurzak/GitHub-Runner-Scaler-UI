@@ -1,7 +1,8 @@
 // owner: d1-platform-core
 
-//! The two host locks: one that keeps a second agent from reconciling the same
-//! policies, and one that serialises runtime creation.
+//! The host locks: one keeps a second agent from reconciling the same policies,
+//! one serialises runtime creation, and one serialises rotating credentials
+//! across a background service and foreground tools.
 //!
 //! `03-control-flows.md`, flow 3.1: *"A single-instance lock prevents two
 //! agents on one host from reconciling the same policy."* Flow 2.4: the agent
@@ -69,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths::AppPaths;
 use crate::process::{Adoption, ProcessIdentity};
 
-/// Which of the two host locks.
+/// Which host-wide operation is being excluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockKind {
@@ -79,6 +80,9 @@ pub enum LockKind {
     /// Held only while one runtime is being created, so that two concurrent
     /// allocations cannot both read the same headroom and both use it.
     Allocation,
+    /// Held while one process rotates the credential shared by a service and
+    /// foreground tools.
+    CredentialRenewal,
 }
 
 impl LockKind {
@@ -88,6 +92,7 @@ impl LockKind {
         match self {
             Self::SingleInstance => "agent.lock",
             Self::Allocation => "allocation.lock",
+            Self::CredentialRenewal => "credential-renewal.lock",
         }
     }
 
@@ -97,6 +102,7 @@ impl LockKind {
         match self {
             Self::SingleInstance => "the single-instance agent lock",
             Self::Allocation => "the runtime allocation lock",
+            Self::CredentialRenewal => "the credential-renewal lock",
         }
     }
 
@@ -112,6 +118,10 @@ impl LockKind {
             }
             Self::Allocation => {
                 "This lock is held only for as long as it takes to create one runtime. Retry \
+                 shortly."
+            }
+            Self::CredentialRenewal => {
+                "This lock is held only while one process rotates the shared credential. Retry \
                  shortly."
             }
         }
@@ -683,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_locks_do_not_contend_with_each_other() {
+    fn independent_host_locks_do_not_contend_with_each_other() {
         // `e1` takes the allocation lock while the agent already holds the
         // single-instance lock. If those two shared a file, the agent would
         // deadlock against itself on the first runtime it tried to create.
@@ -701,10 +711,22 @@ mod tests {
         )
         .expect("the allocation lock is a different lock and must be free");
 
+        let renewal = HostLock::try_acquire_at(
+            &lock_path(&directory, LockKind::CredentialRenewal),
+            LockKind::CredentialRenewal,
+        )
+        .expect("the credential-renewal lock is a different lock and must be free");
+
         assert_ne!(instance.path(), allocation.path());
+        assert_ne!(instance.path(), renewal.path());
+        assert_ne!(allocation.path(), renewal.path());
         assert_ne!(
             LockKind::SingleInstance.file_name(),
             LockKind::Allocation.file_name()
+        );
+        assert_ne!(
+            LockKind::Allocation.file_name(),
+            LockKind::CredentialRenewal.file_name()
         );
     }
 

@@ -17,6 +17,7 @@ const RESTART_DELAY: Duration = Duration::from_secs(2);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(60);
 const STABLE_CHILD_UPTIME: Duration = Duration::from_secs(5 * 60);
 const UPGRADE_PENDING_EXIT_CODE: i32 = 21;
+const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
 
 fn main() -> ExitCode {
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
         let mut command = Command::new(&program);
         command
             .args(&arguments)
+            .env(SUPERVISED_ENVIRONMENT, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

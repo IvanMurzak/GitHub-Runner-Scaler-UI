@@ -46,6 +46,7 @@
 
 use std::fmt::Display;
 use std::io::{self, IsTerminal as _, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,7 @@ use runner_manager_github::{
     AuthenticatedClient, CredentialRenewal, CredentialSource, GithubError, Installation,
     InstallationDiscovery, RepositorySelection, TokioSleeper, UserAccessToken,
 };
+use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 use secrecy::zeroize::Zeroize as _;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -386,18 +388,59 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
 pub struct StoringRenewal {
     flow: DeviceFlow,
     secrets: Arc<dyn SecretStore>,
+    lock_path: PathBuf,
 }
 
 impl StoringRenewal {
     #[must_use]
-    pub fn new(flow: DeviceFlow, secrets: Arc<dyn SecretStore>) -> Self {
-        Self { flow, secrets }
+    pub fn new(flow: DeviceFlow, secrets: Arc<dyn SecretStore>, lock_path: PathBuf) -> Self {
+        Self {
+            flow,
+            secrets,
+            lock_path,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialRenewal for StoringRenewal {
     async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+        // The client's async mutex covers one process only. GitHub invalidates
+        // a rotating refresh token on first use, so a service and TUI sharing
+        // a store must serialize the complete read/exchange/write transaction.
+        let lock_path = self.lock_path.clone();
+        let _lock = tokio::task::spawn_blocking(move || {
+            HostLock::acquire_at(
+                &lock_path,
+                LockKind::CredentialRenewal,
+                Duration::from_secs(45),
+            )
+        })
+        .await
+        .map_err(|source| format!("the credential-renewal lock task failed: {source}"))?
+        .map_err(|source| format!("the credential-renewal lock could not be acquired: {source}"))?;
+
+        // The winner may have rotated and stored a replacement while this
+        // process waited. Re-read under the lock and use that replacement
+        // instead of replaying the predecessor at GitHub.
+        let stored = self
+            .secrets
+            .load()
+            .map_err(|source| {
+                format!("the credential store could not be re-read before renewal: {source}")
+            })?
+            .ok_or_else(|| {
+                "the credential was removed while renewal was waiting; it was not recreated"
+                    .to_string()
+            })?;
+        let stored = UserAccessToken::from_stored_document(&stored);
+        let still_current = stored.renewal().is_some_and(|renewal| {
+            renewal.refresh_token().expose_secret() == refresh_token.expose_secret()
+        });
+        if !still_current {
+            return Ok(stored);
+        }
+
         let fresh = self
             .flow
             .refresh(refresh_token)
@@ -3035,6 +3078,55 @@ mod tests {
             Endpoints::for_test_server("http://127.0.0.1:1/").expect("a valid URL"),
         )
         .expect("a context rooted at a temp dir")
+    }
+
+    #[tokio::test]
+    async fn service_and_tui_serialize_refresh_token_rotation_across_process_locks() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+                .expect("a rooted store resolves"),
+        );
+        store
+            .store(&SecretString::from(document(
+                &windows_access_canary(),
+                &windows_refresh_canary(),
+            )))
+            .expect("the shared credential is stored");
+
+        let github = FakeDeviceFlow::approving();
+        let context = context_against(root.path(), &github);
+        let app = context
+            .app_registration()
+            .expect("the test app is registered");
+        let lock_path = root.path().join("state").join("credential-renewal.lock");
+        let renewal = || {
+            StoringRenewal::new(
+                DeviceFlow::new(app.clone(), github.endpoints()).expect("a device client"),
+                Arc::clone(&store) as Arc<dyn SecretStore>,
+                lock_path.clone(),
+            )
+        };
+        let service = renewal();
+        let tui = renewal();
+        let service_refresh = SecretString::from(windows_refresh_canary());
+        let tui_refresh = SecretString::from(windows_refresh_canary());
+
+        let (service_result, tui_result) =
+            tokio::join!(service.renew(&service_refresh), tui.renew(&tui_refresh),);
+
+        let service_result = service_result.expect("the service gets a usable replacement");
+        let tui_result = tui_result.expect("the TUI gets the same usable replacement");
+        assert_eq!(
+            service_result.secret().expose_secret(),
+            tui_result.secret().expose_secret(),
+            "both processes must converge on the winner's stored credential"
+        );
+        assert_eq!(
+            github.requests_answered(),
+            1,
+            "the shared refresh token must reach GitHub exactly once"
+        );
     }
 
     // -- receive: what it refuses ------------------------------------------

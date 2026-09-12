@@ -942,13 +942,10 @@ impl InstallPlan {
         if !binary.is_file() {
             return Err(ServiceError::BinaryMissing { path: binary });
         }
-        // `d2` publishes both halves of the systemd credential seam — the
-        // credential's name and the guard file the store lives in — precisely so
-        // that a unit file can name them without this module reimplementing
-        // either. A store that cannot be resolved at all is not fatal here: it
-        // means the unit carries no `LoadCredential=` line and the daemon opens
-        // the file itself, which is the pre-systemd-credential path `d2` still
-        // supports.
+        // `d2` publishes the guard file the store lives in so the systemd
+        // sandbox can admit only its parent for atomic token rotation. A store
+        // that cannot be resolved is not fatal here; it merely cannot receive
+        // that narrow writable-path exception.
         let secret_guard = crate::secrets::PlatformSecretStore::for_start_mode(request.start_mode)
             .ok()
             .map(|store| store.guard());
@@ -1007,12 +1004,12 @@ impl InstallPlan {
         self.on_demand
     }
 
-    /// Names the file the machine-scoped secret store lives in, for the
-    /// systemd `LoadCredential=` line.
+    /// Names the file the secret store lives in, so systemd can permit atomic
+    /// replacement of it under `ProtectSystem=strict`.
     ///
     /// [`InstallPlan::resolve`] fills this from `d2`; a test names it directly
-    /// so that a Windows or macOS CI leg can assert the Linux unit's credential
-    /// line for a path that platform does not have.
+    /// so that a Windows or macOS CI leg can assert the Linux unit's writable
+    /// path for a store that platform does not have.
     #[must_use]
     pub fn with_secret_guard(mut self, guard: impl Into<PathBuf>) -> Self {
         self.secret_guard = Some(guard.into());
@@ -1503,11 +1500,13 @@ pub const START_LIMIT_BURST: u32 = 5;
 /// `05-infrastructure.md` item 2 ends *"and write its configured cache and
 /// runtime directories — and no more"*. `ProtectSystem=strict` plus an explicit
 /// `ReadWritePaths` is what "and no more" means on Linux: everything outside the
-/// four recorded directories is read-only to this unit.
+/// recorded application-data directories and the credential store directory
+/// is read-only to this unit. The latter must be writable because refresh-token
+/// rotation atomically replaces the credential file.
 ///
 /// **The runner inherits it.** The agent spawns the GitHub Actions runner as a
 /// child, so a workflow running on this host also runs inside this sandbox: it
-/// cannot write outside the four directories and its private `/tmp`, and
+/// cannot write outside those directories and its private `/tmp`, and
 /// `NoNewPrivileges=yes` means it cannot `sudo`. `07-security.md` assumes a
 /// hostile workflow may run here, so that is the intended direction — but it is
 /// a real behavioural limit and `docs/service-account.md` states it where an
@@ -1547,28 +1546,18 @@ pub fn systemd_unit(plan: &InstallPlan) -> String {
     out.push_str("Restart=on-failure\n");
     out.push_str(&format!("RestartSec={}\n", restart.delay().as_secs()));
 
-    // `d2` publishes the credential name so the unit and the reader cannot
-    // disagree about it. A user unit never carries one: the file it would name
-    // is root-owned, and a user-scoped store is deliberately not for a service.
-    if plan.start_mode() == StartMode::Boot
-        && let Some(guard) = plan.secret_guard()
-    {
-        out.push_str(&format!(
-            "LoadCredential={}:{}\n",
-            crate::secrets::SYSTEMD_CREDENTIAL,
-            guard.display()
-        ));
-    }
-
     out.push_str("\n# Least privilege. See docs/service-account.md.\n");
     for directive in SYSTEMD_HARDENING {
         out.push_str(directive);
         out.push('\n');
     }
+    let mut writable = directories.all().to_vec();
+    if let Some(secret_directory) = plan.secret_guard().and_then(Path::parent) {
+        writable.push(secret_directory);
+    }
     out.push_str(&format!(
         "ReadWritePaths={}\n",
-        directories
-            .all()
+        writable
             .iter()
             .map(|path| quote_argument(&path.to_string_lossy()))
             .collect::<Vec<_>>()
@@ -2185,12 +2174,19 @@ pub fn review_least_privilege(
 }
 
 /// Every writable path a definition may name, as the strings it names them by.
-fn permitted_paths(plan: &InstallPlan) -> Vec<String> {
-    plan.directories()
+fn permitted_paths(kind: DefinitionKind, plan: &InstallPlan) -> Vec<String> {
+    let mut permitted = plan
+        .directories()
         .all()
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
-        .collect()
+        .collect::<Vec<_>>();
+    if kind == DefinitionKind::SystemdUnit
+        && let Some(secret_directory) = plan.secret_guard().and_then(Path::parent)
+    {
+        permitted.push(secret_directory.to_string_lossy().into_owned());
+    }
+    permitted
 }
 
 /// Whether two path spellings name the same place on **this host's**
@@ -2218,7 +2214,7 @@ fn same_path_for(kind: DefinitionKind, left: &str, right: &str) -> bool {
     }
 }
 
-/// Checks a `ReadWritePaths`-style list against the four permitted directories.
+/// Checks a `ReadWritePaths`-style list against the permitted directories.
 fn review_writable_paths(
     kind: DefinitionKind,
     subject: &str,
@@ -2227,7 +2223,7 @@ fn review_writable_paths(
     controls: &mut Vec<String>,
     findings: &mut Vec<PrivilegeFinding>,
 ) {
-    let permitted = permitted_paths(plan);
+    let permitted = permitted_paths(kind, plan);
     for entry in listed {
         if !permitted
             .iter()
@@ -2237,8 +2233,7 @@ fn review_writable_paths(
                 kind: FindingKind::Excess,
                 subject: subject.to_string(),
                 detail: format!(
-                    "{entry} is writable but is not one of this registration's four \
-                     application-data directories"
+                    "{entry} is writable but is not one of this registration's required paths"
                 ),
             });
         }
@@ -2260,7 +2255,7 @@ fn review_writable_paths(
     }
     if listed.len() == permitted.len() && findings.iter().all(|f| f.subject != subject) {
         controls.push(format!(
-            "{subject} names exactly the four application-data directories"
+            "{subject} names exactly the required application-data and credential paths"
         ));
     }
 }
@@ -2675,6 +2670,17 @@ pub(crate) fn xml_value(text: &str, tag: &str) -> Option<String> {
     let start = text.find(&open)? + open.len();
     let end = text[start..].find(&close)? + start;
     Some(xml_unescape(text[start..end].trim()))
+}
+
+/// Whether Task Scheduler will launch a login task automatically.
+///
+/// Its `/Query /XML` output normalises away values that equal the schema
+/// default. In particular, an enabled task commonly has no `<Enabled>` node at
+/// all, so only an explicit `false` means disabled.
+#[cfg(any(windows, test))]
+fn windows_login_task_starts_automatically(document: &str) -> bool {
+    document.contains("<LogonTrigger>")
+        && xml_value(document, "Enabled").as_deref() != Some("false")
 }
 
 /// The `<string>` that follows `<key>key</key>` in a property list.
@@ -5736,8 +5742,7 @@ mod sys {
                 command_line,
                 account: xml_value(&document, "UserId"),
                 running: task_is_running(&name),
-                starts_automatically: document.contains("<LogonTrigger>")
-                    && xml_value(&document, "Enabled").as_deref() == Some("true"),
+                starts_automatically: super::windows_login_task_starts_automatically(&document),
                 restart_delay: xml_value(&document, "Interval")
                     .as_deref()
                     .and_then(parse_iso8601),
@@ -6356,6 +6361,22 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    #[test]
+    fn task_scheduler_omitting_default_enabled_still_means_automatic() {
+        assert!(windows_login_task_starts_automatically(
+            "<Task><Triggers><LogonTrigger></LogonTrigger></Triggers></Task>"
+        ));
+        assert!(windows_login_task_starts_automatically(
+            "<Task><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Task>"
+        ));
+        assert!(!windows_login_task_starts_automatically(
+            "<Task><LogonTrigger><Enabled>false</Enabled></LogonTrigger></Task>"
+        ));
+        assert!(!windows_login_task_starts_automatically(
+            "<Task><BootTrigger></BootTrigger></Task>"
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Fixtures
     // -----------------------------------------------------------------------
@@ -6702,14 +6723,11 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_unit_reads_the_token_through_the_credential_d2_publishes() {
+    fn the_boot_unit_reads_the_live_store_instead_of_a_frozen_systemd_copy() {
         let unit = systemd_unit(&linux_plan(StartMode::Boot));
         assert!(
-            unit.contains(&format!(
-                "LoadCredential={}:/var/lib/runner-manager/secrets/user-access-token\n",
-                crate::secrets::SYSTEMD_CREDENTIAL
-            )),
-            "the unit must name the credential `d2` reads, got:\n{unit}"
+            !unit.contains("LoadCredential="),
+            "a startup snapshot would shadow every rotated credential until restart:\n{unit}"
         );
     }
 
@@ -6724,7 +6742,7 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_makes_exactly_the_four_directories_writable() {
+    fn the_unit_can_atomically_replace_the_credential_and_write_only_required_directories() {
         let plan = linux_plan(StartMode::Boot);
         let unit = systemd_unit(&plan);
         let directives = ini_directives(&unit, "Service");
@@ -6733,7 +6751,7 @@ mod tests {
                 .get("ReadWritePaths")
                 .expect("the unit names its writable paths"),
         );
-        assert_eq!(listed.len(), 4, "{listed:?}");
+        assert_eq!(listed.len(), 5, "{listed:?}");
         for path in plan.directories().all() {
             assert!(
                 listed.iter().any(|entry| entry == &path.to_string_lossy()),
@@ -6741,6 +6759,12 @@ mod tests {
                 path.display()
             );
         }
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry == "/var/lib/runner-manager/secrets"),
+            "atomic credential replacement needs its parent directory in {listed:?}"
+        );
     }
 
     #[test]

@@ -7,6 +7,30 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.16
+
+### Fixes
+
+- The TUI now continuously reports operational readiness separately from
+  GitHub inventory: stopped or missing services, legacy Windows tasks without
+  the restart supervisor, service-manager/permission failures, login-only
+  availability, and unhealthy managed WSL hosts appear in the header,
+  Dashboard, and Activity view with copy-safe remediation commands.
+- The TUI now proactively renews GitHub credentials even when no service is
+  installed and when the host has no policies. Credential rotation is guarded
+  by an OS file lock, so a service and TUI sharing a store cannot replay the
+  same one-time refresh token.
+- Linux and WSL systemd services now receive narrowly scoped write access to
+  the credential-store directory, allowing a successful refresh exchange to
+  atomically persist the rotated pair under `ProtectSystem=strict`.
+- Legacy Windows login tasks now migrate themselves to the windowless restart
+  supervisor before the daemon starts, so an upgrade cannot exhaust Task
+  Scheduler's finite retry count and leave the registered service stopped. If
+  an elevated task's ACL prevents replacement, it bootstraps the same permanent
+  supervisor directly without requiring administrator rights.
+- `service status` now recognises Task Scheduler's omitted default
+  `Enabled=true` value and reports a stopped login task as unhealthy.
+
 ## 0.4.15
 
 ### Reliability

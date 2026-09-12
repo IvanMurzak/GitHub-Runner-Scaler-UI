@@ -144,29 +144,18 @@ A systemd system unit runs as `root`. The machine-scoped store is a `0600` file
 under `/var/lib/runner-manager`, which only `root` can open before any session
 exists.
 
-**There is a way out of that, and the unit already takes the first half of it.**
-`d2` publishes a systemd credential name (`runner-manager.user-access-token`)
-and the guard file it reads, and the generated boot unit carries:
-
-```ini
-LoadCredential=runner-manager.user-access-token:/var/lib/runner-manager/secrets/user-access-token
-```
-
-systemd reads that file **as root** and hands the contents to the service
-through `$CREDENTIALS_DIRECTORY`, which means a future version could add
-`User=runner-manager` — or `DynamicUser=yes` — and the daemon would still get
-its token while running unprivileged.
-
-This installer does not do that, deliberately: creating a system account on
-somebody's home machine is not something a `service install` should do without
-being asked, and `05-infrastructure.md` does not ask for it. The credential line
-is there so that the change is a one-line unit edit rather than a redesign.
+The generated unit deliberately reads that live store rather than using
+`LoadCredential=`. A systemd credential is a startup snapshot; it would keep
+shadowing the newly persisted pair after GitHub rotates a refresh token and
+would make the next reload move backwards to the dead pair. Supporting a
+non-root system account therefore requires a writable credential broker rather
+than a one-line unit edit.
 
 ---
 
 ## What the daemon may write, and nothing else
 
-Every definition restricts the daemon to the four directories
+Every definition restricts the daemon to the application-data directories
 `05-infrastructure.md` gives it, recorded at install time in
 `config/service.toml`:
 
@@ -176,6 +165,11 @@ state/       the agent lock, the attempt journal, the runner package cache
 runtime/     per-attempt disposable runner workspaces
 logs/        rotating redacted diagnostics
 ```
+
+On Linux the systemd unit additionally admits only the selected credential
+store directory. Renewal writes a temporary `0600` file and atomically renames
+it over the old pair, so write access to the parent directory is required; the
+credential file alone is not sufficient.
 
 ### Two accounts write into one `logs/`
 
@@ -212,7 +206,7 @@ On Linux the confinement below is enforced, not merely intended:
 
 ```ini
 ProtectSystem=strict
-ReadWritePaths=<config> <state> <runtime> <logs>
+ReadWritePaths=<config> <state> <runtime> <logs> <credential-store-directory>
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -229,7 +223,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 `ProtectSystem=strict` makes the entire filesystem read-only except for the
 paths named in `ReadWritePaths`, plus the private `/tmp` that `PrivateTmp=yes`
-supplies. `review_least_privilege` fails a unit that names a fifth path there,
+supplies. `review_least_privilege` fails a unit that names any other path there,
 that drops any of the directives above, or that weakens one of them.
 
 ### The consequence a Linux operator will actually notice
@@ -238,8 +232,9 @@ that drops any of the directives above, or that weakens one of them.
 as a child process, so a workflow running on this host runs inside the same
 restrictions:
 
-- it can write to the attempt workspace under `runtime/` and to its private
-  `/tmp`, and to nothing else on the filesystem;
+- it can write to the attempt workspace under `runtime/`, to its private
+  `/tmp`, and to the credential-store directory which the manager needs for
+  atomic refresh-token rotation; it cannot write elsewhere on the filesystem;
 - `NoNewPrivileges=yes` means it cannot `sudo`, and no setuid binary gains
   privilege inside it;
 - an action that installs tooling into `/usr`, `/opt`, or the account's home

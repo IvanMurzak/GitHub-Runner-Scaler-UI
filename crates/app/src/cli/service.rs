@@ -5,9 +5,13 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 
 use runner_manager_domain::model::StartMode;
 use runner_manager_domain::store::{Store, StoreError};
+#[cfg(windows)]
+use runner_manager_platform::service::InstallRecord;
 use runner_manager_platform::service::{
     HostControls, InstallRequest, ServiceError, ServiceIdentity, ServiceOperations,
     WINDOWS_SCM_HOST_ARGUMENT,
@@ -33,6 +37,8 @@ pub fn dispatch(
 ///
 /// See [`identity`].
 pub(super) const SERVICE_TAG_VARIABLE: &str = "RUNNER_MANAGER_SERVICE_NAME_TAG";
+#[cfg(windows)]
+pub(super) const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
 
 /// The one place that decides which registration this process acts on.
 ///
@@ -233,6 +239,21 @@ pub fn install(
     args: &ServiceInstallArgs,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    let source = std::env::current_exe().map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot resolve this executable's own path: {source}"),
+        )
+    })?;
+    install_from(context, args, out, &source)
+}
+
+fn install_from(
+    context: &Context,
+    args: &ServiceInstallArgs,
+    out: &mut dyn Write,
+    source: &std::path::Path,
+) -> Result<(), CliError> {
     let failed = write_failed("this service installation");
     let mode: StartMode = args.start_at.into();
     let store = context.store()?;
@@ -274,13 +295,7 @@ pub fn install(
     // is never locked, so an upgrade lands, and the daemon can compare itself
     // against it. `installed_from` keeps the origin, which is what item 6's
     // stale-path detection needs and what the upgrade watch reads.
-    let source = std::env::current_exe().map_err(|source| {
-        CliError::new(
-            Failure::LocalState,
-            format!("cannot resolve this executable's own path: {source}"),
-        )
-    })?;
-    let owned = install_owned_copy(context, &source)?;
+    let owned = install_owned_copy(context, source)?;
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut service_binary = owned.path.clone();
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -303,7 +318,7 @@ pub fn install(
     };
     let request = InstallRequest::new(mode)
         .for_binary(&service_binary)
-        .copied_from(&source)
+        .copied_from(source)
         .with_arguments(service_arguments);
     // The swap above is undone on every failure below it. See `OwnedCopy`: a
     // refused install that left the new copy in place is what put a running
@@ -400,6 +415,113 @@ pub fn install(
         writeln!(out, "  host setting              {previous} -> {mode}").map_err(failed)?;
     }
     Ok(())
+}
+
+/// Upgrades the pre-supervisor Windows login registration in place.
+///
+/// This runs before the daemon takes its single-instance lock. An old Task
+/// Scheduler registration launches the private daemon image directly, so an
+/// upgrade exit eventually consumes Task Scheduler's finite retry allowance
+/// and leaves the host stopped. Re-registering from the recorded package copy
+/// installs the permanent supervisor; the newly started supervisor waits for
+/// this short-lived legacy process to exit and then owns all future restarts.
+#[cfg(windows)]
+pub(super) fn migrate_legacy_windows_login_registration(
+    context: &Context,
+    out: &mut dyn Write,
+) -> Result<bool, CliError> {
+    let Some(record) = InstallRecord::read(context.paths()).map_err(service_failure)? else {
+        return Ok(false);
+    };
+    let current = std::env::current_exe().map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot inspect the running daemon path: {source}"),
+        )
+    })?;
+    if !is_legacy_windows_login_action(record.start_mode, &record.binary, &current) {
+        return Ok(false);
+    }
+    let Some(source) = record.source_binary else {
+        return Ok(false);
+    };
+    if !source
+        .with_file_name("runner-manager-supervisor.exe")
+        .is_file()
+    {
+        return Ok(false);
+    }
+
+    let supervisor = source.with_file_name("runner-manager-supervisor.exe");
+    let result = install_from(
+        context,
+        &ServiceInstallArgs {
+            start_at: super::StartAt::Login,
+        },
+        out,
+        &source,
+    );
+    if let Err(error) = result {
+        // A login task created from an elevated shell can be readable and
+        // runnable by the user while its ACL still denies replacement. The
+        // registration cannot be repaired without elevation, but continuity
+        // does not need to wait for it: bootstrap the same supervisor directly.
+        launch_supervisor(&supervisor, &current).map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!(
+                    "cannot migrate the legacy Windows task ({error}) or launch its restart supervisor: {source}"
+                ),
+            )
+        })?;
+        tracing::warn!(
+            %error,
+            "the legacy Windows task ACL denied migration; launched the restart supervisor directly"
+        );
+        return Ok(true);
+    }
+    tracing::info!("migrated the legacy Windows login task to the restart supervisor");
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn launch_supervisor(
+    supervisor: &std::path::Path,
+    daemon: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new(supervisor)
+        .arg(daemon)
+        .args(std::env::args_os().skip(1))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(any(windows, test))]
+fn is_legacy_windows_login_action(
+    mode: StartMode,
+    registered: &std::path::Path,
+    current: &std::path::Path,
+) -> bool {
+    mode == StartMode::Login
+        && same_executable(registered, current)
+        && !registered
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("runner-manager-supervisor.exe"))
+}
+
+#[cfg(any(windows, test))]
+fn same_executable(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 pub fn uninstall(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
@@ -509,11 +631,38 @@ fn service_failure(source: ServiceError) -> CliError {
 mod tests {
     use super::*;
     use clap::Parser as _;
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::cli::{Cli, Command, DaemonCommand};
     use runner_manager_domain::path::LocalAbsolutePath;
     use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
+
+    #[test]
+    fn only_the_running_pre_supervisor_login_action_needs_migration() {
+        let daemon = Path::new("C:/state/bin/runner-manager.exe");
+        let supervisor = Path::new("C:/state/bin/runner-manager-supervisor.exe");
+        assert!(is_legacy_windows_login_action(
+            StartMode::Login,
+            daemon,
+            daemon
+        ));
+        assert!(!is_legacy_windows_login_action(
+            StartMode::Login,
+            supervisor,
+            supervisor
+        ));
+        assert!(!is_legacy_windows_login_action(
+            StartMode::Boot,
+            daemon,
+            daemon
+        ));
+        assert!(!is_legacy_windows_login_action(
+            StartMode::Login,
+            daemon,
+            Path::new("C:/package/runner-manager.exe")
+        ));
+    }
 
     /// The copy is what makes an upgrade possible at all: a package manager
     /// cannot replace a file a running service holds open, and on Windows it

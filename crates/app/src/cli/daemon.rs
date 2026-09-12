@@ -51,6 +51,17 @@ pub fn dispatch(
 ) -> Result<(), CliError> {
     match command {
         DaemonCommand::Run(_) => {
+            #[cfg(windows)]
+            if std::env::var_os(super::service::SUPERVISED_ENVIRONMENT).is_none() {
+                match super::service::migrate_legacy_windows_login_registration(context, out) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "the legacy Windows login task could not start its restart supervisor; continuing under Task Scheduler"
+                    ),
+                }
+            }
             let runtime = super::runtime()?;
             runtime.block_on(run(context, out, service_shutdown))
         }
@@ -174,6 +185,10 @@ async fn run_generation(
             )
         })?,
         Arc::clone(&secrets),
+        context
+            .paths()
+            .state_dir()
+            .join(LockKind::CredentialRenewal.file_name()),
     ));
     let client = Arc::new(
         AuthenticatedClient::new(
@@ -595,8 +610,14 @@ fn idle_credential_client(context: &Context, mode: StartMode) -> Option<Arc<Auth
             return None;
         }
     };
-    let renewal: Arc<dyn CredentialRenewal> =
-        Arc::new(super::auth::StoringRenewal::new(flow, Arc::clone(&secrets)));
+    let renewal: Arc<dyn CredentialRenewal> = Arc::new(super::auth::StoringRenewal::new(
+        flow,
+        Arc::clone(&secrets),
+        context
+            .paths()
+            .state_dir()
+            .join(LockKind::CredentialRenewal.file_name()),
+    ));
     let client = match AuthenticatedClient::new(
         context.endpoints().clone(),
         UserAccessToken::from_stored(secret),

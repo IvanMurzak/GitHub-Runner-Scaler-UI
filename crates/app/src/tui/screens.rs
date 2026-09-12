@@ -76,6 +76,39 @@ pub enum Availability {
     Cancelled,
 }
 
+/// Whether this host could accept and execute its next assigned job.
+///
+/// Kept apart from GitHub [`Availability`]: the API may be reachable while the
+/// local service is stopped, its supervisor is missing, or a managed WSL host
+/// is unusable. The header reports the worse of the two truths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalReadiness {
+    Unknown,
+    Ready,
+    Degraded,
+    Blocked,
+}
+
+impl OperationalReadiness {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Ready => "READY",
+            Self::Degraded => "DEGRADED",
+            Self::Blocked => "BLOCKED",
+        }
+    }
+
+    const fn tone(self) -> Tone {
+        match self {
+            Self::Unknown => Tone::Muted,
+            Self::Ready => Tone::Ok,
+            Self::Degraded => Tone::Warn,
+            Self::Blocked => Tone::Bad,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
     Autoscale,
@@ -271,7 +304,7 @@ pub enum WslHostState {
 }
 
 impl WslHostState {
-    const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Unmanaged => "unmanaged",
             Self::Healthy => "healthy",
@@ -301,6 +334,8 @@ pub struct Snapshot {
     pub repositories: Vec<RepositoryRow>,
     pub runners: Vec<RunnerRow>,
     pub activity: Vec<ActivityRow>,
+    pub readiness: OperationalReadiness,
+    pub readiness_summary: String,
     pub wsl_capability: WslCapability,
     pub wsl_hosts: Vec<WslHostRow>,
 }
@@ -312,6 +347,8 @@ impl Default for Snapshot {
             repositories: vec![],
             runners: vec![],
             activity: vec![],
+            readiness: OperationalReadiness::Unknown,
+            readiness_summary: "Host readiness has not been checked yet.".to_owned(),
             wsl_capability: if cfg!(windows) {
                 WslCapability::NoDistributions
             } else {
@@ -1314,13 +1351,16 @@ fn state_panel(
 fn ready(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
     match model.screen {
         ReadOnlyScreen::Dashboard => {
+            let readiness = readiness_panel(model, skin);
             if model.snapshot.repositories.is_empty()
                 && model.snapshot.runners.is_empty()
                 && model.snapshot.metrics == DashboardMetrics::default()
             {
-                return vec![empty_panel(skin, model.screen)];
+                return vec![readiness, empty_panel(skin, model.screen)];
             }
-            dashboard_sections(model, skin, rows)
+            let mut sections = vec![readiness];
+            sections.extend(dashboard_sections(model, skin, rows));
+            sections
         }
         ReadOnlyScreen::Repositories => {
             if model.snapshot.repositories.is_empty() {
@@ -1353,6 +1393,23 @@ fn ready(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
             activity_sections(model, skin, &visible, rows)
         }
     }
+}
+
+fn readiness_panel(model: &ScreenModel, skin: &Skin) -> Section {
+    state_panel(
+        skin,
+        model.snapshot.readiness.tone(),
+        &format!(
+            "OPERATIONAL READINESS: {}",
+            model.snapshot.readiness.label()
+        ),
+        vec![(model.snapshot.readiness_summary.clone(), Tone::Plain)],
+        if model.snapshot.readiness == OperationalReadiness::Ready {
+            "Action: F5 verifies again"
+        } else {
+            "Action: a opens diagnostics and remediation"
+        },
+    )
 }
 
 /// Nothing is configured, which is not the same as nothing being busy.
@@ -1980,6 +2037,9 @@ mod tests {
                     remediation: "inspect local runner log".into(),
                 },
             ],
+            readiness: OperationalReadiness::Ready,
+            readiness_summary:
+                "Local service and every managed WSL host are ready for the next job.".into(),
             wsl_capability: WslCapability::Available,
             wsl_hosts: vec![WslHostRow {
                 distribution: "Ubuntu".into(),
@@ -1987,6 +2047,44 @@ mod tests {
                 detail: "daemon and lifecycle task are ready".into(),
             }],
         }
+    }
+
+    #[test]
+    fn dashboard_leads_with_operational_readiness_and_activity_carries_the_fix() {
+        let mut snapshot = populated();
+        snapshot.readiness = OperationalReadiness::Blocked;
+        snapshot.readiness_summary = "The next job may not start: service is stopped.".into();
+        snapshot.activity.insert(
+            0,
+            ActivityRow {
+                id: "readiness:local:service-stopped".into(),
+                occurred_at: "12:02:00Z".into(),
+                outcome: ActivityOutcome::Failed,
+                summary: "Local service is registered but stopped.".into(),
+                remediation: "Run `runner-manager service start`.".into(),
+            },
+        );
+        let mut model = ScreenModel::new(snapshot);
+        let dashboard = render_text(&model);
+        assert!(
+            dashboard.starts_with("OPERATIONAL READINESS: BLOCKED"),
+            "{dashboard}"
+        );
+        assert!(
+            dashboard.contains("a opens diagnostics and remediation"),
+            "{dashboard}"
+        );
+
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Activity));
+        let activity = render_text(&model);
+        assert!(
+            activity.contains("Local service is registered but stopped."),
+            "{activity}"
+        );
+        assert!(
+            activity.contains("runner-manager service start"),
+            "{activity}"
+        );
     }
 
     fn matrix_snapshot() -> String {
@@ -2059,8 +2157,8 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=22 bytes=1118 fnv=d57a263d18f10990 | HEALTH: OK live snapshot
-        Dashboard/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
+        Dashboard/populated: lines=25 bytes=1242 fnv=f5af4f7c7a0b7785 | OPERATIONAL READINESS: READY | Action: F5 verifies again
+        Dashboard/empty: lines=6 bytes=233 fnv=11ea30b19b1f95b6 | OPERATIONAL READINESS: UNKNOWN | Action: a opens diagnostics and remediation
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
