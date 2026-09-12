@@ -3,6 +3,13 @@
 **GREEN. It renews itself, on both platforms, to the second, with nobody
 watching.** **Confirmed:** 2026-08-29. **Shipped in:** 0.1.11.
 
+The daemon now also renews proactively shortly before the access-token
+boundary. This closes the remaining idle-host gap: the `401`-driven path works
+only when an active policy causes GitHub traffic, so a service with no policies
+could leave its six-month refresh token untouched until that token expired too.
+The maintenance loop runs without the TUI and also notices a credential stored
+after an idle service has already started.
+
 This was an [`docs/open/`](../open/README.md) note from 2026-08-27 until the
 eight-hour boundary actually passed on two real hosts. It is here rather than
 there because the question is answered.

@@ -1523,6 +1523,49 @@ impl AuthenticatedClient {
         .await
     }
 
+    /// Proactively replace a renewable credential when either half is close
+    /// to expiry.
+    ///
+    /// Ordinary request handling also renews after a `401`, but a daemon with
+    /// no GitHub work can make no request for months. In that state the refresh
+    /// token itself eventually expires and an interactive sign-in is the only
+    /// recovery. A long-running owner calls this periodically so every
+    /// successful rotation extends the credential even while it is otherwise
+    /// idle.
+    ///
+    /// The stored credential is checked first for the same reason as the `401`
+    /// path: another process may already have rotated the pair, and spending
+    /// its predecessor after that would be a refresh-token replay.
+    ///
+    /// Returns `true` when a different credential was loaded or minted. A
+    /// credential without a refresh half is left untouched. Missing expiry
+    /// metadata is treated as due once so that the exchange can repair an old
+    /// stored document.
+    pub async fn renew_if_expiring_within(&self, window: Duration) -> bool {
+        let due = {
+            let credential = self
+                .credential
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(renewal) = credential.renewal() else {
+                return false;
+            };
+            let Some(deadline) = self.clock.now().checked_add_signed(
+                chrono::TimeDelta::from_std(window).unwrap_or(chrono::TimeDelta::MAX),
+            ) else {
+                return true;
+            };
+            renewal
+                .access_expires_at
+                .is_none_or(|expires| expires <= deadline)
+                || renewal
+                    .refresh_expires_at
+                    .is_some_and(|expires| expires <= deadline)
+        };
+
+        due && (self.reload_once().await || self.renew_once().await)
+    }
+
     /// Serialize, `POST`, and deserialize in one step.
     ///
     /// # Errors
@@ -5012,6 +5055,82 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "renew should not be called because reload succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_renewal_waits_until_the_access_token_is_near_expiry() {
+        let renewal = Arc::new(SpyRenewal {
+            invocations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let document = serde_json::json!({
+            "access_token": "ghu_initial",
+            "refresh_token": "ghr_initial",
+            "access_expires_at": "2026-08-21T02:00:00Z",
+            "refresh_expires_at": "2027-02-21T00:00:00Z"
+        });
+        let clock = Arc::new(TestClock::default());
+        let client = AuthenticatedClient::new(
+            Endpoints::production(),
+            UserAccessToken::from_stored_document(&SecretString::from(document.to_string())),
+            clock.clone(),
+        )
+        .unwrap()
+        .with_renewal(renewal.clone());
+
+        assert!(
+            !client
+                .renew_if_expiring_within(Duration::from_secs(30 * 60))
+                .await
+        );
+        assert_eq!(
+            renewal
+                .invocations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        clock.advance_secs(91 * 60);
+        assert!(
+            client
+                .renew_if_expiring_within(Duration::from_secs(30 * 60))
+                .await
+        );
+        assert_eq!(
+            renewal
+                .invocations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_renewal_repairs_a_pair_with_no_expiry_metadata() {
+        let renewal = Arc::new(SpyRenewal {
+            invocations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let document = serde_json::json!({
+            "access_token": "ghu_initial",
+            "refresh_token": "ghr_initial"
+        });
+        let client = AuthenticatedClient::new(
+            Endpoints::production(),
+            UserAccessToken::from_stored_document(&SecretString::from(document.to_string())),
+            Arc::new(TestClock::default()),
+        )
+        .unwrap()
+        .with_renewal(renewal.clone());
+
+        assert!(
+            client
+                .renew_if_expiring_within(Duration::from_secs(30 * 60))
+                .await
+        );
+        assert_eq!(
+            renewal
+                .invocations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }

@@ -24,7 +24,7 @@ use runner_manager_agent::reconcile::{
     RepositoryDirectory, TeeEvents, TracingEvents,
 };
 use runner_manager_domain::attempt::{FailureReason, active_count_for};
-use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget};
+use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
@@ -74,9 +74,10 @@ async fn run(
 
     writeln!(out, "daemon running (pid {})", std::process::id()).map_err(failed)?;
 
-    // A host with no policies owns no GitHub work. It still holds the lock and
-    // behaves as a real daemon, but it neither demands a credential nor opens a
-    // network connection while waiting to be configured, upgraded, or stopped.
+    // A host with no policies owns no runner work, but it may still own a
+    // renewable credential. Keep that pair rotating: otherwise an installed,
+    // healthy service can sit quietly until the six-month refresh half expires
+    // and require a person merely because no TUI happened to be open.
     if targets.is_empty() {
         tokio::select! {
             signal = wait_for_shutdown(service_shutdown) => {
@@ -92,6 +93,9 @@ async fn run(
             } => {
                 return stop_for_upgrade(own_binary.as_deref(), &version, out);
             }
+            () = maintain_idle_credential(context, host.service_start_mode) => {
+                unreachable!("credential maintenance runs until the daemon is stopped")
+            },
         }
     }
 
@@ -320,6 +324,9 @@ async fn run(
             restart_reason = Some("the set of repositories this host serves changed");
             None
         }
+        () = maintain_credential(Arc::clone(&client)) => {
+            unreachable!("credential maintenance runs until the daemon is stopped")
+        }
         result = loops.join_next() => result,
     };
     if upgraded_to.is_some() || restart_reason.is_some() {
@@ -374,6 +381,99 @@ async fn run(
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(())
+}
+
+/// How often an otherwise idle daemon checks the credential timestamps.
+///
+/// A short interval is only a local mutex read until the renewal window opens;
+/// it does not poll GitHub.
+const CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Renew ahead of the eight-hour boundary so a transient network failure gets
+/// more than one attempt before the access half stops working.
+const CREDENTIAL_RENEWAL_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// Keep the daemon's credential alive even when no runner request uses it.
+async fn maintain_credential(client: Arc<AuthenticatedClient>) {
+    loop {
+        client
+            .renew_if_expiring_within(CREDENTIAL_RENEWAL_WINDOW)
+            .await;
+        tokio::time::sleep(CREDENTIAL_MAINTENANCE_INTERVAL).await;
+    }
+}
+
+/// The idle variant also notices a credential stored after the service starts.
+/// This matters when installation precedes `auth login` and no policy change is
+/// available to make the service manager restart the daemon.
+async fn maintain_idle_credential(context: &Context, mode: StartMode) {
+    let mut client = None;
+    loop {
+        if client.is_none() {
+            client = idle_credential_client(context, mode);
+        }
+        if let Some(client) = &client {
+            client
+                .renew_if_expiring_within(CREDENTIAL_RENEWAL_WINDOW)
+                .await;
+        }
+        tokio::time::sleep(CREDENTIAL_MAINTENANCE_INTERVAL).await;
+    }
+}
+
+/// Prepare credential maintenance for a host that currently owns no policies.
+///
+/// Idle mode historically required neither a sign-in nor even a readable
+/// secret store, and installing a service before onboarding is valid. Preserve
+/// that property: maintenance is best-effort until a policy-set change restarts
+/// the daemon through the strict, authenticated path above.
+fn idle_credential_client(context: &Context, mode: StartMode) -> Option<Arc<AuthenticatedClient>> {
+    let secrets = match context.secret_store(mode) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            tracing::debug!(%error, "idle credential maintenance could not reach the store");
+            return None;
+        }
+    };
+    let secret = match secrets.load() {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(%error, "idle credential maintenance could not read the store");
+            return None;
+        }
+    };
+    let app = match context.app_registration() {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::debug!(%error, "idle credential maintenance could not load the App registration");
+            return None;
+        }
+    };
+    let flow = match DeviceFlow::new(app, context.endpoints().clone()) {
+        Ok(flow) => flow,
+        Err(error) => {
+            tracing::debug!(%error, "idle credential maintenance could not prepare renewal");
+            return None;
+        }
+    };
+    let renewal: Arc<dyn CredentialRenewal> =
+        Arc::new(super::auth::StoringRenewal::new(flow, Arc::clone(&secrets)));
+    let client = match AuthenticatedClient::new(
+        context.endpoints().clone(),
+        UserAccessToken::from_stored(secret),
+        context.clock(),
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%error, "idle credential maintenance could not prepare the GitHub client");
+            return None;
+        }
+    };
+    Some(Arc::new(
+        client
+            .with_renewal(renewal)
+            .with_credential_source(Arc::new(super::auth::StoredCredential::new(secrets))),
+    ))
 }
 
 fn stop_for_upgrade(
@@ -1321,6 +1421,7 @@ impl RepositoryDirectory for GithubDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1333,6 +1434,27 @@ mod tests {
     use runner_manager_github::rest::RefreshState;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    #[derive(Debug)]
+    struct CountingRenewal {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialRenewal for CountingRenewal {
+        async fn renew(&self, _refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(UserAccessToken::from_stored(SecretString::from(
+                serde_json::json!({
+                    "access_token": "ghu_daemon_renewed_fixture",
+                    "refresh_token": "ghr_daemon_renewed_fixture",
+                    "access_expires_at": "2027-08-21T00:00:00Z",
+                    "refresh_expires_at": "2028-02-21T00:00:00Z"
+                })
+                .to_string(),
+            )))
+        }
+    }
 
     #[derive(Debug)]
     struct RecoveryGithub {
@@ -1667,6 +1789,45 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("9.9.9"), "{output}");
         assert!(output.contains("every runner finished"), "{output}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_maintenance_renews_an_expired_pair_without_tui_traffic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let renewal: Arc<dyn CredentialRenewal> = Arc::new(CountingRenewal {
+            calls: Arc::clone(&calls),
+        });
+        let expired = UserAccessToken::from_stored(SecretString::from(
+            serde_json::json!({
+                "access_token": "ghu_daemon_expired_fixture",
+                "refresh_token": "ghr_daemon_expired_fixture",
+                "access_expires_at": "2026-08-20T23:59:59Z",
+                "refresh_expires_at": "2027-02-21T00:00:00Z"
+            })
+            .to_string(),
+        ));
+        let client = Arc::new(
+            AuthenticatedClient::new(
+                runner_manager_github::Endpoints::production(),
+                expired,
+                Arc::new(FakeClock::default()),
+            )
+            .unwrap()
+            .with_renewal(renewal),
+        );
+
+        let maintenance = tokio::spawn(maintain_credential(client));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(CREDENTIAL_MAINTENANCE_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the fresh pair must not be rotated again on every maintenance tick"
+        );
+        maintenance.abort();
     }
 
     #[derive(Default)]
