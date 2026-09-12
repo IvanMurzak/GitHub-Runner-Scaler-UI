@@ -1,0 +1,84 @@
+.taskflow/2026-09-11-windows-service-wsl-self-healing/ROADMAP.md
+  s_ac5a13ce404118::t_0b25ffc0418778 7-9,154-175
+crates/app/src/cli/mod.rs
+  s_ac5a13ce404118::t_1a8e6493ded54d 53
+  s_ac5a13ce404118::t_17344ad5074923 693,697-704
+  s_ac5a13ce404118::t_ad934c509861ab 694-696,707-709,1716
+  s_85d9ac5d33d9be::t_bf68bf4c1e420e 705-706
+crates/app/src/cli/wsl.rs
+  s_ac5a13ce404118::t_5303a8b4a200a2 244,246-248,276-313,1901-1906,1912-1913,3970
+  s_ac5a13ce404118::t_ad934c509861ab 238-242,253-260,271
+  s_ac5a13ce404118::t_0e2b37f56d0c43 261-270,1898-1900
+  s_ac5a13ce404118::t_3ca5c1bd174a47 272,314-315
+crates/platform/src/wsl/mod.rs
+  s_ac5a13ce404118::t_b6cf4969032671 69
+README.md
+  s_ac5a13ce404118::t_0b25ffc0418778 210-211,404-415
+crates/platform/examples/wsl_recovery_fixture.rs
+  s_ac5a13ce404118::t_85d5b2ef201c09 12-16,27-30
+  s_ac5a13ce404118::t_03c3b1b2a1250f 1-11,17-26,31-50
+crates/app/src/cli/daemon.rs
+  s_ac5a13ce404118::t_421a6438c7894f 131-134,441-467
+  s_ac5a13ce404118::t_ce24e1c5ba1594 23-24,26,39,42,105-106,129-130,219,334-335,374-375,379,468-474,479-499,501-508,513-515,520-523
+  s_ac5a13ce404118::t_20b2cc1b3df28f 500
+  s_ac5a13ce404118::t_52ce3cbb8401ab 202,336,376-378
+  s_ac5a13ce404118::t_0e2b37f56d0c43 40-41,220-223,475-478,509-512,516-519
+  s_ac5a13ce404118::t_d39a693d8de548 524
+crates/app/src/cli/wsl_watchdog.rs
+  s_ac5a13ce404118::t_1a8e6493ded54d 1-17,19-96,100-110,112-148,150-167,171-210,214-238,244-251,255-300,302-310,314-335,393
+  s_ac5a13ce404118::t_0987167a1876c8 149,239-243,252-254,336-341,347-392
+  s_ac5a13ce404118::t_0e2b37f56d0c43 18,97-99,111,168-170,211-213,301,311-313
+  s_ac5a13ce404118::t_d15dc5590f3f10 342-346
+crates/app/src/cli/service.rs
+  s_ac5a13ce404118::t_9fe23e77697cfa 284,286
+CHANGELOG.md
+  s_ac5a13ce404118::t_0b25ffc0418778 12-22
+crates/platform/src/wsl/fence.rs
+  s_ac5a13ce404118::t_0987167a1876c8 285-290,403-406,410-441
+  s_ac5a13ce404118::t_20b2cc1b3df28f 18,151
+  s_ac5a13ce404118::t_b6cf4969032671 1-15,19-24,26,36-150,152,185-284,291-308,311-395,399-402,407-409,442-443
+  s_ac5a13ce404118::t_886f5825db003a 25,153-184
+  s_ac5a13ce404118::t_ad934c509861ab 16,27-35
+  s_ac5a13ce404118::t_0e2b37f56d0c43 17,309-310,396-398
+crates/platform/src/wsl/task.rs
+  s_ac5a13ce404118::t_17344ad5074923 152,169,173-179,219-221
+  s_92e74af38f2870::t_38b2d9013a8166 222
+crates/app/src/tui/shell.rs
+  s_ac5a13ce404118::t_85d5b2ef201c09 40-41
+  s_ac5a13ce404118::t_90bb75984db0c9 694-701
+  s_ac5a13ce404118::t_908b06f5ae2a29 682-693,702-708
+crates/agent/src/reconcile.rs
+  s_ac5a13ce404118::t_0e2b37f56d0c43 1128-1181,2994-3032
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "112142a503f627017a6274db3e20c764d1b22041",
+  "prompts": {},
+  "sessions": {
+    "s_85d9ac5d33d9be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d3f13fe-302d-47f0-9d10-273cbb49779c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
