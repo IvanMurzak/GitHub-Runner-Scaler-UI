@@ -1,0 +1,19 @@
+crates/platform/tests/privileged_service_installer.rs
+  s_ac5a13ce404118::t_1c4fe681709f95 380-395,740
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "be13792cd3c5f6f37269895569de325b8bad2150",
+  "prompts": {},
+  "sessions": {
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
