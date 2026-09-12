@@ -1,0 +1,40 @@
+crates/app/src/tui/screens.rs
+  s_c9018c0a298938::t_58c083c5e3e726 1024,1091,1208,1220,1223,1351,1354,1359-1360,1438-1439,1450,1512-1526,1543-1552,1555,1578-1588,1590-1600,1617-1654,1656-1709,2300
+  s_c9018c0a298938::t_23b8f7ff776767 1440,1527-1532
+  s_c9018c0a298938::t_39b2cd33619b34 2372-2373
+  s_c9018c0a298938::t_0888a8b3939faa 1506-1511,1533-1542,1589,1601-1616
+  s_c9018c0a298938::t_c3abf622a028ac 2229,2232,2237,2256-2257
+  s_c9018c0a298938::t_17ae3712b4345a 1655,2234,2238,2252-2255,2258-2299
+  s_5332f62e0ed5a7::t_ea44b2519a301a 2301
+crates/app/src/tui/shell.rs
+  s_c9018c0a298938::t_23b8f7ff776767 1741
+  s_c9018c0a298938::t_f8925a0cfed9d2 3415-3437
+  s_c9018c0a298938::t_58c083c5e3e726 1740,1742-1743
+  s_c9018c0a298938::t_29084a1add0ab0 3414
+CHANGELOG.md
+  s_c9018c0a298938::t_7ba5eaaaae0ec7 18-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1b3efce4de4e8713047e32b302885ecc52495f53",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_c9018c0a298938": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0973c-2ad1-7622-b64b-2f3109c27b5b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
