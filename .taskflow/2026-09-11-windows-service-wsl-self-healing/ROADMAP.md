@@ -4,7 +4,7 @@
 open.
 **Task status:** Derived 2026-09-11: 14 immutable specifications, four conflict
 domains, waves 0-6.
-**Implementation status:** Wave 0 in progress.
+**Implementation status:** Taskflow worker dispatch unavailable; local fallback in progress.
 **Repository:** `.` / `main` at `db4c074`.
 **Last updated:** 2026-09-11.
 
@@ -76,7 +76,7 @@ must remain `recovery_blocked` and must not terminate.
 
 | id | Task (spec) | group | seq | needs | repo | base_branch | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---:|---:|---|---|---|---|---|---|---|---|
-| a1-windows-launcher-spike | `tasks/a1-windows-launcher-spike.md` | A | 1 | — | . | main | 3/6 | top | 🔵 | worktree-a1-windows-launcher-spike | 2026-09-11 |
+| a1-windows-launcher-spike | `tasks/a1-windows-launcher-spike.md` | A | 1 | — | . | main | 3/6 | top | not started | worker profile unavailable | 2026-09-11 |
 | a2-supervisor-core | `tasks/a2-supervisor-core.md` | A | 2 | a1 | . | main | 3/8 | top | not started | — | 2026-09-11 |
 | a3-daemon-reload-contract | `tasks/a3-daemon-reload-contract.md` | A | 3 | a2 | . | main | 3/6 | top | not started | — | 2026-09-11 |
 | a4-service-install-start | `tasks/a4-service-install-start.md` | A | 4 | a3 | . | main | 3/7 | top | not started | — | 2026-09-11 |
@@ -132,3 +132,9 @@ C cannot collect until B exposes status; D owns only cross-cutting packaging,
 acceptance and documentation. Wave 0 contains the two empirical gates that can
 invalidate implementation mechanisms without weakening the fail-closed product
 decision.
+
+**2026-09-11 — execution fallback.** The installed Taskflow executor requires
+the registered `taskflow-implementer` worker profile, while this Codex runtime's
+spawn interface accepts only underscore task names and exposes no custom-agent
+selector. The refused dispatch started no worker; the clean isolated slot was
+removed. Implementation continues locally without weakening WSL safety gates.
