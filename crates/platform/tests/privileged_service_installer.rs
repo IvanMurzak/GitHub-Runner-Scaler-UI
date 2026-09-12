@@ -502,10 +502,8 @@ fn production_daemon_entrypoint_reaches_running_and_handles_scm_stop() {
         Err(error) => panic!("{error}"),
     }
 
-    fixture
-        .operations
-        .start()
-        .expect("SCM starts the production entrypoint");
+    // Installation starts the registration immediately. Reaching RUNNING here
+    // proves that the install path entered the production SCM entrypoint.
     wait_for_running(&fixture, true, Duration::from_secs(30));
 
     // The old production path never connected to SCM: it was killed at the
@@ -712,6 +710,15 @@ fn a_binary_that_moves_after_install_is_reported_as_stale() {
         "{healthy}"
     );
 
+    assert!(
+        fixture
+            .operations
+            .stop()
+            .expect("the installed fixture stops before its binary moves"),
+        "install must have started the fixture"
+    );
+    wait_for_running(&fixture, false, Duration::from_secs(30));
+
     // The npm upgrade, reproduced: the file the registration names goes away
     // while the registration itself survives untouched.
     std::fs::remove_file(&fixture.binary).expect("the binary moves out from under the record");
@@ -848,7 +855,8 @@ fn a_killed_service_comes_back_and_no_sooner_than_the_bounded_delay() {
         .expect("ten seconds is inside the supported range");
     fixture.install(StartMode::Boot, restart);
 
-    fixture.operations.start().expect("the fixture host starts");
+    // `install` starts the fixture; wait for that first process rather than
+    // issuing a duplicate SCM start request.
     let first = fixture.wait_for_starts(1, Duration::from_secs(30));
     let (_, pid) = first[0];
 
@@ -1018,7 +1026,7 @@ fn a_boot_service_creates_materializes_and_cleans_a_child_below_the_real_default
         Err(error @ ServiceError::NeedsElevation { .. }) => require_elevation(&error),
         Err(error) => panic!("{error}"),
     }
-    fixture.operations.start().expect("SCM starts the fixture");
+    // Installation starts the LocalSystem fixture immediately.
     fixture.wait_for_starts(1, Duration::from_secs(30));
 
     let outcome = fixture.wait_for_workspace_outcome(Duration::from_secs(30));
