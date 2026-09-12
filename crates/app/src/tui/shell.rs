@@ -1737,6 +1737,10 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     }
                     _ => "repository settings are not loaded".into(),
                 }
+            } else if state.screen == Screen::Dashboard
+                && let Some(fixes) = screens::readiness_remediation_text(&state.screen_model)
+            {
+                fixes
             } else if read_only_screen(state.screen) == Some(ReadOnlyScreen::Activity) {
                 screens::render_text(&state.screen_model)
             } else {
@@ -3405,6 +3409,30 @@ mod tests {
             panic!()
         };
         assert!(!copy.contains(token) && !copy.contains(jit));
+    }
+
+    #[test]
+    fn dashboard_c_copies_the_visible_readiness_fixes() {
+        let mut state = AppState::new(PresentationState::default(), 160, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: screens::Availability::Ready,
+            readiness: screens::OperationalReadiness::Blocked,
+            readiness_summary: "The next job may not start.".into(),
+            activity: vec![screens::ActivityRow {
+                id: "readiness:local:service-stopped".into(),
+                occurred_at: "now".into(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: "Local service is stopped.".into(),
+                remediation: "Run `runner-manager service start`.".into(),
+            }],
+            ..Snapshot::default()
+        });
+
+        let Effect::Copy(copy) = &reduce(&mut state, key(KeyCode::Char('c')))[0] else {
+            panic!("Dashboard c must copy readiness fixes")
+        };
+        assert!(copy.contains("Local service is stopped."), "{copy}");
+        assert!(copy.contains("runner-manager service start"), "{copy}");
     }
 
     #[test]

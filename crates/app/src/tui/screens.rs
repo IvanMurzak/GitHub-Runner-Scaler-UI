@@ -1021,7 +1021,7 @@ pub fn dashboard_sort_column_at(
         return None;
     }
     let height = usize::from(inner.height);
-    let mut laid: Vec<Laid> = sections(model, skin, height)
+    let mut laid: Vec<Laid> = sections(model, skin, height, inner.width)
         .into_iter()
         .map(|section| Laid::measured(section, inner.width))
         .collect();
@@ -1088,7 +1088,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, model: &ScreenModel, skin: &Ski
     // only what survives it is divided between the grids. One pass, and the
     // last row of a table always arrives with its closing border.
     let height = usize::from(inner.height);
-    let mut laid: Vec<Laid> = sections(model, skin, height)
+    let mut laid: Vec<Laid> = sections(model, skin, height, inner.width)
         .into_iter()
         .map(|section| Laid::measured(section, inner.width))
         .collect();
@@ -1205,7 +1205,7 @@ fn allot(laid: &mut [Laid], height: usize) {
 /// print, and no cell shortened away from somebody about to paste it. The row
 /// window is the one on screen, so what is copied is what was read.
 pub fn render_text(model: &ScreenModel) -> String {
-    sections(model, &Skin::ASCII, TABLE_VIEWPORT_ROWS)
+    sections(model, &Skin::ASCII, TABLE_VIEWPORT_ROWS, 120)
         .iter()
         .map(|section| match section {
             Section::Prose(lines) => table::text_of(lines),
@@ -1217,10 +1217,10 @@ pub fn render_text(model: &ScreenModel) -> String {
 }
 
 /// Build a screen. `rows` is the most any one grid on it may draw.
-fn sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
+fn sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16) -> Vec<Section> {
     let plain = |message: String| vec![(message, Tone::Plain)];
     let (tone, title, body, action) = match &model.snapshot.availability {
-        Availability::Ready => return ready(model, skin, rows),
+        Availability::Ready => return ready(model, skin, rows, width),
         Availability::Loading => {
             return vec![state_panel(
                 skin,
@@ -1348,18 +1348,17 @@ fn state_panel(
 /// Every screen's list is built exactly once here, and handed to the builder
 /// that needs it -- deriving it is a filter, a sort and a clone of the whole
 /// collection, and the suite keeps a ten-thousand repository case honest.
-fn ready(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
+fn ready(model: &ScreenModel, skin: &Skin, rows: usize, width: u16) -> Vec<Section> {
     match model.screen {
         ReadOnlyScreen::Dashboard => {
-            let readiness = readiness_panel(model, skin);
+            let mut sections = dashboard_sections(model, skin, rows, width);
             if model.snapshot.repositories.is_empty()
                 && model.snapshot.runners.is_empty()
                 && model.snapshot.metrics == DashboardMetrics::default()
             {
-                return vec![readiness, empty_panel(skin, model.screen)];
+                sections.push(empty_panel(skin, model.screen));
+                return sections;
             }
-            let mut sections = vec![readiness];
-            sections.extend(dashboard_sections(model, skin, rows));
             sections
         }
         ReadOnlyScreen::Repositories => {
@@ -1393,23 +1392,6 @@ fn ready(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
             activity_sections(model, skin, &visible, rows)
         }
     }
-}
-
-fn readiness_panel(model: &ScreenModel, skin: &Skin) -> Section {
-    state_panel(
-        skin,
-        model.snapshot.readiness.tone(),
-        &format!(
-            "OPERATIONAL READINESS: {}",
-            model.snapshot.readiness.label()
-        ),
-        vec![(model.snapshot.readiness_summary.clone(), Tone::Plain)],
-        if model.snapshot.readiness == OperationalReadiness::Ready {
-            "Action: F5 verifies again"
-        } else {
-            "Action: a opens diagnostics and remediation"
-        },
-    )
 }
 
 /// Nothing is configured, which is not the same as nothing being busy.
@@ -1453,7 +1435,9 @@ fn no_matches(skin: &Skin) -> Section {
     )
 }
 
-fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Section> {
+const DASHBOARD_TWO_COLUMN_MIN_WIDTH: u16 = 104;
+
+fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16) -> Vec<Section> {
     let m = &model.snapshot.metrics;
     let metric = |label: &str, value: String, tone: Tone| {
         Line::from(vec![
@@ -1463,7 +1447,7 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
     };
     let mut head_lines = vec![
         Line::from(Span::styled(
-            "HEALTH: OK live snapshot".to_owned(),
+            "GITHUB INVENTORY: LIVE".to_owned(),
             skin.style(Tone::Ok).add_modifier(Modifier::BOLD),
         )),
         metric(
@@ -1519,12 +1503,56 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
             tone,
         ));
     }
-    head_lines.push(Line::default());
-    let head = Section::Prose(head_lines);
+    let has_readiness_issues = model
+        .snapshot
+        .activity
+        .iter()
+        .any(|row| row.id.starts_with("readiness:"));
+    let mut readiness_lines = vec![
+        Line::from(Span::styled(
+            format!("RUNNER READINESS: {}", model.snapshot.readiness.label()),
+            skin.style(model.snapshot.readiness.tone())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            model.snapshot.readiness_summary.clone(),
+            skin.style(Tone::Plain),
+        )),
+    ];
+    let problem_lines = readiness_problem_lines(model, skin);
+    let mut overview = if width >= DASHBOARD_TWO_COLUMN_MIN_WIDTH {
+        let mut left = readiness_lines;
+        left.push(Line::default());
+        left.extend(head_lines);
+        vec![Section::Prose(side_by_side(
+            left,
+            problem_lines,
+            width,
+            skin,
+        ))]
+    } else if !has_readiness_issues && model.snapshot.readiness == OperationalReadiness::Ready {
+        readiness_lines.push(Line::from(Span::styled(
+            "[F5] Recheck now".to_owned(),
+            skin.style(Tone::Accent),
+        )));
+        vec![
+            Section::Prose(readiness_lines),
+            Section::Prose(vec![Line::default()]),
+            Section::Prose(head_lines),
+        ]
+    } else {
+        vec![
+            Section::Prose(readiness_lines),
+            Section::Prose(vec![Line::default()]),
+            Section::Prose(problem_lines),
+            Section::Prose(vec![Line::default()]),
+            Section::Prose(head_lines),
+        ]
+    };
+    overview.push(Section::Prose(vec![Line::default()]));
     let repositories = model.dashboard_repositories();
     let runners = model.dashboard_runners();
-    vec![
-        head,
+    overview.extend([
         Section::Grid(repository_grid(
             model,
             skin,
@@ -1547,7 +1575,138 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
             &RUNNER_COLUMNS[..3],
             GridPresentation::preview(model.dashboard_runner_sort),
         )),
-    ]
+    ]);
+    overview
+}
+
+fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static>> {
+    let issues: Vec<_> = model
+        .snapshot
+        .activity
+        .iter()
+        .filter(|row| row.id.starts_with("readiness:"))
+        .collect();
+    if issues.is_empty() && model.snapshot.readiness == OperationalReadiness::Ready {
+        return vec![
+            Line::from(Span::styled(
+                "Problems & fixes: none".to_owned(),
+                skin.style(Tone::Ok).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "The service and managed hosts are ready for the next job.".to_owned(),
+                skin.style(Tone::Plain),
+            )),
+            Line::from(Span::styled(
+                "[F5] Recheck now".to_owned(),
+                skin.style(Tone::Accent),
+            )),
+        ];
+    }
+    if issues.is_empty() {
+        return vec![
+            Line::from(Span::styled(
+                "Problems & fixes: checking".to_owned(),
+                skin.style(Tone::Warn).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "No actionable diagnosis is available yet.".to_owned(),
+                skin.style(Tone::Plain),
+            )),
+            Line::from(Span::styled(
+                "[a] Open diagnostics   [F5] Recheck".to_owned(),
+                skin.style(Tone::Accent),
+            )),
+        ];
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!("Problems & fixes ({})", issues.len()),
+        skin.style(model.snapshot.readiness.tone())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for (index, row) in issues.into_iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!("{}. {}", index + 1, copy_safe(&row.summary)),
+            skin.style(row.outcome.tone()),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("   Fix: ".to_owned(), skin.style(Tone::Muted)),
+            Span::styled(copy_safe(&row.remediation), skin.style(Tone::Accent)),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "[c] Copy fixes   [a] Open details   [F5] Recheck".to_owned(),
+        skin.style(Tone::Accent),
+    )));
+    lines
+}
+
+/// Compose the overview as real terminal columns, not a fixed-width mockup.
+/// Each side wraps inside its own allocation before the rows are zipped, so a
+/// resize can never let the remediation text overwrite the workload summary.
+fn side_by_side(
+    left: Vec<Line<'static>>,
+    right: Vec<Line<'static>>,
+    width: u16,
+    skin: &Skin,
+) -> Vec<Line<'static>> {
+    const SEPARATOR_WIDTH: usize = 3;
+    let total = usize::from(width);
+    let left_width = (total * 43 / 100).clamp(42, 72);
+    let right_width = total.saturating_sub(left_width + SEPARATOR_WIDTH).max(1);
+    let left: Vec<_> = left
+        .into_iter()
+        .flat_map(|line| wrapped(line, left_width as u16))
+        .collect();
+    let right: Vec<_> = right
+        .into_iter()
+        .flat_map(|line| wrapped(line, right_width as u16))
+        .collect();
+    let rows = left.len().max(right.len());
+
+    (0..rows)
+        .map(|index| {
+            let mut spans = left
+                .get(index)
+                .map(|line| line.spans.clone())
+                .unwrap_or_default();
+            let used = left.get(index).map_or(0, Line::width);
+            spans.push(Span::raw(" ".repeat(left_width.saturating_sub(used))));
+            spans.push(Span::styled(
+                format!(" {} ", skin.pick("│", "|")),
+                skin.style(Tone::Muted),
+            ));
+            if let Some(line) = right.get(index) {
+                spans.extend(line.spans.clone());
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Copy-safe, actionable text for the Dashboard's `c` shortcut.
+pub fn readiness_remediation_text(model: &ScreenModel) -> Option<String> {
+    let issues: Vec<_> = model
+        .snapshot
+        .activity
+        .iter()
+        .filter(|row| row.id.starts_with("readiness:"))
+        .collect();
+    (!issues.is_empty()).then(|| {
+        issues
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                format!(
+                    "{}. {}\nFix: {}",
+                    index + 1,
+                    copy_safe(&row.summary),
+                    copy_safe(&row.remediation)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
 }
 
 const fn workload_tone(value: u32) -> Tone {
@@ -2067,13 +2226,16 @@ mod tests {
         let mut model = ScreenModel::new(snapshot);
         let dashboard = render_text(&model);
         assert!(
-            dashboard.starts_with("OPERATIONAL READINESS: BLOCKED"),
+            dashboard.starts_with("RUNNER READINESS: BLOCKED"),
             "{dashboard}"
         );
+        assert!(dashboard.contains("Problems & fixes (1)"), "{dashboard}");
         assert!(
-            dashboard.contains("a opens diagnostics and remediation"),
+            dashboard.contains("runner-manager service start"),
             "{dashboard}"
         );
+        assert!(dashboard.contains("[c] Copy fixes"), "{dashboard}");
+        assert!(!dashboard.contains("HEALTH: OK"), "{dashboard}");
 
         model.apply(ScreenAction::Open(ReadOnlyScreen::Activity));
         let activity = render_text(&model);
@@ -2085,6 +2247,56 @@ mod tests {
             activity.contains("runner-manager service start"),
             "{activity}"
         );
+    }
+
+    #[test]
+    fn dashboard_uses_the_second_column_when_wide_and_stacks_fixes_when_narrow() {
+        let mut snapshot = populated();
+        snapshot.readiness = OperationalReadiness::Blocked;
+        snapshot.readiness_summary =
+            "The next job may not start: two conditions need attention.".into();
+        snapshot.activity.splice(
+            0..0,
+            [
+                ActivityRow {
+                    id: "readiness:local:service-stopped".into(),
+                    occurred_at: "12:02:00Z".into(),
+                    outcome: ActivityOutcome::Failed,
+                    summary: "Local service is registered but stopped.".into(),
+                    remediation: "Run `runner-manager service start`.".into(),
+                },
+                ActivityRow {
+                    id: "readiness:local:login-only".into(),
+                    occurred_at: "12:02:00Z".into(),
+                    outcome: ActivityOutcome::Retry,
+                    summary: "The service starts only after sign in.".into(),
+                    remediation: "Run `runner-manager service install --start-at boot`.".into(),
+                },
+            ],
+        );
+        let model = ScreenModel::new(snapshot);
+
+        let wide = drawn(180, 32, &model);
+        let wide_status = wide
+            .lines()
+            .find(|line| line.contains("RUNNER READINESS"))
+            .expect("wide readiness row");
+        assert!(wide_status.contains("Problems & fixes (2)"), "{wide}");
+        assert!(wide.contains("runner-manager service start"), "{wide}");
+
+        let narrow = drawn(80, 36, &model);
+        let readiness_row = narrow.find("RUNNER READINESS").expect("narrow readiness");
+        let problems_row = narrow.find("Problems & fixes (2)").expect("narrow fixes");
+        assert!(problems_row > readiness_row, "{narrow}");
+        assert!(
+            !narrow
+                .lines()
+                .find(|line| line.contains("RUNNER READINESS"))
+                .expect("narrow readiness row")
+                .contains("Problems & fixes"),
+            "{narrow}"
+        );
+        assert!(narrow.contains("runner-manager service start"), "{narrow}");
     }
 
     fn matrix_snapshot() -> String {
@@ -2157,8 +2369,8 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=25 bytes=1242 fnv=f5af4f7c7a0b7785 | OPERATIONAL READINESS: READY | Action: F5 verifies again
-        Dashboard/empty: lines=6 bytes=233 fnv=11ea30b19b1f95b6 | OPERATIONAL READINESS: UNKNOWN | Action: a opens diagnostics and remediation
+        Dashboard/populated: lines=27 bytes=1657 fnv=df4952d47044b735 | RUNNER READINESS: READY                             | Problems & fixes: none
+        Dashboard/empty: lines=23 bytes=1131 fnv=d62ee7e526e608db | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors

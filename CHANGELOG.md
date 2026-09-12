@@ -15,7 +15,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   GitHub inventory: stopped or missing services, legacy Windows tasks without
   the restart supervisor, service-manager/permission failures, login-only
   availability, and unhealthy managed WSL hosts appear in the header,
-  Dashboard, and Activity view with copy-safe remediation commands.
+  Dashboard, and Activity view with copy-safe remediation commands. Wide
+  Dashboards place concrete problems and fixes beside the workload summary;
+  narrow terminals stack them, and `c` copies the fixes directly.
 - The TUI now proactively renews GitHub credentials even when no service is
   installed and when the host has no policies. Credential rotation is guarded
   by an OS file lock, so a service and TUI sharing a store cannot replay the
