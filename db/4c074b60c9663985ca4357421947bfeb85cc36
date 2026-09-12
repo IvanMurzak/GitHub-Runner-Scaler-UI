@@ -1,0 +1,29 @@
+docs/spikes/token-expiry-and-renewal.md
+  s_ecd737bff5dcce::t_7959966846a343 6-11
+  s_ecd737bff5dcce::t_87ee216947dc4e 12
+crates/github/src/lib.rs
+  s_ecd737bff5dcce::t_12637672741bf7 1526-1568,5060-5135
+crates/app/src/cli/daemon.rs
+  s_ecd737bff5dcce::t_87ee216947dc4e 96-98,401-418
+  s_ecd737bff5dcce::t_8d69409c54a0af 1445
+  s_ecd737bff5dcce::t_2d1cc7e81accc5 27,77-80,327-328
+  s_ecd737bff5dcce::t_7d17c5605570f2 386-400,419-478
+  s_ecd737bff5dcce::t_c344e96caf9695 329,1424,1438-1444,1446-1458,1794-1831
+  s_ecd737bff5dcce::t_e5c3aff29f1b9e 1832
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "db4c074b60c9663985ca4357421947bfeb85cc36",
+  "prompts": {},
+  "sessions": {
+    "s_ecd737bff5dcce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939e-ad74-78c1-b1ff-acc9d84c70f1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
