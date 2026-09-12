@@ -1,0 +1,32 @@
+CHANGELOG.md
+  s_ac5a13ce404118::t_0140450dbe3556 10-16
+  s_92e74af38f2870::t_7ce9aa4536efff 17
+crates/agent/src/lifecycle.rs
+  s_ac5a13ce404118::t_de856acdfd6f25 5673-5702
+  s_ac5a13ce404118::t_7271e9bc8370ed 716
+  s_ac5a13ce404118::t_5db7a2e23e9be8 722-739,1024,2276-2282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed67d244d15191485f0957112d9897252e6262e7",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
