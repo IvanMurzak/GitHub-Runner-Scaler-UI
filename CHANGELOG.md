@@ -7,6 +7,14 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.15
+
+### Reliability
+
+- Linux and WSL ephemeral runner cleanup now unlinks .NET diagnostic FIFOs
+  without opening them, preventing the reconcile loop from waiting forever for
+  a nonexistent pipe peer after a runner exits.
+
 ## 0.4.14
 
 ### Reliability

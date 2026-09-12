@@ -713,9 +713,27 @@ fn is_retainable_work_folder(name: &OsStr, metadata: &fs::Metadata) -> bool {
 /// (`02-target-architecture.md`, "Persistent repository").
 fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
     match attempt.workspace() {
-        AttemptWorkspace::Ephemeral => remove_dir_all::remove_dir_all(attempt.runtime_path()),
+        AttemptWorkspace::Ephemeral => remove_runtime_tree(attempt.runtime_path()),
         AttemptWorkspace::PersistentSlot { .. } => scrub_slot_entries(attempt.runtime_path())
             .map_err(|quarantine| std::io::Error::other(quarantine.to_string())),
+    }
+}
+
+/// Remove a disposable runner tree without opening workflow-created special files.
+///
+/// On Unix, `remove_dir_all` 1.0 can open a FIFO while walking a directory and
+/// wait forever for its peer. The .NET runner routinely leaves diagnostic FIFOs
+/// in its private `tmp`, so use the standard library's fd-relative Unix remover,
+/// which unlinks non-directories without opening them. Keep the external remover
+/// on Windows for its existing read-only and junction handling.
+fn remove_runtime_tree(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        remove_dir_all::remove_dir_all(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir_all(path)
     }
 }
 
@@ -1003,7 +1021,7 @@ fn remove_slot_entry(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()
         // Windows junction needs `remove_dir`. Neither follows the link.
         fs::remove_file(path).or_else(|_| fs::remove_dir(path))
     } else if metadata.is_dir() {
-        remove_dir_all::remove_dir_all(path)
+        remove_runtime_tree(path)
     } else {
         fs::remove_file(path)
     };
@@ -2255,15 +2273,13 @@ impl LifecycleLauncher {
             }
         }
         match attempt.workspace() {
-            AttemptWorkspace::Ephemeral => {
-                match remove_dir_all::remove_dir_all(attempt.runtime_path()) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
-                        "attempt workspace could not be removed".into(),
-                    ))),
-                }
-            }
+            AttemptWorkspace::Ephemeral => match remove_runtime_tree(attempt.runtime_path()) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
+                    "attempt workspace could not be removed".into(),
+                ))),
+            },
             AttemptWorkspace::PersistentSlot { slot } => self.scrub_persistent_slot(attempt, slot),
         }
     }
@@ -5652,6 +5668,36 @@ mod tests {
     /// The one entry a cleaned slot is allowed to hold.
     fn only_the_job_workspace() -> Vec<String> {
         vec![DEFAULT_WORK_FOLDER.to_owned()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposable_tree_removal_does_not_open_a_dotnet_diagnostic_fifo() {
+        use std::sync::mpsc;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let tree = temporary.path().join("attempt");
+        let diagnostic = tree.join("tmp/clr-debug-pipe-runner-in");
+        fs::create_dir_all(diagnostic.parent().unwrap()).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&diagnostic)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let (finished, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let removed = remove_runtime_tree(&tree);
+            let _ = finished.send(removed);
+        });
+
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime deletion must not wait for a FIFO peer")
+            .unwrap();
+        assert!(!diagnostic.exists());
     }
 
     /// One slot entry that refuses to be removed, and the undo that lets the
