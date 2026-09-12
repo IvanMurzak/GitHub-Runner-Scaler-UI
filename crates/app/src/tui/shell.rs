@@ -37,10 +37,11 @@ use runner_manager_github::rest::{
 };
 use runner_manager_github::{AuthenticatedClient, UserAccessToken};
 
+#[cfg(windows)]
+use super::screens::WslHostState;
 use super::screens::{
     self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,
     RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot, WslCapability, WslHostRow,
-    WslHostState,
 };
 use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
 use super::table::Skin;
@@ -678,7 +679,33 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
         })
         .collect::<Vec<_>>();
     rows.extend(documents.into_iter().map(|document| {
-        let (state, detail) = if document.healthy {
+        let recovery = runner_manager_platform::wsl::fence::recovery_root(
+            context.paths(),
+            &document.distribution,
+        )
+        .ok()
+        .and_then(|root| {
+            runner_manager_platform::wsl::fence::RecoveryStatus::read(&root)
+                .ok()
+                .flatten()
+        });
+        let recovery_state = recovery.as_ref().and_then(|status| {
+            use runner_manager_platform::wsl::fence::RecoveryPhase;
+            match status.phase {
+                RecoveryPhase::Healthy => None,
+                RecoveryPhase::Degraded => Some(WslHostState::Degraded),
+                RecoveryPhase::Draining => Some(WslHostState::Draining),
+                RecoveryPhase::Recovering => Some(WslHostState::Recovering),
+                RecoveryPhase::Backoff => Some(WslHostState::Backoff),
+                RecoveryPhase::RecoveryBlocked => Some(WslHostState::RecoveryBlocked),
+            }
+        });
+        let (state, detail) = if let Some(state) = recovery_state {
+            let detail = recovery
+                .and_then(|status| status.reason)
+                .unwrap_or_else(|| "WSL recovery supervisor is active".into());
+            (state, detail)
+        } else if document.healthy {
             (
                 WslHostState::Healthy,
                 "daemon and lifecycle task are ready".into(),

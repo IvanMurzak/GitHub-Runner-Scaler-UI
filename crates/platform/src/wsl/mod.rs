@@ -66,6 +66,7 @@
 pub mod artifact;
 pub mod discovery;
 pub mod exec;
+pub mod fence;
 pub mod probe;
 pub mod record;
 pub mod recovery;

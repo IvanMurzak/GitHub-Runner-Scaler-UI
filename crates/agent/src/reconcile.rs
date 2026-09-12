@@ -1125,6 +1125,60 @@ impl AllocationLock for FileAllocationLock {
     }
 }
 
+/// Adds the Windows/WSL recovery fence to an ordinary allocation lock.
+///
+/// A Windows watchdog writes its drain request before attempting the same
+/// atomic directory claim. Therefore either this guard owns the directory and
+/// finishes the one launch already in progress, or Windows owns it and no new
+/// launch can pass. A malformed configured fence fails closed.
+#[derive(Debug)]
+pub struct WslRecoveryAllocationLock {
+    paths: Arc<runner_manager_platform::paths::AppPaths>,
+    inner: Arc<dyn AllocationLock>,
+}
+
+impl WslRecoveryAllocationLock {
+    #[must_use]
+    pub fn new(
+        paths: Arc<runner_manager_platform::paths::AppPaths>,
+        inner: Arc<dyn AllocationLock>,
+    ) -> Self {
+        Self { paths, inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl AllocationLock for WslRecoveryAllocationLock {
+    async fn acquire(&self) -> Result<AllocationGuard, AllocationLockBusy> {
+        use runner_manager_platform::wsl::fence::{
+            DrainRequest, FenceClaim, FenceOwnerKind, GuestRecoveryConfig,
+        };
+
+        let paths = Arc::clone(&self.paths);
+        let claim = tokio::task::spawn_blocking(move || {
+            let Some(config) = GuestRecoveryConfig::read(&paths).map_err(|_| ())? else {
+                return Ok(None);
+            };
+            let Some(claim) =
+                FenceClaim::try_claim(&config.shared_root, FenceOwnerKind::GuestLaunch, None)
+                    .map_err(|_| ())?
+            else {
+                return Err(());
+            };
+            match DrainRequest::read(&config.shared_root) {
+                Ok(None) => Ok(Some(claim)),
+                Ok(Some(_)) | Err(_) => Err(()),
+            }
+        })
+        .await
+        .map_err(|_| AllocationLockBusy)?
+        .map_err(|()| AllocationLockBusy)?;
+
+        let inner = self.inner.acquire().await?;
+        Ok(AllocationGuard::new((claim, inner)))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle events
 // ---------------------------------------------------------------------------
@@ -2935,6 +2989,45 @@ mod tests {
         async fn acquire(&self) -> Result<AllocationGuard, AllocationLockBusy> {
             Ok(AllocationGuard::new(()))
         }
+    }
+
+    #[tokio::test]
+    async fn a_wsl_drain_request_fences_the_exact_pre_launch_boundary() {
+        use runner_manager_platform::paths::AppPaths;
+        use runner_manager_platform::wsl::fence::{DrainRequest, GuestRecoveryConfig};
+
+        let local = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let paths = Arc::new(AppPaths::rooted_at(local.path()));
+        paths.create_all().unwrap();
+        GuestRecoveryConfig::new(shared.path().to_path_buf())
+            .write(&paths)
+            .unwrap();
+        DrainRequest::new(4, chrono::Utc::now())
+            .write(shared.path())
+            .unwrap();
+        let lock = WslRecoveryAllocationLock::new(paths, Arc::new(NoLock));
+
+        assert!(lock.acquire().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_guest_launch_claim_is_released_with_its_allocation_guard() {
+        use runner_manager_platform::paths::AppPaths;
+        use runner_manager_platform::wsl::fence::{FENCE_DIRECTORY, GuestRecoveryConfig};
+
+        let local = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let paths = Arc::new(AppPaths::rooted_at(local.path()));
+        paths.create_all().unwrap();
+        GuestRecoveryConfig::new(shared.path().to_path_buf())
+            .write(&paths)
+            .unwrap();
+        let lock = WslRecoveryAllocationLock::new(paths, Arc::new(NoLock));
+        let guard = lock.acquire().await.unwrap();
+        assert!(shared.path().join(FENCE_DIRECTORY).exists());
+        drop(guard);
+        assert!(!shared.path().join(FENCE_DIRECTORY).exists());
     }
 
     /// A lock nobody can take.

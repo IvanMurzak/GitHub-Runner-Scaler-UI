@@ -4,9 +4,9 @@
 open.
 **Task status:** Derived 2026-09-11: 14 immutable specifications, four conflict
 domains, waves 0-6.
-**Implementation status:** Windows service fixes implemented and under test;
-automatic WSL termination remains gated on disposable-distro safety evidence.
-**Repository:** `.` / `main` at `db4c074`.
+**Implementation status:** Windows service fixes and fail-closed named-WSL
+recovery implemented; disposable-distro G1/G2 evidence and workspace tests pass.
+**Repository:** `.` / `main` at `8d45ee7` plus the current recovery change.
 **Last updated:** 2026-09-11.
 
 **Execution isolation:** `.claude/worktrees/wsl-self-healing-integration` from
@@ -151,3 +151,25 @@ machine has only `Ubuntu` (which contains the unmanaged
 target, so enabling automatic termination without a disposable WSL2
 distribution would violate the owner gate and the requested no-active-runner
 guarantee.
+
+**2026-09-11 — recovery implementation and live acceptance.** Cross-boundary
+tests rejected Windows file-share locks, Unix `flock`, and SQLite locking on
+DrvFS because they did not serialize between Windows and Linux. Atomic
+directory creation did serialize in both directions and is now the durable,
+fail-closed launch fence. The guest publishes a ten-second heartbeat from its
+authoritative journal, acknowledges a drain generation, and repeats the audit
+for unmanaged Actions services. The Windows watchdog requires three failures
+over at least five minutes, two acknowledged zero-attempt heartbeats, two
+complete zero-online/zero-busy GitHub inventories over every managed target,
+an owned enabled task, a verified WSL2 distribution, and a held fence. It then
+terminates only the named distribution, restarts its exact lifecycle task with
+bounded backoff, and opens a circuit after three attempts per hour.
+
+A disposable Debian WSL2 instance proved that the non-elevated owning user can
+terminate exactly one distribution while Ubuntu, Docker Desktop, five restored
+containers, and GitHub runner state remain available. The same real guest
+acknowledged a Windows drain generation while reporting zero active attempts;
+the Windows recovery owner excluded the guest launch boundary. Windows and
+Linux clippy passed with warnings denied, targeted fence/watchdog tests passed,
+and `cargo test --workspace --all-targets` completed with no failures. The
+disposable Debian instance was unregistered after the test.

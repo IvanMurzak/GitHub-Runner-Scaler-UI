@@ -235,15 +235,82 @@ pub fn dispatch(
 /// [`Failure::UnsupportedHost`] anywhere but Linux, and
 /// [`Failure::WslProvisioning`] when systemd is not usable or will not start
 /// the unit.
-pub fn dispatch_wsl_host(command: &WslHostCommand, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn dispatch_wsl_host(
+    context: &Context,
+    command: &WslHostCommand,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     match command {
-        WslHostCommand::Hold => {
+        WslHostCommand::Hold(args) => {
             require_linux()?;
+            if let Some(shared_root) = &args.shared_root {
+                configure_guest_recovery(context, shared_root)?;
+            }
             let unit = super::service::identity().systemd_unit();
             let mut wait = wait_for_a_stop_signal;
             hold(&HostSystemd, &unit, out, &mut wait)
         }
+        WslHostCommand::ConfigureRecovery(args) => {
+            require_linux()?;
+            if !args.shared_root.is_absolute() {
+                return Err(CliError::new(
+                    Failure::InvalidArgument,
+                    "the WSL recovery shared root must be an absolute Linux path",
+                ));
+            }
+            runner_manager_platform::wsl::fence::GuestRecoveryConfig::new(args.shared_root.clone())
+                .write(context.paths())
+                .map_err(|source| {
+                    CliError::new(
+                        Failure::LocalState,
+                        format!("cannot configure WSL recovery: {source}"),
+                    )
+                })?;
+            writeln!(out, "WSL recovery fence configured.")
+                .map_err(write_failed("this configuration"))?;
+            Ok(())
+        }
     }
+}
+
+fn configure_guest_recovery(context: &Context, windows_path: &Path) -> Result<(), CliError> {
+    let output = std::process::Command::new("/usr/bin/wslpath")
+        .args(["-u", "-a", "--"])
+        .arg(windows_path)
+        .output()
+        .map_err(|source| {
+            CliError::new(
+                Failure::WslProvisioning,
+                format!("cannot start wslpath for the recovery fence: {source}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliError::new(
+            Failure::WslProvisioning,
+            "wslpath could not translate the Windows recovery directory",
+        ));
+    }
+    let translated = String::from_utf8(output.stdout).map_err(|_| {
+        CliError::new(
+            Failure::WslProvisioning,
+            "wslpath returned non-UTF-8 output",
+        )
+    })?;
+    let translated = PathBuf::from(translated.trim());
+    if !translated.is_absolute() {
+        return Err(CliError::new(
+            Failure::WslProvisioning,
+            "wslpath did not return an absolute Linux recovery directory",
+        ));
+    }
+    runner_manager_platform::wsl::fence::GuestRecoveryConfig::new(translated)
+        .write(context.paths())
+        .map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot configure WSL recovery: {source}"),
+            )
+        })
 }
 
 /// Refuses `wsl-host` anywhere but inside a Linux distribution.
@@ -1828,12 +1895,22 @@ impl Provisioner<'_> {
         let service_installed = self.settle_the_service(&invoker, &distribution, out)?;
 
         // -- Stage 7: the Windows lifecycle task ---------------------------
+        let recovery_root =
+            runner_manager_platform::wsl::fence::recovery_root(self.paths, &distribution)
+                .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?;
+        std::fs::create_dir_all(&recovery_root).map_err(|source| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot create the WSL recovery directory: {source}"),
+            )
+        })?;
         let task = LifecycleTask::new(
             identity.clone(),
             self.principal.clone(),
             self.host.executable(),
             self.linux_binary.clone(),
-        );
+        )
+        .with_recovery_root(recovery_root);
         let tasks = self.host.tasks();
         tasks
             .register(&task)
@@ -3890,7 +3967,7 @@ mod tests {
     fn the_two_windows_only_families_cannot_be_addressed_to_another_host() {
         for command in [
             Command::Wsl(WslCommand::List),
-            Command::WslHost(WslHostCommand::Hold),
+            Command::WslHost(WslHostCommand::Hold(Default::default())),
         ] {
             let refusal =
                 refuse_a_command_that_cannot_be_proxied(&command).expect_err("not proxyable");

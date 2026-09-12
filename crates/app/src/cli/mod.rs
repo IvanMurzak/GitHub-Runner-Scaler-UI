@@ -50,6 +50,7 @@ pub mod ui;
 pub mod update;
 pub mod workspace;
 pub mod wsl;
+mod wsl_watchdog;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -689,7 +690,23 @@ pub struct WslStatusArgs {
 #[derive(Debug, Subcommand)]
 pub enum WslHostCommand {
     /// Start the Linux service, then stay alive until this process is stopped.
-    Hold,
+    Hold(WslHostHoldArgs),
+    /// Store the DrvFS recovery directory selected by the Windows provider.
+    #[command(hide = true)]
+    ConfigureRecovery(WslHostConfigureRecoveryArgs),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct WslHostHoldArgs {
+    /// Windows directory used for the cross-boundary launch fence.
+    #[arg(long, value_name = "WINDOWS_PATH", hide = true)]
+    pub shared_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct WslHostConfigureRecoveryArgs {
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub shared_root: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1696,7 +1713,7 @@ fn route(
         Command::Service(command) => service::dispatch(context, command, out),
         Command::Update(args) => update::dispatch(context, args, out),
         Command::Wsl(command) => wsl::dispatch(context, command, styling, out),
-        Command::WslHost(command) => wsl::dispatch_wsl_host(command, out),
+        Command::WslHost(command) => wsl::dispatch_wsl_host(context, command, out),
         // `dispatch` returns the terminal UI's own exit code before reaching
         // here, so that `g1` owns what `tui` exits with.
         Command::Tui => Err(not_implemented("g1")),

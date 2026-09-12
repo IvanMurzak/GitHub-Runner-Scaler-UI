@@ -9,6 +9,17 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ## 0.4.13
 
+### Reliability
+
+- The Windows daemon can now self-heal a failed managed WSL2 distribution after
+  a five-minute failure threshold, but only with a cross-boundary launch fence,
+  an acknowledged idle drain, complete GitHub inventory, and no unmanaged
+  runner service. Recovery targets one named distribution and is circuit-broken.
+- The Windows TUI now distinguishes degraded, draining, recovering, backoff,
+  and recovery-blocked WSL states.
+- WSL lifecycle tasks now configure the guest heartbeat and shared launch
+  fence required by safe recovery.
+
 ### Fixes
 
 - WSL service and distribution startup failures during the root preflight are

@@ -281,7 +281,9 @@ pub fn install(
         )
     })?;
     let owned = install_owned_copy(context, &source)?;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut service_binary = owned.path.clone();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut service_arguments = daemon_arguments(context, mode);
     #[cfg(windows)]
     let supervisor = if mode == StartMode::Login {

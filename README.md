@@ -207,8 +207,8 @@ runner-manager tui
 ```
 
 On Windows the dashboard also reports whether WSL is unsupported, absent,
-empty, unavailable, or present, and shows the health of each visible
-distribution without doing any WSL work in the rendering path.
+empty, unavailable, or present. Managed distributions additionally report
+degraded, draining, recovering, backoff, and recovery-blocked states.
 
 Organizations use the same commands with `org` in place of `repo`.
 
@@ -400,6 +400,18 @@ against.
 feature promises unattended Linux availability **after that user logs on**, not between a
 Windows reboot and the first interactive logon. `wsl status` says so on every run rather than
 leaving you to discover it after a restart.
+
+**Safe automatic recovery.** The Windows daemon probes each managed WSL2 distribution. After a
+continuous five-minute transport failure it requests a drain and can terminate and restart only
+that exact distribution. Recovery proceeds only after two fresh guest heartbeats report zero
+active attempts, two complete GitHub inventories report no busy or online managed registrations,
+the lifecycle task is verified as product-owned, and no unmanaged Actions runner service exists.
+Missing, stale, contradictory, or unauthorized evidence leaves the host in
+`recovery-blocked`; it never falls back to a global `wsl --shutdown`. Recovery is capped at three
+attempts per hour.
+
+Run `wsl install` once after upgrading an older managed distribution so its lifecycle task gets
+the shared recovery fence. Fresh installations configure it automatically.
 
 **Docker is diagnosed, not installed.** If the distribution runs a Docker engine, status reports
 its version; if not, status says container jobs would fail while ordinary jobs still run. It is

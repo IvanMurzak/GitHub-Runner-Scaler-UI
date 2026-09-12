@@ -149,6 +149,7 @@ pub struct LifecycleTask {
     principal: TaskPrincipal,
     wsl_executable: PathBuf,
     linux_binary: String,
+    recovery_root: Option<PathBuf>,
 }
 
 impl LifecycleTask {
@@ -165,7 +166,15 @@ impl LifecycleTask {
             principal,
             wsl_executable: wsl_executable.path().to_path_buf(),
             linux_binary: linux_binary.into(),
+            recovery_root: None,
         }
+    }
+
+    /// Give the hold process the Windows directory used for recovery state.
+    #[must_use]
+    pub fn with_recovery_root(mut self, path: PathBuf) -> Self {
+        self.recovery_root = Some(path);
+        self
     }
 
     /// Which task this is.
@@ -207,6 +216,10 @@ impl LifecycleTask {
                 .iter()
                 .map(|argument| (*argument).to_string()),
         );
+        if let Some(root) = &self.recovery_root {
+            argv.push("--shared-root".to_string());
+            argv.push(root.to_string_lossy().into_owned());
+        }
         argv
     }
 

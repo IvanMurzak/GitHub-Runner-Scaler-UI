@@ -20,10 +20,10 @@ use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
 };
 use runner_manager_agent::reconcile::{
-    FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler, ReconcilerPorts,
-    RepositoryDirectory, TeeEvents, TracingEvents,
+    AllocationLock, FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler,
+    ReconcilerPorts, RepositoryDirectory, TeeEvents, TracingEvents, WslRecoveryAllocationLock,
 };
-use runner_manager_domain::attempt::{FailureReason, active_count_for};
+use runner_manager_domain::attempt::{FailureReason, active_count, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
@@ -36,6 +36,10 @@ use runner_manager_github::{
 };
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
 use runner_manager_platform::service::{InstallRecord, record_github_contact};
+use runner_manager_platform::wsl::fence::{
+    DrainRequest, GuestHeartbeat, GuestRecoveryConfig,
+    SCHEMA_VERSION as WSL_RECOVERY_SCHEMA_VERSION, unmanaged_runner_service_count,
+};
 
 use super::{CliError, Context, DaemonCommand, Failure, write_failed};
 
@@ -98,6 +102,8 @@ async fn run_generation(
     // healthy service can sit quietly until the six-month refresh half expires
     // and require a person merely because no TUI happened to be open.
     if targets.is_empty() {
+        let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
+        let heartbeat_paths = context.paths().clone();
         tokio::select! {
             signal = wait_for_shutdown(service_shutdown) => {
                 signal.map_err(signal_failure)?;
@@ -119,6 +125,12 @@ async fn run_generation(
             }
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
+            },
+            () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
+                unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
+            },
+            () = maintain_wsl_recovery_without_local_policies(context, host.service_start_mode) => {
+                unreachable!("WSL recovery watchdog runs until the daemon is stopped")
             },
         }
     }
@@ -187,6 +199,7 @@ async fn run_generation(
     );
     let clock = context.clock();
     let inventory = Arc::new(RestInventory::new(Arc::clone(&client), Arc::clone(&clock)));
+    let wsl_inventory = Arc::clone(&inventory) as Arc<dyn InventoryGateway>;
     let jit = Arc::new(RestJit::new(Arc::clone(&client)));
     let lifecycle_github = Arc::new(GithubLifecycle {
         jit,
@@ -203,7 +216,11 @@ async fn run_generation(
         Arc::new(TracingEvents),
         Arc::new(runner_manager_agent::reconcile::EventLog::new()),
     ));
-    let shared_lock = Arc::new(FileAllocationLock::new(paths));
+    let base_lock: Arc<dyn AllocationLock> = Arc::new(FileAllocationLock::new(Arc::clone(&paths)));
+    let shared_lock = Arc::new(WslRecoveryAllocationLock::new(
+        Arc::clone(&paths),
+        base_lock,
+    ));
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -314,6 +331,9 @@ async fn run_generation(
     // registration made before copies existed, and then nothing is watched.
     let mut upgraded_to = None;
     let mut restart_reason: Option<&'static str> = None;
+    let heartbeat_store = Arc::clone(&store) as Arc<dyn Store>;
+    let heartbeat_paths = context.paths().clone();
+    let watchdog_paths = context.paths().clone();
     let early = tokio::select! {
         signal = wait_for_shutdown(service_shutdown.clone()) => {
             signal.map_err(signal_failure)?;
@@ -350,6 +370,12 @@ async fn run_generation(
         }
         () = maintain_credential(Arc::clone(&client)) => {
             unreachable!("credential maintenance runs until the daemon is stopped")
+        }
+        () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
+            unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
+        }
+        () = super::wsl_watchdog::maintain(watchdog_paths, wsl_inventory) => {
+            unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
         result = loops.join_next() => result,
     };
@@ -410,6 +436,90 @@ async fn run_generation(
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
     Ok(DaemonOutcome::Stopped)
+}
+
+async fn maintain_wsl_recovery_without_local_policies(context: &Context, mode: StartMode) {
+    if !cfg!(windows) {
+        std::future::pending::<()>().await;
+        return;
+    }
+    loop {
+        let inventory = context
+            .secret_store(mode)
+            .ok()
+            .and_then(|store| store.load().ok().flatten())
+            .and_then(|secret| {
+                AuthenticatedClient::new(
+                    context.endpoints().clone(),
+                    UserAccessToken::from_stored(secret),
+                    context.clock(),
+                )
+                .ok()
+            })
+            .map(|client| {
+                Arc::new(RestInventory::new(Arc::new(client), context.clock()))
+                    as Arc<dyn InventoryGateway>
+            });
+        if let Some(inventory) = inventory {
+            super::wsl_watchdog::maintain(context.paths().clone(), inventory).await;
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Publish only local, non-secret evidence. Windows owns the destructive
+/// decision; the guest owns the authoritative attempt journal and the audit
+/// for persistent runner services Windows cannot safely infer.
+async fn maintain_wsl_guest_heartbeat(
+    paths: runner_manager_platform::paths::AppPaths,
+    store: Arc<dyn Store>,
+) {
+    loop {
+        match GuestRecoveryConfig::read(&paths) {
+            Ok(Some(config)) => {
+                let request = DrainRequest::read(&config.shared_root);
+                let attempts = store.attempts();
+                let policies = store.policies();
+                let heartbeat = GuestHeartbeat {
+                    schema_version: WSL_RECOVERY_SCHEMA_VERSION,
+                    observed_at: chrono::Utc::now(),
+                    acknowledged_generation: request
+                        .as_ref()
+                        .ok()
+                        .and_then(|request| request.as_ref().map(|request| request.generation)),
+                    local_active_attempts: attempts
+                        .as_ref()
+                        .ok()
+                        .map(|attempts| u32::from(active_count(attempts))),
+                    managed_targets: policies
+                        .map(|policies| {
+                            policies
+                                .into_iter()
+                                .map(|policy| policy.target)
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    unmanaged_runner_services: unmanaged_runner_service_count(),
+                };
+                if request.is_err() || heartbeat.write(&config.shared_root).is_err() {
+                    tracing::warn!(
+                        reason = "wsl_recovery_state_unreadable",
+                        "WSL recovery heartbeat is unavailable"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(_) => tracing::warn!(
+                reason = "wsl_recovery_config_unreadable",
+                "WSL recovery configuration is unavailable"
+            ),
+        }
+        tokio::time::sleep(WSL_GUEST_HEARTBEAT_INTERVAL).await;
+    }
 }
 
 /// How often an otherwise idle daemon checks the credential timestamps.
