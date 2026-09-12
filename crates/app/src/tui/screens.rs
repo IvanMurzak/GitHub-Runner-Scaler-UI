@@ -2315,6 +2315,10 @@ mod tests {
                     "populated" => populated(),
                     "empty" => Snapshot {
                         availability: Availability::Ready,
+                        // The Dashboard now renders this field. Keep the golden
+                        // fixture identical on Windows, Linux, and macOS rather
+                        // than inheriting the host-specific production default.
+                        wsl_capability: WslCapability::NotSupported,
                         ..Snapshot::default()
                     },
                     "unauthorized" => Snapshot {
@@ -2370,7 +2374,7 @@ mod tests {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
         Dashboard/populated: lines=27 bytes=1657 fnv=df4952d47044b735 | RUNNER READINESS: READY                             | Problems & fixes: none
-        Dashboard/empty: lines=23 bytes=1131 fnv=d62ee7e526e608db | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
+        Dashboard/empty: lines=23 bytes=1131 fnv=d745b466823d023c | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
