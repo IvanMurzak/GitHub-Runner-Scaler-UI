@@ -1,0 +1,45 @@
+crates/platform/src/service.rs
+  s_c9018c0a298938::t_fa7707bf60a207 4421,8607-8615
+  s_c9018c0a298938::t_aaa790a28cd89b 4417-4419
+crates/app/src/tui/screens.rs
+  s_c9018c0a298938::t_fa7707bf60a207 2223,2234,2247,2266,2285-2288,2302-2303,2305
+  s_5332f62e0ed5a7::t_1638c949f3ebbd 2304
+CHANGELOG.md
+  s_c9018c0a298938::t_fa7707bf60a207 10-16
+  s_92e74af38f2870::t_5a2c380ae72804 17
+crates/app/src/tui/shell.rs
+  s_c9018c0a298938::t_fa7707bf60a207 550-554,604,612,614,3433,3442-3445,4582-4586,4603-4617
+  s_c9018c0a298938::t_aaa790a28cd89b 613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d6b66f3af64ff2e63c19b8780f9676b7b13af367",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_c9018c0a298938": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0973c-2ad1-7622-b64b-2f3109c27b5b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
