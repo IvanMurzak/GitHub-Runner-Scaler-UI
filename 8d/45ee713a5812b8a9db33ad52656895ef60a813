@@ -1,0 +1,125 @@
+crates/app/tests/release_channels.rs
+  s_ac5a13ce404118::t_bd8a0523f9c3ad 640-647
+  s_ac5a13ce404118::t_97d91e79e987f9 648
+crates/app/Cargo.toml
+  s_ac5a13ce404118::t_efb581eabde292 27-30
+crates/app/tests/common/mod.rs
+  s_ac5a13ce404118::t_e06c28cd2e2197 251-256,472-483
+  s_ac5a13ce404118::t_6ecc42b3ba7819 257,470-471
+crates/app/tests/install_scripts.rs
+  s_ac5a13ce404118::t_97c241386c8da2 1171,1173-1174,1195-1199,1202-1205,1227-1231
+crates/app/src/cli/wsl.rs
+  s_ac5a13ce404118::t_5e6a469a3236b6 2413-2481
+crates/app/src/cli/update.rs
+  s_ac5a13ce404118::t_e20557be9204fd 861-876
+  s_da2e97123915fe::t_a1a900adc35642 877-878
+crates/app/tests/update_command.rs
+  s_ac5a13ce404118::t_a76358e7bb8af8 243-248,256
+  s_ac5a13ce404118::t_d243baa7f874d4 241,249-255
+  s_ac5a13ce404118::t_4605b64d79aa0b 242
+README.md
+  s_ac5a13ce404118::t_5a70d508d43dea 190-193,209,212
+  s_ac5a13ce404118::t_24ec50398110c2 210-211
+.taskflow/2026-09-11-windows-service-wsl-self-healing/ROADMAP.md
+  s_ac5a13ce404118::t_0e446ba335ba54 7-8,142-153
+crates/app/src/tui/screens.rs
+  s_ac5a13ce404118::t_9c95d136551d44 258-261,294,1445-1449,1455-1457
+  s_ac5a13ce404118::t_317d8c26c1dda7 2062
+  s_ac5a13ce404118::t_0c192a0e9c6ec4 250,1442
+  s_ac5a13ce404118::t_8ff625a6404dee 1461
+  s_ac5a13ce404118::t_69b8fb062e573f 243-249,251-256,262-293,304-305,315-320,1407,1437-1441,1443,1450-1454,1459-1460,1462-1466
+  s_ac5a13ce404118::t_d47f7550cc55cf 1983-1988
+  s_5332f62e0ed5a7::t_a5b41d9c7cea49 257,1444,1458
+crates/app/src/cli/daemon.rs
+  s_ac5a13ce404118::t_c3365c0aadd8d5 61-79,105,113-118,372-373,382-385,387,412
+  s_ac5a13ce404118::t_9c9fe412c2fe17 80,318,377-381,386
+install/install.ps1
+  s_ac5a13ce404118::t_cf53db1dd13914 527,530,576,578-580,585-589,592,595
+  s_ac5a13ce404118::t_d59af7d3fc700b 505-506,510-512,524,526,529,532,567,570-573,581,591
+  s_ac5a13ce404118::t_0253808d7354e9 574,635-651
+  s_ac5a13ce404118::t_85b1655fdb22da 534-542
+  s_5332f62e0ed5a7::t_ddc4899b973585 533
+.github/scripts/channels.sh
+  s_ac5a13ce404118::t_36e3574056b8d8 529-535
+crates/app/src/tui/shell.rs
+  s_ac5a13ce404118::t_13edc7bd36e8ac 2359,3096,3180,3462,3493
+  s_ac5a13ce404118::t_9c95d136551d44 682-685,689-692,708-709
+  s_ac5a13ce404118::t_6c22f89dea26cb 2365,3102,3186,3474,3502
+  s_ac5a13ce404118::t_3979ebdc511813 42-43,460,482-483,625-626,630-636,638,664-681,686-688,693,695-707
+  s_ac5a13ce404118::t_95ddc8f08c8dd3 637,639-640,650-651,662-663
+  s_ac5a13ce404118::t_acf4fe16271e6b 641-649,652-660
+  s_ac5a13ce404118::t_6d919ec2f69feb 970,1239,2109
+  s_ac5a13ce404118::t_52c14de0d212ce 661
+  s_ac5a13ce404118::t_2579d49f57edfa 694
+crates/platform/src/service.rs
+  s_ac5a13ce404118::t_527781dfae4b3b 3756-3759,3767,3844,3846,3883,3905-3909
+  s_ac5a13ce404118::t_70c03dbc0b3d08 3807-3808,3821-3826,3845
+  s_ac5a13ce404118::t_9c95d136551d44 3835-3843,3847-3858,4406-4416,5120,8558
+  s_ac5a13ce404118::t_abd97add446848 8559-8581
+  s_ac5a13ce404118::t_83c953ab65ece2 3829
+crates/platform/src/wsl/mod.rs
+  s_ac5a13ce404118::t_b1767712a2dcb0 71
+crates/platform/src/wsl/probe.rs
+  s_ac5a13ce404118::t_b725e6b9cc45fd 699,702-703,707-724
+  s_ac5a13ce404118::t_b1767712a2dcb0 311-330
+  s_ac5a13ce404118::t_b29ed04be1f515 295-310
+  s_ac5a13ce404118::t_2c106d3d5665a6 700-701,704-706
+  s_92e74af38f2870::t_8b300fa7098603 698
+docs/service-account.md
+  s_ac5a13ce404118::t_5f5b9bc4a47908 369-375
+crates/platform/src/wsl/recovery.rs
+  s_ac5a13ce404118::t_1e3d0d2c335c8b 57-60,110-112
+  s_ac5a13ce404118::t_62c2943883bb1f 108-109,113
+  s_ac5a13ce404118::t_60218a060372c0 13-14,19,21-22,24-27,41,54-56,61-74,95-107,114,125-126,131,133-134,136-139,151-152,156,184-198
+  s_ac5a13ce404118::t_b1767712a2dcb0 1-12,15-18,20,23,28-40,42-53,75-94,115-124,127-130,132,135,140-150,153-155,157-183,199-200
+crates/app/src/supervisor_main.rs
+  s_ac5a13ce404118::t_efb581eabde292 1-8,10-15,20-21,28,31,33,35-46,49-54,85-86
+  s_ac5a13ce404118::t_9f974b7f27f3a4 9,16-19,32,34,47-48,55-84
+  s_ac5a13ce404118::t_3a81804191f96a 22-23,25-27,29-30
+  s_ac5a13ce404118::t_cd922b0c1e4d60 24
+.github/workflows/release.yml
+  s_ac5a13ce404118::t_36e3574056b8d8 618
+crates/app/src/cli/service.rs
+  s_ac5a13ce404118::t_ee8baf264f4f9a 284-301,303,305,312-315,329-331
+  s_ac5a13ce404118::t_1c5c8651831332 178-186,218-224,332,337-342
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d45ee713a5812b8a9db33ad52656895ef60a813",
+  "prompts": {},
+  "sessions": {
+    "s_5332f62e0ed5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe916b1f-7706-49b8-9ffe-14c6556270b5",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ac5a13ce404118": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0939d-7cca-74b2-b044-469f46e15dcf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_da2e97123915fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f744e95-e2d8-4e25-8532-d377a70fa6ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
