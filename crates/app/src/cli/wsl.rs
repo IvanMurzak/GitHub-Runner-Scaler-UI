@@ -1075,8 +1075,8 @@ impl WslStatusDocument {
             format!("{} is a healthy managed runner host.", self.distribution)
         } else {
             format!(
-                "{} is not ready to accept jobs. Every line below is read from the \
-                 distribution, not from this machine's record.",
+                "{} is not ready to accept jobs. The status above was read from the \
+                 distribution, not inferred from this machine's record.",
                 self.distribution
             )
         }
@@ -1147,6 +1147,13 @@ impl WslStatusDocument {
         }
         parts
     }
+}
+
+/// The convergent operator action for both first-time WSL provisioning and
+/// repairing an existing managed distribution.
+#[must_use]
+pub(crate) fn install_remediation(distribution: &str) -> String {
+    format!("runner-manager wsl install --distribution {distribution:?}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2826,6 +2833,23 @@ fn write_status_text(document: &WslStatusDocument, out: &mut dyn Write) -> Resul
 
     writeln!(out).map_err(failed)?;
     writeln!(out, "{}", document.headline()).map_err(failed)?;
+    if !document.healthy {
+        writeln!(out).map_err(failed)?;
+        writeln!(out, "Problems:").map_err(failed)?;
+        for problem in document.unhealthy_parts() {
+            writeln!(out, "  - {problem}").map_err(failed)?;
+        }
+        if document.wsl.ready {
+            writeln!(out).map_err(failed)?;
+            writeln!(out, "Fix:").map_err(failed)?;
+            writeln!(out, "  {}", install_remediation(&document.distribution)).map_err(failed)?;
+            writeln!(
+                out,
+                "  This safely brings an existing host up to date; do not uninstall its Linux service first."
+            )
+            .map_err(failed)?;
+        }
+    }
     if !document.drift.is_empty() {
         writeln!(out).map_err(failed)?;
         writeln!(out, "Drift between this machine's record and the host:").map_err(failed)?;
@@ -4800,6 +4824,19 @@ mod tests {
                 .unhealthy_parts()
                 .join("; ")
                 .contains("its binary is 0.3.2")
+        );
+
+        let mut rendered = Vec::new();
+        write_status_text(&document, &mut rendered).expect("it renders");
+        let text = String::from_utf8(rendered).expect("utf-8");
+        assert!(text.contains("Problems:"), "{text}");
+        assert!(
+            text.contains("runner-manager wsl install --distribution \"Ubuntu\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("do not uninstall its Linux service first"),
+            "{text}"
         );
     }
 

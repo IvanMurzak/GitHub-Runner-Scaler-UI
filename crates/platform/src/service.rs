@@ -5470,21 +5470,36 @@ mod sys {
                 identity.name(),
                 ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
             ) {
-                Ok(service) => service,
+                Ok(service) => Some(service),
                 Err(error) if is_missing(&error) => return Ok(false),
+                // A previous caller has already asked SCM to delete this
+                // registration. That is the desired state, not an uninstall
+                // failure. Wait for SCM to release the name so a following
+                // `service install` can use it immediately.
+                Err(error) if is_marked_for_delete(&error) => None,
                 Err(error) => return Err(scm_error("uninstall", identity.name(), &error)),
             };
-            // A running service can be deleted, but it lingers until it stops.
-            // Stopping first is what makes `uninstall` followed by `install`
-            // work in one sitting, which is what the start-mode switch needs.
-            if let Ok(status) = service.query_status()
-                && status.current_state != ServiceState::Stopped
-            {
-                let _ = service.stop();
+            if let Some(service) = service {
+                // A running service can be deleted, but it lingers until it stops.
+                // Stopping first is what makes `uninstall` followed by `install`
+                // work in one sitting, which is what the start-mode switch needs.
+                if let Ok(status) = service.query_status()
+                    && status.current_state != ServiceState::Stopped
+                {
+                    let _ = service.stop();
+                }
+                match service.delete() {
+                    Ok(()) => {}
+                    // DeleteService is idempotent from the operator's point of
+                    // view. Another process can mark the service between our
+                    // OpenService and DeleteService calls.
+                    Err(error) if is_marked_for_delete(&error) => {}
+                    Err(error) => {
+                        return Err(scm_error("uninstall", identity.name(), &error));
+                    }
+                }
+                drop(service);
             }
-            service
-                .delete()
-                .map_err(|error| scm_error("uninstall", identity.name(), &error))?;
 
             // `DeleteService` marks a registration for deletion and returns;
             // SCM removes it only after the last service handle closes. Drop
@@ -5492,7 +5507,6 @@ mod sys {
             // promised by `uninstall`: an immediate status check must not see
             // a registration that is merely on its way out. This also keeps a
             // stop/uninstall/install sequence deterministic on busy hosts.
-            drop(service);
             let absent = wait_until_scm_absent(DELETE_TIMEOUT, DELETE_POLL_INTERVAL, || {
                 match manager.open_service(identity.name(), ServiceAccess::QUERY_STATUS) {
                     Ok(service) => {
@@ -5594,7 +5608,7 @@ mod sys {
             if io.raw_os_error() == Some(SERVICE_DOES_NOT_EXIST))
     }
 
-    fn is_marked_for_delete(error: &windows_service::Error) -> bool {
+    pub(super) fn is_marked_for_delete(error: &windows_service::Error) -> bool {
         matches!(error, windows_service::Error::Winapi(io)
             if io.raw_os_error() == Some(SERVICE_MARKED_FOR_DELETE))
     }
@@ -6528,6 +6542,14 @@ mod tests {
             3,
             "uninstall must recheck after transient presence instead of treating it as a leak"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recognises_an_already_pending_service_deletion() {
+        let error = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(1072));
+
+        assert!(super::sys::is_marked_for_delete(&error));
     }
 
     #[test]

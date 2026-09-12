@@ -600,7 +600,11 @@ fn readiness_from_facts(
                 .into(),
         ),
         Ok(service) => {
-            if !service.running {
+            let registration_missing = service
+                .problems
+                .iter()
+                .any(|(subject, _)| subject == "registration");
+            if !service.running && !registration_missing {
                 let repair = service_repair_command(service.start_mode);
                 issue(
                     "local:service-stopped",
@@ -618,12 +622,20 @@ fn readiness_from_facts(
                 if !service.running && subject == "runtime" {
                     continue;
                 }
+                let remediation = if subject == "registration" {
+                    format!(
+                        "Run `{}` from an elevated terminal. It recreates the missing registration without deleting configuration or credentials.",
+                        service_repair_command(service.start_mode)
+                    )
+                } else {
+                    "Run `runner-manager service status`, then follow its reported remediation."
+                        .into()
+                };
                 issue(
                     &format!("local:{}", subject.replace(' ', "-")),
                     OperationalReadiness::Blocked,
                     format!("Local service {subject}: {detail}"),
-                    "Run `runner-manager service status`, then follow its reported remediation."
-                        .into(),
+                    remediation,
                 );
             }
             if service.start_mode == Some(StartMode::Login) {
@@ -684,8 +696,8 @@ fn readiness_from_facts(
                         host.detail
                     ),
                     format!(
-                        "Run `runner-manager wsl status --distribution \"{}\"` and follow its remediation.",
-                        host.distribution
+                        "Run `{}`. It repairs or updates the existing WSL host in place; do not uninstall its Linux service first.",
+                        crate::cli::wsl::install_remediation(&host.distribution)
                     ),
                 )
             }
@@ -975,17 +987,14 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
                 .ok()
                 .flatten()
         });
-        let recovery_state = recovery.as_ref().and_then(|status| {
-            use runner_manager_platform::wsl::fence::RecoveryPhase;
-            match status.phase {
-                RecoveryPhase::Healthy => None,
-                RecoveryPhase::Degraded => Some(WslHostState::Degraded),
-                RecoveryPhase::Draining => Some(WslHostState::Draining),
-                RecoveryPhase::Recovering => Some(WslHostState::Recovering),
-                RecoveryPhase::Backoff => Some(WslHostState::Backoff),
-                RecoveryPhase::RecoveryBlocked => Some(WslHostState::RecoveryBlocked),
-            }
-        });
+        // The full status probe above is newer and stronger evidence than a
+        // durable watchdog breadcrumb. A service can be repaired while the
+        // Windows watchdog is stopped; in that case its last Degraded record
+        // must not keep a currently healthy host red forever.
+        let recovery_state = effective_recovery_state(
+            document.healthy,
+            recovery.as_ref().map(|status| status.phase),
+        );
         let (state, detail) = if let Some(state) = recovery_state {
             let detail = recovery
                 .and_then(|status| status.reason)
@@ -1018,6 +1027,26 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
     }));
     rows.sort_by(|left, right| left.distribution.cmp(&right.distribution));
     (WslCapability::Available, rows)
+}
+
+#[cfg(windows)]
+fn effective_recovery_state(
+    host_is_healthy_now: bool,
+    phase: Option<runner_manager_platform::wsl::fence::RecoveryPhase>,
+) -> Option<WslHostState> {
+    use runner_manager_platform::wsl::fence::RecoveryPhase;
+
+    if host_is_healthy_now {
+        return None;
+    }
+    match phase? {
+        RecoveryPhase::Healthy => None,
+        RecoveryPhase::Degraded => Some(WslHostState::Degraded),
+        RecoveryPhase::Draining => Some(WslHostState::Draining),
+        RecoveryPhase::Recovering => Some(WslHostState::Recovering),
+        RecoveryPhase::Backoff => Some(WslHostState::Backoff),
+        RecoveryPhase::RecoveryBlocked => Some(WslHostState::RecoveryBlocked),
+    }
 }
 
 /// Recognise the exact name emitted by `agent::lifecycle::runner_name`.
@@ -4587,6 +4616,10 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     assert!(text.contains("supervisor"), "{text}");
     assert!(text.contains("elevated terminal"), "{text}");
     assert!(text.contains("WSL Ubuntu"), "{text}");
+    assert!(
+        text.contains("runner-manager wsl install --distribution \"Ubuntu\""),
+        "{text}"
+    );
 
     let unknown = readiness_from_facts(Err("access denied".into()), true, &[], "12:00:00Z".into());
     assert_eq!(unknown.state, OperationalReadiness::Unknown);
@@ -4598,6 +4631,50 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     assert_eq!(
         readiness_health(OperationalReadiness::Degraded, false),
         Health::Degraded
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_missing_service_registration_is_one_actionable_problem() {
+    let assessment = readiness_from_facts(
+        Ok(LocalServiceReadiness {
+            installed: true,
+            running: false,
+            start_mode: Some(StartMode::Boot),
+            log_file: "service.log".into(),
+            problems: vec![(
+                "registration".into(),
+                "the service record exists but SCM has no registration".into(),
+            )],
+            legacy_windows_action: false,
+        }),
+        true,
+        &[],
+        "12:00:00Z".into(),
+    );
+
+    assert_eq!(assessment.activity.len(), 1);
+    assert!(assessment.activity[0].summary.contains("registration"));
+    assert!(
+        assessment.activity[0]
+            .remediation
+            .contains("runner-manager service install --start-at boot")
+    );
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn a_fresh_healthy_wsl_probe_overrides_stale_watchdog_degradation() {
+    use runner_manager_platform::wsl::fence::RecoveryPhase;
+
+    assert_eq!(
+        effective_recovery_state(true, Some(RecoveryPhase::Degraded)),
+        None
+    );
+    assert_eq!(
+        effective_recovery_state(false, Some(RecoveryPhase::Degraded)),
+        Some(WslHostState::Degraded)
     );
 }
 

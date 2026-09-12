@@ -7,6 +7,17 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.19
+
+### Fixes
+
+- Windows service removal now treats SCM error 1072 (already marked for
+  deletion) as an in-progress successful uninstall and waits for the service
+  name to be released, so `service uninstall && service install` is reliable.
+- Unhealthy `wsl status` output and TUI readiness now show the direct,
+  convergent `wsl install --distribution NAME` repair command and explain that
+  an existing Linux service must not be uninstalled first.
+
 ## 0.4.18
 
 ### Fixes

@@ -553,10 +553,20 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
     if status.is_healthy() {
         Ok(())
     } else {
+        let remedy = if status
+            .problems()
+            .iter()
+            .any(|problem| problem.subject == "registration")
+        {
+            let mode = status.start_mode().unwrap_or(StartMode::Boot);
+            format!("runner-manager service install --start-at {mode}")
+        } else {
+            "runner-manager service uninstall && runner-manager service install".into()
+        };
         Err(CliError::with_remedy(
             Failure::LocalState,
             "the service status above contains one or more errors",
-            "runner-manager service uninstall && runner-manager service install",
+            remedy,
         ))
     }
 }
