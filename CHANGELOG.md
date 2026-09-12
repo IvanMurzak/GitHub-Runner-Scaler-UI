@@ -7,6 +7,14 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.18
+
+### Fixes
+
+- Stopped-service remediation in the TUI and `service status` now uses the
+  supported, convergent `service install --start-at boot|login` command instead
+  of suggesting the nonexistent `service start` subcommand.
+
 ## 0.4.17
 
 ### Fixes

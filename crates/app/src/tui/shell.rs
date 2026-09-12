@@ -547,6 +547,11 @@ fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceRe
     })
 }
 
+fn service_repair_command(start_mode: Option<StartMode>) -> String {
+    let start_at = start_mode.unwrap_or(StartMode::Boot);
+    format!("runner-manager service install --start-at {start_at}")
+}
+
 fn readiness_from_facts(
     service: Result<LocalServiceReadiness, String>,
     autoscale_enabled: bool,
@@ -596,6 +601,7 @@ fn readiness_from_facts(
         ),
         Ok(service) => {
             if !service.running {
+                let repair = service_repair_command(service.start_mode);
                 issue(
                     "local:service-stopped",
                     OperationalReadiness::Blocked,
@@ -603,8 +609,9 @@ fn readiness_from_facts(
                         "Local service is registered but stopped; inspect {}.",
                         service.log_file
                     ),
-                    "Run `runner-manager service start`; if it stops again, inspect Activity and the service log."
-                        .into(),
+                    format!(
+                        "Run `{repair}`; if the service manager denies replacement, retry from an elevated terminal. If it stops again, inspect Activity and the service log."
+                    ),
                 );
             }
             for (subject, detail) in service.problems {
@@ -3423,7 +3430,7 @@ mod tests {
                 occurred_at: "now".into(),
                 outcome: screens::ActivityOutcome::Failed,
                 summary: "Local service is stopped.".into(),
-                remediation: "Run `runner-manager service start`.".into(),
+                remediation: "Run `runner-manager service install --start-at boot`.".into(),
             }],
             ..Snapshot::default()
         });
@@ -3432,7 +3439,10 @@ mod tests {
             panic!("Dashboard c must copy readiness fixes")
         };
         assert!(copy.contains("Local service is stopped."), "{copy}");
-        assert!(copy.contains("runner-manager service start"), "{copy}");
+        assert!(
+            copy.contains("runner-manager service install --start-at boot"),
+            "{copy}"
+        );
     }
 
     #[test]
@@ -4569,6 +4579,11 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("registered but stopped"), "{text}");
+    assert!(
+        text.contains("runner-manager service install --start-at login"),
+        "{text}"
+    );
+    assert!(!text.contains("runner-manager service start"), "{text}");
     assert!(text.contains("supervisor"), "{text}");
     assert!(text.contains("elevated terminal"), "{text}");
     assert!(text.contains("WSL Ubuntu"), "{text}");
@@ -4584,4 +4599,19 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
         readiness_health(OperationalReadiness::Degraded, false),
         Health::Degraded
     );
+}
+
+#[cfg(test)]
+#[test]
+fn stopped_service_repair_commands_are_accepted_by_the_published_cli() {
+    use clap::Parser as _;
+
+    for mode in [Some(StartMode::Boot), Some(StartMode::Login), None] {
+        let command = service_repair_command(mode);
+        let argv = std::iter::once("runner-manager").chain(command.split_whitespace().skip(1));
+        assert!(
+            crate::cli::Cli::try_parse_from(argv).is_ok(),
+            "TUI remediation must be executable: {command}"
+        );
+    }
 }

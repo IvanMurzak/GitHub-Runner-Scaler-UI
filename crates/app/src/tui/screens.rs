@@ -2220,7 +2220,7 @@ mod tests {
                 occurred_at: "12:02:00Z".into(),
                 outcome: ActivityOutcome::Failed,
                 summary: "Local service is registered but stopped.".into(),
-                remediation: "Run `runner-manager service start`.".into(),
+                remediation: "Run `runner-manager service install --start-at boot`.".into(),
             },
         );
         let mut model = ScreenModel::new(snapshot);
@@ -2231,7 +2231,7 @@ mod tests {
         );
         assert!(dashboard.contains("Problems & fixes (1)"), "{dashboard}");
         assert!(
-            dashboard.contains("runner-manager service start"),
+            dashboard.contains("runner-manager service install --start-at boot"),
             "{dashboard}"
         );
         assert!(dashboard.contains("[c] Copy fixes"), "{dashboard}");
@@ -2244,7 +2244,7 @@ mod tests {
             "{activity}"
         );
         assert!(
-            activity.contains("runner-manager service start"),
+            activity.contains("runner-manager service install --start-at boot"),
             "{activity}"
         );
     }
@@ -2263,7 +2263,7 @@ mod tests {
                     occurred_at: "12:02:00Z".into(),
                     outcome: ActivityOutcome::Failed,
                     summary: "Local service is registered but stopped.".into(),
-                    remediation: "Run `runner-manager service start`.".into(),
+                    remediation: "Run `runner-manager service install --start-at boot`.".into(),
                 },
                 ActivityRow {
                     id: "readiness:local:login-only".into(),
@@ -2282,7 +2282,10 @@ mod tests {
             .find(|line| line.contains("RUNNER READINESS"))
             .expect("wide readiness row");
         assert!(wide_status.contains("Problems & fixes (2)"), "{wide}");
-        assert!(wide.contains("runner-manager service start"), "{wide}");
+        assert!(
+            wide.contains("runner-manager service install --start-at boot"),
+            "{wide}"
+        );
 
         let narrow = drawn(80, 36, &model);
         let readiness_row = narrow.find("RUNNER READINESS").expect("narrow readiness");
@@ -2296,7 +2299,10 @@ mod tests {
                 .contains("Problems & fixes"),
             "{narrow}"
         );
-        assert!(narrow.contains("runner-manager service start"), "{narrow}");
+        assert!(
+            narrow.contains("runner-manager service install --start-at boot"),
+            "{narrow}"
+        );
     }
 
     fn matrix_snapshot() -> String {

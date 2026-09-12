@@ -4414,8 +4414,11 @@ impl ServiceStatus {
                         subject: "runtime",
                         detail: format!(
                             "{} holds an automatic registration, but the daemon is stopped. Run \
-                             `runner-manager service start`; if it stops again, inspect {}.",
+                             `runner-manager service install --start-at {}`; if the service \
+                             manager denies replacement, retry from an elevated terminal. If it \
+                             stops again, inspect {}.",
                             found.manager,
+                            found.start_mode,
                             log_file.display()
                         ),
                     });
@@ -8600,6 +8603,15 @@ logs = \"/d\"
                 .iter()
                 .any(|problem| problem.subject == "runtime"),
             "{status}"
+        );
+        let rendered = status.to_string();
+        assert!(
+            rendered.contains("runner-manager service install --start-at login"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("runner-manager service start"),
+            "{rendered}"
         );
     }
 
