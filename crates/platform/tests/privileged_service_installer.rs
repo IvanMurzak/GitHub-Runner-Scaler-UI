@@ -377,6 +377,22 @@ fn wait_for_running(fixture: &Fixture, running: bool, timeout: Duration) {
     }
 }
 
+fn remove_file_after_process_exit(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("{} did not become removable: {error}", path.display()),
+        }
+    }
+}
+
 fn scm_exit_code(fixture: &Fixture) -> ServiceExitCode {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .expect("the local SCM opens");
@@ -721,7 +737,7 @@ fn a_binary_that_moves_after_install_is_reported_as_stale() {
 
     // The npm upgrade, reproduced: the file the registration names goes away
     // while the registration itself survives untouched.
-    std::fs::remove_file(&fixture.binary).expect("the binary moves out from under the record");
+    remove_file_after_process_exit(&fixture.binary, Duration::from_secs(30));
 
     let stale = fixture.operations.status().expect("a status");
     assert!(
