@@ -858,6 +858,24 @@ async fn replace_from_archive(
         extract_from_tar_gz(&archive, &inside, &unpacked)?;
     }
 
+    // Windows login tasks run the no-console supervisor shipped beside the
+    // CLI. Updating only the CLI would make the next `service install` fail on
+    // a machine originally installed before the supervisor existed. Extract
+    // and replace the stable companion first; it is intentionally compatible
+    // with both the old and new daemon protocol, so a later main-binary
+    // replacement failure still leaves a runnable pair.
+    if cfg!(windows) {
+        let supervisor_name = "runner-manager-supervisor.exe";
+        let supervisor_inside = format!(
+            "runner-manager-{}-{}/{}",
+            published.version, target.triple, supervisor_name
+        );
+        let unpacked_supervisor = work.path().join(supervisor_name);
+        extract_from_zip(&archive, &supervisor_inside, &unpacked_supervisor)?;
+        let supervisor_destination = destination.with_file_name(supervisor_name);
+        install_over(&unpacked_supervisor, &supervisor_destination)?;
+    }
+
     install_over(&unpacked, destination)?;
     writeln!(
         out,

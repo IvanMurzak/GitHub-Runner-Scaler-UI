@@ -2410,6 +2410,75 @@ pub fn status(
     write_status_text(&document, out)
 }
 
+/// A bounded Windows-side snapshot for the TUI's background collector.
+/// Rendering never calls WSL; it receives these already-classified documents.
+#[cfg(windows)]
+pub(crate) struct TuiWslSnapshot {
+    pub installed: Vec<String>,
+    pub documents: Vec<WslStatusDocument>,
+}
+
+#[cfg(windows)]
+pub(crate) struct TuiWslFailure {
+    pub detail: String,
+    pub managed: Vec<String>,
+}
+
+#[cfg(windows)]
+pub(crate) fn tui_status_documents(context: &Context) -> Result<TuiWslSnapshot, TuiWslFailure> {
+    let records = WslProviderRecord::all(context.paths()).map_err(|error| TuiWslFailure {
+        detail: error.to_string(),
+        managed: Vec::new(),
+    })?;
+    let managed_names = records
+        .iter()
+        .map(|record| record.distribution.clone())
+        .collect::<Vec<_>>();
+    let host = host_adapter("the TUI WSL status collector").map_err(|error| TuiWslFailure {
+        detail: error.to_string(),
+        managed: managed_names.clone(),
+    })?;
+    let invoker = host.invoker();
+    let installed = match invoker.list() {
+        Ok(table) => table
+            .entries()
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .collect::<Vec<_>>(),
+        Err(list_error) => {
+            invoker
+                .platform_status()
+                .map_err(|status_error| TuiWslFailure {
+                    detail: format!("{list_error}; WSL platform check also failed: {status_error}"),
+                    managed: managed_names.clone(),
+                })?;
+            Vec::new()
+        }
+    };
+    let mut documents = Vec::with_capacity(records.len());
+    for record in records {
+        documents.push(
+            probe(
+                &host,
+                context.paths(),
+                &record.distribution,
+                DEFAULT_LINUX_DESTINATION,
+                &linux_unit(),
+                env!("CARGO_PKG_VERSION"),
+                context.clock().now(),
+            )
+            .map_err(|error| TuiWslFailure {
+                detail: error.to_string(),
+                managed: managed_names.clone(),
+            })?,
+        );
+    }
+    Ok(TuiWslSnapshot {
+        installed,
+        documents,
+    })
+}
+
 /// `runner-manager wsl detach`.
 ///
 /// # Errors

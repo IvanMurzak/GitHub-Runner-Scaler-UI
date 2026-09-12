@@ -615,6 +615,7 @@ jobs:
           mkdir -p "dist/${stem}"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp "target/${TARGET}/release/runner-manager.exe" "dist/${stem}/"
+            cp "target/${TARGET}/release/runner-manager-supervisor.exe" "dist/${stem}/"
           else
             cp "target/${TARGET}/release/runner-manager" "dist/${stem}/"
           fi

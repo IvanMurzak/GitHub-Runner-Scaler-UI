@@ -292,6 +292,42 @@ impl<'runner> WslInvoker<'runner> {
         Ok(DistributionTable::from_console_output(output.stdout()))
     }
 
+    /// Verifies that the WSL platform itself answers even when there are no
+    /// distributions for `--list` to return.
+    pub fn platform_status(&self) -> Result<(), WslError> {
+        let request = CommandRequest::new(self.executable.path()).arg("--status");
+        let output = self.runner.run(&request)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(WslError::CommandFailed {
+            what: "read WSL platform status",
+            program: self.executable.path().to_path_buf(),
+            exit_code: output.exit_code(),
+            detail: output.diagnostic(),
+        })
+    }
+
+    /// Terminates exactly one validated distribution. This deliberately has
+    /// no whole-WSL counterpart: callers cannot accidentally turn recovery of
+    /// one runner host into `wsl --shutdown` for Docker and every other distro.
+    pub fn terminate_named(&self, distribution: &str) -> Result<(), WslError> {
+        validate_distribution_name(distribution)?;
+        let request = CommandRequest::new(self.executable.path())
+            .arg("--terminate")
+            .arg(distribution);
+        let output = self.runner.run(&request)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(WslError::CommandFailed {
+            what: "terminate the named WSL distribution",
+            program: self.executable.path().to_path_buf(),
+            exit_code: output.exit_code(),
+            detail: output.diagnostic(),
+        })
+    }
+
     /// Runs one command inside a distribution.
     ///
     /// Takes the command **by value**, which is not an accident: a
@@ -657,6 +693,33 @@ mod tests {
             .expect_err("refused");
         assert!(matches!(error, WslError::InvalidName { .. }), "{error:?}");
         assert_eq!(runner.call_count(), 0, "nothing may be launched");
+    }
+
+    #[test]
+    fn recovery_can_terminate_only_one_validated_named_distribution() {
+        let runner =
+            ScriptedRunner::new().always("--terminate Ubuntu", CommandOutput::exited(0, "", ""));
+        let executable = executable();
+        let invoker = WslInvoker::new(&runner, &executable);
+        invoker
+            .terminate_named("Ubuntu")
+            .expect("named termination");
+        assert_eq!(
+            runner.recorded()[0].arguments,
+            vec!["--terminate", "Ubuntu"]
+        );
+        assert!(
+            runner
+                .recorded()
+                .iter()
+                .all(|request| !request.arguments.iter().any(|arg| arg == "--shutdown"))
+        );
+
+        let error = invoker
+            .terminate_named("--shutdown")
+            .expect_err("option-like names are refused");
+        assert!(matches!(error, WslError::InvalidName { .. }));
+        assert_eq!(runner.call_count(), 1);
     }
 
     #[test]

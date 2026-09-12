@@ -238,6 +238,22 @@ fn a_newer_release_replaces_the_running_binary() {
         payload_of(&release),
         "the installed file must be the binary the release archive carried"
     );
+    #[cfg(windows)]
+    assert_eq!(
+        std::fs::read(
+            installed
+                .binary
+                .with_file_name("runner-manager-supervisor.exe")
+        )
+        .expect("the update must install the no-console companion"),
+        std::fs::read(
+            release
+                .staged("x86_64-pc-windows-msvc")
+                .join("runner-manager-supervisor.exe")
+        )
+        .expect("fixture supervisor"),
+        "a standalone update must leave the companion needed by service install"
+    );
 }
 
 /// A release that is not newer changes nothing, and says nothing was done.

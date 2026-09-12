@@ -637,6 +637,15 @@ fn npm_stage_puts_the_verified_binary_in_every_platform_package() {
              A package that claims a licence nobody can read is a package \
              nobody can comply with."
         );
+        if target == "x86_64-pc-windows-msvc" {
+            assert!(
+                out.join(&name)
+                    .join("bin")
+                    .join("runner-manager-supervisor.exe")
+                    .is_file(),
+                "the Windows package cannot install a hidden login service without its supervisor"
+            );
+        }
     }
 
     // The root package carries the shim and nothing platform-specific.

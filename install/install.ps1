@@ -502,8 +502,13 @@ try {
 
     $stem     = "runner-manager-$resolvedVersion-$target"
     $produced = Join-Path (Join-Path $unpacked $stem) $BinaryName
+    $supervisorName = 'runner-manager-supervisor.exe'
+    $producedSupervisor = Join-Path (Join-Path $unpacked $stem) $supervisorName
     if (-not (Test-Path -LiteralPath $produced -PathType Leaf)) {
         Write-Fail "$asset does not contain $stem\$BinaryName."
+    }
+    if (-not (Test-Path -LiteralPath $producedSupervisor -PathType Leaf)) {
+        Write-Fail "$asset does not contain $stem\$supervisorName."
     }
 
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
@@ -516,9 +521,25 @@ try {
     # executable, so that case gets a sentence naming the cause rather than an
     # unexplained access-denied.
     $destination = Join-Path $Dir $BinaryName
+    $supervisorDestination = Join-Path $Dir $supervisorName
     $staged      = Join-Path $Dir '.runner-manager.install-tmp'
+    $stagedSupervisor = Join-Path $Dir '.runner-manager-supervisor.install-tmp'
+    $supervisorBackup = Join-Path $Dir '.runner-manager-supervisor.install-backup'
     if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force }
+    if (Test-Path -LiteralPath $stagedSupervisor) { Remove-Item -LiteralPath $stagedSupervisor -Force }
+    if (Test-Path -LiteralPath $supervisorBackup) { Remove-Item -LiteralPath $supervisorBackup -Force }
     Copy-Item -LiteralPath $produced -Destination $staged -Force
+    Copy-Item -LiteralPath $producedSupervisor -Destination $stagedSupervisor -Force
+
+    # Some ZIP readers restore Unix executable attributes as a Windows
+    # read-only bit.  The extracted payload is disposable, so normalise that
+    # bit before the finally block removes the work tree.  Without this,
+    # PowerShell can report a successful install and then fail while cleaning
+    # up the extracted supervisor.
+    $extractedSupervisor = Get-Item -LiteralPath $producedSupervisor -Force
+    if ($extractedSupervisor.IsReadOnly) {
+        $extractedSupervisor.IsReadOnly = $false
+    }
 
     # -----------------------------------------------------------------------
     # `Move-Item -Force` ONTO A DIRECTORY SUCCEEDS, AT THE WRONG THING.
@@ -543,16 +564,35 @@ try {
     # over the same `mv`.
     if (Test-Path -LiteralPath $destination -PathType Container) {
         Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stagedSupervisor -Force -ErrorAction SilentlyContinue
         Write-Fail "$destination is a directory, not a file, so it cannot be replaced with a binary. Remove it and re-run."
     }
+    if (Test-Path -LiteralPath $supervisorDestination -PathType Container) {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stagedSupervisor -Force -ErrorAction SilentlyContinue
+        Write-Fail "$supervisorDestination is a directory, not a file, so it cannot be replaced with a binary. Remove it and re-run."
+    }
 
+    $hadSupervisor = Test-Path -LiteralPath $supervisorDestination -PathType Leaf
     try {
+        if ($hadSupervisor) {
+            Copy-Item -LiteralPath $supervisorDestination -Destination $supervisorBackup -Force
+        }
+        Move-Item -LiteralPath $stagedSupervisor -Destination $supervisorDestination -Force
         Move-Item -LiteralPath $staged -Destination $destination -Force
     } catch {
         $null = $_
+        if ($hadSupervisor -and (Test-Path -LiteralPath $supervisorBackup -PathType Leaf)) {
+            Copy-Item -LiteralPath $supervisorBackup -Destination $supervisorDestination -Force -ErrorAction SilentlyContinue
+        } elseif (-not $hadSupervisor) {
+            Remove-Item -LiteralPath $supervisorDestination -Force -ErrorAction SilentlyContinue
+        }
         Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stagedSupervisor -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $supervisorBackup -Force -ErrorAction SilentlyContinue
         Write-Fail "could not replace $destination. If the agent is running, stop it first: runner-manager service stop"
     }
+    Remove-Item -LiteralPath $supervisorBackup -Force -ErrorAction SilentlyContinue
 
     Write-Output ''
     Write-Output "Installed runner-manager $resolvedVersion to $destination"
@@ -592,5 +632,21 @@ try {
     Write-Output 'permission set and why organization scope is the narrower option.'
 }
 finally {
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    # Antivirus and ZIP attribute translation can briefly make a newly
+    # extracted `.exe` refuse recursive deletion.  Cleanup must never turn an
+    # otherwise successful, verified install into a failure, but retry first
+    # so we normally leave no temporary payload behind.
+    for ($cleanupAttempt = 0; $cleanupAttempt -lt 3; $cleanupAttempt++) {
+        try {
+            if (-not (Test-Path -LiteralPath $work)) { break }
+            Get-ChildItem -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    if (-not $_.PSIsContainer -and $_.IsReadOnly) { $_.IsReadOnly = $false }
+                }
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction Stop
+            break
+        } catch {
+            if ($cleanupAttempt -lt 2) { Start-Sleep -Milliseconds 100 }
+        }
+    }
 }

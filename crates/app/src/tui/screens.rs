@@ -240,6 +240,58 @@ pub struct ActivityRow {
     pub remediation: String,
 }
 
+/// Windows-side WSL capability. Kept in the immutable snapshot so rendering
+/// never launches `wsl.exe` and non-Windows builds can state the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WslCapability {
+    NotSupported,
+    NotInstalled(String),
+    NoDistributions,
+    Unavailable(String),
+    Available,
+}
+
+/// One distribution's operator-facing lifecycle state. Recovery-only states
+/// are part of the vocabulary now so the watchdog can publish them without a
+/// later TUI schema change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "recovery supervisor publishes the transitional states"
+)]
+pub enum WslHostState {
+    Unmanaged,
+    Healthy,
+    Degraded,
+    Unreachable,
+    Draining,
+    Recovering,
+    Backoff,
+    RecoveryBlocked,
+}
+
+impl WslHostState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unmanaged => "unmanaged",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unreachable => "unreachable",
+            Self::Draining => "draining",
+            Self::Recovering => "recovering",
+            Self::Backoff => "backoff",
+            Self::RecoveryBlocked => "recovery blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WslHostRow {
+    pub distribution: String,
+    pub state: WslHostState,
+    pub detail: String,
+}
+
 /// Complete in-memory input. Credentials have no field in this type, so a
 /// frame cannot accidentally obtain one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +301,8 @@ pub struct Snapshot {
     pub repositories: Vec<RepositoryRow>,
     pub runners: Vec<RunnerRow>,
     pub activity: Vec<ActivityRow>,
+    pub wsl_capability: WslCapability,
+    pub wsl_hosts: Vec<WslHostRow>,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -258,6 +312,12 @@ impl Default for Snapshot {
             repositories: vec![],
             runners: vec![],
             activity: vec![],
+            wsl_capability: if cfg!(windows) {
+                WslCapability::NoDistributions
+            } else {
+                WslCapability::NotSupported
+            },
+            wsl_hosts: vec![],
         }
     }
 }
@@ -1344,7 +1404,7 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
             Span::styled(value, skin.style(tone).add_modifier(Modifier::BOLD)),
         ])
     };
-    let head = Section::Prose(vec![
+    let mut head_lines = vec![
         Line::from(Span::styled(
             "HEALTH: OK live snapshot".to_owned(),
             skin.style(Tone::Ok).add_modifier(Modifier::BOLD),
@@ -1374,8 +1434,36 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize) -> Vec<Sect
             format!("{}/{}", m.host_capacity_used, m.host_capacity_total),
             Tone::Accent,
         ),
-        Line::default(),
-    ]);
+    ];
+    let capability = match &model.snapshot.wsl_capability {
+        WslCapability::NotSupported => "not supported on this operating system".to_owned(),
+        WslCapability::NotInstalled(detail) => format!("not installed: {detail}"),
+        WslCapability::NoDistributions => "installed; no distributions".to_owned(),
+        WslCapability::Unavailable(detail) => format!("unavailable: {detail}"),
+        WslCapability::Available => format!("{} distribution(s)", model.snapshot.wsl_hosts.len()),
+    };
+    head_lines.push(metric(
+        "WSL                    : ",
+        capability,
+        Tone::Accent,
+    ));
+    for host in &model.snapshot.wsl_hosts {
+        let tone = match host.state {
+            WslHostState::Healthy => Tone::Ok,
+            WslHostState::Unmanaged => Tone::Muted,
+            WslHostState::Draining | WslHostState::Recovering | WslHostState::Backoff => Tone::Busy,
+            WslHostState::Degraded | WslHostState::Unreachable | WslHostState::RecoveryBlocked => {
+                Tone::Bad
+            }
+        };
+        head_lines.push(metric(
+            &format!("  {:<20} : ", host.distribution),
+            format!("{} - {}", host.state.label(), host.detail),
+            tone,
+        ));
+    }
+    head_lines.push(Line::default());
+    let head = Section::Prose(head_lines);
     let repositories = model.dashboard_repositories();
     let runners = model.dashboard_runners();
     vec![
@@ -1892,6 +1980,12 @@ mod tests {
                     remediation: "inspect local runner log".into(),
                 },
             ],
+            wsl_capability: WslCapability::Available,
+            wsl_hosts: vec![WslHostRow {
+                distribution: "Ubuntu".into(),
+                state: WslHostState::Healthy,
+                detail: "daemon and lifecycle task are ready".into(),
+            }],
         }
     }
 
@@ -1965,7 +2059,7 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=20 bytes=1004 fnv=497a3012da50a54f | HEALTH: OK live snapshot
+        Dashboard/populated: lines=22 bytes=1118 fnv=d57a263d18f10990 | HEALTH: OK live snapshot
         Dashboard/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic

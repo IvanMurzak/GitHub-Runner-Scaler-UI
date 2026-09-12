@@ -3753,8 +3753,10 @@ impl ServiceOperations {
         // moves the registration between two service managers and changes the
         // account and the secret store with it; `set_start_mode` does that,
         // carefully, and an install is not the place for it.
-        let replacing = match self.find_registration()? {
-            Some((existing, _)) if existing == request.start_mode() => true,
+        let (replacing, previous_was_running) = match self.find_registration()? {
+            Some((existing, registration)) if existing == request.start_mode() => {
+                (true, registration.running)
+            }
             Some((existing, _)) => {
                 return Err(ServiceError::AlreadyInstalled {
                     name: self.identity.name().to_string(),
@@ -3762,7 +3764,7 @@ impl ServiceOperations {
                     requested: request.start_mode(),
                 });
             }
-            None => false,
+            None => (false, false),
         };
 
         let plan = InstallPlan::resolve(
@@ -3802,7 +3804,8 @@ impl ServiceOperations {
             Err(cause) => {
                 // Nothing was deregistered on a first install, so there is
                 // nothing to put back and `reinstate` says so with `Ok(())`.
-                let restored = self.reinstate(control.as_ref(), previous.as_ref());
+                let restored =
+                    self.reinstate(control.as_ref(), previous.as_ref(), previous_was_running);
                 return Err(rolled_back(
                     retained_runner_root(&root),
                     restored,
@@ -3815,10 +3818,40 @@ impl ServiceOperations {
         let review = review_least_privilege(&definition, &plan);
         let record = InstallRecord::of(&plan, &definition, Utc::now());
         if let Err(cause) = record.write(&self.paths) {
+            let rollback = control
+                .uninstall(&self.identity)
+                .map(|_| ())
+                .and_then(|()| {
+                    self.reinstate(control.as_ref(), previous.as_ref(), previous_was_running)
+                });
             return Err(rolled_back(
                 retained_runner_root(&root),
-                control.uninstall(&self.identity),
+                rollback,
                 "install",
+                &self.identity,
+                cause,
+            ));
+        }
+
+        // Registration is not the postcondition of an install: a service the
+        // current session still has to start by hand is only half-installed.
+        // This matters most for a logon-triggered Windows task because its
+        // trigger has already passed by the time an operator reinstalls it.
+        // Start through the same control that registered the definition and
+        // roll the whole replacement back if the manager refuses it.
+        if let Err(cause) = control.start(&self.identity) {
+            let remove_new = control.uninstall(&self.identity).map(|_| ());
+            let restore_registration = remove_new.and_then(|()| {
+                self.reinstate(control.as_ref(), previous.as_ref(), previous_was_running)
+            });
+            let restore_record = restore_registration.and_then(|()| match &previous {
+                Some(previous) => previous.write(&self.paths),
+                None => InstallRecord::remove(&self.paths).map(|_| ()),
+            });
+            return Err(rolled_back(
+                retained_runner_root(&root),
+                restore_record,
+                "install and start",
                 &self.identity,
                 cause,
             ));
@@ -3847,6 +3880,7 @@ impl ServiceOperations {
         &self,
         control: &dyn ServiceControl,
         previous: Option<&InstallRecord>,
+        was_running: bool,
     ) -> Result<(), ServiceError> {
         let Some(record) = previous else {
             return Ok(());
@@ -3868,7 +3902,11 @@ impl ServiceOperations {
             Ok(store) => plan.with_secret_guard(store.guard()),
             Err(_) => plan,
         };
-        control.install(&plan).map(|_| ())
+        control.install(&plan)?;
+        if was_running {
+            control.start(&self.identity)?;
+        }
+        Ok(())
     }
 
     /// Deregisters, and deletes nothing else.
@@ -4364,6 +4402,17 @@ impl ServiceStatus {
                             expected.as_secs()
                         ));
                     }
+                }
+                if found.starts_automatically && !found.running {
+                    problems.push(StatusProblem {
+                        subject: "runtime",
+                        detail: format!(
+                            "{} holds an automatic registration, but the daemon is stopped. Run \
+                             `runner-manager service start`; if it stops again, inspect {}.",
+                            found.manager,
+                            log_file.display()
+                        ),
+                    });
                 }
             }
             (None, None) => {}
@@ -5068,7 +5117,7 @@ fn enable_launchd_registration(
 ///
 /// The application owns the drain policy; this platform boundary only turns
 /// `SERVICE_CONTROL_STOP`/`SHUTDOWN` into an awaitable notification.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServiceShutdown(tokio::sync::watch::Receiver<bool>);
 
 impl ServiceShutdown {
@@ -8502,6 +8551,30 @@ logs = \"/d\"
                 .problems()
                 .iter()
                 .any(|problem| problem.detail.contains("after a reboot")),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn install_starts_the_registration_and_a_later_stop_is_unhealthy() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Login))
+            .expect("install and immediate start");
+
+        assert!(
+            operations.status().expect("running status").is_running(),
+            "install must not wait for the next login trigger"
+        );
+        operations.stop().expect("stop the registration");
+        let status = operations.status().expect("stopped status");
+        assert!(!status.is_healthy(), "{status}");
+        assert!(
+            status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == "runtime"),
             "{status}"
         );
     }

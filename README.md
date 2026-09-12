@@ -187,6 +187,10 @@ runner-manager repo set-scale OWNER/REPO --enabled true
 runner-manager service install
 ```
 
+Installation starts the agent immediately; a login-mode Windows install does
+not wait for the next sign-in and runs through a no-console supervisor, so it
+does not leave an extra terminal window open.
+
 The `repo add` command prints the routing label it reserved, such as `rm-home-win-x64` for
 host label `home` on a Windows x64 machine. Use that label in the repository workflow:
 
@@ -201,6 +205,10 @@ Queue a workflow, then watch the runner start and complete the job:
 ```sh
 runner-manager tui
 ```
+
+On Windows the dashboard also reports whether WSL is unsupported, absent,
+empty, unavailable, or present, and shows the health of each visible
+distribution without doing any WSL work in the rendering path.
 
 Organizations use the same commands with `org` in place of `repo`.
 

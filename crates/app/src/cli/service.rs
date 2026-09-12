@@ -175,6 +175,15 @@ impl OwnedCopy {
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::rename(&replaced, &self.path);
     }
+
+    /// Finalises a successful swap. A previous Windows image can remain
+    /// mapped for a moment after its registration is stopped, so cleanup is
+    /// best-effort and the next install also removes the same fixed backup.
+    fn commit(self) {
+        if let Some(replaced) = self.replaced {
+            let _ = std::fs::remove_file(replaced);
+        }
+    }
 }
 
 /// Copies the running executable to a path this product owns, and answers where.
@@ -206,7 +215,13 @@ fn install_owned_copy(context: &Context, source: &std::path::Path) -> Result<Own
             .map_err(failed("move the previous service binary aside"))?;
         replaced = Some(aside);
     }
-    std::fs::copy(source, &owned).map_err(failed("copy the binary the service will run"))?;
+    if let Err(source_error) = std::fs::copy(source, &owned) {
+        let _ = std::fs::remove_file(&owned);
+        if let Some(aside) = &replaced {
+            let _ = std::fs::rename(aside, &owned);
+        }
+        return Err(failed("copy the binary the service will run")(source_error));
+    }
     Ok(OwnedCopy {
         path: owned,
         replaced,
@@ -266,16 +281,38 @@ pub fn install(
         )
     })?;
     let owned = install_owned_copy(context, &source)?;
+    let mut service_binary = owned.path.clone();
+    let mut service_arguments = daemon_arguments(context, mode);
+    #[cfg(windows)]
+    let supervisor = if mode == StartMode::Login {
+        let source_supervisor = source.with_file_name("runner-manager-supervisor.exe");
+        let installed = match install_owned_copy(context, &source_supervisor) {
+            Ok(installed) => installed,
+            Err(error) => {
+                owned.restore();
+                return Err(error);
+            }
+        };
+        service_arguments.insert(0, owned.path.as_os_str().to_owned());
+        service_binary = installed.path.clone();
+        Some(installed)
+    } else {
+        None
+    };
     let request = InstallRequest::new(mode)
-        .for_binary(&owned.path)
+        .for_binary(&service_binary)
         .copied_from(&source)
-        .with_arguments(daemon_arguments(context, mode));
+        .with_arguments(service_arguments);
     // The swap above is undone on every failure below it. See `OwnedCopy`: a
     // refused install that left the new copy in place is what put a running
     // daemon on a binary nobody registered.
     let installed = match operations.install(&request) {
         Ok(installed) => installed,
         Err(source) => {
+            #[cfg(windows)]
+            if let Some(supervisor) = supervisor {
+                supervisor.restore();
+            }
             owned.restore();
             return Err(service_failure(source));
         }
@@ -289,9 +326,19 @@ pub fn install(
         // it cannot put back the private executable this command swapped
         // before registration. Restore it too: otherwise a failed install can
         // leave a later service start running a version the command rejected.
+        #[cfg(windows)]
+        if let Some(supervisor) = supervisor {
+            supervisor.restore();
+        }
         owned.restore();
         return Err(rollback_failure("install", source, rollback.err()));
     }
+
+    #[cfg(windows)]
+    if let Some(supervisor) = supervisor {
+        supervisor.commit();
+    }
+    owned.commit();
 
     writeln!(
         out,

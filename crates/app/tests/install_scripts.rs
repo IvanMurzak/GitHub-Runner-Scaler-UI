@@ -1168,7 +1168,10 @@ fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alo
         assert!(ok, "the first install must succeed under {host}:\n{output}");
 
         let binary = fixture.directory.join("runner-manager.exe");
+        let supervisor = fixture.directory.join("runner-manager-supervisor.exe");
         let before = std::fs::read(&binary).expect("the installed binary");
+        let supervisor_before =
+            std::fs::read(&supervisor).expect("the installed no-console supervisor");
 
         substitute_payload(&fixture.release, "x86_64-pc-windows-msvc");
 
@@ -1190,8 +1193,16 @@ fn install_ps1_aborts_on_a_corrupted_archive_and_leaves_the_previous_install_alo
              working, under {host}. A failed upgrade must be a no-op."
         );
         assert_eq!(
+            std::fs::read(&supervisor).expect("the installed no-console supervisor"),
+            supervisor_before,
+            "a failed install replaced or damaged the supervisor, under {host}"
+        );
+        assert_eq!(
             installed_entries(&fixture.directory),
-            vec!["runner-manager.exe".to_string()],
+            vec![
+                "runner-manager-supervisor.exe".to_string(),
+                "runner-manager.exe".to_string(),
+            ],
             "the aborted install left a staging file behind ({host})"
         );
     }
@@ -1213,8 +1224,11 @@ fn install_ps1_is_idempotent_and_pins_the_version_asked_for() {
         }
         assert_eq!(
             installed_entries(&fixture.directory),
-            vec!["runner-manager.exe".to_string()],
-            "running install.ps1 twice must leave exactly one binary and no \
+            vec![
+                "runner-manager-supervisor.exe".to_string(),
+                "runner-manager.exe".to_string(),
+            ],
+            "running install.ps1 twice must leave exactly the executable pair and no \
              staging files ({host})"
         );
 

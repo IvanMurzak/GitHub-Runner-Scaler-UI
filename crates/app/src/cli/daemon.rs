@@ -58,7 +58,26 @@ async fn run(
     out: &mut dyn Write,
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
-    let _instance = acquire_instance(context)?;
+    loop {
+        match run_generation(context, out, service_shutdown.clone()).await? {
+            DaemonOutcome::Stopped => return Ok(()),
+            DaemonOutcome::Reload => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonOutcome {
+    Stopped,
+    Reload,
+}
+
+async fn run_generation(
+    context: &Context,
+    out: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+) -> Result<DaemonOutcome, CliError> {
+    let instance = acquire_instance(context)?;
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
     let targets = active_autoscale_targets(store.policies().map_err(local_store_failure)?);
@@ -83,7 +102,7 @@ async fn run(
             signal = wait_for_shutdown(service_shutdown) => {
                 signal.map_err(signal_failure)?;
                 writeln!(out, "daemon stopped; no runner was terminated").map_err(failed)?;
-                return Ok(());
+                return Ok(DaemonOutcome::Stopped);
             }
             version = async {
                 match own_binary.clone() {
@@ -91,7 +110,12 @@ async fn run(
                     None => std::future::pending().await,
                 }
             } => {
-                return stop_for_upgrade(own_binary.as_deref(), &version, out);
+                return stop_for_upgrade(own_binary.as_deref(), &version, out)
+                    .map(|()| DaemonOutcome::Stopped);
+            }
+            () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
+                writeln!(out, "a repository policy was added; reloading").map_err(failed)?;
+                return Ok(DaemonOutcome::Reload);
             }
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
@@ -291,7 +315,7 @@ async fn run(
     let mut upgraded_to = None;
     let mut restart_reason: Option<&'static str> = None;
     let early = tokio::select! {
-        signal = wait_for_shutdown(service_shutdown) => {
+        signal = wait_for_shutdown(service_shutdown.clone()) => {
             signal.map_err(signal_failure)?;
             None
         }
@@ -345,17 +369,22 @@ async fn run(
         // same one, and putting a file in place for it would be a write nobody
         // asked for.
         if let Some(version) = upgraded_to {
-            return stop_for_upgrade(own_binary.as_deref(), &version, out);
+            return stop_for_upgrade(own_binary.as_deref(), &version, out)
+                .map(|()| DaemonOutcome::Stopped);
         }
         let reason = restart_reason.unwrap_or("this daemon was asked to reload");
         writeln!(out, "every runner finished; reloading").map_err(failed)?;
-        return Err(CliError::with_remedy(
-            Failure::UpgradePending,
-            format!(
-                "{reason}, and every runner this daemon held has finished; stopping so the                  service manager starts one that reads the new set"
-            ),
-            "runner-manager service status",
-        ));
+        tracing::info!(%reason, "reloading the daemon in-process after the drain");
+        // A policy-set change is configuration reload, not a binary upgrade.
+        // Exiting with UpgradePending made a login task depend on Task
+        // Scheduler's bounded failure retries and could leave it stopped
+        // forever. Release the host lock and rebuild the target loops in this
+        // process instead. The outer loop drops this generation's host lock,
+        // store and clients before rebuilding them, so repeated edits consume
+        // constant stack and memory. The SCM receiver is cloned so every
+        // generation remains stoppable.
+        drop(instance);
+        return Ok(DaemonOutcome::Reload);
     }
     let _ = shutdown.send(true);
     if let Some(result) = early {
@@ -380,7 +409,7 @@ async fn run(
         })??;
     }
     writeln!(out, "daemon stopped; no busy runner was terminated").map_err(failed)?;
-    Ok(())
+    Ok(DaemonOutcome::Stopped)
 }
 
 /// How often an otherwise idle daemon checks the credential timestamps.

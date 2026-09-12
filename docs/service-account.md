@@ -366,6 +366,13 @@ is why the command's failure modes matter more than they look.
   and including *"an agent is already running on this host"*, which an install
   meets whenever the daemon happens to hold the single-instance lock at that
   moment. Whatever the reason, the service is left running what it was running.
+- **A successful install also starts the registration.** A login trigger that
+  already passed is not treated as a future start request. On Windows login
+  mode, Task Scheduler launches a small GUI-subsystem supervisor, so starting
+  or restarting the daemon does not open a terminal window. The supervisor
+  restarts an unexpectedly failed daemon with bounded backoff; planned policy
+  reloads happen inside the daemon and do not consume Task Scheduler's finite
+  failure-retry count.
 
 ## What `service uninstall` may delete
 

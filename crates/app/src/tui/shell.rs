@@ -39,7 +39,8 @@ use runner_manager_github::{AuthenticatedClient, UserAccessToken};
 
 use super::screens::{
     self, AgentHealth, Availability, DashboardMetrics, PolicyMode, ReadOnlyScreen, RepositoryRow,
-    RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot,
+    RunnerOwnership, RunnerRow, ScreenAction, ScreenModel, Snapshot, WslCapability, WslHostRow,
+    WslHostState,
 };
 use super::settings::{self, SettingsCommand, SettingsUi, SettingsView};
 use super::table::Skin;
@@ -456,6 +457,7 @@ async fn production_screen_snapshot(
     local: &crate::cli::status::StatusDocument,
     cancel: &CancelToken,
 ) -> Result<Snapshot, (Availability, String)> {
+    let (wsl_capability, wsl_hosts) = wsl_overview(context);
     let activity =
         production_activity(context).map_err(|detail| offline_failure(context, detail))?;
     let start_mode = StartMode::from_str(&local.host.service_start_mode).map_err(|error| {
@@ -477,6 +479,8 @@ async fn production_screen_snapshot(
         return Ok(Snapshot {
             availability: Availability::Ready,
             activity,
+            wsl_capability,
+            wsl_hosts,
             ..Snapshot::default()
         });
     }
@@ -618,7 +622,89 @@ async fn production_screen_snapshot(
         repositories,
         runners,
         activity,
+        wsl_capability,
+        wsl_hosts,
     })
+}
+
+#[cfg(not(windows))]
+fn wsl_overview(_: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow>) {
+    (WslCapability::NotSupported, Vec::new())
+}
+
+#[cfg(windows)]
+fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow>) {
+    let snapshot = match crate::cli::wsl::tui_status_documents(context) {
+        Ok(snapshot) => snapshot,
+        Err(failure) => {
+            let detail = failure.detail;
+            let missing = detail.to_ascii_lowercase();
+            let capability = if missing.contains("not found")
+                || missing.contains("cannot find")
+                || missing.contains("is not recognized")
+            {
+                WslCapability::NotInstalled(detail.clone())
+            } else {
+                WslCapability::Unavailable(detail.clone())
+            };
+            let rows = failure
+                .managed
+                .into_iter()
+                .map(|distribution| WslHostRow {
+                    distribution,
+                    state: WslHostState::Unreachable,
+                    detail: detail.clone(),
+                })
+                .collect();
+            return (capability, rows);
+        }
+    };
+    let installed = snapshot.installed;
+    let documents = snapshot.documents;
+    if installed.is_empty() {
+        return (WslCapability::NoDistributions, Vec::new());
+    }
+    let managed = documents
+        .iter()
+        .map(|document| document.distribution.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut rows = installed
+        .iter()
+        .filter(|name| !managed.contains(name.as_str()))
+        .map(|name| WslHostRow {
+            distribution: name.clone(),
+            state: WslHostState::Unmanaged,
+            detail: "not managed by Runner Manager".into(),
+        })
+        .collect::<Vec<_>>();
+    rows.extend(documents.into_iter().map(|document| {
+        let (state, detail) = if document.healthy {
+            (
+                WslHostState::Healthy,
+                "daemon and lifecycle task are ready".into(),
+            )
+        } else if !document.wsl.ready && document.wsl.installed {
+            (
+                WslHostState::Unreachable,
+                document
+                    .wsl
+                    .problem
+                    .unwrap_or_else(|| "new WSL sessions fail".into()),
+            )
+        } else {
+            (
+                WslHostState::Degraded,
+                document.unhealthy_parts().join("; "),
+            )
+        };
+        WslHostRow {
+            distribution: document.distribution,
+            state,
+            detail,
+        }
+    }));
+    rows.sort_by(|left, right| left.distribution.cmp(&right.distribution));
+    (WslCapability::Available, rows)
 }
 
 /// Recognise the exact name emitted by `agent::lifecycle::runner_name`.
@@ -881,7 +967,7 @@ pub enum AppEvent {
     FocusGained,
     FocusLost,
     Timer(Instant),
-    Agent(AgentEvent),
+    Agent(Box<AgentEvent>),
     InputFailed(String),
 }
 
@@ -1150,6 +1236,7 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             Vec::new()
         }
         AppEvent::Agent(agent) => {
+            let agent = *agent;
             state.presentation.health = agent.health;
             state.presentation.privacy_access_denied = agent.privacy_access_denied;
             state.presentation.service_version = agent.service_version;
@@ -2019,7 +2106,7 @@ where
             },
             instant = timer.tick() => AppEvent::Timer(instant.into_std()),
             agent = agent_events.recv(), if agent_events_open => match agent {
-                Some(agent) => AppEvent::Agent(agent),
+                Some(agent) => AppEvent::Agent(Box::new(agent)),
                 None => {
                     agent_events_open = false;
                     continue;
@@ -2269,13 +2356,13 @@ mod tests {
         assert_eq!(state.ticks, 1);
         reduce(
             &mut state,
-            AppEvent::Agent(AgentEvent {
+            AppEvent::Agent(Box::new(AgentEvent {
                 summary: "runner busy".to_owned(),
                 health: Health::Busy,
                 privacy_access_denied: false,
                 service_version: None,
                 snapshot: None,
-            }),
+            })),
         );
         assert_eq!(state.presentation.health, Health::Busy);
         reduce(&mut state, AppEvent::from(Event::FocusLost));
@@ -3006,13 +3093,13 @@ mod tests {
         let mut state = AppState::new(PresentationState::default(), 120, 30);
         reduce(
             &mut state,
-            AppEvent::Agent(AgentEvent {
+            AppEvent::Agent(Box::new(AgentEvent {
                 summary: "GitHub inventory refreshed".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
                 service_version: None,
                 snapshot: Some(snapshot),
-            }),
+            })),
         );
 
         reduce(&mut state, key(KeyCode::Char('r')));
@@ -3090,13 +3177,13 @@ mod tests {
         let mut state = AppState::new(PresentationState::default(), 120, 30);
         reduce(
             &mut state,
-            AppEvent::Agent(AgentEvent {
+            AppEvent::Agent(Box::new(AgentEvent {
                 summary: "production snapshot".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
                 service_version: None,
                 snapshot: Some(snapshot),
-            }),
+            })),
         );
 
         reduce(&mut state, key(KeyCode::Char('n')));
@@ -3372,7 +3459,7 @@ mod tests {
         let mut state = AppState::new(PresentationState::default(), 120, 30);
         reduce(
             &mut state,
-            AppEvent::Agent(AgentEvent {
+            AppEvent::Agent(Box::new(AgentEvent {
                 summary: "rate limited".into(),
                 health: Health::Error,
                 privacy_access_denied: false,
@@ -3384,7 +3471,7 @@ mod tests {
                     activity: vec![row],
                     ..Snapshot::default()
                 }),
-            }),
+            })),
         );
         reduce(&mut state, key(KeyCode::Char('a')));
         let detail = screens::render_text(&state.screen_model);
@@ -3403,7 +3490,7 @@ mod tests {
 
         reduce(
             &mut state,
-            AppEvent::Agent(AgentEvent {
+            AppEvent::Agent(Box::new(AgentEvent {
                 summary: "ready again".into(),
                 health: Health::Ready,
                 privacy_access_denied: false,
@@ -3412,7 +3499,7 @@ mod tests {
                     availability: Availability::Ready,
                     ..Snapshot::default()
                 }),
-            }),
+            })),
         );
         let retained = screens::render_text(&state.screen_model);
         assert!(retained.contains("RATE-LIMIT"), "{retained}");

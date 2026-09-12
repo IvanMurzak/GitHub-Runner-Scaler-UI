@@ -4,7 +4,8 @@
 open.
 **Task status:** Derived 2026-09-11: 14 immutable specifications, four conflict
 domains, waves 0-6.
-**Implementation status:** Taskflow worker dispatch unavailable; local fallback in progress.
+**Implementation status:** Windows service fixes implemented and under test;
+automatic WSL termination remains gated on disposable-distro safety evidence.
 **Repository:** `.` / `main` at `db4c074`.
 **Last updated:** 2026-09-11.
 
@@ -138,3 +139,15 @@ the registered `taskflow-implementer` worker profile, while this Codex runtime's
 spawn interface accepts only underscore task names and exposes no custom-agent
 selector. The refused dispatch started no worker; the clean isolated slot was
 removed. Implementation continues locally without weakening WSL safety gates.
+
+**2026-09-11 — local implementation checkpoint.** The login registration now
+starts immediately through a packaged no-console supervisor; policy changes
+reload in-process; stopped automatic registrations are unhealthy; packaging,
+installer and updater carry the supervisor; and the Windows TUI has typed WSL
+capability/host states. The exact named-termination primitive and fail-closed
+decision model exist, but are deliberately not connected to a watchdog. This
+machine has only `Ubuntu` (which contains the unmanaged
+`ubuntu-server-runner`) and Docker Desktop. Neither is a permissible G1/G2 test
+target, so enabling automatic termination without a disposable WSL2
+distribution would violate the owner gate and the requested no-active-runner
+guarantee.

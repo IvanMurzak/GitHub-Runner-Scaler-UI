@@ -248,6 +248,13 @@ pub fn build_release(root: &Path, version: &str) -> FixtureRelease {
 
         let body = format!("#!/bin/sh\necho \"runner-manager {version} ({target})\"\n");
         std::fs::write(payload.join(binary), body.as_bytes()).expect("fixture binary");
+        if target == "x86_64-pc-windows-msvc" {
+            std::fs::write(
+                payload.join("runner-manager-supervisor.exe"),
+                b"fixture no-console supervisor\n",
+            )
+            .expect("fixture supervisor");
+        }
         std::fs::write(payload.join("LICENSE"), b"MIT\n").expect("fixture licence");
 
         let archive = assets.join(format!("{stem}.{extension}"));
@@ -460,14 +467,20 @@ fn pack(stage: &Path, stem: &str, binary: &str, extension: &str, archive: &Path,
             // deflated entries through the same API.
             let licence = std::fs::read(stage.join(stem).join("LICENSE"))
                 .expect("the staged LICENSE that the tar path already packs");
-            write_stored_zip(
-                archive,
-                &[
-                    (format!("{stem}/"), &[][..]),
-                    (format!("{stem}/{binary}"), body),
-                    (format!("{stem}/LICENSE"), licence.as_slice()),
-                ],
-            );
+            let supervisor =
+                std::fs::read(stage.join(stem).join("runner-manager-supervisor.exe")).ok();
+            let mut entries = vec![
+                (format!("{stem}/"), &[][..]),
+                (format!("{stem}/{binary}"), body),
+                (format!("{stem}/LICENSE"), licence.as_slice()),
+            ];
+            if let Some(supervisor) = &supervisor {
+                entries.push((
+                    format!("{stem}/runner-manager-supervisor.exe"),
+                    supervisor.as_slice(),
+                ));
+            }
+            write_stored_zip(archive, &entries);
         }
         other => panic!("unknown archive extension {other}"),
     }

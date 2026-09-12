@@ -526,6 +526,13 @@ cmd_npm_stage() {
         mkdir -p "${outdir}/${package}/bin"
         cp "$produced" "${outdir}/${package}/bin/${binary}"
         chmod 755 "${outdir}/${package}/bin/${binary}"
+        if [[ "$os" == "win32" ]]; then
+            local supervisor="${unpack}/${PRODUCT}-${version}-${target}/runner-manager-supervisor.exe"
+            [[ -f "$supervisor" ]] ||
+                die "npm-stage: ${asset} is missing runner-manager-supervisor.exe"
+            cp "$supervisor" "${outdir}/${package}/bin/runner-manager-supervisor.exe"
+            chmod 755 "${outdir}/${package}/bin/runner-manager-supervisor.exe"
+        fi
         cp "$wrapper_readme" "${outdir}/${package}/README.md"
         cp "$licence" "${outdir}/${package}/LICENSE"
         rm -rf "$unpack"
@@ -661,4 +668,3 @@ main() {
 }
 
 main "$@"
-

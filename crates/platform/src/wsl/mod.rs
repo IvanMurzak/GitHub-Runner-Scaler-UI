@@ -68,6 +68,7 @@ pub mod discovery;
 pub mod exec;
 pub mod probe;
 pub mod record;
+pub mod recovery;
 pub mod task;
 
 use std::fmt;
