@@ -50,7 +50,7 @@ pub fn dispatch(
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
     match command {
-        DaemonCommand::Run(_) => {
+        DaemonCommand::Run(args) => {
             #[cfg(windows)]
             if std::env::var_os(super::service::SUPERVISED_ENVIRONMENT).is_none() {
                 match super::service::migrate_legacy_windows_login_registration(context, out) {
@@ -63,7 +63,12 @@ pub fn dispatch(
                 }
             }
             let runtime = super::runtime()?;
-            runtime.block_on(run(context, out, service_shutdown))
+            runtime.block_on(run(
+                context,
+                out,
+                service_shutdown,
+                args.windows_service_host,
+            ))
         }
     }
 }
@@ -72,9 +77,10 @@ async fn run(
     context: &Context,
     out: &mut dyn Write,
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+    windows_service_host: bool,
 ) -> Result<(), CliError> {
     loop {
-        match run_generation(context, out, service_shutdown.clone()).await? {
+        match run_generation(context, out, service_shutdown.clone(), windows_service_host).await? {
             DaemonOutcome::Stopped => return Ok(()),
             DaemonOutcome::Reload => {}
         }
@@ -91,6 +97,7 @@ async fn run_generation(
     context: &Context,
     out: &mut dyn Write,
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+    windows_service_host: bool,
 ) -> Result<DaemonOutcome, CliError> {
     let instance = acquire_instance(context)?;
     let store = Arc::new(context.store()?);
@@ -140,7 +147,11 @@ async fn run_generation(
             () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
                 unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
             },
-            () = maintain_wsl_recovery_without_local_policies(context, host.service_start_mode) => {
+            () = maintain_wsl_recovery_without_local_policies(
+                context,
+                host.service_start_mode,
+                windows_service_host,
+            ) => {
                 unreachable!("WSL recovery watchdog runs until the daemon is stopped")
             },
         }
@@ -389,7 +400,7 @@ async fn run_generation(
         () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
             unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
         }
-        () = super::wsl_watchdog::maintain(watchdog_paths, wsl_inventory) => {
+        () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
         result = loops.join_next() => result,
@@ -453,8 +464,15 @@ async fn run_generation(
     Ok(DaemonOutcome::Stopped)
 }
 
-async fn maintain_wsl_recovery_without_local_policies(context: &Context, mode: StartMode) {
-    if !cfg!(windows) {
+async fn maintain_wsl_recovery_without_local_policies(
+    context: &Context,
+    mode: StartMode,
+    windows_service_host: bool,
+) {
+    if windows_service_host {
+        super::wsl_watchdog::retire(context.paths());
+    }
+    if !wsl_recovery_is_available(windows_service_host) {
         std::future::pending::<()>().await;
         return;
     }
@@ -480,6 +498,30 @@ async fn maintain_wsl_recovery_without_local_policies(context: &Context, mode: S
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+async fn maintain_wsl_recovery(
+    paths: runner_manager_platform::paths::AppPaths,
+    inventory: Arc<dyn InventoryGateway>,
+    windows_service_host: bool,
+) {
+    if windows_service_host {
+        super::wsl_watchdog::retire(&paths);
+    }
+    if !wsl_recovery_is_available(windows_service_host) {
+        std::future::pending::<()>().await;
+        return;
+    }
+    super::wsl_watchdog::maintain(paths, inventory).await;
+}
+
+/// WSL distributions belong to an interactive Windows account. An SCM service
+/// runs as LocalSystem and cannot truthfully probe those distributions: every
+/// attempt looks like a guest failure and used to overwrite a healthy user's
+/// recovery state with `degraded` every ten seconds. Login tasks and manually
+/// started daemons retain the watchdog because they run in the owning account.
+const fn wsl_recovery_is_available(windows_service_host: bool) -> bool {
+    cfg!(windows) && !windows_service_host
 }
 
 const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -1594,6 +1636,12 @@ mod tests {
     use runner_manager_github::rest::RefreshState;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    #[test]
+    fn scm_service_never_claims_authority_over_user_owned_wsl() {
+        assert!(!wsl_recovery_is_available(true));
+        assert_eq!(wsl_recovery_is_available(false), cfg!(windows));
+    }
 
     #[derive(Debug)]
     struct CountingRenewal {

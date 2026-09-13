@@ -3500,7 +3500,18 @@ mod tests {
                 .autoscale("home", 2)
                 .active()
                 .build();
-            let host = fixtures::host().build();
+            // A unit harness must never inspect or write the workstation's
+            // production runner root. On Windows that is C:\rman, which is
+            // intentionally inaccessible to an ordinary account after a boot
+            // service is installed. Using it made the same suite pass on a
+            // clean CI image and fail on a correctly secured developer host.
+            let host_root = root.path().join("host-root");
+            fs::create_dir_all(&host_root).unwrap();
+            let mut host = fixtures::host().build();
+            host.runner_root_override = Some(
+                LocalAbsolutePath::new(host_root.to_str().expect("a UTF-8 temporary path"))
+                    .expect("a local absolute host root"),
+            );
             let store = Arc::new(SqliteStore::open_in_memory().unwrap());
             store.put_host(&host).unwrap();
             let github = Arc::new(github);

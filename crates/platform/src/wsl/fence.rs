@@ -295,6 +295,30 @@ pub fn clear_recovery(root: &Path, generation: u64) -> Result<(), FenceError> {
     }
 }
 
+/// Retire coordination written by a Windows recovery watchdog that no longer
+/// has authority to run. A guest launch claim is deliberately preserved. The
+/// fence and request may have different generations after a watchdog restart,
+/// so each Windows-owned generation is cleared independently.
+pub fn retire_windows_recovery(root: &Path) -> Result<(), FenceError> {
+    let recovery_generation = FenceClaim::owner(root)?.and_then(|owner| {
+        (owner.kind == FenceOwnerKind::WindowsRecovery)
+            .then_some(owner.generation)
+            .flatten()
+    });
+    if let Some(generation) = recovery_generation {
+        clear_recovery(root, generation)?;
+    }
+    if let Some(request) = DrainRequest::read(root)? {
+        clear_recovery(root, request.generation)?;
+    }
+    let status_path = root.join(RECOVERY_STATUS_FILE);
+    match fs::remove_file(&status_path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io("remove", &status_path, source)),
+    }
+}
+
 fn remove_claim(directory: &Path) -> Result<(), FenceError> {
     match fs::remove_dir_all(directory) {
         Ok(()) => Ok(()),
@@ -406,6 +430,43 @@ mod tests {
         );
         clear_recovery(root.path(), 9).unwrap();
         assert!(!root.path().join(FENCE_DIRECTORY).exists());
+        assert!(!root.path().join(REQUEST_FILE).exists());
+    }
+
+    #[test]
+    fn retiring_windows_recovery_handles_restarted_generations_but_keeps_guest_claims() {
+        let root = tempfile::tempdir().unwrap();
+        let claim = FenceClaim::try_claim(root.path(), FenceOwnerKind::WindowsRecovery, Some(7))
+            .unwrap()
+            .unwrap();
+        claim.make_durable();
+        DrainRequest::new(8, Utc::now()).write(root.path()).unwrap();
+        RecoveryStatus {
+            schema_version: SCHEMA_VERSION,
+            observed_at: Utc::now(),
+            phase: RecoveryPhase::RecoveryBlocked,
+            consecutive_probe_failures: 9,
+            reason: Some("stale".into()),
+            last_recovered_at: None,
+        }
+        .write(root.path())
+        .unwrap();
+
+        retire_windows_recovery(root.path()).unwrap();
+
+        assert!(!root.path().join(FENCE_DIRECTORY).exists());
+        assert!(!root.path().join(REQUEST_FILE).exists());
+        assert!(!root.path().join(RECOVERY_STATUS_FILE).exists());
+
+        let guest = FenceClaim::try_claim(root.path(), FenceOwnerKind::GuestLaunch, None)
+            .unwrap()
+            .unwrap();
+        guest.make_durable();
+        DrainRequest::new(10, Utc::now())
+            .write(root.path())
+            .unwrap();
+        retire_windows_recovery(root.path()).unwrap();
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
         assert!(!root.path().join(REQUEST_FILE).exists());
     }
 

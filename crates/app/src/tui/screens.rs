@@ -418,6 +418,8 @@ pub struct ScreenModel {
     pub repository_detail: Option<String>,
     pub runner_detail: Option<String>,
     pub acknowledged_activity: HashSet<String>,
+    refresh_in_progress: bool,
+    refresh_animation_tick: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,11 +452,35 @@ impl ScreenModel {
             repository_detail: None,
             runner_detail: None,
             acknowledged_activity: HashSet::new(),
+            refresh_in_progress: false,
+            refresh_animation_tick: 0,
         };
         model.runners.sort_column = 2;
         model.activity.sort_column = 1;
         model.reconcile_all(None);
         model
+    }
+
+    pub(super) fn set_refresh_animation(&mut self, in_progress: bool, tick: u64) {
+        self.refresh_in_progress = in_progress;
+        self.refresh_animation_tick = tick;
+    }
+
+    pub(super) fn refresh_label(&self, label: &str, skin: &Skin) -> String {
+        if self.refresh_in_progress {
+            const POSITIONS: [usize; 8] = [0, 1, 2, 3, 4, 3, 2, 1];
+            let frame = usize::try_from(self.refresh_animation_tick % POSITIONS.len() as u64)
+                .unwrap_or_default();
+            let position = POSITIONS[frame];
+            let active = skin.pick("●", "#");
+            let inactive = skin.pick("·", ".");
+            let cells = (0..5)
+                .map(|index| if index == position { active } else { inactive })
+                .collect::<String>();
+            format!("{label} [{cells}]")
+        } else {
+            label.to_owned()
+        }
     }
 
     /// Apply one user or refresh event. This reducer has no effects and no I/O.
@@ -1483,11 +1509,8 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
         WslCapability::Unavailable(detail) => format!("unavailable: {detail}"),
         WslCapability::Available => format!("{} distribution(s)", model.snapshot.wsl_hosts.len()),
     };
-    head_lines.push(metric(
-        "WSL                    : ",
-        capability,
-        Tone::Accent,
-    ));
+    let wsl_tone = wsl_capability_tone(&model.snapshot.wsl_capability);
+    head_lines.push(metric("WSL                    : ", capability, wsl_tone));
     for host in &model.snapshot.wsl_hosts {
         let tone = match host.state {
             WslHostState::Healthy => Tone::Ok,
@@ -1503,11 +1526,12 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
             tone,
         ));
     }
-    let has_readiness_issues = model
-        .snapshot
-        .activity
-        .iter()
-        .any(|row| row.id.starts_with("readiness:"));
+    let has_readiness_issues = model.snapshot.readiness != OperationalReadiness::Ready
+        && model
+            .snapshot
+            .activity
+            .iter()
+            .any(|row| row.id.starts_with("readiness:"));
     let mut readiness_lines = vec![
         Line::from(Span::styled(
             format!("RUNNER READINESS: {}", model.snapshot.readiness.label()),
@@ -1532,7 +1556,7 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
         ))]
     } else if !has_readiness_issues && model.snapshot.readiness == OperationalReadiness::Ready {
         readiness_lines.push(Line::from(Span::styled(
-            "[F5] Recheck now".to_owned(),
+            model.refresh_label("[F5] Recheck now", skin),
             skin.style(Tone::Accent),
         )));
         vec![
@@ -1579,12 +1603,23 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
     overview
 }
 
+const fn wsl_capability_tone(capability: &WslCapability) -> Tone {
+    if matches!(capability, WslCapability::NotSupported) {
+        Tone::Muted
+    } else {
+        Tone::Accent
+    }
+}
+
 fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static>> {
     let issues: Vec<_> = model
         .snapshot
         .activity
         .iter()
-        .filter(|row| row.id.starts_with("readiness:"))
+        .filter(|row| {
+            model.snapshot.readiness != OperationalReadiness::Ready
+                && row.id.starts_with("readiness:")
+        })
         .collect();
     if issues.is_empty() && model.snapshot.readiness == OperationalReadiness::Ready {
         return vec![
@@ -1597,7 +1632,7 @@ fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static
                 skin.style(Tone::Plain),
             )),
             Line::from(Span::styled(
-                "[F5] Recheck now".to_owned(),
+                model.refresh_label("[F5] Recheck now", skin),
                 skin.style(Tone::Accent),
             )),
         ];
@@ -1613,7 +1648,10 @@ fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static
                 skin.style(Tone::Plain),
             )),
             Line::from(Span::styled(
-                "[a] Open diagnostics   [F5] Recheck".to_owned(),
+                format!(
+                    "[a] Open diagnostics   {}",
+                    model.refresh_label("[F5] Recheck", skin)
+                ),
                 skin.style(Tone::Accent),
             )),
         ];
@@ -1635,7 +1673,10 @@ fn readiness_problem_lines(model: &ScreenModel, skin: &Skin) -> Vec<Line<'static
         ]));
     }
     lines.push(Line::from(Span::styled(
-        "[c] Copy fixes   [a] Open details   [F5] Recheck".to_owned(),
+        format!(
+            "[c] Copy fixes   [a] Open details   {}",
+            model.refresh_label("[F5] Recheck", skin)
+        ),
         skin.style(Tone::Accent),
     )));
     lines
@@ -1690,7 +1731,10 @@ pub fn readiness_remediation_text(model: &ScreenModel) -> Option<String> {
         .snapshot
         .activity
         .iter()
-        .filter(|row| row.id.starts_with("readiness:"))
+        .filter(|row| {
+            model.snapshot.readiness != OperationalReadiness::Ready
+                && row.id.starts_with("readiness:")
+        })
         .collect();
     (!issues.is_empty()).then(|| {
         issues
@@ -2122,6 +2166,22 @@ pub fn copy_safe(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_wsl_is_muted_while_windows_capability_remains_actionable() {
+        assert_eq!(
+            wsl_capability_tone(&WslCapability::NotSupported),
+            Tone::Muted
+        );
+        assert_eq!(
+            wsl_capability_tone(&WslCapability::NoDistributions),
+            Tone::Accent
+        );
+        assert_eq!(
+            wsl_capability_tone(&WslCapability::NotInstalled("missing".into())),
+            Tone::Accent
+        );
+    }
 
     fn populated() -> Snapshot {
         Snapshot {

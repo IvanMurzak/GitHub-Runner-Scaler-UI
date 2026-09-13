@@ -11,7 +11,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::wsl::WslHost;
 use runner_manager_platform::wsl::fence::{
     DrainRequest, FenceClaim, FenceOwnerKind, GuestHeartbeat, RecoveryPhase, RecoveryStatus,
-    SCHEMA_VERSION, clear_recovery, recovery_root,
+    SCHEMA_VERSION, clear_recovery, recovery_root, retire_windows_recovery,
 };
 use runner_manager_platform::wsl::probe::LinuxCommand;
 use runner_manager_platform::wsl::record::WslProviderRecord;
@@ -57,6 +57,30 @@ pub async fn maintain(paths: AppPaths, inventory: Arc<dyn InventoryGateway>) {
             ),
         }
         tokio::time::sleep(WATCH_INTERVAL).await;
+    }
+}
+
+/// Remove only coordination owned by the obsolete Windows-side watchdog. This
+/// is used when an SCM service discovers that its LocalSystem identity cannot
+/// see the interactive user's WSL registrations.
+pub fn retire(paths: &AppPaths) {
+    if !cfg!(windows) {
+        return;
+    }
+    let records = match WslProviderRecord::all(paths) {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(%error, "obsolete WSL recovery state could not be enumerated");
+            return;
+        }
+    };
+    for record in records {
+        let Ok(root) = recovery_root(paths, &record.distribution) else {
+            continue;
+        };
+        if let Err(error) = retire_windows_recovery(&root) {
+            tracing::warn!(distribution = %record.distribution, %error, "obsolete WSL recovery state could not be retired");
+        }
     }
 }
 

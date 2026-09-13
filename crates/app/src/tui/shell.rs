@@ -358,11 +358,18 @@ impl Drop for LocalAgentEventSource {
 
 pub trait RefreshRequester {
     fn request_refresh(&self) -> io::Result<()>;
+    fn refresh_in_progress(&self) -> bool;
 }
 
 impl RefreshRequester for LocalAgentEventSource {
     fn request_refresh(&self) -> io::Result<()> {
         LocalAgentEventSource::request_refresh(self)
+    }
+
+    fn refresh_in_progress(&self) -> bool {
+        let (state, _) = &*self.control;
+        let state = state.lock().unwrap();
+        state.refresh_pending || state.active.is_some()
     }
 }
 
@@ -371,6 +378,10 @@ struct NoopRefreshRequester;
 impl RefreshRequester for NoopRefreshRequester {
     fn request_refresh(&self) -> io::Result<()> {
         Ok(())
+    }
+
+    fn refresh_in_progress(&self) -> bool {
+        false
     }
 }
 
@@ -1616,6 +1627,11 @@ fn merge_activity_history(
     current.extend(
         previous
             .iter()
+            // Readiness is a replace-set calculated by the latest live probe,
+            // not activity history. Keeping a resolved row made the Dashboard
+            // say READY on the left while still prescribing its old fix on
+            // the right. Ordinary runner activity remains historical.
+            .filter(|row| !row.id.starts_with("readiness:"))
             .filter(|row| ids.insert(row.id.clone()))
             .cloned(),
     );
@@ -2109,11 +2125,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     } else {
         "unfocused"
     };
+    let refresh = state.screen_model.refresh_label("F5 refresh", &state.skin);
     let footer = if compact {
         format!("? help | q quit | {capture}")
     } else {
         format!(
-            "Tab/arrows focus | Enter activate | / filter | o sort | F5 refresh | p privacy settings | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
+            "Tab/arrows focus | Enter activate | / filter | o sort | {refresh} | p privacy settings | c copy | m release mouse | Esc back | q quit | {capture} | {terminal_focus}"
         )
     };
     frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[3]);
@@ -2425,6 +2442,9 @@ where
     let mut agent_events_open = true;
     let mut current_window_title = String::new();
     loop {
+        state
+            .screen_model
+            .set_refresh_animation(refresh.refresh_in_progress(), state.ticks);
         let metrics = &state.screen_model.snapshot.metrics;
         let new_title = format!(
             "💻 {}/{} Local ◂ 🟢 {} Online ◂ ⚡ {} Busy",
@@ -3472,6 +3492,83 @@ mod tests {
             copy.contains("runner-manager service install --start-at boot"),
             "{copy}"
         );
+    }
+
+    #[test]
+    fn ready_refresh_discards_resolved_readiness_but_keeps_real_activity_history() {
+        let previous = vec![
+            screens::ActivityRow {
+                id: "readiness:wsl:ubuntu:degraded".into(),
+                occurred_at: "2026-09-13T03:40:00Z".into(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: "WSL Ubuntu is degraded".into(),
+                remediation: "repair it".into(),
+            },
+            screens::ActivityRow {
+                id: "attempt:finished".into(),
+                occurred_at: "2026-09-13T03:39:00Z".into(),
+                outcome: screens::ActivityOutcome::CleanupComplete,
+                summary: "Runner finished".into(),
+                remediation: "none".into(),
+            },
+        ];
+
+        let merged = merge_activity_history(&previous, Vec::new());
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "attempt:finished");
+    }
+
+    #[test]
+    fn dashboard_never_offers_a_fix_that_contradicts_ready_state() {
+        let mut state = AppState::new(PresentationState::default(), 160, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: screens::Availability::Ready,
+            readiness: screens::OperationalReadiness::Ready,
+            readiness_summary: "The service and every managed host are ready.".into(),
+            activity: vec![screens::ActivityRow {
+                id: "readiness:local:registration-missing".into(),
+                occurred_at: "stale".into(),
+                outcome: screens::ActivityOutcome::Failed,
+                summary: "stale registration problem".into(),
+                remediation: "stale repair command".into(),
+            }],
+            ..Snapshot::default()
+        });
+
+        let frame = rendered(160, 30, &state);
+        assert!(frame.contains("Problems & fixes: none"), "{frame}");
+        assert!(!frame.contains("stale registration problem"), "{frame}");
+        assert!(screens::readiness_remediation_text(&state.screen_model).is_none());
+    }
+
+    #[test]
+    fn active_refresh_animates_both_dashboard_indicators() {
+        let mut state = AppState::new(PresentationState::default(), 160, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: screens::Availability::Ready,
+            readiness: screens::OperationalReadiness::Ready,
+            readiness_summary: "Ready.".into(),
+            ..Snapshot::default()
+        });
+        state.skin = Skin::ASCII;
+        state.screen_model.set_refresh_animation(true, 0);
+        let first = rendered(160, 30, &state);
+        state.screen_model.set_refresh_animation(true, 1);
+        let second = rendered(160, 30, &state);
+
+        assert!(first.contains("[F5] Recheck now [#....]"), "{first}");
+        assert!(first.contains("F5 refresh [#....] | p privacy"), "{first}");
+        assert!(second.contains("[F5] Recheck now [.#...]"), "{second}");
+        assert!(
+            second.contains("F5 refresh [.#...] | p privacy"),
+            "{second}"
+        );
+
+        state.screen_model.set_refresh_animation(false, 2);
+        let stopped = rendered(160, 30, &state);
+        assert!(stopped.contains("[F5] Recheck now"), "{stopped}");
+        assert!(!stopped.contains("[F5] Recheck now ["), "{stopped}");
     }
 
     #[test]
