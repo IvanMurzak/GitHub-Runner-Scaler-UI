@@ -1,0 +1,62 @@
+.taskflow/2026-09-13-target-loop-self-recovery/tasks/README.md
+  s_c9018c0a298938::t_6cedffdee0d96b 1-4
+crates/app/src/cli/wsl.rs
+  s_c9018c0a298938::t_9d65a7314e7a8a 121,373-374,379,395-398,402-405
+  s_c9018c0a298938::t_9f4c25f0e58a42 3288-3314
+  s_c9018c0a298938::t_67c837bbc60aa0 331-335
+  s_c9018c0a298938::t_3a03f28f5df2ad 117-120,122-124,269,307-316,323-330,336-372,375-378,380-394,399-401,406-429
+.taskflow/2026-09-13-target-loop-self-recovery/README.md
+  s_c9018c0a298938::t_066e7513b28808 1-2,5-14,23-48
+  s_c9018c0a298938::t_6cedffdee0d96b 3-4,15-22
+.taskflow/2026-09-13-target-loop-self-recovery/ROADMAP.md
+  s_c9018c0a298938::t_066e7513b28808 1-2,7-40,44-56
+  s_c9018c0a298938::t_6cedffdee0d96b 3-5,57-69
+  s_c9018c0a298938::t_d5831d01d51803 6,41-43,70-81
+.taskflow/2026-09-13-target-loop-self-recovery/tasks/a1-wsl-fence-service-access.md
+  s_c9018c0a298938::t_6cedffdee0d96b 1-35
+crates/agent/src/lifecycle.rs
+  s_c9018c0a298938::t_73c13781697c60 3844-3881
+  s_c9018c0a298938::t_57f69ab4f607d1 1880-1892
+  s_c9018c0a298938::t_30ec3dacff9bc8 3843
+crates/app/src/cli/daemon.rs
+  s_c9018c0a298938::t_3a03f28f5df2ad 565,568-576
+crates/agent/src/reconcile.rs
+  s_c9018c0a298938::t_3a03f28f5df2ad 1570-1580
+.taskflow/2026-09-13-target-loop-self-recovery/02-target-architecture.md
+  s_c9018c0a298938::t_066e7513b28808 1-50,58-59,66-79
+  s_c9018c0a298938::t_6cedffdee0d96b 51-57,60-65
+.taskflow/2026-09-13-target-loop-self-recovery/tasks/b1-incident-tests-build.md
+  s_c9018c0a298938::t_6cedffdee0d96b 1-34
+CHANGELOG.md
+  s_c9018c0a298938::t_05c0704587a299 10-23
+  s_92e74af38f2870::t_51774662243fd2 24
+.taskflow/2026-09-13-target-loop-self-recovery/tasks/a2-fence-failure-visibility.md
+  s_c9018c0a298938::t_6cedffdee0d96b 1-33
+.taskflow/2026-09-13-target-loop-self-recovery/01-current-architecture.md
+  s_c9018c0a298938::t_066e7513b28808 1-57,69-75
+  s_c9018c0a298938::t_6cedffdee0d96b 58-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ec06f79c8acfcc3cbf8f78749ae4e20d6d3748b1",
+  "prompts": {},
+  "sessions": {
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_c9018c0a298938": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0973c-2ad1-7622-b64b-2f3109c27b5b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
