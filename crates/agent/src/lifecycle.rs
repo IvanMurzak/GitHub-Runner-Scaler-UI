@@ -1707,6 +1707,11 @@ pub enum LifecycleError {
         class: &'static str,
         detail: String,
     },
+    /// An ephemeral runtime is still held by a late process. Its journal state
+    /// remains unchanged and ordinary supervision retries it, but startup
+    /// recovery must not take unrelated repositories offline because of it.
+    #[error("attempt workspace could not be removed")]
+    WorkspaceCleanupDeferred,
     #[error("runner lifecycle failed: {0}")]
     Failed(FailureReason),
 }
@@ -1722,6 +1727,7 @@ impl LifecycleError {
             // Rendered through `Display` rather than a second copy of the same
             // sentence, so the two cannot drift apart.
             Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
+            Self::WorkspaceCleanupDeferred => FailureReason::Other(self.to_string()),
         }
     }
 }
@@ -1888,7 +1894,30 @@ impl LifecycleLauncher {
             if matches!(attempt.workspace(), AttemptWorkspace::Ephemeral)
                 && attempt.runtime_path().exists()
             {
-                self.scrub_workspace(&attempt)?;
+                // The attempt is already terminal, has released its package
+                // lease, and consumes no capacity. A late child may still hold
+                // one of its recreated files open on Windows, so failure here
+                // is residue to retry, not a reason to abort startup recovery
+                // and take every unrelated repository offline.
+                match self.scrub_workspace(&attempt) {
+                    Ok(()) => {}
+                    Err(LifecycleError::WorkspaceCleanupDeferred) => {
+                        self.ports
+                            .reconcile_events
+                            .emit(LifecycleEvent::AttemptCleanFailed {
+                                policy: attempt.policy_id,
+                                attempt: attempt.id,
+                                reason: "late_ephemeral_workspace_could_not_be_removed",
+                            });
+                        tracing::warn!(
+                            policy_id = %attempt.policy_id,
+                            attempt_id = %attempt.id,
+                            reason = "late_ephemeral_workspace_could_not_be_removed",
+                            "a cleaned ephemeral attempt left late workspace residue; cleanup will retry without blocking the daemon"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             return Ok(ReconcileProgress::Reconciled);
         }
@@ -2214,8 +2243,9 @@ impl LifecycleLauncher {
     /// pass — [`crate::reconcile::Reconciler`]'s terminal sweep on every poll,
     /// or the next startup — attempts exactly the same cleanup again.
     ///
-    /// Only a *quarantine* is tolerated. A journal failure or a package lease
-    /// that cannot be released still propagates: those are not one slot's
+    /// A persistent-slot quarantine and an ephemeral directory still held by a
+    /// late process are tolerated. A journal failure or a package lease that
+    /// cannot be released still propagates: those are not one workspace's
     /// problem.
     fn clean_or_quarantine(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
         match self.clean_attempt(attempt) {
@@ -2226,6 +2256,16 @@ impl LifecycleLauncher {
                         policy: attempt.policy_id,
                         attempt: attempt.id,
                         reason: class,
+                    });
+                Ok(())
+            }
+            Err(LifecycleError::WorkspaceCleanupDeferred) => {
+                self.ports
+                    .reconcile_events
+                    .emit(LifecycleEvent::AttemptCleanFailed {
+                        policy: attempt.policy_id,
+                        attempt: attempt.id,
+                        reason: "ephemeral_workspace_could_not_be_removed",
                     });
                 Ok(())
             }
@@ -2289,9 +2329,7 @@ impl LifecycleLauncher {
             AttemptWorkspace::Ephemeral => match remove_runtime_tree(attempt.runtime_path()) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(LifecycleError::Failed(FailureReason::Other(
-                    "attempt workspace could not be removed".into(),
-                ))),
+                Err(_) => Err(LifecycleError::WorkspaceCleanupDeferred),
             },
             AttemptWorkspace::PersistentSlot { slot } => self.scrub_persistent_slot(attempt, slot),
         }
@@ -3271,6 +3309,7 @@ mod tests {
         leases: Mutex<BTreeSet<AttemptId>>,
         materializations: AtomicUsize,
         materialization_failures: AtomicUsize,
+        release_failures: AtomicUsize,
         releases: AtomicUsize,
         prunes: AtomicUsize,
         prune_currents: Mutex<Vec<RunnerVersion>>,
@@ -3283,6 +3322,7 @@ mod tests {
                 leases: Mutex::new(BTreeSet::new()),
                 materializations: AtomicUsize::new(0),
                 materialization_failures: AtomicUsize::new(0),
+                release_failures: AtomicUsize::new(0),
                 releases: AtomicUsize::new(0),
                 prunes: AtomicUsize::new(0),
                 prune_currents: Mutex::new(Vec::new()),
@@ -3293,6 +3333,10 @@ mod tests {
     impl FakePackages {
         fn fail_materializations(&self, count: usize) {
             self.materialization_failures.store(count, Ordering::SeqCst);
+        }
+
+        fn fail_releases(&self, count: usize) {
+            self.release_failures.store(count, Ordering::SeqCst);
         }
     }
 
@@ -3321,6 +3365,17 @@ mod tests {
         }
 
         fn release(&self, attempt: AttemptId) -> Result<(), FailureReason> {
+            if self
+                .release_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    if left > 0 { Some(left - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err(FailureReason::Other(
+                    "runner package lease could not be released".into(),
+                ));
+            }
             self.leases.lock().unwrap().remove(&attempt);
             self.releases.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -3877,6 +3932,218 @@ mod tests {
             1,
             "reaping residue does not release the package lease twice"
         );
+    }
+
+    #[tokio::test]
+    async fn locked_late_residue_never_blocks_startup_recovery() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        let runtime = started.runtime_path().to_path_buf();
+
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.attempt(started.id).state(), AttemptState::Cleaned);
+
+        let held = runtime.join("_work").join("late-node-process");
+        fs::create_dir_all(&held).unwrap();
+        fs::write(held.join("node_modules.lock"), b"late residue").unwrap();
+        let Some(block) = BlockedDeletion::inject(&held) else {
+            eprintln!(
+                "skipped: this account cannot be refused a deletion, so locked late residue cannot be injected"
+            );
+            return;
+        };
+
+        let restarted = harness.restart();
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("late residue cannot take the daemon offline");
+        assert!(runtime.exists(), "the locked residue remains for a retry");
+        assert!(
+            harness
+                .reconcile_events
+                .events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    LifecycleEvent::AttemptCleanFailed {
+                        attempt,
+                        reason: "late_ephemeral_workspace_could_not_be_removed",
+                        ..
+                    } if *attempt == started.id
+                )),
+            "the non-blocking cleanup failure remains visible"
+        );
+
+        block.release();
+        restarted
+            .supervise(&harness.policy)
+            .await
+            .expect("the ordinary retry succeeds after the lock is released");
+        assert!(!runtime.exists(), "the retry removes the late residue");
+        assert_eq!(harness.attempt(started.id).state(), AttemptState::Cleaned);
+        assert_eq!(
+            harness.packages.releases.load(Ordering::SeqCst),
+            1,
+            "retrying residue never releases the package lease twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_locked_cleanup_residue_isolated_from_the_whole_startup_pass() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+
+        // The first attempt is terminal but its initial cleanup cannot finish.
+        // This is the state left by the original failed job on the affected
+        // workstation.
+        let terminal = harness.launch().await;
+        let terminal_runtime = terminal.runtime_path().to_path_buf();
+        harness.conclude(terminal.id);
+        let Some(terminal_block) = BlockedDeletion::inject(&terminal_runtime.join("late-child"))
+        else {
+            eprintln!("skipped: this account cannot inject the two independent deletion refusals");
+            return;
+        };
+
+        // The second attempt was cleaned successfully, then a child recreated
+        // part of `_work`. Both real-world residue shapes existed together in
+        // the incident, and neither may short-circuit recovery of the other.
+        let cleaned = harness.launch().await;
+        let cleaned_runtime = cleaned.runtime_path().to_path_buf();
+        harness.conclude(cleaned.id);
+        harness
+            .launcher
+            .clean(cleaned.id)
+            .await
+            .expect("the second attempt initially cleans");
+        let Some(cleaned_block) =
+            BlockedDeletion::inject(&cleaned_runtime.join("_work").join("late-child"))
+        else {
+            terminal_block.release();
+            eprintln!("skipped: this account cannot inject the two independent deletion refusals");
+            return;
+        };
+
+        let restarted = harness.restart();
+        for _ in 0..2 {
+            restarted
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .expect("repeated recovery remains ready while both residues are locked");
+        }
+        assert_ne!(
+            harness.attempt(terminal.id).state(),
+            AttemptState::Cleaned,
+            "the journal does not claim the terminal workspace was removed"
+        );
+        assert_eq!(
+            harness.attempt(cleaned.id).state(),
+            AttemptState::Cleaned,
+            "late residue does not undo an already durable cleaned transition"
+        );
+        assert!(terminal_runtime.exists());
+        assert!(cleaned_runtime.exists());
+        assert_eq!(
+            harness.packages.releases.load(Ordering::SeqCst),
+            1,
+            "repeated recovery neither loses nor duplicates package leases"
+        );
+
+        terminal_block.release();
+        cleaned_block.release();
+        restarted
+            .supervise(&harness.policy)
+            .await
+            .expect("one ordinary pass clears both residues after their locks disappear");
+        assert!(!terminal_runtime.exists());
+        assert!(!cleaned_runtime.exists());
+        assert_eq!(harness.attempt(terminal.id).state(), AttemptState::Cleaned);
+        assert_eq!(harness.attempt(cleaned.id).state(), AttemptState::Cleaned);
+        assert_eq!(harness.packages.releases.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_attempt_whose_runtime_is_already_gone_recovers_cleanly() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let runtime = attempt.runtime_path().to_path_buf();
+        harness.conclude(attempt.id);
+        fs::remove_dir_all(&runtime).unwrap();
+
+        harness
+            .restart()
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("an already absent disposable runtime is successful cleanup");
+
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+        assert_eq!(harness.packages.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_workspace_cleanup_failure_still_fails_closed_and_can_retry() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let runtime = attempt.runtime_path().to_path_buf();
+        harness.conclude(attempt.id);
+        harness.packages.fail_releases(1);
+
+        let restarted = harness.restart();
+        let failure = restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect_err("a package-accounting failure is not safe to downgrade to residue");
+        assert!(
+            failure
+                .reason()
+                .to_string()
+                .contains("package lease could not be released")
+        );
+        assert!(
+            !runtime.exists(),
+            "workspace removal completed before release failed"
+        );
+        assert_ne!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("the same journal entry retries safely after the transient failure");
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+        assert_eq!(harness.packages.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_never_scrubs_a_cleaned_persistent_work_directory() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_persistent_workspace(1);
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let retained = attempt.runtime_path().join("_work").join("checkout-marker");
+        fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        fs::write(&retained, b"persistent checkout").unwrap();
+        harness.cleanup_retaining_work(attempt.id).await;
+
+        harness
+            .restart()
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("a cleaned persistent slot is already reconciled");
+
+        assert_eq!(fs::read(&retained).unwrap(), b"persistent checkout");
+        assert_eq!(harness.packages.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -6063,6 +6330,27 @@ mod tests {
         assert!(
             runtime.is_dir(),
             "the directory the removal could not finish is still there, which is the fact the journal must keep agreeing with"
+        );
+
+        let restarted = harness.restart();
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("one locked ephemeral workspace does not stop startup recovery");
+        assert!(
+            harness
+                .reconcile_events
+                .events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    LifecycleEvent::AttemptCleanFailed {
+                        attempt: failed_attempt,
+                        reason: "ephemeral_workspace_could_not_be_removed",
+                        ..
+                    } if *failed_attempt == attempt.id
+                )),
+            "the deferred cleanup remains visible while the daemon keeps running"
         );
 
         // And the ordinary retry -- the reconciler's next terminal sweep --

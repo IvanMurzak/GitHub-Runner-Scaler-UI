@@ -7,6 +7,19 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.22
+
+### Fixes
+
+- Windows startup recovery no longer stops the entire service when a late child
+  process still holds an ephemeral runner workspace. The isolated cleanup is
+  reported and retried on later passes while unrelated repositories continue
+  receiving runners.
+- Terminal and already-cleaned ephemeral attempts now use the same retry-safe
+  handling for locked residue. Missing directories remain successful cleanup,
+  persistent checkouts remain untouched, and journal or package-accounting
+  failures still fail closed.
+
 ## 0.4.21
 
 ### Fixes
