@@ -1877,6 +1877,19 @@ impl LifecycleLauncher {
         mut attempt: RunnerAttempt,
     ) -> Result<ReconcileProgress, LifecycleError> {
         if attempt.state() == AttemptState::Cleaned {
+            // A child of Runner.Worker can outlive the runner process briefly.
+            // If it recreates `_work` after `clean_attempt` removed the tree but
+            // before the journal's final write, the journal truthfully reaches
+            // `cleaned` and the directory appears again afterwards. Cleaned
+            // attempts used to return here forever, making that late residue
+            // invisible. The journalled ephemeral mode is the ownership proof:
+            // retry the whole-tree removal, while a persistent slot deliberately
+            // remains on disk with its retained `_work`.
+            if matches!(attempt.workspace(), AttemptWorkspace::Ephemeral)
+                && attempt.runtime_path().exists()
+            {
+                self.scrub_workspace(&attempt)?;
+            }
             return Ok(ReconcileProgress::Reconciled);
         }
         if attempt.is_terminal() {
@@ -3824,6 +3837,45 @@ mod tests {
                 AttemptState::Finished,
                 AttemptState::Cleaned,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleaned_ephemeral_attempt_reaps_a_directory_recreated_after_cleanup() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        let runtime = started.runtime_path().to_path_buf();
+
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert_eq!(harness.attempt(started.id).state(), AttemptState::Cleaned);
+        assert!(!runtime.exists());
+        assert_eq!(harness.packages.releases.load(Ordering::SeqCst), 1);
+
+        // Reproduce a late orphan creating output after the successful removal
+        // and journal transition. The next ordinary policy supervision must
+        // remove it without replaying package release or another state change.
+        let residue = runtime.join("_work").join("late-node-process");
+        fs::create_dir_all(&residue).unwrap();
+        fs::write(residue.join("node_modules.lock"), b"late residue").unwrap();
+
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert!(!runtime.exists(), "late ephemeral residue is reaped");
+        assert_eq!(harness.attempt(started.id).state(), AttemptState::Cleaned);
+        assert_eq!(
+            harness.packages.releases.load(Ordering::SeqCst),
+            1,
+            "reaping residue does not release the package lease twice"
         );
     }
 

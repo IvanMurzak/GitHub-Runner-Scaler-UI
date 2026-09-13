@@ -1567,7 +1567,17 @@ impl EventSink for TracingEvents {
                 tracing::warn!(event = name, policy_id = %policy, reason);
             }
             LifecycleEvent::AllocationDeferred { policy, count } => {
-                tracing::debug!(event = name, policy_id = %policy, lock = "allocation", count);
+                // Contention is normally brief, but a configured WSL recovery
+                // fence whose shared root is unwritable reaches the same
+                // fail-closed result forever. Demand was already observed and
+                // capacity was already granted, so hiding this at DEBUG makes
+                // a host claim healthy while it starts nothing.
+                tracing::warn!(
+                    event = name,
+                    policy_id = %policy,
+                    reason = "allocation_lock_unavailable",
+                    count
+                );
             }
             LifecycleEvent::AttemptsUnreadable { reason } => {
                 tracing::warn!(event = name, reason);

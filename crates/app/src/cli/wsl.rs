@@ -114,6 +114,14 @@ const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// daemon that opens a database.
 const SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Product-owned systemd extension for the one DrvFS directory shared with the
+/// Windows recovery owner. The base unit cannot name this path: it is selected
+/// per Windows account and distribution, after the Linux service may already
+/// have been installed.
+const RECOVERY_SYSTEMD_DROP_IN_DIR: &str = "/etc/systemd/system/runner-manager.service.d";
+const RECOVERY_SYSTEMD_DROP_IN: &str =
+    "/etc/systemd/system/runner-manager.service.d/20-wsl-recovery.conf";
+
 /// The first release whose private service copy watches its source binary and
 /// performs the unbounded, journal-backed upgrade drain itself.
 ///
@@ -258,14 +266,7 @@ pub fn dispatch_wsl_host(
                     "the WSL recovery shared root must be an absolute Linux path",
                 ));
             }
-            runner_manager_platform::wsl::fence::GuestRecoveryConfig::new(args.shared_root.clone())
-                .write(context.paths())
-                .map_err(|source| {
-                    CliError::new(
-                        Failure::LocalState,
-                        format!("cannot configure WSL recovery: {source}"),
-                    )
-                })?;
+            configure_guest_recovery_path(context, &args.shared_root)?;
             writeln!(out, "WSL recovery fence configured.")
                 .map_err(write_failed("this configuration"))?;
             Ok(())
@@ -303,14 +304,129 @@ fn configure_guest_recovery(context: &Context, windows_path: &Path) -> Result<()
             "wslpath did not return an absolute Linux recovery directory",
         ));
     }
-    runner_manager_platform::wsl::fence::GuestRecoveryConfig::new(translated)
+    configure_guest_recovery_path(context, &translated)
+}
+
+/// Persist the guest side of the fence and make the systemd sandbox capable of
+/// using it. Configuration without authority is worse than no configuration:
+/// `WslRecoveryAllocationLock` correctly fails closed, but that means every
+/// matching job waits forever. Keeping both operations here makes the hidden
+/// lifecycle task a convergent repair for already-installed distributions.
+fn configure_guest_recovery_path(context: &Context, shared_root: &Path) -> Result<(), CliError> {
+    runner_manager_platform::wsl::fence::GuestRecoveryConfig::new(shared_root.to_path_buf())
         .write(context.paths())
         .map_err(|source| {
             CliError::new(
                 Failure::LocalState,
                 format!("cannot configure WSL recovery: {source}"),
             )
-        })
+        })?;
+    converge_recovery_systemd_access(shared_root)
+}
+
+/// Render one additive systemd sandbox grant. Quoting is deliberately local to
+/// unit syntax rather than shell syntax: this text is never executed by a
+/// shell. Percent is doubled because systemd expands specifiers in paths.
+fn recovery_systemd_drop_in(shared_root: &Path) -> Result<String, CliError> {
+    // This function renders a Linux unit even when its tests are compiled on
+    // Windows, where `Path::is_absolute("/mnt/c/...")` is false. Validate the
+    // target syntax, not the build host's path grammar.
+    let raw = shared_root.to_string_lossy();
+    if !raw.starts_with('/') {
+        return Err(CliError::new(
+            Failure::InvalidArgument,
+            "the WSL recovery shared root must be an absolute Linux path",
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(CliError::new(
+            Failure::InvalidArgument,
+            "the WSL recovery shared root contains a control character systemd cannot accept",
+        ));
+    }
+    let escaped = raw
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    Ok(format!(
+        "# Managed by runner-manager; the exact Windows/WSL recovery bridge.\n\
+         [Service]\nReadWritePaths=\"{escaped}\"\n"
+    ))
+}
+
+/// Atomically converge the drop-in and apply it only when its bytes changed.
+/// `try-restart` preserves an intentionally stopped service, while an active
+/// adopted service immediately stops failing closed on its new fence.
+fn converge_recovery_systemd_access(shared_root: &Path) -> Result<(), CliError> {
+    let desired = recovery_systemd_drop_in(shared_root)?;
+    let path = Path::new(RECOVERY_SYSTEMD_DROP_IN);
+    if std::fs::read_to_string(path).ok().as_deref() == Some(desired.as_str()) {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(RECOVERY_SYSTEMD_DROP_IN_DIR).map_err(|source| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!("cannot create the WSL recovery systemd drop-in directory: {source}"),
+        )
+    })?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(RECOVERY_SYSTEMD_DROP_IN_DIR).map_err(|source| {
+            CliError::new(
+                Failure::WslProvisioning,
+                format!("cannot stage the WSL recovery systemd drop-in: {source}"),
+            )
+        })?;
+    temporary.write_all(desired.as_bytes()).map_err(|source| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!("cannot write the WSL recovery systemd drop-in: {source}"),
+        )
+    })?;
+    temporary.as_file().sync_all().map_err(|source| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!("cannot flush the WSL recovery systemd drop-in: {source}"),
+        )
+    })?;
+    temporary.persist(path).map_err(|source| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!(
+                "cannot install the WSL recovery systemd drop-in: {}",
+                source.error
+            ),
+        )
+    })?;
+
+    systemctl_ok(
+        &["daemon-reload"],
+        "reload systemd after configuring WSL recovery",
+    )?;
+    systemctl_ok(
+        &["try-restart", "runner-manager.service"],
+        "restart the active Runner Manager service with WSL recovery access",
+    )
+}
+
+fn systemctl_ok(arguments: &[&str], operation: &str) -> Result<(), CliError> {
+    let output = std::process::Command::new("systemctl")
+        .args(arguments)
+        .output()
+        .map_err(|source| {
+            CliError::new(
+                Failure::WslProvisioning,
+                format!("cannot {operation}: {source}"),
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(CliError::new(
+        Failure::WslProvisioning,
+        format!("cannot {operation}: {detail}"),
+    ))
 }
 
 /// Refuses `wsl-host` anywhere but inside a Linux distribution.
@@ -3168,6 +3284,33 @@ mod tests {
     const DISTRIBUTION: &str = "Ubuntu";
     const UNIT: &str = "runner-manager.service";
     const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+
+    #[test]
+    fn recovery_drop_in_grants_only_the_exact_shared_root() {
+        let rendered = recovery_systemd_drop_in(Path::new(
+            "/mnt/c/Users/Ivan D/AppData/Local/IvanMurzak/runner-manager/%bridge",
+        ))
+        .expect("an absolute DrvFS path");
+        assert_eq!(
+            rendered,
+            "# Managed by runner-manager; the exact Windows/WSL recovery bridge.\n\
+             [Service]\n\
+             ReadWritePaths=\"/mnt/c/Users/Ivan D/AppData/Local/IvanMurzak/runner-manager/%%bridge\"\n"
+        );
+        assert!(!rendered.contains("ReadWritePaths=/mnt\n"));
+        assert!(!rendered.contains("ReadWritePaths=\"/mnt/c/Users/Ivan D\""));
+    }
+
+    #[test]
+    fn recovery_drop_in_rejects_paths_systemd_cannot_parse_safely() {
+        let relative = recovery_systemd_drop_in(Path::new("relative/root"))
+            .expect_err("relative paths must not become sandbox authority");
+        assert_eq!(relative.class(), Failure::InvalidArgument);
+
+        let newline = recovery_systemd_drop_in(Path::new("/mnt/c/good\n[Service]"))
+            .expect_err("a path must not inject another unit directive");
+        assert_eq!(newline.class(), Failure::InvalidArgument);
+    }
 
     /// Shaped like a stored credential document and unmistakably not one.
     ///

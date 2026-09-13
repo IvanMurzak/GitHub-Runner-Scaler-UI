@@ -562,10 +562,18 @@ async fn maintain_wsl_guest_heartbeat(
                         .unwrap_or_default(),
                     unmanaged_runner_services: unmanaged_runner_service_count(),
                 };
-                if request.is_err() || heartbeat.write(&config.shared_root).is_err() {
+                if let Err(error) = request {
                     tracing::warn!(
                         reason = "wsl_recovery_state_unreadable",
-                        "WSL recovery heartbeat is unavailable"
+                        %error,
+                        "WSL recovery drain request is unavailable"
+                    );
+                }
+                if let Err(error) = heartbeat.write(&config.shared_root) {
+                    tracing::warn!(
+                        reason = "wsl_recovery_state_unwritable",
+                        %error,
+                        "WSL recovery heartbeat cannot be published"
                     );
                 }
             }

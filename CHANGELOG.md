@@ -7,6 +7,21 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.21
+
+### Fixes
+
+- A managed WSL host now gives its hardened systemd service write access to the
+  exact Windows recovery-fence directory. Existing installations converge the
+  drop-in in place, reload systemd, and restart only an active service, so an
+  unwritable fence can no longer leave queued Linux jobs unserved indefinitely.
+- Permanent allocation-fence contention and WSL heartbeat read/write failures
+  now reach warning diagnostics with distinct reason codes instead of looking
+  like a healthy but idle host.
+- Ephemeral attempts marked `cleaned` now reap a workspace that a late child
+  process recreates after the original cleanup. The retry does not replay the
+  package lease release or mutate the completed journal record.
+
 ## 0.4.20
 
 ### Fixes
