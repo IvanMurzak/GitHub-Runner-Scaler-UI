@@ -7,6 +7,24 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.20
+
+### Fixes
+
+- A Windows boot service no longer mistakes user-owned WSL distributions for
+  failed hosts when it runs as LocalSystem. On upgrade it retires only the
+  obsolete Windows recovery request and fence, leaving guest launch ownership
+  untouched, so healthy WSL runners are not blocked by false recovery state.
+- Dashboard readiness problems now describe only the latest live probe. A
+  resolved service or WSL problem cannot remain beside a `READY` verdict or be
+  copied as a repair the operator no longer needs.
+- Manual and automatic TUI refreshes now show a fixed-width animated activity
+  track beside both refresh labels. Unsupported WSL information is rendered as
+  muted context instead of an actionable accent.
+- Lifecycle unit tests keep their runner root inside the test temporary
+  directory, so a correctly secured production `C:\rman` cannot make the local
+  workspace suite fail.
+
 ## 0.4.19
 
 ### Fixes
