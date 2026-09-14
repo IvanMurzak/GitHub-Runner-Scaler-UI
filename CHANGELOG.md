@@ -7,6 +7,16 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.24
+
+### Features
+
+- The TUI runner table now shows `Busy for` immediately after `Status`. Local
+  runners use the journaled busy transition time; runners observed on another
+  managed host are timed continuously from their first busy observation. The
+  duration updates live, resets when work ends, remains sortable, and yields
+  space before the repository, status, or runner identity on narrow terminals.
+
 ## 0.4.23
 
 ### Fixes
