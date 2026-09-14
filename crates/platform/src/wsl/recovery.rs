@@ -16,7 +16,9 @@ pub struct RecoveryEvidence {
     pub acknowledged_generation: Option<u64>,
     pub heartbeat_age: Option<Duration>,
     pub local_active_attempts: Option<u32>,
+    pub local_busy_attempts: Option<u32>,
     pub consecutive_zero_attempt_heartbeats: u8,
+    pub consecutive_no_busy_heartbeats: u8,
     pub managed_busy_runners: Option<u32>,
     pub managed_online_registrations: Option<u32>,
     pub consecutive_zero_inventory_reads: u8,
@@ -87,13 +89,23 @@ pub fn decide(evidence: &RecoveryEvidence) -> RecoveryDecision {
     if evidence.acknowledged_generation != Some(evidence.drain_generation) {
         return RecoveryDecision::RequestDrain;
     }
-    match evidence.local_active_attempts {
-        Some(0) => {}
-        Some(_) => return RecoveryDecision::Blocked("the guest owns an active attempt"),
+    let active = match evidence.local_active_attempts {
+        Some(active) => active,
         None => return RecoveryDecision::Blocked("the guest attempt count is unknown"),
+    };
+    match evidence.local_busy_attempts {
+        Some(0) => {}
+        Some(_) => return RecoveryDecision::Blocked("the guest owns a busy attempt"),
+        None => return RecoveryDecision::Blocked("the guest busy-attempt count is unknown"),
     }
-    if evidence.consecutive_zero_attempt_heartbeats < 2 {
-        return RecoveryDecision::Blocked("idle guest state has not been confirmed twice");
+    if active == 0 {
+        if evidence.consecutive_zero_attempt_heartbeats < 2 {
+            return RecoveryDecision::Blocked("idle guest state has not been confirmed twice");
+        }
+    } else if evidence.consecutive_no_busy_heartbeats < 2 {
+        return RecoveryDecision::Blocked(
+            "the guest's active but non-busy attempts have not been confirmed twice",
+        );
     }
     match (
         evidence.managed_busy_runners,
@@ -128,7 +140,9 @@ mod tests {
             acknowledged_generation: Some(7),
             heartbeat_age: Some(Duration::from_secs(2)),
             local_active_attempts: Some(0),
+            local_busy_attempts: Some(0),
             consecutive_zero_attempt_heartbeats: 2,
+            consecutive_no_busy_heartbeats: 2,
             managed_busy_runners: Some(0),
             managed_online_registrations: Some(0),
             consecutive_zero_inventory_reads: 2,
@@ -148,10 +162,11 @@ mod tests {
 
     #[test]
     fn every_unknown_safety_fact_blocks() {
-        let mutations: [fn(&mut RecoveryEvidence); 6] = [
+        let mutations: [fn(&mut RecoveryEvidence); 7] = [
             |e| e.failure_span = None,
             |e| e.heartbeat_age = None,
             |e| e.local_active_attempts = None,
+            |e| e.local_busy_attempts = None,
             |e| e.managed_busy_runners = None,
             |e| e.managed_online_registrations = None,
             |e| e.unmanaged_runner_services = None,
@@ -164,9 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn work_or_an_unmanaged_runner_blocks_recovery() {
+    fn busy_work_or_an_unmanaged_runner_blocks_recovery() {
         for mutate in [
-            |e: &mut RecoveryEvidence| e.local_active_attempts = Some(1),
+            |e: &mut RecoveryEvidence| {
+                e.local_active_attempts = Some(1);
+                e.local_busy_attempts = Some(1);
+            },
             |e: &mut RecoveryEvidence| e.managed_busy_runners = Some(1),
             |e: &mut RecoveryEvidence| e.unmanaged_runner_services = Some(1),
         ] {
@@ -196,5 +214,23 @@ mod tests {
             mutate(&mut evidence);
             assert_ne!(decide(&evidence), RecoveryDecision::TerminateNamed);
         }
+    }
+
+    #[test]
+    fn stale_non_busy_attempts_do_not_deadlock_a_fully_drained_host() {
+        let mut evidence = idle();
+        evidence.local_active_attempts = Some(4);
+        evidence.local_busy_attempts = Some(0);
+        evidence.consecutive_zero_attempt_heartbeats = 0;
+        evidence.consecutive_no_busy_heartbeats = 2;
+        assert_eq!(decide(&evidence), RecoveryDecision::TerminateNamed);
+    }
+
+    #[test]
+    fn even_complete_cloud_evidence_never_overrides_a_guest_busy_attempt() {
+        let mut evidence = idle();
+        evidence.local_active_attempts = Some(1);
+        evidence.local_busy_attempts = Some(1);
+        assert!(matches!(decide(&evidence), RecoveryDecision::Blocked(_)));
     }
 }

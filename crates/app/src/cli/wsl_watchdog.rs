@@ -11,7 +11,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::wsl::WslHost;
 use runner_manager_platform::wsl::fence::{
     DrainRequest, FenceClaim, FenceOwnerKind, GuestHeartbeat, RecoveryPhase, RecoveryStatus,
-    SCHEMA_VERSION, clear_recovery, recovery_root, retire_windows_recovery,
+    SCHEMA_VERSION, clear_recovery, recovery_root,
 };
 use runner_manager_platform::wsl::probe::LinuxCommand;
 use runner_manager_platform::wsl::record::WslProviderRecord;
@@ -19,6 +19,7 @@ use runner_manager_platform::wsl::recovery::{RecoveryDecision, RecoveryEvidence,
 use runner_manager_platform::wsl::task::LifecycleTaskIdentity;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(10);
+const TASK_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const CIRCUIT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const CIRCUIT_LIMIT: usize = 3;
@@ -31,6 +32,7 @@ struct Tracker {
     fence_held: bool,
     last_heartbeat: Option<DateTime<Utc>>,
     zero_heartbeats: u8,
+    no_busy_heartbeats: u8,
     zero_inventory_reads: u8,
     recovery_attempts: VecDeque<Instant>,
     last_recovered_at: Option<DateTime<Utc>>,
@@ -60,27 +62,85 @@ pub async fn maintain(paths: AppPaths, inventory: Arc<dyn InventoryGateway>) {
     }
 }
 
-/// Remove only coordination owned by the obsolete Windows-side watchdog. This
-/// is used when an SCM service discovers that its LocalSystem identity cannot
-/// see the interactive user's WSL registrations.
-pub fn retire(paths: &AppPaths) {
+/// Watch exactly one distribution from the interactive account which owns
+/// it. The SCM daemon cannot do this because WSL registrations are per-user;
+/// the lifecycle task calls this entry point in that user's logon session.
+pub async fn maintain_distribution(
+    paths: AppPaths,
+    inventory: Arc<dyn InventoryGateway>,
+    distribution: String,
+) {
     if !cfg!(windows) {
+        std::future::pending::<()>().await;
         return;
     }
-    let records = match WslProviderRecord::all(paths) {
-        Ok(records) => records,
-        Err(error) => {
-            tracing::warn!(%error, "obsolete WSL recovery state could not be enumerated");
-            return;
+    let mut tracker = Tracker::default();
+    loop {
+        match WslProviderRecord::read(&paths, &distribution) {
+            Ok(Some(record)) => observe(&paths, &record, &mut tracker, inventory.as_ref()).await,
+            Ok(None) => publish_missing_record(&paths, &distribution, &tracker),
+            Err(error) => tracing::warn!(
+                %distribution,
+                %error,
+                "managed WSL recovery cannot read its provider record"
+            ),
         }
-    };
-    for record in records {
-        let Ok(root) = recovery_root(paths, &record.distribution) else {
-            continue;
-        };
-        if let Err(error) = retire_windows_recovery(&root) {
-            tracing::warn!(distribution = %record.distribution, %error, "obsolete WSL recovery state could not be retired");
+        tokio::time::sleep(WATCH_INTERVAL).await;
+    }
+}
+
+/// The SCM-safe half of WSL recovery. LocalSystem cannot probe a user's WSL
+/// registration, but it can ask Task Scheduler to keep the product-owned,
+/// interactive companion running. The companion performs every WSL action in
+/// the owning user's token.
+pub async fn maintain_lifecycle_tasks(paths: AppPaths) {
+    if !cfg!(windows) {
+        std::future::pending::<()>().await;
+        return;
+    }
+    loop {
+        if let (Ok(host), Ok(records)) = (
+            WslHost::on_this_host("managed WSL lifecycle supervision"),
+            WslProviderRecord::all(&paths),
+        ) {
+            for record in records {
+                let Ok(identity) = LifecycleTaskIdentity::for_distribution(&record.distribution)
+                else {
+                    continue;
+                };
+                let task = host.tasks().query(&identity).ok().flatten();
+                if task.as_ref().is_some_and(should_start_lifecycle_task)
+                    && let Err(error) = host.tasks().start(&identity)
+                {
+                    // A boot service normally reaches this branch before
+                    // the owning user has logged on.  An interactive task
+                    // cannot start yet, so this is an expected retry rather
+                    // than a service fault worth appending every 30 seconds
+                    // to the operator-facing log.
+                    tracing::debug!(
+                        distribution = %record.distribution,
+                        %error,
+                        "the Windows service could not restart the WSL recovery companion"
+                    );
+                }
+            }
         }
+        tokio::time::sleep(TASK_WATCH_INTERVAL).await;
+    }
+}
+
+fn should_start_lifecycle_task(task: &runner_manager_platform::wsl::task::RegisteredTask) -> bool {
+    task.is_product_owned() && task.enabled() && !task.running()
+}
+
+fn publish_missing_record(paths: &AppPaths, distribution: &str, tracker: &Tracker) {
+    if let Ok(root) = recovery_root(paths, distribution) {
+        publish(
+            &root,
+            tracker,
+            RecoveryPhase::RecoveryBlocked,
+            Some("the managed WSL provider record is missing"),
+        );
     }
 }
 
@@ -131,6 +191,7 @@ async fn observe(
         tracker.first_failure = None;
         tracker.fence_held = false;
         tracker.zero_heartbeats = 0;
+        tracker.no_busy_heartbeats = 0;
         tracker.zero_inventory_reads = 0;
         publish(&root, tracker, RecoveryPhase::Healthy, None);
         return;
@@ -170,7 +231,7 @@ async fn observe(
     }
 
     let heartbeat = GuestHeartbeat::read(&root).ok().flatten();
-    update_zero_heartbeats(tracker, heartbeat.as_ref(), generation);
+    update_guest_quiescence(tracker, heartbeat.as_ref(), generation);
     let (busy, online, authorized) = match heartbeat.as_ref() {
         Some(heartbeat) => match github_inventory(heartbeat, inventory).await {
             Some((busy, online)) => {
@@ -205,7 +266,11 @@ async fn observe(
         local_active_attempts: heartbeat
             .as_ref()
             .and_then(|heartbeat| heartbeat.local_active_attempts),
+        local_busy_attempts: heartbeat
+            .as_ref()
+            .and_then(|heartbeat| heartbeat.local_busy_attempts),
         consecutive_zero_attempt_heartbeats: tracker.zero_heartbeats,
+        consecutive_no_busy_heartbeats: tracker.no_busy_heartbeats,
         managed_busy_runners: busy,
         managed_online_registrations: online,
         consecutive_zero_inventory_reads: tracker.zero_inventory_reads,
@@ -245,6 +310,7 @@ async fn observe(
                 tracker.generation = None;
                 tracker.fence_held = false;
                 tracker.zero_heartbeats = 0;
+                tracker.no_busy_heartbeats = 0;
                 tracker.zero_inventory_reads = 0;
                 tracker.last_recovered_at = Some(Utc::now());
                 publish(&root, tracker, RecoveryPhase::Healthy, None);
@@ -260,7 +326,7 @@ async fn observe(
     }
 }
 
-fn update_zero_heartbeats(
+fn update_guest_quiescence(
     tracker: &mut Tracker,
     heartbeat: Option<&GuestHeartbeat>,
     generation: u64,
@@ -277,6 +343,13 @@ fn update_zero_heartbeats(
         && heartbeat.local_active_attempts == Some(0)
     {
         tracker.zero_heartbeats.saturating_add(1)
+    } else {
+        0
+    };
+    tracker.no_busy_heartbeats = if heartbeat.acknowledged_generation == Some(generation)
+        && heartbeat.local_busy_attempts == Some(0)
+    {
+        tracker.no_busy_heartbeats.saturating_add(1)
     } else {
         0
     };
@@ -373,6 +446,7 @@ mod tests {
             observed_at,
             acknowledged_generation: generation,
             local_active_attempts: Some(active),
+            local_busy_attempts: Some(0),
             managed_targets: Vec::new(),
             unmanaged_runner_services: Some(0),
         }
@@ -383,16 +457,16 @@ mod tests {
         let mut tracker = Tracker::default();
         let first_at = Utc::now();
         let before_drain = heartbeat(first_at, None, 0);
-        update_zero_heartbeats(&mut tracker, Some(&before_drain), 7);
+        update_guest_quiescence(&mut tracker, Some(&before_drain), 7);
         assert_eq!(tracker.zero_heartbeats, 0);
 
         let first = heartbeat(first_at + chrono::Duration::seconds(1), Some(7), 0);
-        update_zero_heartbeats(&mut tracker, Some(&first), 7);
-        update_zero_heartbeats(&mut tracker, Some(&first), 7);
+        update_guest_quiescence(&mut tracker, Some(&first), 7);
+        update_guest_quiescence(&mut tracker, Some(&first), 7);
         assert_eq!(tracker.zero_heartbeats, 1);
 
         let second = heartbeat(first_at + chrono::Duration::seconds(2), Some(7), 0);
-        update_zero_heartbeats(&mut tracker, Some(&second), 7);
+        update_guest_quiescence(&mut tracker, Some(&second), 7);
         assert_eq!(tracker.zero_heartbeats, 2);
     }
 
@@ -400,18 +474,44 @@ mod tests {
     fn active_work_or_another_generation_resets_the_idle_proof() {
         let mut tracker = Tracker::default();
         let now = Utc::now();
-        update_zero_heartbeats(&mut tracker, Some(&heartbeat(now, Some(9), 0)), 9);
-        update_zero_heartbeats(
+        update_guest_quiescence(&mut tracker, Some(&heartbeat(now, Some(9), 0)), 9);
+        update_guest_quiescence(
             &mut tracker,
             Some(&heartbeat(now + chrono::Duration::seconds(1), Some(9), 1)),
             9,
         );
         assert_eq!(tracker.zero_heartbeats, 0);
-        update_zero_heartbeats(
+        update_guest_quiescence(
             &mut tracker,
             Some(&heartbeat(now + chrono::Duration::seconds(2), Some(8), 0)),
             9,
         );
         assert_eq!(tracker.zero_heartbeats, 0);
+    }
+
+    #[test]
+    fn scm_restarts_only_an_enabled_stopped_product_lifecycle_task() {
+        use runner_manager_platform::wsl::task::RegisteredTask;
+
+        let document = format!(
+            "<Task><RegistrationInfo><Description>{}</Description></RegistrationInfo><Settings><Enabled>true</Enabled></Settings></Task>",
+            runner_manager_platform::wsl::task::PRODUCT_MARKER
+        );
+        let stopped = RegisteredTask::from_document("owned", &document, false);
+        let running = RegisteredTask::from_document("owned", &document, true);
+        let foreign = RegisteredTask::from_document(
+            "foreign",
+            "<Task><RegistrationInfo><Description>somebody else</Description></RegistrationInfo><Settings><Enabled>true</Enabled></Settings></Task>",
+            false,
+        );
+        let disabled = RegisteredTask::from_document(
+            "disabled",
+            &document.replace("<Enabled>true</Enabled>", "<Enabled>false</Enabled>"),
+            false,
+        );
+        assert!(should_start_lifecycle_task(&stopped));
+        assert!(!should_start_lifecycle_task(&running));
+        assert!(!should_start_lifecycle_task(&foreign));
+        assert!(!should_start_lifecycle_task(&disabled));
     }
 }

@@ -559,6 +559,22 @@ pub fn probe_readiness(
     // both of which are usable, so the word is read rather than the code.
     let systemd_report =
         invoker.exec(LinuxCommand::new(name, "systemctl").args(["is-system-running"]))?;
+    // `systemctl` legitimately exits non-zero for useful states such as
+    // `degraded` and `starting`. An empty answer establishes no systemd fact:
+    // wsl.exe reports control-plane failures through stderr with that same
+    // non-zero exit. Preserve that transport failure instead of telling the
+    // operator to enable a systemd which may already be running.
+    if !systemd_report.success()
+        && systemd_report.stdout_text().is_empty()
+        && systemd_report.diagnostic().contains("Wsl/")
+    {
+        return Err(WslError::CommandFailed {
+            what: "verify systemd in the distribution",
+            program: PathBuf::from("systemctl"),
+            exit_code: systemd_report.exit_code(),
+            detail: systemd_report.diagnostic(),
+        });
+    }
     let systemd = SystemdState::from_report(&systemd_report.stdout_text());
     if !systemd.is_usable() {
         return Err(WslError::SystemdUnavailable {
@@ -889,6 +905,27 @@ mod tests {
             panic!("unexpected error: {error:?}");
         };
         assert!(detail.contains("offline"), "{detail}");
+    }
+
+    #[test]
+    fn a_wsl_transport_failure_during_systemd_probe_is_not_mislabeled_as_missing_systemd() {
+        let runner = ScriptedRunner::new()
+            .always("--list --verbose", table())
+            .always("--exec id -u", CommandOutput::exited(0, "0\n", ""))
+            .always("--exec uname -m", CommandOutput::exited(0, "x86_64\n", ""))
+            .always(
+                "--exec systemctl is-system-running",
+                CommandOutput::exited(
+                    1,
+                    "",
+                    "A connection attempt failed. Error code: Wsl/Service/0x8007274c",
+                ),
+            );
+        let executable = executable();
+        let error = probe_readiness(&WslInvoker::new(&runner, &executable), "Ubuntu")
+            .expect_err("the transport failed");
+        assert!(matches!(error, WslError::CommandFailed { .. }), "{error:?}");
+        assert!(error.to_string().contains("0x8007274c"), "{error}");
     }
 
     #[test]

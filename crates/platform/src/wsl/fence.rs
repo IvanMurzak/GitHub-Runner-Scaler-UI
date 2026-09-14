@@ -148,6 +148,11 @@ pub struct GuestHeartbeat {
     pub observed_at: DateTime<Utc>,
     pub acknowledged_generation: Option<u64>,
     pub local_active_attempts: Option<u32>,
+    /// Attempts which the guest journal still considers to be executing a
+    /// GitHub job. This lets recovery distinguish a stuck idle/listener
+    /// process from work which must never be interrupted.
+    #[serde(default)]
+    pub local_busy_attempts: Option<u32>,
     pub managed_targets: Vec<ScaleTarget>,
     pub unmanaged_runner_services: Option<u32>,
 }
@@ -478,6 +483,7 @@ mod tests {
             observed_at: Utc::now(),
             acknowledged_generation: None,
             local_active_attempts: Some(1),
+            local_busy_attempts: Some(1),
             managed_targets: Vec::new(),
             unmanaged_runner_services: Some(0),
         };

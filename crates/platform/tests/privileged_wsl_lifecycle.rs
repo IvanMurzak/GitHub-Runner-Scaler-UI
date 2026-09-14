@@ -45,6 +45,7 @@
 
 use runner_manager_platform::service::TaskPrincipal;
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use runner_manager_platform::wsl::exec::{CommandRequest, CommandRunner, HostCommandRunner};
 use runner_manager_platform::wsl::probe::{WslExecutable, WslInvoker, probe_readiness};
@@ -124,6 +125,18 @@ impl TaskFixture {
             LINUX_BINARY,
         )
     }
+
+    /// The production action shape introduced for Windows-side recovery. The
+    /// files need not exist because this acceptance test registers and exports
+    /// the task without ever starting it.
+    fn supervised_task(&self) -> LifecycleTask {
+        self.task()
+            .with_recovery_root(PathBuf::from(r"C:\runner-manager-selftest\recovery"))
+            .with_windows_supervisor(
+                PathBuf::from(r"C:\runner-manager-selftest\runner-manager-supervisor.exe"),
+                PathBuf::from(r"C:\runner-manager-selftest\runner-manager.exe"),
+            )
+    }
 }
 
 impl Drop for TaskFixture {
@@ -164,7 +177,7 @@ fn the_rendered_task_is_one_task_scheduler_accepts_reads_back_and_removes() {
     let control = LifecycleTaskControl::new(&HostCommandRunner);
 
     control
-        .register(&fixture.task())
+        .register(&fixture.supervised_task())
         .expect("Task Scheduler accepts the document this build renders");
     assert!(
         task_exists(fixture.identity().name()),
@@ -183,11 +196,20 @@ fn the_rendered_task_is_one_task_scheduler_accepts_reads_back_and_removes() {
     );
     assert!(registered.enabled(), "a freshly registered task is enabled");
     assert!(
-        registered.command().to_lowercase().ends_with("wsl.exe"),
-        "the action starts wsl.exe and nothing else: {}",
+        registered
+            .command()
+            .to_lowercase()
+            .ends_with("runner-manager-supervisor.exe"),
+        "the action starts the Windows recovery supervisor: {}",
         registered.command()
     );
-    for expected in ["--distribution", "--user", "root", "--exec", "wsl-host"] {
+    for expected in [
+        "runner-manager.exe",
+        "wsl-host supervise",
+        "--distribution",
+        "--linux-binary",
+        "--shared-root",
+    ] {
         assert!(
             registered.arguments().contains(expected),
             "the argument string Task Scheduler round-tripped is missing {expected:?}: {}",
@@ -204,7 +226,7 @@ fn the_rendered_task_is_one_task_scheduler_accepts_reads_back_and_removes() {
 
     // Idempotent: registering again replaces rather than accumulates.
     control
-        .register(&fixture.task())
+        .register(&fixture.supervised_task())
         .expect("re-registration replaces the task in place");
     assert!(task_exists(fixture.identity().name()));
 

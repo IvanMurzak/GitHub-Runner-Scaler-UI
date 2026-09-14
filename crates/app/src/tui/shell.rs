@@ -682,7 +682,10 @@ fn readiness_from_facts(
     for host in wsl_hosts {
         match host.state {
             WslHostState::Healthy | WslHostState::Unmanaged => {}
-            WslHostState::Draining | WslHostState::Recovering | WslHostState::Backoff => issue(
+            WslHostState::Degraded
+            | WslHostState::Draining
+            | WslHostState::Recovering
+            | WslHostState::Backoff => issue(
                 &format!("wsl:{}", host.distribution),
                 OperationalReadiness::Degraded,
                 format!(
@@ -696,22 +699,20 @@ fn readiness_from_facts(
                     host.distribution
                 ),
             ),
-            WslHostState::Degraded | WslHostState::Unreachable | WslHostState::RecoveryBlocked => {
-                issue(
-                    &format!("wsl:{}", host.distribution),
-                    OperationalReadiness::Blocked,
-                    format!(
-                        "WSL {} is {}: {}",
-                        host.distribution,
-                        host.state.label(),
-                        host.detail
-                    ),
-                    format!(
-                        "Run `{}`. It repairs or updates the existing WSL host in place; do not uninstall its Linux service first.",
-                        crate::cli::wsl::install_remediation(&host.distribution)
-                    ),
-                )
-            }
+            WslHostState::Unreachable | WslHostState::RecoveryBlocked => issue(
+                &format!("wsl:{}", host.distribution),
+                OperationalReadiness::Blocked,
+                format!(
+                    "WSL {} is {}: {}",
+                    host.distribution,
+                    host.state.label(),
+                    host.detail
+                ),
+                format!(
+                    "Run `{}`. It repairs or updates the existing WSL host in place; do not uninstall its Linux service first.",
+                    crate::cli::wsl::install_remediation(&host.distribution)
+                ),
+            ),
         }
     }
 
@@ -960,10 +961,26 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
             let rows = failure
                 .managed
                 .into_iter()
-                .map(|distribution| WslHostRow {
-                    distribution,
-                    state: WslHostState::Unreachable,
-                    detail: detail.clone(),
+                .map(|distribution| {
+                    if let Some(heartbeat) = fresh_guest_heartbeat(context, &distribution) {
+                        WslHostRow {
+                            distribution,
+                            state: WslHostState::Degraded,
+                            detail: format!(
+                                "Windows cannot open a new WSL session, but the guest daemon heartbeat is fresh and reports {} active attempt(s); automatic recovery will drain before restarting only this distribution",
+                                heartbeat.local_active_attempts.map_or_else(
+                                    || "an unknown number of".into(),
+                                    |count| count.to_string(),
+                                )
+                            ),
+                        }
+                    } else {
+                        WslHostRow {
+                            distribution,
+                            state: WslHostState::Unreachable,
+                            detail: detail.clone(),
+                        }
+                    }
                 })
                 .collect();
             return (capability, rows);
@@ -1002,11 +1019,25 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
         // durable watchdog breadcrumb. A service can be repaired while the
         // Windows watchdog is stopped; in that case its last Degraded record
         // must not keep a currently healthy host red forever.
+        let recovery_capable = document
+            .lifecycle_task
+            .arguments
+            .as_deref()
+            .is_some_and(lifecycle_task_has_recovery_companion);
+        let host_is_healthy_now = document.healthy && recovery_capable;
         let recovery_state = effective_recovery_state(
-            document.healthy,
+            host_is_healthy_now,
             recovery.as_ref().map(|status| status.phase),
         );
-        let (state, detail) = if let Some(state) = recovery_state {
+        let (state, detail) = if document.healthy && !recovery_capable {
+            (
+                WslHostState::Degraded,
+                format!(
+                    "the Windows lifecycle task uses the legacy keep-alive and cannot recover a wedged WSL transport; run `{}` once to replace it with the recovery companion",
+                    crate::cli::wsl::install_remediation(&document.distribution)
+                ),
+            )
+        } else if let Some(state) = recovery_state {
             let detail = recovery
                 .and_then(|status| status.reason)
                 .unwrap_or_else(|| "WSL recovery supervisor is active".into());
@@ -1041,6 +1072,15 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
 }
 
 #[cfg(windows)]
+fn lifecycle_task_has_recovery_companion(arguments: &str) -> bool {
+    arguments
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|words| words == ["wsl-host", "supervise"])
+}
+
+#[cfg(windows)]
 fn effective_recovery_state(
     host_is_healthy_now: bool,
     phase: Option<runner_manager_platform::wsl::fence::RecoveryPhase>,
@@ -1058,6 +1098,18 @@ fn effective_recovery_state(
         RecoveryPhase::Backoff => Some(WslHostState::Backoff),
         RecoveryPhase::RecoveryBlocked => Some(WslHostState::RecoveryBlocked),
     }
+}
+
+#[cfg(windows)]
+fn fresh_guest_heartbeat(
+    context: &crate::cli::Context,
+    distribution: &str,
+) -> Option<runner_manager_platform::wsl::fence::GuestHeartbeat> {
+    let root =
+        runner_manager_platform::wsl::fence::recovery_root(context.paths(), distribution).ok()?;
+    let heartbeat = runner_manager_platform::wsl::fence::GuestHeartbeat::read(&root).ok()??;
+    let age = (chrono::Utc::now() - heartbeat.observed_at).to_std().ok()?;
+    (age <= runner_manager_platform::wsl::recovery::MAX_HEARTBEAT_AGE).then_some(heartbeat)
 }
 
 /// Recognise the exact name emitted by `agent::lifecycle::runner_name`.
@@ -4714,9 +4766,21 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     assert!(text.contains("elevated terminal"), "{text}");
     assert!(text.contains("WSL Ubuntu"), "{text}");
     assert!(
-        text.contains("runner-manager wsl install --distribution \"Ubuntu\""),
+        text.contains("runner-manager wsl status --distribution \"Ubuntu\""),
         "{text}"
     );
+
+    let control_degraded = readiness_from_facts(
+        Ok(ready_service()),
+        true,
+        &[WslHostRow {
+            distribution: "Ubuntu".into(),
+            state: WslHostState::Degraded,
+            detail: "Windows control unavailable; guest heartbeat is fresh".into(),
+        }],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(control_degraded.state, OperationalReadiness::Degraded);
 
     let unknown = readiness_from_facts(Err("access denied".into()), true, &[], "12:00:00Z".into());
     assert_eq!(unknown.state, OperationalReadiness::Unknown);
@@ -4773,6 +4837,20 @@ fn a_fresh_healthy_wsl_probe_overrides_stale_watchdog_degradation() {
         effective_recovery_state(false, Some(RecoveryPhase::Degraded)),
         Some(WslHostState::Degraded)
     );
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn only_the_supervised_lifecycle_action_claims_automatic_recovery() {
+    assert!(lifecycle_task_has_recovery_companion(
+        r#"wsl-host supervise --distribution Ubuntu --linux-binary /usr/local/bin/runner-manager"#
+    ));
+    assert!(!lifecycle_task_has_recovery_companion(
+        r#"--distribution Ubuntu --exec /usr/local/bin/runner-manager wsl-host hold"#
+    ));
+    assert!(!lifecycle_task_has_recovery_companion(
+        "wsl-host supervision"
+    ));
 }
 
 #[cfg(test)]

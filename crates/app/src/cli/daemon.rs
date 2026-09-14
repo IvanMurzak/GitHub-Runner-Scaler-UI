@@ -23,7 +23,7 @@ use runner_manager_agent::reconcile::{
     AllocationLock, FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler,
     ReconcilerPorts, RepositoryDirectory, TeeEvents, TracingEvents, WslRecoveryAllocationLock,
 };
-use runner_manager_domain::attempt::{FailureReason, active_count, active_count_for};
+use runner_manager_domain::attempt::{AttemptState, FailureReason, active_count, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::policy::{PolicyState, ScalePolicy};
 use runner_manager_domain::store::Store;
@@ -470,7 +470,8 @@ async fn maintain_wsl_recovery_without_local_policies(
     windows_service_host: bool,
 ) {
     if windows_service_host {
-        super::wsl_watchdog::retire(context.paths());
+        super::wsl_watchdog::maintain_lifecycle_tasks(context.paths().clone()).await;
+        return;
     }
     if !wsl_recovery_is_available(windows_service_host) {
         std::future::pending::<()>().await;
@@ -506,7 +507,8 @@ async fn maintain_wsl_recovery(
     windows_service_host: bool,
 ) {
     if windows_service_host {
-        super::wsl_watchdog::retire(&paths);
+        super::wsl_watchdog::maintain_lifecycle_tasks(paths).await;
+        return;
     }
     if !wsl_recovery_is_available(windows_service_host) {
         std::future::pending::<()>().await;
@@ -550,6 +552,15 @@ async fn maintain_wsl_guest_heartbeat(
                         .as_ref()
                         .ok()
                         .map(|attempts| u32::from(active_count(attempts))),
+                    local_busy_attempts: attempts.as_ref().ok().and_then(|attempts| {
+                        u32::try_from(
+                            attempts
+                                .iter()
+                                .filter(|attempt| attempt.state() == AttemptState::Busy)
+                                .count(),
+                        )
+                        .ok()
+                    }),
                     managed_targets: policies
                         .map(|policies| {
                             policies

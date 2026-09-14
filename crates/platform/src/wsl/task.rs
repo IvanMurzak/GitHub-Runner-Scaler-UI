@@ -19,8 +19,8 @@
 //! a keep-alive through a shell string. The action here is
 //!
 //! ```text
-//! <Command>C:\Windows\System32\wsl.exe</Command>
-//! <Arguments>--distribution Ubuntu --user root --exec /usr/local/bin/runner-manager wsl-host hold</Arguments>
+//! <Command>...\runner-manager-wsl-supervisor-VERSION.exe</Command>
+//! <Arguments>...\runner-manager-wsl-VERSION.exe wsl-host supervise --distribution Ubuntu ...</Arguments>
 //! ```
 //!
 //! Task Scheduler has no `Arguments` *vector* — the element is a single string
@@ -33,10 +33,11 @@
 //! shell would interpret, and `no_shell_text_reaches_the_task_document` is the
 //! test that keeps it that way.
 //!
-//! `wsl-host hold` is a hidden Linux-only command that starts the existing
-//! systemd unit by argument-vector process execution and then stays alive.
-//! Naming it here is this crate's whole contribution to the lifecycle: the
-//! Linux side of it belongs to the CLI.
+//! `wsl-host supervise` is the hidden Windows companion. It starts the
+//! Linux-only `wsl-host hold`, restarts that child when the named distribution
+//! is recovered, and owns the bounded recovery watchdog. Running in the
+//! distribution owner's interactive token is essential: an SCM service under
+//! LocalSystem cannot see another account's WSL registrations.
 //!
 //! # A task this did not create is never touched
 //!
@@ -150,6 +151,8 @@ pub struct LifecycleTask {
     wsl_executable: PathBuf,
     linux_binary: String,
     recovery_root: Option<PathBuf>,
+    windows_supervisor: Option<PathBuf>,
+    windows_child: Option<PathBuf>,
 }
 
 impl LifecycleTask {
@@ -167,6 +170,8 @@ impl LifecycleTask {
             wsl_executable: wsl_executable.path().to_path_buf(),
             linux_binary: linux_binary.into(),
             recovery_root: None,
+            windows_supervisor: None,
+            windows_child: None,
         }
     }
 
@@ -174,6 +179,16 @@ impl LifecycleTask {
     #[must_use]
     pub fn with_recovery_root(mut self, path: PathBuf) -> Self {
         self.recovery_root = Some(path);
+        self
+    }
+
+    /// Run the keep-alive through a Windows process in the owning user's
+    /// session. That process can both hold the guest open and recover a WSL
+    /// transport which LocalSystem cannot see.
+    #[must_use]
+    pub fn with_windows_supervisor(mut self, supervisor: PathBuf, child: PathBuf) -> Self {
+        self.windows_supervisor = Some(supervisor);
+        self.windows_child = Some(child);
         self
     }
 
@@ -192,7 +207,9 @@ impl LifecycleTask {
     /// The program the task starts.
     #[must_use]
     pub fn command(&self) -> &Path {
-        &self.wsl_executable
+        self.windows_supervisor
+            .as_deref()
+            .unwrap_or(&self.wsl_executable)
     }
 
     /// The action's argument **vector**.
@@ -203,6 +220,26 @@ impl LifecycleTask {
     /// get right rather than two.
     #[must_use]
     pub fn action_arguments(&self) -> Vec<String> {
+        if self.windows_supervisor.is_some() {
+            let mut argv = vec![
+                self.windows_child
+                    .as_ref()
+                    .expect("a Windows supervisor always has a child")
+                    .to_string_lossy()
+                    .into_owned(),
+                "wsl-host".to_string(),
+                "supervise".to_string(),
+                "--distribution".to_string(),
+                self.identity.distribution.clone(),
+                "--linux-binary".to_string(),
+                self.linux_binary.clone(),
+            ];
+            if let Some(root) = &self.recovery_root {
+                argv.push("--shared-root".to_string());
+                argv.push(root.to_string_lossy().into_owned());
+            }
+            return argv;
+        }
         let mut argv = vec![
             "--distribution".to_string(),
             self.identity.distribution.clone(),
@@ -300,7 +337,7 @@ impl LifecycleTask {
         out.push_str("  <Actions Context=\"Author\">\n    <Exec>\n");
         out.push_str(&format!(
             "      <Command>{}</Command>\n",
-            xml_escape(&self.wsl_executable.to_string_lossy())
+            xml_escape(&self.command().to_string_lossy())
         ));
         out.push_str(&format!(
             "      <Arguments>{}</Arguments>\n",
@@ -914,6 +951,41 @@ mod tests {
             "{}",
             read.arguments()
         );
+    }
+
+    #[test]
+    fn a_supervised_task_runs_in_windows_and_carries_the_exact_guest_identity() {
+        let supervised = task("Ubuntu")
+            .with_recovery_root(PathBuf::from(r"C:\state\wsl-recovery\Ubuntu"))
+            .with_windows_supervisor(
+                PathBuf::from(r"C:\runner-manager-supervisor.exe"),
+                PathBuf::from(r"C:\runner-manager.exe"),
+            );
+        assert_eq!(
+            supervised.command(),
+            Path::new(r"C:\runner-manager-supervisor.exe")
+        );
+        assert_eq!(
+            supervised.action_arguments(),
+            vec![
+                r"C:\runner-manager.exe",
+                "wsl-host",
+                "supervise",
+                "--distribution",
+                "Ubuntu",
+                "--linux-binary",
+                "/usr/local/bin/runner-manager",
+                "--shared-root",
+                r"C:\state\wsl-recovery\Ubuntu",
+            ]
+        );
+        let document = supervised.xml();
+        assert!(
+            document.contains(r"C:\runner-manager-supervisor.exe"),
+            "{document}"
+        );
+        assert!(document.contains("wsl-host supervise"), "{document}");
+        assert!(!document.contains("wsl.exe</Command>"), "{document}");
     }
 
     #[test]

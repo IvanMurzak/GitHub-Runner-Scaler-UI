@@ -54,11 +54,15 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use runner_manager_domain::model::Clock;
+use runner_manager_domain::model::{Clock, StartMode};
+use runner_manager_github::device_flow::DeviceFlow;
+use runner_manager_github::rest::{InventoryGateway, RestInventory};
+use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::TaskPrincipal;
 use runner_manager_platform::wsl::artifact::{
@@ -78,11 +82,15 @@ use runner_manager_platform::wsl::{WslError, WslHost};
 use secrecy::SecretString;
 use serde::Serialize;
 
-use super::auth::{BrokeredCredential, SecretSink, SecretSinkError, broker_user_credential};
+use super::auth::{
+    BrokeredCredential, SecretSink, SecretSinkError, StoredCredential, StoringRenewal,
+    broker_user_credential,
+};
 use super::update::{AssetSource, fetch_file, fetch_text};
 use super::{
     AuthCommand, Cli, CliError, Command, Context, Failure, HOST_OPTION, StartAt, Styling,
-    WslCommand, WslDetachArgs, WslHostCommand, WslInstallArgs, WslStatusArgs, write_failed,
+    WslCommand, WslDetachArgs, WslHostCommand, WslHostSuperviseArgs, WslInstallArgs, WslStatusArgs,
+    write_failed,
 };
 
 /// `--host=` — the other spelling clap accepts for the same option.
@@ -258,6 +266,7 @@ pub fn dispatch_wsl_host(
             let mut wait = wait_for_a_stop_signal;
             hold(&HostSystemd, &unit, out, &mut wait)
         }
+        WslHostCommand::Supervise(args) => supervise(context, args, out),
         WslHostCommand::ConfigureRecovery(args) => {
             require_linux()?;
             if !args.shared_root.is_absolute() {
@@ -305,6 +314,148 @@ fn configure_guest_recovery(context: &Context, windows_path: &Path) -> Result<()
         ));
     }
     configure_guest_recovery_path(context, &translated)
+}
+
+/// Windows half of a managed WSL lifecycle task. It runs in the interactive
+/// account which owns the distribution, keeps the Linux holder alive, and is
+/// therefore the only process which can truthfully probe and recover it.
+fn supervise(
+    context: &Context,
+    args: &WslHostSuperviseArgs,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    if !cfg!(windows) {
+        return Err(CliError::new(
+            Failure::UnsupportedHost,
+            "`wsl-host supervise` is available only on Windows",
+        ));
+    }
+    validate_distribution_name(&args.distribution).map_err(|source| wsl_failure(&source))?;
+    if !args.shared_root.is_absolute() {
+        return Err(CliError::new(
+            Failure::InvalidArgument,
+            "the WSL recovery shared root must be an absolute Windows path",
+        ));
+    }
+
+    let store = context.store()?;
+    let mode = context
+        .recorded_start_mode(&store)
+        .unwrap_or(StartMode::Boot);
+    let secrets = context.secret_store(mode)?;
+    let secret = secrets
+        .load()
+        .map_err(|source| CliError::new(Failure::SecretStore, source.to_string()))?
+        .ok_or_else(|| {
+            CliError::with_remedy(
+                Failure::NotAuthenticated,
+                "the WSL recovery companion has no GitHub credential",
+                "runner-manager auth login",
+            )
+        })?;
+    let app = context.app_registration()?;
+    let flow = DeviceFlow::new(app, context.endpoints().clone())
+        .map_err(|source| CliError::new(Failure::NotAuthenticated, source.to_string()))?;
+    let renewal: Arc<dyn CredentialRenewal> = Arc::new(StoringRenewal::new(
+        flow,
+        Arc::clone(&secrets),
+        context
+            .paths()
+            .state_dir()
+            .join(runner_manager_platform::lock::LockKind::CredentialRenewal.file_name()),
+    ));
+    let client = AuthenticatedClient::new(
+        context.endpoints().clone(),
+        UserAccessToken::from_stored(secret),
+        context.clock(),
+    )
+    .map_err(|source| CliError::new(Failure::NotAuthenticated, source.to_string()))?
+    .with_renewal(renewal)
+    .with_credential_source(Arc::new(StoredCredential::new(Arc::clone(&secrets))));
+    let inventory: Arc<dyn InventoryGateway> =
+        Arc::new(RestInventory::new(Arc::new(client), context.clock()));
+    let host = WslHost::on_this_host("managed WSL lifecycle supervisor")
+        .map_err(|source| wsl_failure(&source))?;
+    let executable = host.executable().path().to_path_buf();
+    let paths = context.paths().clone();
+    let distribution = args.distribution.clone();
+    let linux_binary = args.linux_binary.clone();
+    let shared_root = args.shared_root.clone();
+
+    writeln!(
+        out,
+        "WSL lifecycle and recovery supervisor running for {distribution}"
+    )
+    .map_err(write_failed("the WSL lifecycle supervisor"))?;
+    super::runtime()?.block_on(async move {
+        tokio::select! {
+            () = keep_guest_holder_alive(executable, distribution.clone(), linux_binary, shared_root) => {
+                unreachable!("the WSL holder supervisor runs until its task is stopped")
+            }
+            () = super::wsl_watchdog::maintain_distribution(paths, inventory, distribution) => {
+                unreachable!("the WSL recovery watchdog runs until its task is stopped")
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn keep_guest_holder_alive(
+    executable: PathBuf,
+    distribution: String,
+    linux_binary: String,
+    shared_root: PathBuf,
+) {
+    loop {
+        match spawn_guest_holder(&executable, &distribution, &linux_binary, &shared_root) {
+            Ok(mut child) => loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::warn!(%distribution, %status, "the WSL guest holder exited; restarting it");
+                        break;
+                    }
+                    Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
+                    Err(error) => {
+                        tracing::warn!(%distribution, %error, "the WSL guest holder cannot be observed; restarting it");
+                        break;
+                    }
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%distribution, %error, "the WSL guest holder cannot be started")
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn spawn_guest_holder(
+    executable: &Path,
+    distribution: &str,
+    linux_binary: &str,
+    shared_root: &Path,
+) -> io::Result<Child> {
+    let mut command = std::process::Command::new(executable);
+    command
+        .args([
+            "--distribution",
+            distribution,
+            "--user",
+            "root",
+            "--exec",
+            linux_binary,
+        ])
+        .args(["wsl-host", "hold", "--shared-root"])
+        .arg(shared_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    command.spawn()
 }
 
 /// Persist the guest side of the fence and make the systemd sandbox capable of
@@ -1822,6 +1973,9 @@ pub struct Provisioner<'a> {
     pub version: String,
     /// Where the binary goes inside the distribution.
     pub linux_binary: String,
+    /// Windows executable used by the per-user lifecycle/recovery companion.
+    /// Tests may omit it to exercise the legacy direct-WSL task document.
+    pub windows_binary: Option<PathBuf>,
     /// The systemd unit the Linux service registers.
     pub unit: String,
     /// When this ran.
@@ -2034,6 +2188,25 @@ impl Provisioner<'_> {
             self.linux_binary.clone(),
         )
         .with_recovery_root(recovery_root);
+        let task = match &self.windows_binary {
+            Some(binary) => {
+                let (supervisor, child) = self
+                    .install_windows_lifecycle_companion(binary)
+                    .map_err(|source| {
+                        in_stage(
+                            Stage::LifecycleTask,
+                            CliError::new(
+                                Failure::LocalState,
+                                format!(
+                                    "cannot install the Windows WSL recovery companion: {source}"
+                                ),
+                            ),
+                        )
+                    })?;
+                task.with_windows_supervisor(supervisor, child)
+            }
+            None => task,
+        };
         let tasks = self.host.tasks();
         tasks
             .register(&task)
@@ -2086,6 +2259,25 @@ impl Provisioner<'_> {
                 service_installed,
             },
         ))
+    }
+
+    fn install_windows_lifecycle_companion(
+        &self,
+        source: &Path,
+    ) -> Result<(PathBuf, PathBuf), io::Error> {
+        let directory = self.paths.state_dir().join("bin");
+        std::fs::create_dir_all(&directory)?;
+        let child = directory.join(format!("runner-manager-wsl-{}.exe", self.version));
+        let supervisor = directory.join(format!(
+            "runner-manager-wsl-supervisor-{}.exe",
+            self.version
+        ));
+        install_versioned_copy(source, &child)?;
+        install_versioned_copy(
+            &source.with_file_name("runner-manager-supervisor.exe"),
+            &supervisor,
+        )?;
+        Ok((supervisor, child))
     }
 
     /// Stage 2, whole: the checksum document, the exact release, and the
@@ -2383,6 +2575,23 @@ impl Provisioner<'_> {
     }
 }
 
+fn install_versioned_copy(source: &Path, destination: &Path) -> io::Result<()> {
+    if destination.is_file() {
+        return Ok(());
+    }
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut input = std::fs::File::open(source)?;
+    io::copy(&mut input, temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(destination) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
+    }
+}
+
 /// Puts a stage's sentence in front of a failure, keeping its class and remedy.
 ///
 /// Applied to every failure the transaction can raise — the platform's, the
@@ -2572,6 +2781,7 @@ pub fn install(
         principal,
         version,
         linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
+        windows_binary: std::env::current_exe().ok(),
         unit: linux_unit(),
         now: context.clock().now(),
     };
@@ -3312,6 +3522,24 @@ mod tests {
         assert_eq!(newline.class(), Failure::InvalidArgument);
     }
 
+    #[test]
+    fn versioned_windows_companion_copy_is_immutable_and_never_locks_the_package_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.exe");
+        let destination = root.path().join("state/bin/runner-manager-wsl-1.exe");
+        std::fs::write(&source, b"first").unwrap();
+        install_versioned_copy(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"first");
+
+        std::fs::write(&source, b"new package version").unwrap();
+        install_versioned_copy(&source, &destination).unwrap();
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"first",
+            "a running versioned companion is never overwritten"
+        );
+    }
+
     /// Shaped like a stored credential document and unmistakably not one.
     ///
     /// Assembled at run time so the literal is in no source file and in no
@@ -3742,6 +3970,7 @@ mod tests {
                 principal: TaskPrincipal::named("FIXTURE\\ivan"),
                 version: version().to_string(),
                 linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
+                windows_binary: None,
                 unit: UNIT.to_string(),
                 now: DateTime::from_timestamp(1_800_000_000, 0).expect("a fixed instant"),
             };

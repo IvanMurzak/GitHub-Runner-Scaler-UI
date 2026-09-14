@@ -691,6 +691,9 @@ pub struct WslStatusArgs {
 pub enum WslHostCommand {
     /// Start the Linux service, then stay alive until this process is stopped.
     Hold(WslHostHoldArgs),
+    /// Own the Windows-side keep-alive and safe recovery loop. Not for people.
+    #[command(hide = true)]
+    Supervise(WslHostSuperviseArgs),
     /// Store the DrvFS recovery directory selected by the Windows provider.
     #[command(hide = true)]
     ConfigureRecovery(WslHostConfigureRecoveryArgs),
@@ -701,6 +704,16 @@ pub struct WslHostHoldArgs {
     /// Windows directory used for the cross-boundary launch fence.
     #[arg(long, value_name = "WINDOWS_PATH", hide = true)]
     pub shared_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct WslHostSuperviseArgs {
+    #[arg(long, value_name = "NAME")]
+    pub distribution: String,
+    #[arg(long, value_name = "PATH")]
+    pub linux_binary: String,
+    #[arg(long, value_name = "WINDOWS_PATH")]
+    pub shared_root: PathBuf,
 }
 
 #[derive(Debug, Args)]

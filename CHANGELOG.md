@@ -7,6 +7,25 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.23
+
+### Fixes
+
+- Managed WSL hosts now have a per-user Windows recovery companion. The boot
+  service keeps that companion running through Task Scheduler, while the
+  companion holds the distribution open and can recover a wedged WSL transport
+  in the Windows account that owns the distribution.
+- Automatic WSL recovery now distinguishes busy work from stale active attempt
+  records. It restarts only the affected distribution and only after a matching
+  drain acknowledgement, two fresh idle guest heartbeats, two complete idle
+  GitHub inventory reads, and checks for unmanaged runner services.
+- Windows WSL transport failures are no longer reported as missing systemd.
+  When a fresh guest heartbeat survives the control-path failure, the TUI shows
+  the host as degraded instead of blocked and explains the guarded recovery.
+- The TUI detects lifecycle tasks from older releases that have only the direct
+  WSL keep-alive. It shows the exact convergent `wsl install` command that
+  replaces them with the recovery companion.
+
 ## 0.4.22
 
 ### Fixes

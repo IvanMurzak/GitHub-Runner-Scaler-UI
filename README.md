@@ -401,11 +401,13 @@ feature promises unattended Linux availability **after that user logs on**, not 
 Windows reboot and the first interactive logon. `wsl status` says so on every run rather than
 leaving you to discover it after a restart.
 
-**Safe automatic recovery.** The Windows daemon probes each managed WSL2 distribution. After a
-continuous five-minute transport failure it requests a drain and can terminate and restart only
-that exact distribution. Recovery proceeds only after two fresh guest heartbeats report zero
-active attempts, two complete GitHub inventories report no busy or online managed registrations,
-the lifecycle task is verified as product-owned, and no unmanaged Actions runner service exists.
+**Safe automatic recovery.** A Windows recovery companion runs inside each managed distribution's
+per-user lifecycle task; unlike the boot service's `LocalSystem` account, that process can see the
+owning user's WSL registrations. After a continuous five-minute transport failure it requests a
+drain and can terminate and restart only that exact distribution. Recovery proceeds only after
+two fresh guest heartbeats report no busy attempts (idle orphaned listeners do not deadlock it),
+two complete GitHub inventories report no busy or online managed registrations, the lifecycle
+task is verified as product-owned, and no unmanaged Actions runner service exists.
 Missing, stale, contradictory, or unauthorized evidence leaves the host in
 `recovery-blocked`; it never falls back to a global `wsl --shutdown`. Recovery is capped at three
 attempts per hour.

@@ -524,6 +524,7 @@ impl Workstation {
             principal: TaskPrincipal::named(PRINCIPAL),
             version: version().to_string(),
             linux_binary: LINUX_BINARY.to_string(),
+            windows_binary: None,
             unit: UNIT.to_string(),
             now: DateTime::from_timestamp(1_800_000_000, 0).expect("a fixed instant"),
         };
