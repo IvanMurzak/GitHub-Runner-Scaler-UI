@@ -764,6 +764,8 @@ async fn production_screen_snapshot(
         ));
     };
     let clock = context.clock();
+    let busy_for_by_runner = local_busy_durations(context, clock.now())
+        .map_err(|detail| offline_failure(context, detail))?;
     let app = context
         .app_registration()
         .map_err(|error| (Availability::Unauthorized, error.to_string()))?;
@@ -912,6 +914,10 @@ async fn production_screen_snapshot(
                 labels: runner.labels.clone(),
                 online: runner.status.is_online(),
                 busy: runner.busy,
+                busy_for_seconds: runner
+                    .busy
+                    .then(|| busy_for_by_runner.get(&runner.id).copied())
+                    .flatten(),
                 ephemeral,
                 ownership,
             });
@@ -1151,6 +1157,38 @@ fn production_activity(context: &crate::cli::Context) -> Result<Vec<screens::Act
         .map(|policy| (policy.id, policy.target.slug()))
         .collect::<HashMap<_, _>>();
     Ok(activity_rows(&attempts, &targets))
+}
+
+fn local_busy_durations(
+    context: &crate::cli::Context,
+    now: runner_manager_domain::model::Timestamp,
+) -> Result<HashMap<u64, u64>, String> {
+    let store = context.store().map_err(|error| error.to_string())?;
+    let attempts = store.attempts().map_err(|error| error.to_string())?;
+    Ok(busy_durations(&attempts, now))
+}
+
+fn busy_durations(
+    attempts: &[RunnerAttempt],
+    now: runner_manager_domain::model::Timestamp,
+) -> HashMap<u64, u64> {
+    let mut durations = HashMap::new();
+    for attempt in attempts {
+        if attempt.state() != AttemptState::Busy {
+            continue;
+        }
+        let Some(runner_id) = attempt.github_runner_id() else {
+            continue;
+        };
+        let Ok(elapsed) = (now - attempt.last_state_change_at()).to_std() else {
+            continue;
+        };
+        durations
+            .entry(runner_id)
+            .and_modify(|seconds: &mut u64| *seconds = (*seconds).max(elapsed.as_secs()))
+            .or_insert(elapsed.as_secs());
+    }
+    durations
 }
 
 fn activity_rows(
@@ -1535,6 +1573,7 @@ pub struct AppState {
     pub should_exit: bool,
     pub ticks: u64,
     pub last_tick: Option<Instant>,
+    busy_tick_remainder: Duration,
     pub settings: SettingsUi,
     /// Glyphs and colour, resolved once here so no frame has to ask the
     /// environment what the terminal can print.
@@ -1561,6 +1600,7 @@ impl AppState {
             should_exit: false,
             ticks: 0,
             last_tick: None,
+            busy_tick_remainder: Duration::ZERO,
             settings: SettingsUi::default(),
             skin: Skin::detect(),
             navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
@@ -1637,6 +1677,9 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
         }
         AppEvent::Timer(instant) => {
             state.ticks = state.ticks.saturating_add(1);
+            if let Some(previous) = state.last_tick {
+                advance_busy_durations(state, instant.saturating_duration_since(previous));
+            }
             state.last_tick = Some(instant);
             Vec::new()
         }
@@ -1648,6 +1691,10 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
             if let Some(mut snapshot) = agent.snapshot {
+                reconcile_busy_durations(
+                    &state.screen_model.snapshot.runners,
+                    &mut snapshot.runners,
+                );
                 snapshot.activity = merge_activity_history(
                     &state.screen_model.snapshot.activity,
                     snapshot.activity,
@@ -1665,6 +1712,53 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             Vec::new()
         }
         AppEvent::Key(_) => Vec::new(),
+    }
+}
+
+fn advance_busy_durations(state: &mut AppState, elapsed: Duration) {
+    if !state
+        .screen_model
+        .snapshot
+        .runners
+        .iter()
+        .any(|row| row.busy)
+    {
+        state.busy_tick_remainder = Duration::ZERO;
+        return;
+    }
+    let elapsed = state.busy_tick_remainder.saturating_add(elapsed);
+    let whole_seconds = elapsed.as_secs();
+    state.busy_tick_remainder = elapsed.saturating_sub(Duration::from_secs(whole_seconds));
+    if whole_seconds == 0 {
+        return;
+    }
+    for row in &mut state.screen_model.snapshot.runners {
+        if row.busy {
+            row.busy_for_seconds = Some(
+                row.busy_for_seconds
+                    .unwrap_or(0)
+                    .saturating_add(whole_seconds),
+            );
+        }
+    }
+}
+
+fn reconcile_busy_durations(previous: &[RunnerRow], current: &mut [RunnerRow]) {
+    let previous = previous
+        .iter()
+        .filter(|row| row.busy)
+        .filter_map(|row| {
+            row.busy_for_seconds
+                .map(|seconds| (row.id.as_str(), seconds))
+        })
+        .collect::<HashMap<_, _>>();
+    for row in current {
+        if !row.busy {
+            row.busy_for_seconds = None;
+            continue;
+        }
+        let observed = previous.get(row.id.as_str()).copied().unwrap_or(0);
+        row.busy_for_seconds = Some(row.busy_for_seconds.unwrap_or(observed).max(observed));
     }
 }
 
@@ -2677,6 +2771,88 @@ mod tests {
             (Some(false), RunnerOwnership::ManagedRemote),
             "an explicit GitHub fact wins over the name-based fallback"
         );
+    }
+
+    #[test]
+    fn a_local_busy_attempt_uses_the_moment_it_entered_busy() {
+        use chrono::TimeZone as _;
+
+        let entered = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let now = entered + chrono::Duration::seconds(3_725);
+        let busy = runner_manager_testkit::fixtures::attempt()
+            .state(AttemptState::Busy)
+            .github_runner_id(73)
+            .created_at(entered)
+            .entered_state_at(entered)
+            .build();
+        let idle = runner_manager_testkit::fixtures::attempt()
+            .state(AttemptState::Idle)
+            .github_runner_id(74)
+            .created_at(entered)
+            .entered_state_at(entered)
+            .build();
+
+        let durations = busy_durations(&[busy, idle], now);
+        assert_eq!(durations.get(&73), Some(&3_725));
+        assert!(!durations.contains_key(&74));
+    }
+
+    #[test]
+    fn busy_duration_ticks_live_survives_refresh_and_resets_after_idle() {
+        let runner = |busy, busy_for_seconds| RunnerRow {
+            id: "runner-73".into(),
+            name: "runner-manager-1522f949-7875-4752-8cf9-7854dca2a0c2".into(),
+            owner: "acme/app".into(),
+            os: "linux".into(),
+            labels: vec!["self-hosted".into()],
+            online: true,
+            busy,
+            busy_for_seconds,
+            ephemeral: Some(true),
+            ownership: RunnerOwnership::ManagedRemote,
+        };
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            runners: vec![runner(true, None)],
+            ..Snapshot::default()
+        });
+        reconcile_busy_durations(&[], &mut state.screen_model.snapshot.runners);
+        assert_eq!(
+            state.screen_model.snapshot.runners[0].busy_for_seconds,
+            Some(0)
+        );
+
+        let start = Instant::now();
+        reduce(&mut state, AppEvent::Timer(start));
+        reduce(
+            &mut state,
+            AppEvent::Timer(start + Duration::from_millis(1_500)),
+        );
+        assert_eq!(
+            state.screen_model.snapshot.runners[0].busy_for_seconds,
+            Some(1)
+        );
+        reduce(
+            &mut state,
+            AppEvent::Timer(start + Duration::from_millis(2_100)),
+        );
+        assert_eq!(
+            state.screen_model.snapshot.runners[0].busy_for_seconds,
+            Some(2)
+        );
+
+        let previous = state.screen_model.snapshot.runners.clone();
+        let mut refreshed = vec![runner(true, None)];
+        reconcile_busy_durations(&previous, &mut refreshed);
+        assert_eq!(refreshed[0].busy_for_seconds, Some(2));
+
+        let mut idle = vec![runner(false, Some(999))];
+        reconcile_busy_durations(&refreshed, &mut idle);
+        assert_eq!(idle[0].busy_for_seconds, None);
+        let mut busy_again = vec![runner(true, None)];
+        reconcile_busy_durations(&idle, &mut busy_again);
+        assert_eq!(busy_again[0].busy_for_seconds, Some(0));
     }
 
     fn crossterm_key(code: KeyCode) -> KeyEvent {
@@ -3699,6 +3875,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: true,
                     busy: false,
+                    busy_for_seconds: None,
                     ephemeral: Some(true),
                     ownership: RunnerOwnership::Local,
                 },
@@ -3710,6 +3887,7 @@ mod tests {
                     labels: vec!["external".into()],
                     online: false,
                     busy: false,
+                    busy_for_seconds: None,
                     ephemeral: Some(false),
                     ownership: RunnerOwnership::External,
                 },
@@ -3794,6 +3972,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: true,
                     busy: false,
+                    busy_for_seconds: None,
                     ephemeral: Some(true),
                     ownership: RunnerOwnership::Local,
                 },
@@ -3805,6 +3984,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: false,
                     busy: false,
+                    busy_for_seconds: None,
                     ephemeral: Some(false),
                     ownership: RunnerOwnership::External,
                 },
@@ -3903,6 +4083,19 @@ mod tests {
             ),
         );
         assert_eq!(state.screen_model.dashboard_runner_sort, (1, false));
+        let sorted_again = rendered(120, 30, &state);
+        let (runner_header_row, status) = sorted_again
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                (line.contains("Runner") && line.contains("Status")).then(|| {
+                    (
+                        u16::try_from(row).unwrap(),
+                        line.find("Status").unwrap() as u16,
+                    )
+                })
+            })
+            .unwrap();
         reduce(
             &mut state,
             mouse(

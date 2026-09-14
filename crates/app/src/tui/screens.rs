@@ -258,6 +258,10 @@ pub struct RunnerRow {
     pub labels: Vec<String>,
     pub online: bool,
     pub busy: bool,
+    /// Seconds since this runner entered, or was first observed in, `busy`.
+    /// `None` for a non-busy runner or before a busy runner has a trusted
+    /// timestamp or an observation from this TUI.
+    pub busy_for_seconds: Option<u64>,
     /// GitHub omits this field from some runner-inventory responses. `None`
     /// must remain unknown instead of being presented as persistent.
     pub ephemeral: Option<bool>,
@@ -448,14 +452,14 @@ impl ScreenModel {
             runners: TableViewState::default(),
             activity: TableViewState::default(),
             dashboard_repository_sort: (0, false),
-            dashboard_runner_sort: (2, false),
+            dashboard_runner_sort: (3, false),
             repository_detail: None,
             runner_detail: None,
             acknowledged_activity: HashSet::new(),
             refresh_in_progress: false,
             refresh_animation_tick: 0,
         };
-        model.runners.sort_column = 2;
+        model.runners.sort_column = 3;
         model.activity.sort_column = 1;
         model.reconcile_all(None);
         model
@@ -806,8 +810,9 @@ fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> 
     let order = match column {
         0 => a.owner.cmp(&b.owner),
         1 => state(a).cmp(&state(b)),
-        3 => a.os.cmp(&b.os),
-        4 => a.labels.cmp(&b.labels),
+        2 => a.busy_for_seconds.cmp(&b.busy_for_seconds),
+        4 => a.os.cmp(&b.os),
+        5 => a.labels.cmp(&b.labels),
         _ => a.name.cmp(&b.name),
     };
     directed(order, descending).then_with(|| a.name.cmp(&b.name))
@@ -816,8 +821,8 @@ fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> 
 fn set_legacy_sort(table: &mut TableViewState, screen: ReadOnlyScreen, order: SortOrder) {
     let (column, descending) = match (screen, order) {
         (ReadOnlyScreen::Repositories, SortOrder::WorkloadDescending) => (1, true),
-        (ReadOnlyScreen::Runners, SortOrder::NameAscending) => (2, false),
-        (ReadOnlyScreen::Runners, SortOrder::NameDescending) => (2, true),
+        (ReadOnlyScreen::Runners, SortOrder::NameAscending) => (3, false),
+        (ReadOnlyScreen::Runners, SortOrder::NameDescending) => (3, true),
         (ReadOnlyScreen::Activity, SortOrder::NameAscending) => (1, false),
         (ReadOnlyScreen::Activity, _) => (1, true),
         (_, SortOrder::NameDescending) => (0, true),
@@ -938,9 +943,9 @@ const REPOSITORY_COLUMNS: [Column; 6] = [
 /// The repository leads, the state follows, and the runner name comes third:
 /// a reader scans down the repository they care about, checks whether anything
 /// is wrong, and only then needs the identity of the individual runner. The
-/// dashboard draws the first three of these, so their order is load-bearing on
+/// dashboard draws the first four of these, so their order is load-bearing on
 /// two screens.
-const RUNNER_COLUMNS: [Column; 5] = [
+const RUNNER_COLUMNS: [Column; 6] = [
     Column::flexible("Repository", 14, 0),
     // The badge is three facts wide, and on a narrow terminal it gives up the
     // last of them first -- ownership, then lifetime. The state itself, which
@@ -949,6 +954,9 @@ const RUNNER_COLUMNS: [Column; 5] = [
     Column::flexible("Status", 9, 0)
         .trimming(Trim::Tail)
         .reluctant(),
+    // Duration is compact and useful while a job is running, but gives way
+    // before the three identity columns on a genuinely narrow terminal.
+    Column::rigid("Busy for", 1).right(),
     Column::flexible("Runner", 12, 0),
     Column::rigid("OS", 2),
     Column::flexible("Labels", 8, 1),
@@ -1596,7 +1604,7 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
             "Runners",
             &runners,
             rows,
-            &RUNNER_COLUMNS[..3],
+            &RUNNER_COLUMNS[..4],
             GridPresentation::preview(model.dashboard_runner_sort),
         )),
     ]);
@@ -1862,6 +1870,11 @@ fn runner_sections(
                 ("Online: ", row.online.to_string(), online_tone(row.online)),
                 ("Busy: ", row.busy.to_string(), Tone::Plain),
                 (
+                    "Busy for: ",
+                    runner_busy_for(row, skin),
+                    if row.busy { Tone::Busy } else { Tone::Muted },
+                ),
+                (
                     "Lifetime: ",
                     match row.ephemeral {
                         Some(true) => "ephemeral",
@@ -2100,6 +2113,10 @@ fn runner_grid(
                         Tone::Accent,
                     ),
                     runner_status(row, skin),
+                    Cell::new(
+                        runner_busy_for(row, skin),
+                        if row.busy { Tone::Busy } else { Tone::Muted },
+                    ),
                     Cell::plain(row.name.clone()),
                     Cell::new(row.os.clone(), Tone::Muted),
                     Cell::new(row.labels.join(","), Tone::Muted),
@@ -2143,6 +2160,30 @@ fn runner_status(row: &RunnerRow, skin: &Skin) -> Cell {
         (format!("  {mark}{lifetime:<10}"), Tone::Muted),
         (format!("  {ownership}"), Tone::Muted),
     ])
+}
+
+fn runner_busy_for(row: &RunnerRow, skin: &Skin) -> String {
+    if !row.busy {
+        return skin.pick("\u{2014}", "-").to_owned();
+    }
+    row.busy_for_seconds
+        .map_or_else(|| skin.pick("\u{2026}", "..").to_owned(), format_duration)
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h {:02}m", seconds / (60 * 60), (seconds / 60) % 60)
+    } else {
+        format!(
+            "{}d {:02}h",
+            seconds / (24 * 60 * 60),
+            (seconds / (60 * 60)) % 24
+        )
+    }
 }
 
 /// The rows a grid may draw, starting where the table is scrolled to.
@@ -2225,6 +2266,7 @@ mod tests {
                     labels: vec!["self-hosted".into(), "rm-home-win-x64".into()],
                     online: true,
                     busy: true,
+                    busy_for_seconds: Some(125),
                     ephemeral: Some(true),
                     ownership: RunnerOwnership::Local,
                 },
@@ -2236,6 +2278,7 @@ mod tests {
                     labels: vec!["self-hosted".into()],
                     online: true,
                     busy: false,
+                    busy_for_seconds: None,
                     ephemeral: Some(false),
                     ownership: RunnerOwnership::External,
                 },
@@ -2439,8 +2482,8 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=27 bytes=1657 fnv=df4952d47044b735 | RUNNER READINESS: READY                             | Problems & fixes: none
-        Dashboard/empty: lines=23 bytes=1131 fnv=d745b466823d023c | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
+        Dashboard/populated: lines=27 bytes=1723 fnv=f1e4f8491ee972d2 | RUNNER READINESS: READY                             | Problems & fixes: none
+        Dashboard/empty: lines=23 bytes=1175 fnv=3c7196c52442cde1 | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
@@ -2451,7 +2494,7 @@ mod tests {
         Repositories/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Repositories/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         Runners/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Runners/populated: lines=7 bytes=716 fnv=5868bb636fe4722f | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
+        Runners/populated: lines=7 bytes=782 fnv=fb2aa92400d0a70c | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
         Runners/empty: lines=3 bytes=87 fnv=2b42f5859f786d03 | EMPTY | Action: F5 refresh or open Repositories
         Runners/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Runners/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
@@ -2616,8 +2659,13 @@ mod tests {
             .expect("a header row");
         let repository = header.find("Repository").expect("Repository column");
         let status = header.find("Status").expect("Status column");
+        let busy_for = header.find("Busy for").expect("Busy for column");
         let runner = header.find("Runner").expect("Runner column");
-        assert!(repository < status && status < runner, "{header}");
+        assert!(
+            repository < status && status < busy_for && busy_for < runner,
+            "{header}"
+        );
+        assert!(text.contains("2m 05s"), "{text}");
 
         // Natural width keeps the whole name; a real terminal takes its middle
         // and leaves both ends, because both ends are what tell two runners on
@@ -2625,9 +2673,36 @@ mod tests {
         assert!(text.contains("rm-home-win-x64-0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
         let frame = drawn(110, 24, &model);
         assert!(!frame.contains("rm-home-win-x64-0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
-        assert!(frame.contains("rm-home-win"), "head is gone:\n{frame}");
-        assert!(frame.contains("c3d2e1f0"), "tail is gone:\n{frame}");
+        assert!(frame.contains("rm-home"), "head is gone:\n{frame}");
+        assert!(frame.contains("3d2e1f0"), "tail is gone:\n{frame}");
         assert!(frame.contains('\u{2026}'), "no ellipsis:\n{frame}");
+    }
+
+    #[test]
+    fn busy_duration_is_compact_at_every_boundary_and_idle_is_not_timed() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(60), "1m 00s");
+        assert_eq!(format_duration(3_599), "59m 59s");
+        assert_eq!(format_duration(3_600), "1h 00m");
+        assert_eq!(format_duration(86_399), "23h 59m");
+        assert_eq!(format_duration(86_400), "1d 00h");
+
+        let mut idle = populated().runners.remove(0);
+        idle.busy = false;
+        idle.busy_for_seconds = Some(999);
+        assert_eq!(runner_busy_for(&idle, &Skin::ASCII), "-");
+    }
+
+    #[test]
+    fn a_narrow_runner_table_sacrifices_duration_before_identity() {
+        let mut model = ScreenModel::new(populated());
+        model.screen = ReadOnlyScreen::Runners;
+        let frame = drawn(54, 20, &model);
+        assert!(!frame.contains("Busy for"), "{frame}");
+        for essential in ["Repository", "Status", "Runner"] {
+            assert!(frame.contains(essential), "missing {essential}:\n{frame}");
+        }
     }
 
     #[test]
