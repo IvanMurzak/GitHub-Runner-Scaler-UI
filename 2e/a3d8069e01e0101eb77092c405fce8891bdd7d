@@ -1,0 +1,69 @@
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/b1-execution-domain-provider.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/d1-linux-wsl-oci.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/c2-profile-tui.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-34
+.taskflow/2026-09-13-runner-sandbox-isolation/02-target-architecture.md
+  s_2601a144b34c45::t_449fc977f7c2ed 46,129-132
+  s_2601a144b34c45::t_064ca7e80aa654 5-6,9-19,25,35,82-83,85-86,88,90-92,94,106-109,114-119,136,145
+  s_2601a144b34c45::t_104273d4949d40 1-4,7-8,20-24,26-34,36-45,47-81,84,87,89,93,95-105,110-113,120-128,133-135,137-144
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/c1-profile-cli.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/g1-acceptance-docs.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/a1-profile-domain-store.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-36
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/d3-macos-vm.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/ROADMAP.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 4,37,41-44,50,89-94
+  s_2601a144b34c45::t_ae0866fe5c352f 5-6,95-104
+  s_2601a144b34c45::t_1dc24f80396208 3,83-88
+  s_2601a144b34c45::t_18a12ec6e890d3 12,14-21,24-35,77-82
+  s_2601a144b34c45::t_104273d4949d40 1-2,7-11,13,22-23,36,38-40,45-49,60-76
+  s_2601a144b34c45::t_4d663c85603dc7 51-59
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/README.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-8
+.taskflow/2026-09-13-runner-sandbox-isolation/03-platform-strategy.md
+  s_2601a144b34c45::t_408415265ae79a 102-104
+  s_2601a144b34c45::t_104273d4949d40 1-101,105-108
+.taskflow/2026-09-13-runner-sandbox-isolation/05-routing-profiles.md
+  s_2601a144b34c45::t_9cada3746c82ea 35-36,53-57,70-73
+  s_2601a144b34c45::t_7591e994828216 1-34,37-52,58-69,74-102
+.taskflow/2026-09-13-runner-sandbox-isolation/README.md
+  s_2601a144b34c45::t_104273d4949d40 2,5-14,19-23,25,33-38,41,43-44,46,48-60,63
+  s_2601a144b34c45::t_1667f7f624bc7f 3-4,62
+  s_2601a144b34c45::t_36d58438c74ca0 1,15-18,24,26-32,39-40,42,45,47,61
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/a2-routing-reconcile.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/d2-windows-hyperv.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/06-review-findings.md
+  s_2601a144b34c45::t_4a43ba74af9349 1-39
+.taskflow/2026-09-13-runner-sandbox-isolation/tasks/b2-isolated-lifecycle.md
+  s_2601a144b34c45::t_ee8cd9e5faabd4 1-35
+.taskflow/2026-09-13-runner-sandbox-isolation/01-current-architecture.md
+  s_2601a144b34c45::t_c92c38d1b6f4c1 23-42,95-97,99,101,103,105
+  s_2601a144b34c45::t_104273d4949d40 1-22,43-94,98,100,102,104
+.taskflow/2026-09-13-runner-sandbox-isolation/04-security-recovery.md
+  s_2601a144b34c45::t_d5d50999b9ade0 3
+  s_2601a144b34c45::t_95620410bfae13 15-17,79-82,85-89,91,93,95,97,99,101
+  s_2601a144b34c45::t_104273d4949d40 1-2,4-14,18-78,83-84,90,92,94,96,98,100,102-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2ea3d8069e01e0101eb77092c405fce8891bdd7d",
+  "prompts": {},
+  "sessions": {
+    "s_2601a144b34c45": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09d43-7d86-72a2-8244-81b1d9ea8da5",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
