@@ -1,0 +1,95 @@
+CHANGELOG.md
+  s_c9018c0a298938::t_38bf78d3dd8d77 10-27
+  s_92e74af38f2870::t_447fb18354a299 28
+crates/app/src/cli/daemon.rs
+  s_c9018c0a298938::t_3a8646d5fa979b 26,555-563
+  s_c9018c0a298938::t_f930f7fe567cb0 473-474,510-511
+crates/app/src/cli/mod.rs
+  s_c9018c0a298938::t_05bc371896a881 694-696,709-715
+  s_85d9ac5d33d9be::t_77d946af6c2385 716-718
+crates/platform/src/wsl/recovery.rs
+  s_c9018c0a298938::t_3a8646d5fa979b 19,21,92-93,95-99,101-108,143,145,169,218-235
+  s_c9018c0a298938::t_eaddf33926e453 182,184-187
+  s_c9018c0a298938::t_ab65bb0ab4522e 165
+crates/platform/src/wsl/probe.rs
+  s_c9018c0a298938::t_ffbecc5da20a08 562-566,571-577,910-929
+  s_c9018c0a298938::t_6e035d8a25466a 567-570
+  s_92e74af38f2870::t_688783deeccdcd 930
+crates/app/src/cli/wsl_watchdog.rs
+  s_c9018c0a298938::t_c6c48384f6762e 112-124
+  s_c9018c0a298938::t_3a8646d5fa979b 35,194,234,269-271,273,313,329,349-355,449,460,464-465,469,477-478,484
+  s_c9018c0a298938::t_66102c043cf5c3 132
+  s_c9018c0a298938::t_19034e5898032b 14
+  s_c9018c0a298938::t_f930f7fe567cb0 22,92-111,125-126,128-131,133-135,491-516
+  s_c9018c0a298938::t_255a11b529f414 65-72,74,77-86,88-91,136-143
+crates/app/src/cli/wsl_acceptance.rs
+  s_c9018c0a298938::t_3d110778f3edd4 527
+crates/app/src/tui/shell.rs
+  s_c9018c0a298938::t_309a8ef727c171 1022-1027,1029,1033-1039,1074-1080
+  s_c9018c0a298938::t_08f7f399cbdb9c 685-688,964-983,1103-1107,1111-1112
+  s_c9018c0a298938::t_cd3a931baf45f1 4769,4773-4783
+  s_c9018c0a298938::t_88ebfc84e075f1 1081,1113,4842-4855
+  s_c9018c0a298938::t_89e1b322811de2 1032,1040
+  s_c9018c0a298938::t_415919c57fed98 702-715,1108-1110
+  s_c9018c0a298938::t_394b3ced246196 1082
+  s_c9018c0a298938::t_70cfb3a652feeb 1114
+  s_c9018c0a298938::t_c2b3b039a61810 4784
+crates/platform/src/wsl/fence.rs
+  s_c9018c0a298938::t_ab65bb0ab4522e 486
+  s_c9018c0a298938::t_3a8646d5fa979b 151-155
+crates/platform/src/wsl/task.rs
+  s_c9018c0a298938::t_566af97a55e23d 956-959,964,969-970,972-982,987-989
+  s_c9018c0a298938::t_05bc371896a881 154,173,185-187,192-194,210-212,223-224,230-242,340,990
+  s_c9018c0a298938::t_16adaf172d8c0a 22-23,36-40
+  s_c9018c0a298938::t_74c948946731c3 155,174,189-191,225-229,960-963,965-968,971,983-986
+  s_92e74af38f2870::t_1ee634397696d4 188
+README.md
+  s_c9018c0a298938::t_16adaf172d8c0a 404-410
+crates/app/src/cli/wsl.rs
+  s_c9018c0a298938::t_82df21c6367ecb 459,2578-2594
+  s_c9018c0a298938::t_74c948946731c3 2192-2194,2206-2207,2264-2280
+  s_c9018c0a298938::t_05bc371896a881 58,62-63,269,1976-1978,2191,2208-2209,2784
+  s_c9018c0a298938::t_14edb43e029f87 2195-2199,2203-2205
+  s_c9018c0a298938::t_53aec2a7ab3819 2200-2202
+  s_c9018c0a298938::t_415919c57fed98 85-88,92-93,385-389,424-426,440-447
+  s_c9018c0a298938::t_995ed292a16e74 2281,3525-3542
+  s_c9018c0a298938::t_3d110778f3edd4 3973
+  s_c9018c0a298938::t_d1d1160481fcf6 377-378
+  s_c9018c0a298938::t_255a11b529f414 57,319-332,334-376,379-384,390-423,427-439,448-458
+  s_c9018c0a298938::t_f6a724c8ffbb9a 64-65,333
+  s_92e74af38f2870::t_84ae92e3d7384e 460,2282
+crates/platform/tests/privileged_wsl_lifecycle.rs
+  s_c9018c0a298938::t_dca46a628f3a9d 48,128-139,180,199-203,206-212,229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7c55b27da76f55038d5718acd766f8d799c47a01",
+  "prompts": {},
+  "sessions": {
+    "s_85d9ac5d33d9be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d3f13fe-302d-47f0-9d10-273cbb49779c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_92e74af38f2870": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0765a-635f-7b30-a528-29fb49f99855",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_c9018c0a298938": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0973c-2ad1-7622-b64b-2f3109c27b5b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
