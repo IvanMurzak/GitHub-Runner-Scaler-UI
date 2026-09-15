@@ -2,8 +2,8 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1 merged into the integration ref; a2 dispatched,
-and b1 remains ready.
+**Implementation status:** a1 and a2 merged into the integration ref; b1
+is ready for the next round.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -48,7 +48,7 @@ This file is the only live task-state record.
 | id | Task (spec) | group | seq | needs | repo | base_branch | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---:|---:|---|---|---|---|---|---|---|---|
 | a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | ✅ | [PR #70](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/70) / a157f3c | 2026-09-15 |
-| a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | 🔵 | worktree-a2-routing-reconcile / implement-task | 2026-09-15 |
+| a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | ✅ | [PR #71](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/71) / 95901da | 2026-09-15 |
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ready | — | 2026-09-15 |
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | pending | — | 2026-09-13 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | pending | — | 2026-09-13 |
@@ -124,3 +124,10 @@ verified remote integration ref and its PR base recorded as
 `runner-sandbox-isolation`. The pipeline's manager and fresh executor require
 the available native agent slots while a task runs, so b1 is held ready for
 the next dispatch.
+
+**2026-09-15 — a2 integrated.** The native Codex session-loop variant of
+`implement-task` completed implementation, independent review,
+simplification, and landing. Task PR #71 passed the exact local gate and seven
+CI/E2E checks at head 7b17625. The scheduler verified routing refusals,
+shared-target accounting, remedies, and capacity evidence, then squash-merged
+it into `runner-sandbox-isolation` at 95901da. b1 is the next ready task.
