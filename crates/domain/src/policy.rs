@@ -28,7 +28,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ScaleTarget,
+    Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ProfileName, ScaleTarget,
     ValidationError,
 };
 use crate::path::LocalAbsolutePath;
@@ -96,6 +96,15 @@ pub enum PolicyError {
 
     #[error("the host label {label} is the routing identity of this policy and cannot be removed")]
     HostLabelNotRemovable { label: Label },
+
+    #[error("a named profile's stored selector is not its derived selector")]
+    InvalidProfileSelector,
+
+    #[error("the native default profile must retain its compatibility selector")]
+    NamedConstructorForDefault,
+
+    #[error("a named profile must derive its selector when promoted to Autoscale")]
+    NamedProfileNeedsDerivedSelector,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +204,27 @@ impl RoutingLabels {
             ),
             additional: BTreeSet::new(),
         }
+    }
+
+    /// Named profiles have a selector derived from host identity and profile.
+    /// The native `default` profile retains its historical label through the
+    /// compatibility constructor instead.
+    #[must_use]
+    pub fn derive_for_profile(
+        host_label: &HostLabel,
+        os: Os,
+        arch: Arch,
+        profile: &ProfileName,
+    ) -> Self {
+        let label = format!(
+            "{}-{}-{}-{}-{}",
+            Self::PREFIX,
+            host_label.as_str(),
+            os.label_token(),
+            arch.label_token(),
+            profile.as_str()
+        );
+        Self::from_host_label(Label::new(label).expect("validated selector segments form a label"))
     }
 
     /// Build from an explicit host label, for the operator override `f2`
@@ -365,6 +395,13 @@ impl RoutingLabels {
             Ok(required) => required,
             Err(unresolvable) => return RunsOnMatch::Unresolvable(unresolvable),
         };
+
+        // A broad optional label must never claim a job for this profile.
+        if !required.contains(&self.host_label) {
+            return RunsOnMatch::NoMatch {
+                missing: vec![self.host_label.clone()],
+            };
+        }
 
         let missing: Vec<Label> = required
             .iter()
@@ -949,6 +986,8 @@ pub struct ScalePolicy {
     pub host_id: HostId,
     /// Operator-chosen host identity retained even for MonitorOnly policies.
     pub requested_host_label: HostLabel,
+    /// Immutable identity within one repository target on this host.
+    profile_name: ProfileName,
     mode: PolicyMode,
     enabled: bool,
     state: PolicyState,
@@ -997,6 +1036,7 @@ pub struct PersistedPolicy {
     pub installation_id: u64,
     pub host_id: HostId,
     pub requested_host_label: HostLabel,
+    pub profile_name: ProfileName,
     /// `Some` for an Autoscale policy, `None` for a MonitorOnly one (D19).
     pub routing_labels: Option<RoutingLabels>,
     pub min_capacity: u16,
@@ -1017,7 +1057,24 @@ pub struct PersistedPolicy {
     pub revision: u64,
 }
 
+/// Inputs from which a new named profile's immutable selector is derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedProfileSpec {
+    pub requested_host_label: HostLabel,
+    pub os: Os,
+    pub arch: Arch,
+    pub profile_name: ProfileName,
+    pub min_capacity: u16,
+    pub max_capacity: NonZeroU16,
+}
+
 impl ScalePolicy {
+    /// The immutable profile identity within this policy's host and target.
+    #[must_use]
+    pub const fn profile_name(&self) -> &ProfileName {
+        &self.profile_name
+    }
+
     /// A newly added policy.
     ///
     /// D20: `add` never arms a host. The policy starts `Pending` with
@@ -1067,6 +1124,7 @@ impl ScalePolicy {
             installation_id,
             host_id,
             requested_host_label,
+            profile_name: ProfileName::default_profile(),
             mode,
             enabled: false,
             state: PolicyState::Pending,
@@ -1077,6 +1135,70 @@ impl ScalePolicy {
             workspace_policy: WorkspacePolicy::Ephemeral,
             revision: 0,
         }
+    }
+
+    /// Construct a named autoscale policy with an immutable, derived selector.
+    /// A selector is derived from the host and profile; no caller supplies it.
+    pub fn new_named(
+        id: PolicyId,
+        target: ScaleTarget,
+        installation_id: u64,
+        host_id: HostId,
+        spec: NamedProfileSpec,
+        cache_policy: CachePolicy,
+    ) -> Result<Self, PolicyError> {
+        let NamedProfileSpec {
+            requested_host_label,
+            os,
+            arch,
+            profile_name,
+            min_capacity,
+            max_capacity,
+        } = spec;
+        if profile_name.is_default() {
+            return Err(PolicyError::NamedConstructorForDefault);
+        }
+        let labels =
+            RoutingLabels::derive_for_profile(&requested_host_label, os, arch, &profile_name);
+        let mode = PolicyMode::autoscale(labels, min_capacity, max_capacity)?;
+        let mut policy = Self::new_for_host_label(
+            id,
+            target,
+            installation_id,
+            host_id,
+            requested_host_label,
+            mode,
+            cache_policy,
+        );
+        policy.profile_name = profile_name;
+        Ok(policy)
+    }
+
+    /// A named monitor-only profile has identity but no routing selector until
+    /// it is explicitly promoted to autoscale.
+    pub fn new_named_monitor(
+        id: PolicyId,
+        target: ScaleTarget,
+        installation_id: u64,
+        host_id: HostId,
+        requested_host_label: HostLabel,
+        profile_name: ProfileName,
+        cache_policy: CachePolicy,
+    ) -> Result<Self, PolicyError> {
+        if profile_name.is_default() {
+            return Err(PolicyError::NamedConstructorForDefault);
+        }
+        let mut policy = Self::new_for_host_label(
+            id,
+            target,
+            installation_id,
+            host_id,
+            requested_host_label,
+            PolicyMode::monitor_only(),
+            cache_policy,
+        );
+        policy.profile_name = profile_name;
+        Ok(policy)
     }
 
     /// Rebuild a stored policy, re-validating D19's shape.
@@ -1093,6 +1215,7 @@ impl ScalePolicy {
             installation_id,
             host_id,
             requested_host_label,
+            profile_name,
             routing_labels,
             min_capacity,
             max_capacity,
@@ -1105,6 +1228,16 @@ impl ScalePolicy {
         } = fields;
 
         let mode = PolicyMode::from_persisted(routing_labels, min_capacity, max_capacity)?;
+        if !profile_name.is_default()
+            && let Some(labels) = mode.routing_labels()
+        {
+            // Exact host OS/architecture validation runs in the store using
+            // the authoritative host row. Monitor-only has no selector.
+            let suffix = format!("-{}", profile_name.as_str());
+            if !labels.host_label().as_str().ends_with(&suffix) {
+                return Err(PolicyError::InvalidProfileSelector);
+            }
+        }
         // D7 is re-run on every load and not only at the CLI. A row that claims
         // an organization retains a job workspace is corrupt state, not a
         // configuration this build should honour.
@@ -1116,6 +1249,7 @@ impl ScalePolicy {
             installation_id,
             host_id,
             requested_host_label,
+            profile_name,
             mode,
             enabled,
             state,
@@ -1138,6 +1272,7 @@ impl ScalePolicy {
             installation_id: self.installation_id,
             host_id: self.host_id,
             requested_host_label: self.requested_host_label.clone(),
+            profile_name: self.profile_name.clone(),
             routing_labels: self.routing_labels().cloned(),
             min_capacity: self.min_capacity(),
             max_capacity: self.max_capacity(),
@@ -1397,10 +1532,39 @@ impl ScalePolicy {
         min_capacity: u16,
         max_capacity: NonZeroU16,
     ) -> Result<(), PolicyError> {
+        if !self.profile_name.is_default() {
+            return Err(PolicyError::NamedProfileNeedsDerivedSelector);
+        }
         if self.mode.is_autoscale() {
             return Err(PolicyError::AlreadyAutoscale);
         }
         self.mode = PolicyMode::autoscale(routing_labels, min_capacity, max_capacity)?;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Promote a named monitor profile with a selector derived from its host
+    /// identity, platform and immutable profile name.
+    pub fn promote_named_to_autoscale(
+        &mut self,
+        os: Os,
+        arch: Arch,
+        min_capacity: u16,
+        max_capacity: NonZeroU16,
+    ) -> Result<(), PolicyError> {
+        if self.profile_name.is_default() {
+            return Err(PolicyError::NamedConstructorForDefault);
+        }
+        if self.mode.is_autoscale() {
+            return Err(PolicyError::AlreadyAutoscale);
+        }
+        let labels = RoutingLabels::derive_for_profile(
+            &self.requested_host_label,
+            os,
+            arch,
+            &self.profile_name,
+        );
+        self.mode = PolicyMode::autoscale(labels, min_capacity, max_capacity)?;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -1884,7 +2048,7 @@ mod tests {
             Row {
                 name: "string: an optional label alone",
                 runs_on: RunsOn::Single("gpu".into()),
-                expect: Expect::Match,
+                expect: Expect::NoMatch,
             },
             Row {
                 name: "string: another host's label",
@@ -2020,9 +2184,16 @@ mod tests {
         let mut with = host_labels("home");
         with.add(label("self-hosted"));
         assert!(
-            with.matches(&RunsOn::Single("self-hosted".into()))
-                .is_match(),
-            "and it must claim it once the operator adds the label explicitly"
+            !with
+                .matches(&RunsOn::Single("self-hosted".into()))
+                .is_match()
+        );
+        assert!(
+            with.matches(&RunsOn::Many(vec![
+                "rm-home-win-x64".into(),
+                "self-hosted".into()
+            ]))
+            .is_match()
         );
     }
 
@@ -2689,6 +2860,32 @@ mod tests {
         ));
         policy.set_max_capacity(nz(4)).unwrap();
         assert_eq!(policy.max_capacity().unwrap().get(), 4);
+    }
+
+    #[test]
+    fn a_named_monitor_can_only_be_promoted_with_its_derived_selector() {
+        let mut named = ScalePolicy::new_named_monitor(
+            PolicyId::from_u128(3),
+            ScaleTarget::repository("o/r").unwrap(),
+            9,
+            HostId::from_u128(7),
+            HostLabel::new("home").unwrap(),
+            ProfileName::new("Py-Isolated").unwrap(),
+            CachePolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            named.promote_to_autoscale(host_labels("other"), 0, nz(3)),
+            Err(PolicyError::NamedProfileNeedsDerivedSelector)
+        ));
+        assert!(named.routing_labels().is_none());
+        named
+            .promote_named_to_autoscale(Os::Windows, Arch::X64, 0, nz(3))
+            .unwrap();
+        assert_eq!(
+            named.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64-py-isolated"
+        );
     }
 
     #[test]

@@ -653,6 +653,114 @@ impl FromStr for HostLabel {
     }
 }
 
+/// A case-insensitive profile identity. The narrow alphabet also makes it safe
+/// to use as the final segment of a derived GitHub runner label.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProfileName(String);
+
+impl ProfileName {
+    pub const MAX_LEN: usize = 64;
+
+    /// # Errors
+    /// Empty, over-long, or non-ASCII-alphanumeric/`-`/`_` input.
+    pub fn new(raw: impl AsRef<str>) -> Result<Self, ValidationError> {
+        let trimmed = raw.as_ref().trim();
+        if trimmed.is_empty() {
+            return Err(ValidationError::Empty {
+                what: "a profile name",
+            });
+        }
+        if trimmed.len() > Self::MAX_LEN {
+            return Err(ValidationError::TooLong {
+                what: "a profile name",
+                max: Self::MAX_LEN,
+                actual: trimmed.len(),
+            });
+        }
+        if let Some(found) = trimmed
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+        {
+            return Err(ValidationError::IllegalCharacter {
+                what: "a profile name",
+                found,
+            });
+        }
+        if trimmed.starts_with('-') || trimmed.ends_with('-') {
+            return Err(ValidationError::IllegalEdge {
+                what: "a profile name",
+                edge: '-',
+            });
+        }
+        Ok(Self(trimmed.to_ascii_lowercase()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn default_profile() -> Self {
+        Self("default".to_string())
+    }
+
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.0 == "default"
+    }
+}
+
+impl fmt::Display for ProfileName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ProfileName {
+    type Error = ValidationError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ProfileName> for String {
+    fn from(value: ProfileName) -> Self {
+        value.0
+    }
+}
+
+#[cfg(test)]
+mod profile_name_tests {
+    use super::*;
+
+    #[test]
+    fn names_are_case_insensitive_and_reject_selector_unsafe_input() {
+        assert_eq!(
+            ProfileName::new("Py-Isolated").unwrap(),
+            ProfileName::new("py-isolated").unwrap()
+        );
+        assert_eq!(ProfileName::default_profile().as_str(), "default");
+        assert!(matches!(
+            ProfileName::new(" "),
+            Err(ValidationError::Empty { .. })
+        ));
+        assert!(matches!(
+            ProfileName::new("py bad"),
+            Err(ValidationError::IllegalCharacter { .. })
+        ));
+        assert!(matches!(
+            ProfileName::new("-bad"),
+            Err(ValidationError::IllegalEdge { .. })
+        ));
+        assert!(matches!(
+            ProfileName::new("x".repeat(ProfileName::MAX_LEN + 1)),
+            Err(ValidationError::TooLong { .. })
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NonEmpty
 // ---------------------------------------------------------------------------
