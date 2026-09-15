@@ -2,10 +2,10 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** dispatch preflight blocked; no worker, branch,
-worktree, PR or product-code change was created.
+**Implementation status:** a1 dispatched through the implement-task pipeline;
+remaining rows await dependencies.
 **Repository:** `.` / `main`.
-**Last updated:** 2026-09-13.
+**Last updated:** 2026-09-15.
 
 This file is the only live task-state record.
 
@@ -47,7 +47,7 @@ This file is the only live task-state record.
 
 | id | Task (spec) | group | seq | needs | repo | base_branch | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---:|---:|---|---|---|---|---|---|---|---|
-| a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | ready | — | 2026-09-13 |
+| a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | 🔵 | worktree-a1-profile-domain-store / implement-task | 2026-09-15 |
 | a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | pending | — | 2026-09-13 |
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | pending | — | 2026-09-13 |
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | pending | — | 2026-09-13 |
@@ -62,6 +62,7 @@ This file is the only live task-state record.
 
 | repo | base_branch | integration_ref | Final PR | Status | Updated |
 |---|---|---|---|---|---|
+| . | main | runner-sandbox-isolation | — | 🔵 | 2026-09-15 |
 
 ## Progress log
 
@@ -102,3 +103,11 @@ remains pending/ready and no integration ref, worktree, worker, PR, merge or
 product change was created. Resume with `--scope=all --parallel=4
 --merge=on-green --integration-branch=isolation/runner-sandbox-profiles` in a
 session whose spawn interface supports registered custom agents.
+
+**2026-09-15 — execution resumed.** Owner selected the `implement-task`
+pipeline for every implementation, native Codex subagents in dedicated git
+worktrees, task PRs into `runner-sandbox-isolation`, and merge on green. The
+integration ref was created from `main`, pushed, and verified remotely. Its
+pipeline landing step was configured to leave green task PRs open for Taskflow
+verification and merge. The a1 slot was provisioned from the verified
+integration ref; no product code has been merged yet.
