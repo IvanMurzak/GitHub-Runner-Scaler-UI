@@ -1,4 +1,4 @@
-# implement-task — one runner-manager task from implementation to merge
+# implement-task — one runner-manager task from implementation to PR
 
 One run implements one task in an isolated worktree, reviews and simplifies the
 branch, then publishes one final state and squash-merges it after every GitHub
@@ -17,7 +17,7 @@ pipeline CLI.
 Only `land` may write to GitHub. Earlier steps may read an issue referenced by
 the task, but they commit locally and never push or create a PR. `land` publishes
 the final reviewed branch once, waits for the complete PR check rollup from both
-`.github/workflows/ci.yml` and `.github/workflows/e2e.yml`, and merges only after
+`.github/workflows/ci.yml` and `.github/workflows/e2e.yml`, and reports success only after
 `pipeline ci-wait` exits 0.
 
 The four steps have `self_improve: false`. A completed run uses the pipeline
@@ -52,3 +52,4 @@ committed normally from the main checkout instead.
 
 A run halted at `land` keeps its worktree. Resume the same run after addressing
 the reported blocker; `land` reuses an existing open PR for the run branch.
+
