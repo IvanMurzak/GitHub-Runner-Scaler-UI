@@ -8,7 +8,7 @@ the contract to maintainers.
 ## End state
 
 The requested change and its tests are committed on a run worktree branch,
-reviewed with fixes, simplified where useful, and merged into `main` through a
+reviewed with fixes, simplified where useful, and proposed against `runner-sandbox-isolation` through a
 pull request. The completed worktree and local run branch are then reaped by the
 pipeline CLI.
 
@@ -52,4 +52,3 @@ committed normally from the main checkout instead.
 
 A run halted at `land` keeps its worktree. Resume the same run after addressing
 the reported blocker; `land` reuses an existing open PR for the run branch.
-
