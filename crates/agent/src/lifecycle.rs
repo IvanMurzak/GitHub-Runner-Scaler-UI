@@ -1225,7 +1225,7 @@ pub struct ProcessStartFailure {
 }
 
 impl ProcessStartFailure {
-    fn before_spawn(reason: FailureReason) -> Self {
+    pub(crate) fn before_spawn(reason: FailureReason) -> Self {
         Self {
             reason,
             retryable: true,
@@ -1263,6 +1263,7 @@ pub enum ProviderCapability {
     NotInstalled,
     PermissionDenied,
     ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
     Degraded,
 }
 
@@ -1277,6 +1278,7 @@ impl ProviderCapability {
                 Self::ImageUnavailableOrIncompatible => {
                     "isolated image unavailable or incompatible"
                 }
+                Self::DiskQuotaUnavailable => "rootless OCI writable-layer disk quota unavailable",
                 Self::Degraded => "isolation provider degraded",
             }
             .into(),
@@ -1420,7 +1422,7 @@ impl fmt::Debug for OneTimeJitHandoff<'_> {
 }
 
 impl<'a> OneTimeJitHandoff<'a> {
-    fn new(config: &'a EncodedJitConfig) -> Self {
+    pub(crate) fn new(config: &'a EncodedJitConfig) -> Self {
         Self { config }
     }
 
