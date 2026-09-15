@@ -2810,12 +2810,7 @@ impl LifecycleLauncher {
     }
 
     fn clean_isolated_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
-        if attempt.state() == AttemptState::CleanupDeferred {
-            attempt
-                .begin_destroy(self.ports.clock.now())
-                .map_err(|_| LifecycleError::Transition)?;
-            self.record(attempt)?;
-        } else if attempt.state() != AttemptState::Destroying {
+        if attempt.state() != AttemptState::Destroying {
             attempt
                 .begin_destroy(self.ports.clock.now())
                 .map_err(|_| LifecycleError::Transition)?;
