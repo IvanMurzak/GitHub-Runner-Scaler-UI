@@ -248,6 +248,9 @@ pub enum StoreError {
     #[error("policy {id} has a selector/optional-label collision with sibling policy {sibling}")]
     ProfileLabelConflict { id: PolicyId, sibling: PolicyId },
 
+    #[error("policy {id} has the same selector as sibling policy {sibling}")]
+    ProfileSelectorConflict { id: PolicyId, sibling: PolicyId },
+
     #[error("a named profile refers to host {host}, which is absent from the database")]
     ProfileHostMissing { host: HostId },
 
@@ -2145,10 +2148,22 @@ fn validate_profile_in_target(
     ])?;
     while let Some(row) = rows.next()? {
         let sibling = policy_from_row(row)?;
+        // The database's composite profile-name index reports duplicate
+        // identities as AlreadyExists. Only distinct profiles need the
+        // selector/optional-label cross-checks below.
+        if sibling.profile_name == candidate.profile_name {
+            continue;
+        }
         let (Some(own), Some(other)) = (candidate.routing_labels(), sibling.routing_labels())
         else {
             continue;
         };
+        if own.host_label() == other.host_label() {
+            return Err(StoreError::ProfileSelectorConflict {
+                id: candidate.id,
+                sibling: sibling.id,
+            });
+        }
         if other.additional().any(|label| label == own.host_label()) {
             return Err(StoreError::ProfileLabelConflict {
                 id: candidate.id,
@@ -2175,8 +2190,7 @@ fn ensure_profile_identity(conn: &Connection, candidate: &ScalePolicy) -> Result
     if stored.profile_name != candidate.profile_name
         || stored.host_id != candidate.host_id
         || stored.target != candidate.target
-        || (!stored.profile_name.is_default()
-            && stored.routing_labels().is_some()
+        || (stored.routing_labels().is_some()
             && stored.routing_labels().map(RoutingLabels::host_label)
                 != candidate.routing_labels().map(RoutingLabels::host_label))
     {
@@ -5635,14 +5649,14 @@ mod tests {
         );
     }
 
-    fn named_test_policy(name: &str, id: u128) -> ScalePolicy {
+    fn named_test_policy_with_host(name: &str, host_label: &str, id: u128) -> ScalePolicy {
         ScalePolicy::new_named(
             PolicyId::from_u128(id),
             ScaleTarget::repository("o/r").expect("target"),
             1,
             host_id(),
             NamedProfileSpec {
-                requested_host_label: HostLabel::new("home").expect("host label"),
+                requested_host_label: HostLabel::new(host_label).expect("host label"),
                 os: Os::Windows,
                 arch: Arch::X64,
                 profile_name: ProfileName::new(name).expect("profile"),
@@ -5652,6 +5666,10 @@ mod tests {
             CachePolicy::default(),
         )
         .expect("named policy")
+    }
+
+    fn named_test_policy(name: &str, id: u128) -> ScalePolicy {
+        named_test_policy_with_host(name, "home", id)
     }
 
     fn native_test_policy() -> ScalePolicy {
@@ -5722,6 +5740,67 @@ mod tests {
         assert!(
             matches!(error, StoreError::AlreadyExists { what: "policy", .. }),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn equal_derived_selectors_from_distinct_names_fail_on_write_and_load() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let first = named_test_policy_with_host("c", "a-win-x64-b", 0x11);
+        let colliding = named_test_policy_with_host("b-win-x64-c", "a", 0x12);
+        assert_eq!(
+            first.routing_labels().unwrap().host_label(),
+            colliding.routing_labels().unwrap().host_label(),
+            "the separator makes these distinct identities derive one selector"
+        );
+        store.insert_policy(&first).expect("first profile");
+        assert!(matches!(
+            store.insert_policy(&colliding),
+            Err(StoreError::ProfileSelectorConflict { .. })
+        ));
+
+        let other = named_test_policy("b-win-x64-c", 0x12);
+        store.insert_policy(&other).expect("non-colliding selector");
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET requested_host_label = ?1, routing_labels = ?2, \
+                 profile_selector = ?3 WHERE id = ?4",
+                rusqlite::params![
+                    colliding.requested_host_label.as_str(),
+                    json(colliding.routing_labels().unwrap()),
+                    colliding.routing_labels().unwrap().host_label().as_str(),
+                    uuid_text(other.id.as_uuid()),
+                ],
+            )
+            .expect("tamper persisted selector");
+        assert!(matches!(
+            store.policy(other.id),
+            Err(StoreError::ProfileSelectorConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn an_existing_default_selector_cannot_be_changed_through_update() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let native = native_test_policy();
+        store.insert_policy(&native).expect("default profile");
+        let mut fields = native.to_persisted();
+        fields.routing_labels = Some(RoutingLabels::derive(
+            &HostLabel::new("other").expect("host label"),
+            Os::Windows,
+            Arch::X64,
+        ));
+        let changed = ScalePolicy::from_persisted(fields).expect("well-formed alternate selector");
+        assert!(matches!(
+            store.update_policy(&changed, native.revision()),
+            Err(StoreError::ProfileIdentityChanged { .. })
+        ));
+        assert_eq!(
+            store.policy(native.id).expect("load").expect("present"),
+            native
         );
     }
 
