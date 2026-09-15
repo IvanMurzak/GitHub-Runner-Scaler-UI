@@ -27,10 +27,12 @@ use runner_manager_domain::attempt::{
     AttemptOutcome, AttemptState, FailureReason, PersistedAttempt, RunnerAttempt,
 };
 use runner_manager_domain::model::{
-    Arch, AttemptId, CachePolicy, Host, HostId, HostLabel, Label, Os, PolicyId, RefreshInterval,
-    ScaleTarget, StartMode, Timestamp,
+    Arch, AttemptId, CachePolicy, Host, HostId, HostLabel, Label, Os, PolicyId, ProfileName,
+    RefreshInterval, ScaleTarget, StartMode, Timestamp,
 };
-use runner_manager_domain::policy::{PolicyMode, RoutingLabels, RunsOn, ScalePolicy};
+use runner_manager_domain::policy::{
+    NamedProfileSpec, PolicyMode, RoutingLabels, RunsOn, ScalePolicy,
+};
 use runner_manager_domain::workspace::AttemptWorkspace;
 
 use crate::clock::{DEFAULT_EPOCH_SECS, timestamp};
@@ -250,6 +252,31 @@ pub fn active_policy() -> ScalePolicy {
 #[must_use]
 pub fn monitor_only_policy() -> ScalePolicy {
     policy().monitor_only().active().build()
+}
+
+/// A named repository profile sharing the default fixture's host and target.
+/// Its selector is derived by the domain, never supplied by the fixture.
+///
+/// # Panics
+/// On an invalid profile name.
+#[must_use]
+pub fn named_policy(name: &str, id: PolicyId) -> ScalePolicy {
+    ScalePolicy::new_named(
+        id,
+        ScaleTarget::repository("o/r").expect("fixture target"),
+        1,
+        HOST_ID,
+        NamedProfileSpec {
+            requested_host_label: HostLabel::new("home").expect("fixture host label"),
+            os: Os::Windows,
+            arch: Arch::X64,
+            profile_name: ProfileName::new(name).expect("fixture profile name"),
+            min_capacity: 0,
+            max_capacity: NonZeroU16::new(2).expect("non-zero"),
+        },
+        CachePolicy::default(),
+    )
+    .expect("named fixture is valid")
 }
 
 impl PolicyBuilder {
@@ -621,9 +648,32 @@ mod tests {
             "rm-home-win-x64"
         );
         assert_eq!(policy.max_capacity().unwrap().get(), 2);
+        assert_eq!(policy.profile_name.as_str(), "default");
 
         // And `active()` is the explicit `set-scale`.
         assert!(active_policy().may_start_runners());
+    }
+
+    #[test]
+    fn named_fixture_derives_a_distinct_selector_and_preserves_casefolding() {
+        let py = named_policy("Py-Isolated", OTHER_POLICY_ID);
+        assert_eq!(py.profile_name.as_str(), "py-isolated");
+        assert_eq!(
+            py.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64-py-isolated"
+        );
+        assert!(
+            !py.routing_labels()
+                .unwrap()
+                .matches(&queued_job(&["gpu"]))
+                .is_match()
+        );
+        assert!(
+            py.routing_labels()
+                .unwrap()
+                .matches(&queued_job(&["rm-home-win-x64-py-isolated"]))
+                .is_match()
+        );
     }
 
     #[test]

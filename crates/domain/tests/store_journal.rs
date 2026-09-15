@@ -179,6 +179,7 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
             {
                 let mut policy = fixtures::policy()
                     .id(PolicyId::from_u128(5))
+                    .repository("o/pending")
                     .autoscale("home-win", 3)
                     .cache_policy(CachePolicy::DiscardRunnerPackage)
                     .installation_id(9_876_543_210)
@@ -193,13 +194,17 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
             },
         ),
         ("a policy that reached repair_required", {
-            let mut policy = fixtures::policy().id(PolicyId::from_u128(6)).build();
+            let mut policy = fixtures::policy()
+                .id(PolicyId::from_u128(6))
+                .repository("o/repair")
+                .build();
             policy.repair_required().expect("pending policies may");
             policy
         }),
         ("a policy that drained to disabled", {
             let mut policy = fixtures::policy()
                 .id(PolicyId::from_u128(7))
+                .repository("o/draining")
                 .active()
                 .build();
             policy.request_disable().expect("active policies drain");
@@ -209,6 +214,7 @@ fn both_scale_target_variants_and_both_policy_modes_round_trip_byte_identically(
         ("a policy whose authentication failed", {
             let mut policy = fixtures::policy()
                 .id(PolicyId::from_u128(8))
+                .repository("o/auth-failed")
                 .active()
                 .build();
             policy.authentication_failed().expect("any state may");
@@ -936,6 +942,7 @@ fn no_fixture_database_or_its_dump_holds_a_token_shaped_value() {
                 .build(),
             fixtures::policy()
                 .id(PolicyId::from_u128(3))
+                .repository("o/monitor")
                 .monitor_only()
                 .build(),
             {
