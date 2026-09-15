@@ -29,6 +29,9 @@ use runner_manager_domain::attempt::{
     RecoveryDecision, RecoveryObservation, RecoveryTimeouts, RunnerAttempt, active_count,
     recovery_decision,
 };
+use runner_manager_domain::execution::{
+    AttemptExecution, Backend, ExecutionPolicy, ImageReference, ResourceLimits,
+};
 use runner_manager_domain::model::{
     Arch, AttemptId, CachePolicy, Clock, Elapsed, Host, HostId, Os, PolicyId, StartMode,
     TargetScope,
@@ -626,6 +629,72 @@ fn the_journal_survives_process_death_and_yields_the_same_attempts() {
 }
 
 #[test]
+fn isolated_identity_survives_clean_and_crash_style_file_reopens() {
+    let dir = tempfile::tempdir().expect("temporary database directory");
+    let path = database(dir.path());
+    let clock = FakeClock::default();
+    let image = ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+        .expect("pinned image");
+    let mut policy = fixtures::policy()
+        .id(PolicyId::from_u128(0x81))
+        .repository("o/isolated-reopen")
+        .active()
+        .build();
+    policy
+        .set_execution_policy(ExecutionPolicy::Isolated {
+            backend: Backend::Oci,
+            image: image.clone(),
+            resources: ResourceLimits {
+                cpu_millis: 1000,
+                memory_mib: 1024,
+                disk_mib: 4096,
+            },
+        })
+        .expect("isolated repository policy");
+    let mut attempt = RunnerAttempt::allocate(
+        AttemptId::from_u128(0x82),
+        policy.id,
+        "runtime/isolated-reopen",
+        clock.now(),
+    );
+    attempt
+        .allocate_execution(AttemptExecution::Isolated {
+            provider_kind: Backend::Oci,
+            environment_id: None,
+            resolved_image: image,
+            generation: "generation-82".into(),
+        })
+        .expect("isolated provider intent");
+
+    let store = SqliteStore::open(&path).expect("file store opens");
+    store
+        .put_host(&fixtures::host().build())
+        .expect("host stored");
+    store.insert_policy(&policy).expect("policy stored");
+    store.record_attempt(&attempt).expect("intent stored");
+    drop(store);
+
+    let store = SqliteStore::open(&path).expect("clean close reopens");
+    assert_eq!(
+        store.attempt(attempt.id).expect("loads"),
+        Some(attempt.clone())
+    );
+    attempt
+        .prepared_environment("environment-82".into())
+        .expect("concrete provider identity");
+    store.record_attempt(&attempt).expect("identity stored");
+    abandon(store);
+
+    let store = SqliteStore::open(&path).expect("unclean close reopens");
+    assert_eq!(store.schema_version(), SCHEMA_VERSION);
+    assert_eq!(store.attempt(attempt.id).expect("loads"), Some(attempt));
+    assert_eq!(
+        store.policy(policy.id).expect("loads").expect("present"),
+        policy
+    );
+}
+
+#[test]
 fn a_reloaded_journal_drives_the_same_recovery_decisions_as_the_live_one() {
     // The journal is the input to `e3`'s startup recovery, so what matters is
     // not only that the rows come back but that the decisions taken from them do
@@ -839,8 +908,8 @@ const TOKEN_PREFIXES: &[&str] = &[
 ];
 
 /// Every token-shaped thing in `haystack`: a known prefix, or a run of at least
-/// forty hexadecimal characters, which is the shape of a classic personal access
-/// token and of the encoded blobs this product must never store.
+/// forty hexadecimal characters. A complete `sha256:` image digest is excluded:
+/// it is a required, non-secret execution identity rather than a token.
 fn token_shaped(haystack: &str) -> Vec<String> {
     let mut found: Vec<String> = TOKEN_PREFIXES
         .iter()
@@ -848,14 +917,24 @@ fn token_shaped(haystack: &str) -> Vec<String> {
         .map(|prefix| (*prefix).to_string())
         .collect();
 
+    let bytes = haystack.as_bytes();
+    let mut start = 0usize;
     let mut run = 0usize;
-    for ch in haystack.chars() {
-        if ch.is_ascii_hexdigit() {
+    for index in 0..=bytes.len() {
+        if index < bytes.len() && bytes[index].is_ascii_hexdigit() {
+            if run == 0 {
+                start = index;
+            }
             run += 1;
-            if run == 40 {
+        } else {
+            // A complete image digest is a required, non-secret identity. Keep
+            // finding bare hex tokens and shorter `sha256:`-prefixed canaries.
+            let pinned_digest = run == 64
+                && start >= b"sha256:".len()
+                && &bytes[start - b"sha256:".len()..start] == b"sha256:";
+            if run >= 40 && !pinned_digest {
                 found.push("a 40-character hexadecimal run".to_string());
             }
-        } else {
             run = 0;
         }
     }
@@ -870,10 +949,13 @@ fn the_token_scanner_can_actually_fail() {
     assert!(!token_shaped("ghu_16C7e42F292c6912E7710c838347Ae178B4a").is_empty());
     assert!(!token_shaped("Authorization: token abc").is_empty());
     assert!(!token_shaped(&"a".repeat(40)).is_empty());
+    assert!(!token_shaped(&"a".repeat(64)).is_empty());
     assert!(
         token_shaped(&"a".repeat(39)).is_empty(),
         "the hexadecimal run threshold must be an edge, not an approximation"
     );
+    assert!(token_shaped(&format!("sha256:{}", "a".repeat(64))).is_empty());
+    assert!(!token_shaped(&format!("sha256:{}", "a".repeat(40))).is_empty());
 
     // And it finds a planted secret in a real database and its dump, which is
     // what makes the clean result in the next test meaningful. `runtime_path`,
@@ -992,7 +1074,53 @@ fn no_fixture_database_or_its_dump_holds_a_token_shaped_value() {
             store.record_attempt(&leased).expect("journalled");
         }
 
+        let image =
+            ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+                .expect("pinned image");
+        let mut isolated_policy = fixtures::policy()
+            .id(PolicyId::from_u128(5))
+            .repository("o/isolated-canary")
+            .active()
+            .build();
+        isolated_policy
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: image.clone(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            })
+            .expect("isolated repository policy");
+        store
+            .insert_policy(&isolated_policy)
+            .expect("isolated policy stored");
+        let mut isolated_attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x800),
+            isolated_policy.id,
+            "runtime/isolated-canary",
+            clock.now(),
+        );
+        isolated_attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image,
+                generation: "generation-800".into(),
+            })
+            .expect("isolated intent");
+        isolated_attempt
+            .prepared_environment("environment-800".into())
+            .expect("concrete environment identity");
+        store
+            .record_attempt(&isolated_attempt)
+            .expect("isolated attempt stored");
+
         let dump = store.dump_text().expect("dumpable");
+        assert!(dump.contains("policies.execution_policy="));
+        assert!(dump.contains("attempts.execution="));
+        assert!(dump.contains("environment-800"));
         // A clean close checkpoints the write-ahead log into the main file, so
         // the scan below sees everything that was written rather than only what
         // had been checkpointed.

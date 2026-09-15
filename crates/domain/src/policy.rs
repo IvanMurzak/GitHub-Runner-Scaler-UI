@@ -27,6 +27,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution::{ExecutionError, ExecutionPolicy};
 use crate::model::{
     Arch, CachePolicy, HostId, HostLabel, Label, NonEmpty, Os, PolicyId, ProfileName, ScaleTarget,
     ValidationError,
@@ -47,6 +48,9 @@ pub enum PolicyError {
     /// pair of workspace columns this crate cannot have written (D4, D7).
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
+
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
 
     #[error(
         "an Autoscale policy requires routing labels; a policy with none is a \
@@ -1000,6 +1004,7 @@ pub struct ScalePolicy {
     /// here to check it against. [`Self::set_workspace_policy`] is the only
     /// writer, so the pair cannot be made inconsistent by assignment.
     workspace_policy: WorkspacePolicy,
+    execution_policy: ExecutionPolicy,
     revision: u64,
 }
 
@@ -1053,6 +1058,7 @@ pub struct PersistedPolicy {
     /// The configured persistent root: `Some` exactly when `workspace_kind` is
     /// `persistent`.
     pub workspace_root: Option<LocalAbsolutePath>,
+    pub execution_policy: ExecutionPolicy,
     /// Optimistic-concurrency token. Not an identifier of anything.
     pub revision: u64,
 }
@@ -1133,6 +1139,7 @@ impl ScalePolicy {
             // separate, explicit `repo set-workspace`, so a policy this
             // constructor produced is always disposable.
             workspace_policy: WorkspacePolicy::Ephemeral,
+            execution_policy: ExecutionPolicy::Native,
             revision: 0,
         }
     }
@@ -1224,6 +1231,7 @@ impl ScalePolicy {
             cache_policy,
             workspace_kind,
             workspace_root,
+            execution_policy,
             revision,
         } = fields;
 
@@ -1243,6 +1251,7 @@ impl ScalePolicy {
         // configuration this build should honour.
         let workspace_policy =
             WorkspacePolicy::from_persisted(workspace_kind, workspace_root, target.scope())?;
+        execution_policy.validate(target.scope(), &workspace_policy)?;
         Ok(Self {
             id,
             target,
@@ -1255,6 +1264,7 @@ impl ScalePolicy {
             state,
             cache_policy,
             workspace_policy,
+            execution_policy,
             revision,
         })
     }
@@ -1281,6 +1291,7 @@ impl ScalePolicy {
             cache_policy: self.cache_policy,
             workspace_kind: self.workspace_policy.kind(),
             workspace_root: self.workspace_policy.root().cloned(),
+            execution_policy: self.execution_policy.clone(),
             revision: self.revision,
         }
     }
@@ -1321,6 +1332,21 @@ impl ScalePolicy {
         &self.workspace_policy
     }
 
+    #[must_use]
+    pub const fn execution_policy(&self) -> &ExecutionPolicy {
+        &self.execution_policy
+    }
+
+    /// The store's uncleaned-attempt guard must fence this mutation on write.
+    pub fn set_execution_policy(&mut self, execution: ExecutionPolicy) -> Result<(), PolicyError> {
+        execution.validate(self.target.scope(), &self.workspace_policy)?;
+        if self.execution_policy != execution {
+            self.execution_policy = execution;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// `repo set-workspace --mode …` (D4).
     ///
     /// The refusal of a persistent workspace for an organization target is D7,
@@ -1344,6 +1370,8 @@ impl ScalePolicy {
         // rule is re-run here on the value actually handed in, through the one
         // predicate that owns it.
         workspace.permitted_for(self.target.scope())?;
+        self.execution_policy
+            .validate(self.target.scope(), &workspace)?;
         if self.workspace_policy != workspace {
             self.workspace_policy = workspace;
             self.revision = self.revision.saturating_add(1);

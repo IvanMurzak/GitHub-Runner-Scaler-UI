@@ -3263,6 +3263,9 @@ mod tests {
             state,
             outcome,
             process_id: None,
+            execution: runner_manager_domain::execution::AttemptExecution::Native {
+                process_id: None,
+            },
             runtime_path: "runtime/p/a".into(),
             workspace_kind: WorkspaceKind::Ephemeral,
             workspace_slot: None,
@@ -3282,6 +3285,9 @@ mod tests {
             state: outcome.terminal_state(),
             outcome: Some(outcome),
             process_id: None,
+            execution: runner_manager_domain::execution::AttemptExecution::Native {
+                process_id: None,
+            },
             runtime_path: "runtime/p/a".into(),
             workspace_kind: WorkspaceKind::Ephemeral,
             workspace_slot: None,

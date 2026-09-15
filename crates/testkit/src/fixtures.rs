@@ -580,6 +580,9 @@ impl AttemptBuilder {
             state: self.state,
             outcome,
             process_id: self.process_id,
+            execution: runner_manager_domain::execution::AttemptExecution::Native {
+                process_id: self.process_id,
+            },
             runtime_path: self.runtime_path.into(),
             workspace_kind: self.workspace.kind(),
             workspace_slot: self.workspace.slot_number(),
