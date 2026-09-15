@@ -1,0 +1,33 @@
+crates/agent/src/reconcile.rs
+  s_5801a853f78e8a::t_e15b040e401f37 4666,4687,4698,4715-4730
+  s_5801a853f78e8a::t_f8ad270f531baf 4648-4659,4662
+  s_5801a853f78e8a::t_c2b6b94b2c6451 1258-1285,1320-1325,1391,1411,1457-1461,1584-1594,2029-2057,2124-2127,2614-2676,4672-4675,4701-4706,4773-4777
+  s_5801a853f78e8a::t_e4c0a5e85b2133 4676-4686,4688-4697,4699-4700,4707-4714,4731-4772
+  s_5801a853f78e8a::t_7035b873e9eaf8 1257
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_fa44109b3931d3 77,156-157,184-185,187,267,289,293
+  s_5801a853f78e8a::t_dfa6f8a607a799 898,915-919,924-925
+  s_5801a853f78e8a::t_52a1a610f3c28a 161,163
+  s_5801a853f78e8a::t_00bced5c7b3ebb 902-914,920-923
+  s_5801a853f78e8a::t_35e34b34c04099 196,201,897
+crates/app/src/cli/daemon.rs
+  s_5801a853f78e8a::t_05b295d7d2dad2 1216-1219,2212-2231
+crates/app/src/cli/policy.rs
+  s_5801a853f78e8a::t_62413147d2d92b 5,271,274-277,279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f2169f3ed9b8a8e603ea9090a307d239f38ebf71",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
