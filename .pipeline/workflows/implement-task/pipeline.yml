@@ -4,7 +4,7 @@ name: implement-task
 description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish a PR after the full PR check rollup is green.
 
 execution: sequential
-runner: manager
+runner: session
 isolation: run
 base_branch: runner-sandbox-isolation
 
