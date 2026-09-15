@@ -648,7 +648,7 @@ mod tests {
             "rm-home-win-x64"
         );
         assert_eq!(policy.max_capacity().unwrap().get(), 2);
-        assert_eq!(policy.profile_name.as_str(), "default");
+        assert_eq!(policy.profile_name().as_str(), "default");
 
         // And `active()` is the explicit `set-scale`.
         assert!(active_policy().may_start_runners());
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn named_fixture_derives_a_distinct_selector_and_preserves_casefolding() {
         let py = named_policy("Py-Isolated", OTHER_POLICY_ID);
-        assert_eq!(py.profile_name.as_str(), "py-isolated");
+        assert_eq!(py.profile_name().as_str(), "py-isolated");
         assert_eq!(
             py.routing_labels().unwrap().host_label().as_str(),
             "rm-home-win-x64-py-isolated"

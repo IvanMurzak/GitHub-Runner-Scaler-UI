@@ -2112,7 +2112,7 @@ fn validate_profile_in_target(
     conn: &Connection,
     candidate: &ScalePolicy,
 ) -> Result<(), StoreError> {
-    if !candidate.profile_name.is_default() {
+    if !candidate.profile_name().is_default() {
         let mut host_stmt = conn.prepare("SELECT * FROM hosts WHERE id = ?1")?;
         let mut host_rows = host_stmt.query([uuid_text(candidate.host_id.as_uuid())])?;
         let host = match host_rows.next()? {
@@ -2128,7 +2128,7 @@ fn validate_profile_in_target(
                 &candidate.requested_host_label,
                 host.os,
                 host.architecture,
-                &candidate.profile_name,
+                candidate.profile_name(),
             );
             if found.host_label() != expected.host_label() {
                 return Err(StoreError::CorruptProfileSelector { id: candidate.id });
@@ -2151,7 +2151,7 @@ fn validate_profile_in_target(
         // The database's composite profile-name index reports duplicate
         // identities as AlreadyExists. Only distinct profiles need the
         // selector/optional-label cross-checks below.
-        if sibling.profile_name == candidate.profile_name {
+        if sibling.profile_name() == candidate.profile_name() {
             continue;
         }
         let (Some(own), Some(other)) = (candidate.routing_labels(), sibling.routing_labels())
@@ -2187,7 +2187,7 @@ fn ensure_profile_identity(conn: &Connection, candidate: &ScalePolicy) -> Result
         return Ok(());
     };
     let stored = policy_from_row(row)?;
-    if stored.profile_name != candidate.profile_name
+    if stored.profile_name() != candidate.profile_name()
         || stored.host_id != candidate.host_id
         || stored.target != candidate.target
         || (stored.routing_labels().is_some()
@@ -3375,7 +3375,7 @@ mod tests {
             "an upgrade must not retain a workspace the operator never selected"
         );
         assert_eq!(policy.requested_host_label.as_str(), "host");
-        assert_eq!(policy.profile_name.as_str(), "default");
+        assert_eq!(policy.profile_name().as_str(), "default");
         assert_eq!(
             policy.routing_labels().unwrap().host_label().as_str(),
             "rm-home-win-x64"
@@ -5718,7 +5718,7 @@ mod tests {
                 *policy
             );
         }
-        assert_eq!(py.profile_name.as_str(), "py-isolated");
+        assert_eq!(py.profile_name().as_str(), "py-isolated");
         assert_eq!(
             py.routing_labels().unwrap().host_label().as_str(),
             "rm-home-win-x64-py-isolated"

@@ -102,6 +102,9 @@ pub enum PolicyError {
 
     #[error("the native default profile must retain its compatibility selector")]
     NamedConstructorForDefault,
+
+    #[error("a named profile must derive its selector when promoted to Autoscale")]
+    NamedProfileNeedsDerivedSelector,
 }
 
 // ---------------------------------------------------------------------------
@@ -984,7 +987,7 @@ pub struct ScalePolicy {
     /// Operator-chosen host identity retained even for MonitorOnly policies.
     pub requested_host_label: HostLabel,
     /// Immutable identity within one repository target on this host.
-    pub profile_name: ProfileName,
+    profile_name: ProfileName,
     mode: PolicyMode,
     enabled: bool,
     state: PolicyState,
@@ -1066,6 +1069,12 @@ pub struct NamedProfileSpec {
 }
 
 impl ScalePolicy {
+    /// The immutable profile identity within this policy's host and target.
+    #[must_use]
+    pub const fn profile_name(&self) -> &ProfileName {
+        &self.profile_name
+    }
+
     /// A newly added policy.
     ///
     /// D20: `add` never arms a host. The policy starts `Pending` with
@@ -1523,10 +1532,39 @@ impl ScalePolicy {
         min_capacity: u16,
         max_capacity: NonZeroU16,
     ) -> Result<(), PolicyError> {
+        if !self.profile_name.is_default() {
+            return Err(PolicyError::NamedProfileNeedsDerivedSelector);
+        }
         if self.mode.is_autoscale() {
             return Err(PolicyError::AlreadyAutoscale);
         }
         self.mode = PolicyMode::autoscale(routing_labels, min_capacity, max_capacity)?;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Promote a named monitor profile with a selector derived from its host
+    /// identity, platform and immutable profile name.
+    pub fn promote_named_to_autoscale(
+        &mut self,
+        os: Os,
+        arch: Arch,
+        min_capacity: u16,
+        max_capacity: NonZeroU16,
+    ) -> Result<(), PolicyError> {
+        if self.profile_name.is_default() {
+            return Err(PolicyError::NamedConstructorForDefault);
+        }
+        if self.mode.is_autoscale() {
+            return Err(PolicyError::AlreadyAutoscale);
+        }
+        let labels = RoutingLabels::derive_for_profile(
+            &self.requested_host_label,
+            os,
+            arch,
+            &self.profile_name,
+        );
+        self.mode = PolicyMode::autoscale(labels, min_capacity, max_capacity)?;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -2822,6 +2860,32 @@ mod tests {
         ));
         policy.set_max_capacity(nz(4)).unwrap();
         assert_eq!(policy.max_capacity().unwrap().get(), 4);
+    }
+
+    #[test]
+    fn a_named_monitor_can_only_be_promoted_with_its_derived_selector() {
+        let mut named = ScalePolicy::new_named_monitor(
+            PolicyId::from_u128(3),
+            ScaleTarget::repository("o/r").unwrap(),
+            9,
+            HostId::from_u128(7),
+            HostLabel::new("home").unwrap(),
+            ProfileName::new("Py-Isolated").unwrap(),
+            CachePolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            named.promote_to_autoscale(host_labels("other"), 0, nz(3)),
+            Err(PolicyError::NamedProfileNeedsDerivedSelector)
+        ));
+        assert!(named.routing_labels().is_none());
+        named
+            .promote_named_to_autoscale(Os::Windows, Arch::X64, 0, nz(3))
+            .unwrap();
+        assert_eq!(
+            named.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64-py-isolated"
+        );
     }
 
     #[test]
