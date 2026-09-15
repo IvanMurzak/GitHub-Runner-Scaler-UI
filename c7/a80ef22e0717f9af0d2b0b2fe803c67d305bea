@@ -1,0 +1,23 @@
+.pipeline/workflows/implement-task/steps/land.md
+  s_5801a853f78e8a::t_00df666e94515f 1,5-6,10-13,17,23-24,26-48,52-54
+.pipeline/workflows/implement-task/pipeline.yml
+  s_5801a853f78e8a::t_5bf17bfa93b564 4,9
+.pipeline/workflows/implement-task/PIPELINE.md
+  s_5801a853f78e8a::t_f65910ee6ae5f1 1,20,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c7a80ef22e0717f9af0d2b0b2fe803c67d305bea",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
