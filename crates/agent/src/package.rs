@@ -1760,7 +1760,7 @@ impl PackageCache {
         let holders = self.holders(version)?;
         for holder in &holders {
             match attempts.iter().find(|attempt| attempt.id == *holder) {
-                Some(attempt) if !attempt.is_terminal() => {
+                Some(attempt) if attempt.counts_against_capacity() => {
                     return Err(PackageError::VersionInUse {
                         version: version.clone(),
                         attempt: *holder,
@@ -1783,7 +1783,7 @@ impl PackageCache {
             path: dir,
             source,
         })?;
-        // The holders were all terminal, so their leases are spent.
+        // The holders no longer own execution resources, so their leases are spent.
         for holder in holders {
             self.release(holder)?;
         }
@@ -4227,7 +4227,15 @@ mod tests {
         assert!(root.is_dir());
 
         // ...and allowed the moment the same attempt is terminal.
-        for state in AttemptState::ALL.iter().filter(|s| s.is_terminal()) {
+        for state in AttemptState::ALL.iter().filter(|s| {
+            matches!(
+                s,
+                AttemptState::Finished
+                    | AttemptState::Failed
+                    | AttemptState::Orphaned
+                    | AttemptState::Cleaned
+            )
+        }) {
             let concluded = attempt_in(&harness, 0x100, *state);
             assert!(concluded.is_terminal());
             // Re-create the entry for each terminal state so each is a real

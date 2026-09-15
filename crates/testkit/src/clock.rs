@@ -267,6 +267,9 @@ mod domain_recovery_tests {
             match state {
                 AttemptState::Cleaned => assert_eq!(decision, RecoveryDecision::Nothing),
                 s if s.is_terminal() => assert_eq!(decision, RecoveryDecision::Clean, "{state}"),
+                AttemptState::Preparing | AttemptState::Prepared => {
+                    assert_eq!(decision, RecoveryDecision::Wait, "{state}")
+                }
                 _ => assert_eq!(decision, RecoveryDecision::Adopt, "{state}"),
             }
 

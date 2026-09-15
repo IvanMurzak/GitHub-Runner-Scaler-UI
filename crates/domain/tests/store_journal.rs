@@ -428,8 +428,8 @@ fn every_attempt_state_round_trips_byte_identically() {
     assert_eq!(all.len(), AttemptState::ALL.len());
     assert_eq!(
         active_count(&all),
-        5,
-        "exactly the five non-terminal states hold a host capacity slot; if \
+        9,
+        "seven live states and two isolated cleanup states hold host capacity; if \
          storage changed that, the reconciliation formula would silently starve \
          or oversubscribe the host"
     );
