@@ -74,6 +74,7 @@
 //! models has somewhere to go — and this file states the assumption where the
 //! number is read.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
 
@@ -152,14 +153,14 @@ pub struct HostBudget {
     /// Organization targets in the set. Non-zero makes the projection a
     /// **floor** rather than an estimate; see [`HostBudget::is_floor`].
     organization_targets: usize,
-    /// Policies priced, whatever their state.
-    priced_policies: usize,
+    /// Distinct targets priced, whatever their policies' states.
+    priced_targets: usize,
 }
 
 impl HostBudget {
-    /// Prices every persisted policy, at this host's refresh interval.
+    /// Prices every distinct persisted target, at this host's refresh interval.
     ///
-    /// # Every policy is priced, including the ones not polling
+    /// # Every target is priced, including the ones not polling
     ///
     /// A `pending`, `disabled` or `monitor_only` policy costs less than this
     /// says — a monitor-only policy never polls demand at all, and a disabled
@@ -180,9 +181,10 @@ impl HostBudget {
     /// shortfall sayable instead of silent.
     #[must_use]
     pub fn of(interval: RefreshInterval, targets: &[ScaleTarget]) -> Self {
-        let mut costs = Vec::with_capacity(targets.len());
+        let unique: BTreeSet<&ScaleTarget> = targets.iter().collect();
+        let mut costs = Vec::with_capacity(unique.len());
         let mut organization_targets = 0;
-        for target in targets {
+        for target in unique {
             costs.push(measured(match target {
                 ScaleTarget::Repository(_) => TargetCost::repository(),
                 ScaleTarget::Organization(_) => {
@@ -191,11 +193,12 @@ impl HostBudget {
                 }
             }));
         }
+        let priced_targets = costs.len();
         Self {
             interval,
             projection: BudgetProjection::new(interval, costs),
             organization_targets,
-            priced_policies: targets.len(),
+            priced_targets,
         }
     }
 
@@ -261,7 +264,7 @@ impl HostBudget {
             self.ceiling()
         )?;
         writeln!(out, "  headroom                  {}", self.headroom())?;
-        writeln!(out, "  policies priced           {}", self.priced_policies)?;
+        writeln!(out, "  targets priced            {}", self.priced_targets)?;
         writeln!(
             out,
             "  repository targets that fit at this interval: about {}",
@@ -283,11 +286,11 @@ impl HostBudget {
 
         writeln!(
             out,
-            "  About: every configured policy is priced as if it were polling, whatever its"
+            "  About: every configured target is priced as if it were polling, whatever its"
         )?;
         writeln!(
             out,
-            "  state, so this total is never an under-estimate of the set you have."
+            "  policies' states; profiles sharing a target use one poll and one charge."
         )?;
         if self.is_floor() {
             writeln!(
@@ -891,9 +894,33 @@ mod tests {
         assert_eq!(one.requests_per_hour(), 360);
         assert_eq!(three.requests_per_hour(), 1_080);
         assert!(
-            budget_text(&three).contains("policies priced           3"),
-            "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
+            budget_text(&three).contains("targets priced            3"),
+            "the output must say how many targets the total covers, or an operator              cannot tell an under-count from a cheap set"
         );
+    }
+
+    #[test]
+    fn equal_profile_targets_are_charged_once_even_with_case_variants() {
+        let interval = RefreshInterval::default();
+        let targets = [
+            repository("o/one"),
+            repository("O/ONE"),
+            repository("o/two"),
+            organization("acme"),
+            organization("ACME"),
+        ];
+        let budget = HostBudget::of(interval, &targets);
+        let unique = HostBudget::of(
+            interval,
+            &[
+                repository("o/one"),
+                repository("o/two"),
+                organization("acme"),
+            ],
+        );
+        assert_eq!(budget.requests_per_hour(), unique.requests_per_hour());
+        assert_eq!(budget.headroom(), unique.headroom());
+        assert!(budget_text(&budget).contains("targets priced            3"));
     }
 
     /// An organization's real cost is unknown locally, so the total must be

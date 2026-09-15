@@ -2,6 +2,7 @@
 
 //! Repository and organization policy commands. Both families share one path.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::num::NonZeroU16;
 
@@ -267,11 +268,15 @@ fn add(
         TargetScope::Repository => TargetCost::repository(),
         TargetScope::Organization => TargetCost::organization(installed_repositories),
     };
-    let costs = store
+    let existing_targets: BTreeSet<ScaleTarget> = store
         .policies()
         .map_err(store_failure)?
+        .into_iter()
+        .map(|policy| policy.target)
+        .collect();
+    let costs = existing_targets
         .iter()
-        .map(|policy| cost_for(&policy.target, reachable))
+        .map(|target| cost_for(target, reachable))
         .collect();
     let armed = target.clone();
     record_policy(

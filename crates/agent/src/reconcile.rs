@@ -1254,6 +1254,35 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
     }
 }
 
+/// Fixed, credential-free reasons a queued job cannot route to one profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RoutingRefusal {
+    MissingSelector,
+    MultipleSelectors,
+    OverlappingProfiles,
+}
+
+impl RoutingRefusal {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingSelector => "missing_profile_selector",
+            Self::MultipleSelectors => "multiple_profile_selectors",
+            Self::OverlappingProfiles => "overlapping_profile_matches",
+        }
+    }
+}
+
+impl fmt::Display for RoutingRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::MissingSelector => "add exactly one profile selector to a static `runs-on`",
+            Self::MultipleSelectors => "remove the extra profile selectors from `runs-on`",
+            Self::OverlappingProfiles => "repair overlapping profile selectors or optional labels",
+        })
+    }
+}
+
 /// What `g2`'s activity view and the local log sink see.
 ///
 /// **Every field is an identifier, a count, a duration, or a `&'static str`
@@ -1287,6 +1316,12 @@ pub enum LifecycleEvent {
         unresolvable: u32,
         /// `false` when the count is a floor rather than a total.
         complete: bool,
+    },
+    /// A queued job cannot be assigned unambiguously to this target's profiles.
+    RoutingRefused {
+        policy: PolicyId,
+        reason: RoutingRefusal,
+        count: u32,
     },
     /// A target could not be polled, so its policies start nothing this pass.
     TargetUnreadable {
@@ -1353,6 +1388,7 @@ impl LifecycleEvent {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::DemandObserved { .. } => "demand_observed",
+            Self::RoutingRefused { .. } => "routing_refused",
             Self::TargetUnreadable { .. } => "target_unreadable",
             Self::Allocated { .. } => "allocated",
             Self::MonitorOnlySkipped { .. } => "monitor_only_skipped",
@@ -1372,6 +1408,7 @@ impl LifecycleEvent {
     pub const fn policy(&self) -> Option<PolicyId> {
         match self {
             Self::DemandObserved { policy, .. }
+            | Self::RoutingRefused { policy, .. }
             | Self::TargetUnreadable { policy, .. }
             | Self::Allocated { policy, .. }
             | Self::MonitorOnlySkipped { policy }
@@ -1417,6 +1454,11 @@ impl fmt::Display for LifecycleEvent {
             Self::TargetUnreadable { policy, reason } => {
                 write!(f, "policy {policy}: target unreadable ({reason})")
             }
+            Self::RoutingRefused {
+                policy,
+                reason,
+                count,
+            } => write!(f, "policy {policy}: {count} queued jobs blocked: {reason}"),
             Self::Allocated {
                 policy,
                 demand,
@@ -1539,6 +1581,17 @@ impl EventSink for TracingEvents {
             LifecycleEvent::TargetUnreadable { policy, reason } => {
                 tracing::warn!(event = name, policy_id = %policy, reason);
             }
+            LifecycleEvent::RoutingRefused {
+                policy,
+                reason,
+                count,
+            } => tracing::warn!(
+                event = name,
+                policy_id = %policy,
+                reason = reason.as_str(),
+                count,
+                "{reason}"
+            ),
             LifecycleEvent::Allocated {
                 policy,
                 demand,
@@ -1973,6 +2026,35 @@ impl Reconciler {
         }
 
         let readings = self.poll_targets(&pollable, &mut report).await;
+        report.targets_read = u16::try_from(
+            readings
+                .values()
+                .filter(|outcome| matches!(outcome, PollOutcome::Ready(_)))
+                .count(),
+        )
+        .unwrap_or(u16::MAX);
+        let mut routed = BTreeMap::new();
+        for (target, outcome) in &readings {
+            let PollOutcome::Ready(reading) = outcome else {
+                continue;
+            };
+            let profiles: Vec<&ScalePolicy> = pollable
+                .iter()
+                .copied()
+                .filter(|policy| &policy.target == target)
+                .collect();
+            let (tallies, refusals) = route_demand(policies, &profiles, reading);
+            if let Some(first) = profiles.first() {
+                for (reason, count) in refusals {
+                    self.events.emit(LifecycleEvent::RoutingRefused {
+                        policy: first.id,
+                        reason,
+                        count,
+                    });
+                }
+            }
+            routed.insert(target.clone(), tallies);
+        }
 
         // --- Flow 2.8: terminal attempts, whatever else this pass does -------
         //
@@ -2039,8 +2121,10 @@ impl Reconciler {
                     });
                 }
                 PollOutcome::Ready(demand) => {
-                    report.targets_read = report.targets_read.saturating_add(1);
-                    let tally = demand_for(policy, demand);
+                    let tally = routed
+                        .get(&policy.target)
+                        .and_then(|tallies| tallies.get(&policy.id))
+                        .expect("every pollable profile has a routed tally");
                     let count = tally.demand();
                     self.events.emit(LifecycleEvent::DemandObserved {
                         policy: policy.id,
@@ -2525,6 +2609,69 @@ fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand) -> DemandTally {
         ScaleTarget::Repository(repository) => labels.tally(reading.jobs_for(repository)),
         ScaleTarget::Organization(_) => labels.tally(reading.jobs()),
     }
+}
+
+/// Tally one shared target reading while refusing jobs whose selector cannot
+/// identify exactly one profile. The individual label predicate remains the
+/// authority for optional labels and unresolvable expressions.
+fn route_demand(
+    all_policies: &[ScalePolicy],
+    profiles: &[&ScalePolicy],
+    reading: &QueuedDemand,
+) -> (
+    BTreeMap<PolicyId, DemandTally>,
+    BTreeMap<RoutingRefusal, u32>,
+) {
+    let mut tallies: BTreeMap<PolicyId, DemandTally> = profiles
+        .iter()
+        .map(|policy| (policy.id, demand_for(policy, reading)))
+        .collect();
+    let mut refusals: BTreeMap<RoutingRefusal, u32> = BTreeMap::new();
+    let Some(first) = profiles.first() else {
+        return (tallies, refusals);
+    };
+    let jobs: Vec<&runner_manager_domain::policy::RunsOn> = match &first.target {
+        ScaleTarget::Repository(repository) => reading.jobs_for(repository).iter().collect(),
+        ScaleTarget::Organization(_) => reading.jobs().collect(),
+    };
+    for job in jobs {
+        let Ok(required) = job.required_labels() else {
+            // `demand_for` already preserves this as unresolvable for each profile.
+            continue;
+        };
+        let selectors = all_policies
+            .iter()
+            .filter(|policy| policy.target == first.target)
+            .filter_map(ScalePolicy::routing_labels)
+            .map(|labels| labels.host_label())
+            .filter(|selector| required.contains(selector))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let matched: Vec<PolicyId> = profiles
+            .iter()
+            .filter(|policy| {
+                policy
+                    .routing_labels()
+                    .is_some_and(|labels| labels.matches(job).is_match())
+            })
+            .map(|policy| policy.id)
+            .collect();
+        let refusal = match (selectors, matched.len()) {
+            (0, _) => Some(RoutingRefusal::MissingSelector),
+            (2.., _) => Some(RoutingRefusal::MultipleSelectors),
+            (_, 2..) => Some(RoutingRefusal::OverlappingProfiles),
+            _ => None,
+        };
+        if let Some(reason) = refusal {
+            *refusals.entry(reason).or_default() += 1;
+            for id in matched {
+                let tally = tallies.get_mut(&id).expect("matched profile was tallied");
+                tally.matched -= 1;
+                tally.not_matched += 1;
+            }
+        }
+    }
+    (tallies, refusals)
 }
 
 /// How urgently one failure should slow the loop down.
@@ -4498,19 +4645,136 @@ mod tests {
         // `04-subsystem-contracts.md` prices a *target*. A loop that spent per
         // policy would exceed the projection `f2` admitted the configuration
         // against, silently.
-        let mut harness = Harness::simple(8, 4, "acme/app");
+        let mut harness = Harness::simple(8, 4, "o/r");
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [
+                fixtures::queued_job(&[HOST_LABEL]),
+                fixtures::queued_job(&[HOST_LABEL]),
+                fixtures::queued_job(&["rm-home-win-x64-py-isolated"]),
+                fixtures::queued_job(&["rm-home-win-x64-py-isolated"]),
+            ],
+        )));
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated.activate().unwrap();
         let report = harness
             .reconciler
-            .reconcile(&[policy(1, "acme/app", 2), policy(2, "acme/app", 2)])
+            .reconcile(&[policy(1, "o/r", 2), isolated])
             .await;
 
         assert_eq!(harness.demand.polls().len(), 1);
+        assert_eq!(report.targets_read, 1, "profiles share one target reading");
         assert_eq!(
             report.demand_requests,
             runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL,
             "one repository's worth of demand requests, not two policies' worth. Read              from the constant rather than written as a literal so that repricing the              poll cannot silently turn this into an assertion about the wrong thing"
         );
-        assert_eq!(report.started, 4, "and both policies still get their share");
+        assert_eq!(
+            report.started, 4,
+            "native and isolated profiles each get two"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_optional_labels_do_not_duplicate_native_and_isolated_demand() {
+        let mut harness = Harness::simple(2, 0, "o/r");
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [
+                fixtures::queued_job(&[HOST_LABEL, "gpu"]),
+                fixtures::queued_job(&["rm-home-win-x64-py-isolated", "gpu"]),
+                fixtures::queued_job(&["gpu"]),
+                fixtures::unresolvable_job(),
+            ],
+        )));
+        let mut native = policy(1, "o/r", 2);
+        native.add_routing_label(fixtures::label("gpu")).unwrap();
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated.add_routing_label(fixtures::label("gpu")).unwrap();
+        isolated.activate().unwrap();
+
+        let report = harness.reconciler.reconcile(&[native, isolated]).await;
+        assert_eq!(harness.demand.polls().len(), 1);
+        assert_eq!(report.targets_read, 1);
+        assert_eq!(report.started, 2);
+        assert_eq!(report.allocations.len(), 2);
+        assert!(
+            report
+                .allocations
+                .iter()
+                .all(|allocation| allocation.to_start == 1)
+        );
+        assert!(harness.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::RoutingRefused {
+                reason: RoutingRefusal::MissingSelector,
+                count: 1,
+                ..
+            }
+        )));
+        assert_eq!(
+            harness
+                .events
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    LifecycleEvent::DemandObserved {
+                        unresolvable: 1,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "an expression stays unresolvable for both profiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_and_overlapping_selectors_start_no_runner_and_show_remedies() {
+        let mut harness = Harness::simple(4, 0, "o/r");
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [fixtures::queued_job(&[
+                HOST_LABEL,
+                "rm-home-win-x64-py-isolated",
+            ])],
+        )));
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated.activate().unwrap();
+        let report = harness
+            .reconciler
+            .reconcile(&[policy(1, "o/r", 2), isolated])
+            .await;
+        assert_eq!(report.started, 0);
+        assert!(harness.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::RoutingRefused {
+                reason: RoutingRefusal::MultipleSelectors,
+                count: 1,
+                ..
+            }
+        )));
+
+        let mut overlap = Harness::simple(4, 1, "o/r");
+        let report = overlap
+            .reconciler
+            .reconcile(&[policy(1, "o/r", 2), policy(2, "o/r", 2)])
+            .await;
+        assert_eq!(report.started, 0);
+        assert!(overlap.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::RoutingRefused {
+                reason: RoutingRefusal::OverlappingProfiles,
+                count: 1,
+                ..
+            }
+        )));
+        assert!(
+            RoutingRefusal::OverlappingProfiles
+                .to_string()
+                .contains("repair")
+        );
     }
 
     // =======================================================================

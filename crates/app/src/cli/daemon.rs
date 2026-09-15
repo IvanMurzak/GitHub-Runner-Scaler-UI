@@ -1213,7 +1213,10 @@ impl TargetReconciler for ManagedTarget {
         };
         let refreshed: Vec<ScalePolicy> = all
             .into_iter()
-            .filter(|policy| policy.target == target)
+            .filter(|policy| {
+                policy.target == target
+                    && (policy.may_start_runners() || policy.state() == PolicyState::Draining)
+            })
             .collect();
         // An empty answer means the policy was removed. The loop keeps its last
         // known copy so that `local_active` still names something and any runner
@@ -2204,6 +2207,26 @@ mod tests {
             "{targets:?}"
         );
         assert!(!targets.iter().any(|t| t == "disabled/repo"), "{targets:?}");
+    }
+
+    #[test]
+    fn named_native_and_isolated_profiles_share_one_target_loop() {
+        let native = fixtures::policy()
+            .id(PolicyId::from_u128(1))
+            .active()
+            .build();
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated.activate().unwrap();
+        let monitor = fixtures::policy()
+            .id(PolicyId::from_u128(3))
+            .monitor_only()
+            .active()
+            .build();
+        let groups = active_autoscale_targets(vec![isolated, monitor, native]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].target, groups[0][1].target);
+        assert_ne!(groups[0][0].profile_name(), groups[0][1].profile_name());
     }
 
     /// A policy disabled while it still held a runner used to be lost for good.
