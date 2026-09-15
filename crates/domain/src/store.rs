@@ -3627,6 +3627,81 @@ mod tests {
     }
 
     #[test]
+    fn a_live_version_four_attempt_migrates_to_native_identity_and_is_adopted() {
+        use crate::attempt::{
+            GithubRunnerObservation, RecoveryDecision, RecoveryObservation, RecoveryTimeouts,
+            recovery_decision,
+        };
+        use crate::execution::{AttemptExecution, ExecutionPolicy};
+
+        #[derive(Debug)]
+        struct FixedClock(Timestamp);
+        impl crate::model::Clock for FixedClock {
+            fn now(&self) -> Timestamp {
+                self.0
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let path = dir.path().join("live-version-four.sqlite3");
+        a_database_at_version(&path, 4);
+        let conn = Connection::open(&path).expect("version-four database opens");
+        conn.execute(
+            "UPDATE policies SET profile_selector = \
+             json_extract(routing_labels, '$.host_label') WHERE id = ?1",
+            [POLICY_UUID],
+        )
+        .expect("version-four selector is journalled");
+        conn.execute(
+            "UPDATE attempts SET state = 'idle', process_id = 4242, github_runner_id = 73 \
+             WHERE id = ?1",
+            [ATTEMPT_UUID],
+        )
+        .expect("legacy live process is journalled");
+        assert_eq!(current_version(&conn).expect("version readable"), 4);
+        drop(conn);
+
+        let store = SqliteStore::open(&path).expect("forward migration succeeds");
+        assert_eq!(store.schema_version(), 5);
+        assert_eq!(
+            store
+                .policy(policy_id())
+                .expect("policy loads")
+                .expect("present")
+                .execution_policy(),
+            &ExecutionPolicy::Native
+        );
+        let attempt = store
+            .attempt(attempt_id())
+            .expect("attempt loads")
+            .expect("present");
+        assert_eq!(attempt.state(), AttemptState::Idle);
+        assert_eq!(attempt.process_id(), Some(4242));
+        assert_eq!(
+            attempt.execution(),
+            &AttemptExecution::Native {
+                process_id: Some(4242)
+            }
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt,
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::NotRegistered,
+                },
+                RecoveryTimeouts::provisional(),
+                &FixedClock(ts(1_000)),
+            ),
+            RecoveryDecision::Adopt
+        );
+        store
+            .record_attempt(&attempt)
+            .expect("migrated native row remains writable");
+        assert_eq!(store.attempt(attempt.id).expect("reloads"), Some(attempt));
+    }
+
+    #[test]
     fn ambiguous_legacy_target_rows_fail_migration_without_rewriting_them() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ambiguous.sqlite3");
