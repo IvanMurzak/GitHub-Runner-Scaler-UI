@@ -1121,7 +1121,7 @@ impl Store for TargetRecoveryStore {
 /// supervision, which is exactly what the state is waiting for.
 fn active_autoscale_targets(mut policies: Vec<ScalePolicy>) -> Vec<Vec<ScalePolicy>> {
     policies.retain(|policy| policy.may_start_runners() || policy.state() == PolicyState::Draining);
-    policies.sort_by(|left, right| left.target.to_string().cmp(&right.target.to_string()));
+    policies.sort_by(|left, right| left.target.cmp(&right.target));
     let mut targets: Vec<Vec<ScalePolicy>> = Vec::new();
     for policy in policies {
         match targets.last_mut() {
@@ -1213,7 +1213,10 @@ impl TargetReconciler for ManagedTarget {
         };
         let refreshed: Vec<ScalePolicy> = all
             .into_iter()
-            .filter(|policy| policy.target == target)
+            .filter(|policy| {
+                policy.target == target
+                    && (policy.may_start_runners() || policy.state() == PolicyState::Draining)
+            })
             .collect();
         // An empty answer means the policy was removed. The loop keeps its last
         // known copy so that `local_active` still names something and any runner
@@ -2204,6 +2207,50 @@ mod tests {
             "{targets:?}"
         );
         assert!(!targets.iter().any(|t| t == "disabled/repo"), "{targets:?}");
+    }
+
+    #[test]
+    fn named_native_and_isolated_profiles_share_one_target_loop() {
+        let native = fixtures::policy()
+            .id(PolicyId::from_u128(1))
+            .active()
+            .build();
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated.activate().unwrap();
+        let monitor = fixtures::policy()
+            .id(PolicyId::from_u128(3))
+            .monitor_only()
+            .active()
+            .build();
+        let groups = active_autoscale_targets(vec![isolated, monitor, native]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].target, groups[0][1].target);
+        assert_ne!(groups[0][0].profile_name(), groups[0][1].profile_name());
+    }
+
+    #[test]
+    fn case_variant_targets_stay_in_one_loop_when_another_target_interleaves() {
+        let upper = fixtures::policy()
+            .id(PolicyId::from_u128(1))
+            .repository("A/repo")
+            .active()
+            .build();
+        let middle = fixtures::policy()
+            .id(PolicyId::from_u128(2))
+            .repository("B/repo")
+            .active()
+            .build();
+        let lower = fixtures::policy()
+            .id(PolicyId::from_u128(3))
+            .repository("a/repo")
+            .active()
+            .build();
+        let groups = active_autoscale_targets(vec![upper, middle, lower]);
+        assert_eq!(groups.len(), 2, "equal targets must share a daemon loop");
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].target, groups[0][1].target);
+        assert_eq!(groups[1].len(), 1);
     }
 
     /// A policy disabled while it still held a runner used to be lost for good.
