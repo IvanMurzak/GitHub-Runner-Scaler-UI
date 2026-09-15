@@ -1,0 +1,20 @@
+crates/domain/src/store.rs
+  s_5801a853f78e8a::t_4968b300f60933 251-253,2151-2156,2161-2166,2193,5673-5674,5800-5806
+  s_5801a853f78e8a::t_fea2be2ad77db1 5652,5659,5671-5672,5746-5799
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "998c0a416f06a724570aebef5f62a88a5ab0f0ec",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
