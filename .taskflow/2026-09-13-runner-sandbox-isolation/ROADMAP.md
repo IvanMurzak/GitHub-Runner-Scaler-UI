@@ -2,8 +2,8 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1, a2 and b1 merged into the integration ref;
-b2 dispatched and c1 remains ready.
+**Implementation status:** a1, a2, b1 and b2 merged into the integration
+ref; c1 and three platform-provider tasks are ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -50,12 +50,12 @@ This file is the only live task-state record.
 | a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | ✅ | [PR #70](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/70) / a157f3c | 2026-09-15 |
 | a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | ✅ | [PR #71](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/71) / 95901da | 2026-09-15 |
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ✅ | [PR #72](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/72) / 8805435 | 2026-09-15 |
-| b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | 🔵 | worktree-b2-isolated-lifecycle / implement-task | 2026-09-15 |
+| b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ready | — | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | pending | — | 2026-09-13 |
-| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | pending | — | 2026-09-13 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | pending | — | 2026-09-13 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | pending | — | 2026-09-13 |
+| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ready | — | 2026-09-15 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -149,3 +149,12 @@ are now dependency-ready.
 verified remote integration ref, with its branch-scoped PR base read back as
 `runner-sandbox-isolation`. c1 remains ready while the native Codex pipeline
 session loop uses the available agent slots for b2.
+
+**2026-09-15 — b2 integrated.** Task PR #73 completed the native Codex
+`implement-task` chain and passed the exact local gate plus seven CI/E2E checks
+at head 79021db. The scheduler verified durable prepare-before-JIT, fail
+closed start behavior, recovery and ownership tests, capacity retention until
+confirmed absence, and bounded typed diagnostics. PR #73 was squash-merged
+into `runner-sandbox-isolation` at 590619c and the remote ref verified. Native
+backend execution, literal OS restart and complete diagnostics acceptance are
+assigned to the later platform/integrated gates. c1 and d1-d3 are ready.
