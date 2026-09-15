@@ -3150,6 +3150,8 @@ mod tests {
         // unpinned token.
         for (state, expected) in [
             (AttemptState::Allocated, "allocated"),
+            (AttemptState::Preparing, "preparing"),
+            (AttemptState::Prepared, "prepared"),
             (AttemptState::JitReceived, "jit_received"),
             (AttemptState::Starting, "starting"),
             (AttemptState::Idle, "idle"),
@@ -3157,13 +3159,15 @@ mod tests {
             (AttemptState::Finished, "finished"),
             (AttemptState::Failed, "failed"),
             (AttemptState::Orphaned, "orphaned"),
+            (AttemptState::Destroying, "destroying"),
+            (AttemptState::CleanupDeferred, "cleanup_deferred"),
             (AttemptState::Cleaned, "cleaned"),
         ] {
             assert_eq!(token(&state), expected);
         }
         assert_eq!(
             AttemptState::ALL.len(),
-            9,
+            13,
             "a new AttemptState needs a pinned token above"
         );
 
@@ -5099,7 +5103,10 @@ mod tests {
                 FailureReason::ProcessExitedUnexpectedly,
             )),
             AttemptState::Orphaned => Some(AttemptOutcome::Orphaned),
-            AttemptState::Finished | AttemptState::Cleaned => Some(AttemptOutcome::CompletedJob),
+            AttemptState::Finished
+            | AttemptState::Destroying
+            | AttemptState::CleanupDeferred
+            | AttemptState::Cleaned => Some(AttemptOutcome::CompletedJob),
             _ => None,
         }
     }
@@ -5111,6 +5118,24 @@ mod tests {
     fn attempt_in_state(attempt: &RunnerAttempt, state: AttemptState) -> RunnerAttempt {
         let mut fields = attempt.to_persisted();
         fields.state = state;
+        if matches!(
+            state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) {
+            fields.execution = crate::execution::AttemptExecution::Isolated {
+                provider_kind: crate::execution::Backend::Oci,
+                environment_id: (state != AttemptState::Preparing).then(|| "owned-fixture".into()),
+                resolved_image: crate::execution::ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .expect("pinned fixture"),
+                generation: "generation-fixture".into(),
+            };
+        }
         fields.outcome = outcome_for(state);
         fields.terminal_at = state.is_terminal().then(|| ts(2_000));
         fields.last_state_change_at = ts(2_000);
@@ -5305,9 +5330,11 @@ mod tests {
                 .expect("journalled");
         }
 
-        let expected_active = AttemptState::ALL
-            .into_iter()
-            .filter(|state| state.counts_against_capacity())
+        let expected_active = store
+            .attempts()
+            .expect("all states load")
+            .iter()
+            .filter(|attempt| attempt.counts_against_capacity())
             .count();
         let expected_uncleaned = AttemptState::ALL
             .into_iter()

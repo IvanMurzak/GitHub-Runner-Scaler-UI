@@ -181,6 +181,8 @@ pub enum OwnershipError {
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
     Allocated,
+    Preparing,
+    Prepared,
     JitReceived,
     Starting,
     Idle,
@@ -188,12 +190,16 @@ pub enum AttemptState {
     Finished,
     Failed,
     Orphaned,
+    Destroying,
+    CleanupDeferred,
     Cleaned,
 }
 
 impl AttemptState {
-    pub const ALL: [AttemptState; 9] = [
+    pub const ALL: [AttemptState; 13] = [
         AttemptState::Allocated,
+        AttemptState::Preparing,
+        AttemptState::Prepared,
         AttemptState::JitReceived,
         AttemptState::Starting,
         AttemptState::Idle,
@@ -201,6 +207,8 @@ impl AttemptState {
         AttemptState::Finished,
         AttemptState::Failed,
         AttemptState::Orphaned,
+        AttemptState::Destroying,
+        AttemptState::CleanupDeferred,
         AttemptState::Cleaned,
     ];
 
@@ -208,6 +216,9 @@ impl AttemptState {
     pub const LEGAL: &'static [(AttemptState, AttemptState)] = &[
         // `allocated -> jit_received -> starting -> idle | busy`.
         (AttemptState::Allocated, AttemptState::JitReceived),
+        (AttemptState::Allocated, AttemptState::Preparing),
+        (AttemptState::Preparing, AttemptState::Prepared),
+        (AttemptState::Prepared, AttemptState::JitReceived),
         (AttemptState::JitReceived, AttemptState::Starting),
         (AttemptState::Starting, AttemptState::Idle),
         (AttemptState::Starting, AttemptState::Busy),
@@ -216,6 +227,10 @@ impl AttemptState {
         // `allocated | jit_received | starting -> failed | orphaned`.
         (AttemptState::Allocated, AttemptState::Failed),
         (AttemptState::Allocated, AttemptState::Orphaned),
+        (AttemptState::Preparing, AttemptState::Failed),
+        (AttemptState::Preparing, AttemptState::Orphaned),
+        (AttemptState::Prepared, AttemptState::Failed),
+        (AttemptState::Prepared, AttemptState::Orphaned),
         (AttemptState::JitReceived, AttemptState::Failed),
         (AttemptState::JitReceived, AttemptState::Orphaned),
         (AttemptState::Starting, AttemptState::Failed),
@@ -231,6 +246,12 @@ impl AttemptState {
         (AttemptState::Finished, AttemptState::Cleaned),
         (AttemptState::Failed, AttemptState::Cleaned),
         (AttemptState::Orphaned, AttemptState::Cleaned),
+        (AttemptState::Finished, AttemptState::Destroying),
+        (AttemptState::Failed, AttemptState::Destroying),
+        (AttemptState::Orphaned, AttemptState::Destroying),
+        (AttemptState::Destroying, AttemptState::CleanupDeferred),
+        (AttemptState::CleanupDeferred, AttemptState::Destroying),
+        (AttemptState::Destroying, AttemptState::Cleaned),
     ];
 
     /// The five states an attempt can still be concluded from: every
@@ -241,6 +262,8 @@ impl AttemptState {
     /// edge, and that equality is a property worth failing loudly on.
     pub const CONCLUDABLE_FROM: &'static [AttemptState] = &[
         AttemptState::Allocated,
+        AttemptState::Preparing,
+        AttemptState::Prepared,
         AttemptState::JitReceived,
         AttemptState::Starting,
         AttemptState::Idle,
@@ -263,6 +286,8 @@ impl AttemptState {
             AttemptState::Finished
                 | AttemptState::Failed
                 | AttemptState::Orphaned
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
                 | AttemptState::Cleaned
         )
     }
@@ -292,6 +317,8 @@ impl fmt::Display for AttemptState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             AttemptState::Allocated => "allocated",
+            AttemptState::Preparing => "preparing",
+            AttemptState::Prepared => "prepared",
             AttemptState::JitReceived => "jit_received",
             AttemptState::Starting => "starting",
             AttemptState::Idle => "idle",
@@ -299,6 +326,8 @@ impl fmt::Display for AttemptState {
             AttemptState::Finished => "finished",
             AttemptState::Failed => "failed",
             AttemptState::Orphaned => "orphaned",
+            AttemptState::Destroying => "destroying",
+            AttemptState::CleanupDeferred => "cleanup_deferred",
             AttemptState::Cleaned => "cleaned",
         })
     }
@@ -801,7 +830,13 @@ impl RunnerAttempt {
             }
             (Some(outcome), true) => {
                 let expected = outcome.terminal_state();
-                if state != expected && state != AttemptState::Cleaned {
+                let allowed_isolated_cleanup = !execution.is_native()
+                    && matches!(
+                        state,
+                        AttemptState::Destroying | AttemptState::CleanupDeferred
+                    );
+                if ![expected, AttemptState::Cleaned].contains(&state) && !allowed_isolated_cleanup
+                {
                     return Err(AttemptError::OutcomeStateMismatch {
                         state,
                         outcome: outcome.clone(),
@@ -823,6 +858,33 @@ impl RunnerAttempt {
             (None, true) => return Err(AttemptError::TerminalWithoutTimestamp { state }),
             (Some(_), false) => return Err(AttemptError::NonTerminalWithTimestamp { state }),
             _ => {}
+        }
+
+        if matches!(
+            state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) && execution.is_native()
+        {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        if matches!(
+            state,
+            AttemptState::Prepared
+                | AttemptState::JitReceived
+                | AttemptState::Starting
+                | AttemptState::Idle
+                | AttemptState::Busy
+        ) && matches!(
+            &execution,
+            AttemptExecution::Isolated {
+                environment_id: None,
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
         }
 
         // Presence was checked above; *ordering* is checked here, and it is a
@@ -915,7 +977,15 @@ impl RunnerAttempt {
     /// Fill the provider identity through a durable journal write before an
     /// isolated runner receives JIT. A second or changed identity is refused.
     pub fn prepared_environment(&mut self, environment_id: String) -> Result<(), AttemptError> {
-        if self.state != AttemptState::Allocated {
+        if !matches!(
+            self.state,
+            AttemptState::Allocated
+                | AttemptState::Preparing
+                | AttemptState::Failed
+                | AttemptState::Orphaned
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) {
             return Err(ExecutionError::AttemptIdentityMismatch.into());
         }
         let AttemptExecution::Isolated {
@@ -940,6 +1010,28 @@ impl RunnerAttempt {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Persist intent before a provider performs an external prepare effect.
+    pub fn begin_prepare(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Preparing, now)
+    }
+
+    /// Persist the returned provider identity before requesting JIT.
+    pub fn mark_prepared(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if !matches!(
+            self.execution,
+            AttemptExecution::Isolated {
+                environment_id: Some(_),
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Prepared, now)
     }
 
     #[must_use]
@@ -1030,6 +1122,20 @@ impl RunnerAttempt {
         Ok(())
     }
 
+    /// An isolated environment has no host PID; its immutable identity is already journalled.
+    pub fn started_isolated(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if !matches!(
+            self.execution,
+            AttemptExecution::Isolated {
+                environment_id: Some(_),
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Starting, now)
+    }
+
     /// `starting -> idle`: the runner registered and is awaiting its one
     /// assignment.
     ///
@@ -1100,6 +1206,36 @@ impl RunnerAttempt {
         }
         if !self.execution.is_native() {
             return Err(ExecutionError::IsolatedCleanupUnproven.into());
+        }
+        if !self.state.is_concluded() {
+            return Err(AttemptError::IllegalTransition {
+                from: self.state,
+                to: AttemptState::Cleaned,
+            });
+        }
+        self.move_to(AttemptState::Cleaned, now)
+    }
+
+    /// Durable cleanup intent, recorded before stop or destroy is attempted.
+    pub fn begin_destroy(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() || self.outcome.is_none() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Destroying, now)
+    }
+
+    /// The provider still owns resources; preserve the capacity lease for a retry.
+    pub fn defer_cleanup(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::CleanupDeferred, now)
+    }
+
+    /// Only the lifecycle may call this after an independent missing observation.
+    pub fn clean_isolated(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
         }
         self.move_to(AttemptState::Cleaned, now)
     }
@@ -1622,7 +1758,8 @@ pub fn recovery_decision(
             }
         }
 
-        S::Finished | S::Failed | S::Orphaned | S::Cleaned => {
+        S::Preparing | S::Prepared => RecoveryDecision::Wait,
+        S::Finished | S::Failed | S::Orphaned | S::Destroying | S::CleanupDeferred | S::Cleaned => {
             unreachable!("terminal states are handled above")
         }
     }
@@ -1750,6 +1887,9 @@ mod tests {
         // Line 1.
         let mut edges = vec![
             (Allocated, JitReceived),
+            (Allocated, Preparing),
+            (Preparing, Prepared),
+            (Prepared, JitReceived),
             (JitReceived, Starting),
             (Starting, Idle),
             (Starting, Busy),
@@ -1757,7 +1897,7 @@ mod tests {
         // Line 2, added by the 2026-08-21 amendment.
         edges.push((Idle, Busy));
         // Line 3, added by the same amendment.
-        for from in [Allocated, JitReceived, Starting] {
+        for from in [Allocated, Preparing, Prepared, JitReceived, Starting] {
             for to in [Failed, Orphaned] {
                 edges.push((from, to));
             }
@@ -1771,7 +1911,13 @@ mod tests {
         // Line 5.
         for from in [Finished, Failed, Orphaned] {
             edges.push((from, Cleaned));
+            edges.push((from, Destroying));
         }
+        edges.extend([
+            (Destroying, CleanupDeferred),
+            (CleanupDeferred, Destroying),
+            (Destroying, Cleaned),
+        ]);
         edges
     }
 
@@ -1780,7 +1926,7 @@ mod tests {
         let expected = diagram_edges();
         assert_eq!(
             expected.len(),
-            20,
+            33,
             "the transcription itself changed; check it against the diagram"
         );
 
@@ -1817,8 +1963,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_seen, 20);
-        assert_eq!(illegal_seen, 81 - 20);
+        assert_eq!(legal_seen, 33);
+        assert_eq!(illegal_seen, 13 * 13 - 33);
 
         // And the published constant matches the transcription.
         let mut published = AttemptState::LEGAL.to_vec();

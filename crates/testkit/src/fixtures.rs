@@ -572,6 +572,33 @@ impl AttemptBuilder {
         };
         let entered_state_at = self.entered_state_at.unwrap_or(self.created_at);
         let terminal_at = self.state.is_terminal().then_some(entered_state_at);
+        let isolated_stage = matches!(
+            self.state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        );
+        let process_id = if isolated_stage {
+            None
+        } else {
+            self.process_id
+        };
+        let execution = if isolated_stage {
+            runner_manager_domain::execution::AttemptExecution::Isolated {
+                provider_kind: runner_manager_domain::execution::Backend::Oci,
+                environment_id: (self.state != AttemptState::Preparing)
+                    .then(|| "fixture-environment".into()),
+                resolved_image: runner_manager_domain::execution::ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .expect("pinned fixture"),
+                generation: "fixture-generation".into(),
+            }
+        } else {
+            runner_manager_domain::execution::AttemptExecution::Native { process_id }
+        };
 
         RunnerAttempt::from_persisted(PersistedAttempt {
             id: self.id,
@@ -579,10 +606,8 @@ impl AttemptBuilder {
             github_runner_id: self.github_runner_id,
             state: self.state,
             outcome,
-            process_id: self.process_id,
-            execution: runner_manager_domain::execution::AttemptExecution::Native {
-                process_id: self.process_id,
-            },
+            process_id,
+            execution,
             runtime_path: self.runtime_path.into(),
             workspace_kind: self.workspace.kind(),
             workspace_slot: self.workspace.slot_number(),
