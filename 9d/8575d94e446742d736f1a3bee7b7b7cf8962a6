@@ -1,0 +1,19 @@
+.taskflow/2026-09-13-runner-sandbox-isolation/ROADMAP.md
+  s_5801a853f78e8a::t_9a632f6150ede1 5-6,8,50,65,106-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9d8575d94e446742d736f1a3bee7b7b7cf8962a6",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
