@@ -2,8 +2,8 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1 and a2 merged into the integration ref; b1
-is dispatched.
+**Implementation status:** a1, a2 and b1 merged into the integration ref;
+b2 and c1 are ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -49,9 +49,9 @@ This file is the only live task-state record.
 |---|---|---:|---:|---|---|---|---|---|---|---|---|
 | a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | ✅ | [PR #70](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/70) / a157f3c | 2026-09-15 |
 | a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | ✅ | [PR #71](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/71) / 95901da | 2026-09-15 |
-| b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | 🔵 | worktree-b1-execution-domain-provider / implement-task | 2026-09-15 |
-| b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | pending | — | 2026-09-13 |
-| c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | pending | — | 2026-09-13 |
+| b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ✅ | [PR #72](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/72) / 8805435 | 2026-09-15 |
+| b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ready | — | 2026-09-15 |
+| c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ready | — | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | pending | — | 2026-09-13 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | pending | — | 2026-09-13 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | pending | — | 2026-09-13 |
@@ -137,3 +137,10 @@ verified remote integration ref and its branch-scoped PR base was read back as
 `runner-sandbox-isolation`. The Codex session-loop `implement-task` pipeline
 will run all implementation, review, simplification, and landing steps in an
 isolated run worktree.
+
+**2026-09-15 — b1 integrated.** Task PR #72 passed the exact full local
+gate and seven CI/E2E checks at head adaee90. The scheduler required focused
+v4 live-PID migration/recovery, isolated crash/reopen, and isolated-row token
+canary regressions before merge. PR #72 was squash-merged into
+`runner-sandbox-isolation` at 8805435 and the remote ref verified. b2 and c1
+are now dependency-ready.
