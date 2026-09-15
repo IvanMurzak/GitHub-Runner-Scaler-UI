@@ -178,7 +178,9 @@ impl ExecutionPolicy {
             }
             resources.validate()?;
             ImageReference::new(image.as_str())?;
-            if matches!(backend, Backend::Oci) && !image.as_str().contains("sha256:") {
+            if matches!(backend, Backend::Oci | Backend::WindowsHyperVContainer)
+                && !image.as_str().contains("sha256:")
+            {
                 return Err(ExecutionError::BackendImageMismatch);
             }
         }
@@ -292,7 +294,10 @@ impl AttemptExecution {
                 return Err(ExecutionError::UnresolvedProvider);
             }
             ImageReference::new(resolved_image.as_str())?;
-            if matches!(provider_kind, Backend::Oci) && !resolved_image.as_str().contains("sha256:")
+            if matches!(
+                provider_kind,
+                Backend::Oci | Backend::WindowsHyperVContainer
+            ) && !resolved_image.as_str().contains("sha256:")
             {
                 return Err(ExecutionError::BackendImageMismatch);
             }
@@ -419,6 +424,49 @@ mod tests {
             generation: "gen-123".into(),
         };
         assert_eq!(unknown.validate(), Err(ExecutionError::UnresolvedProvider));
+    }
+
+    #[test]
+    fn container_backends_require_digest_images_for_policy_and_journal() {
+        let version = ImageReference::new("vm-version:macos-15.0").expect("pinned VM version");
+        for backend in [Backend::Oci, Backend::WindowsHyperVContainer] {
+            let policy = ExecutionPolicy::Isolated {
+                backend,
+                image: version.clone(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            };
+            assert_eq!(
+                policy.validate(TargetScope::Repository, &WorkspacePolicy::Ephemeral),
+                Err(ExecutionError::BackendImageMismatch)
+            );
+            let attempt = AttemptExecution::Isolated {
+                provider_kind: backend,
+                environment_id: None,
+                resolved_image: version.clone(),
+                generation: "gen-123".into(),
+            };
+            assert_eq!(
+                attempt.validate(),
+                Err(ExecutionError::BackendImageMismatch)
+            );
+        }
+        let vm = ExecutionPolicy::Isolated {
+            backend: Backend::VirtualMachine,
+            image: version,
+            resources: ResourceLimits {
+                cpu_millis: 1000,
+                memory_mib: 1024,
+                disk_mib: 4096,
+            },
+        };
+        assert!(
+            vm.validate(TargetScope::Repository, &WorkspacePolicy::Ephemeral)
+                .is_ok()
+        );
     }
 }
 
