@@ -25,6 +25,7 @@ use runner_manager_domain::attempt::{
     AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, RecoveryDecision,
     RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize, recovery_decision,
 };
+use runner_manager_domain::execution::{Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_domain::policy::ScalePolicy;
@@ -1250,7 +1251,146 @@ impl ProcessStartFailure {
     }
 }
 
-pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
+/// A credential-free capability report. An isolated policy never treats a
+/// native-ready result as permission to launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCapability {
+    Ready,
+    Unsupported,
+    NotInstalled,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedEnvironment {
+    attempt: AttemptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentIdentity {
+    NativeProcess(u32),
+    Isolated {
+        provider_kind: Backend,
+        environment_id: String,
+        resolved_image: ImageReference,
+        generation: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentState {
+    Starting,
+    Running,
+    Exited,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStop {
+    Stopped,
+    StillRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDestroy {
+    Destroyed,
+    Deferred(&'static str),
+}
+
+/// Provider lifecycle and native process supervision. The default lifecycle
+/// methods adapt the existing native spawn/recovery implementation, and refuse
+/// every isolated allocation. Future platform adapters must implement their
+/// own prepare/start/inspect/stop/destroy paths rather than fall back here.
+pub trait ExecutionProvider: fmt::Debug + Send + Sync {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        if policy.execution_policy().is_native() {
+            ProviderCapability::Ready
+        } else {
+            ProviderCapability::Unsupported
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        if !attempt.execution().is_native() || !policy.execution_policy().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        Ok(PreparedEnvironment {
+            attempt: attempt.id,
+        })
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        if prepared.attempt != attempt.id || !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "execution provider identity mismatch".into(),
+            )));
+        }
+        self.spawn(attempt, config)
+            .map(EnvironmentIdentity::NativeProcess)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.is_alive(attempt).map(|alive| {
+            if alive {
+                EnvironmentState::Running
+            } else {
+                EnvironmentState::Missing
+            }
+        })
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.terminate(attempt).map(|()| ProviderStop::Stopped)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        // Native termination is already settled by the existing recovery
+        // decision before workspace cleanup. There is no separate sandbox
+        // resource to destroy, and repeating an observation here changes the
+        // established native cleanup behaviour.
+        Ok(ProviderDestroy::Destroyed)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.inspect(attempt)
+    }
+
+    fn enumerate_owned(&self, _host_id: HostId) -> Vec<EnvironmentIdentity> {
+        Vec::new() // Native processes have no independent provider resources.
+    }
+
+    fn diagnostics(&self, _attempt: &RunnerAttempt) -> Vec<&'static str> {
+        Vec::new() // No job or JIT output enters provider metadata.
+    }
+
     fn spawn(
         &self,
         attempt: &RunnerAttempt,
@@ -1267,6 +1407,9 @@ pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
     fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool;
     fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason>;
 }
+
+/// Compatibility name for existing native process tests and callers.
+pub use ExecutionProvider as ProcessSupervisor;
 
 /// Native process supervision.  The start token is stored beside the runtime;
 /// recovery never trusts a recycled PID merely because SQLite contains it.
@@ -1663,7 +1806,7 @@ pub struct LifecyclePorts {
     pub store: Arc<dyn Store>,
     pub github: Arc<dyn LifecycleGithub>,
     pub packages: Arc<dyn RuntimePackages>,
-    pub processes: Arc<dyn ProcessSupervisor>,
+    pub processes: Arc<dyn ExecutionProvider>,
     pub clock: Arc<dyn Clock>,
     pub demand: Arc<dyn DemandPersistence>,
     pub delay: Arc<dyn RetryDelay>,
@@ -1791,6 +1934,10 @@ impl LifecycleLauncher {
         &self,
         policies: &[ScalePolicy],
     ) -> Result<Vec<ReplacementIntent>, LifecycleError> {
+        *self
+            .recovery_complete
+            .lock()
+            .map_err(|_| LifecycleError::Journal)? = false;
         let by_id: BTreeMap<_, _> = policies.iter().map(|policy| (policy.id, policy)).collect();
         let attempts = self
             .ports
@@ -1800,12 +1947,19 @@ impl LifecycleLauncher {
         let mut unresolved = false;
         for attempt in attempts {
             let Some(policy) = by_id.get(&attempt.policy_id) else {
-                if !attempt.is_terminal() && attempt.state() != AttemptState::Cleaned {
+                if attempt.counts_against_capacity() {
                     unresolved = true;
                 }
                 continue;
             };
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
+            if !attempt.execution().is_native() {
+                // This build has no isolated adapter. Keep the journal and
+                // capacity lease intact, without invoking native recovery or
+                // opening the startup launch gate.
+                unresolved = true;
+                continue;
+            }
             match self.reconcile_one(policy, attempt).await? {
                 ReconcileProgress::Deferred => unresolved = true,
                 ReconcileProgress::Replacement { attempt, operation } => {
@@ -1864,6 +2018,9 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?;
         for attempt in attempts {
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
+            if !attempt.execution().is_native() {
+                continue;
+            }
             if let ReconcileProgress::Replacement { attempt, operation } =
                 self.reconcile_one(policy, attempt).await?
             {
@@ -1882,6 +2039,9 @@ impl LifecycleLauncher {
         policy: &ScalePolicy,
         mut attempt: RunnerAttempt,
     ) -> Result<ReconcileProgress, LifecycleError> {
+        if !attempt.execution().is_native() {
+            return Ok(ReconcileProgress::Deferred);
+        }
         if attempt.state() == AttemptState::Cleaned {
             // A child of Runner.Worker can outlive the runner process briefly.
             // If it recreates `_work` after `clean_attempt` removed the tree but
@@ -1928,8 +2088,9 @@ impl LifecycleLauncher {
         let process_alive = self
             .ports
             .processes
-            .is_alive(&attempt)
-            .map_err(LifecycleError::Failed)?;
+            .inspect(&attempt)
+            .map_err(LifecycleError::Failed)?
+            == EnvironmentState::Running;
         let github = self
             .ports
             .github
@@ -2114,15 +2275,21 @@ impl LifecycleLauncher {
                 self.ports.events.emit(AttemptEvent::TerminateIntent {
                     attempt: attempt.id,
                 });
-                self.ports
-                    .processes
-                    .terminate(&attempt)
-                    .map_err(LifecycleError::Failed)?;
                 if self
                     .ports
                     .processes
-                    .is_alive(&attempt)
+                    .stop(&attempt)
                     .map_err(LifecycleError::Failed)?
+                    == ProviderStop::StillRunning
+                {
+                    return Ok(ReconcileProgress::Deferred);
+                }
+                if self
+                    .ports
+                    .processes
+                    .inspect(&attempt)
+                    .map_err(LifecycleError::Failed)?
+                    == EnvironmentState::Running
                 {
                     return Ok(ReconcileProgress::Deferred);
                 }
@@ -2274,6 +2441,17 @@ impl LifecycleLauncher {
     }
 
     fn clean_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
+        match self
+            .ports
+            .processes
+            .destroy(attempt)
+            .map_err(LifecycleError::Failed)?
+        {
+            ProviderDestroy::Destroyed => {}
+            ProviderDestroy::Deferred(reason) => {
+                return Err(LifecycleError::Failed(FailureReason::Other(reason.into())));
+            }
+        }
         let outcome = attempt
             .outcome()
             .cloned()
@@ -2778,6 +2956,13 @@ impl LifecycleLauncher {
         {
             return Err(LifecycleError::RecoveryIncomplete);
         }
+        if !policy.execution_policy().is_native()
+            || self.ports.processes.probe(policy) != ProviderCapability::Ready
+        {
+            return Err(LifecycleError::Failed(FailureReason::Other(
+                "execution provider unavailable".into(),
+            )));
+        }
         let labels = policy
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
@@ -2806,6 +2991,11 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
 
+        let prepared = match self.ports.processes.prepare(&attempt, policy) {
+            Ok(prepared) => prepared,
+            Err(reason) => return self.fail_launch(&mut attempt, reason),
+        };
+
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
         let registration = match self.register_with_retry(policy, id, &jit_request).await {
@@ -2822,8 +3012,16 @@ impl LifecycleLauncher {
         let mut issued = 0_u32;
         let pid = loop {
             issued = issued.saturating_add(1);
-            match self.ports.processes.spawn(&attempt, &config) {
-                Ok(pid) => break pid,
+            match self.ports.processes.start(prepared, &attempt, &config) {
+                Ok(EnvironmentIdentity::NativeProcess(pid)) => break pid,
+                Ok(EnvironmentIdentity::Isolated { .. }) => {
+                    // No isolated launch sequence is wired in this task. Keep
+                    // the nonterminal JIT journal as a capacity fence rather
+                    // than treating an unexpected resource as a native PID.
+                    return Err(LifecycleError::Failed(FailureReason::Other(
+                        "unexpected isolated environment identity".into(),
+                    )));
+                }
                 Err(error) => {
                     if let Some(pid) = error.live_pid {
                         attempt
@@ -3771,6 +3969,116 @@ mod tests {
         fn only_attempt(&self) -> RunnerAttempt {
             self.store.attempts().unwrap().into_iter().next().unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_policy_and_journal_never_enter_native_provider_or_jit() {
+        use runner_manager_domain::execution::{
+            AttemptExecution, Backend, ExecutionPolicy, ImageReference, ResourceLimits,
+        };
+
+        let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_host_runner_root();
+        let image =
+            ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+                .expect("pinned image");
+        harness
+            .policy
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: image.clone(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            })
+            .expect("valid isolated profile");
+
+        harness.ready().await;
+        assert_eq!(
+            harness.processes.probe(&harness.policy),
+            ProviderCapability::Unsupported
+        );
+        let failure = harness
+            .launch_result()
+            .await
+            .expect_err("provider is unavailable");
+        assert!(
+            failure
+                .reason
+                .to_string()
+                .contains("execution provider unavailable")
+        );
+
+        let runtime = harness.host_root().join("isolated-owned-environment");
+        fs::create_dir_all(&runtime).expect("provider resource fixture");
+        fs::write(runtime.join("owned-marker"), "non-secret").expect("fixture marker");
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x123),
+            harness.policy.id,
+            runtime.clone(),
+            harness.clock.now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image,
+                generation: "generation-123".into(),
+            })
+            .expect("isolated intent");
+        attempt
+            .prepared_environment("environment-123".into())
+            .expect("prepared identity");
+        harness
+            .store
+            .record_attempt(&attempt)
+            .expect("durable isolated journal");
+
+        assert!(matches!(
+            harness
+                .launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await,
+            Err(LifecycleError::RecoveryIncomplete)
+        ));
+        let failure = harness
+            .launch_result()
+            .await
+            .expect_err("unresolved provider allocation fences all new launches");
+        assert!(failure.reason.to_string().contains("recovery"));
+        harness
+            .launcher
+            .supervise(&harness.policy)
+            .await
+            .expect("unavailable attempt is deferred");
+        assert!(harness.launcher.clean(attempt.id).await.is_err());
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::ProcessStartFailed),
+                harness.clock.now(),
+            )
+            .expect("isolated runner is terminal");
+        harness
+            .store
+            .record_attempt(&attempt)
+            .expect("terminal resource remains journalled");
+        assert!(matches!(
+            harness.launcher.recover_startup(&[]).await,
+            Err(LifecycleError::RecoveryIncomplete)
+        ));
+        assert!(
+            runtime.join("owned-marker").is_file(),
+            "native cleanup touched the isolated environment"
+        );
+        assert!(
+            harness.processes.actions.lock().unwrap().is_empty(),
+            "native recovery inspected an isolated identity"
+        );
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.packages.materializations.load(Ordering::SeqCst), 0);
     }
 
     /// The wiring the three-hour outage needed and did not have.
