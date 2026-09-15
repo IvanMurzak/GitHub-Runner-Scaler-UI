@@ -2,8 +2,8 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1 merged into the integration ref; a2 and b1
-are ready for the next round.
+**Implementation status:** a1 merged into the integration ref; a2 dispatched,
+and b1 remains ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -48,7 +48,7 @@ This file is the only live task-state record.
 | id | Task (spec) | group | seq | needs | repo | base_branch | imp/cx | model | Status | Run / PR | Updated |
 |---|---|---:|---:|---|---|---|---|---|---|---|---|
 | a1-profile-domain-store | `tasks/a1-profile-domain-store.md` | A | 1 | — | . | main | 9/8 | top | ✅ | [PR #70](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/70) / a157f3c | 2026-09-15 |
-| a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | ready | — | 2026-09-15 |
+| a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | 🔵 | worktree-a2-routing-reconcile / implement-task | 2026-09-15 |
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ready | — | 2026-09-15 |
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | pending | — | 2026-09-13 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | pending | — | 2026-09-13 |
@@ -118,3 +118,9 @@ fixed at the same PR head; the raw v3 upgrade test compares all legacy policy,
 host and attempt fields. The exact local gate and seven CI/E2E checks passed
 at head 76846bf. PR #70 was squash-merged into `runner-sandbox-isolation` at
 a157f3c and the remote ref was verified. a2 and b1 are now dependency-ready.
+
+**2026-09-15 — a2 dispatched.** The a2 task slot was provisioned from the
+verified remote integration ref and its PR base recorded as
+`runner-sandbox-isolation`. The pipeline's manager and fresh executor require
+the available native agent slots while a task runs, so b1 is held ready for
+the next dispatch.
