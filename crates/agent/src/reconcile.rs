@@ -2630,6 +2630,12 @@ fn route_demand(
     let Some(first) = profiles.first() else {
         return (tallies, refusals);
     };
+    let selectors: BTreeSet<_> = all_policies
+        .iter()
+        .filter(|policy| policy.target == first.target)
+        .filter_map(ScalePolicy::routing_labels)
+        .map(|labels| labels.host_label())
+        .collect();
     let jobs: Vec<&runner_manager_domain::policy::RunsOn> = match &first.target {
         ScaleTarget::Repository(repository) => reading.jobs_for(repository).iter().collect(),
         ScaleTarget::Organization(_) => reading.jobs().collect(),
@@ -2639,14 +2645,10 @@ fn route_demand(
             // `demand_for` already preserves this as unresolvable for each profile.
             continue;
         };
-        let selectors = all_policies
+        let selector_count = selectors
             .iter()
-            .filter(|policy| policy.target == first.target)
-            .filter_map(ScalePolicy::routing_labels)
-            .map(|labels| labels.host_label())
             .filter(|selector| required.contains(selector))
-            .collect::<BTreeSet<_>>()
-            .len();
+            .count();
         let matched: Vec<PolicyId> = profiles
             .iter()
             .filter(|policy| {
@@ -2656,7 +2658,7 @@ fn route_demand(
             })
             .map(|policy| policy.id)
             .collect();
-        let refusal = match (selectors, matched.len()) {
+        let refusal = match (selector_count, matched.len()) {
             (0, _) => Some(RoutingRefusal::MissingSelector),
             (2.., _) => Some(RoutingRefusal::MultipleSelectors),
             (_, 2..) => Some(RoutingRefusal::OverlappingProfiles),
