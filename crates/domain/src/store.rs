@@ -3452,6 +3452,69 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_version_three_database_preserves_legacy_rows_as_default() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+        a_database_at_version(&path, 3);
+
+        // Compare SQLite values with their original column names, rather than
+        // domain objects that could normalize a rewritten legacy value on load.
+        let snapshot = |conn: &Connection, table: &str, id: &str| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} WHERE id = ?1"))
+                .expect("legacy row query");
+            let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+            let values: Vec<rusqlite::types::Value> = stmt
+                .query_row([id], |row| {
+                    (0..columns.len())
+                        .map(|index| row.get(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("legacy row");
+            columns.into_iter().zip(values).collect::<Vec<_>>()
+        };
+
+        let conn = Connection::open(&path).expect("open version three");
+        let policy_before = snapshot(&conn, "policies", POLICY_UUID);
+        let host_before = snapshot(&conn, "hosts", HOST_UUID);
+        let attempt_before = snapshot(&conn, "attempts", ATTEMPT_UUID);
+        assert_eq!(policy_before.len(), 15, "all version-three policy columns");
+        assert_eq!(current_version(&conn).expect("version three"), 3);
+        drop(conn);
+
+        let store = SqliteStore::open(&path).expect("clean version three upgrades");
+        assert_everything_migrated_to_ephemeral(&store);
+        let conn = store.lock();
+        let policy_after = snapshot(&conn, "policies", POLICY_UUID);
+        assert_eq!(policy_after.len(), policy_before.len() + 2);
+        assert_eq!(
+            &policy_after[..policy_before.len()],
+            policy_before.as_slice(),
+            "migration four must preserve every pre-existing policy field"
+        );
+        assert_eq!(snapshot(&conn, "hosts", HOST_UUID), host_before);
+        assert_eq!(
+            snapshot(&conn, "attempts", ATTEMPT_UUID),
+            attempt_before,
+            "recovery must retain the original runtime path, state, lease, and timestamps"
+        );
+        assert_eq!(
+            policy_after[policy_before.len()],
+            (
+                "profile_name".to_string(),
+                rusqlite::types::Value::Text("default".to_string())
+            )
+        );
+        assert_eq!(
+            policy_after[policy_before.len() + 1],
+            (
+                "profile_selector".to_string(),
+                rusqlite::types::Value::Text("rm-home-win-x64".to_string())
+            )
+        );
+    }
+
+    #[test]
     fn ambiguous_legacy_target_rows_fail_migration_without_rewriting_them() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ambiguous.sqlite3");
