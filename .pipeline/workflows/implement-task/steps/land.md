@@ -38,11 +38,16 @@ and verify the complete GitHub check rollup. The Taskflow scheduler owns merge.
    concise title and a body explaining behavior, validation, and the Taskflow
    task or issue reference. Capture the PR number and URL.
 6. Run `pipeline ci-wait --pr "$pr" --repo "$worktree_path" --timeout 540 --json`
-   without piping it. Repeat at most ten times only for exit code 3 (pending).
-   Exit 0 means all reported checks passed. For exit 1, report failed checks
-   and links; if the same check fails on the base branch for the same reason,
-   follow the executor's out-of-scope blocker protocol. For exit 2 or 4,
-   report the CLI or missing-check condition and stop.
+   without piping it. Capture its output and exit code separately. Exit 0
+   means all reported checks passed. A timeout may exit 1 with JSON
+   `status: "timeout"` even while checks are only pending; when the current
+   PR head still has pending checks and zero failures, repeat the wait at most
+   ten times. Treat exit 3 (pending) the same way. For a terminal exit 1 with
+   failed checks, report names and links; if the same check fails on the base
+   branch for the same reason, follow the executor's out-of-scope blocker
+   protocol. For exit 2 or 4, report the CLI or missing-check condition and
+   stop. Never infer success from a timeout: require a fresh exit-0 result
+   for the current published PR head.
 7. Verify `gh pr view "$pr" --json state,baseRefName,headRefOid,url` reports
    an `OPEN` PR against `$BASE_BRANCH` at this step's published head.
 8. Report PR number/URL, published head SHA, and final check totals.
