@@ -2855,13 +2855,19 @@ impl LifecycleLauncher {
             return Err(self.defer_environment_cleanup(attempt)?);
         }
         let current = if has_identity {
-            match provider.inspect(attempt) {
-                Ok(state) => state,
-                Err(_) => return Err(self.defer_environment_cleanup(attempt)?),
-            }
+            provider.inspect(attempt)
         } else {
-            EnvironmentState::Missing
+            // A prepare effect may have succeeded before its identity could be
+            // journalled. Empty enumeration alone is not proof of absence.
+            provider.recover(attempt)
         };
+        let current = match current {
+            Ok(state) => state,
+            Err(_) => return Err(self.defer_environment_cleanup(attempt)?),
+        };
+        if !has_identity && current != EnvironmentState::Missing {
+            return Err(self.defer_environment_cleanup(attempt)?);
+        }
         if current != EnvironmentState::Missing {
             if !matches!(provider.owns(attempt), Ok(true)) {
                 self.ports
@@ -4266,6 +4272,7 @@ mod tests {
         permission_denied: AtomicBool,
         incompatible_image: AtomicBool,
         prepare_failure: AtomicBool,
+        recovery_unavailable: AtomicBool,
         destroy_deferred: AtomicBool,
         handoffs: AtomicUsize,
         native_calls: AtomicUsize,
@@ -4376,6 +4383,15 @@ mod tests {
                 .unwrap()
                 .get(&attempt.id)
                 .map_or(EnvironmentState::Missing, |(_, state)| *state))
+        }
+
+        fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+            if self.recovery_unavailable.load(Ordering::SeqCst) {
+                return Err(FailureReason::Other(
+                    "provider discovery unavailable".into(),
+                ));
+            }
+            self.inspect(attempt)
         }
 
         fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
@@ -5072,6 +5088,58 @@ mod tests {
             assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
             assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn no_journalled_environment_id_waits_for_provider_absence_proof() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let runtime = harness.host_root().join("prepare-without-identity");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x9191),
+            harness.policy.id,
+            runtime,
+            harness.clock.now(),
+        );
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "prepare-generation".into(),
+            })
+            .unwrap();
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::Other("prepare interrupted".into())),
+                harness.clock.now(),
+            )
+            .unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+
+        provider.recovery_unavailable.store(true, Ordering::SeqCst);
+        launcher
+            .clean(attempt.id)
+            .await
+            .expect_err("absence unproven");
+        let deferred = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(deferred.state(), AttemptState::CleanupDeferred);
+        assert!(deferred.counts_against_capacity());
+
+        provider.recovery_unavailable.store(false, Ordering::SeqCst);
+        launcher.clean(attempt.id).await.expect("absence proven");
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
     }
 
     #[tokio::test]
