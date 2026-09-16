@@ -1326,23 +1326,14 @@ impl SettingsUi {
         let name = self.create_name.text();
         // Validate early so the preview and the command reject the same name.
         form.preview_selector(&name)?;
-        let isolation = if self.create_execution_mode == ExecutionMode::Native {
-            IsolationArgs {
-                backend: None,
-                image: None,
-                cpu: None,
-                memory: None,
-                disk: None,
-            }
-        } else {
-            IsolationArgs {
-                backend: Some(self.create_execution_backend),
-                image: Some(self.create_execution_image.text()),
-                cpu: Some(self.create_execution_cpu),
-                memory: Some(self.create_execution_memory),
-                disk: Some(self.create_execution_disk),
-            }
-        };
+        let isolation = isolation_args(
+            self.create_execution_mode,
+            self.create_execution_backend,
+            &self.create_execution_image,
+            self.create_execution_cpu,
+            self.create_execution_memory,
+            self.create_execution_disk,
+        );
         let mut output = Vec::new();
         cli::profile::dispatch(
             context,
@@ -1368,23 +1359,14 @@ impl SettingsUi {
             return Ok(());
         };
         let form = form.clone();
-        let isolation = if self.execution_mode == ExecutionMode::Native {
-            IsolationArgs {
-                backend: None,
-                image: None,
-                cpu: None,
-                memory: None,
-                disk: None,
-            }
-        } else {
-            IsolationArgs {
-                backend: Some(self.execution_backend),
-                image: Some(self.execution_image.text()),
-                cpu: Some(self.execution_cpu),
-                memory: Some(self.execution_memory),
-                disk: Some(self.execution_disk),
-            }
-        };
+        let isolation = isolation_args(
+            self.execution_mode,
+            self.execution_backend,
+            &self.execution_image,
+            self.execution_cpu,
+            self.execution_memory,
+            self.execution_disk,
+        );
         let mut output = Vec::new();
         let result = cli::profile::dispatch(
             context,
@@ -1805,19 +1787,7 @@ Select another profile in Repositories or create one with the CLI.",
                 self.execution_notice = None;
             }
             Control::PolicyExecutionBackend => {
-                self.execution_backend =
-                    match (self.execution_backend, increase) {
-                        (BackendMode::Auto, true)
-                        | (BackendMode::WindowsHyperVContainer, false) => BackendMode::Oci,
-                        (BackendMode::Oci, true) | (BackendMode::VirtualMachine, false) => {
-                            BackendMode::WindowsHyperVContainer
-                        }
-                        (BackendMode::WindowsHyperVContainer, true)
-                        | (BackendMode::Auto, false) => BackendMode::VirtualMachine,
-                        (BackendMode::VirtualMachine, true) | (BackendMode::Oci, false) => {
-                            BackendMode::Auto
-                        }
-                    };
+                self.execution_backend = step_backend(self.execution_backend, increase);
             }
             Control::PolicyExecutionCpu => {
                 self.execution_cpu = step_u32(self.execution_cpu, increase, 100, 100);
@@ -1845,18 +1815,7 @@ Select another profile in Repositories or create one with the CLI.",
             }
             Control::ProfileExecutionBackend => {
                 self.create_execution_backend =
-                    match (self.create_execution_backend, increase) {
-                        (BackendMode::Auto, true)
-                        | (BackendMode::WindowsHyperVContainer, false) => BackendMode::Oci,
-                        (BackendMode::Oci, true) | (BackendMode::VirtualMachine, false) => {
-                            BackendMode::WindowsHyperVContainer
-                        }
-                        (BackendMode::WindowsHyperVContainer, true)
-                        | (BackendMode::Auto, false) => BackendMode::VirtualMachine,
-                        (BackendMode::VirtualMachine, true) | (BackendMode::Oci, false) => {
-                            BackendMode::Auto
-                        }
-                    };
+                    step_backend(self.create_execution_backend, increase);
             }
             Control::ProfileExecutionCpu => {
                 self.create_execution_cpu = step_u32(self.create_execution_cpu, increase, 100, 100)
@@ -2771,6 +2730,47 @@ fn step_u32(current: u32, increase: bool, step: u32, minimum: u32) -> u32 {
         current.saturating_add(step)
     } else {
         current.saturating_sub(step).max(minimum)
+    }
+}
+
+fn step_backend(current: BackendMode, increase: bool) -> BackendMode {
+    match (current, increase) {
+        (BackendMode::Auto, true) | (BackendMode::WindowsHyperVContainer, false) => {
+            BackendMode::Oci
+        }
+        (BackendMode::Oci, true) | (BackendMode::VirtualMachine, false) => {
+            BackendMode::WindowsHyperVContainer
+        }
+        (BackendMode::WindowsHyperVContainer, true) | (BackendMode::Auto, false) => {
+            BackendMode::VirtualMachine
+        }
+        (BackendMode::VirtualMachine, true) | (BackendMode::Oci, false) => BackendMode::Auto,
+    }
+}
+
+fn isolation_args(
+    mode: ExecutionMode,
+    backend: BackendMode,
+    image: &PathField,
+    cpu: u32,
+    memory: u32,
+    disk: u32,
+) -> IsolationArgs {
+    match mode {
+        ExecutionMode::Native => IsolationArgs {
+            backend: None,
+            image: None,
+            cpu: None,
+            memory: None,
+            disk: None,
+        },
+        ExecutionMode::Isolated => IsolationArgs {
+            backend: Some(backend),
+            image: Some(image.text()),
+            cpu: Some(cpu),
+            memory: Some(memory),
+            disk: Some(disk),
+        },
     }
 }
 
