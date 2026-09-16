@@ -575,11 +575,14 @@ action you need:
 `d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
 `h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
 
-The repositories view lists each policy's `runs-on` labels beside its capacity and health;
-`s` opens the settings for the selected repository, where the optional labels can be edited
-in place. The host label above them is fixed, because it is the identity that keeps two
-machines from answering each other's jobs, so only the descriptive labels are editable.
-Saving makes the stored set equal exactly what is on the line.
+The repositories view groups runner profiles beneath each repository. Select the exact profile
+row before pressing `s`; Repository Settings never guesses among siblings. The screen shows the
+profile's immutable selector and copyable `runs-on`, and exposes its capacity, scaling, optional
+labels, workspace, native/isolated execution mode, backend, pinned image and resource limits. It
+also creates sibling profiles, drains or removes only the selected profile, and reports provider
+readiness with a concrete remedy. Static `runs-on` selectors are required; matrix expressions are
+not resolved. The selector stays fixed because it is the routing identity that prevents sibling
+profiles or different hosts from answering the same job.
 
 Every status is also written in words, so the dashboard remains usable without colour or
 box-drawing characters.

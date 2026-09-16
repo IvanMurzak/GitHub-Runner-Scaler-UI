@@ -273,6 +273,8 @@ pub struct BudgetSnapshot {
 pub struct PolicySnapshot {
     pub id: String,
     pub target: String,
+    /// Immutable runner-profile identity within `target`.
+    pub profile_name: String,
     pub scope: String,
     pub mode: String,
     pub state: String,
@@ -336,6 +338,7 @@ impl PolicySnapshot {
         Self {
             id: policy.id.to_string(),
             target: policy.target.slug(),
+            profile_name: policy.profile_name().to_string(),
             scope: workspace::scope_token(policy.target.scope()).to_string(),
             mode: match policy.mode() {
                 PolicyMode::MonitorOnly => "monitor_only",
@@ -714,6 +717,7 @@ mod tests {
             policies: vec![PolicySnapshot {
                 id: "00000000-0000-0000-0000-000000000010".to_string(),
                 target: "owner/repo".to_string(),
+                profile_name: "default".to_string(),
                 scope: "repository".to_string(),
                 mode: "autoscale".to_string(),
                 state: "active".to_string(),
@@ -831,6 +835,7 @@ mod tests {
                 "max_capacity",
                 "min_capacity",
                 "mode",
+                "profile_name",
                 "routing_labels",
                 "scope",
                 "state",
