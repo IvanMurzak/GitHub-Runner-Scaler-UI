@@ -163,6 +163,11 @@ pub struct PresentationState {
     pub privacy_access_denied: bool,
     /// Version reported by the binary registered for the local service.
     pub service_version: Option<String>,
+    /// The WSL distribution this TUI runs inside, so the local service is
+    /// labelled as that host's rather than passed off as the Windows one.
+    pub service_host: Option<String>,
+    /// Each managed WSL host's service version, as its own status reports it.
+    pub wsl_service_versions: Vec<(String, Option<String>)>,
     pub access_token: Option<String>,
     pub jit_configuration: Option<String>,
 }
@@ -176,6 +181,8 @@ impl Default for PresentationState {
             health: Health::Ready,
             privacy_access_denied: false,
             service_version: None,
+            service_host: None,
+            wsl_service_versions: Vec::new(),
             access_token: None,
             jit_configuration: None,
         }
@@ -217,6 +224,10 @@ pub struct AgentEvent {
     /// The registered service binary's own `--version` result. Older or
     /// unreadable installations intentionally report `None`.
     pub service_version: Option<String>,
+    /// See [`PresentationState::service_host`].
+    pub service_host: Option<String>,
+    /// See [`PresentationState::wsl_service_versions`].
+    pub wsl_service_versions: Vec<(String, Option<String>)>,
     /// A fully collected GitHub inventory snapshot when the embedding agent
     /// has one. The standalone local journal reader supplies `None`; it never
     /// invents GitHub workload counts from local attempt counts.
@@ -397,6 +408,8 @@ fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> Age
                 health: Health::Error,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: None,
             };
         }
@@ -420,6 +433,8 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                             health: Health::Error,
                             privacy_access_denied: false,
                             service_version: local.product.service_binary_version.clone(),
+                            service_host: local_service_host(),
+                            wsl_service_versions: Vec::new(),
                             snapshot: None,
                         };
                     }
@@ -430,6 +445,11 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                 local.policies.len()
             );
             let (wsl_capability, wsl_hosts) = wsl_overview(context);
+            let wsl_service_versions = wsl_hosts
+                .iter()
+                .filter(|host| host.state != WslHostState::Unmanaged)
+                .map(|host| (host.distribution.clone(), host.service_version.clone()))
+                .collect::<Vec<_>>();
             let readiness = operational_readiness(context, &local, &wsl_hosts);
             match production_screen_snapshot(context, &local, cancel, wsl_capability, wsl_hosts)
                 .await
@@ -446,6 +466,8 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                         summary: format!("{summary} {}", snapshot.readiness_summary),
                         privacy_access_denied,
                         service_version: local.product.service_binary_version.clone(),
+                        service_host: local_service_host(),
+                        wsl_service_versions,
                         snapshot: Some(snapshot),
                     }
                 }
@@ -454,6 +476,8 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
                     health: Health::Error,
                     privacy_access_denied,
                     service_version: local.product.service_binary_version.clone(),
+                    service_host: local_service_host(),
+                    wsl_service_versions,
                     snapshot: Some(Snapshot {
                         activity: readiness
                             .activity
@@ -480,6 +504,8 @@ async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelTo
             health: Health::Error,
             privacy_access_denied: false,
             service_version: None,
+            service_host: None,
+            wsl_service_versions: Vec::new(),
             snapshot: None,
         },
     }
@@ -500,6 +526,43 @@ struct LocalServiceReadiness {
     log_file: String,
     problems: Vec<(String, String)>,
     legacy_windows_action: bool,
+}
+
+/// The WSL distribution this process runs inside, if any.
+///
+/// `runner-manager --host wsl:NAME tui` runs the Linux build inside the
+/// distribution, where the local service *is* that host's. Labelling it plain
+/// `service` read as the Windows service and hid which one was outdated.
+fn local_service_host() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        std::env::var("WSL_DISTRO_NAME")
+            .ok()
+            .filter(|name| !name.is_empty())
+    } else {
+        None
+    }
+}
+
+/// Every service version this TUI can see, for the header: the local service,
+/// then each managed WSL host's.
+fn service_versions(presentation: &PresentationState) -> String {
+    let version =
+        |value: Option<&str>| value.map_or_else(|| "unknown".to_owned(), |v| format!("v{v}"));
+    let mut text = match &presentation.service_host {
+        Some(distribution) => format!("wsl:{distribution} "),
+        None => String::new(),
+    };
+    text.push_str(&format!(
+        "service {}  ",
+        version(presentation.service_version.as_deref())
+    ));
+    for (distribution, service) in &presentation.wsl_service_versions {
+        text.push_str(&format!(
+            "wsl:{distribution} service {}  ",
+            version(service.as_deref())
+        ));
+    }
+    text
 }
 
 fn readiness_health(readiness: OperationalReadiness, busy: bool) -> Health {
@@ -633,7 +696,13 @@ fn readiness_from_facts(
                 if !service.running && subject == "runtime" {
                     continue;
                 }
-                let remediation = if subject == "registration" {
+                let remediation = if subject == "github credential" {
+                    "Run `runner-manager auth login`; the service picks up the new credential without a restart."
+                        .into()
+                } else if subject == "definition" {
+                    "Run `runner-manager service status` for the exact re-registration command; configuration and credentials are kept."
+                        .into()
+                } else if subject == "registration" {
                     format!(
                         "Run `{}` from an elevated terminal. It recreates the missing registration without deleting configuration or credentials.",
                         service_repair_command(service.start_mode)
@@ -696,6 +765,20 @@ fn readiness_from_facts(
                 ),
                 format!(
                     "Run `runner-manager wsl status --distribution \"{}\"` for current recovery details.",
+                    host.distribution
+                ),
+            ),
+            WslHostState::SignedOut => issue(
+                &format!("wsl:{}", host.distribution),
+                OperationalReadiness::Blocked,
+                format!(
+                    "WSL {} is {}: {}",
+                    host.distribution,
+                    host.state.label(),
+                    host.detail
+                ),
+                format!(
+                    "Run `runner-manager --host wsl:{} auth login`; its service picks up the new credential without a restart.",
                     host.distribution
                 ),
             ),
@@ -1010,6 +1093,7 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
                         WslHostRow {
                             distribution,
                             state: WslHostState::Degraded,
+                            service_version: None,
                             detail: format!(
                                 "Windows cannot open a new WSL session, but the guest daemon heartbeat is fresh and reports {} active attempt(s); automatic recovery will drain before restarting only this distribution",
                                 heartbeat.local_active_attempts.map_or_else(
@@ -1022,6 +1106,7 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
                         WslHostRow {
                             distribution,
                             state: WslHostState::Unreachable,
+                            service_version: None,
                             detail: detail.clone(),
                         }
                     }
@@ -1045,6 +1130,7 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
         .map(|name| WslHostRow {
             distribution: name.clone(),
             state: WslHostState::Unmanaged,
+            service_version: None,
             detail: "not managed by Runner Manager".into(),
         })
         .collect::<Vec<_>>();
@@ -1073,7 +1159,15 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
             host_is_healthy_now,
             recovery.as_ref().map(|status| status.phase),
         );
-        let (state, detail) = if document.healthy && !recovery_capable {
+        let (state, detail) = if let Some(since) = document.service.credential_rejected_since {
+            (
+                WslHostState::SignedOut,
+                format!(
+                    "GitHub has rejected this host's service credential since {}; it cannot see queued jobs or start runners",
+                    compact_activity_time(since)
+                ),
+            )
+        } else if document.healthy && !recovery_capable {
             (
                 WslHostState::Degraded,
                 format!(
@@ -1106,6 +1200,7 @@ fn wsl_overview(context: &crate::cli::Context) -> (WslCapability, Vec<WslHostRow
             )
         };
         WslHostRow {
+            service_version: document.service.binary_version.clone(),
             distribution: document.distribution,
             state,
             detail,
@@ -1726,6 +1821,8 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<Effect> {
             state.presentation.health = agent.health;
             state.presentation.privacy_access_denied = agent.privacy_access_denied;
             state.presentation.service_version = agent.service_version;
+            state.presentation.service_host = agent.service_host;
+            state.presentation.wsl_service_versions = agent.wsl_service_versions;
             let summary = state.presentation.redact(&agent.summary);
             state.presentation.diagnostics.push(summary);
             if let Some(mut snapshot) = agent.snapshot {
@@ -2186,13 +2283,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(
-                "service v{}  app v{} ",
-                state
-                    .presentation
-                    .service_version
-                    .as_deref()
-                    .unwrap_or("unknown"),
-                env!("CARGO_PKG_VERSION"),
+                "{}app v{} ",
+                service_versions(&state.presentation),
+                env!("CARGO_PKG_VERSION")
             ),
             Style::default().fg(Color::DarkGray),
         ))
@@ -2918,10 +3011,45 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_the_local_and_every_wsl_service_version() {
+        let state = AppState::new(
+            PresentationState {
+                service_version: Some("0.4.26".into()),
+                wsl_service_versions: vec![("Ubuntu".into(), Some("0.4.24".into()))],
+                ..PresentationState::default()
+            },
+            160,
+            30,
+        );
+        let header = rendered(160, 30, &state).lines().next().unwrap().to_owned();
+        let local = header.find("service v0.4.26").expect(&header);
+        let wsl = header.find("wsl:Ubuntu service v0.4.24").expect(&header);
+        assert!(local < wsl, "{header}");
+
+        let inside = AppState::new(
+            PresentationState {
+                service_version: Some("0.4.24".into()),
+                service_host: Some("Ubuntu".into()),
+                ..PresentationState::default()
+            },
+            160,
+            30,
+        );
+        let header = rendered(160, 30, &inside)
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(header.contains("wsl:Ubuntu service v0.4.24"), "{header}");
+    }
+
+    #[test]
     fn header_shows_client_and_service_versions_compactly() {
         let state = AppState::new(
             PresentationState {
                 service_version: Some("0.4.4".into()),
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 ..PresentationState::default()
             },
             120,
@@ -2989,6 +3117,8 @@ mod tests {
                 health: Health::Busy,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: None,
             })),
         );
@@ -3351,6 +3481,8 @@ mod tests {
                     health: Health::Ready,
                     privacy_access_denied: false,
                     service_version: None,
+                    service_host: None,
+                    wsl_service_versions: Vec::new(),
                     snapshot: Some(snapshot),
                 }
             },
@@ -3869,6 +4001,8 @@ mod tests {
                 health: Health::Ready,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: Some(snapshot),
             })),
         );
@@ -3955,6 +4089,8 @@ mod tests {
                 health: Health::Ready,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: Some(snapshot),
             })),
         );
@@ -4254,6 +4390,8 @@ mod tests {
                 health: Health::Error,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: Some(Snapshot {
                     availability: Availability::RateLimited {
                         retry_after_seconds: 90,
@@ -4285,6 +4423,8 @@ mod tests {
                 health: Health::Ready,
                 privacy_access_denied: false,
                 service_version: None,
+                service_host: None,
+                wsl_service_versions: Vec::new(),
                 snapshot: Some(Snapshot {
                     availability: Availability::Ready,
                     ..Snapshot::default()
@@ -4322,6 +4462,8 @@ mod tests {
                         health: Health::Ready,
                         privacy_access_denied: false,
                         service_version: None,
+                        service_host: None,
+                        wsl_service_versions: Vec::new(),
                         snapshot: None,
                     }
                 },
@@ -4383,6 +4525,8 @@ mod tests {
                     health: Health::Ready,
                     privacy_access_denied: false,
                     service_version: None,
+                    service_host: None,
+                    wsl_service_versions: Vec::new(),
                     snapshot: None,
                 }
             },
@@ -5154,6 +5298,7 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
         Ok(stopped),
         true,
         &[WslHostRow {
+            service_version: None,
             distribution: "Ubuntu".into(),
             state: WslHostState::Degraded,
             detail: "credential rejected".into(),
@@ -5185,6 +5330,7 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
         Ok(ready_service()),
         true,
         &[WslHostRow {
+            service_version: None,
             distribution: "Ubuntu".into(),
             state: WslHostState::Degraded,
             detail: "Windows control unavailable; guest heartbeat is fresh".into(),
@@ -5203,6 +5349,47 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     assert_eq!(
         readiness_health(OperationalReadiness::Degraded, false),
         Health::Degraded
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_signed_out_service_blocks_readiness_with_the_sign_in_that_fixes_it() {
+    // The service was rejected for nine hours while this panel said ready:
+    // the TUI authenticated with its own renewed copy and never asked.
+    let mut local = ready_service();
+    local.problems.push((
+        "github credential".into(),
+        "GitHub has rejected the service's credential".into(),
+    ));
+    let assessment = readiness_from_facts(Ok(local), true, &[], "12:00:00Z".into());
+    assert_eq!(assessment.state, OperationalReadiness::Blocked);
+    assert!(
+        assessment.activity[0]
+            .remediation
+            .contains("runner-manager auth login"),
+        "{:?}",
+        assessment.activity
+    );
+
+    let assessment = readiness_from_facts(
+        Ok(ready_service()),
+        true,
+        &[WslHostRow {
+            distribution: "Ubuntu".into(),
+            state: WslHostState::SignedOut,
+            detail: "GitHub has rejected this host's service credential".into(),
+            service_version: Some("0.4.24".into()),
+        }],
+        "12:00:00Z".into(),
+    );
+    assert_eq!(assessment.state, OperationalReadiness::Blocked);
+    assert!(
+        assessment.activity[0]
+            .remediation
+            .contains("runner-manager --host wsl:Ubuntu auth login"),
+        "{:?}",
+        assessment.activity
     );
 }
 

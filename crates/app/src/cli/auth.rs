@@ -56,7 +56,7 @@ use runner_manager_domain::store::Store;
 use runner_manager_github::device_flow::{DeviceAuthorization, DeviceFlow, DeviceFlowError};
 use runner_manager_github::{
     AuthenticatedClient, CredentialRenewal, CredentialSource, GithubError, Installation,
-    InstallationDiscovery, RepositorySelection, TokioSleeper, UserAccessToken,
+    InstallationDiscovery, RenewalError, RepositorySelection, TokioSleeper, UserAccessToken,
 };
 use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
@@ -404,7 +404,7 @@ impl StoringRenewal {
 
 #[async_trait::async_trait]
 impl CredentialRenewal for StoringRenewal {
-    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, RenewalError> {
         // The client's async mutex covers one process only. GitHub invalidates
         // a rotating refresh token on first use, so a service and TUI sharing
         // a store must serialize the complete read/exchange/write transaction.
@@ -440,6 +440,25 @@ impl CredentialRenewal for StoringRenewal {
         if !still_current {
             return Ok(stored);
         }
+
+        // GitHub kills the pair every process on this host shares the moment
+        // the exchange succeeds, so the replacement exists only in whatever
+        // this process manages to write. One that cannot write must not ask.
+        //
+        // The reason is a boot-mode host: the service runs as root and the
+        // store is root's to write, while a TUI or `status` started without
+        // `sudo` can still read it. That TUI once opened the renewal window
+        // first, spent the refresh token, was refused by the System keychain,
+        // and left the service holding a pair GitHub had already retired --
+        // an outage only `auth login` could end. Declining here leaves the
+        // pair intact for the service, and this process picks up what the
+        // service stores through its credential source.
+        self.secrets.ensure_writable().map_err(|source| {
+            RenewalError::Declined(format!(
+                "this process cannot write the credential store, so it left renewal to one \
+                 that can: {source}"
+            ))
+        })?;
 
         let fresh = self
             .flow
@@ -2845,6 +2864,14 @@ mod tests {
             "the machine-scoped store this host is already signed in to".to_string()
         }
 
+        fn ensure_writable(&self) -> Result<(), SecretStoreError> {
+            Err(SecretStoreError::Store {
+                scope: self.scope(),
+                location: self.location(),
+                source: Self::refusal(),
+            })
+        }
+
         fn store(&self, _secret: &SecretString) -> Result<(), SecretStoreError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Err(SecretStoreError::Store {
@@ -3127,6 +3154,121 @@ mod tests {
             1,
             "the shared refresh token must reach GitHub exactly once"
         );
+    }
+
+    /// Reads through to a real store and refuses every write, as the
+    /// machine-scoped store does for a TUI started without `sudo`.
+    #[derive(Debug)]
+    struct ReadOnlyStore(Arc<PlatformSecretStore>);
+
+    impl ReadOnlyStore {
+        fn refusal(&self) -> SecretStoreError {
+            SecretStoreError::Store {
+                scope: self.0.scope(),
+                location: self.0.location(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "only the service account may write this store",
+                ),
+            }
+        }
+    }
+
+    impl SecretStore for ReadOnlyStore {
+        fn scope(&self) -> SecretScope {
+            self.0.scope()
+        }
+
+        fn location(&self) -> String {
+            self.0.location()
+        }
+
+        fn store(&self, _secret: &SecretString) -> Result<(), SecretStoreError> {
+            Err(self.refusal())
+        }
+
+        fn ensure_writable(&self) -> Result<(), SecretStoreError> {
+            Err(self.refusal())
+        }
+
+        fn load(&self) -> Result<Option<SecretString>, SecretStoreError> {
+            self.0.load()
+        }
+
+        fn delete(&self) -> Result<Removal, SecretStoreError> {
+            Err(self.refusal())
+        }
+
+        fn protection(&self) -> Result<Protection, SecretStoreError> {
+            self.0.protection()
+        }
+    }
+
+    /// The outage this guards against: on a boot-mode host a TUI run without
+    /// `sudo` reached the renewal window first, spent the refresh token, could
+    /// not write the System keychain, and the service was left holding a pair
+    /// GitHub had already retired.
+    #[tokio::test]
+    async fn a_process_that_cannot_store_a_renewal_never_spends_the_refresh_token() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            PlatformSecretStore::rooted_at(SecretScope::Machine, root.path())
+                .expect("a rooted store resolves"),
+        );
+        let shared = document(&windows_access_canary(), &windows_refresh_canary());
+        store
+            .store(&SecretString::from(shared.clone()))
+            .expect("the shared credential is stored");
+
+        let github = FakeDeviceFlow::approving();
+        let context = context_against(root.path(), &github);
+        let app = context
+            .app_registration()
+            .expect("the test app is registered");
+        let tui = StoringRenewal::new(
+            DeviceFlow::new(app, github.endpoints()).expect("a device client"),
+            Arc::new(ReadOnlyStore(Arc::clone(&store))),
+            root.path().join("state").join("credential-renewal.lock"),
+        );
+        let refresh = SecretString::from(windows_refresh_canary());
+
+        let declined = tui
+            .renew(&refresh)
+            .await
+            .expect_err("a process that cannot store the renewal must not renew");
+        assert!(
+            matches!(declined, RenewalError::Declined(_)),
+            "a deferral is not a failed credential: {declined:?}"
+        );
+        assert_eq!(
+            github.requests_answered(),
+            0,
+            "the refresh token must never reach GitHub from a process that cannot keep the result"
+        );
+        assert_eq!(
+            store
+                .load()
+                .expect("readable")
+                .expect("present")
+                .expose_secret(),
+            shared,
+            "the pair the service depends on must be untouched"
+        );
+
+        // The service renews and stores. The same read-only process then adopts
+        // the replacement rather than declining, still without asking GitHub.
+        store
+            .store(&SecretString::from(document(
+                &wsl_access_canary(),
+                &wsl_refresh_canary(),
+            )))
+            .expect("the service stores its renewal");
+        let adopted = tui
+            .renew(&refresh)
+            .await
+            .expect("a pair renewed by another process is adopted");
+        assert_eq!(adopted.secret().expose_secret(), wsl_access_canary());
+        assert_eq!(github.requests_answered(), 0);
     }
 
     // -- receive: what it refuses ------------------------------------------

@@ -307,6 +307,8 @@ pub enum WslHostState {
     Recovering,
     Backoff,
     RecoveryBlocked,
+    /// GitHub rejects the host service's credential.
+    SignedOut,
 }
 
 impl WslHostState {
@@ -320,6 +322,7 @@ impl WslHostState {
             Self::Recovering => "recovering",
             Self::Backoff => "backoff",
             Self::RecoveryBlocked => "recovery blocked",
+            Self::SignedOut => "signed out",
         }
     }
 }
@@ -329,6 +332,8 @@ pub struct WslHostRow {
     pub distribution: String,
     pub state: WslHostState,
     pub detail: String,
+    /// The version of the host's own service binary, when it reported one.
+    pub service_version: Option<String>,
 }
 
 /// Complete in-memory input. Credentials have no field in this type, so a
@@ -1575,9 +1580,10 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
             WslHostState::Healthy => Tone::Ok,
             WslHostState::Unmanaged => Tone::Muted,
             WslHostState::Draining | WslHostState::Recovering | WslHostState::Backoff => Tone::Busy,
-            WslHostState::Degraded | WslHostState::Unreachable | WslHostState::RecoveryBlocked => {
-                Tone::Bad
-            }
+            WslHostState::Degraded
+            | WslHostState::Unreachable
+            | WslHostState::RecoveryBlocked
+            | WslHostState::SignedOut => Tone::Bad,
         };
         head_lines.push(metric(
             &format!("  {:<20} : ", host.distribution),
@@ -2376,6 +2382,7 @@ mod tests {
                 distribution: "Ubuntu".into(),
                 state: WslHostState::Healthy,
                 detail: "daemon and lifecycle task are ready".into(),
+                service_version: None,
             }],
         }
     }
