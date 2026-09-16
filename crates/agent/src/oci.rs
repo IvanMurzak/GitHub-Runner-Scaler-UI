@@ -270,26 +270,26 @@ impl OciProcesses {
     fn check_ownership(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
         let id = self.environment_id(attempt)?;
         let labels = self.labels(id)?;
-        let AttemptExecution::Isolated {
-            generation,
-            resolved_image,
-            ..
-        } = attempt.execution()
-        else {
+        let AttemptExecution::Isolated { resolved_image, .. } = attempt.execution() else {
             return Err(ownership_failure());
         };
-        Ok(labels
-            .get(HOST_LABEL)
-            .is_some_and(|value| value == &self.host.to_string())
-            && labels
-                .get(ATTEMPT_LABEL)
-                .is_some_and(|value| value == &attempt.id.to_string())
-            && labels
-                .get(GENERATION_LABEL)
-                .is_some_and(|value| value == generation)
+        Ok(self.matches_attempt_labels(&labels, attempt)
             && labels
                 .get(IMAGE_LABEL)
                 .is_some_and(|value| value == resolved_image.as_str()))
+    }
+
+    fn matches_attempt_labels(
+        &self,
+        labels: &BTreeMap<String, String>,
+        attempt: &RunnerAttempt,
+    ) -> bool {
+        let AttemptExecution::Isolated { generation, .. } = attempt.execution() else {
+            return false;
+        };
+        labels.get(HOST_LABEL) == Some(&self.host.to_string())
+            && labels.get(ATTEMPT_LABEL) == Some(&attempt.id.to_string())
+            && labels.get(GENERATION_LABEL) == Some(generation)
     }
 
     fn state(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
@@ -471,17 +471,10 @@ impl ExecutionProvider for OciProcesses {
         if self.status(&["cp", &source, &destination]).is_err() {
             // Roll back before returning without a journalled environment ID.
             // An unavailable runtime leaves a labelled orphan for enumeration.
-            if self.labels(&id).is_ok_and(|labels| {
-                labels
-                    .get(HOST_LABEL)
-                    .is_some_and(|value| value == &self.host.to_string())
-                    && labels
-                        .get(ATTEMPT_LABEL)
-                        .is_some_and(|value| value == &attempt.id.to_string())
-                    && labels
-                        .get(GENERATION_LABEL)
-                        .is_some_and(|value| value == generation)
-            }) {
+            if self
+                .labels(&id)
+                .is_ok_and(|labels| self.matches_attempt_labels(&labels, attempt))
+            {
                 let _ = self.status(&["rm", "--force", &id]);
             }
             return Err(provider_failure());
