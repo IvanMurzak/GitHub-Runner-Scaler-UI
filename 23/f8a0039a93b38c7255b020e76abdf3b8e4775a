@@ -1,0 +1,27 @@
+crates/agent/src/lifecycle/windows_hyperv.rs
+  s_5801a853f78e8a::t_98d81896f2a7d0 35-36,251,264-273,275-281,299-315,328-345,742-745,750-753,1035-1037
+  s_5801a853f78e8a::t_8bb905889185d4 347,990-1001
+  s_5801a853f78e8a::t_f01261edb9cdab 6,252-261,316-327,740-741,748-749
+  s_5801a853f78e8a::t_fe1179a0ab9471 346
+  s_5801a853f78e8a::t_bd0b5f9b3d9be0 348
+README.md
+  s_5801a853f78e8a::t_13f0136e507b74 304-307
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_f5b8f7e8d0aadb 617-620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "23f8a0039a93b38c7255b020e76abdf3b8e4775a",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
