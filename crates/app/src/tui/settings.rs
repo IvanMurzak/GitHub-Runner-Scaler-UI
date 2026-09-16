@@ -44,11 +44,15 @@ use ratatui::{
 };
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::capacity::HostAllocator;
+use runner_manager_domain::execution::{Backend, ExecutionPolicy};
 use runner_manager_domain::model::{
-    CachePolicy, RefreshInterval, ScaleTarget, StartMode, TargetScope,
+    Arch, CachePolicy, HostLabel, Os, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
+    StartMode, TargetScope,
 };
 use runner_manager_domain::path::LocalAbsolutePath;
-use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
+#[cfg(test)]
+use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{PolicyMode, RoutingLabels};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_platform::runner_root::RootOwner;
@@ -57,16 +61,19 @@ use runner_manager_platform::service::ServiceError;
 use super::path_field::PathField;
 use crate::cli::workspace::{AffectedAttempts, HostRoot, RepositoryWorkspace};
 use crate::cli::{
-    self, CliError, Context, Failure, HostSetCapacityArgs, RepoSetWorkspaceArgs, WorkspaceMode,
+    self, BackendMode, CliError, Context, ExecutionMode, Failure, HostSetCapacityArgs,
+    IsolationArgs, RepoProfileAddArgs, RepoProfileCommand, RepoProfileExecutionArgs,
+    RepoProfileSelectArgs, RepoProfileWorkspaceArgs, WorkspaceMode,
 };
 #[cfg(test)]
 use crate::cli::{
     OrgCommand, OrgSetCapacityArgs, OrgSetScaleArgs, RepoCommand, RepoSetCapacityArgs,
-    RepoSetScaleArgs,
+    RepoSetScaleArgs, RepoSetWorkspaceArgs,
 };
 
 pub const MAX_FOCUSED_FORM_ACTIONS: u8 = 5;
 pub const FORK_TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
+pub const STATIC_SELECTOR_WARNING: &str = "Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors start no runner.";
 
 /// What Organization Settings says instead of offering a mode control.
 ///
@@ -273,8 +280,13 @@ pub struct HostIntervalPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySettings {
+    pub policy_id: PolicyId,
     pub target: ScaleTarget,
+    pub profile_name: String,
     pub host_identity: String,
+    pub requested_host_label: HostLabel,
+    pub host_os: Os,
+    pub host_arch: Arch,
     pub mode: SettingsPolicyMode,
     pub enabled: bool,
     pub current_max_capacity: Option<u16>,
@@ -290,6 +302,10 @@ pub struct PolicySettings {
     pub copyable_runs_on: Option<String>,
     pub cache_policy: CachePolicy,
     pub active_runners: u16,
+    pub execution_policy: ExecutionPolicy,
+    /// Typed, presentation-safe capability diagnostics. Raw provider process
+    /// output is discarded before this read model is constructed.
+    pub provider_diagnostics: Vec<cli::host::IsolationCapability>,
     /// `d1`'s repository read model, unmodified: mode, effective root, the two
     /// refusal counts, and the slot leases — with no path inside a workspace
     /// and no directory listing anywhere.
@@ -303,9 +319,18 @@ pub enum SettingsPolicyMode {
 }
 
 impl PolicySettings {
+    #[cfg(test)]
     pub fn load(context: &Context, target: &ScaleTarget) -> Result<Self, CliError> {
+        Self::load_selected(context, target, None)
+    }
+
+    pub fn load_selected(
+        context: &Context,
+        target: &ScaleTarget,
+        profile: Option<&str>,
+    ) -> Result<Self, CliError> {
         let store = context.store()?;
-        let policy = find_policy(&store, target)?;
+        let policy = cli::policy::find_policy_selected(&store, target, profile)?;
         let host = store
             .host(policy.host_id)
             .map_err(store_failure)?
@@ -341,8 +366,13 @@ impl PolicySettings {
             &policy,
         )?;
         Ok(Self {
+            policy_id: policy.id,
             target: policy.target.clone(),
+            profile_name: policy.profile_name().to_string(),
             host_identity: host.display_name,
+            requested_host_label: policy.requested_host_label.clone(),
+            host_os: host.os,
+            host_arch: host.architecture,
             mode: match policy.mode() {
                 PolicyMode::Autoscale(_) => SettingsPolicyMode::Autoscale,
                 PolicyMode::MonitorOnly => SettingsPolicyMode::MonitorOnly,
@@ -354,6 +384,8 @@ impl PolicySettings {
             copyable_runs_on,
             cache_policy: policy.cache_policy,
             active_runners,
+            execution_policy: policy.execution_policy().clone(),
+            provider_diagnostics: cli::host::isolation_capabilities(),
             workspace,
         })
     }
@@ -392,16 +424,19 @@ impl PolicySettings {
         raw_path: Option<&str>,
         out: &mut dyn Write,
     ) -> Result<(), CliError> {
-        cli::policy::set_workspace(
+        cli::profile::dispatch(
             context,
-            &RepoSetWorkspaceArgs {
-                repository: self.target.to_string(),
+            &RepoProfileCommand::SetWorkspace(RepoProfileWorkspaceArgs {
+                selection: RepoProfileSelectArgs {
+                    repository: self.target.to_string(),
+                    profile: Some(self.profile_name.clone()),
+                },
                 mode: match kind {
                     WorkspaceKind::Ephemeral => WorkspaceMode::Ephemeral,
                     WorkspaceKind::Persistent => WorkspaceMode::Persistent,
                 },
                 path: raw_path.map(ToOwned::to_owned),
-            },
+            }),
             out,
         )
     }
@@ -413,7 +448,7 @@ impl PolicySettings {
     }
 
     /// `repo add-label` / `repo remove-label` collapsed into one save, through
-    /// [`cli::policy::replace_optional_labels`] rather than a second copy of
+    /// [`cli::policy::replace_optional_labels_selected`] rather than a second copy of
     /// the set arithmetic.
     ///
     /// The typed line is split on commas and nothing else, because this parse
@@ -447,7 +482,13 @@ impl PolicySettings {
             .filter(|part| !part.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        cli::policy::replace_optional_labels(context, &self.target, &desired, out)
+        cli::policy::replace_optional_labels_selected(
+            context,
+            &self.target,
+            Some(&self.profile_name),
+            &desired,
+            out,
+        )
     }
 
     /// The label field and its save button. Monitor-only reserves no labels, so
@@ -504,9 +545,10 @@ impl PolicySettings {
         drain_confirmation: Option<cli::policy::ScaleObservation>,
         out: &mut dyn Write,
     ) -> Result<(), CliError> {
-        cli::policy::apply_policy_mutation(
+        cli::policy::apply_policy_mutation_selected(
             context,
             &self.target,
+            Some(&self.profile_name),
             cli::policy::PolicyMutation {
                 max_capacity: draft.max_capacity,
                 enabled: draft.enabled,
@@ -520,6 +562,24 @@ impl PolicySettings {
     #[must_use]
     pub const fn exposes_scale_toggle(&self) -> bool {
         matches!(self.mode, SettingsPolicyMode::Autoscale)
+    }
+
+    pub fn preview_selector(&self, raw_name: &str) -> Result<String, CliError> {
+        let name = ProfileName::new(raw_name).map_err(invalid)?;
+        if name.is_default() {
+            return Err(CliError::new(
+                Failure::InvalidArgument,
+                "profile `default` is reserved for repo add",
+            ));
+        }
+        Ok(RoutingLabels::derive_for_profile(
+            &self.requested_host_label,
+            self.host_os,
+            self.host_arch,
+            &name,
+        )
+        .host_label()
+        .to_string())
     }
 
     #[must_use]
@@ -583,6 +643,26 @@ pub enum Control {
     /// because a monitor-only policy has no label set to edit.
     PolicyLabels,
     PolicyLabelsSave,
+    PolicyExecutionMode,
+    PolicyExecutionBackend,
+    PolicyExecutionImage,
+    PolicyExecutionCpu,
+    PolicyExecutionMemory,
+    PolicyExecutionDisk,
+    PolicyExecutionSave,
+    PolicyDrain,
+    PolicyRemove,
+    PolicyAddProfile,
+    ProfileName,
+    ProfileCapacity,
+    ProfileExecutionMode,
+    ProfileExecutionBackend,
+    ProfileExecutionImage,
+    ProfileExecutionCpu,
+    ProfileExecutionMemory,
+    ProfileExecutionDisk,
+    ProfileCreate,
+    ProfileCreateCancel,
     /// `ephemeral` / `persistent` for one repository.
     WorkspaceMode,
     /// The repository persistent-root text field; present only in persistent
@@ -604,6 +684,17 @@ impl Control {
                 | Control::PolicyScale
                 | Control::PolicyCapacity
                 | Control::PolicyCache
+                | Control::PolicyExecutionMode
+                | Control::PolicyExecutionBackend
+                | Control::PolicyExecutionCpu
+                | Control::PolicyExecutionMemory
+                | Control::PolicyExecutionDisk
+                | Control::ProfileCapacity
+                | Control::ProfileExecutionMode
+                | Control::ProfileExecutionBackend
+                | Control::ProfileExecutionCpu
+                | Control::ProfileExecutionMemory
+                | Control::ProfileExecutionDisk
                 | Control::WorkspaceMode
         )
     }
@@ -690,6 +781,24 @@ pub struct SettingsUi {
     pub policy_labels: PathField,
     /// Inline answer for [`Self::policy_labels`], shown after a save.
     pub policy_labels_notice: Option<String>,
+    pub execution_mode: ExecutionMode,
+    pub execution_backend: BackendMode,
+    pub execution_image: PathField,
+    pub execution_cpu: u32,
+    pub execution_memory: u32,
+    pub execution_disk: u32,
+    pub execution_notice: Option<String>,
+    pub awaiting_remove_confirmation: bool,
+    pub profile_create_open: bool,
+    pub create_name: PathField,
+    pub create_capacity: u16,
+    pub create_execution_mode: ExecutionMode,
+    pub create_execution_backend: BackendMode,
+    pub create_execution_image: PathField,
+    pub create_execution_cpu: u32,
+    pub create_execution_memory: u32,
+    pub create_execution_disk: u32,
+    pub create_notice: Option<String>,
     /// The repository workspace mode being edited.
     pub workspace_mode: WorkspaceKind,
     /// The repository persistent root being edited.
@@ -722,7 +831,14 @@ pub enum SettingsView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsCommand {
     LoadHost,
+    /// Compatibility load for tests covering a target with exactly one profile.
+    #[cfg(test)]
     LoadPolicy(String),
+    /// Load one explicit sibling; the TUI never guesses among profiles.
+    LoadProfile {
+        target: String,
+        profile: String,
+    },
     ApplyHost,
     ApplyPolicy,
     Copy(String),
@@ -738,6 +854,10 @@ pub enum SettingsCommand {
     SaveWorkspace,
     /// The optional routing labels of this policy, made to equal the field.
     SaveLabels,
+    SaveExecution,
+    DrainProfile,
+    RemoveProfile,
+    CreateProfile,
 }
 
 impl SettingsUi {
@@ -758,6 +878,9 @@ impl SettingsUi {
         self.host_root.is_editing()
             || self.workspace_path.is_editing()
             || self.policy_labels.is_editing()
+            || self.execution_image.is_editing()
+            || self.create_name.is_editing()
+            || self.create_execution_image.is_editing()
     }
 
     /// Bracketed paste into whichever path control is being edited.
@@ -768,6 +891,12 @@ impl SettingsUi {
             self.workspace_path.paste(text);
         } else if self.policy_labels.is_editing() {
             self.policy_labels.paste(text);
+        } else if self.execution_image.is_editing() {
+            self.execution_image.paste(text);
+        } else if self.create_name.is_editing() {
+            self.create_name.paste(text);
+        } else if self.create_execution_image.is_editing() {
+            self.create_execution_image.paste(text);
         }
     }
 
@@ -799,6 +928,9 @@ impl SettingsUi {
                 SettingsView::Policy(form) => form.copyable_runs_on.clone(),
                 _ => None,
             },
+            Control::PolicyExecutionImage => Some(self.execution_image.text()),
+            Control::ProfileName => Some(self.create_name.text()),
+            Control::ProfileExecutionImage => Some(self.create_execution_image.text()),
             _ => None,
         }
     }
@@ -823,6 +955,16 @@ impl SettingsUi {
             self.policy_labels.cancel();
             self.policy_labels_notice = None;
         }
+        if self.execution_image.is_editing() {
+            self.execution_image.cancel();
+            self.execution_notice = None;
+        }
+        if self.create_name.is_editing() {
+            self.create_name.cancel();
+        }
+        if self.create_execution_image.is_editing() {
+            self.create_execution_image.cancel();
+        }
     }
 
     /// Ends any edit in progress, keeping the draft, exactly as Enter does.
@@ -841,13 +983,25 @@ impl SettingsUi {
         if self.policy_labels.is_editing() {
             self.policy_labels.accept();
         }
+        if self.execution_image.is_editing() {
+            self.execution_image.accept();
+        }
+        if self.create_name.is_editing() {
+            self.create_name.accept();
+        }
+        if self.create_execution_image.is_editing() {
+            self.create_execution_image.accept();
+        }
     }
 
     pub fn execute(&mut self, context: &Context, command: SettingsCommand) -> Option<String> {
-        if matches!(
+        let is_load = matches!(
             &command,
-            SettingsCommand::LoadHost | SettingsCommand::LoadPolicy(_)
-        ) {
+            SettingsCommand::LoadHost | SettingsCommand::LoadProfile { .. }
+        );
+        #[cfg(test)]
+        let is_load = is_load || matches!(&command, SettingsCommand::LoadPolicy(_));
+        if is_load {
             self.view = SettingsView::Empty;
             self.message = None;
         }
@@ -856,10 +1010,22 @@ impl SettingsUi {
                 self.focus = 0;
                 self.message = None;
             }),
+            #[cfg(test)]
             SettingsCommand::LoadPolicy(raw) => ScaleTarget::repository(&raw)
                 .or_else(|_| ScaleTarget::organization(&raw))
                 .map_err(invalid)
-                .and_then(|target| self.load_policy(context, &target))
+                .and_then(|target| self.load_policy(context, &target, None))
+                .map(|()| {
+                    self.focus = 0;
+                    self.message = None;
+                }),
+            SettingsCommand::LoadProfile {
+                target: raw,
+                profile,
+            } => ScaleTarget::repository(&raw)
+                .or_else(|_| ScaleTarget::organization(&raw))
+                .map_err(invalid)
+                .and_then(|target| self.load_policy(context, &target, Some(&profile)))
                 .map(|()| {
                     self.focus = 0;
                     self.message = None;
@@ -876,6 +1042,13 @@ impl SettingsUi {
             SettingsCommand::CheckWorkspaceRoot => self.check_workspace_root(context),
             SettingsCommand::SaveWorkspace => self.save_workspace(context),
             SettingsCommand::SaveLabels => self.save_labels(context),
+            SettingsCommand::SaveExecution => self.save_execution(context),
+            SettingsCommand::DrainProfile => {
+                self.policy_draft.enabled = Some(false);
+                self.apply_policy(context)
+            }
+            SettingsCommand::RemoveProfile => self.remove_profile(context),
+            SettingsCommand::CreateProfile => self.create_profile(context),
         };
         if let Err(error) = result {
             self.message = Some(format!("error: {error}"));
@@ -894,14 +1067,58 @@ impl SettingsUi {
         Ok(())
     }
 
-    fn load_policy(&mut self, context: &Context, target: &ScaleTarget) -> Result<(), CliError> {
-        let form = PolicySettings::load(context, target)?;
+    fn load_policy(
+        &mut self,
+        context: &Context,
+        target: &ScaleTarget,
+        profile: Option<&str>,
+    ) -> Result<(), CliError> {
+        let form = PolicySettings::load_selected(context, target, profile)?;
         self.policy_draft = PolicyDraft::default();
         self.workspace_mode = form.workspace.kind();
         self.workspace_path.reset_to(&form.configured_root_text());
         self.workspace_notice = None;
         self.policy_labels.reset_to(&form.editable_labels_text());
         self.policy_labels_notice = None;
+        match &form.execution_policy {
+            ExecutionPolicy::Native => {
+                self.execution_mode = ExecutionMode::Native;
+                self.execution_backend = BackendMode::Auto;
+                self.execution_image.reset_to("");
+                self.execution_cpu = 1000;
+                self.execution_memory = 1024;
+                self.execution_disk = 4096;
+            }
+            ExecutionPolicy::Isolated {
+                backend,
+                image,
+                resources,
+            } => {
+                self.execution_mode = ExecutionMode::Isolated;
+                self.execution_backend = match backend {
+                    Backend::Auto => BackendMode::Auto,
+                    Backend::Oci => BackendMode::Oci,
+                    Backend::WindowsHyperVContainer => BackendMode::WindowsHyperVContainer,
+                    Backend::VirtualMachine => BackendMode::VirtualMachine,
+                };
+                self.execution_image.reset_to(image.as_str());
+                self.execution_cpu = resources.cpu_millis;
+                self.execution_memory = resources.memory_mib;
+                self.execution_disk = resources.disk_mib;
+            }
+        }
+        self.execution_notice = None;
+        self.profile_create_open = false;
+        self.create_name.reset_to("");
+        self.create_capacity = 1;
+        self.create_execution_mode = ExecutionMode::Native;
+        self.create_execution_backend = BackendMode::Auto;
+        self.create_execution_image.reset_to("");
+        self.create_execution_cpu = 1000;
+        self.create_execution_memory = 1024;
+        self.create_execution_disk = 4096;
+        self.create_notice = None;
+        self.awaiting_remove_confirmation = false;
         self.awaiting_drain_confirmation = false;
         self.drain_observation = None;
         self.view = SettingsView::Policy(Box::new(form));
@@ -1049,7 +1266,7 @@ impl SettingsUi {
             self.workspace_path.clone(),
             self.workspace_notice.clone(),
         );
-        let reloaded = self.load_policy(context, &form.target);
+        let reloaded = self.load_policy(context, &form.target, Some(&form.profile_name));
         if result.is_err() {
             (
                 self.workspace_mode,
@@ -1084,7 +1301,7 @@ impl SettingsUi {
             self.policy_labels.clone(),
             self.policy_labels_notice.clone(),
         );
-        let reloaded = self.load_policy(context, &form.target);
+        let reloaded = self.load_policy(context, &form.target, Some(&form.profile_name));
         if result.is_err() {
             (self.policy_labels, self.policy_labels_notice) = draft;
         }
@@ -1102,13 +1319,144 @@ impl SettingsUi {
         Ok(())
     }
 
+    fn create_profile(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Policy(form) = &self.view else {
+            return Ok(());
+        };
+        let form = form.clone();
+        let name = self.create_name.text();
+        // Validate early so the preview and the command reject the same name.
+        form.preview_selector(&name)?;
+        let isolation = isolation_args(
+            self.create_execution_mode,
+            self.create_execution_backend,
+            &self.create_execution_image,
+            self.create_execution_cpu,
+            self.create_execution_memory,
+            self.create_execution_disk,
+        );
+        let mut output = Vec::new();
+        cli::profile::dispatch(
+            context,
+            &RepoProfileCommand::Add(RepoProfileAddArgs {
+                repository: form.target.to_string(),
+                name: name.clone(),
+                host_label: None,
+                max_capacity: Some(self.create_capacity),
+                labels: Vec::new(),
+                execution: self.create_execution_mode,
+                isolation,
+                enable: false,
+            }),
+            &mut output,
+        )?;
+        self.load_policy(context, &form.target, Some(&name))?;
+        self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
+        Ok(())
+    }
+
+    fn save_execution(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Policy(form) = &self.view else {
+            return Ok(());
+        };
+        let form = form.clone();
+        let isolation = isolation_args(
+            self.execution_mode,
+            self.execution_backend,
+            &self.execution_image,
+            self.execution_cpu,
+            self.execution_memory,
+            self.execution_disk,
+        );
+        let mut output = Vec::new();
+        let result = cli::profile::dispatch(
+            context,
+            &RepoProfileCommand::SetExecution(RepoProfileExecutionArgs {
+                selection: RepoProfileSelectArgs {
+                    repository: form.target.to_string(),
+                    profile: Some(form.profile_name.clone()),
+                },
+                mode: self.execution_mode,
+                isolation,
+            }),
+            &mut output,
+        );
+        let draft = (
+            self.execution_mode,
+            self.execution_backend,
+            self.execution_image.clone(),
+            self.execution_cpu,
+            self.execution_memory,
+            self.execution_disk,
+        );
+        let reloaded = self.load_policy(context, &form.target, Some(&form.profile_name));
+        if result.is_err() {
+            (
+                self.execution_mode,
+                self.execution_backend,
+                self.execution_image,
+                self.execution_cpu,
+                self.execution_memory,
+                self.execution_disk,
+            ) = draft;
+        }
+        result?;
+        reloaded?;
+        self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
+        Ok(())
+    }
+
+    fn remove_profile(&mut self, context: &Context) -> Result<(), CliError> {
+        let SettingsView::Policy(form) = &self.view else {
+            return Ok(());
+        };
+        let form = form.clone();
+        if form.enabled || form.active_runners > 0 {
+            return Err(CliError::with_remedy(
+                Failure::Conflict,
+                format!(
+                    "profile {} must be drained before removal; nothing was changed",
+                    form.profile_name
+                ),
+                "focus `Drain selected profile`, wait for active runners to finish, then remove it",
+            ));
+        }
+        if !self.awaiting_remove_confirmation {
+            self.awaiting_remove_confirmation = true;
+            self.message = Some(format!(
+                "Confirm removal of profile {} only. Press Enter again.",
+                form.profile_name
+            ));
+            return Ok(());
+        }
+        let mut output = Vec::new();
+        cli::policy::remove_selected(
+            context,
+            form.target.clone(),
+            Some(&form.profile_name),
+            false,
+            &mut output,
+        )?;
+        self.show_notice(format!(
+            "{}
+
+Select another profile in Repositories or create one with the CLI.",
+            String::from_utf8_lossy(&output).trim()
+        ));
+        Ok(())
+    }
+
     fn apply_policy(&mut self, context: &Context) -> Result<(), CliError> {
         let SettingsView::Policy(form) = &self.view else {
             return Ok(());
         };
         let form = form.clone();
         if self.policy_draft.enabled == Some(false) && self.drain_observation.is_none() {
-            let observed = cli::policy::observe_scale(context, &form.target)?;
+            let observed = cli::policy::observe_scale_selected(
+                context,
+                &form.target,
+                Some(&form.profile_name),
+            )?;
             if observed.active > 0 {
                 self.awaiting_drain_confirmation = true;
                 self.drain_observation = Some(observed);
@@ -1131,11 +1479,15 @@ impl SettingsUi {
         if let Err(error) = result {
             self.awaiting_drain_confirmation = false;
             self.drain_observation = None;
-            self.view = SettingsView::Policy(Box::new(PolicySettings::load(context, &target)?));
+            self.view = SettingsView::Policy(Box::new(PolicySettings::load_selected(
+                context,
+                &target,
+                Some(&form.profile_name),
+            )?));
             return Err(error);
         }
         self.message = Some(String::from_utf8_lossy(&output).trim().to_owned());
-        self.load_policy(context, &target)
+        self.load_policy(context, &target, Some(&form.profile_name))
     }
 
     #[must_use]
@@ -1170,12 +1522,21 @@ impl SettingsUi {
             Control::HostRunnerRoot
         } else if self.workspace_path.is_editing() {
             Control::WorkspacePath
+        } else if self.execution_image.is_editing() {
+            Control::PolicyExecutionImage
+        } else if self.create_name.is_editing() {
+            Control::ProfileName
+        } else if self.create_execution_image.is_editing() {
+            Control::ProfileExecutionImage
         } else {
             Control::PolicyLabels
         };
         let field = match owner {
             Control::HostRunnerRoot => &mut self.host_root,
             Control::WorkspacePath => &mut self.workspace_path,
+            Control::PolicyExecutionImage => &mut self.execution_image,
+            Control::ProfileName => &mut self.create_name,
+            Control::ProfileExecutionImage => &mut self.create_execution_image,
             _ => &mut self.policy_labels,
         };
         match code {
@@ -1191,6 +1552,10 @@ impl SettingsUi {
                 match owner {
                     Control::HostRunnerRoot => self.host_root_notice = None,
                     Control::WorkspacePath => self.workspace_notice = None,
+                    Control::PolicyExecutionImage => self.execution_notice = None,
+                    Control::ProfileName | Control::ProfileExecutionImage => {
+                        self.create_notice = None
+                    }
                     _ => self.policy_labels_notice = None,
                 }
             }
@@ -1283,6 +1648,19 @@ impl SettingsUi {
                     controls.push(Control::PolicyLabels);
                     controls.push(Control::PolicyLabelsSave);
                 }
+                if !form.is_organization() {
+                    controls.push(Control::PolicyExecutionMode);
+                    if self.execution_mode == ExecutionMode::Isolated {
+                        controls.push(Control::PolicyExecutionBackend);
+                        controls.push(Control::PolicyExecutionImage);
+                        controls.push(Control::PolicyExecutionCpu);
+                        controls.push(Control::PolicyExecutionMemory);
+                        controls.push(Control::PolicyExecutionDisk);
+                    }
+                    controls.push(Control::PolicyExecutionSave);
+                    controls.push(Control::PolicyDrain);
+                    controls.push(Control::PolicyRemove);
+                }
                 // D7: an organization policy is shown its mode and told why it
                 // cannot be changed, rather than given a control that refuses.
                 if !form.is_organization() {
@@ -1291,6 +1669,23 @@ impl SettingsUi {
                         controls.push(Control::WorkspacePath);
                     }
                     controls.push(Control::WorkspaceSave);
+                }
+                if !form.is_organization() {
+                    controls.push(Control::PolicyAddProfile);
+                    if self.profile_create_open {
+                        controls.push(Control::ProfileName);
+                        controls.push(Control::ProfileCapacity);
+                        controls.push(Control::ProfileExecutionMode);
+                        if self.create_execution_mode == ExecutionMode::Isolated {
+                            controls.push(Control::ProfileExecutionBackend);
+                            controls.push(Control::ProfileExecutionImage);
+                            controls.push(Control::ProfileExecutionCpu);
+                            controls.push(Control::ProfileExecutionMemory);
+                            controls.push(Control::ProfileExecutionDisk);
+                        }
+                        controls.push(Control::ProfileCreate);
+                        controls.push(Control::ProfileCreateCancel);
+                    }
                 }
                 controls
             }
@@ -1384,6 +1779,56 @@ impl SettingsUi {
                     });
                 }
             }
+            Control::PolicyExecutionMode => {
+                self.execution_mode = if self.execution_mode == ExecutionMode::Native {
+                    ExecutionMode::Isolated
+                } else {
+                    ExecutionMode::Native
+                };
+                self.execution_notice = None;
+            }
+            Control::PolicyExecutionBackend => {
+                self.execution_backend = step_backend(self.execution_backend, increase);
+            }
+            Control::PolicyExecutionCpu => {
+                self.execution_cpu = step_u32(self.execution_cpu, increase, 100, 100);
+            }
+            Control::PolicyExecutionMemory => {
+                self.execution_memory = step_u32(self.execution_memory, increase, 256, 256);
+            }
+            Control::PolicyExecutionDisk => {
+                self.execution_disk = step_u32(self.execution_disk, increase, 1024, 1024);
+            }
+            Control::ProfileCapacity => {
+                self.create_capacity = if increase {
+                    self.create_capacity.saturating_add(1)
+                } else {
+                    self.create_capacity.saturating_sub(1).max(1)
+                };
+            }
+            Control::ProfileExecutionMode => {
+                self.create_execution_mode = if self.create_execution_mode == ExecutionMode::Native
+                {
+                    ExecutionMode::Isolated
+                } else {
+                    ExecutionMode::Native
+                };
+            }
+            Control::ProfileExecutionBackend => {
+                self.create_execution_backend =
+                    step_backend(self.create_execution_backend, increase);
+            }
+            Control::ProfileExecutionCpu => {
+                self.create_execution_cpu = step_u32(self.create_execution_cpu, increase, 100, 100)
+            }
+            Control::ProfileExecutionMemory => {
+                self.create_execution_memory =
+                    step_u32(self.create_execution_memory, increase, 256, 256)
+            }
+            Control::ProfileExecutionDisk => {
+                self.create_execution_disk =
+                    step_u32(self.create_execution_disk, increase, 1024, 1024)
+            }
             Control::WorkspaceMode => {
                 self.workspace_mode = match self.workspace_mode {
                     WorkspaceKind::Ephemeral => WorkspaceKind::Persistent,
@@ -1400,6 +1845,15 @@ impl SettingsUi {
             | Control::PolicySave
             | Control::PolicyLabels
             | Control::PolicyLabelsSave
+            | Control::PolicyExecutionImage
+            | Control::PolicyExecutionSave
+            | Control::PolicyDrain
+            | Control::PolicyRemove
+            | Control::PolicyAddProfile
+            | Control::ProfileName
+            | Control::ProfileExecutionImage
+            | Control::ProfileCreate
+            | Control::ProfileCreateCancel
             | Control::WorkspacePath
             | Control::WorkspaceSave => {}
         }
@@ -1425,6 +1879,38 @@ impl SettingsUi {
                 None
             }
             Control::PolicyLabelsSave => Some(SettingsCommand::SaveLabels),
+            Control::PolicyExecutionImage => {
+                self.execution_image.begin();
+                None
+            }
+            Control::PolicyExecutionSave => Some(SettingsCommand::SaveExecution),
+            Control::PolicyDrain => Some(SettingsCommand::DrainProfile),
+            Control::PolicyRemove => Some(SettingsCommand::RemoveProfile),
+            Control::PolicyAddProfile => {
+                self.profile_create_open = true;
+                self.create_notice = None;
+                self.focus = self
+                    .controls()
+                    .iter()
+                    .position(|control| *control == Control::ProfileName)
+                    .unwrap_or(self.focus);
+                None
+            }
+            Control::ProfileName => {
+                self.create_name.begin();
+                None
+            }
+            Control::ProfileExecutionImage => {
+                self.create_execution_image.begin();
+                None
+            }
+            Control::ProfileCreate => Some(SettingsCommand::CreateProfile),
+            Control::ProfileCreateCancel => {
+                self.profile_create_open = false;
+                self.create_notice = None;
+                self.focus = self.focus.min(self.control_count().saturating_sub(1));
+                None
+            }
             Control::WorkspacePath => {
                 self.workspace_path.begin();
                 None
@@ -1436,6 +1922,17 @@ impl SettingsUi {
             | Control::PolicyScale
             | Control::PolicyCapacity
             | Control::PolicyCache
+            | Control::PolicyExecutionMode
+            | Control::PolicyExecutionBackend
+            | Control::PolicyExecutionCpu
+            | Control::PolicyExecutionMemory
+            | Control::PolicyExecutionDisk
+            | Control::ProfileCapacity
+            | Control::ProfileExecutionMode
+            | Control::ProfileExecutionBackend
+            | Control::ProfileExecutionCpu
+            | Control::ProfileExecutionMemory
+            | Control::ProfileExecutionDisk
             | Control::WorkspaceMode => None,
         }
     }
@@ -1561,6 +2058,7 @@ impl SettingsUi {
         let preview = form.preview(&self.policy_draft);
         let mut lines = vec![
             FormLine::keep(format!("Target: {}", form.target)),
+            FormLine::keep(format!("Profile: {}", form.profile_name)),
             FormLine::text(format!("Mode: {:?}", form.mode)),
             FormLine::text(format!("Local host: {}", form.host_identity)),
             FormLine::text(format!(
@@ -1578,6 +2076,9 @@ impl SettingsUi {
             // none, and putting the placeholder sentence on the clipboard
             // would hand the operator a `runs-on:` value no workflow can use.
             .copyable(form.copyable_runs_on.clone()),
+            FormLine::keep(STATIC_SELECTOR_WARNING)
+                .copyable(Some(STATIC_SELECTOR_WARNING.to_owned())),
+            FormLine::keep(FORK_TRUST_WARNING).copyable(Some(FORK_TRUST_WARNING.to_owned())),
         ];
         let mut next = 0;
         if form.exposes_scale_toggle() {
@@ -1622,7 +2123,15 @@ impl SettingsUi {
         lines.push(FormLine::text(""));
         lines.extend(self.label_lines(form, width, &mut next));
         lines.push(FormLine::text(""));
-        lines.extend(self.workspace_lines(form, width, next));
+        if !form.is_organization() {
+            lines.extend(self.execution_lines(form, width, &mut next));
+            lines.push(FormLine::text(""));
+        }
+        lines.extend(self.workspace_lines(form, width, &mut next));
+        if !form.is_organization() {
+            lines.push(FormLine::text(""));
+            lines.extend(self.profile_create_lines(form, width, &mut next));
+        }
         lines.push(FormLine::text(format!(
             "Focused form actions: {}/{} scaling, {}/{} labels, {}/{} workspace",
             form.focused_action_count(),
@@ -1679,13 +2188,100 @@ impl SettingsUi {
         lines
     }
 
+    fn execution_lines(
+        &self,
+        form: &PolicySettings,
+        width: usize,
+        control: &mut usize,
+    ) -> Vec<FormLine> {
+        let stored = match &form.execution_policy {
+            ExecutionPolicy::Native => "native".to_owned(),
+            ExecutionPolicy::Isolated {
+                backend,
+                image,
+                resources,
+            } => format!(
+                "isolated backend={} image={} cpu={}m memory={}MiB disk={}MiB",
+                backend_name(*backend),
+                image.as_str(),
+                resources.cpu_millis,
+                resources.memory_mib,
+                resources.disk_mib,
+            ),
+        };
+        let mut lines = vec![
+            FormLine::keep(format!("Execution: {stored}")),
+            FormLine::keep(format!(
+                "Execution mode: {}  [toggle]",
+                execution_mode_name(self.execution_mode)
+            ))
+            .at(*control),
+        ];
+        *control += 1;
+        if self.execution_mode == ExecutionMode::Isolated {
+            lines.push(
+                FormLine::keep(format!(
+                    "Backend: {}  [cycle]",
+                    backend_mode_name(self.execution_backend)
+                ))
+                .at(*control),
+            );
+            *control += 1;
+            lines.push(
+                FormLine::keep(self.field_row(
+                    "Pinned image",
+                    &self.execution_image,
+                    width,
+                    "(required: sha256, OCI digest, or vm-version)",
+                ))
+                .at(*control),
+            );
+            *control += 1;
+            for (label, value, suffix) in [
+                ("CPU", self.execution_cpu, "m"),
+                ("Memory", self.execution_memory, "MiB"),
+                ("Disk", self.execution_disk, "MiB"),
+            ] {
+                lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
+                *control += 1;
+            }
+            let capability = backend_capability(self.execution_backend);
+            lines.push(FormLine::keep(format!(
+                "Selected provider: {}; remedy: {}",
+                capability.state.display_name(),
+                capability.remedy.unwrap_or("none required")
+            )));
+        }
+        if let Some(notice) = &self.execution_notice {
+            lines.push(FormLine::keep(notice.clone()));
+        }
+        lines.push(FormLine::keep("Save execution [Enter/click]").at(*control));
+        *control += 1;
+        lines.extend(form.provider_diagnostics.iter().map(|provider| {
+            FormLine::text(format!(
+                "{} provider: {}",
+                provider.backend.display_name(),
+                provider.state.display_name()
+            ))
+        }));
+        lines.push(FormLine::text(
+            "Isolated scaling remains unavailable until a provider is installed and integrated.",
+        ));
+        lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
+        *control += 1;
+        lines
+            .push(FormLine::keep("Remove selected profile [Enter twice/click twice]").at(*control));
+        *control += 1;
+        lines
+    }
+
     /// The workspace half of Repository Settings (`02-target-architecture.md`,
     /// "TUI"), and the organization explanation that replaces it.
     fn workspace_lines(
         &self,
         form: &PolicySettings,
         width: usize,
-        first_control: usize,
+        control: &mut usize,
     ) -> Vec<FormLine> {
         let mut lines = vec![
             FormLine::keep(format!(
@@ -1712,12 +2308,11 @@ impl SettingsUi {
             )));
             return lines;
         }
-        let mut control = first_control;
         lines.push(
             FormLine::keep(format!("Workspace mode: {}  [toggle]", self.workspace_mode))
-                .at(control),
+                .at(*control),
         );
-        control += 1;
+        *control += 1;
         if self.workspace_mode.is_persistent() {
             lines.push(
                 FormLine::keep(self.field_row(
@@ -1726,9 +2321,9 @@ impl SettingsUi {
                     width,
                     "(none - platform default)",
                 ))
-                .at(control),
+                .at(*control),
             );
-            control += 1;
+            *control += 1;
         }
         if let Some(notice) = &self.workspace_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -1749,7 +2344,89 @@ impl SettingsUi {
         if let Some(retained) = self.retained_notice(form) {
             lines.push(FormLine::keep(retained));
         }
-        lines.push(FormLine::keep("Save workspace [Enter/click]").at(control));
+        lines.push(FormLine::keep("Save workspace [Enter/click]").at(*control));
+        *control += 1;
+        lines
+    }
+
+    fn profile_create_lines(
+        &self,
+        form: &PolicySettings,
+        width: usize,
+        control: &mut usize,
+    ) -> Vec<FormLine> {
+        let mut lines = vec![FormLine::keep("Add sibling profile [Enter/click]").at(*control)];
+        *control += 1;
+        if !self.profile_create_open {
+            return lines;
+        }
+        lines.push(
+            FormLine::keep(self.field_row(
+                "New profile name",
+                &self.create_name,
+                width,
+                "(required)",
+            ))
+            .at(*control),
+        );
+        *control += 1;
+        let preview = form
+            .preview_selector(&self.create_name.text())
+            .unwrap_or_else(|_| "type a valid name to preview".to_owned());
+        lines.push(FormLine::keep(format!("Selector preview: {preview}")));
+        lines.push(
+            FormLine::keep(format!("Capacity: {}  [-/+]", self.create_capacity)).at(*control),
+        );
+        *control += 1;
+        lines.push(
+            FormLine::keep(format!(
+                "Execution mode: {}  [toggle]",
+                execution_mode_name(self.create_execution_mode)
+            ))
+            .at(*control),
+        );
+        *control += 1;
+        if self.create_execution_mode == ExecutionMode::Isolated {
+            lines.push(
+                FormLine::keep(format!(
+                    "Backend: {}  [cycle]",
+                    backend_mode_name(self.create_execution_backend)
+                ))
+                .at(*control),
+            );
+            *control += 1;
+            lines.push(
+                FormLine::keep(self.field_row(
+                    "Pinned image",
+                    &self.create_execution_image,
+                    width,
+                    "(required)",
+                ))
+                .at(*control),
+            );
+            *control += 1;
+            for (label, value, suffix) in [
+                ("CPU", self.create_execution_cpu, "m"),
+                ("Memory", self.create_execution_memory, "MiB"),
+                ("Disk", self.create_execution_disk, "MiB"),
+            ] {
+                lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
+                *control += 1;
+            }
+            let capability = backend_capability(self.create_execution_backend);
+            lines.push(FormLine::keep(format!(
+                "Selected provider: {}; remedy: {}",
+                capability.state.display_name(),
+                capability.remedy.unwrap_or("none required")
+            )));
+        }
+        if let Some(notice) = &self.create_notice {
+            lines.push(FormLine::keep(notice.clone()));
+        }
+        lines.push(FormLine::keep("Create profile [Enter/click]").at(*control));
+        *control += 1;
+        lines.push(FormLine::text("Cancel profile creation [Enter/click]").at(*control));
+        *control += 1;
         lines
     }
 
@@ -2008,6 +2685,7 @@ fn dispatch_capacity(
             context,
             &RepoCommand::SetCapacity(RepoSetCapacityArgs {
                 repository: target.to_string(),
+                profile: None,
                 max_capacity: maximum,
             }),
             out,
@@ -2035,6 +2713,7 @@ fn dispatch_scale(
             context,
             &RepoCommand::SetScale(RepoSetScaleArgs {
                 repository: target.to_string(),
+                profile: None,
                 enabled,
             }),
             out,
@@ -2050,6 +2729,7 @@ fn dispatch_scale(
     }
 }
 
+#[cfg(test)]
 fn find_policy(store: &dyn Store, target: &ScaleTarget) -> Result<ScalePolicy, CliError> {
     store
         .policies()
@@ -2057,6 +2737,102 @@ fn find_policy(store: &dyn Store, target: &ScaleTarget) -> Result<ScalePolicy, C
         .into_iter()
         .find(|policy| &policy.target == target)
         .ok_or_else(|| CliError::new(Failure::NotFound, format!("no policy for {target} exists")))
+}
+
+fn step_u32(current: u32, increase: bool, step: u32, minimum: u32) -> u32 {
+    if increase {
+        current.saturating_add(step)
+    } else {
+        current.saturating_sub(step).max(minimum)
+    }
+}
+
+fn step_backend(current: BackendMode, increase: bool) -> BackendMode {
+    match (current, increase) {
+        (BackendMode::Auto, true) | (BackendMode::WindowsHyperVContainer, false) => {
+            BackendMode::Oci
+        }
+        (BackendMode::Oci, true) | (BackendMode::VirtualMachine, false) => {
+            BackendMode::WindowsHyperVContainer
+        }
+        (BackendMode::WindowsHyperVContainer, true) | (BackendMode::Auto, false) => {
+            BackendMode::VirtualMachine
+        }
+        (BackendMode::VirtualMachine, true) | (BackendMode::Oci, false) => BackendMode::Auto,
+    }
+}
+
+fn isolation_args(
+    mode: ExecutionMode,
+    backend: BackendMode,
+    image: &PathField,
+    cpu: u32,
+    memory: u32,
+    disk: u32,
+) -> IsolationArgs {
+    match mode {
+        ExecutionMode::Native => IsolationArgs {
+            backend: None,
+            image: None,
+            cpu: None,
+            memory: None,
+            disk: None,
+        },
+        ExecutionMode::Isolated => IsolationArgs {
+            backend: Some(backend),
+            image: Some(image.text()),
+            cpu: Some(cpu),
+            memory: Some(memory),
+            disk: Some(disk),
+        },
+    }
+}
+
+const fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Native => "native",
+        ExecutionMode::Isolated => "isolated",
+    }
+}
+
+const fn backend_mode_name(backend: BackendMode) -> &'static str {
+    match backend {
+        BackendMode::Auto => "auto",
+        BackendMode::Oci => "oci",
+        BackendMode::WindowsHyperVContainer => "windows-hyper-v-container",
+        BackendMode::VirtualMachine => "virtual-machine",
+    }
+}
+
+const fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Auto => "auto",
+        Backend::Oci => "oci",
+        Backend::WindowsHyperVContainer => "windows-hyper-v-container",
+        Backend::VirtualMachine => "virtual-machine",
+    }
+}
+
+fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
+    use cli::host::{IsolationBackend, IsolationObservation, IsolationReadiness};
+
+    let (backend, state) = match backend {
+        BackendMode::Auto => (IsolationBackend::Auto, IsolationReadiness::NotInstalled),
+        BackendMode::Oci => (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        BackendMode::WindowsHyperVContainer => (
+            IsolationBackend::WindowsHyperVContainer,
+            IsolationReadiness::Unsupported,
+        ),
+        BackendMode::VirtualMachine => (
+            IsolationBackend::VirtualMachine,
+            IsolationReadiness::NotInstalled,
+        ),
+    };
+    cli::host::sanitize_isolation_observation(IsolationObservation {
+        backend,
+        state,
+        raw_output: None,
+    })
 }
 
 fn invalid(source: impl std::fmt::Display) -> CliError {
@@ -2087,15 +2863,22 @@ fn service_failure(source: ServiceError) -> CliError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::io::{BufRead as _, BufReader};
+    use std::net::{TcpListener, TcpStream};
     use std::num::NonZeroU16;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use runner_manager_domain::attempt::RunnerAttempt;
+    use runner_manager_domain::execution::{ImageReference, ResourceLimits};
     use runner_manager_domain::model::{
         Arch, AttemptId, Host, HostId, HostLabel, Label, Os, PolicyId,
     };
     use runner_manager_domain::policy::{PolicyState, RoutingLabels};
+    use runner_manager_github::Endpoints;
+    use secrecy::SecretString;
     use tempfile::TempDir;
 
     fn nz(value: u16) -> NonZeroU16 {
@@ -2139,6 +2922,444 @@ mod tests {
         store.insert_policy(&policy).unwrap();
         drop(store);
         (dir, context, target)
+    }
+
+    struct ProfileGithub {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ProfileGithub {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("http://{}/", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            std::thread::spawn(move || answer_profile_github(stream))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                }
+            });
+            Self {
+                base_url,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for ProfileGithub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn answer_profile_github(mut stream: TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let path = request.split_whitespace().nth(1).unwrap_or("/");
+        let body = if path.starts_with("/user/installations/7/repositories") {
+            r#"{"total_count":1,"repositories":[{"full_name":"octo/repo"}]}"#
+        } else if path.starts_with("/user/installations") {
+            r#"{"total_count":1,"installations":[{"id":7,"account":{"login":"octo","type":"Organization"},"repository_selection":"selected","permissions":{"administration":"write","actions":"read"}}]}"#
+        } else {
+            r#"{"message":"not found"}"#
+        };
+        let status = if path.starts_with("/user/installations") {
+            "200 OK"
+        } else {
+            "404 Not Found"
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    fn authenticated_fixture() -> (TempDir, ProfileGithub, Context, ScaleTarget) {
+        let dir = TempDir::new().unwrap();
+        let github = ProfileGithub::start();
+        let endpoints = Endpoints::for_test_server(&github.base_url).unwrap();
+        let context = Context::rooted_against(dir.path(), endpoints).unwrap();
+        let store = context.store().unwrap();
+        let host = Host::new(
+            HostId::from_u128(1),
+            "local-home",
+            Os::Linux,
+            Arch::X64,
+            nz(4),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        store.put_host(&host).unwrap();
+        let target = ScaleTarget::repository("octo/repo").unwrap();
+        let policy = ScalePolicy::new_for_host_label(
+            PolicyId::from_u128(2),
+            target.clone(),
+            7,
+            host.id,
+            HostLabel::new("home").unwrap(),
+            PolicyMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&policy).unwrap();
+        let mode = context.recorded_start_mode(&store).unwrap();
+        drop(store);
+        context
+            .secret_store(mode)
+            .unwrap()
+            .store(&SecretString::from("ghu_profile_fixture_token"))
+            .unwrap();
+        (dir, github, context, target)
+    }
+
+    #[test]
+    fn settings_command_creates_drains_and_removes_one_profile() {
+        let (_dir, _github, context, target) = authenticated_fixture();
+        let mut ui = SettingsUi::default();
+        ui.execute(
+            &context,
+            SettingsCommand::LoadProfile {
+                target: target.to_string(),
+                profile: "default".into(),
+            },
+        );
+        ui.profile_create_open = true;
+        ui.create_name.reset_to("build");
+        ui.create_capacity = 3;
+        ui.execute(&context, SettingsCommand::CreateProfile);
+        let SettingsView::Policy(form) = &ui.view else {
+            panic!("created profile must load")
+        };
+        assert_eq!(form.profile_name, "build", "{:?}", ui.message);
+        assert_eq!(form.current_max_capacity, Some(3));
+        assert_ne!(form.policy_id, PolicyId::from_u128(2));
+
+        ui.policy_draft.enabled = Some(true);
+        ui.execute(&context, SettingsCommand::ApplyPolicy);
+        assert!(
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("build"))
+                .unwrap()
+                .enabled()
+        );
+
+        ui.execute(&context, SettingsCommand::DrainProfile);
+        assert!(
+            !cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("build"))
+                .unwrap()
+                .enabled()
+        );
+
+        ui.execute(&context, SettingsCommand::RemoveProfile);
+        assert!(ui.awaiting_remove_confirmation);
+        ui.execute(&context, SettingsCommand::RemoveProfile);
+        let store = context.store().unwrap();
+        assert!(cli::policy::find_policy_selected(&store, &target, Some("default")).is_ok());
+        assert!(cli::policy::find_policy_selected(&store, &target, Some("build")).is_err());
+    }
+
+    #[test]
+    fn every_profile_and_isolation_control_has_keyboard_mouse_focus_and_compact_reachability() {
+        let (_dir, context, target) = fixture(false);
+        let isolated_ui = || {
+            let mut ui = SettingsUi::default();
+            ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+            ui.execution_mode = ExecutionMode::Isolated;
+            ui.profile_create_open = true;
+            ui.create_execution_mode = ExecutionMode::Isolated;
+            ui
+        };
+        let new_controls = [
+            Control::PolicyLabels,
+            Control::PolicyLabelsSave,
+            Control::PolicyExecutionMode,
+            Control::PolicyExecutionBackend,
+            Control::PolicyExecutionImage,
+            Control::PolicyExecutionCpu,
+            Control::PolicyExecutionMemory,
+            Control::PolicyExecutionDisk,
+            Control::PolicyExecutionSave,
+            Control::PolicyDrain,
+            Control::PolicyRemove,
+            Control::PolicyAddProfile,
+            Control::ProfileName,
+            Control::ProfileCapacity,
+            Control::ProfileExecutionMode,
+            Control::ProfileExecutionBackend,
+            Control::ProfileExecutionImage,
+            Control::ProfileExecutionCpu,
+            Control::ProfileExecutionMemory,
+            Control::ProfileExecutionDisk,
+            Control::ProfileCreate,
+            Control::ProfileCreateCancel,
+        ];
+        for control in new_controls {
+            let mut keyboard = isolated_ui();
+            if control == Control::PolicyAddProfile {
+                keyboard.profile_create_open = false;
+            }
+            focus_by_keyboard(&mut keyboard, control);
+            assert_eq!(keyboard.focused(), Some(control));
+            let focus = keyboard.focus;
+            let normal = keyboard.control_rows(100, false);
+            assert!(
+                normal.contains(&Some(focus)),
+                "{control:?} has no normal-width row"
+            );
+            let compact = keyboard.control_rows(42, true);
+            assert!(
+                compact.contains(&Some(focus)),
+                "{control:?} has no compact row"
+            );
+            let keyboard_result = if control.is_adjustable() {
+                keyboard.key(KeyCode::Right)
+            } else {
+                keyboard.key(KeyCode::Enter)
+            };
+            assert_control_activated(&keyboard, control, keyboard_result.as_ref());
+
+            let mut mouse = isolated_ui();
+            if control == Control::PolicyAddProfile {
+                mouse.profile_create_open = false;
+            }
+            let mouse_focus = mouse
+                .controls()
+                .iter()
+                .position(|item| *item == control)
+                .unwrap();
+            let row = mouse
+                .control_rows(100, false)
+                .iter()
+                .position(|mapped| *mapped == Some(mouse_focus))
+                .unwrap();
+            let mouse_result = mouse.click(row as u16, 100, false);
+            assert_eq!(
+                mouse.focused(),
+                Some(if control == Control::PolicyAddProfile {
+                    Control::ProfileName
+                } else if control == Control::ProfileCreateCancel {
+                    Control::PolicyAddProfile
+                } else {
+                    control
+                })
+            );
+            assert_control_activated(&mouse, control, mouse_result.as_ref());
+        }
+    }
+
+    fn assert_control_activated(
+        ui: &SettingsUi,
+        control: Control,
+        command: Option<&SettingsCommand>,
+    ) {
+        match control {
+            Control::PolicyLabels => assert!(ui.policy_labels.is_editing()),
+            Control::PolicyLabelsSave => assert_eq!(command, Some(&SettingsCommand::SaveLabels)),
+            Control::PolicyExecutionMode => assert_eq!(ui.execution_mode, ExecutionMode::Native),
+            Control::PolicyExecutionBackend => assert_ne!(ui.execution_backend, BackendMode::Auto),
+            Control::PolicyExecutionImage => assert!(ui.execution_image.is_editing()),
+            Control::PolicyExecutionCpu => assert_eq!(ui.execution_cpu, 1100),
+            Control::PolicyExecutionMemory => assert_eq!(ui.execution_memory, 1280),
+            Control::PolicyExecutionDisk => assert_eq!(ui.execution_disk, 5120),
+            Control::PolicyExecutionSave => {
+                assert_eq!(command, Some(&SettingsCommand::SaveExecution))
+            }
+            Control::PolicyDrain => assert_eq!(command, Some(&SettingsCommand::DrainProfile)),
+            Control::PolicyRemove => assert_eq!(command, Some(&SettingsCommand::RemoveProfile)),
+            Control::PolicyAddProfile => assert!(ui.profile_create_open),
+            Control::ProfileName => assert!(ui.create_name.is_editing()),
+            Control::ProfileCapacity => assert_eq!(ui.create_capacity, 2),
+            Control::ProfileExecutionMode => {
+                assert_eq!(ui.create_execution_mode, ExecutionMode::Native)
+            }
+            Control::ProfileExecutionBackend => {
+                assert_ne!(ui.create_execution_backend, BackendMode::Auto)
+            }
+            Control::ProfileExecutionImage => assert!(ui.create_execution_image.is_editing()),
+            Control::ProfileExecutionCpu => assert_eq!(ui.create_execution_cpu, 1100),
+            Control::ProfileExecutionMemory => assert_eq!(ui.create_execution_memory, 1280),
+            Control::ProfileExecutionDisk => assert_eq!(ui.create_execution_disk, 5120),
+            Control::ProfileCreate => assert_eq!(command, Some(&SettingsCommand::CreateProfile)),
+            Control::ProfileCreateCancel => assert!(!ui.profile_create_open),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn complete_selector_copy_includes_sorted_extra_labels() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.policy_labels.reset_to("trusted, gpu");
+        ui.execute(&context, SettingsCommand::SaveLabels);
+
+        let SettingsView::Policy(form) = &ui.view else {
+            panic!("policy remains loaded")
+        };
+        assert_eq!(
+            form.copyable_runs_on.as_deref(),
+            Some("rm-home-linux-x64, gpu, trusted")
+        );
+        focus_by_keyboard(&mut ui, Control::PolicyLabels);
+        assert_eq!(
+            ui.copy_text().as_deref(),
+            Some("rm-home-linux-x64, gpu, trusted")
+        );
+        let copy_row = ui
+            .rows(100, false)
+            .iter()
+            .position(|row| row.copy.as_deref() == Some("rm-home-linux-x64, gpu, trusted"))
+            .unwrap();
+        assert_eq!(
+            ui.click(copy_row as u16, 100, false),
+            Some(SettingsCommand::Copy(
+                "rm-home-linux-x64, gpu, trusted".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn execution_save_rejects_invalid_image_and_resources_without_persistence() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.execution_mode = ExecutionMode::Isolated;
+        ui.execution_backend = BackendMode::Oci;
+        ui.execution_image
+            .reset_to("registry.example/runner:latest");
+        ui.execute(&context, SettingsCommand::SaveExecution);
+        assert!(ui.message.as_deref().unwrap().contains("pinned"));
+        assert!(
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap()
+                .execution_policy()
+                .is_native()
+        );
+
+        ui.execution_image.reset_to(&format!(
+            "registry.example/runner@sha256:{}",
+            "a".repeat(64)
+        ));
+        ui.execution_cpu = 99;
+        ui.execute(&context, SettingsCommand::SaveExecution);
+        assert!(
+            ui.message
+                .as_deref()
+                .unwrap()
+                .contains("below the required floor")
+        );
+        assert!(
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap()
+                .execution_policy()
+                .is_native()
+        );
+
+        ui.execution_backend = BackendMode::WindowsHyperVContainer;
+        let rendered = rows_text(&ui, 100, false);
+        assert!(
+            rendered.contains("Selected provider: unsupported"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("remedy: use a supported host and provider"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn execution_save_persists_custom_backend_image_and_resources() {
+        let (_dir, context, target) = fixture(false);
+        let image = format!("registry.example/runner@sha256:{}", "b".repeat(64));
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.execution_mode = ExecutionMode::Isolated;
+        ui.execution_backend = BackendMode::Oci;
+        ui.execution_image.reset_to(&image);
+        ui.execution_cpu = 2300;
+        ui.execution_memory = 3328;
+        ui.execution_disk = 12288;
+        ui.execute(&context, SettingsCommand::SaveExecution);
+
+        let stored =
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap();
+        assert_eq!(
+            stored.execution_policy(),
+            &ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: ImageReference::new(image).unwrap(),
+                resources: ResourceLimits {
+                    cpu_millis: 2300,
+                    memory_mib: 3328,
+                    disk_mib: 12288,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn provider_raw_output_is_discarded_before_render_and_copy_surfaces() {
+        use cli::host::{
+            IsolationBackend, IsolationObservation, IsolationReadiness,
+            sanitize_isolation_observation,
+        };
+
+        let sentinel = format!("{}{}", "ghu_", "raw_provider_secret_never_rendered");
+        let capability = sanitize_isolation_observation(IsolationObservation {
+            backend: IsolationBackend::WindowsHyperVContainer,
+            state: IsolationReadiness::Unsupported,
+            raw_output: Some(&sentinel),
+        });
+        assert_eq!(capability.state, IsolationReadiness::Unsupported);
+        assert_eq!(capability.remedy, Some("use a supported host and provider"));
+
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        let SettingsView::Policy(form) = &mut ui.view else {
+            panic!("policy loaded")
+        };
+        form.provider_diagnostics = vec![capability];
+        let rows = ui.rows(100, false);
+        let rendered = rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Hyper-V container provider: unsupported"));
+        assert!(!rendered.contains(&sentinel));
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.copy.as_deref())
+                .all(|copy| !copy.contains(&sentinel))
+        );
+        for control in ui.controls() {
+            focus_by_keyboard(&mut ui, control);
+            assert!(ui.copy_text().is_none_or(|copy| !copy.contains(&sentinel)));
+        }
     }
 
     #[test]
@@ -3226,6 +4447,7 @@ mod tests {
             &through_cli.context,
             &RepoCommand::SetWorkspace(RepoSetWorkspaceArgs {
                 repository: through_cli.target.to_string(),
+                profile: None,
                 mode: WorkspaceMode::Persistent,
                 path: Some(slots.clone()),
             }),
@@ -3248,6 +4470,7 @@ mod tests {
             &through_cli.context,
             &RepoCommand::SetWorkspace(RepoSetWorkspaceArgs {
                 repository: through_cli.target.to_string(),
+                profile: None,
                 mode: WorkspaceMode::Ephemeral,
                 path: None,
             }),
@@ -3702,7 +4925,10 @@ mod tests {
         let mut ui = SettingsUi::default();
         ui.execute(
             &fixture.context,
-            SettingsCommand::LoadPolicy(organization.to_string()),
+            SettingsCommand::LoadProfile {
+                target: organization.to_string(),
+                profile: "default".into(),
+            },
         );
         let SettingsView::Policy(form) = &ui.view else {
             panic!("{:?}", ui.message)
@@ -3715,6 +4941,11 @@ mod tests {
             Control::WorkspaceMode,
             Control::WorkspacePath,
             Control::WorkspaceSave,
+            Control::PolicyExecutionMode,
+            Control::PolicyExecutionSave,
+            Control::PolicyDrain,
+            Control::PolicyRemove,
+            Control::PolicyAddProfile,
         ] {
             assert!(
                 !ui.controls().contains(&control),
@@ -3729,6 +4960,25 @@ mod tests {
             assert!(
                 !text.contains(line.trim()),
                 "an organization is never offered persistence, so it is never warned about it"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_and_trust_warnings_are_mouse_copyable() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+        for warning in [STATIC_SELECTOR_WARNING, FORK_TRUST_WARNING] {
+            let row = ui
+                .rows(160, false)
+                .iter()
+                .position(|line| line.text == warning)
+                .expect("warning row");
+            assert_eq!(
+                ui.click(row as u16, 160, false),
+                Some(SettingsCommand::Copy(warning.to_owned()))
             );
         }
     }
@@ -4031,10 +5281,15 @@ mod tests {
         Save runner root [Enter/click]
         --- repository/ephemeral ---
         Target: octo/repo
+        Profile: default
         Mode: Autoscale
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
         max_capacity: 2  [-/+; setting promotes monitor-only]
         Cache policy: RetainRunnerPackage  [toggle]
@@ -4045,6 +5300,17 @@ mod tests {
         Extra labels: (none - this policy answers its host label only)  [Enter to edit]
         Comma-separated. Saving makes the stored set equal this line.
         Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: native  [toggle]
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
 
         Workspace: ephemeral  (platform-default)
         Workspace root: <DEFAULT>
@@ -4052,13 +5318,20 @@ mod tests {
         Affected attempts: 0 active, 0 awaiting cleanup
         Workspace mode: ephemeral  [toggle]
         Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
-        --- repository/persistent-warning ---
+        --- repository/isolated ---
         Target: octo/repo
+        Profile: default
         Mode: Autoscale
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
         max_capacity: 2  [-/+; setting promotes monitor-only]
         Cache policy: RetainRunnerPackage  [toggle]
@@ -4069,6 +5342,171 @@ mod tests {
         Extra labels: (none - this policy answers its host label only)  [Enter to edit]
         Comma-separated. Saving makes the stored set equal this line.
         Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <56:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported host and provider
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Slot leases: none
+        Affected attempts: 0 active, 0 awaiting cleanup
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
+        Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
+        --- repository/create-isolated ---
+        Target: octo/repo
+        Profile: default
+        Mode: Autoscale
+        Local host: local-home
+        Current max_capacity: 2
+        runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Cache policy: RetainRunnerPackage  [toggle]
+        Preview: no runner is terminated immediately.
+        Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <56:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported host and provider
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Slot leases: none
+        Affected attempts: 0 active, 0 awaiting cleanup
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
+        New profile name: gpu-build  [Enter to edit]
+        Selector preview: rm-home-linux-x64-gpu-build
+        Capacity: 3  [-/+]
+        Execution mode: isolated  [toggle]
+        Backend: oci  [cycle]
+        Pinned image: <56:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  [Enter to edit]
+        CPU: 4000m  [-/+]
+        Memory: 8192MiB  [-/+]
+        Disk: 20480MiB  [-/+]
+        Selected provider: not installed; remedy: install and configure an OCI execution provider
+        Create profile [Enter/click]
+        Cancel profile creation [Enter/click]
+        Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
+        --- repository/create-isolated-compact ---
+        Target: octo/repo
+        Profile: default
+        Static runs-on required: matrix expressions are not
+        resolved; missing or multiple profile selectors start no
+        runner.
+        warning: fork and untrusted pull-request workflows must
+        not run on a personal host until you explicitly accept
+        that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Confirm policy [Enter/click]
+        Host label: rm-home-linux-x64  (fixed: it is this
+        machine's routing identity)
+        Extra labels: (none - this policy answers its host label
+        only)  [Enter to edit]
+        Save labels [Enter/click]
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <ddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported
+        host and provider
+        Save execution [Enter/click]
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+        Add sibling profile [Enter/click]
+        New profile name: gpu-build  [Enter to edit]
+        Selector preview: rm-home-linux-x64-gpu-build
+        Capacity: 3  [-/+]
+        Execution mode: isolated  [toggle]
+        Backend: oci  [cycle]
+        Pinned image: <eeeeeeeeeeeeeeeeeeeeeee  [Enter to edit]
+        CPU: 4000m  [-/+]
+        Memory: 8192MiB  [-/+]
+        Disk: 20480MiB  [-/+]
+        Selected provider: not installed; remedy: install and
+        configure an OCI execution provider
+        Create profile [Enter/click]
+        --- repository/persistent-warning ---
+        Target: octo/repo
+        Profile: default
+        Mode: Autoscale
+        Local host: local-home
+        Current max_capacity: 2
+        runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Cache policy: RetainRunnerPackage  [toggle]
+        Preview: no runner is terminated immediately.
+        Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: native  [toggle]
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
 
         Workspace: ephemeral  (platform-default)
         Workspace root: <DEFAULT>
@@ -4085,13 +5523,20 @@ mod tests {
           - `actions/checkout` still cleans the workspace, including Git-ignored files,
             unless the workflow sets `clean: false`.
         Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
         --- repository/cleanup-blocked ---
         Target: octo/repo
+        Profile: default
         Mode: Autoscale
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
         max_capacity: 2  [-/+; setting promotes monitor-only]
         Cache policy: RetainRunnerPackage  [toggle]
@@ -4102,6 +5547,17 @@ mod tests {
         Extra labels: (none - this policy answers its host label only)  [Enter to edit]
         Comma-separated. Saving makes the stored set equal this line.
         Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: native  [toggle]
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
 
         Workspace: persistent  (repository-specific)
         Workspace root: <SLOTS>
@@ -4121,6 +5577,8 @@ mod tests {
         Left in place: every slot under <SLOTS> remains on disk, including its _work directory. Nothing is
         moved or deleted.
         Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 3/5 workspace
         "#);
     }
@@ -4188,6 +5646,42 @@ mod tests {
         sections.push((
             "repository/ephemeral",
             stable_rows(&repository.policy_screen(), 100, false, &repository),
+        ));
+
+        let mut isolated = repository.policy_screen();
+        isolated.execution_mode = ExecutionMode::Isolated;
+        isolated.execution_backend = BackendMode::WindowsHyperVContainer;
+        isolated.execution_image.reset_to(&format!(
+            "registry.example/runner@sha256:{}",
+            "d".repeat(64)
+        ));
+        isolated.execution_cpu = 2200;
+        isolated.execution_memory = 3072;
+        isolated.execution_disk = 10240;
+        sections.push((
+            "repository/isolated",
+            stable_rows(&isolated, 100, false, &repository),
+        ));
+
+        isolated.profile_create_open = true;
+        isolated.create_name.reset_to("gpu-build");
+        isolated.create_capacity = 3;
+        isolated.create_execution_mode = ExecutionMode::Isolated;
+        isolated.create_execution_backend = BackendMode::Oci;
+        isolated.create_execution_image.reset_to(&format!(
+            "registry.example/gpu-runner@sha256:{}",
+            "e".repeat(64)
+        ));
+        isolated.create_execution_cpu = 4000;
+        isolated.create_execution_memory = 8192;
+        isolated.create_execution_disk = 20480;
+        sections.push((
+            "repository/create-isolated",
+            stable_rows(&isolated, 100, false, &repository),
+        ));
+        sections.push((
+            "repository/create-isolated-compact",
+            stable_rows(&isolated, 56, true, &repository),
         ));
 
         let mut ui = repository.policy_screen();

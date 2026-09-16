@@ -34,7 +34,7 @@ use runner_manager_domain::model::{RefreshInterval, StartMode, Timestamp};
 use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::rest::refreshes_per_hour;
-use runner_manager_platform::service::InstallRecord;
+use runner_manager_platform::service::{InstallRecord, github_credential_rejected_since};
 use serde::Serialize;
 
 use super::host::{FALLBACK_COST_MULTIPLE, HostBudget, local_host, max_repository_targets};
@@ -133,6 +133,12 @@ pub struct Product {
     /// The version reported by the product-owned binary registered for the
     /// local service, or `null` when no readable service installation exists.
     pub service_binary_version: Option<String>,
+    /// Since when GitHub has rejected the local service's credential, as the
+    /// daemon last recorded it; `null` while it is accepted.
+    pub service_credential_rejected_since: Option<Timestamp>,
+    /// The build that wrote the service definition, when that definition is no
+    /// longer what this build renders; `null` when it is current.
+    pub service_definition_outdated_since_version: Option<String>,
 }
 
 fn binary_version(path: &std::path::Path) -> Option<String> {
@@ -153,6 +159,14 @@ fn binary_version(path: &std::path::Path) -> Option<String> {
 fn installed_service_version(context: &Context) -> Option<String> {
     let record = InstallRecord::read(context.paths()).ok().flatten()?;
     binary_version(&record.binary)
+}
+
+fn outdated_service_definition(context: &Context) -> Option<String> {
+    super::service::operations(context)
+        .definition_drift()
+        .ok()
+        .flatten()
+        .map(|drift| drift.installed_by_version)
 }
 
 /// What is known about the credential **without asking GitHub**.
@@ -273,6 +287,8 @@ pub struct BudgetSnapshot {
 pub struct PolicySnapshot {
     pub id: String,
     pub target: String,
+    /// Immutable runner-profile identity within `target`.
+    pub profile_name: String,
     pub scope: String,
     pub mode: String,
     pub state: String,
@@ -336,6 +352,7 @@ impl PolicySnapshot {
         Self {
             id: policy.id.to_string(),
             target: policy.target.slug(),
+            profile_name: policy.profile_name().to_string(),
             scope: workspace::scope_token(policy.target.scope()).to_string(),
             mode: match policy.mode() {
                 PolicyMode::MonitorOnly => "monitor_only",
@@ -441,6 +458,10 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
             service_binary_version: installed_service_version(context),
+            service_credential_rejected_since: github_credential_rejected_since(context.paths())
+                .ok()
+                .flatten(),
+            service_definition_outdated_since_version: outdated_service_definition(context),
         },
         github_contacted: false,
         credential: Credential {
@@ -673,6 +694,8 @@ mod tests {
                 name: "runner-manager",
                 version: "0.1.0",
                 service_binary_version: None,
+                service_credential_rejected_since: None,
+                service_definition_outdated_since_version: None,
             },
             github_contacted: false,
             credential: Credential {
@@ -714,6 +737,7 @@ mod tests {
             policies: vec![PolicySnapshot {
                 id: "00000000-0000-0000-0000-000000000010".to_string(),
                 target: "owner/repo".to_string(),
+                profile_name: "default".to_string(),
                 scope: "repository".to_string(),
                 mode: "autoscale".to_string(),
                 state: "active".to_string(),
@@ -779,7 +803,13 @@ mod tests {
         );
         assert_eq!(
             keys(&emitted, "/product"),
-            ["name", "service_binary_version", "version"]
+            [
+                "name",
+                "service_binary_version",
+                "service_credential_rejected_since",
+                "service_definition_outdated_since_version",
+                "version"
+            ]
         );
         assert_eq!(
             keys(&emitted, "/credential"),
@@ -831,6 +861,7 @@ mod tests {
                 "max_capacity",
                 "min_capacity",
                 "mode",
+                "profile_name",
                 "routing_labels",
                 "scope",
                 "state",

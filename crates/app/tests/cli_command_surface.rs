@@ -55,6 +55,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "set-runtime-root",
             "reset-runtime-root",
             "show",
+            "isolation",
         ],
     ),
     (
@@ -68,6 +69,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "remove-label",
             "set-workspace",
             "remove",
+            "profile",
         ],
     ),
     (
@@ -88,6 +90,26 @@ const SURFACE: [(&str, &[&str]); 10] = [
     ("status", &[]),
     ("update", &[]),
     ("wsl", &["list", "install", "status", "detach"]),
+];
+
+/// Profile and provider leaves added by the runner-sandbox architecture.
+const NESTED_SURFACE: [(&str, &[&str]); 2] = [
+    ("host isolation", &["status"]),
+    (
+        "repo profile",
+        &[
+            "add",
+            "list",
+            "show",
+            "set-capacity",
+            "set-scale",
+            "add-label",
+            "remove-label",
+            "set-workspace",
+            "set-execution",
+            "remove",
+        ],
+    ),
 ];
 
 /// The command names clap lists under `Commands:` in a help page.
@@ -796,7 +818,7 @@ fn the_readme_documents_exactly_the_commands_the_help_text_lists() {
 
 /// `SURFACE` as leaves, spelled `family` or `family subcommand`.
 fn published_leaves() -> Vec<String> {
-    SURFACE
+    let mut leaves: Vec<String> = SURFACE
         .iter()
         .flat_map(|(family, subcommands)| {
             if subcommands.is_empty() {
@@ -804,11 +826,31 @@ fn published_leaves() -> Vec<String> {
             } else {
                 subcommands
                     .iter()
+                    .filter(|subcommand| {
+                        !NESTED_SURFACE
+                            .iter()
+                            .any(|(nested, _)| *nested == format!("{family} {subcommand}"))
+                    })
                     .map(|subcommand| format!("{family} {subcommand}"))
                     .collect()
             }
         })
-        .collect()
+        .collect();
+    for (parent, children) in NESTED_SURFACE {
+        leaves.extend(children.iter().map(|child| format!("{parent} {child}")));
+    }
+    leaves
+}
+
+#[test]
+fn new_profile_and_provider_families_list_their_documented_leaves() {
+    for (path, children) in NESTED_SURFACE {
+        let mut listed = commands_in(&help_for(&path.split_whitespace().collect::<Vec<_>>()));
+        listed.sort();
+        let mut expected: Vec<String> = children.iter().map(|child| (*child).to_string()).collect();
+        expected.sort();
+        assert_eq!(listed, expected, "{path} command inventory");
+    }
 }
 
 /// `HIDDEN_BRIDGES` as leaves, in the same spelling.

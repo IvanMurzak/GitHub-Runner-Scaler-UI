@@ -324,6 +324,50 @@ pub fn retire_windows_recovery(root: &Path) -> Result<(), FenceError> {
     }
 }
 
+/// Retire Windows recovery coordination that no live watchdog is maintaining.
+///
+/// A watchdog keeps its recovery generation in memory only. When it exits
+/// mid-recovery -- the Windows service or the companion task restarting while
+/// WSL is being recovered -- its durable fence claim and drain request outlive
+/// it, and its successor starts with a new generation. [`clear_recovery`] only
+/// clears a matching generation, so the successor never clears them and every
+/// guest launch stays fenced forever while WSL itself is healthy.
+///
+/// A live watchdog rewrites its drain request on every unhealthy observation,
+/// so a request newer than `abandoned_after` means recovery is still being
+/// driven and nothing is touched. A Windows-owned claim younger than that is
+/// likewise left alone, because its owner may be between claiming the fence
+/// and its next request write. A guest launch claim is never removed.
+///
+/// Returns `true` when abandoned coordination was retired.
+pub fn retire_abandoned_windows_recovery(
+    root: &Path,
+    now: DateTime<Utc>,
+    abandoned_after: std::time::Duration,
+) -> Result<bool, FenceError> {
+    let abandoned = |at: DateTime<Utc>| (now - at).to_std().is_ok_and(|age| age >= abandoned_after);
+    let request = DrainRequest::read(root)?;
+    if request
+        .as_ref()
+        .is_some_and(|request| !abandoned(request.requested_at))
+    {
+        return Ok(false);
+    }
+    let windows_owner =
+        FenceClaim::owner(root)?.filter(|owner| owner.kind == FenceOwnerKind::WindowsRecovery);
+    if windows_owner
+        .as_ref()
+        .is_some_and(|owner| !abandoned(owner.acquired_at))
+    {
+        return Ok(false);
+    }
+    if request.is_none() && windows_owner.is_none() {
+        return Ok(false);
+    }
+    retire_windows_recovery(root)?;
+    Ok(true)
+}
+
 fn remove_claim(directory: &Path) -> Result<(), FenceError> {
     match fs::remove_dir_all(directory) {
         Ok(()) => Ok(()),
@@ -471,6 +515,60 @@ mod tests {
             .write(root.path())
             .unwrap();
         retire_windows_recovery(root.path()).unwrap();
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
+        assert!(!root.path().join(REQUEST_FILE).exists());
+    }
+
+    #[test]
+    fn a_restarted_watchdog_retires_only_recovery_nobody_is_still_driving() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let window = std::time::Duration::from_secs(300);
+        let old = now - chrono::Duration::minutes(10);
+        let claim = FenceClaim::try_claim(root.path(), FenceOwnerKind::WindowsRecovery, Some(1))
+            .unwrap()
+            .unwrap();
+        claim.make_durable();
+        let owner_path = root.path().join(FENCE_DIRECTORY).join(OWNER_FILE);
+        let backdate_owner = || {
+            let mut owner = FenceClaim::owner(root.path()).unwrap().unwrap();
+            owner.acquired_at = old;
+            write_json(&owner_path, &owner).unwrap();
+        };
+
+        // A live watchdog keeps its request fresh: nothing is touched even
+        // though the claim itself is old and of another generation.
+        backdate_owner();
+        DrainRequest::new(2, now - chrono::Duration::seconds(10))
+            .write(root.path())
+            .unwrap();
+        assert!(!retire_abandoned_windows_recovery(root.path(), now, window).unwrap());
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
+
+        // The incident: a dead generation's claim and request, WSL healthy.
+        DrainRequest::new(2, old).write(root.path()).unwrap();
+        assert!(retire_abandoned_windows_recovery(root.path(), now, window).unwrap());
+        assert!(!root.path().join(FENCE_DIRECTORY).exists());
+        assert!(!root.path().join(REQUEST_FILE).exists());
+        assert!(!retire_abandoned_windows_recovery(root.path(), now, window).unwrap());
+
+        // A freshly claimed fence whose request has not been rewritten yet.
+        let claim = FenceClaim::try_claim(root.path(), FenceOwnerKind::WindowsRecovery, Some(3))
+            .unwrap()
+            .unwrap();
+        claim.make_durable();
+        assert!(!retire_abandoned_windows_recovery(root.path(), now, window).unwrap());
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
+        remove_claim(&root.path().join(FENCE_DIRECTORY)).unwrap();
+
+        // A guest launch claim is never retired, but an abandoned request is.
+        let guest = FenceClaim::try_claim(root.path(), FenceOwnerKind::GuestLaunch, None)
+            .unwrap()
+            .unwrap();
+        guest.make_durable();
+        backdate_owner();
+        DrainRequest::new(4, old).write(root.path()).unwrap();
+        assert!(retire_abandoned_windows_recovery(root.path(), now, window).unwrap());
         assert!(root.path().join(FENCE_DIRECTORY).exists());
         assert!(!root.path().join(REQUEST_FILE).exists());
     }
