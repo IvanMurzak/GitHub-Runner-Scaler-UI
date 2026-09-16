@@ -570,25 +570,22 @@ const fn readiness_from_provider_capability(capability: ProviderCapability) -> I
 
 #[must_use]
 pub fn isolation_capabilities() -> Vec<IsolationCapability> {
-    let mut providers = [
-        (IsolationBackend::Native, IsolationReadiness::Ready),
-        (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
-        (
-            IsolationBackend::VirtualMachine,
-            IsolationReadiness::NotInstalled,
-        ),
-    ]
-    .into_iter()
-    .map(|(backend, state)| {
+    let capability = |backend, state| {
         sanitize_isolation_observation(IsolationObservation {
             backend,
             state,
             raw_output: None,
         })
-    })
-    .collect::<Vec<_>>();
-    providers.insert(2, windows_hyper_v_capability());
-    providers
+    };
+    vec![
+        capability(IsolationBackend::Native, IsolationReadiness::Ready),
+        capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        windows_hyper_v_capability(),
+        capability(
+            IsolationBackend::VirtualMachine,
+            IsolationReadiness::NotInstalled,
+        ),
+    ]
 }
 
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {

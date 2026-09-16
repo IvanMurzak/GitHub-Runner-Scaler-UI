@@ -1611,6 +1611,14 @@ impl PlatformExecutionProvider {
             }
         }
     }
+
+    fn required_provider_for_attempt(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<&dyn ExecutionProvider, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))
+    }
 }
 
 impl ExecutionProvider for PlatformExecutionProvider {
@@ -1669,26 +1677,21 @@ impl ExecutionProvider for PlatformExecutionProvider {
     }
 
     fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .inspect(attempt)
     }
 
     fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
-            .stop(attempt)
+        self.required_provider_for_attempt(attempt)?.stop(attempt)
     }
 
     fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .destroy(attempt)
     }
 
     fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .recover(attempt)
     }
 
@@ -1702,9 +1705,7 @@ impl ExecutionProvider for PlatformExecutionProvider {
     }
 
     fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
-            .owns(attempt)
+        self.required_provider_for_attempt(attempt)?.owns(attempt)
     }
 
     fn spawn(
@@ -1721,14 +1722,12 @@ impl ExecutionProvider for PlatformExecutionProvider {
     }
 
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .is_alive(attempt)
     }
 
     fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .recovered_pid(attempt)
     }
 
@@ -1738,8 +1737,7 @@ impl ExecutionProvider for PlatformExecutionProvider {
     }
 
     fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .record_terminate_intent(attempt)
     }
 
@@ -1749,8 +1747,7 @@ impl ExecutionProvider for PlatformExecutionProvider {
     }
 
     fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
-        self.provider_for_attempt(attempt)
-            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+        self.required_provider_for_attempt(attempt)?
             .terminate(attempt)
     }
 }
