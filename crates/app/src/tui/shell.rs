@@ -4542,6 +4542,174 @@ mod tests {
     }
 
     #[test]
+    fn table_selection_loads_exact_native_and_isolated_policy_ids_without_sibling_crosstalk() {
+        use std::num::NonZeroU16;
+
+        use runner_manager_domain::execution::{
+            Backend, ExecutionPolicy, ImageReference, ResourceLimits,
+        };
+        use runner_manager_domain::model::{
+            Arch, CachePolicy, Host, HostId, HostLabel, Os, PolicyId, ProfileName,
+        };
+        use runner_manager_domain::policy::{
+            NamedProfileSpec, PolicyMode as DomainMode, RoutingLabels, ScalePolicy,
+        };
+
+        let root = tempfile::TempDir::new().unwrap();
+        let context = crate::cli::Context::resolve(Some(root.path()), &mut Vec::new()).unwrap();
+        let store = context.store().unwrap();
+        let host = Host::new(
+            HostId::from_u128(950),
+            "profile-selection-host",
+            Os::Linux,
+            Arch::X64,
+            NonZeroU16::new(4).unwrap(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        store.put_host(&host).unwrap();
+        let target = ScaleTarget::repository("octo/profile-selection").unwrap();
+        let native_id = PolicyId::from_u128(951);
+        let isolated_id = PolicyId::from_u128(952);
+        let native = ScalePolicy::new_for_host_label(
+            native_id,
+            target.clone(),
+            7,
+            host.id,
+            HostLabel::new("home").unwrap(),
+            DomainMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                0,
+                NonZeroU16::new(2).unwrap(),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&native).unwrap();
+        let mut isolated = ScalePolicy::new_named(
+            isolated_id,
+            target.clone(),
+            7,
+            host.id,
+            NamedProfileSpec {
+                requested_host_label: HostLabel::new("home").unwrap(),
+                os: Os::Linux,
+                arch: Arch::X64,
+                profile_name: ProfileName::new("isolated").unwrap(),
+                min_capacity: 0,
+                max_capacity: NonZeroU16::new(1).unwrap(),
+            },
+            CachePolicy::default(),
+        )
+        .unwrap();
+        isolated
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "c".repeat(64)
+                ))
+                .unwrap(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            })
+            .unwrap();
+        store.insert_policy(&isolated).unwrap();
+        drop(store);
+
+        let row = |id: PolicyId, profile_name: &str, max_capacity| RepositoryRow {
+            id: id.to_string(),
+            target: target.to_string(),
+            profile_name: profile_name.to_owned(),
+            in_progress_workflows: 0,
+            mode: PolicyMode::Autoscale,
+            max_capacity: Some(max_capacity),
+            health: AgentHealth::Healthy,
+            host_label: Some(format!("rm-home-linux-x64-{profile_name}")),
+            extra_labels: Vec::new(),
+        };
+        let mut state = AppState::new(PresentationState::default(), 120, 30);
+        state.screen_model = ScreenModel::new(Snapshot {
+            availability: Availability::Ready,
+            repositories: vec![
+                row(native_id, "default", 2),
+                row(isolated_id, "isolated", 1),
+            ],
+            ..Snapshot::default()
+        });
+        state.screen = Screen::Repositories;
+        state
+            .screen_model
+            .apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        state.screen_model.apply(ScreenAction::MoveSelection(0));
+
+        let Effect::Settings(native_load) = reduce(&mut state, key(KeyCode::Char('s'))).remove(0)
+        else {
+            panic!("native table row dispatches settings")
+        };
+        assert_eq!(
+            native_load,
+            SettingsCommand::LoadProfile {
+                target: target.to_string(),
+                profile: "default".to_owned(),
+            }
+        );
+        state.settings.execute(&context, native_load);
+        let SettingsView::Policy(native_form) = &state.settings.view else {
+            panic!("native form")
+        };
+        assert_eq!(native_form.policy_id, native_id);
+        state.settings.policy_draft.max_capacity = Some(4);
+        state
+            .settings
+            .execute(&context, SettingsCommand::ApplyPolicy);
+
+        state.screen_model.apply(ScreenAction::MoveSelection(1));
+        let Effect::Settings(isolated_load) = reduce(&mut state, key(KeyCode::Char('s'))).remove(0)
+        else {
+            panic!("isolated table row dispatches settings")
+        };
+        assert_eq!(
+            isolated_load,
+            SettingsCommand::LoadProfile {
+                target: target.to_string(),
+                profile: "isolated".to_owned(),
+            }
+        );
+        state.settings.execute(&context, isolated_load);
+        let SettingsView::Policy(isolated_form) = &state.settings.view else {
+            panic!("isolated form")
+        };
+        assert_eq!(isolated_form.policy_id, isolated_id);
+        assert!(matches!(
+            isolated_form.execution_policy,
+            ExecutionPolicy::Isolated { .. }
+        ));
+        state.settings.execution_cpu = 2100;
+        state
+            .settings
+            .execute(&context, SettingsCommand::SaveExecution);
+
+        let store = context.store().unwrap();
+        let native =
+            crate::cli::policy::find_policy_selected(&store, &target, Some("default")).unwrap();
+        let isolated =
+            crate::cli::policy::find_policy_selected(&store, &target, Some("isolated")).unwrap();
+        assert_eq!(native.id, native_id);
+        assert_eq!(native.max_capacity().map(NonZeroU16::get), Some(4));
+        assert!(native.execution_policy().is_native());
+        assert_eq!(isolated.id, isolated_id);
+        assert_eq!(isolated.max_capacity().map(NonZeroU16::get), Some(1));
+        assert!(matches!(
+            isolated.execution_policy(),
+            ExecutionPolicy::Isolated { resources, .. } if resources.cpu_millis == 2100
+        ));
+    }
+
+    #[test]
     fn production_settings_keyboard_and_mouse_paths_render_edit_copy_and_persist() {
         use std::num::NonZeroU16;
 

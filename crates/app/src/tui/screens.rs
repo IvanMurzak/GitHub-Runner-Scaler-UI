@@ -3038,6 +3038,16 @@ mod tests {
         assert_eq!(rendered.matches("acme/alpha").count(), 1, "{rendered}");
         assert!(rendered.contains("- native"), "{rendered}");
         assert!(rendered.contains("- py-isolated"), "{rendered}");
+        insta::assert_snapshot!(rendered, @r#"
+        Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
+        +--------------+-------------------+-------------+----------------+----------+------------+------------------------------------------+
+        | Repository   | Profile           | Workflows ^ | Mode           | Capacity | Agent      | Labels                                   |
+        +--------------+-------------------+-------------+----------------+----------+------------+------------------------------------------+
+        | acme/alpha   |     - py-isolated |           0 | [autoscale]    |        4 | OK healthy | rm-home-win-x64-py-isolated, self-hosted |
+        |              |     - native      |           9 | [autoscale]    |        4 | OK healthy | rm-home-win-x64, self-hosted             |
+        | acme/observe |     - default     |           2 | [monitor-only] |      n/a | ! degraded | not reserved                             |
+        +--------------+-------------------+-------------+----------------+----------+------------+------------------------------------------+
+        "#);
 
         model.apply(ScreenAction::Filter("py-isolated".into()));
         assert_eq!(

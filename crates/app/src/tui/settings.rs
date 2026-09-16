@@ -46,8 +46,8 @@ use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::execution::{Backend, ExecutionPolicy};
 use runner_manager_domain::model::{
-    Arch, CachePolicy, HostLabel, Os, ProfileName, RefreshInterval, ScaleTarget, StartMode,
-    TargetScope,
+    Arch, CachePolicy, HostLabel, Os, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
+    StartMode, TargetScope,
 };
 use runner_manager_domain::path::LocalAbsolutePath;
 #[cfg(test)]
@@ -280,6 +280,7 @@ pub struct HostIntervalPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySettings {
+    pub policy_id: PolicyId,
     pub target: ScaleTarget,
     pub profile_name: String,
     pub host_identity: String,
@@ -302,8 +303,9 @@ pub struct PolicySettings {
     pub cache_policy: CachePolicy,
     pub active_runners: u16,
     pub execution_policy: ExecutionPolicy,
-    /// Copy-safe capability diagnostics from the shared host-isolation handler.
-    pub provider_diagnostics: String,
+    /// Typed, presentation-safe capability diagnostics. Raw provider process
+    /// output is discarded before this read model is constructed.
+    pub provider_diagnostics: Vec<cli::host::IsolationCapability>,
     /// `d1`'s repository read model, unmodified: mode, effective root, the two
     /// refusal counts, and the slot leases — with no path inside a workspace
     /// and no directory listing anywhere.
@@ -363,9 +365,8 @@ impl PolicySettings {
             &cli::workspace::host_root(context.paths(), Some(&host)),
             &policy,
         )?;
-        let mut provider_output = Vec::new();
-        cli::host::isolation_status(false, &mut provider_output)?;
         Ok(Self {
+            policy_id: policy.id,
             target: policy.target.clone(),
             profile_name: policy.profile_name().to_string(),
             host_identity: host.display_name,
@@ -384,7 +385,7 @@ impl PolicySettings {
             cache_policy: policy.cache_policy,
             active_runners,
             execution_policy: policy.execution_policy().clone(),
-            provider_diagnostics: String::from_utf8_lossy(&provider_output).trim().to_owned(),
+            provider_diagnostics: cli::host::isolation_capabilities(),
             workspace,
         })
     }
@@ -2244,9 +2245,11 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let (state, remedy) = backend_capability(self.execution_backend);
+            let capability = backend_capability(self.execution_backend);
             lines.push(FormLine::keep(format!(
-                "Selected provider: {state}; remedy: {remedy}"
+                "Selected provider: {}; remedy: {}",
+                capability.state.display_name(),
+                capability.remedy.unwrap_or("none required")
             )));
         }
         if let Some(notice) = &self.execution_notice {
@@ -2254,7 +2257,16 @@ Select another profile in Repositories or create one with the CLI.",
         }
         lines.push(FormLine::keep("Save execution [Enter/click]").at(*control));
         *control += 1;
-        lines.extend(form.provider_diagnostics.lines().map(FormLine::text));
+        lines.extend(form.provider_diagnostics.iter().map(|provider| {
+            FormLine::text(format!(
+                "{} provider: {}",
+                provider.backend.display_name(),
+                provider.state.display_name()
+            ))
+        }));
+        lines.push(FormLine::text(
+            "Isolated scaling remains unavailable until a provider is installed and integrated.",
+        ));
         lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
         *control += 1;
         lines
@@ -2401,9 +2413,11 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let (state, remedy) = backend_capability(self.create_execution_backend);
+            let capability = backend_capability(self.create_execution_backend);
             lines.push(FormLine::keep(format!(
-                "Selected provider: {state}; remedy: {remedy}"
+                "Selected provider: {}; remedy: {}",
+                capability.state.display_name(),
+                capability.remedy.unwrap_or("none required")
             )));
         }
         if let Some(notice) = &self.create_notice {
@@ -2799,22 +2813,26 @@ const fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-const fn backend_capability(backend: BackendMode) -> (&'static str, &'static str) {
-    match backend {
-        BackendMode::Auto => (
-            "unavailable",
-            "install and configure an integrated isolation provider",
+fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
+    use cli::host::{IsolationBackend, IsolationObservation, IsolationReadiness};
+
+    let (backend, state) = match backend {
+        BackendMode::Auto => (IsolationBackend::Auto, IsolationReadiness::NotInstalled),
+        BackendMode::Oci => (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        BackendMode::WindowsHyperVContainer => (
+            IsolationBackend::WindowsHyperVContainer,
+            IsolationReadiness::Unsupported,
         ),
-        BackendMode::Oci => (
-            "not installed",
-            "install and configure an OCI execution provider",
-        ),
-        BackendMode::WindowsHyperVContainer => ("unsupported", "use a supported host and provider"),
         BackendMode::VirtualMachine => (
-            "not installed",
-            "install and configure a virtual machine execution provider",
+            IsolationBackend::VirtualMachine,
+            IsolationReadiness::NotInstalled,
         ),
-    }
+    };
+    cli::host::sanitize_isolation_observation(IsolationObservation {
+        backend,
+        state,
+        raw_output: None,
+    })
 }
 
 fn invalid(source: impl std::fmt::Display) -> CliError {
@@ -2845,15 +2863,22 @@ fn service_failure(source: ServiceError) -> CliError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::io::{BufRead as _, BufReader};
+    use std::net::{TcpListener, TcpStream};
     use std::num::NonZeroU16;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use runner_manager_domain::attempt::RunnerAttempt;
+    use runner_manager_domain::execution::{ImageReference, ResourceLimits};
     use runner_manager_domain::model::{
         Arch, AttemptId, Host, HostId, HostLabel, Label, Os, PolicyId,
     };
-    use runner_manager_domain::policy::{NamedProfileSpec, PolicyState, RoutingLabels};
+    use runner_manager_domain::policy::{PolicyState, RoutingLabels};
+    use runner_manager_github::Endpoints;
+    use secrecy::SecretString;
     use tempfile::TempDir;
 
     fn nz(value: u16) -> NonZeroU16 {
@@ -2899,108 +2924,153 @@ mod tests {
         (dir, context, target)
     }
 
-    #[test]
-    fn profile_create_select_edit_drain_and_remove_are_scoped_to_one_sibling() {
-        let (dir, context, target) = fixture(false);
-        let store = context.store().unwrap();
-        let default = cli::policy::find_policy_selected(&store, &target, Some("default")).unwrap();
-        let build = ScalePolicy::new_named(
-            PolicyId::from_u128(22),
-            target.clone(),
-            default.installation_id,
-            default.host_id,
-            NamedProfileSpec {
-                requested_host_label: HostLabel::new("home").unwrap(),
-                os: Os::Linux,
-                arch: Arch::X64,
-                profile_name: ProfileName::new("build").unwrap(),
-                min_capacity: 0,
-                max_capacity: nz(1),
-            },
-            CachePolicy::default(),
+    struct ProfileGithub {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ProfileGithub {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("http://{}/", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            std::thread::spawn(move || answer_profile_github(stream))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                }
+            });
+            Self {
+                base_url,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for ProfileGithub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn answer_profile_github(mut stream: TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let path = request.split_whitespace().nth(1).unwrap_or("/");
+        let body = if path.starts_with("/user/installations/7/repositories") {
+            r#"{"total_count":1,"repositories":[{"full_name":"octo/repo"}]}"#
+        } else if path.starts_with("/user/installations") {
+            r#"{"total_count":1,"installations":[{"id":7,"account":{"login":"octo","type":"Organization"},"repository_selection":"selected","permissions":{"administration":"write","actions":"read"}}]}"#
+        } else {
+            r#"{"message":"not found"}"#
+        };
+        let status = if path.starts_with("/user/installations") {
+            "200 OK"
+        } else {
+            "404 Not Found"
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         )
         .unwrap();
-        store.insert_policy(&build).unwrap();
-        drop(store);
+    }
 
+    fn authenticated_fixture() -> (TempDir, ProfileGithub, Context, ScaleTarget) {
+        let dir = TempDir::new().unwrap();
+        let github = ProfileGithub::start();
+        let endpoints = Endpoints::for_test_server(&github.base_url).unwrap();
+        let context = Context::rooted_against(dir.path(), endpoints).unwrap();
+        let store = context.store().unwrap();
+        let host = Host::new(
+            HostId::from_u128(1),
+            "local-home",
+            Os::Linux,
+            Arch::X64,
+            nz(4),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        store.put_host(&host).unwrap();
+        let target = ScaleTarget::repository("octo/repo").unwrap();
+        let policy = ScalePolicy::new_for_host_label(
+            PolicyId::from_u128(2),
+            target.clone(),
+            7,
+            host.id,
+            HostLabel::new("home").unwrap(),
+            PolicyMode::autoscale(
+                RoutingLabels::derive(&HostLabel::new("home").unwrap(), Os::Linux, Arch::X64),
+                0,
+                nz(2),
+            )
+            .unwrap(),
+            CachePolicy::default(),
+        );
+        store.insert_policy(&policy).unwrap();
+        let mode = context.recorded_start_mode(&store).unwrap();
+        drop(store);
+        context
+            .secret_store(mode)
+            .unwrap()
+            .store(&SecretString::from("ghu_profile_fixture_token"))
+            .unwrap();
+        (dir, github, context, target)
+    }
+
+    #[test]
+    fn settings_command_creates_drains_and_removes_one_profile() {
+        let (_dir, _github, context, target) = authenticated_fixture();
         let mut ui = SettingsUi::default();
         ui.execute(
             &context,
             SettingsCommand::LoadProfile {
                 target: target.to_string(),
-                profile: "BUILD".into(),
+                profile: "default".into(),
             },
         );
+        ui.profile_create_open = true;
+        ui.create_name.reset_to("build");
+        ui.create_capacity = 3;
+        ui.execute(&context, SettingsCommand::CreateProfile);
         let SettingsView::Policy(form) = &ui.view else {
-            panic!("selected profile must load")
+            panic!("created profile must load")
         };
-        assert_eq!(form.profile_name, "build");
-        assert_eq!(
-            form.copyable_runs_on.as_deref(),
-            Some("rm-home-linux-x64-build")
-        );
+        assert_eq!(form.profile_name, "build", "{:?}", ui.message);
+        assert_eq!(form.current_max_capacity, Some(3));
+        assert_ne!(form.policy_id, PolicyId::from_u128(2));
 
-        ui.policy_draft.max_capacity = Some(3);
-        ui.execute(&context, SettingsCommand::ApplyPolicy);
-        ui.policy_labels.reset_to("gpu, trusted");
-        ui.execute(&context, SettingsCommand::SaveLabels);
-        let workspace = dir.path().join("build-workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        ui.workspace_mode = WorkspaceKind::Persistent;
-        ui.workspace_path.reset_to(workspace.to_str().unwrap());
-        ui.execute(&context, SettingsCommand::SaveWorkspace);
-
-        let store = context.store().unwrap();
-        let default = cli::policy::find_policy_selected(&store, &target, Some("default")).unwrap();
-        let build = cli::policy::find_policy_selected(&store, &target, Some("BUILD")).unwrap();
-        assert_eq!(default.max_capacity().map(NonZeroU16::get), Some(2));
-        assert!(
-            default
-                .routing_labels()
-                .unwrap()
-                .additional()
-                .next()
-                .is_none()
-        );
-        assert_eq!(default.workspace_policy().kind(), WorkspaceKind::Ephemeral);
-        assert_eq!(build.max_capacity().map(NonZeroU16::get), Some(3));
-        assert_eq!(
-            build
-                .routing_labels()
-                .unwrap()
-                .additional()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["gpu", "trusted"]
-        );
-        assert_eq!(build.workspace_policy().kind(), WorkspaceKind::Persistent);
-        drop(store);
-
-        // Isolated execution requires an ephemeral workspace and stays disabled
-        // while the shared capability handler reports no integrated provider.
-        ui.workspace_mode = WorkspaceKind::Ephemeral;
-        ui.execute(&context, SettingsCommand::SaveWorkspace);
-        ui.execution_mode = ExecutionMode::Isolated;
-        ui.execution_backend = BackendMode::Oci;
-        ui.execution_image
-            .reset_to(&format!("sha256:{}", "0".repeat(64)));
-        ui.execute(&context, SettingsCommand::SaveExecution);
         ui.policy_draft.enabled = Some(true);
         ui.execute(&context, SettingsCommand::ApplyPolicy);
         assert!(
-            ui.message
-                .as_deref()
-                .unwrap()
-                .contains("no integrated provider is ready")
-        );
-        let build =
             cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("build"))
-                .unwrap();
-        assert!(matches!(
-            build.execution_policy(),
-            ExecutionPolicy::Isolated { .. }
-        ));
-        assert!(!build.enabled());
+                .unwrap()
+                .enabled()
+        );
+
+        ui.execute(&context, SettingsCommand::DrainProfile);
+        assert!(
+            !cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("build"))
+                .unwrap()
+                .enabled()
+        );
 
         ui.execute(&context, SettingsCommand::RemoveProfile);
         assert!(ui.awaiting_remove_confirmation);
@@ -3011,46 +3081,285 @@ mod tests {
     }
 
     #[test]
-    fn isolated_profile_controls_remain_keyboard_mouse_and_compact_width_reachable() {
+    fn every_profile_and_isolation_control_has_keyboard_mouse_focus_and_compact_reachability() {
         let (_dir, context, target) = fixture(false);
-        let mut ui = SettingsUi::default();
-        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
-        ui.execution_mode = ExecutionMode::Isolated;
-        ui.profile_create_open = true;
-        ui.create_execution_mode = ExecutionMode::Isolated;
-        let controls = ui.controls();
-        for (focus, control) in controls.iter().copied().enumerate() {
-            ui.focus = focus;
-            let normal = ui.control_rows(100, false);
+        let isolated_ui = || {
+            let mut ui = SettingsUi::default();
+            ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+            ui.execution_mode = ExecutionMode::Isolated;
+            ui.profile_create_open = true;
+            ui.create_execution_mode = ExecutionMode::Isolated;
+            ui
+        };
+        let new_controls = [
+            Control::PolicyLabels,
+            Control::PolicyLabelsSave,
+            Control::PolicyExecutionMode,
+            Control::PolicyExecutionBackend,
+            Control::PolicyExecutionImage,
+            Control::PolicyExecutionCpu,
+            Control::PolicyExecutionMemory,
+            Control::PolicyExecutionDisk,
+            Control::PolicyExecutionSave,
+            Control::PolicyDrain,
+            Control::PolicyRemove,
+            Control::PolicyAddProfile,
+            Control::ProfileName,
+            Control::ProfileCapacity,
+            Control::ProfileExecutionMode,
+            Control::ProfileExecutionBackend,
+            Control::ProfileExecutionImage,
+            Control::ProfileExecutionCpu,
+            Control::ProfileExecutionMemory,
+            Control::ProfileExecutionDisk,
+            Control::ProfileCreate,
+            Control::ProfileCreateCancel,
+        ];
+        for control in new_controls {
+            let mut keyboard = isolated_ui();
+            if control == Control::PolicyAddProfile {
+                keyboard.profile_create_open = false;
+            }
+            focus_by_keyboard(&mut keyboard, control);
+            assert_eq!(keyboard.focused(), Some(control));
+            let focus = keyboard.focus;
+            let normal = keyboard.control_rows(100, false);
             assert!(
                 normal.contains(&Some(focus)),
                 "{control:?} has no normal-width row"
             );
-            let compact = ui.control_rows(42, true);
+            let compact = keyboard.control_rows(42, true);
             assert!(
                 compact.contains(&Some(focus)),
                 "{control:?} has no compact row"
             );
+            let keyboard_result = if control.is_adjustable() {
+                keyboard.key(KeyCode::Right)
+            } else {
+                keyboard.key(KeyCode::Enter)
+            };
+            assert_control_activated(&keyboard, control, keyboard_result.as_ref());
+
+            let mut mouse = isolated_ui();
+            if control == Control::PolicyAddProfile {
+                mouse.profile_create_open = false;
+            }
+            let mouse_focus = mouse
+                .controls()
+                .iter()
+                .position(|item| *item == control)
+                .unwrap();
+            let row = mouse
+                .control_rows(100, false)
+                .iter()
+                .position(|mapped| *mapped == Some(mouse_focus))
+                .unwrap();
+            let mouse_result = mouse.click(row as u16, 100, false);
+            assert_eq!(
+                mouse.focused(),
+                Some(if control == Control::PolicyAddProfile {
+                    Control::ProfileName
+                } else if control == Control::ProfileCreateCancel {
+                    Control::PolicyAddProfile
+                } else {
+                    control
+                })
+            );
+            assert_control_activated(&mouse, control, mouse_result.as_ref());
         }
-        let image = controls
+    }
+
+    fn assert_control_activated(
+        ui: &SettingsUi,
+        control: Control,
+        command: Option<&SettingsCommand>,
+    ) {
+        match control {
+            Control::PolicyLabels => assert!(ui.policy_labels.is_editing()),
+            Control::PolicyLabelsSave => assert_eq!(command, Some(&SettingsCommand::SaveLabels)),
+            Control::PolicyExecutionMode => assert_eq!(ui.execution_mode, ExecutionMode::Native),
+            Control::PolicyExecutionBackend => assert_ne!(ui.execution_backend, BackendMode::Auto),
+            Control::PolicyExecutionImage => assert!(ui.execution_image.is_editing()),
+            Control::PolicyExecutionCpu => assert_eq!(ui.execution_cpu, 1100),
+            Control::PolicyExecutionMemory => assert_eq!(ui.execution_memory, 1280),
+            Control::PolicyExecutionDisk => assert_eq!(ui.execution_disk, 5120),
+            Control::PolicyExecutionSave => {
+                assert_eq!(command, Some(&SettingsCommand::SaveExecution))
+            }
+            Control::PolicyDrain => assert_eq!(command, Some(&SettingsCommand::DrainProfile)),
+            Control::PolicyRemove => assert_eq!(command, Some(&SettingsCommand::RemoveProfile)),
+            Control::PolicyAddProfile => assert!(ui.profile_create_open),
+            Control::ProfileName => assert!(ui.create_name.is_editing()),
+            Control::ProfileCapacity => assert_eq!(ui.create_capacity, 2),
+            Control::ProfileExecutionMode => {
+                assert_eq!(ui.create_execution_mode, ExecutionMode::Native)
+            }
+            Control::ProfileExecutionBackend => {
+                assert_ne!(ui.create_execution_backend, BackendMode::Auto)
+            }
+            Control::ProfileExecutionImage => assert!(ui.create_execution_image.is_editing()),
+            Control::ProfileExecutionCpu => assert_eq!(ui.create_execution_cpu, 1100),
+            Control::ProfileExecutionMemory => assert_eq!(ui.create_execution_memory, 1280),
+            Control::ProfileExecutionDisk => assert_eq!(ui.create_execution_disk, 5120),
+            Control::ProfileCreate => assert_eq!(command, Some(&SettingsCommand::CreateProfile)),
+            Control::ProfileCreateCancel => assert!(!ui.profile_create_open),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn complete_selector_copy_includes_sorted_extra_labels() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.policy_labels.reset_to("trusted, gpu");
+        ui.execute(&context, SettingsCommand::SaveLabels);
+
+        let SettingsView::Policy(form) = &ui.view else {
+            panic!("policy remains loaded")
+        };
+        assert_eq!(
+            form.copyable_runs_on.as_deref(),
+            Some("rm-home-linux-x64, gpu, trusted")
+        );
+        focus_by_keyboard(&mut ui, Control::PolicyLabels);
+        assert_eq!(
+            ui.copy_text().as_deref(),
+            Some("rm-home-linux-x64, gpu, trusted")
+        );
+        let copy_row = ui
+            .rows(100, false)
             .iter()
-            .position(|control| *control == Control::PolicyExecutionImage)
+            .position(|row| row.copy.as_deref() == Some("rm-home-linux-x64, gpu, trusted"))
             .unwrap();
-        ui.focus = image;
-        assert_eq!(ui.key(KeyCode::Enter), None);
-        assert!(ui.execution_image.is_editing());
-        let _ = ui.key(KeyCode::Esc);
-        let create = controls
+        assert_eq!(
+            ui.click(copy_row as u16, 100, false),
+            Some(SettingsCommand::Copy(
+                "rm-home-linux-x64, gpu, trusted".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn execution_save_rejects_invalid_image_and_resources_without_persistence() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.execution_mode = ExecutionMode::Isolated;
+        ui.execution_backend = BackendMode::Oci;
+        ui.execution_image
+            .reset_to("registry.example/runner:latest");
+        ui.execute(&context, SettingsCommand::SaveExecution);
+        assert!(ui.message.as_deref().unwrap().contains("pinned"));
+        assert!(
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap()
+                .execution_policy()
+                .is_native()
+        );
+
+        ui.execution_image.reset_to(&format!(
+            "registry.example/runner@sha256:{}",
+            "a".repeat(64)
+        ));
+        ui.execution_cpu = 99;
+        ui.execute(&context, SettingsCommand::SaveExecution);
+        assert!(
+            ui.message
+                .as_deref()
+                .unwrap()
+                .contains("below the required floor")
+        );
+        assert!(
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap()
+                .execution_policy()
+                .is_native()
+        );
+
+        ui.execution_backend = BackendMode::WindowsHyperVContainer;
+        let rendered = rows_text(&ui, 100, false);
+        assert!(
+            rendered.contains("Selected provider: unsupported"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("remedy: use a supported host and provider"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn execution_save_persists_custom_backend_image_and_resources() {
+        let (_dir, context, target) = fixture(false);
+        let image = format!("registry.example/runner@sha256:{}", "b".repeat(64));
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        ui.execution_mode = ExecutionMode::Isolated;
+        ui.execution_backend = BackendMode::Oci;
+        ui.execution_image.reset_to(&image);
+        ui.execution_cpu = 2300;
+        ui.execution_memory = 3328;
+        ui.execution_disk = 12288;
+        ui.execute(&context, SettingsCommand::SaveExecution);
+
+        let stored =
+            cli::policy::find_policy_selected(&context.store().unwrap(), &target, Some("default"))
+                .unwrap();
+        assert_eq!(
+            stored.execution_policy(),
+            &ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: ImageReference::new(image).unwrap(),
+                resources: ResourceLimits {
+                    cpu_millis: 2300,
+                    memory_mib: 3328,
+                    disk_mib: 12288,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn provider_raw_output_is_discarded_before_render_and_copy_surfaces() {
+        use cli::host::{
+            IsolationBackend, IsolationObservation, IsolationReadiness,
+            sanitize_isolation_observation,
+        };
+
+        let sentinel = format!("{}{}", "ghu_", "raw_provider_secret_never_rendered");
+        let capability = sanitize_isolation_observation(IsolationObservation {
+            backend: IsolationBackend::WindowsHyperVContainer,
+            state: IsolationReadiness::Unsupported,
+            raw_output: Some(&sentinel),
+        });
+        assert_eq!(capability.state, IsolationReadiness::Unsupported);
+        assert_eq!(capability.remedy, Some("use a supported host and provider"));
+
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+        let SettingsView::Policy(form) = &mut ui.view else {
+            panic!("policy loaded")
+        };
+        form.provider_diagnostics = vec![capability];
+        let rows = ui.rows(100, false);
+        let rendered = rows
             .iter()
-            .position(|control| *control == Control::ProfileCreate)
-            .unwrap();
-        let row = ui
-            .control_rows(100, false)
-            .iter()
-            .position(|mapped| *mapped == Some(create))
-            .unwrap();
-        let _ = ui.click(row as u16, 100, false);
-        assert_eq!(ui.focus, create);
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Hyper-V container provider: unsupported"));
+        assert!(!rendered.contains(&sentinel));
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.copy.as_deref())
+                .all(|copy| !copy.contains(&sentinel))
+        );
+        for control in ui.controls() {
+            focus_by_keyboard(&mut ui, control);
+            assert!(ui.copy_text().is_none_or(|copy| !copy.contains(&sentinel)));
+        }
     }
 
     #[test]
@@ -5012,6 +5321,160 @@ mod tests {
 
         Add sibling profile [Enter/click]
         Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
+        --- repository/isolated ---
+        Target: octo/repo
+        Profile: default
+        Mode: Autoscale
+        Local host: local-home
+        Current max_capacity: 2
+        runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Cache policy: RetainRunnerPackage  [toggle]
+        Preview: no runner is terminated immediately.
+        Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <56:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported host and provider
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Slot leases: none
+        Affected attempts: 0 active, 0 awaiting cleanup
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
+        Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
+        --- repository/create-isolated ---
+        Target: octo/repo
+        Profile: default
+        Mode: Autoscale
+        Local host: local-home
+        Current max_capacity: 2
+        runs-on: rm-home-linux-x64  [click to copy]
+        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
+        start no runner.
+        warning: fork and untrusted pull-request workflows must not run on a personal host until you
+        explicitly accept that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Cache policy: RetainRunnerPackage  [toggle]
+        Preview: no runner is terminated immediately.
+        Confirm policy [Enter/click]
+
+        Host label: rm-home-linux-x64  (fixed: it is this machine's routing identity)
+        Extra labels: (none - this policy answers its host label only)  [Enter to edit]
+        Comma-separated. Saving makes the stored set equal this line.
+        Save labels [Enter/click]
+
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <56:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported host and provider
+        Save execution [Enter/click]
+        Native provider: ready
+        OCI provider: not installed
+        Hyper-V container provider: unsupported
+        Virtual machine provider: not installed
+        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Slot leases: none
+        Affected attempts: 0 active, 0 awaiting cleanup
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+
+        Add sibling profile [Enter/click]
+        New profile name: gpu-build  [Enter to edit]
+        Selector preview: rm-home-linux-x64-gpu-build
+        Capacity: 3  [-/+]
+        Execution mode: isolated  [toggle]
+        Backend: oci  [cycle]
+        Pinned image: <56:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  [Enter to edit]
+        CPU: 4000m  [-/+]
+        Memory: 8192MiB  [-/+]
+        Disk: 20480MiB  [-/+]
+        Selected provider: not installed; remedy: install and configure an OCI execution provider
+        Create profile [Enter/click]
+        Cancel profile creation [Enter/click]
+        Focused form actions: 4/5 scaling, 2/5 labels, 2/5 workspace
+        --- repository/create-isolated-compact ---
+        Target: octo/repo
+        Profile: default
+        Static runs-on required: matrix expressions are not
+        resolved; missing or multiple profile selectors start no
+        runner.
+        warning: fork and untrusted pull-request workflows must
+        not run on a personal host until you explicitly accept
+        that trust boundary.
+        Scaling enabled: false  [toggle]
+        max_capacity: 2  [-/+; setting promotes monitor-only]
+        Confirm policy [Enter/click]
+        Host label: rm-home-linux-x64  (fixed: it is this
+        machine's routing identity)
+        Extra labels: (none - this policy answers its host label
+        only)  [Enter to edit]
+        Save labels [Enter/click]
+        Execution: native
+        Execution mode: isolated  [toggle]
+        Backend: windows-hyper-v-container  [cycle]
+        Pinned image: <ddddddddddddddddddddddd  [Enter to edit]
+        CPU: 2200m  [-/+]
+        Memory: 3072MiB  [-/+]
+        Disk: 10240MiB  [-/+]
+        Selected provider: unsupported; remedy: use a supported
+        host and provider
+        Save execution [Enter/click]
+        Drain selected profile [Enter/click]
+        Remove selected profile [Enter twice/click twice]
+        Workspace: ephemeral  (platform-default)
+        Workspace root: <DEFAULT>
+        Workspace mode: ephemeral  [toggle]
+        Save workspace [Enter/click]
+        Add sibling profile [Enter/click]
+        New profile name: gpu-build  [Enter to edit]
+        Selector preview: rm-home-linux-x64-gpu-build
+        Capacity: 3  [-/+]
+        Execution mode: isolated  [toggle]
+        Backend: oci  [cycle]
+        Pinned image: <eeeeeeeeeeeeeeeeeeeeeee  [Enter to edit]
+        CPU: 4000m  [-/+]
+        Memory: 8192MiB  [-/+]
+        Disk: 20480MiB  [-/+]
+        Selected provider: not installed; remedy: install and
+        configure an OCI execution provider
+        Create profile [Enter/click]
         --- repository/persistent-warning ---
         Target: octo/repo
         Profile: default
@@ -5183,6 +5646,42 @@ mod tests {
         sections.push((
             "repository/ephemeral",
             stable_rows(&repository.policy_screen(), 100, false, &repository),
+        ));
+
+        let mut isolated = repository.policy_screen();
+        isolated.execution_mode = ExecutionMode::Isolated;
+        isolated.execution_backend = BackendMode::WindowsHyperVContainer;
+        isolated.execution_image.reset_to(&format!(
+            "registry.example/runner@sha256:{}",
+            "d".repeat(64)
+        ));
+        isolated.execution_cpu = 2200;
+        isolated.execution_memory = 3072;
+        isolated.execution_disk = 10240;
+        sections.push((
+            "repository/isolated",
+            stable_rows(&isolated, 100, false, &repository),
+        ));
+
+        isolated.profile_create_open = true;
+        isolated.create_name.reset_to("gpu-build");
+        isolated.create_capacity = 3;
+        isolated.create_execution_mode = ExecutionMode::Isolated;
+        isolated.create_execution_backend = BackendMode::Oci;
+        isolated.create_execution_image.reset_to(&format!(
+            "registry.example/gpu-runner@sha256:{}",
+            "e".repeat(64)
+        ));
+        isolated.create_execution_cpu = 4000;
+        isolated.create_execution_memory = 8192;
+        isolated.create_execution_disk = 20480;
+        sections.push((
+            "repository/create-isolated",
+            stable_rows(&isolated, 100, false, &repository),
+        ));
+        sections.push((
+            "repository/create-isolated-compact",
+            stable_rows(&isolated, 56, true, &repository),
         ));
 
         let mut ui = repository.policy_screen();

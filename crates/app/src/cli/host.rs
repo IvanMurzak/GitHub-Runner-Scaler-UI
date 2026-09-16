@@ -86,6 +86,7 @@ use runner_manager_github::rest::{
     BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
 };
 use runner_manager_platform::runner_root::RootOwner;
+use serde::Serialize;
 
 use super::workspace;
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, Styling, write_failed};
@@ -428,18 +429,125 @@ pub fn dispatch(
     }
 }
 
-pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationBackend {
+    Auto,
+    Native,
+    Oci,
+    WindowsHyperVContainer,
+    VirtualMachine,
+}
+
+impl IsolationBackend {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Native => "Native",
+            Self::Oci => "OCI",
+            Self::WindowsHyperVContainer => "Hyper-V container",
+            Self::VirtualMachine => "Virtual machine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationReadiness {
+    Ready,
+    NotInstalled,
+    Unsupported,
+}
+
+impl IsolationReadiness {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotInstalled => "not installed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// A presentation-safe provider capability. Provider process output is never
+/// stored here, so TUI and JSON consumers can render only the typed state and
+/// the product-owned remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct IsolationCapability {
+    pub backend: IsolationBackend,
+    pub state: IsolationReadiness,
+    pub remedy: Option<&'static str>,
+}
+
+/// Untrusted probe input. `raw_output` exists only at the conversion boundary
+/// and is intentionally discarded by [`sanitize_isolation_observation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IsolationObservation<'a> {
+    pub backend: IsolationBackend,
+    pub state: IsolationReadiness,
+    pub raw_output: Option<&'a str>,
+}
+
+#[must_use]
+pub(crate) const fn sanitize_isolation_observation(
+    observation: IsolationObservation<'_>,
+) -> IsolationCapability {
+    let _ = observation.raw_output;
+    let remedy = match (observation.backend, observation.state) {
+        (_, IsolationReadiness::Ready) => None,
+        (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => {
+            Some("install and configure an OCI execution provider")
+        }
+        (IsolationBackend::WindowsHyperVContainer, IsolationReadiness::Unsupported) => {
+            Some("use a supported host and provider")
+        }
+        (IsolationBackend::VirtualMachine, IsolationReadiness::NotInstalled) => {
+            Some("install and configure a virtual machine execution provider")
+        }
+        _ => Some("install and configure an integrated isolation provider"),
+    };
+    IsolationCapability {
+        backend: observation.backend,
+        state: observation.state,
+        remedy,
+    }
+}
+
+#[must_use]
+pub fn isolation_capabilities() -> Vec<IsolationCapability> {
     // The currently shipped provider executes native processes only. These
     // states are deliberately closed: an isolated profile cannot be armed on
     // the strength of a runtime that the agent has not integrated.
+    [
+        (IsolationBackend::Native, IsolationReadiness::Ready),
+        (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        (
+            IsolationBackend::WindowsHyperVContainer,
+            IsolationReadiness::Unsupported,
+        ),
+        (
+            IsolationBackend::VirtualMachine,
+            IsolationReadiness::NotInstalled,
+        ),
+    ]
+    .into_iter()
+    .map(|(backend, state)| {
+        sanitize_isolation_observation(IsolationObservation {
+            backend,
+            state,
+            raw_output: None,
+        })
+    })
+    .collect()
+}
+
+pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+    let providers = isolation_capabilities();
     let document = serde_json::json!({
         "schema_version": 1,
-        "providers": [
-            {"backend": "native", "state": "ready", "remedy": null},
-            {"backend": "oci", "state": "not_installed", "remedy": "install and configure an OCI execution provider"},
-            {"backend": "windows_hyper_v_container", "state": "unsupported", "remedy": "use a supported host and provider"},
-            {"backend": "virtual_machine", "state": "not_installed", "remedy": "install and configure a virtual machine execution provider"}
-        ]
+        "providers": providers,
     });
     if json {
         writeln!(
@@ -450,8 +558,20 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
         )
         .map_err(write_failed("this provider status"))?;
     } else {
-        writeln!(out, "Native provider: ready\nOCI provider: not installed\nHyper-V container provider: unsupported\nVirtual machine provider: not installed\nIsolated scaling remains unavailable until a provider is installed and integrated.")
+        for provider in providers {
+            writeln!(
+                out,
+                "{} provider: {}",
+                provider.backend.display_name(),
+                provider.state.display_name()
+            )
             .map_err(write_failed("this provider status"))?;
+        }
+        writeln!(
+            out,
+            "Isolated scaling remains unavailable until a provider is installed and integrated."
+        )
+        .map_err(write_failed("this provider status"))?;
     }
     Ok(())
 }
