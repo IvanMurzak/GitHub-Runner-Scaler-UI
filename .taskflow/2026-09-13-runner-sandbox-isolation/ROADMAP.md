@@ -3,8 +3,8 @@
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
 **Implementation status:** a1, a2, b1, b2, c1 and c2 merged into the
-integration ref; d1 is held at a green PR for native acceptance, d2 is
-dispatched, and d3 is ready.
+integration ref; d1 and d2 are held at green PRs for native acceptance, and d3
+is ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -55,7 +55,7 @@ This file is the only live task-state record.
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🔵 | worktree-d2-windows-hyperv / `implement-task` | 2026-09-16 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / native Windows client+Server gates pending | 2026-09-16 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
@@ -205,3 +205,18 @@ at head a75fd37. PR #76 was squash-merged into
 provisioned from the verified remote integration ref, with its branch-scoped
 PR base read back as `runner-sandbox-isolation`. Its native Codex
 `implement-task` session loop will run in the isolated checkout.
+
+**2026-09-16 — main update integrated.** The requested important `main`
+update at fa040e4 was merged into `runner-sandbox-isolation` at a63c5b3 and
+pushed. Held PR #74 was synchronized at 8ae7b6c; its full local gate and seven
+CI/E2E checks passed without changing the pending native OCI gates.
+
+**2026-09-16 — d2 PR held for native acceptance.** `implement-task` opened
+PR #77. Scheduler review found the locked process-count control absent.
+Official Windows container controls expose CPU, memory and storage but no HCS
+process-count control, so head 537fa66 now refuses the provider before image
+resolution or JIT with a typed `ProcessLimitUnsupported` diagnostic and marks
+it preview-only. The exact full local gate and seven CI/E2E checks passed.
+A real Hyper-V-isolated runner job, restart/recovery/forensic tests, and client
+plus Server native matrix remain unverified, so PR #77 stays open and d2 stays
+`🟣`.
