@@ -1651,6 +1651,7 @@ mod tests {
     use runner_manager_domain::attempt::RunnerAttempt;
     use runner_manager_domain::model::PolicyId;
     use runner_manager_domain::store::SqliteStore;
+    use runner_manager_github::RenewalError;
     use runner_manager_github::jit::JitRegistration;
     use runner_manager_github::rest::RefreshState;
     use runner_manager_testkit::clock::FakeClock;
@@ -1669,7 +1670,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CredentialRenewal for CountingRenewal {
-        async fn renew(&self, _refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+        async fn renew(
+            &self,
+            _refresh_token: &SecretString,
+        ) -> Result<UserAccessToken, RenewalError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(UserAccessToken::from_stored(SecretString::from(
                 serde_json::json!({

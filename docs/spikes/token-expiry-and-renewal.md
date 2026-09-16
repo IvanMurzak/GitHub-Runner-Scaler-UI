@@ -180,6 +180,41 @@ whole trap: renewal takes the store away from the operator, and then the repair
 refuses. **Fixing this one is what makes every other store-access failure
 recoverable**, on both platforms, including ones not yet found.
 
+### A reader that cannot write spent the refresh token
+
+Fixed in 0.4.25. Watched on a boot-mode macOS host on 2026-09-16, seven and a
+half hours after a `sudo auth login` at about `02:14Z`.
+
+The service runs as root and the credential lives in the System keychain. A
+TUI left open overnight ran as the operator. It could *read* the item, which is
+granted to every application, so it held the same pair as the service and ran
+the same 30-minute renewal check. At `09:45:29Z` it reached the window first,
+exchanged the refresh token, and tried to store the replacement. The unified
+log for that PID:
+
+```text
+SecItemDelete
+create /Library/Keychains/System.keychain.sb-...: Permission denied
+CSSMERR_DL_OS_ACCESS_DENIED
+```
+
+The new pair died with the TUI's failed write, and GitHub had already retired
+the old one. Forty seconds later the service's next poll got a `401`, reloaded
+the unchanged store, and tried to renew with a spent refresh token. It stayed
+unauthorized until the next `auth login`. The cross-process renewal lock did
+its job: it made the two processes take turns, but nothing stopped one that
+could not store the result from taking a turn.
+
+`StoringRenewal` now asks the store `ensure_writable` after re-reading under
+the lock and before the exchange. A process that cannot write returns
+`RenewalError::Declined`, logged at `DEBUG`, and adopts whatever the service
+stores through its credential source.
+
+The service log only said `the user access token could not be renewed`, with
+the error redacted, and it did not show which process renewed. The unified log
+did: `log show --predicate 'process == "runner-manager"'` around the first
+failure, then look for a PID other than the service's that writes the keychain.
+
 ## Two readings that were trusted and should not have been
 
 **`auth status` cannot tell expiry from revocation.** GitHub answers `401` for

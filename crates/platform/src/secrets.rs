@@ -498,6 +498,25 @@ pub trait SecretStore: fmt::Debug + Send + Sync {
     /// [`SecretStoreError::Store`].
     fn store(&self, secret: &SecretString) -> Result<(), SecretStoreError>;
 
+    /// Refuses when [`SecretStore::store`] would, without writing anything.
+    ///
+    /// For a caller about to do something that only a successful write makes
+    /// safe. Renewal is that caller: GitHub retires a refresh token the moment
+    /// it is exchanged, so a process that exchanges it and then cannot store
+    /// the replacement has destroyed the credential for every process sharing
+    /// this store. On a boot-mode host that is any TUI or CLI command started
+    /// without the privilege the machine-scoped store needs to be written,
+    /// even though it can read it.
+    ///
+    /// A permission check, not a promise: a write can still fail for reasons
+    /// no check can foresee. It answers the question that is stable across a
+    /// process's lifetime -- whether *this* account may write here at all.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretStoreError::Store`], carrying why a write would be refused.
+    fn ensure_writable(&self) -> Result<(), SecretStoreError>;
+
     /// Reads the value back, or reports that there is none.
     ///
     /// `Ok(None)` is absence and is not an error; see [`SecretStoreError`].
@@ -698,6 +717,14 @@ impl SecretStore for PlatformSecretStore {
         Ok(())
     }
 
+    fn ensure_writable(&self) -> Result<(), SecretStoreError> {
+        sys::ensure_writable(&self.site).map_err(|source| SecretStoreError::Store {
+            scope: self.scope,
+            location: self.location(),
+            source,
+        })
+    }
+
     fn load(&self) -> Result<Option<SecretString>, SecretStoreError> {
         let bytes = sys::load(&self.site, self.scope).map_err(|source| {
             // A backend reports "there is something here and it is not ours"
@@ -800,7 +827,7 @@ pub const CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
 // Platform implementations
 // ---------------------------------------------------------------------------
 //
-// Each `sys` module offers the same eight items, and the shared code above is
+// Each `sys` module offers the same nine items, and the shared code above is
 // the only caller:
 //
 //   Site                        -- where one store keeps its value
@@ -810,6 +837,8 @@ pub const CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
 //   guard(&Site)                -> the object whose access control decides
 //                                  who can read the value
 //   store(&Site, scope, bytes)  -> write, replacing whatever was there
+//   ensure_writable(&Site)      -> refuse when `store` would be refused by
+//                                  permissions, without writing anything
 //   load(&Site, scope)          -> Ok(None) when nothing is stored;
 //                                  ErrorKind::InvalidData when something is
 //                                  stored and it is not ours
@@ -924,6 +953,52 @@ fn trim_trailing_ascii_whitespace(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.pop();
     }
     bytes
+}
+
+/// Refuses when this process may not create entries in the directory a write
+/// to `target` replaces it from.
+///
+/// Both Unix backends write by creating a new file beside the old one and
+/// renaming it over. The Linux store does that itself; a keychain does it
+/// inside Security.framework, in this process -- `create
+/// /Library/Keychains/System.keychain.sb-...: Permission denied` is what an
+/// unprivileged TUI logged there. So the right to create entries in that
+/// directory is exactly the permission a write turns on.
+///
+/// The nearest directory that exists is the one asked, because `store` creates
+/// any that are missing. `AT_EACCESS` asks with the effective IDs, which are
+/// the ones the write itself would use, so a command run under `sudo` passes.
+#[cfg(unix)]
+fn ensure_directory_writable(target: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(directory) = target.ancestors().skip(1).find(|path| path.is_dir()) else {
+        return Ok(());
+    };
+    let c_path =
+        std::ffi::CString::new(directory.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call, and
+    // `faccessat` only reads it.
+    let status = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    Err(std::io::Error::new(
+        error.kind(),
+        format!(
+            "this account may not create files in {} ({error}), so the store would refuse the \
+             write",
+            directory.display()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,6 +1523,13 @@ mod sys {
             // inventing a diagnosis from an unrelated errno.
             Err(_) => None,
         }
+    }
+
+    pub(super) fn ensure_writable(site: &Site) -> io::Result<()> {
+        if let Some(refusal) = cannot_replace(site) {
+            return Err(refusal);
+        }
+        Ok(())
     }
 
     pub(super) fn store(site: &Site, scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
@@ -2268,6 +2350,14 @@ mod sys {
         std::fs::set_permissions(&site.path, std::fs::Permissions::from_mode(0o600))
     }
 
+    /// The keychain database is rewritten beside itself, in this process, so
+    /// its directory is what a write needs. Root's alone for the System
+    /// keychain -- which every local account can nevertheless *read* an item
+    /// from, once it is granted to every application.
+    pub(super) fn ensure_writable(site: &Site) -> io::Result<()> {
+        super::ensure_directory_writable(&site.path)
+    }
+
     pub(super) fn store(site: &Site, _scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
         let _no_ui = without_user_interaction();
         let keychain = open(site, true)?.ok_or_else(|| {
@@ -2910,6 +3000,16 @@ mod sys {
              it -- `systemd-creds` and `LoadCredentialEncrypted=` -- and restart the service.",
             site.file.display()
         )))
+    }
+
+    pub(super) fn ensure_writable(site: &Site) -> io::Result<()> {
+        if let Some(error) = shadowed_by_credential(
+            site,
+            "A token written here would be shadowed by it on the very next load.",
+        ) {
+            return Err(error);
+        }
+        super::ensure_directory_writable(&site.file)
     }
 
     pub(super) fn store(site: &Site, _scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
@@ -4551,6 +4651,53 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777
+        }
+
+        /// Asked before anything irreversible, so it has to agree with what a
+        /// write would meet -- in both directions.
+        #[test]
+        fn ensure_writable_refuses_exactly_when_the_store_directory_is_not_writable() {
+            // SAFETY: `geteuid` reads this process's own credentials, takes no
+            // pointer, and cannot fail.
+            if unsafe { libc::geteuid() } == 0 {
+                // Modes refuse nobody running as root, so the refusal half
+                // cannot be staged here.
+                return;
+            }
+            for scope in [SecretScope::Machine, SecretScope::User] {
+                let root = TempDir::new().expect("a temporary directory");
+                let store = rooted(scope, &root);
+                store
+                    .ensure_writable()
+                    .unwrap_or_else(|error| panic!("{scope}: nothing written yet: {error}"));
+                store.store(&fixture_token()).expect("stored");
+                store
+                    .ensure_writable()
+                    .unwrap_or_else(|error| panic!("{scope}: the writer's own store: {error}"));
+
+                let guard = store.guard();
+                let directory = guard.parent().expect("the guard has a directory");
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+                    .expect("the directory is made read-only");
+                let refusal = store.ensure_writable();
+                let write = store.store(&fixture_token());
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("the directory is restored for cleanup");
+
+                let refusal = refusal.expect_err("a read-only directory refuses a write");
+                assert!(
+                    matches!(
+                        &refusal,
+                        SecretStoreError::Store { source, .. }
+                            if source.kind() == std::io::ErrorKind::PermissionDenied
+                    ),
+                    "{scope}: got {refusal:?}"
+                );
+                assert!(
+                    write.is_err(),
+                    "{scope}: the check refused a write that then succeeded"
+                );
+            }
         }
 
         #[test]

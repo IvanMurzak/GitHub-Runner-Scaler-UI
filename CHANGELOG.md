@@ -7,6 +7,18 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.25
+
+### Fixes
+
+- A TUI or CLI command that can read the machine-scoped credential but cannot
+  write it, such as one run without `sudo` on a boot-mode macOS host, no longer
+  renews the token. It used to spend the shared refresh token when the renewal
+  window opened, fail to store the replacement, and leave the service with a
+  pair GitHub had already retired, so the host stayed unauthorized until the
+  next `auth login`. Such a process now leaves renewal to the service and picks
+  up the renewed credential from the store.
+
 ## 0.4.24
 
 ### Features

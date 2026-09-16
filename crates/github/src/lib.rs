@@ -1219,8 +1219,33 @@ pub trait CredentialRenewal: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     /// Any failure; the caller treats every one the same way, by keeping the
-    /// credential it has and letting the next `401` try again.
-    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, String>;
+    /// credential it has and letting the next `401` try again. The variant
+    /// decides only how loudly that is reported; see [`RenewalError`].
+    async fn renew(&self, refresh_token: &SecretString) -> Result<UserAccessToken, RenewalError>;
+}
+
+/// Why [`CredentialRenewal::renew`] handed back no fresh pair.
+#[derive(Debug, thiserror::Error)]
+pub enum RenewalError {
+    /// This process chose not to spend the refresh token, and GitHub was not
+    /// asked.
+    ///
+    /// The pair is intact, so this is not a credential problem: a process that
+    /// cannot store what the exchange returns leaves renewal to one that can --
+    /// on a boot-mode host, the service. Reported quietly, because it recurs
+    /// on every attempt for as long as the renewal window is open and nothing
+    /// about it needs an operator.
+    #[error("{0}")]
+    Declined(String),
+    /// The renewal was attempted and did not produce a stored pair.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for RenewalError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
 }
 
 /// Where a client can go to find out that the stored credential changed under
@@ -1508,7 +1533,14 @@ impl AuthenticatedClient {
                 }?;
                 match renewal.renew(&refresh).await {
                     Ok(fresh) => Some(fresh),
-                    Err(error) => {
+                    Err(RenewalError::Declined(reason)) => {
+                        tracing::debug!(
+                            %reason,
+                            "left the user access token for a process that can store its renewal"
+                        );
+                        None
+                    }
+                    Err(RenewalError::Failed(error)) => {
                         tracing::warn!(
                             %error,
                             "the user access token could not be renewed; an interactive \
@@ -4999,7 +5031,10 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl CredentialRenewal for SpyRenewal {
-        async fn renew(&self, _refresh_token: &SecretString) -> Result<UserAccessToken, String> {
+        async fn renew(
+            &self,
+            _refresh_token: &SecretString,
+        ) -> Result<UserAccessToken, RenewalError> {
             self.invocations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(UserAccessToken::new(SecretString::from("ghu_renewed")))
