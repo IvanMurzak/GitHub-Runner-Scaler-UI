@@ -73,6 +73,7 @@ use crate::cli::{
 
 pub const MAX_FOCUSED_FORM_ACTIONS: u8 = 5;
 pub const FORK_TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
+pub const STATIC_SELECTOR_WARNING: &str = "Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors start no runner.";
 
 /// What Organization Settings says instead of offering a mode control.
 ///
@@ -1021,6 +1022,7 @@ impl SettingsUi {
                 target: raw,
                 profile,
             } => ScaleTarget::repository(&raw)
+                .or_else(|_| ScaleTarget::organization(&raw))
                 .map_err(invalid)
                 .and_then(|target| self.load_policy(context, &target, Some(&profile)))
                 .map(|()| {
@@ -1663,17 +1665,19 @@ Select another profile in Repositories or create one with the CLI.",
                     controls.push(Control::PolicyLabels);
                     controls.push(Control::PolicyLabelsSave);
                 }
-                controls.push(Control::PolicyExecutionMode);
-                if self.execution_mode == ExecutionMode::Isolated {
-                    controls.push(Control::PolicyExecutionBackend);
-                    controls.push(Control::PolicyExecutionImage);
-                    controls.push(Control::PolicyExecutionCpu);
-                    controls.push(Control::PolicyExecutionMemory);
-                    controls.push(Control::PolicyExecutionDisk);
+                if !form.is_organization() {
+                    controls.push(Control::PolicyExecutionMode);
+                    if self.execution_mode == ExecutionMode::Isolated {
+                        controls.push(Control::PolicyExecutionBackend);
+                        controls.push(Control::PolicyExecutionImage);
+                        controls.push(Control::PolicyExecutionCpu);
+                        controls.push(Control::PolicyExecutionMemory);
+                        controls.push(Control::PolicyExecutionDisk);
+                    }
+                    controls.push(Control::PolicyExecutionSave);
+                    controls.push(Control::PolicyDrain);
+                    controls.push(Control::PolicyRemove);
                 }
-                controls.push(Control::PolicyExecutionSave);
-                controls.push(Control::PolicyDrain);
-                controls.push(Control::PolicyRemove);
                 // D7: an organization policy is shown its mode and told why it
                 // cannot be changed, rather than given a control that refuses.
                 if !form.is_organization() {
@@ -1683,20 +1687,22 @@ Select another profile in Repositories or create one with the CLI.",
                     }
                     controls.push(Control::WorkspaceSave);
                 }
-                controls.push(Control::PolicyAddProfile);
-                if self.profile_create_open {
-                    controls.push(Control::ProfileName);
-                    controls.push(Control::ProfileCapacity);
-                    controls.push(Control::ProfileExecutionMode);
-                    if self.create_execution_mode == ExecutionMode::Isolated {
-                        controls.push(Control::ProfileExecutionBackend);
-                        controls.push(Control::ProfileExecutionImage);
-                        controls.push(Control::ProfileExecutionCpu);
-                        controls.push(Control::ProfileExecutionMemory);
-                        controls.push(Control::ProfileExecutionDisk);
+                if !form.is_organization() {
+                    controls.push(Control::PolicyAddProfile);
+                    if self.profile_create_open {
+                        controls.push(Control::ProfileName);
+                        controls.push(Control::ProfileCapacity);
+                        controls.push(Control::ProfileExecutionMode);
+                        if self.create_execution_mode == ExecutionMode::Isolated {
+                            controls.push(Control::ProfileExecutionBackend);
+                            controls.push(Control::ProfileExecutionImage);
+                            controls.push(Control::ProfileExecutionCpu);
+                            controls.push(Control::ProfileExecutionMemory);
+                            controls.push(Control::ProfileExecutionDisk);
+                        }
+                        controls.push(Control::ProfileCreate);
+                        controls.push(Control::ProfileCreateCancel);
                     }
-                    controls.push(Control::ProfileCreate);
-                    controls.push(Control::ProfileCreateCancel);
                 }
                 controls
             }
@@ -2110,10 +2116,9 @@ Select another profile in Repositories or create one with the CLI.",
             // none, and putting the placeholder sentence on the clipboard
             // would hand the operator a `runs-on:` value no workflow can use.
             .copyable(form.copyable_runs_on.clone()),
-            FormLine::keep(
-                "Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors start no runner.",
-            ),
-            FormLine::keep(FORK_TRUST_WARNING),
+            FormLine::keep(STATIC_SELECTOR_WARNING)
+                .copyable(Some(STATIC_SELECTOR_WARNING.to_owned())),
+            FormLine::keep(FORK_TRUST_WARNING).copyable(Some(FORK_TRUST_WARNING.to_owned())),
         ];
         let mut next = 0;
         if form.exposes_scale_toggle() {
@@ -2158,11 +2163,15 @@ Select another profile in Repositories or create one with the CLI.",
         lines.push(FormLine::text(""));
         lines.extend(self.label_lines(form, width, &mut next));
         lines.push(FormLine::text(""));
-        lines.extend(self.execution_lines(form, width, &mut next));
-        lines.push(FormLine::text(""));
+        if !form.is_organization() {
+            lines.extend(self.execution_lines(form, width, &mut next));
+            lines.push(FormLine::text(""));
+        }
         lines.extend(self.workspace_lines(form, width, &mut next));
-        lines.push(FormLine::text(""));
-        lines.extend(self.profile_create_lines(form, width, &mut next));
+        if !form.is_organization() {
+            lines.push(FormLine::text(""));
+            lines.extend(self.profile_create_lines(form, width, &mut next));
+        }
         lines.push(FormLine::text(format!(
             "Focused form actions: {}/{} scaling, {}/{} labels, {}/{} workspace",
             form.focused_action_count(),
@@ -4607,7 +4616,10 @@ mod tests {
         let mut ui = SettingsUi::default();
         ui.execute(
             &fixture.context,
-            SettingsCommand::LoadPolicy(organization.to_string()),
+            SettingsCommand::LoadProfile {
+                target: organization.to_string(),
+                profile: "default".into(),
+            },
         );
         let SettingsView::Policy(form) = &ui.view else {
             panic!("{:?}", ui.message)
@@ -4620,6 +4632,11 @@ mod tests {
             Control::WorkspaceMode,
             Control::WorkspacePath,
             Control::WorkspaceSave,
+            Control::PolicyExecutionMode,
+            Control::PolicyExecutionSave,
+            Control::PolicyDrain,
+            Control::PolicyRemove,
+            Control::PolicyAddProfile,
         ] {
             assert!(
                 !ui.controls().contains(&control),
@@ -4634,6 +4651,25 @@ mod tests {
             assert!(
                 !text.contains(line.trim()),
                 "an organization is never offered persistence, so it is never warned about it"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_and_trust_warnings_are_mouse_copyable() {
+        let (_dir, context, target) = fixture(false);
+        let mut ui = SettingsUi::default();
+        ui.execute(&context, SettingsCommand::LoadPolicy(target.to_string()));
+
+        for warning in [STATIC_SELECTOR_WARNING, FORK_TRUST_WARNING] {
+            let row = ui
+                .rows(160, false)
+                .iter()
+                .position(|line| line.text == warning)
+                .expect("warning row");
+            assert_eq!(
+                ui.click(row as u16, 160, false),
+                Some(SettingsCommand::Copy(warning.to_owned()))
             );
         }
     }

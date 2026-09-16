@@ -11,7 +11,7 @@
 //! collected [`Snapshot`] and cannot perform filesystem or network I/O.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ratatui::{
     Frame,
@@ -600,7 +600,7 @@ impl ScreenModel {
             ReadOnlyScreen::Dashboard => {}
             ReadOnlyScreen::Repositories => {
                 let ids = self.visible_repository_ids();
-                reconcile_table(&mut self.repositories, &ids, old_len);
+                reconcile_repository_table(&mut self.repositories, &ids, old_len);
             }
             ReadOnlyScreen::Runners => {
                 let ids = self.visible_runner_ids();
@@ -617,7 +617,7 @@ impl ScreenModel {
         let repos = self.visible_repository_ids();
         let runners = self.visible_runner_ids();
         let activity = self.visible_activity_ids();
-        reconcile_table(&mut self.repositories, &repos, old.map(|v| v[0]));
+        reconcile_repository_table(&mut self.repositories, &repos, old.map(|v| v[0]));
         reconcile_table(&mut self.runners, &runners, old.map(|v| v[1]));
         reconcile_table(&mut self.activity, &activity, old.map(|v| v[2]));
         if self
@@ -656,9 +656,10 @@ impl ScreenModel {
         let current = table
             .selected_id
             .as_ref()
-            .and_then(|id| ids.iter().position(|candidate| candidate == id))
+            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+        let next = current
+            .map(|current| current.saturating_add_signed(delta).min(ids.len() - 1))
             .unwrap_or(0);
-        let next = current.saturating_add_signed(delta).min(ids.len() - 1);
         table.selected_id = Some(ids[next].clone());
         keep_selection_visible(table, next, ids.len());
     }
@@ -667,21 +668,28 @@ impl ScreenModel {
     /// Callers that want identifiers derive them from this rather than the
     /// other way round, so no caller has to find a row it already had.
     fn visible_repositories(&self) -> Vec<&RepositoryRow> {
-        let mut rows: Vec<_> = self
+        let rows: Vec<_> = self
             .snapshot
             .repositories
             .iter()
-            .filter(|row| contains_folded(&row.target, &self.repositories.filter))
+            .filter(|row| {
+                contains_folded(&row.target, &self.repositories.filter)
+                    || contains_folded(&row.profile_name, &self.repositories.filter)
+                    || row
+                        .host_label
+                        .as_deref()
+                        .is_some_and(|label| contains_folded(label, &self.repositories.filter))
+                    || row
+                        .extra_labels
+                        .iter()
+                        .any(|label| contains_folded(label, &self.repositories.filter))
+            })
             .collect();
-        rows.sort_by(|a, b| {
-            repository_cmp(
-                a,
-                b,
-                self.repositories.sort_column,
-                self.repositories.sort_descending,
-            )
-        });
-        rows
+        sort_repository_rows(
+            rows,
+            self.repositories.sort_column,
+            self.repositories.sort_descending,
+        )
     }
 
     fn visible_repository_ids(&self) -> Vec<String> {
@@ -730,16 +738,11 @@ impl ScreenModel {
     /// from the complete, default-ordered inventory and therefore cannot
     /// inherit a full-screen filter, sort, selection, or viewport offset.
     fn dashboard_repositories(&self) -> Vec<&RepositoryRow> {
-        let mut rows: Vec<_> = self.snapshot.repositories.iter().collect();
-        rows.sort_by(|a, b| {
-            repository_cmp(
-                a,
-                b,
-                self.dashboard_repository_sort.0,
-                self.dashboard_repository_sort.1,
-            )
-        });
-        rows
+        sort_repository_rows(
+            self.snapshot.repositories.iter().collect(),
+            self.dashboard_repository_sort.0,
+            self.dashboard_repository_sort.1,
+        )
     }
 
     fn dashboard_runners(&self) -> Vec<&RunnerRow> {
@@ -810,6 +813,31 @@ fn repository_cmp(
         .then_with(|| a.profile_name.cmp(&b.profile_name))
 }
 
+/// Keep every repository's profiles contiguous under every sort mode.
+///
+/// A selected column orders profiles within a repository and the first
+/// profile in that ordered group is the repository's sort key. This preserves
+/// useful column sorting without allowing an unrelated repository to split a
+/// sibling group.
+fn sort_repository_rows(
+    rows: Vec<&RepositoryRow>,
+    column: usize,
+    descending: bool,
+) -> Vec<&RepositoryRow> {
+    let mut by_target: BTreeMap<&str, Vec<&RepositoryRow>> = BTreeMap::new();
+    for row in rows {
+        by_target.entry(&row.target).or_default().push(row);
+    }
+    let mut groups: Vec<_> = by_target.into_values().collect();
+    for group in &mut groups {
+        group.sort_by(|a, b| repository_cmp(a, b, column, descending));
+    }
+    groups.sort_by(|a, b| {
+        repository_cmp(a[0], b[0], column, descending).then_with(|| a[0].target.cmp(&b[0].target))
+    });
+    groups.into_iter().flatten().collect()
+}
+
 fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> Ordering {
     let state = |row: &RunnerRow| (!row.online, row.busy, row.ephemeral, row.ownership.marker());
     let order = match column {
@@ -870,6 +898,23 @@ fn reconcile_table(table: &mut TableViewState, ids: &[String], old_len: Option<u
     let index = table.scroll.min(old_last).min(ids.len() - 1);
     table.selected_id = Some(ids[index].clone());
     keep_selection_visible(table, index, ids.len());
+}
+
+/// Repository profiles require an explicit choice before settings can open.
+/// A non-empty filter is itself a user choice and may select its first match;
+/// an unfiltered initial load or a refresh that removes the selected profile
+/// leaves the selection empty.
+fn reconcile_repository_table(table: &mut TableViewState, ids: &[String], old_len: Option<usize>) {
+    let selected_is_visible = table
+        .selected_id
+        .as_ref()
+        .is_some_and(|selected| ids.contains(selected));
+    if table.filter.is_empty() && !selected_is_visible {
+        table.selected_id = None;
+        table.scroll = table.scroll.min(ids.len().saturating_sub(1));
+        return;
+    }
+    reconcile_table(table, ids, old_len);
 }
 
 /// Keep a one-row look-ahead around selection where the viewport has room.
@@ -2512,7 +2557,7 @@ mod tests {
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         Repositories/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Repositories/populated: lines=7 bytes=764 fnv=d08b19b0f2e6f889 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
+        Repositories/populated: lines=7 bytes=764 fnv=8877a50e8f4fe9d3 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
         Repositories/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
         Repositories/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Repositories/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
@@ -2638,6 +2683,7 @@ mod tests {
         // repository below the one the reader aimed at.
         let mut model = ScreenModel::new(populated());
         model.screen = ReadOnlyScreen::Repositories;
+        model.apply(ScreenAction::MoveSelection(0));
         // The drawn frame here is the content area alone; the real origin also
         // counts the title bar and the navigation row above it.
         let offset = usize::from(REPOSITORY_ROW_ORIGIN) - 2;
@@ -2830,8 +2876,13 @@ mod tests {
     #[test]
     fn keyboard_and_mouse_repository_detail_meet_action_budgets() {
         let mut keyboard = ScreenModel::new(populated());
+        assert_eq!(
+            keyboard.repositories.selected_id, None,
+            "a profile requires an explicit keyboard or mouse choice"
+        );
         let keyboard_actions = [
             ScreenAction::Open(ReadOnlyScreen::Repositories),
+            ScreenAction::MoveSelection(1),
             ScreenAction::Activate,
         ];
         for action in keyboard_actions.clone() {
@@ -2877,6 +2928,7 @@ mod tests {
         model.apply(ScreenAction::SetFocus(TableFocus::Footer));
         model.apply(ScreenAction::SetSort(SortOrder::WorkloadDescending));
         model.apply(ScreenAction::MoveSelection(1));
+        model.apply(ScreenAction::MoveSelection(1));
         assert_eq!(model.repositories.selected_id.as_deref(), Some("observe"));
         assert_eq!(model.repositories.scroll, 0);
         model.apply(ScreenAction::Refresh(populated()));
@@ -2887,7 +2939,7 @@ mod tests {
         let mut removed = populated();
         removed.repositories.retain(|row| row.id != "observe");
         model.apply(ScreenAction::Refresh(removed));
-        assert_eq!(model.repositories.selected_id.as_deref(), Some("alpha"));
+        assert_eq!(model.repositories.selected_id, None);
         assert_eq!(model.repositories.scroll, 0);
         assert_eq!(model.repositories.focus, TableFocus::Footer);
         assert_eq!(model.repositories.sort_order, SortOrder::WorkloadDescending);
@@ -2964,17 +3016,35 @@ mod tests {
     fn sibling_profiles_are_grouped_and_indented_under_one_repository() {
         let mut snapshot = populated();
         snapshot.repositories[0].profile_name = "native".into();
+        snapshot.repositories[0].in_progress_workflows = 9;
         let mut isolated = snapshot.repositories[0].clone();
         isolated.id = "alpha-isolated".into();
         isolated.profile_name = "py-isolated".into();
         isolated.host_label = Some("rm-home-win-x64-py-isolated".into());
+        isolated.in_progress_workflows = 0;
         snapshot.repositories.push(isolated);
         let mut model = ScreenModel::new(snapshot);
         model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::SortColumn(2));
+        let ids = model.visible_repository_ids();
+        let native = ids.iter().position(|id| id == "alpha").unwrap();
+        let isolated = ids.iter().position(|id| id == "alpha-isolated").unwrap();
+        assert_eq!(
+            native.abs_diff(isolated),
+            1,
+            "sibling rows must stay adjacent"
+        );
         let rendered = render_text(&model);
         assert_eq!(rendered.matches("acme/alpha").count(), 1, "{rendered}");
         assert!(rendered.contains("- native"), "{rendered}");
         assert!(rendered.contains("- py-isolated"), "{rendered}");
+
+        model.apply(ScreenAction::Filter("py-isolated".into()));
+        assert_eq!(
+            model.visible_repository_ids(),
+            vec!["alpha-isolated"],
+            "profile names must be searchable"
+        );
     }
 
     #[test]
@@ -3056,6 +3126,7 @@ mod tests {
     fn repository_detail_is_a_visible_rendered_path() {
         let mut model = ScreenModel::new(populated());
         model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::MoveSelection(0));
         model.apply(ScreenAction::Activate);
         let rendered = render_text(&model);
         assert!(rendered.contains("REPOSITORY DETAIL"), "{rendered}");
@@ -3082,6 +3153,7 @@ mod tests {
             .collect();
         let mut model = ScreenModel::new(snapshot);
         model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        model.apply(ScreenAction::MoveSelection(0));
         model.apply(ScreenAction::MoveSelection(10));
         let rendered = render_text(&model);
         assert!(

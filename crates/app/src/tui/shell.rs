@@ -841,26 +841,38 @@ async fn production_screen_snapshot(
     let mut assigned_jobs = 0_u32;
     let mut online_runners = 0_u32;
 
-    for policy in &local.policies {
-        let (target, scope) = if policy.scope == "repository" {
-            let repository = OwnerRepo::from_str(&policy.target)
-                .map_err(|error| offline_failure(context, error.to_string()))?;
-            (
-                ScaleTarget::Repository(repository.clone()),
-                ActivityScope::repository(repository),
-            )
-        } else {
-            let org = Org::from_str(&policy.target)
-                .map_err(|error| offline_failure(context, error.to_string()))?;
-            let repositories: Vec<_> = reachable_repositories
-                .iter()
-                .filter(|repository| repository.owner().eq_ignore_ascii_case(org.as_str()))
-                .cloned()
-                .collect();
-            (
-                ScaleTarget::Organization(org.clone()),
-                ActivityScope::organization(org, repositories),
-            )
+    let policy_targets: Vec<_> = local
+        .policies
+        .iter()
+        .map(|policy| {
+            if policy.scope == "repository" {
+                OwnerRepo::from_str(&policy.target)
+                    .map(ScaleTarget::Repository)
+                    .map_err(|error| offline_failure(context, error.to_string()))
+            } else {
+                Org::from_str(&policy.target)
+                    .map(ScaleTarget::Organization)
+                    .map_err(|error| offline_failure(context, error.to_string()))
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    let unique_targets = unique_targets_in_order(&policy_targets);
+    let mut snapshots = HashMap::with_capacity(unique_targets.len());
+
+    // One GitHub read per target. Sibling profiles share its workflow and
+    // runner inventory, so adding a profile neither spends more requests nor
+    // inflates dashboard totals.
+    for target in &unique_targets {
+        let scope = match target {
+            ScaleTarget::Repository(repository) => ActivityScope::repository(repository.clone()),
+            ScaleTarget::Organization(org) => {
+                let repositories: Vec<_> = reachable_repositories
+                    .iter()
+                    .filter(|repository| repository.owner().eq_ignore_ascii_case(org.as_str()))
+                    .cloned()
+                    .collect();
+                ActivityScope::organization(org.clone(), repositories)
+            }
         };
         let refreshed = inventory
             .snapshot(&scope, cancel)
@@ -868,6 +880,53 @@ async fn production_screen_snapshot(
             .map_err(|error| inventory_failure(context, &clock, error))?;
         let workflow_count = refreshed.activity.total();
         in_progress_workflows = in_progress_workflows.saturating_add(workflow_count);
+        for runner in refreshed.runners.runners() {
+            if !seen_runners.insert(runner.id) {
+                continue;
+            }
+            let locally_owned = local
+                .policies
+                .iter()
+                .zip(&policy_targets)
+                .filter(|(_, policy_target)| *policy_target == target)
+                .any(|(policy, _)| {
+                    policy.mode != "monitor_only"
+                        && !policy.routing_labels.is_empty()
+                        && policy
+                            .routing_labels
+                            .iter()
+                            .all(|label| runner.has_label(label))
+                });
+            let (ephemeral, ownership) =
+                classify_runner(&runner.name, runner.ephemeral, locally_owned);
+            busy_runners = busy_runners.saturating_add(u32::from(runner.busy));
+            assigned_jobs = assigned_jobs.saturating_add(u32::from(runner.busy && locally_owned));
+            online_runners = online_runners.saturating_add(u32::from(runner.status.is_online()));
+            runners.push(RunnerRow {
+                id: runner.id.to_string(),
+                name: runner.name.clone(),
+                owner: target.slug(),
+                os: runner.os.clone(),
+                labels: runner.labels.clone(),
+                online: runner.status.is_online(),
+                busy: runner.busy,
+                busy_for_seconds: runner
+                    .busy
+                    .then(|| busy_for_by_runner.get(&runner.id).copied())
+                    .flatten(),
+                ephemeral,
+                ownership,
+            });
+        }
+        snapshots.insert(target.clone(), refreshed);
+    }
+
+    for (policy, target) in local.policies.iter().zip(&policy_targets) {
+        let workflow_count = snapshots
+            .get(target)
+            .expect("every policy target was collected")
+            .activity
+            .total();
         repositories.push(RepositoryRow {
             id: policy.id.clone(),
             target: policy.target.clone(),
@@ -892,37 +951,6 @@ async fn production_screen_snapshot(
             host_label: policy.routing_labels.first().cloned(),
             extra_labels: policy.routing_labels.iter().skip(1).cloned().collect(),
         });
-        for runner in refreshed.runners.runners() {
-            if !seen_runners.insert(runner.id) {
-                continue;
-            }
-            let locally_owned = policy.mode != "monitor_only"
-                && !policy.routing_labels.is_empty()
-                && policy
-                    .routing_labels
-                    .iter()
-                    .all(|label| runner.has_label(label));
-            let (ephemeral, ownership) =
-                classify_runner(&runner.name, runner.ephemeral, locally_owned);
-            busy_runners = busy_runners.saturating_add(u32::from(runner.busy));
-            assigned_jobs = assigned_jobs.saturating_add(u32::from(runner.busy && locally_owned));
-            online_runners = online_runners.saturating_add(u32::from(runner.status.is_online()));
-            runners.push(RunnerRow {
-                id: runner.id.to_string(),
-                name: runner.name.clone(),
-                owner: target.slug(),
-                os: runner.os.clone(),
-                labels: runner.labels.clone(),
-                online: runner.status.is_online(),
-                busy: runner.busy,
-                busy_for_seconds: runner
-                    .busy
-                    .then(|| busy_for_by_runner.get(&runner.id).copied())
-                    .flatten(),
-                ephemeral,
-                ownership,
-            });
-        }
     }
 
     Ok(Snapshot {
@@ -943,6 +971,15 @@ async fn production_screen_snapshot(
         wsl_capability,
         wsl_hosts,
     })
+}
+
+fn unique_targets_in_order(targets: &[ScaleTarget]) -> Vec<ScaleTarget> {
+    let mut seen = HashSet::with_capacity(targets.len());
+    targets
+        .iter()
+        .filter(|target| seen.insert((*target).clone()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -3140,6 +3177,16 @@ mod tests {
         assert!(
             maintenance < empty_host,
             "credential maintenance must run before an empty-policy host returns"
+        );
+    }
+
+    #[test]
+    fn sibling_profiles_share_one_inventory_target_in_first_seen_order() {
+        let alpha = ScaleTarget::repository("acme/alpha").unwrap();
+        let beta = ScaleTarget::repository("acme/beta").unwrap();
+        assert_eq!(
+            unique_targets_in_order(&[alpha.clone(), alpha.clone(), beta.clone(), alpha]),
+            vec![ScaleTarget::repository("acme/alpha").unwrap(), beta]
         );
     }
 
