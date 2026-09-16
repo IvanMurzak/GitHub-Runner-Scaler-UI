@@ -3,7 +3,8 @@
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
 **Implementation status:** a1, a2, b1 and b2 merged into the integration
-ref; d1 is held at a green PR for native acceptance, with c1, d2 and d3 ready.
+ref; d1 is held at a green PR for native acceptance, c1 is dispatched, and
+d2 and d3 are ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -51,7 +52,7 @@ This file is the only live task-state record.
 | a2-routing-reconcile | `tasks/a2-routing-reconcile.md` | A | 2 | a1-profile-domain-store | . | main | 9/7 | top | ✅ | [PR #71](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/71) / 95901da | 2026-09-15 |
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ✅ | [PR #72](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/72) / 8805435 | 2026-09-15 |
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
-| c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ready | — | 2026-09-15 |
+| c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | 🔵 | worktree-c1-profile-cli / `implement-task` | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | pending | — | 2026-09-13 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
@@ -173,3 +174,8 @@ d1 DoD requires. On this Ubuntu WSL host, default extfs refuses the hard
 writable-layer quota; a separate XFS `prjquota` rootless fixture also refused
 its device-node quota probe with `EPERM`. The provider fails closed before
 JIT. PR #74 stays open, d1 stays `🟣`, and other ready groups may proceed.
+
+**2026-09-15 — c1 dispatched.** The CLI profile task slot was provisioned
+from the verified remote integration ref, with its branch-scoped PR base read
+back as `runner-sandbox-isolation`. Its native Codex `implement-task` session
+loop will run in the isolated checkout while d1's native gates remain pending.
