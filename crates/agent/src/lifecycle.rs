@@ -49,6 +49,9 @@ use crate::reconcile::{
     ReplacementIntent, RunnerLauncher,
 };
 
+mod windows_hyperv;
+pub use windows_hyperv::{WindowsHyperVContainers, WindowsHyperVHostState};
+
 const IDENTITY_FILE: &str = ".runner-process.json";
 const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
 const UNRESOLVED_PROCESS_FILE: &str = ".runner-process.unresolved";
@@ -1573,6 +1576,183 @@ pub struct NativeProcesses {
     post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     use_long_lived_test_listener: std::sync::atomic::AtomicBool,
+}
+
+/// Production provider set. Native and isolated allocations are routed by the
+/// immutable execution kind in the policy/journal; an unavailable isolated
+/// backend can never fall through to native process launch.
+#[derive(Debug)]
+pub struct PlatformExecutionProvider {
+    native: NativeProcesses,
+    windows_hyper_v: WindowsHyperVContainers,
+}
+
+impl PlatformExecutionProvider {
+    #[must_use]
+    pub fn new(host_id: HostId) -> Self {
+        Self {
+            native: NativeProcesses::new(),
+            windows_hyper_v: WindowsHyperVContainers::new(host_id),
+        }
+    }
+
+    fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
+        match backend {
+            Backend::Auto | Backend::WindowsHyperVContainer => Some(&self.windows_hyper_v),
+            Backend::Oci | Backend::VirtualMachine => None,
+        }
+    }
+
+    fn provider_for_attempt(&self, attempt: &RunnerAttempt) -> Option<&dyn ExecutionProvider> {
+        match attempt.execution() {
+            AttemptExecution::Native { .. } => Some(&self.native),
+            AttemptExecution::Isolated { provider_kind, .. } => {
+                self.isolated_provider(*provider_kind)
+            }
+        }
+    }
+}
+
+impl ExecutionProvider for PlatformExecutionProvider {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => self.native.probe(policy),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .map_or(ProviderCapability::Unsupported, |provider| {
+                    provider.probe(policy)
+                }),
+        }
+    }
+
+    fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.resolve(policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .resolve(policy),
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.prepare(attempt, policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .prepare(attempt, policy),
+        }
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| {
+                ProcessStartFailure::before_spawn(FailureReason::Other(
+                    "execution provider unavailable".into(),
+                ))
+            })?
+            .start(prepared, attempt, handoff)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .inspect(attempt)
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .stop(attempt)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .destroy(attempt)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .recover(attempt)
+    }
+
+    fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
+        self.windows_hyper_v.enumerate_owned(host_id)
+    }
+
+    fn diagnostics(&self, attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+        self.provider_for_attempt(attempt)
+            .map_or_else(Vec::new, |provider| provider.diagnostics(attempt))
+    }
+
+    fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .owns(attempt)
+    }
+
+    fn spawn(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+    ) -> Result<u32, ProcessStartFailure> {
+        if !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "native process launch refused for an isolated allocation".into(),
+            )));
+        }
+        self.native.spawn(attempt, config)
+    }
+
+    fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .is_alive(attempt)
+    }
+
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .recovered_pid(attempt)
+    }
+
+    fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.completed_successfully(attempt))
+    }
+
+    fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .record_terminate_intent(attempt)
+    }
+
+    fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.has_terminate_intent(attempt))
+    }
+
+    fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+            .terminate(attempt)
+    }
 }
 
 #[cfg(test)]

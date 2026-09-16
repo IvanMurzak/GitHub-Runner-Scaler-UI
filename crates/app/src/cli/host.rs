@@ -78,6 +78,11 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
 
+use runner_manager_agent::lifecycle::ProviderCapability;
+#[cfg(not(test))]
+use runner_manager_agent::lifecycle::WindowsHyperVContainers;
+#[cfg(test)]
+use runner_manager_agent::lifecycle::WindowsHyperVHostState;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::store::{Store, StoreError};
@@ -458,6 +463,9 @@ pub enum IsolationReadiness {
     Ready,
     NotInstalled,
     Unsupported,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    Degraded,
 }
 
 impl IsolationReadiness {
@@ -467,6 +475,9 @@ impl IsolationReadiness {
             Self::Ready => "ready",
             Self::NotInstalled => "not installed",
             Self::Unsupported => "unsupported",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::Degraded => "degraded",
         }
     }
 }
@@ -479,6 +490,7 @@ pub struct IsolationCapability {
     pub backend: IsolationBackend,
     pub state: IsolationReadiness,
     pub remedy: Option<&'static str>,
+    pub unsupported_workflow_capabilities: &'static [&'static str],
 }
 
 /// Untrusted probe input. `raw_output` exists only at the conversion boundary
@@ -512,21 +524,55 @@ pub(crate) const fn sanitize_isolation_observation(
         backend: observation.backend,
         state: observation.state,
         remedy,
+        unsupported_workflow_capabilities: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            &[
+                "desktop",
+                "devices",
+                "container_actions",
+                "service_containers",
+            ]
+        } else {
+            &[]
+        },
+    }
+}
+
+fn windows_hyper_v_capability() -> IsolationCapability {
+    #[cfg(test)]
+    let host = WindowsHyperVHostState::UnsupportedHost;
+    #[cfg(not(test))]
+    let host = WindowsHyperVContainers::host_state();
+    let state = readiness_from_provider_capability(host.capability());
+    let mut capability = sanitize_isolation_observation(IsolationObservation {
+        backend: IsolationBackend::WindowsHyperVContainer,
+        state,
+        raw_output: None,
+    });
+    capability.remedy = host.remedy();
+    capability
+}
+
+const fn readiness_from_provider_capability(capability: ProviderCapability) -> IsolationReadiness {
+    match capability {
+        ProviderCapability::Ready => IsolationReadiness::Ready,
+        ProviderCapability::Unsupported => IsolationReadiness::Unsupported,
+        ProviderCapability::NotInstalled => IsolationReadiness::NotInstalled,
+        ProviderCapability::PermissionDenied => IsolationReadiness::PermissionDenied,
+        ProviderCapability::ImageUnavailableOrIncompatible => {
+            IsolationReadiness::ImageUnavailableOrIncompatible
+        }
+        ProviderCapability::Degraded => IsolationReadiness::Degraded,
     }
 }
 
 #[must_use]
 pub fn isolation_capabilities() -> Vec<IsolationCapability> {
-    // The currently shipped provider executes native processes only. These
-    // states are deliberately closed: an isolated profile cannot be armed on
-    // the strength of a runtime that the agent has not integrated.
-    [
+    let mut providers = [
         (IsolationBackend::Native, IsolationReadiness::Ready),
         (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
-        (
-            IsolationBackend::WindowsHyperVContainer,
-            IsolationReadiness::Unsupported,
-        ),
         (
             IsolationBackend::VirtualMachine,
             IsolationReadiness::NotInstalled,
@@ -540,7 +586,9 @@ pub fn isolation_capabilities() -> Vec<IsolationCapability> {
             raw_output: None,
         })
     })
-    .collect()
+    .collect::<Vec<_>>();
+    providers.insert(2, windows_hyper_v_capability());
+    providers
 }
 
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
@@ -566,11 +614,16 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
                 provider.state.display_name()
             )
             .map_err(write_failed("this provider status"))?;
+            if !provider.unsupported_workflow_capabilities.is_empty() {
+                writeln!(
+                    out,
+                    "  unsupported workflow capabilities: {}",
+                    provider.unsupported_workflow_capabilities.join(", ")
+                )
+                .map_err(write_failed("this provider status"))?;
+            }
         }
-        writeln!(
-            out,
-            "Isolated scaling remains unavailable until a provider is installed and integrated."
-        )
+        writeln!(out, "Provider readiness is checked again, including the pinned image, before JIT registration.")
         .map_err(write_failed("this provider status"))?;
     }
     Ok(())

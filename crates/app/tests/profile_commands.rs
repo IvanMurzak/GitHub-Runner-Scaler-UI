@@ -248,7 +248,7 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
         ]
     );
     for provider in providers {
-        assert_eq!(provider.as_object().unwrap().len(), 3, "{provider}");
+        assert_eq!(provider.as_object().unwrap().len(), 4, "{provider}");
         assert!(
             matches!(
                 provider["state"].as_str(),
@@ -263,6 +263,7 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
             ),
             "{provider}"
         );
+        assert!(provider["unsupported_workflow_capabilities"].is_array());
     }
 }
 

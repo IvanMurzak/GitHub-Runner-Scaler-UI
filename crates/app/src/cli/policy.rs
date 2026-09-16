@@ -6,6 +6,9 @@ use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::num::NonZeroU16;
 
+use runner_manager_agent::lifecycle::{
+    ExecutionProvider, PlatformExecutionProvider, ProviderCapability,
+};
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::execution::ExecutionPolicy;
 use runner_manager_domain::model::{
@@ -1249,14 +1252,18 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                return Err(CliError::with_remedy(
-                    Failure::Conflict,
-                    format!(
-                        "isolated profile {} cannot be enabled: no integrated provider is ready; nothing was changed",
-                        policy.profile_name()
-                    ),
-                    "runner-manager host isolation status",
-                ));
+                let capability = PlatformExecutionProvider::new(policy.host_id).probe(&policy);
+                if capability != ProviderCapability::Ready {
+                    return Err(CliError::with_remedy(
+                        Failure::Conflict,
+                        format!(
+                            "isolated profile {} cannot be enabled: provider state is {}; nothing was changed",
+                            policy.profile_name(),
+                            provider_capability_name(capability)
+                        ),
+                        "runner-manager host isolation status",
+                    ));
+                }
             }
             if policy.routing_labels().is_none() {
                 return Err(CliError::with_remedy(
@@ -1345,6 +1352,17 @@ pub fn apply_policy_mutation_selected(
         }
     }
     Ok(())
+}
+
+const fn provider_capability_name(capability: ProviderCapability) -> &'static str {
+    match capability {
+        ProviderCapability::Ready => "ready",
+        ProviderCapability::Unsupported => "unsupported",
+        ProviderCapability::NotInstalled => "not installed",
+        ProviderCapability::PermissionDenied => "permission denied",
+        ProviderCapability::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+        ProviderCapability::Degraded => "degraded",
+    }
 }
 
 fn confirm_disable(

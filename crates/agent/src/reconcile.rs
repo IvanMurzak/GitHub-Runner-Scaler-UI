@@ -5215,6 +5215,10 @@ mod tests {
         const SOURCES: &[(&str, &str)] = &[
             ("lib.rs", include_str!("lib.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
+            (
+                "lifecycle/windows_hyperv.rs",
+                include_str!("lifecycle/windows_hyperv.rs"),
+            ),
             ("package.rs", include_str!("package.rs")),
             ("reconcile.rs", include_str!("reconcile.rs")),
         ];
