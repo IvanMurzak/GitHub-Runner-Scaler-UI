@@ -709,9 +709,8 @@ fn record_policy_with_id(
     policy_id: PolicyId,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    if store
-        .policies()
-        .map_err(store_failure)?
+    let policies = store.policies().map_err(store_failure)?;
+    if policies
         .iter()
         .any(|policy| policy.target == target && policy.profile_name().is_default())
     {
@@ -722,11 +721,7 @@ fn record_policy_with_id(
         ));
     }
     let projection = BudgetProjection::new(RefreshInterval::default(), existing_costs);
-    let same_target_exists = store
-        .policies()
-        .map_err(store_failure)?
-        .iter()
-        .any(|policy| policy.target == target);
+    let same_target_exists = policies.iter().any(|policy| policy.target == target);
     if !same_target_exists && let refusal @ Admission::Refused { .. } = projection.admit(candidate)
     {
         return Err(CliError::with_remedy(
