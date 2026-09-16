@@ -56,6 +56,7 @@ impl ImageReference {
             .is_some_and(|version| {
                 !version.is_empty()
                     && version.len() <= 128
+                    && !version.eq_ignore_ascii_case("latest")
                     && version
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
@@ -369,6 +370,8 @@ mod tests {
     fn mutable_credentials_and_unknown_provider_shapes_fail_closed() {
         for reference in [
             "runner:latest",
+            "vm-version:latest",
+            "vm-version:LATEST",
             "https://user:token@registry.example/runner",
             "registry.example/runner@sha256:short",
             "registry.example/runner @sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

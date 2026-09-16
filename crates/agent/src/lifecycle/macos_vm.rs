@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -139,7 +139,9 @@ impl MacOsVmProcesses {
             Err(HelperFailure::PermissionDenied) => {
                 return MacOsVmHostState::HelperPermissionDenied;
             }
-            Err(HelperFailure::Rejected) => return MacOsVmHostState::HelperIncompatible,
+            Err(HelperFailure::Missing | HelperFailure::Rejected) => {
+                return MacOsVmHostState::HelperIncompatible;
+            }
             Err(HelperFailure::Degraded) => return MacOsVmHostState::RuntimeDegraded,
         };
         let Ok(probe) = serde_json::from_slice::<ProbeResponse>(&response) else {
@@ -177,27 +179,25 @@ impl MacOsVmProcesses {
         }
     }
 
-    fn inspect_image(&self, image: &ImageReference) -> Result<ImageResponse, FailureReason> {
+    fn inspect_image_metadata(
+        &self,
+        image: &ImageReference,
+    ) -> Result<ImageResponse, HelperFailure> {
         if !image.as_str().starts_with("vm-version:") {
-            return Err(failure(
-                "macOS VM templates require a pinned vm-version reference",
-            ));
+            return Err(HelperFailure::Rejected);
         }
-        let output = self
-            .helper
-            .run(
-                &[
-                    "image".into(),
-                    "inspect".into(),
-                    "--image".into(),
-                    image.as_str().into(),
-                    "--json".into(),
-                ],
-                None,
-            )
-            .map_err(image_helper_failure)?;
-        let image_response: ImageResponse = serde_json::from_slice(&output)
-            .map_err(|_| failure("macOS VM helper returned invalid image metadata"))?;
+        let output = self.helper.run(
+            &[
+                "image".into(),
+                "inspect".into(),
+                "--image".into(),
+                image.as_str().into(),
+                "--json".into(),
+            ],
+            None,
+        )?;
+        let image_response: ImageResponse =
+            serde_json::from_slice(&output).map_err(|_| HelperFailure::Rejected)?;
         if image_response.protocol_version != PROTOCOL_VERSION
             || image_response.image != image.as_str()
             || image_response.guest_os != "macos"
@@ -205,9 +205,14 @@ impl MacOsVmProcesses {
             || !image_response.immutable
             || !image_response.bootstrap_ready
         {
-            return Err(failure("macOS VM image is unavailable or incompatible"));
+            return Err(HelperFailure::Rejected);
         }
         Ok(image_response)
+    }
+
+    fn inspect_image(&self, image: &ImageReference) -> Result<ImageResponse, FailureReason> {
+        self.inspect_image_metadata(image)
+            .map_err(image_helper_failure)
     }
 
     fn expected<'a>(
@@ -245,7 +250,7 @@ impl MacOsVmProcesses {
             Ok(output) => serde_json::from_slice(&output)
                 .map(Some)
                 .map_err(|_| failure("macOS VM helper returned invalid environment metadata")),
-            Err(HelperFailure::Rejected) => Ok(None),
+            Err(HelperFailure::Missing) => Ok(None),
             Err(error) => Err(operation_helper_failure(error)),
         }
     }
@@ -341,9 +346,14 @@ impl ExecutionProvider for MacOsVmProcesses {
         if capability != ProviderCapability::Ready {
             return capability;
         }
-        match self.inspect_image(image) {
+        match self.inspect_image_metadata(image) {
             Ok(_) => ProviderCapability::Ready,
-            Err(_) => ProviderCapability::ImageUnavailableOrIncompatible,
+            Err(HelperFailure::NotInstalled) => ProviderCapability::NotInstalled,
+            Err(HelperFailure::PermissionDenied) => ProviderCapability::PermissionDenied,
+            Err(HelperFailure::Missing | HelperFailure::Rejected) => {
+                ProviderCapability::ImageUnavailableOrIncompatible
+            }
+            Err(HelperFailure::Degraded) => ProviderCapability::Degraded,
         }
     }
 
@@ -800,7 +810,9 @@ fn image_helper_failure(error: HelperFailure) -> FailureReason {
     match error {
         HelperFailure::NotInstalled => failure("macOS VM helper is not installed"),
         HelperFailure::PermissionDenied => failure("macOS VM helper permission denied"),
-        HelperFailure::Rejected => failure("macOS VM image is unavailable or incompatible"),
+        HelperFailure::Missing | HelperFailure::Rejected => {
+            failure("macOS VM image is unavailable or incompatible")
+        }
         HelperFailure::Degraded => failure("macOS VM helper is degraded"),
     }
 }
@@ -809,6 +821,7 @@ fn operation_helper_failure(error: HelperFailure) -> FailureReason {
     match error {
         HelperFailure::NotInstalled => failure("macOS VM helper is not installed"),
         HelperFailure::PermissionDenied => failure("macOS VM helper permission denied"),
+        HelperFailure::Missing => failure("macOS VM resource is absent"),
         HelperFailure::Rejected => failure("macOS VM helper rejected the operation"),
         HelperFailure::Degraded => failure("macOS VM helper operation failed"),
     }
@@ -822,6 +835,7 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 enum HelperFailure {
     NotInstalled,
     PermissionDenied,
+    Missing,
     Rejected,
     Degraded,
 }
@@ -865,8 +879,40 @@ impl SystemHelper {
             pipe.flush()?;
             drop(pipe);
         }
-        child.wait_with_output()
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("helper stdout unavailable"));
+        let stdout = match stdout.and_then(read_bounded_response) {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let status = child.wait()?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
     }
+}
+
+fn read_bounded_response(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_RESPONSE + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_RESPONSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS VM helper response exceeded 64 KiB",
+        ));
+    }
+    Ok(response)
 }
 
 impl HelperCommand for SystemHelper {
@@ -885,7 +931,7 @@ impl HelperCommand for SystemHelper {
             return Ok(output.stdout);
         }
         Err(match output.status.code() {
-            Some(66) => HelperFailure::Rejected,
+            Some(66) => HelperFailure::Missing,
             Some(77) => HelperFailure::PermissionDenied,
             Some(78) => HelperFailure::Rejected,
             _ => HelperFailure::Degraded,
@@ -913,7 +959,8 @@ mod tests {
     #[derive(Debug)]
     struct FakeHelper {
         probe: Mutex<Result<Value, HelperFailure>>,
-        image: Mutex<Value>,
+        image: Mutex<Result<Value, HelperFailure>>,
+        inspect_failure: Mutex<Option<HelperFailure>>,
         records: Mutex<BTreeMap<String, Value>>,
         calls: Mutex<Vec<Vec<String>>>,
         jit_inputs: Mutex<Vec<Vec<u8>>>,
@@ -923,7 +970,8 @@ mod tests {
         fn ready() -> Arc<Self> {
             Arc::new(Self {
                 probe: Mutex::new(Ok(ready_probe())),
-                image: Mutex::new(ready_image()),
+                image: Mutex::new(Ok(ready_image())),
+                inspect_failure: Mutex::new(None),
                 records: Mutex::new(BTreeMap::new()),
                 calls: Mutex::new(Vec::new()),
                 jit_inputs: Mutex::new(Vec::new()),
@@ -935,7 +983,15 @@ mod tests {
         }
 
         fn set_image(&self, value: Value) {
-            *self.image.lock().unwrap() = value;
+            *self.image.lock().unwrap() = Ok(value);
+        }
+
+        fn set_image_failure(&self, failure: HelperFailure) {
+            *self.image.lock().unwrap() = Err(failure);
+        }
+
+        fn set_inspect_failure(&self, failure: HelperFailure) {
+            *self.inspect_failure.lock().unwrap() = Some(failure);
         }
 
         fn record(&self, environment: &str) -> Option<Value> {
@@ -953,15 +1009,23 @@ mod tests {
                     .unwrap()
                     .clone()
                     .map(|value| serde_json::to_vec(&value).unwrap()),
-                Some("image") => Ok(serde_json::to_vec(&*self.image.lock().unwrap()).unwrap()),
+                Some("image") => self
+                    .image
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(|value| serde_json::to_vec(&value).unwrap()),
                 Some("inspect") => {
+                    if let Some(failure) = *self.inspect_failure.lock().unwrap() {
+                        return Err(failure);
+                    }
                     let environment = argument(args, "--environment");
                     self.records
                         .lock()
                         .unwrap()
                         .get(environment)
                         .map(|value| serde_json::to_vec(value).unwrap())
-                        .ok_or(HelperFailure::Rejected)
+                        .ok_or(HelperFailure::Missing)
                 }
                 Some("prepare") => {
                     let environment = argument(args, "--environment").to_owned();
@@ -1150,6 +1214,19 @@ mod tests {
     }
 
     #[test]
+    fn helper_response_reader_stops_at_the_documented_limit() {
+        let accepted = vec![b'a'; MAX_RESPONSE];
+        assert_eq!(
+            read_bounded_response(std::io::Cursor::new(&accepted)).unwrap(),
+            accepted
+        );
+
+        let oversized = vec![b'b'; MAX_RESPONSE + 4096];
+        let error = read_bounded_response(std::io::Cursor::new(oversized)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn host_probe_classifies_missing_permission_and_protocol_failures() {
         let helper = FakeHelper::ready();
         let provider = provider(HostId::from_u128(1), Arc::clone(&helper));
@@ -1162,6 +1239,7 @@ mod tests {
                 HelperFailure::PermissionDenied,
                 MacOsVmHostState::HelperPermissionDenied,
             ),
+            (HelperFailure::Missing, MacOsVmHostState::HelperIncompatible),
             (
                 HelperFailure::Rejected,
                 MacOsVmHostState::HelperIncompatible,
@@ -1198,6 +1276,36 @@ mod tests {
                 ProviderCapability::ImageUnavailableOrIncompatible,
                 "field {field}"
             );
+        }
+    }
+
+    #[test]
+    fn image_probe_preserves_helper_failure_classification() {
+        let helper = FakeHelper::ready();
+        let policy = isolated_policy();
+        let provider = provider(policy.host_id, Arc::clone(&helper));
+
+        for (failure, expected) in [
+            (
+                HelperFailure::NotInstalled,
+                ProviderCapability::NotInstalled,
+            ),
+            (
+                HelperFailure::PermissionDenied,
+                ProviderCapability::PermissionDenied,
+            ),
+            (
+                HelperFailure::Missing,
+                ProviderCapability::ImageUnavailableOrIncompatible,
+            ),
+            (
+                HelperFailure::Rejected,
+                ProviderCapability::ImageUnavailableOrIncompatible,
+            ),
+            (HelperFailure::Degraded, ProviderCapability::Degraded),
+        ] {
+            helper.set_image_failure(failure);
+            assert_eq!(provider.probe(&policy), expected);
         }
     }
 
@@ -1341,6 +1449,21 @@ mod tests {
             provider.diagnostics(&attempt),
             vec![ProviderDiagnostic::OwnershipMismatch]
         );
+    }
+
+    #[test]
+    fn unsupported_inspect_is_not_accepted_as_resource_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = FakeHelper::ready();
+        let policy = isolated_policy();
+        let provider = provider(policy.host_id, Arc::clone(&helper));
+        let attempt = isolated_attempt(&policy, 42, root.path());
+        provider.prepare(&attempt, &policy).unwrap();
+
+        helper.set_inspect_failure(HelperFailure::Rejected);
+
+        assert!(provider.inspect(&attempt).is_err());
+        assert!(provider.destroy(&attempt).is_err());
     }
 
     #[test]
