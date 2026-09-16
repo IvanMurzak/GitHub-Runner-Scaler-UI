@@ -1,0 +1,56 @@
+crates/app/src/cli/profile.rs
+  s_5801a853f78e8a::t_fd2515a06699df 1-328
+crates/app/src/cli/policy.rs
+  s_e3f2ebf0732f36::t_d70fee6cf799bd 1408
+  s_ed79f8843352e6::t_9613abd8254066 1403
+  s_5801a853f78e8a::t_fd2515a06699df 10,12-16,45-46,50,52-58,61,63-64,68,71,76,79,85,88,92,109-110,199-206,210-235,243-244,335-363,370-454,461,491-501,505,716,725-731,879,881-888,905,907-914,968-982,1031-1047,1115-1122,1125,1170-1180,1183,1229-1242,1254-1263,1342-1345,1383-1392,1395,1401-1402,1404-1407,1409-1411,1416,1418,1420-1425,1459-1467,1471-1518
+  s_e3f2ebf0732f36::t_a6d210f0c03ef6 1412-1413
+README.md
+  s_5801a853f78e8a::t_dc9ad81695431f 203-220,246,260-269
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_a0fd1cc968352a 425-427,431-458
+crates/app/src/cli/mod.rs
+  s_5801a853f78e8a::t_1560f61aca0f29 47,810-818,891-1016,1064-1065,1111-1112,1122-1123,1132-1133,1142-1143
+crates/app/src/cli/workspace.rs
+  s_5801a853f78e8a::t_6095b051b7142c 828-831,838-848,851
+crates/app/src/tui/settings.rs
+  s_5801a853f78e8a::t_7df15ea1703038 399,2012,2040,3232,3255
+crates/app/tests/cli_command_surface.rs
+  s_5801a853f78e8a::t_1ec19931086c2a 58,72,95-114,821,829-833,838-853
+crates/app/tests/command_accountability/mod.rs
+  s_5801a853f78e8a::t_0b2c41f0f3c1d2 81,107-109,156,214-227,258-269,279-318
+crates/app/tests/profile_commands.rs
+  s_5801a853f78e8a::t_8f175381585173 1-333
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "343d8036041d2b6a43d8f890e039a19908361d06",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_e3f2ebf0732f36": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02e0a-30d9-7661-9602-16868708df1e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ed79f8843352e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dd6444e-46d7-4ff2-8ee2-5baa2bb6a927",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
