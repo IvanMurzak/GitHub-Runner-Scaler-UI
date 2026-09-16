@@ -924,9 +924,6 @@ impl HelperCommand for SystemHelper {
                 std::io::ErrorKind::PermissionDenied => HelperFailure::PermissionDenied,
                 _ => HelperFailure::Degraded,
             })?;
-        if output.stdout.len() > MAX_RESPONSE {
-            return Err(HelperFailure::Degraded);
-        }
         if output.status.success() {
             return Ok(output.stdout);
         }
