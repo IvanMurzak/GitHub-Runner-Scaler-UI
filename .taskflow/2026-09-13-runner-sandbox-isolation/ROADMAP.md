@@ -3,8 +3,8 @@
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
 **Implementation status:** a1, a2, b1, b2, c1 and c2 merged into the
-integration ref; d1 is held at a green PR for native acceptance, with d2 and
-d3 ready.
+integration ref; d1 is held at a green PR for native acceptance, d2 is
+dispatched, and d3 is ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -55,7 +55,7 @@ This file is the only live task-state record.
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🔵 | worktree-d2-windows-hyperv / `implement-task` | 2026-09-16 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
@@ -200,3 +200,8 @@ resource persistence, unsupported-provider refusal, and raw-diagnostic
 redaction evidence. The exact full local gate and seven CI/E2E checks passed
 at head a75fd37. PR #76 was squash-merged into
 `runner-sandbox-isolation` at 0c60d9a and the remote ref verified.
+
+**2026-09-16 — d2 dispatched.** The Windows Hyper-V task slot was
+provisioned from the verified remote integration ref, with its branch-scoped
+PR base read back as `runner-sandbox-isolation`. Its native Codex
+`implement-task` session loop will run in the isolated checkout.
