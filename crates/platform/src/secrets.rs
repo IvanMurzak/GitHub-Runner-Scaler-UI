@@ -4680,7 +4680,13 @@ mod tests {
                 std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
                     .expect("the directory is made read-only");
                 let refusal = store.ensure_writable();
-                let write = store.store(&fixture_token());
+                // A new entry beside the store, which is what both backends'
+                // replacing write creates first. Not `store` itself: the Linux
+                // backend re-applies `0700` to a directory this test's account
+                // owns, so it would undo the staging rather than meet it. The
+                // production case -- a directory another account owns -- is
+                // one no chmod of ours can repair.
+                let write = std::fs::File::create(directory.join("probe.tmp"));
                 std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                     .expect("the directory is restored for cleanup");
 
@@ -4695,7 +4701,7 @@ mod tests {
                 );
                 assert!(
                     write.is_err(),
-                    "{scope}: the check refused a write that then succeeded"
+                    "{scope}: the check refused an entry the directory then accepted"
                 );
             }
         }
