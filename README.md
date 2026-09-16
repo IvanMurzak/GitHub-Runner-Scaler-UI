@@ -296,22 +296,24 @@ runner-manager wsl status --distribution NAME [--json]         # Report that hos
 runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
 ```
 
-On Windows, the integrated isolated backend uses **Hyper-V-isolated Windows
-containers** through a Docker-compatible Windows container runtime. The host
-must be Windows Pro, Enterprise, Education, or Server with both Hyper-V and
-Containers enabled; the runtime must be in Windows-container mode, and the
-profile image must be pinned by digest and report `windows/amd64`. These checks,
-including a real Hyper-V container bootstrap and runner-binary preflight, finish
-before Runner Manager asks GitHub for a JIT registration. `host isolation status`
-reports missing features, runtime permission, Linux-container mode, and runtime
-degradation separately.
+On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
+containers** through a Docker-compatible Windows container runtime. Candidate
+hosts are Windows Pro, Enterprise, Education, or Server with both Hyper-V and
+Containers enabled; native client and Server acceptance is still pending.
+Microsoft's current [Windows container resource-control
+surface](https://learn.microsoft.com/virtualization/windowscontainers/manage-containers/resource-controls)
+does not expose an enforceable process-count limit through Docker/HCS, so the
+backend fails closed during typed host preflight and cannot request a JIT
+registration or execute jobs. `host isolation status` reports this graduation
+block separately from missing features, runtime permission, Linux-container
+mode, and runtime degradation.
 
-The backend copies the verified runner package into a fresh container layer,
-sets CPU, memory, and disk limits, and never mounts a host directory, device, or
-container-runtime socket. It supports shell and JavaScript actions. Desktop/UI
-automation, host devices, container actions, and service containers are
-explicitly unsupported; use a different, separately accepted profile for those
-workflows. There is no process-isolation or native-execution fallback.
+Once an enforceable process-count control is available and verified, the
+backend is designed to copy the verified runner package into a fresh container
+layer, set CPU, memory, process-count, and disk limits, and never mount a host
+directory, device, or container-runtime socket. Desktop/UI automation, host
+devices, container actions, and service containers remain explicitly
+unsupported. There is no process-isolation or native-execution fallback.
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.

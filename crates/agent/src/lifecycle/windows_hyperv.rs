@@ -46,6 +46,7 @@ pub enum WindowsHyperVHostState {
     RuntimeNotInstalled,
     RuntimePermissionDenied,
     RuntimeInLinuxMode,
+    ProcessLimitUnsupported,
     RuntimeDegraded,
 }
 
@@ -54,7 +55,9 @@ impl WindowsHyperVHostState {
     pub const fn capability(self) -> ProviderCapability {
         match self {
             Self::Ready => ProviderCapability::Ready,
-            Self::UnsupportedHost | Self::RuntimeInLinuxMode => ProviderCapability::Unsupported,
+            Self::UnsupportedHost | Self::RuntimeInLinuxMode | Self::ProcessLimitUnsupported => {
+                ProviderCapability::Unsupported
+            }
             Self::HyperVUnavailable | Self::ContainersUnavailable | Self::RuntimeNotInstalled => {
                 ProviderCapability::NotInstalled
             }
@@ -81,6 +84,9 @@ impl WindowsHyperVHostState {
                 Some("grant the runner-manager service account access to the container runtime")
             }
             Self::RuntimeInLinuxMode => Some("switch the container runtime to Windows containers"),
+            Self::ProcessLimitUnsupported => Some(
+                "the Docker/HCS Windows control surface does not expose an enforceable process-count limit; this preview backend cannot graduate",
+            ),
             Self::RuntimeDegraded => Some("repair or start the Windows container runtime"),
         }
     }
@@ -624,7 +630,8 @@ impl ResourceRecord {
         let attempt = AttemptId::from_uuid(uuid::Uuid::parse_str(fields.next()?).ok()?);
         let generation = fields.next()?.to_owned();
         let image = ImageReference::new(fields.next()?).ok()?;
-        (fields.next()? == PROVIDER_VALUE && fields.next().is_none()).then_some(Self {
+        let provider = fields.next()?;
+        (provider == PROVIDER_VALUE && fields.next().is_none()).then_some(Self {
             name,
             state,
             exit_code,
@@ -772,7 +779,12 @@ fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
     if runtime.stdout.trim() != "windows" {
         return WindowsHyperVHostState::RuntimeInLinuxMode;
     }
-    WindowsHyperVHostState::Ready
+    // Microsoft documents the Windows HCS controls exposed through Docker for
+    // CPU, memory, storage, and networking, but no active-process limit. Docker
+    // Engine's `.PidsLimit` info flag reports host-kernel PID-controller support
+    // and is not evidence for a Windows/HCS process-count control. Keep this
+    // typed refusal ahead of image resolution, preparation, and therefore JIT.
+    WindowsHyperVHostState::ProcessLimitUnsupported
 }
 
 fn inspect_image(image: &ImageReference) -> Result<bool, CommandFailure> {
@@ -940,53 +952,53 @@ mod tests {
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
-                Some(output("windows\n"))
+                Some(output("windows\n")),
             ),
-            WindowsHyperVHostState::Ready
+            WindowsHyperVHostState::ProcessLimitUnsupported
         );
         assert_eq!(
-            host_probe(output("edition=Core\nhyperv=1\ncontainers=1\n"), None),
+            host_probe(output("edition=Core\nhyperv=1\ncontainers=1\n"), None,),
             WindowsHyperVHostState::UnsupportedHost
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=0\ncontainers=1\n"),
-                None
+                None,
             ),
             WindowsHyperVHostState::HyperVUnavailable
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=0\n"),
-                None
+                None,
             ),
             WindowsHyperVHostState::ContainersUnavailable
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
-                Some(Err(CommandFailure::NotFound))
+                Some(Err(CommandFailure::NotFound)),
             ),
             WindowsHyperVHostState::RuntimeNotInstalled
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
-                Some(output("linux\n"))
+                Some(output("linux\n")),
             ),
             WindowsHyperVHostState::RuntimeInLinuxMode
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
-                Some(Err(CommandFailure::PermissionDenied))
+                Some(Err(CommandFailure::PermissionDenied)),
             ),
             WindowsHyperVHostState::RuntimePermissionDenied
         );
         assert_eq!(
             host_probe(
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
-                Some(Err(CommandFailure::Failed))
+                Some(Err(CommandFailure::Failed)),
             ),
             WindowsHyperVHostState::RuntimeDegraded
         );
@@ -1002,6 +1014,19 @@ mod tests {
                 "{malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn process_limit_capability_is_fail_closed() {
+        assert_eq!(
+            WindowsHyperVHostState::ProcessLimitUnsupported.capability(),
+            ProviderCapability::Unsupported
+        );
+        assert!(
+            WindowsHyperVHostState::ProcessLimitUnsupported
+                .remedy()
+                .is_some_and(|remedy| remedy.contains("cannot graduate"))
+        );
     }
 
     #[test]
@@ -1074,6 +1099,7 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--storage-opt", "size=8192m"])
         );
+        assert!(!args.iter().any(|arg| arg == "--pids-limit"));
         for forbidden in ["--volume", "--mount", "--device", "--privileged"] {
             assert!(!args.iter().any(|arg| arg == forbidden), "{args:?}");
         }

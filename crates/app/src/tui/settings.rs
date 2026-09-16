@@ -2251,6 +2251,9 @@ Select another profile in Repositories or create one with the CLI.",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
             if !capability.unsupported_workflow_capabilities.is_empty() {
                 lines.push(FormLine::keep(format!(
                     "Unsupported workflows: {}",
@@ -2426,6 +2429,9 @@ Select another profile in Repositories or create one with the CLI.",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
             if !capability.unsupported_workflow_capabilities.is_empty() {
                 lines.push(FormLine::keep(format!(
                     "Unsupported workflows: {}",

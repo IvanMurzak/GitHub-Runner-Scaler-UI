@@ -490,6 +490,7 @@ pub struct IsolationCapability {
     pub backend: IsolationBackend,
     pub state: IsolationReadiness,
     pub remedy: Option<&'static str>,
+    pub support_notice: Option<&'static str>,
     pub unsupported_workflow_capabilities: &'static [&'static str],
 }
 
@@ -524,6 +525,16 @@ pub(crate) const fn sanitize_isolation_observation(
         backend: observation.backend,
         state: observation.state,
         remedy,
+        support_notice: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            Some(
+                "preview: native Windows client and Server job, restart, reboot, and resource-exhaustion acceptance is pending",
+            )
+        } else {
+            None
+        },
         unsupported_workflow_capabilities: if matches!(
             observation.backend,
             IsolationBackend::WindowsHyperVContainer
@@ -613,6 +624,10 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
             .map_err(write_failed("this provider status"))?;
             if let Some(remedy) = provider.remedy {
                 writeln!(out, "  remedy: {remedy}")
+                    .map_err(write_failed("this provider status"))?;
+            }
+            if let Some(notice) = provider.support_notice {
+                writeln!(out, "  support: {notice}")
                     .map_err(write_failed("this provider status"))?;
             }
             if !provider.unsupported_workflow_capabilities.is_empty() {
