@@ -697,6 +697,9 @@ pub enum WslHostCommand {
     /// Store the DrvFS recovery directory selected by the Windows provider.
     #[command(hide = true)]
     ConfigureRecovery(WslHostConfigureRecoveryArgs),
+    /// Rewrite a systemd unit an older build installed. Not for people.
+    #[command(hide = true)]
+    ConvergeService,
 }
 
 #[derive(Debug, Args, Default)]

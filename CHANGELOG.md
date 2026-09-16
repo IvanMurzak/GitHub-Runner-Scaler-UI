@@ -7,6 +7,35 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.26
+
+### Fixes
+
+- A Linux service installed by 0.4.15 or older kept its original systemd unit
+  through every upgrade. That unit handed the daemon a copy of the credential
+  frozen at service start (`LoadCredential=`) and no write access to the
+  credential store, so the daemon could neither renew the token nor see one
+  renewed by the TUI. Once the frozen token expired it stopped starting runners
+  until someone restarted it. `service status` now reports an outdated unit, and
+  a managed WSL host rewrites it and restarts the service automatically on
+  `wsl install` and on each WSL start.
+- A service whose credential GitHub rejects is no longer reported as healthy.
+  The daemon records the rejection, and `service status`, `status --json`, the
+  TUI readiness panel and the Windows TUI's WSL host rows show it with the
+  `auth login` command that fixes it. A managed WSL host in this state shows as
+  `signed out`.
+- A WSL recovery watchdog that exited while recovering left its launch fence
+  and drain request behind, and its successor never cleared them. A healthy
+  distribution then stayed fenced and started no runner, logging only
+  `allocation_lock_unavailable`. A watchdog that finds WSL healthy now retires
+  recovery coordination that no live watchdog has refreshed for five minutes.
+
+### Features
+
+- The TUI header shows every service version it can see: the local service,
+  each managed WSL host's service, and the app. A TUI started with
+  `--host wsl:NAME` labels its service as that WSL host's.
+
 ## 0.4.25
 
 ### Fixes

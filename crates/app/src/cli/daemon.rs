@@ -30,12 +30,17 @@ use runner_manager_domain::store::Store;
 use runner_manager_github::demand::RestDemand;
 use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::jit::{JitError, JitGateway, JitRunnerRequest, RestJit};
-use runner_manager_github::rest::{CancelToken, InventoryError, InventoryGateway, RestInventory};
+use runner_manager_github::rest::{
+    CancelToken, InventoryError, InventoryGateway, RefreshState, RestInventory,
+};
 use runner_manager_github::{
     AppRegistration, AuthenticatedClient, CredentialRenewal, GithubError, UserAccessToken,
 };
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
-use runner_manager_platform::service::{InstallRecord, record_github_contact};
+use runner_manager_platform::service::{
+    InstallRecord, clear_github_credential_rejection, record_github_contact,
+    record_github_credential_rejected,
+};
 use runner_manager_platform::wsl::fence::{
     DrainRequest, GuestHeartbeat, GuestRecoveryConfig,
     SCHEMA_VERSION as WSL_RECOVERY_SCHEMA_VERSION, unmanaged_runner_service_count,
@@ -1238,6 +1243,14 @@ impl TargetReconciler for ManagedTarget {
 
 trait ContactRecorder: Send + Sync + 'static {
     fn record(&self) -> Result<(), CliError>;
+
+    /// GitHub rejected the credential this pass. Best effort: the record only
+    /// informs `service status` and the TUI, and losing it must not stop the
+    /// daemon that would otherwise recover the moment a sign-in lands.
+    fn rejected(&self) {}
+
+    /// GitHub accepted the credential this pass.
+    fn accepted(&self) {}
 }
 
 struct FileContactRecorder {
@@ -1260,6 +1273,24 @@ impl ContactRecorder for FileContactRecorder {
                 format!("cannot record the last successful GitHub contact: {source}"),
             )
         })
+    }
+
+    fn rejected(&self) {
+        let Ok(_write) = self.write.lock() else {
+            return;
+        };
+        if let Err(error) = record_github_credential_rejected(&self.paths, self.clock.now()) {
+            tracing::warn!(%error, "cannot record that GitHub rejected the credential");
+        }
+    }
+
+    fn accepted(&self) {
+        let Ok(_write) = self.write.lock() else {
+            return;
+        };
+        if let Err(error) = clear_github_credential_rejection(&self.paths) {
+            tracing::warn!(%error, "cannot clear the recorded credential rejection");
+        }
     }
 }
 
@@ -1349,6 +1380,16 @@ async fn run_target_loop<T: TargetReconciler>(
         // `healthy` while doing nothing.
         if draining.is_none() && report.reached_github() {
             contacts.record()?;
+        }
+        // Published so that `service status` and the TUI can say what the log
+        // alone used to: this service is signed out, even while an operator's
+        // own commands authenticate fine with a copy it cannot see.
+        if draining.is_none() {
+            if matches!(report.failure, Some(RefreshState::Unauthorized)) {
+                contacts.rejected();
+            } else if report.reached_github() {
+                contacts.accepted();
+            }
         }
         match draining {
             Some(DrainKind::Shutdown) if target.active_owned(&report) == Some(0) => {
@@ -2395,6 +2436,72 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         healthy_loop.await.unwrap().unwrap();
         offline_loop.await.unwrap().unwrap();
+    }
+
+    #[derive(Default)]
+    struct AuthContacts {
+        rejected: AtomicUsize,
+        accepted: AtomicUsize,
+    }
+
+    impl ContactRecorder for AuthContacts {
+        fn record(&self) -> Result<(), CliError> {
+            Ok(())
+        }
+
+        fn rejected(&self) {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn accepted(&self) {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_credential_is_published_and_an_accepted_one_clears_it() {
+        // The log was the only place a signed-out service said so, and it
+        // started no runner for nine hours while `service status` and the TUI
+        // both reported a healthy host.
+        let mut rejected = ReconcileReport {
+            failure: Some(RefreshState::Unauthorized),
+            ..Default::default()
+        };
+        rejected.next_poll.delay = Duration::from_secs(1);
+        let mut accepted = ReconcileReport {
+            targets_read: 1,
+            ..Default::default()
+        };
+        accepted.next_poll.delay = Duration::from_secs(1);
+
+        for (report, rejections, acceptances) in [(rejected, true, false), (accepted, false, true)]
+        {
+            let (target, _calls) = FakeTarget::repeating(
+                fixtures::policy()
+                    .repository("acme/repo")
+                    .autoscale("home", 1)
+                    .active()
+                    .build(),
+                report,
+            );
+            let contacts = Arc::new(AuthContacts::default());
+            let (stop, _) = tokio::sync::watch::channel(false);
+            let daemon = tokio::spawn(run_target_loop(
+                target,
+                stop.subscribe(),
+                never_upgraded(),
+                Arc::clone(&contacts) as Arc<dyn ContactRecorder>,
+            ));
+            for _ in 0..3 {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(contacts.rejected.load(Ordering::SeqCst) > 0, rejections);
+            assert_eq!(contacts.accepted.load(Ordering::SeqCst) > 0, acceptances);
+            stop.send(true).unwrap();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -64,7 +64,7 @@ use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{InventoryGateway, RestInventory};
 use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
 use runner_manager_platform::paths::AppPaths;
-use runner_manager_platform::service::TaskPrincipal;
+use runner_manager_platform::service::{InstallRecord, TaskPrincipal};
 use runner_manager_platform::wsl::artifact::{
     BinaryInstaller, DEFAULT_LINUX_DESTINATION, LinuxBinaryPath, PublishedArtifact, ReleaseTarget,
     linux_target, select_exact_release,
@@ -261,6 +261,8 @@ pub fn dispatch_wsl_host(
             require_linux()?;
             if let Some(shared_root) = &args.shared_root {
                 configure_guest_recovery(context, shared_root)?;
+            } else if converge_service_definition(context)? {
+                apply_systemd_changes()?;
             }
             let unit = super::service::identity().systemd_unit();
             let mut wait = wait_for_a_stop_signal;
@@ -278,6 +280,17 @@ pub fn dispatch_wsl_host(
             configure_guest_recovery_path(context, &args.shared_root)?;
             writeln!(out, "WSL recovery fence configured.")
                 .map_err(write_failed("this configuration"))?;
+            Ok(())
+        }
+        WslHostCommand::ConvergeService => {
+            require_linux()?;
+            let message = if converge_service_definition(context)? {
+                apply_systemd_changes()?;
+                "The outdated systemd unit was rewritten and the service restarted."
+            } else {
+                "The systemd unit is current."
+            };
+            writeln!(out, "{message}").map_err(write_failed("this configuration"))?;
             Ok(())
         }
     }
@@ -472,7 +485,81 @@ fn configure_guest_recovery_path(context: &Context, shared_root: &Path) -> Resul
                 format!("cannot configure WSL recovery: {source}"),
             )
         })?;
-    converge_recovery_systemd_access(shared_root)
+    let unit_changed = converge_service_definition(context)?;
+    let drop_in_changed = converge_recovery_systemd_access(shared_root)?;
+    if unit_changed || drop_in_changed {
+        apply_systemd_changes()?;
+    }
+    Ok(())
+}
+
+/// Rewrite the boot unit when an older build wrote it, and say whether it did.
+///
+/// An upgrade replaces the service binary and nothing else, so a unit written
+/// by 0.4.7 -- which froze the credential at service start through
+/// `LoadCredential=` and could not write the credential store -- outlived every
+/// release that fixed it. This runs from the lifecycle task on each WSL start
+/// and from `wsl install`, both as root and outside the service's sandbox,
+/// which is what may write `/etc/systemd/system`. The caller reloads systemd.
+fn converge_service_definition(context: &Context) -> Result<bool, CliError> {
+    let operations = super::service::operations(context);
+    let drift = operations.definition_drift().map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot compare the installed systemd unit: {source}"),
+        )
+    })?;
+    let Some(drift) = drift.filter(|drift| drift.start_mode == StartMode::Boot) else {
+        return Ok(false);
+    };
+    let failed = |operation: &str, source: &dyn std::fmt::Display| {
+        CliError::new(
+            Failure::WslProvisioning,
+            format!(
+                "cannot {operation} the outdated systemd unit at {}: {source}",
+                drift.path.display()
+            ),
+        )
+    };
+    let directory = drift.path.parent().unwrap_or_else(|| Path::new("/"));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|source| failed("stage a replacement for", &source))?;
+    temporary
+        .write_all(drift.rendered.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| failed("write a replacement for", &source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o644))
+            .map_err(|source| failed("set the mode of the replacement for", &source))?;
+    }
+    temporary
+        .persist(&drift.path)
+        .map_err(|source| failed("replace", &source.error))?;
+    if let Ok(Some(mut record)) = InstallRecord::read(context.paths()) {
+        record.installed_by_version = env!("CARGO_PKG_VERSION").to_string();
+        let _ = record.write(context.paths());
+    }
+    tracing::warn!(
+        path = %drift.path.display(),
+        installed_by = %drift.installed_by_version,
+        "rewrote a systemd unit an older build installed"
+    );
+    Ok(true)
+}
+
+/// Reload systemd and restart an active service onto what changed.
+/// `try-restart` preserves an intentionally stopped service.
+fn apply_systemd_changes() -> Result<(), CliError> {
+    systemctl_ok(
+        &["daemon-reload"],
+        "reload systemd after converging the service",
+    )?;
+    systemctl_ok(
+        &["try-restart", "runner-manager.service"],
+        "restart the active Runner Manager service onto its converged definition",
+    )
 }
 
 /// Render one additive systemd sandbox grant. Quoting is deliberately local to
@@ -505,14 +592,14 @@ fn recovery_systemd_drop_in(shared_root: &Path) -> Result<String, CliError> {
     ))
 }
 
-/// Atomically converge the drop-in and apply it only when its bytes changed.
-/// `try-restart` preserves an intentionally stopped service, while an active
-/// adopted service immediately stops failing closed on its new fence.
-fn converge_recovery_systemd_access(shared_root: &Path) -> Result<(), CliError> {
+/// Atomically converge the drop-in and report whether its bytes changed; the
+/// caller applies it with [`apply_systemd_changes`], so an active adopted
+/// service immediately stops failing closed on its new fence.
+fn converge_recovery_systemd_access(shared_root: &Path) -> Result<bool, CliError> {
     let desired = recovery_systemd_drop_in(shared_root)?;
     let path = Path::new(RECOVERY_SYSTEMD_DROP_IN);
     if std::fs::read_to_string(path).ok().as_deref() == Some(desired.as_str()) {
-        return Ok(());
+        return Ok(false);
     }
 
     std::fs::create_dir_all(RECOVERY_SYSTEMD_DROP_IN_DIR).map_err(|source| {
@@ -550,14 +637,7 @@ fn converge_recovery_systemd_access(shared_root: &Path) -> Result<(), CliError> 
         )
     })?;
 
-    systemctl_ok(
-        &["daemon-reload"],
-        "reload systemd after configuring WSL recovery",
-    )?;
-    systemctl_ok(
-        &["try-restart", "runner-manager.service"],
-        "restart the active Runner Manager service with WSL recovery access",
-    )
+    Ok(true)
 }
 
 fn systemctl_ok(arguments: &[&str], operation: &str) -> Result<(), CliError> {
@@ -1311,6 +1391,11 @@ pub struct ServiceSnapshot {
     /// service, when the Linux status command could inspect it.
     pub binary_version: Option<String>,
     pub matches_expected: bool,
+    /// Since when GitHub has rejected the Linux service's credential, as its
+    /// daemon recorded it.
+    pub credential_rejected_since: Option<DateTime<Utc>>,
+    /// The build that wrote the systemd unit, when that unit is outdated.
+    pub definition_outdated_since_version: Option<String>,
     pub healthy: bool,
 }
 
@@ -1387,7 +1472,21 @@ impl WslStatusDocument {
                 None => "the distribution holds no credential of its own".to_string(),
             });
         }
-        if !self.service.healthy {
+        if let Some(since) = self.service.credential_rejected_since {
+            parts.push(format!(
+                "GitHub has rejected the Linux service's credential since {}; run `runner-manager                  --host wsl:{} auth login`",
+                since.to_rfc3339(),
+                self.distribution
+            ));
+        }
+        if let Some(version) = &self.service.definition_outdated_since_version {
+            parts.push(format!(
+                "the systemd unit {} was written by runner-manager {version} and is outdated; run                  `{}`",
+                self.service.unit,
+                install_remediation(&self.distribution)
+            ));
+        }
+        if !(self.service.active.as_deref() == Some("active") && self.service.matches_expected) {
             parts.push(format!(
                 "the systemd unit {} is {}; its binary is {} (expected {})",
                 self.service.unit,
@@ -1445,6 +1544,12 @@ struct LinuxProduct {
     version: String,
     #[serde(default)]
     service_binary_version: Option<String>,
+    // Absent from a guest older than 0.4.26, which is read as "not known to
+    // be rejected" rather than refused.
+    #[serde(default)]
+    service_credential_rejected_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    service_definition_outdated_since_version: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1508,6 +1613,8 @@ pub fn probe(
         active: None,
         binary_version: None,
         matches_expected: false,
+        credential_rejected_since: None,
+        definition_outdated_since_version: None,
         healthy: false,
     };
     let mut capacity = None;
@@ -1522,6 +1629,10 @@ pub fn probe(
                 service.matches_expected =
                     status.product.service_binary_version.as_deref() == Some(expected_version);
                 service.binary_version = status.product.service_binary_version;
+                service.credential_rejected_since =
+                    status.product.service_credential_rejected_since;
+                service.definition_outdated_since_version =
+                    status.product.service_definition_outdated_since_version;
                 credential.present = status.credential.present;
                 credential.unreadable = status.credential.unreadable;
                 credential.store_scope = status.credential.store_scope;
@@ -1541,7 +1652,10 @@ pub fn probe(
 
         service.enabled = systemctl_word(&invoker, distribution, &["is-enabled", unit]);
         service.active = systemctl_word(&invoker, distribution, &["is-active", unit]);
-        service.healthy = service.active.as_deref() == Some("active") && service.matches_expected;
+        service.healthy = service.active.as_deref() == Some("active")
+            && service.matches_expected
+            && service.credential_rejected_since.is_none()
+            && service.definition_outdated_since_version.is_none();
 
         diagnostics.push(docker_diagnostic(&invoker, distribution));
     }
@@ -2494,6 +2608,25 @@ impl Provisioner<'_> {
         let failed = write_failed("this install");
         let enabled = systemctl_word(invoker, distribution, &["is-enabled", &self.unit]);
         let active = systemctl_word(invoker, distribution, &["is-active", &self.unit]);
+        if matches!(active.as_deref(), Some("active"))
+            || matches!(enabled.as_deref(), Some("enabled"))
+        {
+            // Adoption keeps the registration, and with it whatever unit an
+            // older build wrote. The new binary rewrites an outdated one and
+            // restarts the service onto it; a current unit is left alone.
+            let converged = invoker
+                .exec_ok(
+                    "converge the adopted Linux service definition",
+                    self.linux(distribution)
+                        .args(["wsl-host", "converge-service"])
+                        .with_timeout(SERVICE_TIMEOUT),
+                )
+                .map_err(|source| self.stage_failure(Stage::Service, &source))?;
+            let said = converged.stdout_text();
+            if !said.is_empty() {
+                writeln!(out, "{said}").map_err(failed)?;
+            }
+        }
         if active.as_deref() == Some("active") {
             if enabled.as_deref() != Some("enabled") {
                 invoker
