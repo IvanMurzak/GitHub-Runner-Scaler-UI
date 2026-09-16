@@ -7,10 +7,14 @@ use std::io::{self, BufRead, Write};
 use std::num::NonZeroU16;
 
 use runner_manager_domain::attempt::active_count_for;
+use runner_manager_domain::execution::ExecutionPolicy;
 use runner_manager_domain::model::{
-    CachePolicy, Host, HostLabel, Label, PolicyId, RefreshInterval, ScaleTarget, TargetScope,
+    CachePolicy, Host, HostLabel, Label, PolicyId, ProfileName, RefreshInterval, ScaleTarget,
+    TargetScope,
 };
-use runner_manager_domain::policy::{PolicyMode, PolicyState, RoutingLabels, ScalePolicy};
+use runner_manager_domain::policy::{
+    NamedProfileSpec, PolicyMode, PolicyState, RoutingLabels, ScalePolicy,
+};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::WorkspaceKind;
 use runner_manager_github::InstallationAccount;
@@ -38,42 +42,54 @@ pub fn dispatch_repo(
             a.max_capacity,
             &a.labels,
             a.enable,
+            None,
+            ExecutionPolicy::Native,
             out,
         ),
         RepoCommand::List => list(context, TargetScope::Repository, out),
-        RepoCommand::SetCapacity(a) => set_capacity(
+        RepoCommand::SetCapacity(a) => apply_policy_mutation_selected(
             context,
-            ScaleTarget::repository(&a.repository).map_err(invalid)?,
-            a.max_capacity,
+            &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            a.profile.as_deref(),
+            PolicyMutation {
+                max_capacity: Some(a.max_capacity),
+                ..PolicyMutation::default()
+            },
+            None,
             out,
         ),
-        RepoCommand::SetScale(a) => set_scale(
+        RepoCommand::SetScale(a) => super::profile::set_scale_selected(
             context,
-            ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            a.profile.as_deref(),
             a.enabled,
             out,
         ),
-        RepoCommand::AddLabel(a) => mutate_labels(
+        RepoCommand::AddLabel(a) => mutate_labels_selected(
             context,
             &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            a.profile.as_deref(),
             &a.labels,
             LabelChange::Add,
             out,
         ),
-        RepoCommand::RemoveLabel(a) => mutate_labels(
+        RepoCommand::RemoveLabel(a) => mutate_labels_selected(
             context,
             &ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            a.profile.as_deref(),
             &a.labels,
             LabelChange::Remove,
             out,
         ),
         RepoCommand::SetWorkspace(a) => set_workspace(context, a, out),
-        RepoCommand::Remove(a) => remove(
+        RepoCommand::Remove(a) => remove_selected(
             context,
             ScaleTarget::repository(&a.repository).map_err(invalid)?,
+            a.profile.as_deref(),
             a.purge,
             out,
         ),
+        RepoCommand::Profile(command) => super::profile::dispatch(context, command, out),
     }
 }
 
@@ -90,6 +106,8 @@ pub fn dispatch_org(
             a.max_capacity,
             &a.labels,
             a.enable,
+            None,
+            ExecutionPolicy::Native,
             out,
         ),
         OrgCommand::List => list(context, TargetScope::Organization, out),
@@ -178,10 +196,43 @@ pub fn set_workspace(
     };
 
     let store = context.store()?;
-    let change = workspace::set_repository_workspace(context, &store, &target, kind, path)?;
+    let change = workspace::set_repository_workspace_selected(
+        context,
+        &store,
+        &target,
+        args.profile.as_deref(),
+        kind,
+        path,
+    )?;
     workspace::write_workspace_change(out, &change)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn add_named(
+    context: &Context,
+    target: ScaleTarget,
+    host_label: &str,
+    max_capacity: Option<u16>,
+    labels: &[String],
+    enable: bool,
+    name: ProfileName,
+    execution: ExecutionPolicy,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    add(
+        context,
+        target,
+        host_label,
+        max_capacity,
+        labels,
+        enable,
+        Some(name),
+        execution,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn add(
     context: &Context,
     target: ScaleTarget,
@@ -189,6 +240,8 @@ fn add(
     max_capacity: Option<u16>,
     raw_labels: &[String],
     enable: bool,
+    profile_name: Option<ProfileName>,
+    execution: ExecutionPolicy,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let host_label = HostLabel::new(raw_host_label).map_err(invalid)?;
@@ -279,32 +332,133 @@ fn add(
         .map(|target| cost_for(target, reachable))
         .collect();
     let armed = target.clone();
-    record_policy(
-        &store,
-        &host,
-        target,
-        host_label,
-        extra,
-        maximum,
-        installation_id,
-        candidate,
-        costs,
-        out,
-    )?;
+    if let Some(name) = profile_name.as_ref() {
+        record_named_policy(
+            &store,
+            &host,
+            target,
+            host_label,
+            extra,
+            maximum,
+            installation_id,
+            candidate,
+            costs,
+            name.clone(),
+            execution,
+            out,
+        )?;
+    } else {
+        record_policy(
+            &store,
+            &host,
+            target,
+            host_label,
+            extra,
+            maximum,
+            installation_id,
+            candidate,
+            costs,
+            out,
+        )?;
+    }
     // Arming is still a separate decision; `--enable` is the operator making it
     // here rather than in a second command. It runs *after* the policy exists,
     // through the same path `set-scale` uses, so the state machine and the
     // trust warning are the ones that already govern arming rather than a
     // second, quieter copy of them.
     if enable {
-        set_scale(context, armed, true, out)?;
+        if let Some(name) = profile_name {
+            super::profile::set_scale_selected(context, &armed, Some(name.as_str()), true, out)?;
+        } else {
+            set_scale(context, armed, true, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_named_policy(
+    store: &dyn Store,
+    host: &Host,
+    target: ScaleTarget,
+    host_label: HostLabel,
+    extra: Vec<Label>,
+    maximum: Option<NonZeroU16>,
+    installation_id: u64,
+    candidate: TargetCost,
+    existing_costs: Vec<TargetCost>,
+    name: ProfileName,
+    execution: ExecutionPolicy,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    if name.is_default() {
+        return Err(CliError::with_remedy(
+            Failure::InvalidArgument,
+            "profile `default` is reserved for `repo add`; no profile was stored",
+            format!("runner-manager repo add {target} --host-label {host_label}"),
+        ));
+    }
+    let same_target_exists = store
+        .policies()
+        .map_err(store_failure)?
+        .iter()
+        .any(|policy| policy.target == target);
+    if !same_target_exists
+        && let refusal @ Admission::Refused { .. } =
+            BudgetProjection::new(RefreshInterval::default(), existing_costs).admit(candidate)
+    {
+        return Err(CliError::with_remedy(
+            Failure::BudgetRefused,
+            format!("{refusal}. No profile was stored."),
+            "runner-manager host show",
+        ));
+    }
+    let mut policy = if let Some(maximum) = maximum {
+        ScalePolicy::new_named(
+            PolicyId::new_random(),
+            target,
+            installation_id,
+            host.id,
+            NamedProfileSpec {
+                requested_host_label: host_label,
+                os: host.os,
+                arch: host.architecture,
+                profile_name: name,
+                min_capacity: 0,
+                max_capacity: maximum,
+            },
+            CachePolicy::default(),
+        )
+        .map_err(invalid)?
+    } else {
+        ScalePolicy::new_named_monitor(
+            PolicyId::new_random(),
+            target,
+            installation_id,
+            host.id,
+            host_label,
+            name,
+            CachePolicy::default(),
+        )
+        .map_err(invalid)?
+    };
+    for label in extra {
+        policy.add_routing_label(label).map_err(invalid)?;
+    }
+    policy.set_execution_policy(execution).map_err(invalid)?;
+    store.insert_policy(&policy).map_err(store_failure)?;
+    write_add_result(out, &policy, host)?;
+    if let Some(labels) = policy.routing_labels() {
+        writeln!(out, "Profile: {} selector={}\nCopy runs-on: {}\nwarning: automatic demand needs a static selector; matrix expressions are not resolved.",
+            policy.profile_name(), labels.host_label(), labels.host_label())
+            .map_err(write_failed("this profile result"))?;
     }
     Ok(())
 }
 
 /// Whether a label mutation adds or removes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LabelChange {
+pub enum LabelChange {
     Add,
     Remove,
 }
@@ -335,9 +489,20 @@ fn mutate_labels(
     change: LabelChange,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    mutate_labels_selected(context, target, None, raw_labels, change, out)
+}
+
+pub fn mutate_labels_selected(
+    context: &Context,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+    raw_labels: &[String],
+    change: LabelChange,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let labels = parse_labels(raw_labels)?;
     let store = context.store()?;
-    let mut policy = find_policy(&store, target)?;
+    let mut policy = find_policy_selected(&store, target, profile)?;
     let expected = policy.revision();
 
     if policy.routing_labels().is_none() {
@@ -548,7 +713,7 @@ fn record_policy_with_id(
         .policies()
         .map_err(store_failure)?
         .iter()
-        .any(|policy| policy.target == target)
+        .any(|policy| policy.target == target && policy.profile_name().is_default())
     {
         return Err(CliError::with_remedy(
             Failure::Conflict,
@@ -557,7 +722,13 @@ fn record_policy_with_id(
         ));
     }
     let projection = BudgetProjection::new(RefreshInterval::default(), existing_costs);
-    if let refusal @ Admission::Refused { .. } = projection.admit(candidate) {
+    let same_target_exists = store
+        .policies()
+        .map_err(store_failure)?
+        .iter()
+        .any(|policy| policy.target == target);
+    if !same_target_exists && let refusal @ Admission::Refused { .. } = projection.admit(candidate)
+    {
         return Err(CliError::with_remedy(
             Failure::BudgetRefused,
             format!("{refusal}. No policy was stored."),
@@ -705,9 +876,16 @@ fn write_add_result(
             writeln!(out, "Routing labels: {}", all.join(", ")).map_err(failed)?;
             writeln!(
                 out,
-                "Next: runner-manager {} set-scale {} --enabled true",
+                "Next: runner-manager {} set-scale {}{} --enabled true",
                 scope_word(policy.target.scope()),
-                policy.target
+                policy.target,
+                if policy.target.scope() == TargetScope::Repository
+                    && !policy.profile_name().is_default()
+                {
+                    format!(" --profile {}", policy.profile_name())
+                } else {
+                    String::new()
+                }
             )
             .map_err(failed)?;
         }
@@ -724,9 +902,16 @@ fn write_add_result(
             super::auth::write_grant_consequences(out).map_err(failed)?;
             writeln!(
                 out,
-                "Promote it with: runner-manager {} set-capacity {} --max-capacity N",
+                "Promote it with: runner-manager {} set-capacity {}{} --max-capacity N",
                 scope_word(policy.target.scope()),
-                policy.target
+                policy.target,
+                if policy.target.scope() == TargetScope::Repository
+                    && !policy.profile_name().is_default()
+                {
+                    format!(" --profile {}", policy.profile_name())
+                } else {
+                    String::new()
+                }
             )
             .map_err(failed)?;
         }
@@ -780,6 +965,21 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
             policy.workspace_policy().kind()
         )
         .map_err(failed)?;
+        writeln!(
+            out,
+            "profile: {} execution={}",
+            policy.profile_name(),
+            if policy.execution_policy().is_native() {
+                "native"
+            } else {
+                "isolated"
+            }
+        )
+        .map_err(failed)?;
+        if let Some(labels) = policy.routing_labels() {
+            writeln!(out, "selector: {} (copy runs-on); warning: automatic scaling needs a static selector, not a matrix expression",
+                labels.host_label()).map_err(failed)?;
+        }
 
         // The detail line, which `d1` requires of the "repository detail" and
         // `05-user-workflows.md` requires to name the effective path, its
@@ -828,13 +1028,23 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
             .map_err(failed)?;
         }
         if policy.state() == PolicyState::RepairRequired {
-            writeln!(
-                out,
-                "repair: runner-manager {} remove {} --purge",
-                scope_word(policy.target.scope()),
-                policy.target
-            )
-            .map_err(failed)?;
+            if scope == TargetScope::Repository && !policy.profile_name().is_default() {
+                writeln!(
+                    out,
+                    "repair: runner-manager repo remove {} --profile {} --purge",
+                    policy.target,
+                    policy.profile_name()
+                )
+                .map_err(failed)?;
+            } else {
+                writeln!(
+                    out,
+                    "repair: runner-manager {} remove {} --purge",
+                    scope_word(policy.target.scope()),
+                    policy.target
+                )
+                .map_err(failed)?;
+            }
         }
     }
     if count == 0 {
@@ -903,8 +1113,16 @@ pub fn observe_scale(
     context: &Context,
     target: &ScaleTarget,
 ) -> Result<ScaleObservation, CliError> {
+    observe_scale_selected(context, target, None)
+}
+
+pub fn observe_scale_selected(
+    context: &Context,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+) -> Result<ScaleObservation, CliError> {
     let store = context.store()?;
-    let policy = find_policy(&store, target)?;
+    let policy = find_policy_selected(&store, target, profile)?;
     let attempts = store
         .attempts_for_policy(policy.id)
         .map_err(store_failure)?;
@@ -950,8 +1168,19 @@ pub fn apply_policy_mutation(
     confirmation: Option<ScaleObservation>,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    apply_policy_mutation_selected(context, target, None, mutation, confirmation, out)
+}
+
+pub fn apply_policy_mutation_selected(
+    context: &Context,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+    mutation: PolicyMutation,
+    confirmation: Option<ScaleObservation>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let store = context.store()?;
-    let mut policy = find_policy(&store, target)?;
+    let mut policy = find_policy_selected(&store, target, profile)?;
     let expected = policy.revision();
     let attempts = store
         .attempts_for_policy(policy.id)
@@ -997,7 +1226,20 @@ pub fn apply_policy_mutation(
                 })?;
             policy
                 .promote_to_autoscale(
-                    RoutingLabels::derive(&policy.requested_host_label, host.os, host.architecture),
+                    if policy.profile_name().is_default() {
+                        RoutingLabels::derive(
+                            &policy.requested_host_label,
+                            host.os,
+                            host.architecture,
+                        )
+                    } else {
+                        RoutingLabels::derive_for_profile(
+                            &policy.requested_host_label,
+                            host.os,
+                            host.architecture,
+                            policy.profile_name(),
+                        )
+                    },
                     0,
                     maximum,
                 )
@@ -1009,6 +1251,16 @@ pub fn apply_policy_mutation(
 
     if let Some(enabled) = mutation.enabled {
         if enabled {
+            if !policy.execution_policy().is_native() {
+                return Err(CliError::with_remedy(
+                    Failure::Conflict,
+                    format!(
+                        "isolated profile {} cannot be enabled: no integrated provider is ready; nothing was changed",
+                        policy.profile_name()
+                    ),
+                    "runner-manager host isolation status",
+                ));
+            }
             if policy.routing_labels().is_none() {
                 return Err(CliError::with_remedy(
                     Failure::InvalidArgument,
@@ -1087,6 +1339,10 @@ pub fn apply_policy_mutation(
         if enabled {
             writeln!(out, "Scaling enabled for {}.", policy.target).map_err(failed)?;
             writeln!(out, "{TRUST_WARNING}").map_err(failed)?;
+            if let Some(labels) = policy.routing_labels() {
+                writeln!(out, "Copy runs-on: {}\nwarning: automatic scaling requires this static selector; matrix expressions are not resolved.",
+                    labels.host_label()).map_err(failed)?;
+            }
         } else {
             writeln!(out, "{} is {} with {active} active runner(s); busy runners were not terminated. Cache and historical diagnostics were preserved.", policy.target, if active == 0 { "disabled" } else { "draining" }).map_err(failed)?;
         }
@@ -1125,22 +1381,48 @@ fn remove(
     purge: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    remove_selected(context, target, None, purge, out)
+}
+
+pub fn remove_selected(
+    context: &Context,
+    target: ScaleTarget,
+    profile: Option<&str>,
+    purge: bool,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     let store = context.store()?;
-    let policy = find_policy(&store, &target)?;
+    let policy = find_policy_selected(&store, &target, profile)?;
     let attempts = store
         .attempts_for_policy(policy.id)
         .map_err(store_failure)?;
     let active = active_count_for(policy.id, attempts.iter());
     if purge && active > 0 {
+        let message = profile.map_or_else(
+            || {
+                format!(
+                    "cannot purge {target} while {active} active runner(s) exist; no policy, cache, or diagnostics were removed"
+                )
+            },
+            |_| {
+                format!(
+                    "cannot remove {target} profile {} while {active} active runner(s) exist; no policy, cache, or diagnostics were removed",
+                    policy.profile_name()
+                )
+            },
+        );
         return Err(CliError::with_remedy(
             Failure::Conflict,
+            message,
             format!(
-                "cannot purge {target} while {active} active runner(s) exist; no policy, cache, or diagnostics were removed"
-            ),
-            format!(
-                "runner-manager {} set-scale {} --enabled false",
+                "runner-manager {} set-scale {}{} --enabled false",
                 scope_word(target.scope()),
-                target
+                target,
+                if target.scope() == TargetScope::Repository {
+                    format!(" --profile {}", policy.profile_name())
+                } else {
+                    String::new()
+                }
             ),
         ));
     }
@@ -1174,18 +1456,66 @@ fn remove(
 }
 
 fn find_policy(store: &dyn Store, target: &ScaleTarget) -> Result<ScalePolicy, CliError> {
-    store
+    find_policy_selected(store, target, None)
+}
+
+pub fn find_policy_selected(
+    store: &dyn Store,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+) -> Result<ScalePolicy, CliError> {
+    let policies: Vec<_> = store
         .policies()
         .map_err(store_failure)?
         .into_iter()
-        .find(|policy| &policy.target == target)
-        .ok_or_else(|| {
-            CliError::with_remedy(
-                Failure::NotFound,
-                format!("no policy for {target} exists"),
-                format!("runner-manager {} list", scope_word(target.scope())),
-            )
-        })
+        .filter(|policy| &policy.target == target)
+        .collect();
+    if policies.is_empty() {
+        return Err(CliError::with_remedy(
+            Failure::NotFound,
+            format!("no policy for {target} exists"),
+            format!("runner-manager {} list", scope_word(target.scope())),
+        ));
+    }
+    if let Some(raw) = profile {
+        let name = ProfileName::new(raw).map_err(invalid)?;
+        return policies
+            .into_iter()
+            .find(|policy| policy.profile_name() == &name)
+            .ok_or_else(|| {
+                CliError::with_remedy(
+                    Failure::NotFound,
+                    format!("no profile {name} for {target} exists"),
+                    format!("runner-manager repo profile list {target}"),
+                )
+            });
+    }
+    if policies.len() != 1 {
+        let choices = policies
+            .iter()
+            .map(|policy| {
+                let selector = policy
+                    .routing_labels()
+                    .map_or("monitor-only", |labels| labels.host_label().as_str());
+                format!("{} ({selector})", policy.profile_name())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::with_remedy(
+            Failure::Conflict,
+            format!(
+                "{target} has multiple profiles: {choices}. Select one explicitly; nothing was changed."
+            ),
+            format!("runner-manager repo profile show {target} --profile NAME"),
+        ));
+    }
+    policies.into_iter().next().ok_or_else(|| {
+        CliError::with_remedy(
+            Failure::NotFound,
+            format!("no policy for {target} exists"),
+            format!("runner-manager {} list", scope_word(target.scope())),
+        )
+    })
 }
 
 fn cost_for(

@@ -200,6 +200,24 @@ jobs:
     runs-on: rm-home-win-x64
 ```
 
+`repo add` creates the `default` runner profile. A repository can also have named profiles:
+
+```sh
+runner-manager repo profile add OWNER/REPO --name native --max-capacity 2 --execution native
+runner-manager repo profile add OWNER/REPO --name isolated --max-capacity 2 \
+  --execution isolated --backend oci --image registry.example/runner@sha256:<64-hex-digest>
+runner-manager repo profile list OWNER/REPO
+runner-manager host isolation status --json
+```
+
+Each named profile prints its immutable selector and a copyable `runs-on` label. Put that
+literal selector in each job's `runs-on`; a matrix expression such as `${{ matrix.runner }}`
+cannot be resolved for automatic scaling. Commands that change a repository policy need
+`--profile NAME` once the repository has several profiles. An isolated profile cannot be
+enabled until its execution provider reports ready; provider failure never starts it as a
+native runner. Keep fork and untrusted pull-request workflows off a personal host unless
+you explicitly accept that trust boundary.
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh
@@ -225,6 +243,7 @@ runner-manager host show                                       # Show capacity, 
 runner-manager host set-capacity N                             # Limit concurrent runners on this machine
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
+runner-manager host isolation status [--json]                  # Report execution provider readiness
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
@@ -238,6 +257,16 @@ runner-manager repo set-workspace OWNER/REPO --mode ephemeral  # Discard the wor
 runner-manager repo set-workspace OWNER/REPO \
   --mode persistent --path PATH                                # Keep each slot's _work between jobs
 runner-manager repo remove OWNER/REPO [--purge]                # Remove a policy and optional retained data
+runner-manager repo profile add OWNER/REPO --name NAME           # Add a named runner profile
+runner-manager repo profile list OWNER/REPO                    # List profiles and selectors
+runner-manager repo profile show OWNER/REPO [--profile NAME]   # Inspect one unambiguous profile
+runner-manager repo profile set-capacity OWNER/REPO [--profile NAME] --max-capacity N
+runner-manager repo profile set-scale OWNER/REPO [--profile NAME] --enabled BOOL
+runner-manager repo profile add-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo profile remove-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo profile set-workspace OWNER/REPO [--profile NAME] --mode ephemeral
+runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode native
+runner-manager repo profile remove OWNER/REPO [--profile NAME] [--purge]
 
 runner-manager org add ORG --host-label HOST                   # Add an organization in monitor-only mode
 runner-manager org add ORG --host-label HOST \

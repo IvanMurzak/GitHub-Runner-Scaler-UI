@@ -1,0 +1,333 @@
+mod support;
+
+use runner_manager_domain::execution::ExecutionPolicy;
+use runner_manager_domain::store::{SqliteStore, Store};
+use support::{FakeGithub, run, runner_manager, runner_manager_against};
+
+fn signed_in(data_dir: &std::path::Path) {
+    let github = FakeGithub::start();
+    github
+        .with_device_code()
+        .with_approval()
+        .with_no_installations();
+    let result = run({
+        let mut command = runner_manager_against(data_dir, &github);
+        command.args(["auth", "login"]);
+        command
+    });
+    assert_eq!(result.code, 0, "{}", result.both());
+}
+
+fn store(data_dir: &std::path::Path) -> SqliteStore {
+    SqliteStore::open(data_dir.join("config/runner-manager.sqlite3")).unwrap()
+}
+
+#[test]
+fn named_profiles_select_one_policy_and_legacy_ambiguity_is_closed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+    let add_default = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args([
+            "repo",
+            "add",
+            "octo/one",
+            "--host-label",
+            "home",
+            "--max-capacity",
+            "1",
+        ]);
+        command
+    });
+    assert_eq!(add_default.code, 0, "{}", add_default.both());
+    let add_named = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args([
+            "repo",
+            "profile",
+            "add",
+            "octo/one",
+            "--name",
+            "Py-Isolated",
+            "--max-capacity",
+            "2",
+            "--execution",
+            "native",
+        ]);
+        command
+    });
+    assert_eq!(add_named.code, 0, "{}", add_named.both());
+    assert!(add_named.stdout.contains("rm-home-"));
+    assert!(add_named.stdout.contains("py-isolated"));
+    assert!(add_named.stdout.contains("static selector"));
+
+    let policies = store(data_dir.path()).policies().unwrap();
+    assert_eq!(policies.len(), 2);
+    assert_ne!(policies[0].id, policies[1].id);
+    let ambiguous = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args(["repo", "set-capacity", "octo/one", "--max-capacity", "3"]);
+        command
+    });
+    assert_eq!(ambiguous.code, 11, "{}", ambiguous.both());
+    assert!(ambiguous.both().contains("--profile NAME"));
+    let selected = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "set-capacity",
+            "octo/one",
+            "--profile",
+            "PY-ISOLATED",
+            "--max-capacity",
+            "3",
+        ]);
+        command
+    });
+    assert_eq!(selected.code, 0, "{}", selected.both());
+    let after = store(data_dir.path()).policies().unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .find(|p| p.profile_name().as_str() == "default")
+            .unwrap()
+            .max_capacity()
+            .unwrap()
+            .get(),
+        1
+    );
+    assert_eq!(
+        after
+            .iter()
+            .find(|p| p.profile_name().as_str() == "py-isolated")
+            .unwrap()
+            .max_capacity()
+            .unwrap()
+            .get(),
+        3
+    );
+}
+
+#[test]
+fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+    let image = format!("registry.example/runner@sha256:{}", "a".repeat(64));
+    let add = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args([
+            "repo",
+            "profile",
+            "add",
+            "octo/one",
+            "--name",
+            "isolated",
+            "--max-capacity",
+            "1",
+            "--execution",
+            "isolated",
+            "--backend",
+            "oci",
+            "--image",
+            &image,
+            "--cpu",
+            "2000",
+            "--memory",
+            "2048",
+            "--disk",
+            "8192",
+        ]);
+        command
+    });
+    assert_eq!(add.code, 0, "{}", add.both());
+    let policy = store(data_dir.path()).policies().unwrap().remove(0);
+    assert!(matches!(
+        policy.execution_policy(),
+        ExecutionPolicy::Isolated { .. }
+    ));
+    let arm = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "profile",
+            "set-scale",
+            "octo/one",
+            "--profile",
+            "isolated",
+            "--enabled",
+            "true",
+        ]);
+        command
+    });
+    assert_eq!(arm.code, 11, "{}", arm.both());
+    assert!(arm.both().contains("host isolation status"));
+    assert!(
+        !store(data_dir.path())
+            .policies()
+            .unwrap()
+            .remove(0)
+            .enabled()
+    );
+
+    let status = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args(["host", "isolation", "status", "--json"]);
+        command
+    });
+    assert_eq!(status.code, 0, "{}", status.both());
+    let json: serde_json::Value = serde_json::from_str(&status.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["providers"][0]["state"], "ready");
+    assert_eq!(json["providers"][1]["state"], "not_installed");
+}
+
+#[test]
+fn profile_commands_mutate_and_remove_only_the_selected_sibling() {
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+    for args in [
+        vec![
+            "repo",
+            "add",
+            "octo/one",
+            "--host-label",
+            "home",
+            "--max-capacity",
+            "1",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "add",
+            "octo/one",
+            "--name",
+            "build",
+            "--max-capacity",
+            "2",
+        ],
+    ] {
+        let result = run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args(args);
+            command
+        });
+        assert_eq!(result.code, 0, "{}", result.both());
+    }
+    let before = store(data_dir.path()).policies().unwrap();
+    let default = before
+        .iter()
+        .find(|policy| policy.profile_name().as_str() == "default")
+        .unwrap();
+    let default_id = default.id;
+    let default_revision = default.revision();
+    let run_command = |args: &[&str]| {
+        run({
+            let mut command = runner_manager(data_dir.path());
+            command.args(args);
+            command
+        })
+    };
+    for args in [
+        vec!["repo", "profile", "list", "octo/one"],
+        vec!["repo", "profile", "show", "octo/one", "--profile", "BUILD"],
+        vec![
+            "repo",
+            "profile",
+            "add-label",
+            "octo/one",
+            "--profile",
+            "build",
+            "--label",
+            "gpu",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "remove-label",
+            "octo/one",
+            "--profile",
+            "build",
+            "--label",
+            "gpu",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "set-workspace",
+            "octo/one",
+            "--profile",
+            "build",
+            "--mode",
+            "ephemeral",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "set-execution",
+            "octo/one",
+            "--profile",
+            "build",
+            "--mode",
+            "native",
+        ],
+    ] {
+        let result = run_command(&args);
+        assert_eq!(result.code, 0, "{}: {}", args.join(" "), result.both());
+    }
+    let image = format!("registry.example/runner@sha256:{}", "b".repeat(64));
+    let isolated = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "profile",
+            "set-execution",
+            "octo/one",
+            "--profile",
+            "build",
+            "--mode",
+            "isolated",
+            "--backend",
+            "oci",
+            "--image",
+            &image,
+        ]);
+        command
+    });
+    assert_eq!(isolated.code, 0, "{}", isolated.both());
+    let current = store(data_dir.path()).policies().unwrap();
+    assert!(matches!(
+        current
+            .iter()
+            .find(|p| p.profile_name().as_str() == "build")
+            .unwrap()
+            .execution_policy(),
+        ExecutionPolicy::Isolated { .. }
+    ));
+    assert!(
+        current
+            .iter()
+            .find(|p| p.id == default_id)
+            .unwrap()
+            .execution_policy()
+            .is_native()
+    );
+    let remove = run_command(&[
+        "repo",
+        "profile",
+        "remove",
+        "octo/one",
+        "--profile",
+        "build",
+    ]);
+    assert_eq!(remove.code, 0, "{}", remove.both());
+    let after = store(data_dir.path()).policies().unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, default_id);
+    assert_eq!(after[0].revision(), default_revision);
+}
