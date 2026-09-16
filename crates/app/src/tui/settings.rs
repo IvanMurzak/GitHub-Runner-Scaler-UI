@@ -5384,6 +5384,8 @@ mod tests {
         Disk: 10240MiB  [-/+]
         Selected provider: unsupported; remedy: use Windows Pro, Enterprise, Education, or Server with
         Hyper-V support
+        Support: preview: native Windows client and Server job, restart, reboot, and resource-exhaustion
+        acceptance is pending
         Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
@@ -5434,6 +5436,8 @@ mod tests {
         Disk: 10240MiB  [-/+]
         Selected provider: unsupported; remedy: use Windows Pro, Enterprise, Education, or Server with
         Hyper-V support
+        Support: preview: native Windows client and Server job, restart, reboot, and resource-exhaustion
+        acceptance is pending
         Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
@@ -5491,6 +5495,9 @@ mod tests {
         Disk: 10240MiB  [-/+]
         Selected provider: unsupported; remedy: use Windows Pro,
         Enterprise, Education, or Server with Hyper-V support
+        Support: preview: native Windows client and Server job,
+        restart, reboot, and resource-exhaustion acceptance is
+        pending
         Unsupported workflows: desktop, devices,
         container_actions, service_containers
         Save execution [Enter/click]
