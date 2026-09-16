@@ -3,7 +3,7 @@
 //! Docker is used as the Windows container control plane, but no Docker socket,
 //! host directory, device, or credential is exposed to the container.  The
 //! verified runner package is copied into a fresh writable layer and the JIT
-//! value crosses the boundary once over `docker exec` stdin.
+//! value crosses the boundary once over the attached container stdin.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -32,7 +32,8 @@ const LABEL_IMAGE: &str = "runner-manager.image";
 const LABEL_PROVIDER: &str = "runner-manager.provider";
 const PROVIDER_VALUE: &str = "windows-hyper-v-container";
 const MAX_CAPTURE: usize = 64 * 1024;
-const BOOTSTRAP: &str = "$jit=[Console]::In.ReadToEnd(); if ([String]::IsNullOrWhiteSpace($jit)) { exit 70 }; try { $env:ACTIONS_RUNNER_INPUT_JITCONFIG=$jit; $jit=$null; & C:\\runner\\bin\\Runner.Listener.exe run } finally { Remove-Item Env:ACTIONS_RUNNER_INPUT_JITCONFIG -ErrorAction SilentlyContinue; $jit=$null }";
+const PREFLIGHT_INPUT: &str = "runner-manager-preflight-v1";
+const BOOTSTRAP: &str = "$ErrorActionPreference='Stop'; $payload=[Console]::In.ReadToEnd(); if ([String]::IsNullOrWhiteSpace($payload)) { exit 70 }; if ($payload -eq 'runner-manager-preflight-v1') { & C:\\runner\\bin\\Runner.Listener.exe --version *> $null; if ($LASTEXITCODE -ne 0) { exit 72 }; exit 0 }; $psi=[System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName='C:\\runner\\bin\\Runner.Listener.exe'; $psi.Arguments='run'; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; $psi.EnvironmentVariables['ACTIONS_RUNNER_INPUT_JITCONFIG']=$payload; $listener=[System.Diagnostics.Process]::new(); $listener.StartInfo=$psi; try { $started=$listener.Start() } finally { $psi.EnvironmentVariables.Remove('ACTIONS_RUNNER_INPUT_JITCONFIG'); $payload=$null }; if (-not $started) { exit 71 }; $listener.WaitForExit(); exit $listener.ExitCode";
 
 /// Host-only preflight detail. It is a closed vocabulary and never carries
 /// provider output, so CLI/TUI surfaces cannot accidentally expose it.
@@ -247,23 +248,37 @@ impl ExecutionProvider for WindowsHyperVContainers {
             return Err(failure("Windows Hyper-V policy is invalid"));
         };
 
-        if let Ok(Some(found)) = Self::inspect_record(&expected.name) {
-            if found.same_owner(&expected) {
-                return Ok(PreparedEnvironment::isolated(
-                    attempt.id,
-                    self.identity_for(attempt, expected.name)
-                        .ok_or_else(|| failure("Windows Hyper-V identity is invalid"))?,
+        let exists = match Self::inspect_record(&expected.name) {
+            Ok(Some(found))
+                if found.same_owner(&expected)
+                    && matches!(found.state.as_str(), "created" | "exited") =>
+            {
+                true
+            }
+            Ok(Some(found)) if found.same_owner(&expected) => {
+                self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+                return Err(failure(
+                    "Windows Hyper-V container state is incompatible with preparation",
                 ));
             }
-            self.note(attempt.id, ProviderDiagnostic::OwnershipMismatch);
-            return Err(failure("Windows Hyper-V container ownership mismatch"));
-        }
+            Ok(Some(_)) => {
+                self.note(attempt.id, ProviderDiagnostic::OwnershipMismatch);
+                return Err(failure("Windows Hyper-V container ownership mismatch"));
+            }
+            Ok(None) => false,
+            Err(_) => {
+                self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+                return Err(failure("Windows Hyper-V container inspection failed"));
+            }
+        };
 
-        let create = Self::docker(&create_args(&expected, *resources))
-            .map_err(|_| failure("Windows Hyper-V container creation failed"))?;
-        if !create.success {
-            self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
-            return Err(failure("Windows Hyper-V container creation failed"));
+        if !exists {
+            let create = Self::docker(&create_args(&expected, *resources))
+                .map_err(|_| failure("Windows Hyper-V container creation failed"))?;
+            if !create.success {
+                self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+                return Err(failure("Windows Hyper-V container creation failed"));
+            }
         }
 
         let source = format!(
@@ -278,6 +293,56 @@ impl ExecutionProvider for WindowsHyperVContainers {
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
                 "runner package copy into Windows Hyper-V container failed",
+            ));
+        }
+
+        // Exercise the exact Hyper-V container, bootstrap, and copied runner
+        // before GitHub issues a JIT registration. An OS/architecture match is
+        // insufficient: an image can still lack PowerShell or the libraries
+        // Runner.Listener needs. The fixed marker is non-secret and the same
+        // stopped container is restarted later with the one-time JIT input.
+        let mut preflight = Command::new("docker")
+            .args([
+                OsStr::new("start"),
+                OsStr::new("--attach"),
+                OsStr::new("--interactive"),
+                OsStr::new(expected.name.as_str()),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let preflight_ok = match &mut preflight {
+            Ok(child) => {
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("docker stdin unavailable"))
+                    .and_then(|mut stdin| {
+                        stdin.write_all(PREFLIGHT_INPUT.as_bytes())?;
+                        stdin.flush()
+                    })
+                    .is_ok()
+                    && child.wait().is_ok_and(|status| status.success())
+            }
+            Err(_) => false,
+        };
+        let preflight_record = Self::inspect_record(&expected.name).ok().flatten();
+        if !preflight_ok
+            || !preflight_record.is_some_and(|record| {
+                record.same_owner(&expected)
+                    && record.state == "exited"
+                    && record.exit_code == Some(0)
+            })
+        {
+            if let Ok(child) = &mut preflight {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
+            self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+            return Err(failure(
+                "Windows Hyper-V image bootstrap compatibility check failed",
             ));
         }
 
@@ -672,10 +737,20 @@ fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
     if !supported_edition(edition) {
         return WindowsHyperVHostState::UnsupportedHost;
     }
-    if value(&system.stdout, "hyperv") == Some("0") {
+    let Some(hyper_v_features) =
+        value(&system.stdout, "hyperv").and_then(|count| count.parse::<u32>().ok())
+    else {
+        return WindowsHyperVHostState::RuntimeDegraded;
+    };
+    if hyper_v_features == 0 {
         return WindowsHyperVHostState::HyperVUnavailable;
     }
-    if value(&system.stdout, "containers") == Some("0") {
+    let Some(container_features) =
+        value(&system.stdout, "containers").and_then(|count| count.parse::<u32>().ok())
+    else {
+        return WindowsHyperVHostState::RuntimeDegraded;
+    };
+    if container_features == 0 {
         return WindowsHyperVHostState::ContainersUnavailable;
     }
     let runtime = match commands.run(
@@ -912,6 +987,18 @@ mod tests {
             ),
             WindowsHyperVHostState::RuntimeDegraded
         );
+        for malformed in [
+            "edition=Professional\ncontainers=1\n",
+            "edition=Professional\nhyperv=not-a-count\ncontainers=1\n",
+            "edition=Professional\nhyperv=1\n",
+            "edition=Professional\nhyperv=1\ncontainers=not-a-count\n",
+        ] {
+            assert_eq!(
+                host_probe(output(malformed), None),
+                WindowsHyperVHostState::RuntimeDegraded,
+                "{malformed:?}"
+            );
+        }
     }
 
     #[test]
@@ -945,6 +1032,9 @@ mod tests {
     fn bootstrap_never_embeds_the_jit_value_in_docker_metadata() {
         assert!(BOOTSTRAP.contains("[Console]::In.ReadToEnd()"));
         assert!(BOOTSTRAP.contains("ACTIONS_RUNNER_INPUT_JITCONFIG"));
+        assert!(BOOTSTRAP.contains("ProcessStartInfo"));
+        assert!(BOOTSTRAP.contains(PREFLIGHT_INPUT));
+        assert!(!BOOTSTRAP.contains("$env:ACTIONS_RUNNER_INPUT_JITCONFIG"));
         assert!(!BOOTSTRAP.contains("fixture-jit-value"));
     }
 

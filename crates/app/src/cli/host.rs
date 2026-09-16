@@ -614,6 +614,10 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
                 provider.state.display_name()
             )
             .map_err(write_failed("this provider status"))?;
+            if let Some(remedy) = provider.remedy {
+                writeln!(out, "  remedy: {remedy}")
+                    .map_err(write_failed("this provider status"))?;
+            }
             if !provider.unsupported_workflow_capabilities.is_empty() {
                 writeln!(
                     out,

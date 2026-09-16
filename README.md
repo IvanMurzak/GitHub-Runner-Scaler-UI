@@ -301,9 +301,10 @@ containers** through a Docker-compatible Windows container runtime. The host
 must be Windows Pro, Enterprise, Education, or Server with both Hyper-V and
 Containers enabled; the runtime must be in Windows-container mode, and the
 profile image must be pinned by digest and report `windows/amd64`. These checks,
-including a real Hyper-V container create, finish before Runner Manager asks
-GitHub for a JIT registration. `host isolation status` reports missing features,
-runtime permission, Linux-container mode, and runtime degradation separately.
+including a real Hyper-V container bootstrap and runner-binary preflight, finish
+before Runner Manager asks GitHub for a JIT registration. `host isolation status`
+reports missing features, runtime permission, Linux-container mode, and runtime
+degradation separately.
 
 The backend copies the verified runner package into a fresh container layer,
 sets CPU, memory, and disk limits, and never mounts a host directory, device, or
