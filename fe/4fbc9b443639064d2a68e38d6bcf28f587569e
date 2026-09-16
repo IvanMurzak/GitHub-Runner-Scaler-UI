@@ -1,0 +1,33 @@
+crates/app/tests/profile_commands.rs
+  s_5801a853f78e8a::t_a9c57cf1e4bf93 267-276
+  s_5801a853f78e8a::t_6af6712864142e 251
+crates/agent/src/lifecycle/windows_hyperv.rs
+  s_5801a853f78e8a::t_c408678c2f432c 49,87,89,633-634
+  s_5801a853f78e8a::t_eb34793cab21d3 955,966,973,980,987,994,1019-1030
+  s_5801a853f78e8a::t_861dee8a4c11e1 58-60,88,782-787,957,960,1001,1031,1102
+README.md
+  s_5801a853f78e8a::t_a9c57cf1e4bf93 300-301,310
+  s_5801a853f78e8a::t_60229394200ea5 299,302-309,311-316
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_a9c57cf1e4bf93 493,528-537,629-631
+  s_5801a853f78e8a::t_afd1243d01a1d9 632
+crates/app/src/tui/settings.rs
+  s_5801a853f78e8a::t_a9c57cf1e4bf93 2254-2256,2432-2433
+  s_5801a853f78e8a::t_c5dcca61073c78 2434
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fe4fbc9b443639064d2a68e38d6bcf28f587569e",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
