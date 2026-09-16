@@ -458,6 +458,9 @@ pub enum IsolationReadiness {
     Ready,
     NotInstalled,
     Unsupported,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    Degraded,
 }
 
 impl IsolationReadiness {
@@ -467,6 +470,9 @@ impl IsolationReadiness {
             Self::Ready => "ready",
             Self::NotInstalled => "not installed",
             Self::Unsupported => "unsupported",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::Degraded => "degraded",
         }
     }
 }
@@ -504,7 +510,7 @@ pub(crate) const fn sanitize_isolation_observation(
             Some("use a supported host and provider")
         }
         (IsolationBackend::VirtualMachine, IsolationReadiness::NotInstalled) => {
-            Some("install and configure a virtual machine execution provider")
+            Some("install and configure the macOS Virtualization.framework helper")
         }
         _ => Some("install and configure an integrated isolation provider"),
     };
@@ -517,30 +523,44 @@ pub(crate) const fn sanitize_isolation_observation(
 
 #[must_use]
 pub fn isolation_capabilities() -> Vec<IsolationCapability> {
-    // The currently shipped provider executes native processes only. These
-    // states are deliberately closed: an isolated profile cannot be armed on
-    // the strength of a runtime that the agent has not integrated.
-    [
-        (IsolationBackend::Native, IsolationReadiness::Ready),
-        (IsolationBackend::Oci, IsolationReadiness::NotInstalled),
-        (
-            IsolationBackend::WindowsHyperVContainer,
-            IsolationReadiness::Unsupported,
-        ),
-        (
-            IsolationBackend::VirtualMachine,
-            IsolationReadiness::NotInstalled,
-        ),
-    ]
-    .into_iter()
-    .map(|(backend, state)| {
+    let capability = |backend, state| {
         sanitize_isolation_observation(IsolationObservation {
             backend,
             state,
             raw_output: None,
         })
-    })
-    .collect()
+    };
+    let host = runner_manager_agent::lifecycle::MacOsVmProcesses::host_state();
+    let mut vm = capability(
+        IsolationBackend::VirtualMachine,
+        readiness_from_provider_capability(host.capability()),
+    );
+    vm.remedy = host.remedy();
+    vec![
+        capability(IsolationBackend::Native, IsolationReadiness::Ready),
+        capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        capability(
+            IsolationBackend::WindowsHyperVContainer,
+            IsolationReadiness::Unsupported,
+        ),
+        vm,
+    ]
+}
+
+const fn readiness_from_provider_capability(
+    capability: runner_manager_agent::lifecycle::ProviderCapability,
+) -> IsolationReadiness {
+    use runner_manager_agent::lifecycle::ProviderCapability;
+    match capability {
+        ProviderCapability::Ready => IsolationReadiness::Ready,
+        ProviderCapability::Unsupported => IsolationReadiness::Unsupported,
+        ProviderCapability::NotInstalled => IsolationReadiness::NotInstalled,
+        ProviderCapability::PermissionDenied => IsolationReadiness::PermissionDenied,
+        ProviderCapability::ImageUnavailableOrIncompatible => {
+            IsolationReadiness::ImageUnavailableOrIncompatible
+        }
+        ProviderCapability::Degraded => IsolationReadiness::Degraded,
+    }
 }
 
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
@@ -566,10 +586,14 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
                 provider.state.display_name()
             )
             .map_err(write_failed("this provider status"))?;
+            if let Some(remedy) = provider.remedy {
+                writeln!(out, "  remedy: {remedy}")
+                    .map_err(write_failed("this provider status"))?;
+            }
         }
         writeln!(
             out,
-            "Isolated scaling remains unavailable until a provider is installed and integrated."
+            "Provider and pinned-template readiness are checked again before JIT registration."
         )
         .map_err(write_failed("this provider status"))?;
     }

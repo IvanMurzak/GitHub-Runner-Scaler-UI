@@ -2265,7 +2265,7 @@ Select another profile in Repositories or create one with the CLI.",
             ))
         }));
         lines.push(FormLine::text(
-            "Isolated scaling remains unavailable until a provider is installed and integrated.",
+            "Provider and pinned-template readiness are checked again before JIT registration.",
         ));
         lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
         *control += 1;
@@ -2828,11 +2828,20 @@ fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
             IsolationReadiness::NotInstalled,
         ),
     };
-    cli::host::sanitize_isolation_observation(IsolationObservation {
+    let fallback = cli::host::sanitize_isolation_observation(IsolationObservation {
         backend,
         state,
         raw_output: None,
-    })
+    });
+    let wanted = if matches!(backend, IsolationBackend::Auto) && cfg!(target_os = "macos") {
+        IsolationBackend::VirtualMachine
+    } else {
+        backend
+    };
+    cli::host::isolation_capabilities()
+        .into_iter()
+        .find(|capability| capability.backend == wanted)
+        .unwrap_or(fallback)
 }
 
 fn invalid(source: impl std::fmt::Display) -> CliError {
@@ -5307,8 +5316,8 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Virtual machine provider: unsupported
+        Provider and pinned-template readiness are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5355,8 +5364,8 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Virtual machine provider: unsupported
+        Provider and pinned-template readiness are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5403,8 +5412,8 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Virtual machine provider: unsupported
+        Provider and pinned-template readiness are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5503,8 +5512,8 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Virtual machine provider: unsupported
+        Provider and pinned-template readiness are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5554,8 +5563,8 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Virtual machine provider: unsupported
+        Provider and pinned-template readiness are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 

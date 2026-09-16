@@ -218,6 +218,14 @@ enabled until its execution provider reports ready; provider failure never start
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
 you explicitly accept that trust boundary.
 
+On macOS, `--backend virtual-machine --image vm-version:<version>` uses an
+operator-installed `runner-manager-macos-vm` helper backed by
+Virtualization.framework. Runner Manager never installs a macOS image. The
+helper, entitlement, same-architecture pinned template, private guest channel,
+fresh-disk support, and resource enforcement must all pass
+`runner-manager host isolation status` before the profile can be enabled or JIT
+can be requested. See [the macOS VM helper protocol](docs/macos-vm-helper.md).
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh

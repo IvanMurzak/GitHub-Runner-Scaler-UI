@@ -49,6 +49,9 @@ use crate::reconcile::{
     ReplacementIntent, RunnerLauncher,
 };
 
+mod macos_vm;
+pub use macos_vm::{MacOsVmHostState, MacOsVmProcesses};
+
 const IDENTITY_FILE: &str = ".runner-process.json";
 const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
 const UNRESOLVED_PROCESS_FILE: &str = ".runner-process.unresolved";
