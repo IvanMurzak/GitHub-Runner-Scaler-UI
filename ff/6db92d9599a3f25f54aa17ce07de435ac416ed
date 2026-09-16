@@ -1,0 +1,21 @@
+crates/app/src/tui/settings.rs
+  s_5801a853f78e8a::t_79589e3df5c529 4246,4248-4252
+  s_5801a853f78e8a::t_2c26c060044212 4237-4245,4247
+  s_5801a853f78e8a::t_05c56870de50c1 4253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ff6db92d9599a3f25f54aa17ce07de435ac416ed",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
