@@ -1,0 +1,29 @@
+crates/app/tests/profile_commands.rs
+  s_5801a853f78e8a::t_8297e405e86332 75-88,197-227,326-384,421-476
+crates/app/src/cli/policy.rs
+  s_5801a853f78e8a::t_a3a718ad8d943e 1504-1513,1519
+README.md
+  s_5801a853f78e8a::t_86ca53519f4c5a 272
+  s_5801a853f78e8a::t_a3a718ad8d943e 252-256,258-260,268-269,271
+crates/app/src/cli/profile.rs
+  s_5801a853f78e8a::t_a3a718ad8d943e 186-198,311-324,327,330,332,334-335,340
+crates/app/src/cli/workspace.rs
+  s_5801a853f78e8a::t_a3a718ad8d943e 903-905
+  s_5801a853f78e8a::t_ad44dd1eff7874 899-902
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d031a135d68e2b24685f6017a6f716cbd659f7a1",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
