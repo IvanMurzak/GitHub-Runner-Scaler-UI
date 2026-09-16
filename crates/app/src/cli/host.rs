@@ -422,7 +422,38 @@ pub fn dispatch(
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
+        HostCommand::Isolation(super::HostIsolationCommand::Status(args)) => {
+            isolation_status(args.json, out)
+        }
     }
+}
+
+fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+    // The currently shipped provider executes native processes only. These
+    // states are deliberately closed: an isolated profile cannot be armed on
+    // the strength of a runtime that the agent has not integrated.
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "providers": [
+            {"backend": "native", "state": "ready", "remedy": null},
+            {"backend": "oci", "state": "not_installed", "remedy": "install and configure an OCI execution provider"},
+            {"backend": "windows_hyper_v_container", "state": "unsupported", "remedy": "use a supported host and provider"},
+            {"backend": "virtual_machine", "state": "not_installed", "remedy": "install and configure a virtual machine execution provider"}
+        ]
+    });
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&document)
+                .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?
+        )
+        .map_err(write_failed("this provider status"))?;
+    } else {
+        writeln!(out, "Native provider: ready\nOCI provider: not installed\nHyper-V container provider: unsupported\nVirtual machine provider: not installed\nIsolated scaling remains unavailable until a provider is installed and integrated.")
+            .map_err(write_failed("this provider status"))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

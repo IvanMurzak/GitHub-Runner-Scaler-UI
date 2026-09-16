@@ -396,6 +396,7 @@ impl PolicySettings {
             context,
             &RepoSetWorkspaceArgs {
                 repository: self.target.to_string(),
+                profile: None,
                 mode: match kind {
                     WorkspaceKind::Ephemeral => WorkspaceMode::Ephemeral,
                     WorkspaceKind::Persistent => WorkspaceMode::Persistent,
@@ -2008,6 +2009,7 @@ fn dispatch_capacity(
             context,
             &RepoCommand::SetCapacity(RepoSetCapacityArgs {
                 repository: target.to_string(),
+                profile: None,
                 max_capacity: maximum,
             }),
             out,
@@ -2035,6 +2037,7 @@ fn dispatch_scale(
             context,
             &RepoCommand::SetScale(RepoSetScaleArgs {
                 repository: target.to_string(),
+                profile: None,
                 enabled,
             }),
             out,
@@ -3226,6 +3229,7 @@ mod tests {
             &through_cli.context,
             &RepoCommand::SetWorkspace(RepoSetWorkspaceArgs {
                 repository: through_cli.target.to_string(),
+                profile: None,
                 mode: WorkspaceMode::Persistent,
                 path: Some(slots.clone()),
             }),
@@ -3248,6 +3252,7 @@ mod tests {
             &through_cli.context,
             &RepoCommand::SetWorkspace(RepoSetWorkspaceArgs {
                 repository: through_cli.target.to_string(),
+                profile: None,
                 mode: WorkspaceMode::Ephemeral,
                 path: None,
             }),
