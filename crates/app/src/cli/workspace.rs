@@ -896,14 +896,18 @@ pub fn set_repository_workspace_selected(
         }
     };
 
+    policy
+        .set_workspace_policy(requested.clone())
+        .map_err(|source| CliError::new(Failure::InvalidArgument, source.to_string()))?;
+
+    // Validate the complete policy shape before creating a requested root.
+    // In particular, isolated execution requires an ephemeral workspace, and
+    // that refusal must leave no directory behind.
     let created = match requested.root() {
         Some(root) => validated_leaf(context.paths(), &host_root, &policies, &owner, root)?,
         None => None,
     };
 
-    policy
-        .set_workspace_policy(requested.clone())
-        .map_err(|source| CliError::new(Failure::InvalidArgument, source.to_string()))?;
     if policy.revision() != expected_revision {
         store
             .update_policy_confirming_uncleaned_count(&policy, expected_revision, affected.total())

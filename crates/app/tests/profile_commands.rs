@@ -72,7 +72,20 @@ fn named_profiles_select_one_policy_and_legacy_ambiguity_is_closed() {
         command
     });
     assert_eq!(ambiguous.code, 11, "{}", ambiguous.both());
-    assert!(ambiguous.both().contains("--profile NAME"));
+    assert!(
+        ambiguous
+            .both()
+            .contains("repo profile show octo/one --profile default"),
+        "{}",
+        ambiguous.both()
+    );
+    assert!(
+        ambiguous
+            .both()
+            .contains("repo profile show octo/one --profile py-isolated"),
+        "{}",
+        ambiguous.both()
+    );
     let selected = run({
         let mut command = runner_manager(data_dir.path());
         command.args([
@@ -181,8 +194,37 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
     assert_eq!(status.code, 0, "{}", status.both());
     let json: serde_json::Value = serde_json::from_str(&status.stdout).unwrap();
     assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["providers"][0]["state"], "ready");
-    assert_eq!(json["providers"][1]["state"], "not_installed");
+    let providers = json["providers"].as_array().expect("provider array");
+    assert_eq!(providers.len(), 4);
+    assert_eq!(
+        providers
+            .iter()
+            .map(|provider| provider["backend"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "native",
+            "oci",
+            "windows_hyper_v_container",
+            "virtual_machine"
+        ]
+    );
+    for provider in providers {
+        assert_eq!(provider.as_object().unwrap().len(), 3, "{provider}");
+        assert!(
+            matches!(
+                provider["state"].as_str(),
+                Some(
+                    "ready"
+                        | "unsupported"
+                        | "not_installed"
+                        | "permission_denied"
+                        | "image_unavailable_or_incompatible"
+                        | "degraded"
+                )
+            ),
+            "{provider}"
+        );
+    }
 }
 
 #[test]
@@ -281,6 +323,65 @@ fn profile_commands_mutate_and_remove_only_the_selected_sibling() {
         assert_eq!(result.code, 0, "{}: {}", args.join(" "), result.both());
     }
     let image = format!("registry.example/runner@sha256:{}", "b".repeat(64));
+    let enabled = run_command(&[
+        "repo",
+        "profile",
+        "set-scale",
+        "octo/one",
+        "--profile",
+        "build",
+        "--enabled",
+        "true",
+    ]);
+    assert_eq!(enabled.code, 0, "{}", enabled.both());
+    let isolated_while_enabled = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "profile",
+            "set-execution",
+            "octo/one",
+            "--profile",
+            "build",
+            "--mode",
+            "isolated",
+            "--backend",
+            "oci",
+            "--image",
+            &image,
+        ]);
+        command
+    });
+    assert_eq!(
+        isolated_while_enabled.code,
+        11,
+        "{}",
+        isolated_while_enabled.both()
+    );
+    assert!(
+        isolated_while_enabled
+            .both()
+            .contains("set-scale octo/one --profile build --enabled false")
+    );
+    let unchanged = store(data_dir.path()).policies().unwrap();
+    let build = unchanged
+        .iter()
+        .find(|policy| policy.profile_name().as_str() == "build")
+        .unwrap();
+    assert!(build.enabled());
+    assert!(build.execution_policy().is_native());
+
+    let disabled = run_command(&[
+        "repo",
+        "profile",
+        "set-scale",
+        "octo/one",
+        "--profile",
+        "build",
+        "--enabled",
+        "false",
+    ]);
+    assert_eq!(disabled.code, 0, "{}", disabled.both());
     let isolated = run({
         let mut command = runner_manager(data_dir.path());
         command.args([
@@ -317,6 +418,62 @@ fn profile_commands_mutate_and_remove_only_the_selected_sibling() {
             .execution_policy()
             .is_native()
     );
+
+    let workspace_parent = tempfile::tempdir().unwrap();
+    let workspace_root = workspace_parent.path().join("isolated-slots");
+    let workspace_text = workspace_root.to_str().unwrap();
+    let persistent = run_command(&[
+        "repo",
+        "profile",
+        "set-workspace",
+        "octo/one",
+        "--profile",
+        "build",
+        "--mode",
+        "persistent",
+        "--path",
+        workspace_text,
+    ]);
+    assert_eq!(persistent.code, 9, "{}", persistent.both());
+    assert!(persistent.both().contains("isolated execution"));
+    assert!(
+        !workspace_root.exists(),
+        "an invalid isolated workspace must not create {}",
+        workspace_root.display()
+    );
+
+    let add_label = run_command(&[
+        "repo",
+        "profile",
+        "add-label",
+        "octo/one",
+        "--profile",
+        "build",
+        "--label",
+        "gpu",
+    ]);
+    assert_eq!(add_label.code, 0, "{}", add_label.both());
+    let show = run_command(&["repo", "profile", "show", "octo/one", "--profile", "build"]);
+    assert_eq!(show.code, 0, "{}", show.both());
+    for field in [
+        "host_label=home",
+        "labels=rm-home-",
+        ",gpu",
+        "state=",
+        "min=0",
+        "workspace=ephemeral",
+        "workspace_path=-",
+        "execution=isolated",
+        "cpu_millis",
+        "memory_mib",
+        "disk_mib",
+    ] {
+        assert!(
+            show.stdout.contains(field),
+            "missing {field:?}: {}",
+            show.stdout
+        );
+    }
     let remove = run_command(&[
         "repo",
         "profile",

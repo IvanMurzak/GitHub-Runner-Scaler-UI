@@ -183,6 +183,19 @@ pub fn dispatch(
             let execution = execution(args.mode, &args.isolation)?;
             let store = context.store()?;
             let mut policy = policy::find_policy_selected(&store, &target, profile)?;
+            if policy.enabled() && !execution.is_native() {
+                return Err(CliError::with_remedy(
+                    Failure::Conflict,
+                    format!(
+                        "profile {} is enabled and no integrated isolation provider is ready; execution was not changed",
+                        policy.profile_name()
+                    ),
+                    format!(
+                        "runner-manager repo profile set-scale {target} --profile {} --enabled false",
+                        policy.profile_name()
+                    ),
+                ));
+            }
             let expected = policy.revision();
             let uncleaned = store
                 .uncleaned_attempts_for_policy(policy.id)
@@ -295,17 +308,36 @@ fn show_policy(
     let selector = policy
         .routing_labels()
         .map(|labels| labels.host_label().as_str());
+    let labels = policy.routing_labels().map_or_else(
+        || "-".to_string(),
+        |labels| {
+            labels
+                .iter()
+                .map(|label| label.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let workspace_path = policy
+        .workspace_policy()
+        .root()
+        .map_or("-", |root| root.as_str());
     writeln!(
         out,
-        "{} profile={} selector={} enabled={} max={} workspace={} execution={}",
+        "{} profile={} host_label={} selector={} labels={} enabled={} state={} min={} max={} workspace={} workspace_path={} execution={}",
         policy.target,
         policy.profile_name(),
+        policy.requested_host_label,
         selector.unwrap_or("monitor-only"),
+        labels,
         policy.enabled(),
+        policy.state(),
+        policy.min_capacity(),
         policy
             .max_capacity()
             .map_or_else(|| "-".to_string(), |maximum| maximum.to_string()),
         policy.workspace_policy().kind(),
+        workspace_path,
         if policy.execution_policy().is_native() {
             "native"
         } else {

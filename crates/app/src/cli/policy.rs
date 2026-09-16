@@ -1501,12 +1501,22 @@ pub fn find_policy_selected(
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let corrected_commands = policies
+            .iter()
+            .map(|policy| {
+                format!(
+                    "runner-manager repo profile show {target} --profile {}",
+                    policy.profile_name()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(CliError::with_remedy(
             Failure::Conflict,
             format!(
                 "{target} has multiple profiles: {choices}. Select one explicitly; nothing was changed."
             ),
-            format!("runner-manager repo profile show {target} --profile NAME"),
+            corrected_commands,
         ));
     }
     policies.into_iter().next().ok_or_else(|| {
