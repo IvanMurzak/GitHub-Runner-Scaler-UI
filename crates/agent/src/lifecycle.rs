@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use runner_manager_domain::attempt::{
-    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, RecoveryDecision,
-    RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize, recovery_decision,
+    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, IsolationProviderFailure,
+    RecoveryDecision, RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize,
+    recovery_decision,
 };
 use runner_manager_domain::execution::{AttemptExecution, Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
@@ -46,7 +47,7 @@ use secrecy::SecretString;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    ReplacementIntent, RunnerLauncher,
+    ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
 
 const IDENTITY_FILE: &str = ".runner-process.json";
@@ -1268,21 +1269,29 @@ pub enum ProviderCapability {
 }
 
 impl ProviderCapability {
-    fn refusal(self) -> FailureReason {
-        FailureReason::Other(
-            match self {
-                Self::Ready => "provider reported ready",
-                Self::Unsupported => "execution provider unavailable",
-                Self::NotInstalled => "isolation provider not installed",
-                Self::PermissionDenied => "isolation provider permission denied",
-                Self::ImageUnavailableOrIncompatible => {
-                    "isolated image unavailable or incompatible"
-                }
-                Self::DiskQuotaUnavailable => "rootless OCI writable-layer disk quota unavailable",
-                Self::Degraded => "isolation provider degraded",
+    pub(crate) fn refusal(self) -> FailureReason {
+        FailureReason::IsolationProvider(match self {
+            Self::Ready | Self::Degraded => IsolationProviderFailure::Degraded,
+            Self::Unsupported => IsolationProviderFailure::Unsupported,
+            Self::NotInstalled => IsolationProviderFailure::NotInstalled,
+            Self::PermissionDenied => IsolationProviderFailure::PermissionDenied,
+            Self::ImageUnavailableOrIncompatible => {
+                IsolationProviderFailure::ImageUnavailableOrIncompatible
             }
-            .into(),
-        )
+            Self::DiskQuotaUnavailable => IsolationProviderFailure::DiskQuotaUnavailable,
+        })
+    }
+}
+
+/// Only the closed isolation category may cross from an adapter into the
+/// attempt journal or operator error. Arbitrary adapter text could echo JIT.
+fn safe_isolation_reason(
+    reason: FailureReason,
+    fallback: IsolationProviderFailure,
+) -> FailureReason {
+    match reason {
+        FailureReason::IsolationProvider(_) => reason,
+        _ => FailureReason::IsolationProvider(fallback),
     }
 }
 
@@ -3071,11 +3080,16 @@ impl LifecycleLauncher {
         })?;
         // Intentionally constructed from typed local facts, not runner output.
         // Raw child output can contain workflow secrets and is never copied.
+        let reason_kind = match outcome {
+            AttemptOutcome::Failed { reason } => failure_reason_kind(reason),
+            _ => "none",
+        };
         let diagnostic = format!(
-            "attempt_id={}\npolicy_id={}\noutcome={}\n",
+            "attempt_id={}\npolicy_id={}\noutcome={}\nreason={}\n",
             attempt.id,
             attempt.policy_id,
-            OutcomeKind::of(outcome).as_str()
+            OutcomeKind::of(outcome).as_str(),
+            reason_kind,
         );
         fs::write(
             self.diagnostics_root.join(format!("{}.log", attempt.id)),
@@ -3431,10 +3445,12 @@ impl LifecycleLauncher {
         if capability != ProviderCapability::Ready {
             return Err(LifecycleError::Failed(capability.refusal()));
         }
-        let resolved = self.ports.processes.resolve(policy).map_err(|_| {
-            LifecycleError::Failed(FailureReason::Other(
-                "isolation provider resolution failed".into(),
-            ))
+        let resolved = self.ports.processes.resolve(policy).map_err(|reason| {
+            LifecycleError::Failed(if policy.execution_policy().is_native() {
+                reason
+            } else {
+                safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
+            })
         })?;
         if policy.execution_policy().is_native() != resolved.is_none() {
             return Err(LifecycleError::Failed(FailureReason::Other(
@@ -3508,7 +3524,7 @@ impl LifecycleLauncher {
             Ok(prepared) => prepared,
             Err(reason) => {
                 let safe_reason = if resolved.is_some() {
-                    FailureReason::Other("isolated environment preparation failed".into())
+                    safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
                 } else {
                     reason
                 };
@@ -3517,13 +3533,13 @@ impl LifecycleLauncher {
         };
         if resolved.is_some() {
             let Some(identity) = prepared.identity() else {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider omitted environment identity".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             };
             if !identity_matches_intent(self.host_id, &attempt, identity) {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider ownership mismatch".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             }
             let EnvironmentIdentity::Isolated { environment_id, .. } = identity else {
@@ -3556,14 +3572,15 @@ impl LifecycleLauncher {
                 .ports
                 .processes
                 .start(prepared, &attempt, OneTimeJitHandoff::new(&config))
-                .map_err(|_| {
-                    LifecycleError::Failed(FailureReason::Other(
-                        "isolated environment start failed".into(),
+                .map_err(|failure| {
+                    LifecycleError::Failed(safe_isolation_reason(
+                        failure.reason,
+                        IsolationProviderFailure::RuntimeOperationFailed,
                     ))
                 })?;
             if !identity_matches_intent(self.host_id, &attempt, &started) {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider start identity mismatch".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             }
             attempt
@@ -4835,11 +4852,9 @@ mod tests {
             .launch_result()
             .await
             .expect_err("provider is unavailable");
-        assert!(
-            failure
-                .reason
-                .to_string()
-                .contains("execution provider unavailable")
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
         );
 
         let runtime = harness.host_root().join("isolated-owned-environment");
@@ -4876,11 +4891,9 @@ mod tests {
             .launch_result()
             .await
             .expect_err("provider unavailable for this policy");
-        assert!(
-            failure
-                .reason
-                .to_string()
-                .contains("execution provider unavailable")
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
         );
         harness
             .launcher
@@ -5055,7 +5068,7 @@ mod tests {
             .await
             .expect("ready");
         let guard = harness.allocation_lock.acquire().await.unwrap();
-        launcher
+        let failure = launcher
             .launch(LaunchRequest {
                 host: &harness.host,
                 policy: &harness.policy,
@@ -5063,6 +5076,10 @@ mod tests {
             })
             .await
             .expect_err("prepare failed after creating resource");
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
         assert_eq!(provider.resource_count(), 1);
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
         assert!(
@@ -5073,6 +5090,12 @@ mod tests {
                 .contains("provider-secret-needle")
         );
         let id = harness.store.attempts().unwrap()[0].id;
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().outcome(),
+            Some(&AttemptOutcome::failed(FailureReason::IsolationProvider(
+                IsolationProviderFailure::RuntimeOperationFailed
+            )))
+        );
         let restarted = launcher_with_isolated(&harness, Arc::clone(&provider));
         restarted
             .recover_startup(std::slice::from_ref(&harness.policy))
@@ -5087,6 +5110,10 @@ mod tests {
             harness.store.attempt(id).unwrap().unwrap().state(),
             AttemptState::Cleaned
         );
+        let diagnostic =
+            fs::read_to_string(restarted.diagnostics_root.join(format!("{id}.log"))).unwrap();
+        assert!(diagnostic.contains("reason=isolation_runtime_operation_failed"));
+        assert!(!diagnostic.contains("provider-secret-needle"));
         assert_eq!(
             provider
                 .actions
@@ -5098,6 +5125,52 @@ mod tests {
             1
         );
         assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn isolation_capability_and_adapter_failures_keep_closed_categories() {
+        let cases = [
+            (
+                ProviderCapability::NotInstalled,
+                IsolationProviderFailure::NotInstalled,
+            ),
+            (
+                ProviderCapability::PermissionDenied,
+                IsolationProviderFailure::PermissionDenied,
+            ),
+            (
+                ProviderCapability::ImageUnavailableOrIncompatible,
+                IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            ),
+            (
+                ProviderCapability::DiskQuotaUnavailable,
+                IsolationProviderFailure::DiskQuotaUnavailable,
+            ),
+            (
+                ProviderCapability::Degraded,
+                IsolationProviderFailure::Degraded,
+            ),
+        ];
+        for (capability, category) in cases {
+            assert_eq!(
+                capability.refusal(),
+                FailureReason::IsolationProvider(category)
+            );
+        }
+        let raw = FailureReason::Other("ghp_secret_from_provider".into());
+        let safe = safe_isolation_reason(raw, IsolationProviderFailure::RuntimeOperationFailed);
+        assert_eq!(
+            safe,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
+        assert!(!safe.to_string().contains("ghp_secret"));
+        assert_eq!(
+            safe_isolation_reason(
+                FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied),
+                IsolationProviderFailure::RuntimeOperationFailed,
+            ),
+            FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied)
+        );
     }
 
     #[tokio::test]

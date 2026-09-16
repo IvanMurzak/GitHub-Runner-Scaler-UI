@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-use runner_manager_domain::attempt::{FailureReason, RunnerAttempt};
+use runner_manager_domain::attempt::{FailureReason, IsolationProviderFailure, RunnerAttempt};
 use runner_manager_domain::execution::{
     AttemptExecution, Backend, ExecutionPolicy, ImageReference,
 };
@@ -180,12 +180,21 @@ impl OciProcesses {
         ProviderCapability::Ready
     }
 
+    fn capability_or(&self, fallback: FailureReason) -> FailureReason {
+        let capability = self.rootless_ready();
+        if capability == ProviderCapability::Ready {
+            fallback
+        } else {
+            capability.refusal()
+        }
+    }
+
     fn image_ready(&self, image: &ImageReference) -> Result<(), FailureReason> {
         let Some((_, expected)) = image.as_str().rsplit_once("@sha256:") else {
             return Err(image_failure());
         };
         self.status(&["pull", "--quiet", image.as_str()])
-            .map_err(|_| image_failure())?;
+            .map_err(|_| self.capability_or(image_failure()))?;
         let digests = self
             .output(&[
                 "image",
@@ -194,7 +203,7 @@ impl OciProcesses {
                 "{{json .RepoDigests}}",
                 image.as_str(),
             ])
-            .map_err(|_| image_failure())?;
+            .map_err(|_| self.capability_or(image_failure()))?;
         let values: Vec<String> =
             serde_json::from_str(digests.trim()).map_err(|_| image_failure())?;
         if !values
@@ -330,13 +339,13 @@ impl OciProcesses {
 }
 
 fn provider_failure() -> FailureReason {
-    FailureReason::Other("rootless OCI runtime operation failed".into())
+    FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
 }
 fn image_failure() -> FailureReason {
-    FailureReason::Other("pinned OCI image unavailable or mismatched".into())
+    FailureReason::IsolationProvider(IsolationProviderFailure::ImageUnavailableOrIncompatible)
 }
 fn ownership_failure() -> FailureReason {
-    FailureReason::Other("OCI environment ownership mismatch".into())
+    FailureReason::IsolationProvider(IsolationProviderFailure::OwnershipMismatch)
 }
 
 impl ExecutionProvider for OciProcesses {
@@ -355,7 +364,12 @@ impl ExecutionProvider for OciProcesses {
             return capability;
         }
         if self.image_ready(image).is_err() {
-            ProviderCapability::ImageUnavailableOrIncompatible
+            let capability = self.rootless_ready();
+            if capability == ProviderCapability::Ready {
+                ProviderCapability::ImageUnavailableOrIncompatible
+            } else {
+                capability
+            }
         } else {
             ProviderCapability::Ready
         }
@@ -365,10 +379,12 @@ impl ExecutionProvider for OciProcesses {
         let ExecutionPolicy::Isolated { backend, image, .. } = policy.execution_policy() else {
             return Ok(None);
         };
-        if !matches!(backend, Backend::Auto | Backend::Oci)
-            || self.rootless_ready() != ProviderCapability::Ready
-        {
-            return Err(provider_failure());
+        if !matches!(backend, Backend::Auto | Backend::Oci) {
+            return Err(ProviderCapability::Unsupported.refusal());
+        }
+        let capability = self.rootless_ready();
+        if capability != ProviderCapability::Ready {
+            return Err(capability.refusal());
         }
         self.image_ready(image)?;
         Ok(Some(ResolvedEnvironment {
@@ -400,12 +416,13 @@ impl ExecutionProvider for OciProcesses {
             .to_str()
             .is_none_or(|path| !path.starts_with('/') || path.starts_with("/mnt/"))
         {
-            return Err(FailureReason::Other(
-                "OCI runner runtime must be on the Linux filesystem".into(),
+            return Err(FailureReason::IsolationProvider(
+                IsolationProviderFailure::UnsafeRuntimePath,
             ));
         }
-        if self.rootless_ready() != ProviderCapability::Ready {
-            return Err(provider_failure());
+        let capability = self.rootless_ready();
+        if capability != ProviderCapability::Ready {
+            return Err(capability.refusal());
         }
         let name = format!(
             "rm-{}-{}",
@@ -458,11 +475,12 @@ impl ExecutionProvider for OciProcesses {
                 resolved_image.as_str(),
                 "-c",
                 BOOTSTRAP,
-            ])?
+            ])
+            .map_err(|reason| self.capability_or(reason))?
             .trim()
             .to_owned();
         if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(provider_failure());
+            return Err(self.capability_or(provider_failure()));
         }
         let identity = self.isolated_identity(attempt, id.clone())?;
         // The package copy is host-to-guest only; no host path is mounted.
@@ -477,7 +495,7 @@ impl ExecutionProvider for OciProcesses {
             {
                 let _ = self.status(&["rm", "--force", &id]);
             }
-            return Err(provider_failure());
+            return Err(self.capability_or(provider_failure()));
         }
         Ok(PreparedEnvironment::isolated(attempt.id, identity))
     }
@@ -511,9 +529,9 @@ impl ExecutionProvider for OciProcesses {
                 .bytes()
                 .any(|byte| byte == b'\n' || byte == b'\r' || byte == 0)
         {
-            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
-                "OCI JIT handoff is not a single bounded line".into(),
-            )));
+            return Err(ProcessStartFailure::before_spawn(
+                FailureReason::IsolationProvider(IsolationProviderFailure::JitHandoffRejected),
+            ));
         }
         let mut command = self.command();
         let mut child = command
@@ -598,7 +616,8 @@ impl ExecutionProvider for OciProcesses {
         if !self.check_ownership(attempt)? {
             return Err(ownership_failure());
         }
-        self.status(&["stop", "--time=10", self.environment_id(attempt)?])?;
+        self.status(&["stop", "--time=10", self.environment_id(attempt)?])
+            .map_err(|reason| self.capability_or(reason))?;
         Ok(ProviderStop::Stopped)
     }
 
@@ -613,7 +632,8 @@ impl ExecutionProvider for OciProcesses {
         if !self.check_ownership(attempt)? {
             return Err(ownership_failure());
         }
-        self.status(&["rm", "--force", self.environment_id(attempt)?])?;
+        self.status(&["rm", "--force", self.environment_id(attempt)?])
+            .map_err(|reason| self.capability_or(reason))?;
         self.reap_attached(attempt.id);
         Ok(ProviderDestroy::Destroyed)
     }
