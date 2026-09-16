@@ -3,7 +3,8 @@
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
 **Implementation status:** a1, a2, b1, b2 and c1 merged into the integration
-ref; d1 is held at a green PR for native acceptance, with c2, d2 and d3 ready.
+ref; d1 is held at a green PR for native acceptance, c2 is dispatched, and d2
+and d3 are ready.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -52,7 +53,7 @@ This file is the only live task-state record.
 | b1-execution-domain-provider | `tasks/b1-execution-domain-provider.md` | B | 1 | a1-profile-domain-store | . | main | 10/9 | top | ✅ | [PR #72](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/72) / 8805435 | 2026-09-15 |
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
-| c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ready | — | 2026-09-15 |
+| c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | 🔵 | worktree-c2-profile-tui / `implement-task` | 2026-09-15 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | ready | — | 2026-09-15 |
@@ -186,3 +187,8 @@ named-profile persistent-workspace trust warning. The exact full local gate
 and seven CI/E2E checks passed at head 5cd7feb. PR #75 was squash-merged into
 `runner-sandbox-isolation` at d36a459 and the remote ref verified. c2 is now
 dependency-ready.
+
+**2026-09-15 — c2 dispatched.** The TUI profile task slot was provisioned
+from the verified remote integration ref, with its branch-scoped PR base read
+back as `runner-sandbox-isolation`. Its native Codex `implement-task` session
+loop will run in the isolated checkout.
