@@ -1,0 +1,30 @@
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_479233401fe12e 640-642
+  s_5801a853f78e8a::t_098e7914e8c765 876-885,893-915
+  s_5801a853f78e8a::t_ee590223b4d9b2 886-892
+  s_5801a853f78e8a::t_12a110015d2077 693-695,699-701,716-718,722,725-727,739,765-772
+  s_5801a853f78e8a::t_3ec08dc81baf6b 130-142,811,845-848
+  s_5801a853f78e8a::t_fbd2eefc3e7b74 732-738,740-764,773-775,875
+  s_5801a853f78e8a::t_a04c70376f69b5 687-689
+crates/agent/src/lifecycle.rs
+  s_5801a853f78e8a::t_2f68e897e88692 5007
+  s_5801a853f78e8a::t_6e2e6b0c138ee0 2587-2591,5037-5046
+  s_5801a853f78e8a::t_657f3aa20e1104 4287,4476,5006,5008-5036
+  s_5801a853f78e8a::t_7e91d602110cc4 2592-2598
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "06a636b40e543aadb457958c85cb9e5bfb4a3389",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
