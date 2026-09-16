@@ -1,6 +1,6 @@
 mod support;
 
-use runner_manager_domain::execution::ExecutionPolicy;
+use runner_manager_domain::execution::{Backend, ExecutionPolicy, ImageReference, ResourceLimits};
 use runner_manager_domain::store::{SqliteStore, Store};
 use support::{FakeGithub, run, runner_manager, runner_manager_against};
 
@@ -42,6 +42,17 @@ fn named_profiles_select_one_policy_and_legacy_ambiguity_is_closed() {
         command
     });
     assert_eq!(add_default.code, 0, "{}", add_default.both());
+    let sole_profile = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args(["repo", "profile", "show", "octo/one"]);
+        command
+    });
+    assert_eq!(sole_profile.code, 0, "{}", sole_profile.both());
+    assert!(
+        sole_profile.stdout.contains("profile=default"),
+        "{}",
+        sole_profile.stdout
+    );
     let add_named = run({
         let mut command = runner_manager_against(data_dir.path(), &github);
         command.args([
@@ -158,10 +169,38 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
     });
     assert_eq!(add.code, 0, "{}", add.both());
     let policy = store(data_dir.path()).policies().unwrap().remove(0);
-    assert!(matches!(
-        policy.execution_policy(),
-        ExecutionPolicy::Isolated { .. }
-    ));
+    let expected_execution = ExecutionPolicy::Isolated {
+        backend: Backend::Oci,
+        image: ImageReference::new(image.clone()).unwrap(),
+        resources: ResourceLimits {
+            cpu_millis: 2000,
+            memory_mib: 2048,
+            disk_mib: 8192,
+        },
+    };
+    assert_eq!(policy.execution_policy(), &expected_execution);
+    let show = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "profile",
+            "show",
+            "octo/one",
+            "--profile",
+            "isolated",
+        ]);
+        command
+    });
+    assert_eq!(show.code, 0, "{}", show.both());
+    let rendered_execution = show
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("execution details: "))
+        .expect("profile inspection must render execution details");
+    assert_eq!(
+        serde_json::from_str::<ExecutionPolicy>(rendered_execution).unwrap(),
+        expected_execution
+    );
     let arm = run({
         let mut command = runner_manager(data_dir.path());
         command.args([
@@ -225,6 +264,94 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
             "{provider}"
         );
     }
+}
+
+#[test]
+fn selected_native_profile_persists_workspace_and_warns_without_changing_sibling() {
+    let data_dir = tempfile::tempdir().unwrap();
+    signed_in(data_dir.path());
+    let github = FakeGithub::start();
+    github.with_installation(77, "octo", "Organization", "selected", &["octo/one"]);
+    for args in [
+        vec![
+            "repo",
+            "add",
+            "octo/one",
+            "--host-label",
+            "home",
+            "--max-capacity",
+            "1",
+        ],
+        vec![
+            "repo",
+            "profile",
+            "add",
+            "octo/one",
+            "--name",
+            "native-cache",
+            "--max-capacity",
+            "2",
+        ],
+    ] {
+        let result = run({
+            let mut command = runner_manager_against(data_dir.path(), &github);
+            command.args(args);
+            command
+        });
+        assert_eq!(result.code, 0, "{}", result.both());
+    }
+
+    let before = store(data_dir.path()).policies().unwrap();
+    let sibling = before
+        .iter()
+        .find(|policy| policy.profile_name().as_str() == "default")
+        .unwrap()
+        .clone();
+    let workspace_parent = tempfile::tempdir().unwrap();
+    let workspace_root = workspace_parent.path().join("native-slots");
+    let workspace_text = workspace_root.to_str().unwrap();
+    let persistent = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args([
+            "repo",
+            "profile",
+            "set-workspace",
+            "octo/one",
+            "--profile",
+            "native-cache",
+            "--mode",
+            "persistent",
+            "--path",
+            workspace_text,
+        ]);
+        command
+    });
+    assert_eq!(persistent.code, 0, "{}", persistent.both());
+    for warning in [
+        "trusted-workflow optimization, not isolation",
+        "untrusted fork or pull-request workflows",
+    ] {
+        assert!(
+            persistent.stdout.contains(warning),
+            "missing {warning:?}: {}",
+            persistent.stdout
+        );
+    }
+
+    let after = store(data_dir.path()).policies().unwrap();
+    let selected = after
+        .iter()
+        .find(|policy| policy.profile_name().as_str() == "native-cache")
+        .unwrap();
+    assert_eq!(
+        selected.workspace_policy().root().map(|root| root.as_str()),
+        Some(workspace_text)
+    );
+    let unchanged_sibling = after
+        .iter()
+        .find(|policy| policy.profile_name().as_str() == "default")
+        .unwrap();
+    assert_eq!(unchanged_sibling, &sibling);
 }
 
 #[test]
