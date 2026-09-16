@@ -127,6 +127,19 @@ impl OciProcesses {
         {
             return ProviderCapability::Degraded;
         }
+        let Some(controllers) = info
+            .pointer("/host/cgroupControllers")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return ProviderCapability::Degraded;
+        };
+        if ["cpu", "memory", "pids"].iter().any(|needed| {
+            !controllers
+                .iter()
+                .any(|controller| controller.as_str() == Some(needed))
+        }) {
+            return ProviderCapability::Degraded;
+        }
         let Some(graph_root) = info
             .pointer("/store/graphRoot")
             .and_then(serde_json::Value::as_str)
@@ -624,12 +637,9 @@ impl ExecutionProvider for OciProcesses {
     }
 
     fn enumerate_owned(&self, host: HostId) -> Vec<EnvironmentIdentity> {
-        if host != self.host
-            || !matches!(
-                self.rootless_ready(),
-                ProviderCapability::Ready | ProviderCapability::DiskQuotaUnavailable
-            )
-        {
+        // Recovery discovery must still work when a capability has degraded
+        // since creation. A failed readiness probe is not evidence of absence.
+        if host != self.host {
             return Vec::new();
         }
         let filter = format!("label={HOST_LABEL}={host}");
@@ -674,12 +684,21 @@ impl ExecutionProvider for OciProcesses {
         attempt: &RunnerAttempt,
         config: &EncodedJitConfig,
     ) -> Result<u32, ProcessStartFailure> {
+        if !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(ownership_failure()));
+        }
         self.native.spawn(attempt, config)
     }
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(ownership_failure());
+        }
         self.native.is_alive(attempt)
     }
     fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(ownership_failure());
+        }
         self.native.recovered_pid(attempt)
     }
     fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
@@ -694,13 +713,63 @@ impl ExecutionProvider for OciProcesses {
             .is_some_and(|status| status.success())
     }
     fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(ownership_failure());
+        }
         self.native.record_terminate_intent(attempt)
     }
     fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool {
-        self.native.has_terminate_intent(attempt)
+        attempt.execution().is_native() && self.native.has_terminate_intent(attempt)
     }
     fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(ownership_failure());
+        }
         self.native.terminate(attempt)
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use runner_manager_domain::model::Clock;
+    use runner_manager_testkit::{clock::FakeClock, fixtures};
+
+    #[test]
+    fn isolated_attempt_cannot_use_native_compatibility_methods() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = fixtures::policy().build();
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            root.path(),
+            FakeClock::default().now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .unwrap(),
+                generation: "generation-1".into(),
+            })
+            .unwrap();
+        let provider = OciProcesses::new(HostId::from_u128(1));
+        let config = EncodedJitConfig::new("test-jit");
+        let failure = provider.spawn(&attempt, &config).unwrap_err();
+        assert_eq!(failure.reason, ownership_failure());
+        assert!(failure.live_pid.is_none());
+        assert_eq!(provider.is_alive(&attempt), Err(ownership_failure()));
+        assert_eq!(provider.recovered_pid(&attempt), Err(ownership_failure()));
+        assert_eq!(
+            provider.record_terminate_intent(&attempt),
+            Err(ownership_failure())
+        );
+        assert!(!provider.has_terminate_intent(&attempt));
+        assert_eq!(provider.terminate(&attempt), Err(ownership_failure()));
     }
 }
 
@@ -739,6 +808,7 @@ mod tests {
             "host": {
                 "security": {"rootless": rootless},
                 "cgroupVersion": "v2",
+                "cgroupControllers": ["cpu", "memory", "pids"],
                 "idMappings": {
                     "uidmap": [{"size": 1}, {"size": subuids}],
                     "gidmap": [{"size": 1}, {"size": subuids}]
@@ -772,6 +842,10 @@ mod tests {
         );
         let (_root, provider) = fixture(&info(true, "/home/ivan/.local/share/containers", 65536));
         assert_eq!(provider.rootless_ready(), ProviderCapability::Ready);
+        let no_pids = info(true, "/home/ivan/.local/share/containers", 65536)
+            .replace("\"pids\"", "\"missing\"");
+        let (_root, provider) = fixture(&no_pids);
+        assert_eq!(provider.rootless_ready(), ProviderCapability::Degraded);
         let extfs = info(true, "/home/ivan/.local/share/containers", 65536).replace(
             "\"Backing Filesystem\":\"xfs\"",
             "\"Backing Filesystem\":\"extfs\"",
@@ -796,6 +870,47 @@ mod tests {
         let mut provider = OciProcesses::new(HostId::from_u128(1));
         provider.runtime = "/a/path/that/cannot/be/podman".into();
         assert_eq!(provider.rootless_ready(), ProviderCapability::NotInstalled);
+    }
+
+    #[test]
+    fn recovery_discovers_owned_container_when_capability_degrades() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("podman");
+        let host = HostId::from_u128(1);
+        let attempt = AttemptId::new_random();
+        let generation = "generation-1";
+        let image = format!("registry.example/runner@sha256:{}", "a".repeat(64));
+        let id = "b".repeat(64);
+        let degraded_info = info(true, "/home/ivan/.local/share/containers", 65536)
+            .replace("\"pids\"", "\"missing\"");
+        let labels = BTreeMap::from([
+            (HOST_LABEL, host.to_string()),
+            (ATTEMPT_LABEL, attempt.to_string()),
+            (GENERATION_LABEL, generation.to_owned()),
+            (IMAGE_LABEL, image),
+        ]);
+        let labels = serde_json::to_string(&labels).unwrap();
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  info) printf '%s' '{degraded_info}' ;;\n  ps) printf '%s\\n' '{id}' ;;\n  container) printf '%s' '{labels}' ;;\n  *) exit 1 ;;\nesac\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut provider = OciProcesses::new(host);
+        provider.runtime = path.to_string_lossy().into_owned();
+        assert_eq!(provider.rootless_ready(), ProviderCapability::Degraded);
+        let owned = provider.enumerate_owned(host);
+        assert_eq!(owned.len(), 1);
+        assert!(matches!(
+            &owned[0],
+            EnvironmentIdentity::Isolated {
+                host: found_host,
+                attempt: found_attempt,
+                environment_id,
+                generation: found_generation,
+                ..
+            } if *found_host == host && *found_attempt == attempt
+                && environment_id == &id && found_generation == generation
+        ));
     }
 
     #[test]

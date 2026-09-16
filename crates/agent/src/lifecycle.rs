@@ -2584,6 +2584,18 @@ impl LifecycleLauncher {
         {
             write_runner_id(attempt.runtime_path(), runner_id)?;
         }
+        // A successfully reaped one-shot listener is stronger evidence than a
+        // missing registration. Recovered guests have no attached child and
+        // still follow the conservative orphan path below.
+        if attempt.state() == AttemptState::Busy
+            && !live
+            && github.status == GithubRunnerObservation::NotRegistered
+            && self.ports.processes.completed_successfully(&attempt)
+        {
+            self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
+        }
         match recovery_decision(
             &attempt,
             RecoveryObservation {
@@ -4272,6 +4284,7 @@ mod tests {
         recovery_unavailable: AtomicBool,
         destroy_deferred: AtomicBool,
         handoffs: AtomicUsize,
+        completed_successfully: AtomicBool,
         native_calls: AtomicUsize,
         actions: Mutex<Vec<&'static str>>,
     }
@@ -4460,7 +4473,7 @@ mod tests {
             panic!("native fallback")
         }
         fn completed_successfully(&self, _attempt: &RunnerAttempt) -> bool {
-            false
+            self.completed_successfully.load(Ordering::SeqCst)
         }
         fn record_terminate_intent(&self, _attempt: &RunnerAttempt) -> Result<(), FailureReason> {
             panic!("native fallback")
@@ -4988,6 +5001,47 @@ mod tests {
             harness.store.attempt(attempt.id).unwrap().unwrap().state(),
             AttemptState::Cleaned
         );
+    }
+
+    #[tokio::test]
+    async fn attached_isolated_job_exit_is_recorded_as_completed() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let attempt = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .unwrap();
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        launcher.supervise(&harness.policy).await.unwrap();
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .get_mut(&attempt.id)
+            .unwrap()
+            .1 = EnvironmentState::Exited;
+        provider
+            .completed_successfully
+            .store(true, Ordering::SeqCst);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        launcher.supervise(&harness.policy).await.unwrap();
+        let cleaned = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
     }
 
     #[tokio::test]
