@@ -871,6 +871,7 @@ async fn production_screen_snapshot(
         repositories.push(RepositoryRow {
             id: policy.id.clone(),
             target: policy.target.clone(),
+            profile_name: policy.profile_name.clone(),
             in_progress_workflows: workflow_count,
             mode: if policy.mode == "monitor_only" {
                 PolicyMode::MonitorOnly
@@ -2094,28 +2095,24 @@ fn reduce_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 /// an answer rather than a diagnostic — and it gets the same answer from the
 /// `s` key and from the navigation bar, which is why both go through here.
 fn open_repository_settings(state: &mut AppState) -> Vec<Effect> {
-    let Some(target) = selected_repository_target(state) else {
-        state.settings.show_notice(
-            "No repository is configured on this host yet.\n\n\
-             Add one from a terminal:\n  \
-             runner-manager repo add OWNER/REPO --host-label <host> --max-capacity 1\n\n\
-             Then press [r] to select it and [s] to configure it.",
-        );
+    let Some(row) = selected_repository_profile(state) else {
+        state.settings.show_notice("No repository profile is selected.\n\nRun `runner-manager repo add OWNER/REPO` if none exists, then press [r], select an exact profile row, and press [s].");
         return Vec::new();
     };
-    vec![Effect::Settings(SettingsCommand::LoadPolicy(target))]
+    vec![Effect::Settings(SettingsCommand::LoadProfile {
+        target: row.target.clone(),
+        profile: row.profile_name.clone(),
+    })]
 }
 
-fn selected_repository_target(state: &AppState) -> Option<String> {
-    let selected = state.screen_model.repositories.selected_id.as_deref();
+fn selected_repository_profile(state: &AppState) -> Option<&screens::RepositoryRow> {
+    let selected = state.screen_model.repositories.selected_id.as_deref()?;
     state
         .screen_model
         .snapshot
         .repositories
         .iter()
-        .find(|row| selected == Some(row.id.as_str()))
-        .or_else(|| state.screen_model.snapshot.repositories.first())
-        .map(|row| row.target.clone())
+        .find(|row| row.id == selected)
 }
 
 /// Draw one frame from memory only.
@@ -3291,6 +3288,7 @@ mod tests {
                         repositories: vec![RepositoryRow {
                             id: "f5-repository".into(),
                             target: "acme/refreshed-by-f5".into(),
+                            profile_name: "default".into(),
                             in_progress_workflows: 9,
                             mode: PolicyMode::Autoscale,
                             max_capacity: Some(4),
@@ -3806,6 +3804,7 @@ mod tests {
             repositories: vec![screens::RepositoryRow {
                 id: "wired-repo".into(),
                 target: "acme/production-wiring".into(),
+                profile_name: "default".into(),
                 in_progress_workflows: 3,
                 mode: screens::PolicyMode::MonitorOnly,
                 max_capacity: None,
@@ -3945,6 +3944,7 @@ mod tests {
                 RepositoryRow {
                     id: "busy".into(),
                     target: "acme/busy".into(),
+                    profile_name: "default".into(),
                     in_progress_workflows: 9,
                     mode: PolicyMode::Autoscale,
                     max_capacity: Some(2),
@@ -3955,6 +3955,7 @@ mod tests {
                 RepositoryRow {
                     id: "idle".into(),
                     target: "acme/idle".into(),
+                    profile_name: "default".into(),
                     in_progress_workflows: 0,
                     mode: PolicyMode::MonitorOnly,
                     max_capacity: None,
@@ -4008,7 +4009,7 @@ mod tests {
                 screens::INVENTORY_HEADER_ROW,
             ),
         );
-        assert_eq!(state.screen_model.repositories.sort_column, 1);
+        assert_eq!(state.screen_model.repositories.sort_column, 2);
         assert!(!state.screen_model.repositories.sort_descending);
         reduce(
             &mut state,
@@ -4058,7 +4059,7 @@ mod tests {
                 repository_header_row,
             ),
         );
-        assert_eq!(state.screen_model.dashboard_repository_sort, (1, false));
+        assert_eq!(state.screen_model.dashboard_repository_sort, (2, false));
         let sorted = rendered(120, 30, &state);
         assert!(sorted.contains("Workflows ^"), "{sorted}");
 
@@ -4377,6 +4378,7 @@ mod tests {
                 .map(|ordinal| RepositoryRow {
                     id: format!("repo-{ordinal}"),
                     target: format!("acme/repository-{ordinal:05}"),
+                    profile_name: "default".into(),
                     in_progress_workflows: ordinal % 7,
                     mode: PolicyMode::Autoscale,
                     max_capacity: Some(4),
@@ -4538,6 +4540,7 @@ mod tests {
             repositories: vec![RepositoryRow {
                 id: "production-settings".into(),
                 target: target.to_string(),
+                profile_name: "default".into(),
                 in_progress_workflows: 0,
                 mode: PolicyMode::Autoscale,
                 max_capacity: Some(2),

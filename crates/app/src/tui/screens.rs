@@ -230,6 +230,8 @@ pub struct DashboardMetrics {
 pub struct RepositoryRow {
     pub id: String,
     pub target: String,
+    /// Immutable profile identity within this repository target.
+    pub profile_name: String,
     pub in_progress_workflows: u32,
     pub mode: PolicyMode,
     pub max_capacity: Option<u16>,
@@ -795,14 +797,17 @@ fn repository_cmp(
     descending: bool,
 ) -> Ordering {
     let order = match column {
-        1 => a.in_progress_workflows.cmp(&b.in_progress_workflows),
-        2 => a.mode.marker().cmp(b.mode.marker()),
-        3 => a.max_capacity.cmp(&b.max_capacity),
-        4 => a.health.marker().cmp(&b.health.marker()),
-        5 => (&a.host_label, &a.extra_labels).cmp(&(&b.host_label, &b.extra_labels)),
+        1 => a.profile_name.cmp(&b.profile_name),
+        2 => a.in_progress_workflows.cmp(&b.in_progress_workflows),
+        3 => a.mode.marker().cmp(b.mode.marker()),
+        4 => a.max_capacity.cmp(&b.max_capacity),
+        5 => a.health.marker().cmp(&b.health.marker()),
+        6 => (&a.host_label, &a.extra_labels).cmp(&(&b.host_label, &b.extra_labels)),
         _ => a.target.cmp(&b.target),
     };
-    directed(order, descending).then_with(|| a.target.cmp(&b.target))
+    directed(order, descending)
+        .then_with(|| a.target.cmp(&b.target))
+        .then_with(|| a.profile_name.cmp(&b.profile_name))
 }
 
 fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> Ordering {
@@ -820,7 +825,7 @@ fn runner_cmp(a: &RunnerRow, b: &RunnerRow, column: usize, descending: bool) -> 
 
 fn set_legacy_sort(table: &mut TableViewState, screen: ReadOnlyScreen, order: SortOrder) {
     let (column, descending) = match (screen, order) {
-        (ReadOnlyScreen::Repositories, SortOrder::WorkloadDescending) => (1, true),
+        (ReadOnlyScreen::Repositories, SortOrder::WorkloadDescending) => (2, true),
         (ReadOnlyScreen::Runners, SortOrder::NameAscending) => (3, false),
         (ReadOnlyScreen::Runners, SortOrder::NameDescending) => (3, true),
         (ReadOnlyScreen::Activity, SortOrder::NameAscending) => (1, false),
@@ -834,7 +839,7 @@ fn set_legacy_sort(table: &mut TableViewState, screen: ReadOnlyScreen, order: So
 }
 
 fn legacy_sort(screen: ReadOnlyScreen, column: usize, descending: bool) -> SortOrder {
-    if screen == ReadOnlyScreen::Repositories && column == 1 && descending {
+    if screen == ReadOnlyScreen::Repositories && column == 2 && descending {
         SortOrder::WorkloadDescending
     } else if descending {
         SortOrder::NameDescending
@@ -931,8 +936,9 @@ enum Laid {
 /// one column whose value the operator can reconstruct elsewhere -- the
 /// settings screen shows the same set in full, with the `runs-on:` line beside
 /// it. Losing its tail on a narrow terminal costs less than losing `Agent`.
-const REPOSITORY_COLUMNS: [Column; 6] = [
+const REPOSITORY_COLUMNS: [Column; 7] = [
     Column::flexible("Repository", 14, 0),
+    Column::flexible("Profile", 10, 0),
     Column::rigid("Workflows", 2).right(),
     Column::rigid("Mode", 3),
     Column::rigid("Capacity", 1).right(),
@@ -1594,7 +1600,7 @@ fn dashboard_sections(model: &ScreenModel, skin: &Skin, rows: usize, width: u16)
             // The dashboard is a summary beside a second grid, so it stops at
             // `Agent`; the Repositories screen owns the whole width and draws
             // the label set as well.
-            &REPOSITORY_COLUMNS[..5],
+            &REPOSITORY_COLUMNS[..6],
             GridPresentation::preview(model.dashboard_repository_sort),
         )),
         Section::Prose(vec![Line::default()]),
@@ -1783,6 +1789,7 @@ fn repository_sections(
             "REPOSITORY DETAIL",
             vec![
                 ("Target: ", row.target.clone(), Tone::Accent),
+                ("Profile: ", row.profile_name.clone(), Tone::Accent),
                 (
                     "In-progress workflows: ",
                     row.in_progress_workflows.to_string(),
@@ -2051,16 +2058,31 @@ fn repository_grid(
     } else {
         0
     };
-    let body = window(visible, scroll, rows)
+    let visible_window = window(visible, scroll, rows);
+    let body = visible_window
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let selected = presentation.selects_rows
                 && model.repositories.selected_id.as_deref() == Some(row.id.as_str());
             GridRow {
                 selected,
                 cells: vec![
                     Cell::new(
-                        format!("{}{}", skin.marker(selected), row.target),
+                        if index == 0 || visible_window[index - 1].target != row.target {
+                            row.target.clone()
+                        } else {
+                            String::new()
+                        },
+                        Tone::Accent,
+                    ),
+                    Cell::new(
+                        format!(
+                            "{}  {} {}",
+                            skin.marker(selected),
+                            skin.pick("└", "-"),
+                            row.profile_name
+                        ),
                         Tone::Accent,
                     ),
                     Cell::new(
@@ -2239,6 +2261,7 @@ mod tests {
                 RepositoryRow {
                     id: "alpha".into(),
                     target: "acme/alpha".into(),
+                    profile_name: "default".into(),
                     in_progress_workflows: 5,
                     mode: PolicyMode::Autoscale,
                     max_capacity: Some(4),
@@ -2249,6 +2272,7 @@ mod tests {
                 RepositoryRow {
                     id: "observe".into(),
                     target: "acme/observe".into(),
+                    profile_name: "default".into(),
                     in_progress_workflows: 2,
                     mode: PolicyMode::MonitorOnly,
                     max_capacity: None,
@@ -2482,13 +2506,13 @@ mod tests {
     fn snapshot_all_four_screens_in_every_required_state() {
         insta::assert_snapshot!(matrix_snapshot(), @"
         Dashboard/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Dashboard/populated: lines=27 bytes=1723 fnv=f1e4f8491ee972d2 | RUNNER READINESS: READY                             | Problems & fixes: none
-        Dashboard/empty: lines=23 bytes=1175 fnv=3c7196c52442cde1 | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
+        Dashboard/populated: lines=27 bytes=1807 fnv=7dc5038ca813a86d | RUNNER READINESS: READY                             | Problems & fixes: none
+        Dashboard/empty: lines=23 bytes=1215 fnv=39838a51f7037aba | RUNNER READINESS: UNKNOWN                           | Problems & fixes: checking | Action: runner-manager repo add OWNER/REPO
         Dashboard/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Dashboard/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
         Dashboard/offline: lines=6 bytes=255 fnv=7aca69b8a1025157 | OFFLINE - no new runners will start | Action: a opens Activity & errors
         Repositories/loading: lines=3 bytes=79 fnv=0773e12a4b1d7abf | LOADING | Action: F5 refresh now
-        Repositories/populated: lines=7 bytes=680 fnv=62f7540f925a9ab8 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
+        Repositories/populated: lines=7 bytes=764 fnv=d08b19b0f2e6f889 | Filter: <none> | Sort: NameAscending | Focus: Rows | Scroll: 0
         Repositories/empty: lines=3 bytes=117 fnv=46b29f02007e5280 | EMPTY | Action: runner-manager repo add OWNER/REPO
         Repositories/unauthorized: lines=3 bytes=98 fnv=b305c2db5095c2ad | UNAUTHORIZED | Action: runner-manager auth login
         Repositories/rate-limited: lines=3 bytes=103 fnv=d96d37598270b0bb | RATE LIMITED | Action: a opens rate-limit details; retry is automatic
@@ -2831,6 +2855,7 @@ mod tests {
             .map(|i| RepositoryRow {
                 id: format!("repo-{i}"),
                 target: format!("acme/repository-{i:05}"),
+                profile_name: "default".into(),
                 in_progress_workflows: 0,
                 mode: PolicyMode::MonitorOnly,
                 max_capacity: None,
@@ -2874,6 +2899,7 @@ mod tests {
         short.repositories.extend((2..4).map(|index| RepositoryRow {
             id: format!("short-{index}"),
             target: format!("acme/short-{index}"),
+            profile_name: "default".into(),
             in_progress_workflows: 0,
             mode: PolicyMode::MonitorOnly,
             max_capacity: None,
@@ -2894,6 +2920,7 @@ mod tests {
             .extend((4..10).map(|index| RepositoryRow {
                 id: format!("long-{index}"),
                 target: format!("acme/long-{index}"),
+                profile_name: "default".into(),
                 in_progress_workflows: 0,
                 mode: PolicyMode::MonitorOnly,
                 max_capacity: None,
@@ -2934,14 +2961,31 @@ mod tests {
     }
 
     #[test]
+    fn sibling_profiles_are_grouped_and_indented_under_one_repository() {
+        let mut snapshot = populated();
+        snapshot.repositories[0].profile_name = "native".into();
+        let mut isolated = snapshot.repositories[0].clone();
+        isolated.id = "alpha-isolated".into();
+        isolated.profile_name = "py-isolated".into();
+        isolated.host_label = Some("rm-home-win-x64-py-isolated".into());
+        snapshot.repositories.push(isolated);
+        let mut model = ScreenModel::new(snapshot);
+        model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
+        let rendered = render_text(&model);
+        assert_eq!(rendered.matches("acme/alpha").count(), 1, "{rendered}");
+        assert!(rendered.contains("- native"), "{rendered}");
+        assert!(rendered.contains("- py-isolated"), "{rendered}");
+    }
+
+    #[test]
     fn inventory_columns_sort_ascending_then_toggle_descending() {
         let mut model = ScreenModel::new(populated());
         model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
-        model.apply(ScreenAction::SortColumn(1));
-        assert_eq!(model.repositories.sort_column, 1);
+        model.apply(ScreenAction::SortColumn(2));
+        assert_eq!(model.repositories.sort_column, 2);
         assert!(!model.repositories.sort_descending);
         assert_eq!(model.visible_repository_ids(), vec!["observe", "alpha"]);
-        model.apply(ScreenAction::SortColumn(1));
+        model.apply(ScreenAction::SortColumn(2));
         assert!(model.repositories.sort_descending);
         assert_eq!(model.visible_repository_ids(), vec!["alpha", "observe"]);
 
@@ -3027,6 +3071,7 @@ mod tests {
             .map(|index| RepositoryRow {
                 id: format!("repo-{index:02}"),
                 target: format!("acme/repository-{index:02}"),
+                profile_name: "default".into(),
                 in_progress_workflows: index,
                 mode: PolicyMode::Autoscale,
                 max_capacity: Some(2),
@@ -3039,7 +3084,12 @@ mod tests {
         model.apply(ScreenAction::Open(ReadOnlyScreen::Repositories));
         model.apply(ScreenAction::MoveSelection(10));
         let rendered = render_text(&model);
-        assert!(rendered.contains("> acme/repository-10"), "{rendered}");
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("acme/repository-10") && line.contains(">   - default")),
+            "{rendered}"
+        );
         assert!(rendered.contains("acme/repository-04"), "{rendered}");
         assert!(rendered.contains("acme/repository-11"), "{rendered}");
         assert!(!rendered.contains("acme/repository-03"), "{rendered}");

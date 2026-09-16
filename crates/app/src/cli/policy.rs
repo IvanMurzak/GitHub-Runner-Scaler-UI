@@ -591,15 +591,17 @@ fn report_labels(policy: &ScalePolicy, out: &mut dyn Write) -> Result<(), CliErr
 /// [`Failure::InvalidArgument`] for a label GitHub would reject or for a
 /// monitor-only policy, which reserves no labels until it is promoted, and
 /// [`Failure::LocalState`] for a store failure or a lost revision race.
-pub fn replace_optional_labels(
+/// Profile-aware label replacement used by the TUI and CLI surfaces.
+pub fn replace_optional_labels_selected(
     context: &Context,
     target: &ScaleTarget,
+    profile: Option<&str>,
     desired: &[String],
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     let desired = parse_labels(desired)?;
     let store = context.store()?;
-    let mut policy = find_policy(&store, target)?;
+    let mut policy = find_policy_selected(&store, target, profile)?;
     let expected = policy.revision();
 
     let Some(current) = policy.routing_labels() else {
@@ -1450,6 +1452,7 @@ pub fn remove_selected(
     Ok(())
 }
 
+#[cfg(test)]
 fn find_policy(store: &dyn Store, target: &ScaleTarget) -> Result<ScalePolicy, CliError> {
     find_policy_selected(store, target, None)
 }

@@ -941,14 +941,16 @@ pub struct RepoProfileAddArgs {
     pub enable: bool,
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ExecutionMode {
+    #[default]
     Native,
     Isolated,
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendMode {
+    #[default]
     Auto,
     Oci,
     WindowsHyperVContainer,

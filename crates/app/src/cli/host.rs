@@ -428,7 +428,7 @@ pub fn dispatch(
     }
 }
 
-fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
     // The currently shipped provider executes native processes only. These
     // states are deliberately closed: an isolated profile cannot be armed on
     // the strength of a runtime that the agent has not integrated.
