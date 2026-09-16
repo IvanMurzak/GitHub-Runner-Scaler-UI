@@ -150,6 +150,11 @@ pub const RECORD_FILE: &str = "service.toml";
 /// and Journey 5 step 4 requires it.
 pub const CONTACT_FILE: &str = "github-contact.toml";
 
+/// Present while GitHub is rejecting the daemon's credential, inside `state/`.
+///
+/// See [`record_github_credential_rejected`] for the contract.
+pub const CREDENTIAL_REJECTION_FILE: &str = "github-credential-rejected.toml";
+
 /// The agent's last runner-root refusal, for `service status` to report.
 ///
 /// See [`record_runner_root_refusal`] for the contract.
@@ -2819,6 +2824,34 @@ impl InstallRecord {
         }
     }
 
+    /// The plan this record describes, as this build would register it.
+    ///
+    /// The directories, binary, arguments and restart policy are the recorded
+    /// ones; everything else -- hardening, the secret store's guard -- is what
+    /// this build renders. That difference is the point: it is how a
+    /// registration written by an older build is compared against, and
+    /// repaired to, the current definition.
+    #[must_use]
+    pub fn plan(&self, identity: ServiceIdentity) -> InstallPlan {
+        let plan = InstallPlan::unchecked(
+            identity,
+            self.start_mode,
+            self.binary.clone(),
+            self.directories.clone(),
+        )
+        .with_arguments(self.arguments.clone())
+        .with_restart(self.restart());
+        let plan = if self.starts_on_demand {
+            plan.started_on_demand()
+        } else {
+            plan
+        };
+        match crate::secrets::PlatformSecretStore::for_start_mode(self.start_mode) {
+            Ok(store) => plan.with_secret_guard(store.guard()),
+            Err(_) => plan,
+        }
+    }
+
     /// The restart policy this record describes, or [`RestartPolicy::default`]
     /// when the recorded numbers are outside the supported range — which can
     /// only happen to a record something else has edited.
@@ -3064,6 +3097,176 @@ pub fn last_github_contact(paths: &AppPaths) -> Result<Option<DateTime<Utc>>, Se
 #[must_use]
 pub fn contact_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(CONTACT_FILE)
+}
+
+// ---------------------------------------------------------------------------
+// The credential GitHub rejected
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialRejectionRecord {
+    schema_version: u32,
+    rejected_since: DateTime<Utc>,
+}
+
+/// Records that GitHub rejected the daemon's credential, keeping the first
+/// moment of an ongoing rejection.
+///
+/// # Why a file of its own
+///
+/// A rejected credential used to be visible only in the daemon's log: the
+/// contact heartbeat simply stopped moving, `service status` still printed
+/// `healthy`, and the TUI -- which authenticates with its own, perhaps freshly
+/// renewed, copy -- showed nothing at all while the service started no runner
+/// for hours. Separate from [`CONTACT_FILE`] so that an older build reading
+/// that file is not handed a field it refuses.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when `state/` cannot be written.
+pub fn record_github_credential_rejected(
+    paths: &AppPaths,
+    at: DateTime<Utc>,
+) -> Result<(), ServiceError> {
+    if github_credential_rejected_since(paths)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(());
+    }
+    let path = credential_rejection_path(paths);
+    let record = CredentialRejectionRecord {
+        schema_version: CONTACT_SCHEMA_VERSION,
+        rejected_since: at,
+    };
+    let failed = |detail: String| ServiceError::Record {
+        operation: "write",
+        path: path.clone(),
+        detail,
+    };
+    let text = toml::to_string_pretty(&record).map_err(|error| failed(error.to_string()))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
+    std::fs::rename(&temporary, &path).map_err(|error| failed(error.to_string()))
+}
+
+/// Clears a recorded rejection once GitHub accepts the credential again.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when the record exists and cannot be removed.
+pub fn clear_github_credential_rejection(paths: &AppPaths) -> Result<(), ServiceError> {
+    let path = credential_rejection_path(paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServiceError::Record {
+            operation: "remove",
+            path,
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// Since when GitHub has been rejecting the daemon's credential, if it is.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when the file exists and cannot be read or parsed.
+pub fn github_credential_rejected_since(
+    paths: &AppPaths,
+) -> Result<Option<DateTime<Utc>>, ServiceError> {
+    let path = credential_rejection_path(paths);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::Record {
+                operation: "read",
+                path,
+                detail: error.to_string(),
+            });
+        }
+    };
+    let record: CredentialRejectionRecord =
+        toml::from_str(&text).map_err(|error| ServiceError::Record {
+            operation: "read",
+            path,
+            detail: error.to_string(),
+        })?;
+    Ok(Some(record.rejected_since))
+}
+
+/// Where the rejection record lives.
+#[must_use]
+pub fn credential_rejection_path(paths: &AppPaths) -> PathBuf {
+    paths.state_dir().join(CREDENTIAL_REJECTION_FILE)
+}
+
+// ---------------------------------------------------------------------------
+// A definition written by an older build
+// ---------------------------------------------------------------------------
+
+/// An installed service definition that differs from what this build renders
+/// for the same recorded installation.
+///
+/// # Why this exists
+///
+/// An upgrade replaces the binary a registration runs and nothing else. A
+/// systemd unit written by 0.4.7 still carried `LoadCredential=`, which hands
+/// the daemon a copy of the credential frozen at service start, and lacked
+/// write access to the credential store. Every release after the fix kept
+/// running under that unit: the daemon could neither renew the token nor see
+/// one renewed by anybody else, and stopped starting runners the moment the
+/// frozen access token expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionDrift {
+    /// The definition file on disk.
+    pub path: PathBuf,
+    /// The build that wrote it, as its install record says.
+    pub installed_by_version: String,
+    /// What this build renders in its place.
+    pub rendered: String,
+    /// The start mode it was installed for.
+    pub start_mode: StartMode,
+}
+
+/// Compares the installed systemd unit against this build's rendering.
+///
+/// Limited to systemd, whose unit is a plain file this module renders byte
+/// for byte; `None` for every other manager, for a definition that cannot be
+/// read, and for one that already matches. The file is read through
+/// `controls`, so a double never compares against a real host's unit.
+fn definition_drift(
+    controls: &dyn ControlFactory,
+    identity: &ServiceIdentity,
+    record: &InstallRecord,
+) -> Option<DefinitionDrift> {
+    if host_definition_kind(record.start_mode) != DefinitionKind::SystemdUnit {
+        return None;
+    }
+    let path = record.definition_path.clone()?;
+    let installed = controls.installed_definition(&path)?;
+    systemd_definition_drift(identity, record, path, &installed)
+}
+
+fn systemd_definition_drift(
+    identity: &ServiceIdentity,
+    record: &InstallRecord,
+    path: PathBuf,
+    installed: &str,
+) -> Option<DefinitionDrift> {
+    let rendered = systemd_unit(&record.plan(identity.clone()));
+    (installed != rendered).then(|| DefinitionDrift {
+        path,
+        installed_by_version: record.installed_by_version.clone(),
+        rendered,
+        start_mode: record.start_mode,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3512,6 +3715,13 @@ pub trait ControlFactory: fmt::Debug + Send + Sync {
     ///
     /// [`ServiceError::Control`] when this host has no manager for that domain.
     fn control(&self, mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError>;
+
+    /// The text of an installed definition file, for drift detection. `None`
+    /// when there is none to read. The default reads nothing, so a double
+    /// never reports the real host's unit as its own.
+    fn installed_definition(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// The real service managers of the host this binary was built for.
@@ -3891,24 +4101,7 @@ impl ServiceOperations {
         let Some(record) = previous else {
             return Ok(());
         };
-        let plan = InstallPlan::unchecked(
-            self.identity.clone(),
-            record.start_mode,
-            record.binary.clone(),
-            record.directories.clone(),
-        )
-        .with_arguments(record.arguments.clone())
-        .with_restart(record.restart());
-        let plan = if record.starts_on_demand {
-            plan.started_on_demand()
-        } else {
-            plan
-        };
-        let plan = match crate::secrets::PlatformSecretStore::for_start_mode(record.start_mode) {
-            Ok(store) => plan.with_secret_guard(store.guard()),
-            Err(_) => plan,
-        };
-        control.install(&plan)?;
+        control.install(&record.plan(self.identity.clone()))?;
         if was_running {
             control.start(&self.identity)?;
         }
@@ -4147,6 +4340,11 @@ impl ServiceOperations {
         };
         let found = self.find_registration()?;
         let last_github_contact = last_github_contact(&self.paths)?;
+        let drift = record
+            .as_ref()
+            .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, record));
+        let credential_rejected_since =
+            github_credential_rejected_since(&self.paths).ok().flatten();
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4154,7 +4352,20 @@ impl ServiceOperations {
             found.map(|(_, registration)| registration),
             last_github_contact,
             &self.paths,
-        ))
+        )
+        .with_definition_drift(drift)
+        .with_credential_rejection(credential_rejected_since))
+    }
+
+    /// The installed definition, when it is not what this build renders for
+    /// the recorded installation. See [`definition_drift`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the install record reports.
+    pub fn definition_drift(&self) -> Result<Option<DefinitionDrift>, ServiceError> {
+        Ok(InstallRecord::read(&self.paths)?
+            .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, &record)))
     }
 
     /// Creates or reconciles the runner root this start mode's account needs.
@@ -4284,6 +4495,7 @@ pub struct ServiceStatus {
     store: Option<crate::secrets::ActiveStore>,
     last_github_contact: Option<DateTime<Utc>>,
     runner_root: Option<(PathBuf, RootAccessReport)>,
+    credential_rejected_since: Option<DateTime<Utc>>,
     problems: Vec<StatusProblem>,
     notes: Vec<String>,
 }
@@ -4556,9 +4768,66 @@ impl ServiceStatus {
             store,
             last_github_contact,
             runner_root,
+            credential_rejected_since: None,
             problems,
             notes,
         }
+    }
+
+    /// Reports a definition this build would render differently.
+    #[must_use]
+    pub fn with_definition_drift(mut self, drift: Option<DefinitionDrift>) -> Self {
+        if let Some(drift) = drift {
+            let repair = match drift.start_mode {
+                StartMode::Boot => {
+                    "`sudo systemctl stop runner-manager && sudo runner-manager service install \
+                     --start-at boot` (for a managed WSL host, run `runner-manager wsl install \
+                     --distribution <name>` from Windows)"
+                }
+                StartMode::Login => {
+                    "`systemctl --user stop runner-manager && runner-manager service install \
+                     --start-at login`"
+                }
+            };
+            self.problems.push(StatusProblem {
+                subject: "definition",
+                detail: format!(
+                    "{} was written by runner-manager {} and differs from what {} renders, so \
+                     the daemon runs under outdated settings (for example a credential frozen \
+                     at service start). Re-register it with {repair}; configuration and \
+                     credentials are kept.",
+                    drift.path.display(),
+                    drift.installed_by_version,
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            });
+        }
+        self
+    }
+
+    /// Reports that GitHub is rejecting the daemon's credential.
+    #[must_use]
+    pub fn with_credential_rejection(mut self, since: Option<DateTime<Utc>>) -> Self {
+        if let Some(since) = since {
+            self.credential_rejected_since = Some(since);
+            self.problems.push(StatusProblem {
+                subject: "github credential",
+                detail: format!(
+                    "GitHub has rejected the service's credential since {}, so the service \
+                     cannot see queued jobs or start runners. Run `runner-manager auth login` \
+                     (for a managed WSL host, `runner-manager --host wsl:<name> auth login` \
+                     from Windows).",
+                    since.to_rfc3339()
+                ),
+            });
+        }
+        self
+    }
+
+    /// Since when GitHub has rejected the service's credential, if it has.
+    #[must_use]
+    pub const fn credential_rejected_since(&self) -> Option<DateTime<Utc>> {
+        self.credential_rejected_since
     }
 
     /// What this host's default runner root grants, and to whom.
@@ -4999,6 +5268,10 @@ impl ServiceControl for RecordingControl {
 impl ControlFactory for HostControls {
     fn control(&self, mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError> {
         sys::control(mode)
+    }
+
+    fn installed_definition(&self, path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
     }
 }
 
@@ -7468,6 +7741,78 @@ mod tests {
         assert_eq!(read, record);
         assert_eq!(read.binary, host.binary);
         assert!(read.binary.is_absolute());
+    }
+
+    #[test]
+    fn a_unit_written_by_an_older_build_is_reported_and_a_current_one_is_not() {
+        let host = Host::new();
+        let identity = ServiceIdentity::product();
+        let plan = InstallPlan::resolve(
+            identity.clone(),
+            &host.request(StartMode::Boot),
+            ServiceDirectories::of(&host.paths),
+        )
+        .expect("a resolvable plan");
+        let installed = systemd_unit(&plan);
+        let definition =
+            ServiceDefinition::from_text(DefinitionKind::SystemdUnit, installed.clone());
+        let mut record = InstallRecord::of(&plan, &definition, Utc::now());
+        let path = PathBuf::from("/etc/systemd/system/runner-manager.service");
+
+        assert_eq!(
+            systemd_definition_drift(&identity, &record, path.clone(), &installed),
+            None,
+            "the record must rebuild exactly the unit `service install` wrote"
+        );
+
+        record.installed_by_version = "0.4.7".into();
+        let frozen = installed.replace(
+            "[Service]\n",
+            "[Service]\nLoadCredential=runner-manager.user-access-token:/var/lib/runner-manager/secrets/user-access-token\n",
+        );
+        let drift = systemd_definition_drift(&identity, &record, path, &frozen)
+            .expect("an outdated unit is drift");
+        assert_eq!(drift.installed_by_version, "0.4.7");
+        assert_eq!(drift.rendered, installed);
+
+        let status = ServiceStatus::compose(identity, None, None, None, None, &host.paths)
+            .with_definition_drift(Some(drift));
+        assert!(!status.is_healthy());
+        assert!(
+            status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == "definition" && problem.detail.contains("0.4.7")),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_credential_keeps_its_first_moment_and_makes_the_service_unhealthy() {
+        let host = Host::new();
+        assert_eq!(github_credential_rejected_since(&host.paths).unwrap(), None);
+        let first = Utc::now() - chrono::Duration::hours(9);
+        record_github_credential_rejected(&host.paths, first).unwrap();
+        record_github_credential_rejected(&host.paths, Utc::now()).unwrap();
+        let since = github_credential_rejected_since(&host.paths).unwrap();
+        assert_eq!(since, Some(first));
+
+        let status = ServiceStatus::compose(
+            ServiceIdentity::product(),
+            None,
+            None,
+            None,
+            None,
+            &host.paths,
+        )
+        .with_credential_rejection(since);
+        assert!(!status.is_healthy());
+        assert_eq!(status.credential_rejected_since(), Some(first));
+        assert!(status.to_string().contains("auth login"), "{status}");
+
+        clear_github_credential_rejection(&host.paths).unwrap();
+        clear_github_credential_rejection(&host.paths).unwrap();
+        assert_eq!(github_credential_rejected_since(&host.paths).unwrap(), None);
     }
 
     /// The record is readable by the account whose directory it is in.

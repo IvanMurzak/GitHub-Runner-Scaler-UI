@@ -11,7 +11,7 @@ use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::wsl::WslHost;
 use runner_manager_platform::wsl::fence::{
     DrainRequest, FenceClaim, FenceOwnerKind, GuestHeartbeat, RecoveryPhase, RecoveryStatus,
-    SCHEMA_VERSION, clear_recovery, recovery_root,
+    SCHEMA_VERSION, clear_recovery, recovery_root, retire_abandoned_windows_recovery,
 };
 use runner_manager_platform::wsl::probe::LinuxCommand;
 use runner_manager_platform::wsl::record::WslProviderRecord;
@@ -23,6 +23,9 @@ const TASK_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const CIRCUIT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const CIRCUIT_LIMIT: usize = 3;
+/// A recovering watchdog rewrites its drain request every [`WATCH_INTERVAL`],
+/// so one this much older has no live owner.
+const ABANDONED_RECOVERY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Default)]
 struct Tracker {
@@ -186,6 +189,21 @@ async fn observe(
     if healthy {
         if let Some(generation) = tracker.generation.take() {
             let _ = clear_recovery(&root, generation);
+        }
+        // A predecessor that exited mid-recovery left its generation behind,
+        // and no generation this process mints will ever match it. Without
+        // this, a healthy distribution stays fenced and starts no runner.
+        match retire_abandoned_windows_recovery(&root, Utc::now(), ABANDONED_RECOVERY_AFTER) {
+            Ok(true) => tracing::warn!(
+                distribution = %record.distribution,
+                "retired WSL recovery coordination abandoned by an earlier watchdog"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                distribution = %record.distribution,
+                %error,
+                "abandoned WSL recovery coordination could not be inspected"
+            ),
         }
         tracker.failures = 0;
         tracker.first_failure = None;
