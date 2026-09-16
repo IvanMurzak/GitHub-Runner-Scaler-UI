@@ -712,6 +712,7 @@ impl CommandRunner for SystemCommands {
     }
 }
 
+#[cfg(any(not(test), windows))]
 fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
     if !cfg!(windows) {
         return WindowsHyperVHostState::UnsupportedHost;
@@ -855,6 +856,7 @@ fn supported_edition(edition: &str) -> bool {
         || edition.contains("iotenterprise")
 }
 
+#[cfg(any(not(test), windows))]
 fn value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines()
         .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
@@ -875,6 +877,7 @@ fn failure(message: &'static str) -> FailureReason {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::collections::VecDeque;
 
     use super::*;
