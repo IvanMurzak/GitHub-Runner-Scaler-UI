@@ -1,0 +1,19 @@
+crates/app/tests/profile_commands.rs
+  s_5801a853f78e8a::t_d3c0755f46d347 3,45-55,172-203,269-356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5cd7feb7c0eb008d0b8993e8fbb25a2edaa82363",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
