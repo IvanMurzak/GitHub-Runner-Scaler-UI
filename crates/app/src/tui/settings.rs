@@ -4234,6 +4234,23 @@ mod tests {
         // placeholder in the field is what keeps that window from ever
         // opening, whatever a host's temporary directory happens to be named.
         let mut ui = ui.clone();
+        // The VM diagnostic is another host-specific value: a macOS test host
+        // without the helper reports `not installed`, while the other CI hosts
+        // report `unsupported`. This snapshot measures the settings states and
+        // layout, so give its fixture one deterministic provider observation;
+        // production screens continue to render the live host probe.
+        if let SettingsView::Policy(form) = &mut ui.view {
+            let vm = form
+                .provider_diagnostics
+                .iter_mut()
+                .find(|provider| provider.backend == cli::host::IsolationBackend::VirtualMachine)
+                .expect("the settings fixture includes the VM provider");
+            *vm = cli::host::sanitize_isolation_observation(cli::host::IsolationObservation {
+                backend: cli::host::IsolationBackend::VirtualMachine,
+                state: cli::host::IsolationReadiness::Unsupported,
+                raw_output: None,
+            });
+        }
         let host_root = redact(&ui.host_root.text());
         ui.host_root.reset_to(&host_root);
         let workspace_path = redact(&ui.workspace_path.text());
