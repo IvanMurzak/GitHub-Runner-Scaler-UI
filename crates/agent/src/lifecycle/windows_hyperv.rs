@@ -34,7 +34,7 @@ const LABEL_PROVIDER: &str = "runner-manager.provider";
 const PROVIDER_VALUE: &str = "windows-hyper-v-container";
 const MAX_CAPTURE: usize = 64 * 1024;
 const PREFLIGHT_INPUT: &str = "runner-manager-preflight-v1";
-#[cfg(test)]
+#[cfg(all(test, windows))]
 const BOOTSTRAP_SELF_TEST_INPUT: &str = "runner-manager-windows-job-self-test-v1";
 const BOOTSTRAP_REQUEST_PROTOCOL: &str = "runner-manager-windows-job-request-v1";
 const BOOTSTRAP_ATTESTATION_PROTOCOL: &str = "runner-manager-windows-job-ready-v1";
