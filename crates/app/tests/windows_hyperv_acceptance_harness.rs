@@ -53,6 +53,14 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
     assert!(script.contains("'service-prior.toml'"));
     assert!(script.contains("'runner-manager-supervisor.exe'"));
     assert!(script.contains("prior service source backup hash does not match"));
+    assert!(script.contains("Find-DefaultServiceRecord"));
+    assert!(script.contains("restore_with_default_paths"));
+    assert!(script.contains("Get-TomlString $text 'binary'"));
+    assert!(script.contains("Get-TomlString $text 'source_binary'"));
+    assert!(script.contains("$current.path_name -eq $State.runner_service.path_name"));
+    assert!(
+        script.contains("$current.executable_sha256 -eq $State.runner_service.executable_sha256")
+    );
 }
 
 #[test]

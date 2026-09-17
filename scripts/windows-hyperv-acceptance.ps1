@@ -133,25 +133,69 @@ function ConvertFrom-TomlPath([string]$Value) {
     return $Value.Replace('\\', '\').Replace('\"', '"')
 }
 
+function Get-TomlString([string]$Text, [string]$Name) {
+    $pattern = '(?m)^' + [Regex]::Escape($Name) + '\s*=\s*(?:"((?:\\.|[^"])*)"|''([^'']*)'')\s*$'
+    if ($Text -match $pattern) {
+        if ($Matches[1]) { return ConvertFrom-TomlPath $Matches[1] }
+        return $Matches[2]
+    }
+    return $null
+}
+
 function Get-ServiceRecordSnapshot([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [ordered]@{ exists = $false; path = $Path }
     }
     $text = Get-Content -LiteralPath $Path -Raw
-    $startMode = if ($text -match '(?m)^start_mode\s*=\s*"([^"]+)"') { $Matches[1].ToLowerInvariant() } else { $null }
-    $binary = if ($text -match '(?m)^binary\s*=\s*"([^"]+)"') { ConvertFrom-TomlPath $Matches[1] } else { $null }
-    $source = if ($text -match '(?m)^source_binary\s*=\s*"([^"]+)"') { ConvertFrom-TomlPath $Matches[1] } else { $null }
+    $serviceName = Get-TomlString $text 'service_name'
+    $startModeValue = Get-TomlString $text 'start_mode'
+    $startMode = if ($startModeValue) { $startModeValue.ToLowerInvariant() } else { $null }
+    $binary = Get-TomlString $text 'binary'
+    $source = Get-TomlString $text 'source_binary'
     $restoreSource = if ($source -and (Test-Path -LiteralPath $source -PathType Leaf)) { $source } else { $binary }
     return [ordered]@{
         exists = $true
         path = $Path
+        service_name = $serviceName
         start_mode = $startMode
         binary = $binary
         binary_sha256 = if ($binary -and (Test-Path -LiteralPath $binary -PathType Leaf)) { (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
         source_binary = $source
         restore_source = $restoreSource
         restore_source_sha256 = if ($restoreSource -and (Test-Path -LiteralPath $restoreSource -PathType Leaf)) { (Get-FileHash -LiteralPath $restoreSource -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
-        scheduled_task_state = try { [string](Get-ScheduledTask -TaskName 'runner-manager' -ErrorAction Stop).State } catch { $null }
+        scheduled_task_state = $(try { [string](Get-ScheduledTask -TaskName 'runner-manager' -ErrorAction Stop).State } catch { $null })
+        restore_with_default_paths = $false
+    }
+}
+
+function Test-SamePath([string]$Left, [string]$Right) {
+    if (-not $Left -or -not $Right) { return $false }
+    try {
+        return [string]::Equals([IO.Path]::GetFullPath($Left).TrimEnd('\'), [IO.Path]::GetFullPath($Right).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Find-DefaultServiceRecord($Service) {
+    if (-not $Service.exists -or -not $env:LOCALAPPDATA) { return $null }
+    $path = Join-Path $env:LOCALAPPDATA 'IvanMurzak/runner-manager/config/service.toml'
+    $record = Get-ServiceRecordSnapshot $path
+    if (-not $record.exists -or $record.service_name -ne 'runner-manager' -or -not (Test-SamePath $record.binary $Service.executable)) { return $null }
+    if (-not $record.binary_sha256 -or $record.binary_sha256 -ne $Service.executable_sha256) { return $null }
+    $record.restore_with_default_paths = $true
+    return $record
+}
+
+function Backup-ServiceRecord($State) {
+    if (-not $State.service_record.exists) { return }
+    $backup = Join-Path (Split-Path $StatePath -Parent) 'prior-service'
+    Protect-StateDirectory $backup
+    Copy-Item -LiteralPath $State.service_record.path -Destination (Join-Path $backup 'service-prior.toml') -Force
+    if ($State.service_record.restore_source -and (Test-Path -LiteralPath $State.service_record.restore_source -PathType Leaf)) {
+        Copy-Item -LiteralPath $State.service_record.restore_source -Destination (Join-Path $backup (Split-Path $State.service_record.restore_source -Leaf)) -Force
+        $supervisor = Join-Path (Split-Path $State.service_record.restore_source -Parent) 'runner-manager-supervisor.exe'
+        if (Test-Path -LiteralPath $supervisor -PathType Leaf) {
+            Copy-Item -LiteralPath $supervisor -Destination (Join-Path $backup 'runner-manager-supervisor.exe') -Force
+        }
     }
 }
 
@@ -242,6 +286,10 @@ function New-AuditState {
     $service = Get-ServiceSnapshot 'runner-manager'
     $serviceRecord = Join-Path $DataDir 'config/service.toml'
     $serviceRecordSnapshot = Get-ServiceRecordSnapshot $serviceRecord
+    if ($service.exists -and -not $serviceRecordSnapshot.exists) {
+        $defaultRecord = Find-DefaultServiceRecord $service
+        if ($defaultRecord) { $serviceRecordSnapshot = $defaultRecord }
+    }
     return [ordered]@{
         schema_version = 1
         created_utc = [DateTime]::UtcNow.ToString('o')
@@ -329,17 +377,7 @@ function Invoke-Audit {
         Protect-StateDirectory $backup
         Copy-Item -LiteralPath $state.runner_service.executable -Destination (Join-Path $backup 'runner-manager-prior.exe') -Force
     }
-    if ($state.service_record.exists) {
-        Protect-StateDirectory $backup
-        Copy-Item -LiteralPath $state.service_record.path -Destination (Join-Path $backup 'service-prior.toml') -Force
-        if ($state.service_record.restore_source -and (Test-Path -LiteralPath $state.service_record.restore_source -PathType Leaf)) {
-            Copy-Item -LiteralPath $state.service_record.restore_source -Destination (Join-Path $backup (Split-Path $state.service_record.restore_source -Leaf)) -Force
-            $supervisor = Join-Path (Split-Path $state.service_record.restore_source -Parent) 'runner-manager-supervisor.exe'
-            if (Test-Path -LiteralPath $supervisor -PathType Leaf) {
-                Copy-Item -LiteralPath $supervisor -Destination (Join-Path $backup 'runner-manager-supervisor.exe') -Force
-            }
-        }
-    }
+    Backup-ServiceRecord $state
     Save-State $state
     $state | ConvertTo-Json -Depth 12
 }
@@ -494,7 +532,18 @@ function Invoke-RunJob($State) {
         throw "acceptance '$($State.acceptance_id)' already used this state file; finish recovery-forensics, cleanup, and rollback, then begin with a fresh audit"
     }
     if ($State.runner_service.exists -and -not $State.service_record.exists) {
-        throw 'an existing runner-manager SCM service has no matching record under DataDir; refusing because rollback cannot safely reconstruct it'
+        $current = Get-ServiceSnapshot 'runner-manager'
+        if ($current.exists -and $current.path_name -eq $State.runner_service.path_name -and $current.executable_sha256 -eq $State.runner_service.executable_sha256) {
+            $defaultRecord = Find-DefaultServiceRecord $current
+            if ($defaultRecord) {
+                Set-StateProperty $State service_record $defaultRecord
+                Backup-ServiceRecord $State
+                Save-State $State
+            }
+        }
+        if (-not $State.service_record.exists) {
+            throw 'an existing runner-manager SCM service has no verified restorable record under DataDir or the current user default paths; refusing because rollback cannot safely reconstruct it'
+        }
     }
     if ($State.service_record.exists -and (-not $State.service_record.source_binary -or -not $State.service_record.restore_source_sha256 -or $State.service_record.start_mode -notin @('boot', 'login'))) {
         throw 'the prior service record lacks a restorable source binary or start mode; refusing to replace it'
@@ -643,7 +692,12 @@ function Restore-ServiceState($State) {
             throw 'prior login service supervisor backup is missing'
         }
         $mode = [string]$State.service_record.start_mode
-        $args = @('--data-dir', $DataDir, 'service', 'install', '--start-at', $mode)
+        $restoreWithDefaultPaths = $State.service_record.PSObject.Properties.Name -contains 'restore_with_default_paths' -and $State.service_record.restore_with_default_paths
+        $args = if ($restoreWithDefaultPaths) {
+            @('service', 'install', '--start-at', $mode)
+        } else {
+            @('--data-dir', $DataDir, 'service', 'install', '--start-at', $mode)
+        }
         Invoke-External $prior $args -DiscardOutput
         if (-not (Test-Path -LiteralPath $State.service_record.binary -PathType Leaf)) { throw 'restored service binary is missing from its prior path' }
         $restoredBinaryHash = (Get-FileHash -LiteralPath $State.service_record.binary -Algorithm SHA256).Hash.ToLowerInvariant()
