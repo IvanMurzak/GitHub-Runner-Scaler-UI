@@ -39,7 +39,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   storage helper backed by finite Linux filesystems. The provider requires the
   helper's bounded-store attestation and keeps returning
   `DiskQuotaUnavailable` for ordinary rootless Podman storage that cannot
-  enforce the requested disk cap.
+  enforce the requested disk cap. The same helper and its provider resources
+  now have a terminate/restart acceptance that verifies generation-fenced
+  adoption, cleanup accounting, and no duplicate JIT registration.
 
 ## 0.4.25
 

@@ -92,6 +92,53 @@ fn wsl_procedure() -> String {
     wsl_section(&source).to_string()
 }
 
+#[test]
+fn managed_wsl_restart_acceptance_keeps_the_distribution_boundary_and_cleanup_explicit() {
+    let root = repository_root();
+    let orchestrator =
+        std::fs::read_to_string(root.join("tests/managed-wsl-oci-restart-acceptance.ps1"))
+            .expect("managed WSL restart orchestrator exists");
+    for required in [
+        "wsl.exe --terminate $Distribution",
+        "finally",
+        "cleanup $repoLinux $managedUser",
+    ] {
+        assert!(
+            orchestrator.contains(required),
+            "managed WSL restart orchestration no longer contains `{required}`"
+        );
+    }
+
+    let harness = std::fs::read_to_string(root.join("tests/managed-wsl-oci-restart-acceptance.sh"))
+        .expect("managed WSL restart harness exists");
+    for required in [
+        "live_rootless_managed_wsl_restart_seed",
+        "live_rootless_managed_wsl_restart_recover",
+        "isolated_restart_at_each_transition_adopts_or_destroys_one_resource",
+        "/run/user/$managed_uid",
+        "pid1-start-before",
+        "windows-session-boot-id",
+    ] {
+        assert!(
+            harness.contains(required),
+            "managed WSL restart harness no longer contains `{required}`"
+        );
+    }
+
+    let provider = std::fs::read_to_string(root.join("crates/agent/src/oci.rs"))
+        .expect("OCI restart fixture exists");
+    for required in [
+        "a different generation adopted the crash-gap resource",
+        "registration-count",
+        "uncleaned_ephemeral_attempts",
+    ] {
+        assert!(
+            provider.contains(required),
+            "managed WSL restart provider evidence no longer contains `{required}`"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Definition of Done 1: nothing is left to the operator to invent
 // ---------------------------------------------------------------------------

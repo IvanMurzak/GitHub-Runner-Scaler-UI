@@ -77,9 +77,12 @@ socket or Docker socket entered a container. The production provider resolved
 the pinned Ubuntu digest, prepared and started two simultaneous containers,
 installed versions 1.0 and 2.0 of the same Debian package independently, and
 then proved a fresh sibling contained neither package state nor executable. A
-1,100 MiB `fallocate` failed with `ENOSPC` against the 1,024 MiB filesystem; the
+1,100 MiB `dd` wrote zeroes through fuse-overlayfs until ext4 returned `ENOSPC`;
+`df -B1` reported only one 4 KiB block available on that same filesystem. The
 fixture removed the partial allocation inside that command so Podman retained
-space to journal the exit and perform normal owned cleanup.
+space to journal the exit and perform normal owned cleanup. This replaced the earlier
+`fallocate`-only probe, whose failure could have meant that overlay allocation
+was unsupported rather than that the filesystem cap was reached.
 
 The same run exercised stdin-only synthetic JIT delivery, inspect/log/history
 and exported-rootfs sentinel scans, CPU/memory/pids controls, normal destruction,
@@ -87,8 +90,35 @@ crash-gap orphan discovery and adoption, and a final independent container
 sweep. The root-owned helper, loop mount, loop image, graph root, cargo target
 and temporary files were removed after the evidence run. This closes the real
 managed-WSL container-boundary gate through the production prepare/start path.
-It does not claim a GitHub runner job or reboot continuity; those require JIT
-fixture secrets and a reboot-resumable host.
+It does not claim a GitHub runner job; the distribution-restart boundary is
+measured separately below.
+
+## Managed WSL distribution restart continuity
+
+On September 16, 2026,
+`tests/managed-wsl-oci-restart-acceptance.ps1 -Distribution Ubuntu` completed a
+real distribution stop/start boundary without rebooting Windows. The harness
+created the same root-owned 1,024 MiB ext4 helper, four production-provider
+resources, and a durable SQLite journal containing `prepared`, running-like
+`starting`, `cleanup_deferred`, and crash-gap `preparing` attempts. It flushed
+the nested loop filesystem, recorded the WSL kernel boot ID and PID 1 start
+time, and then issued exactly `wsl --terminate Ubuntu`.
+
+On the next distribution start, PID 1 had a new start time while the WSL kernel
+boot ID was unchanged, so the evidence is a distribution restart rather than a
+Windows or WSL VM reboot. The harness remounted the finite store, recreated the
+rootless `/run/user/1000` runtime directory, and started a fresh provider
+process. All four journal rows still counted against capacity and all four
+labelled resources were enumerable. Recovery refused a different generation,
+adopted the crash-gap resource carrying the exact attempt and generation,
+destroyed every owned resource, and left zero uncleaned journal rows and zero
+provider resources. The lifecycle restart regression separately covered every
+isolated transition and observed zero JIT registrations during recovery. Final
+cleanup removed the helper, loop mount, loop image, graph root, build target,
+runtime directories, and containers.
+
+This closes continuity across termination of the managed distribution. A full
+Windows reboot remains a separate host boot acceptance boundary.
 
 ## One-time live JIT acceptance
 
@@ -117,50 +147,32 @@ not support a stronger live-process-environment claim.
 
 ## GitHub-hosted native Linux acceptance
 
-CI run `35170389901` exercised the secret-free native fixture on GitHub's
-`ubuntu-24.04` image (Ubuntu 24.04.5, Podman 4.9.3). The harness used the hosted
-runner's documented passwordless `sudo` only to create and mount a disposable
-6 GiB XFS loopback filesystem with `prjquota`; every Podman and provider command
-ran as the ordinary runner user. Podman reported rootless mode, 65,536
-subordinate UIDs/GIDs, cgroup v2 CPU/memory/pids controllers, and the dedicated
-XFS graph root. GitHub documents the hosted Linux privilege model in its
+The PR's native `ubuntu-24.04` gate now uses the same bounded-storage contract as
+managed WSL instead of stopping at plain Podman's XFS quota refusal. The harness
+uses the hosted runner's documented passwordless `sudo` only to create and mount
+a disposable 1,024 MiB ext4 loop filesystem and install a root-owned,
+non-writable helper under `/usr/local/libexec`. Every Podman and production
+provider command runs as the ordinary runner user through that helper, with
+fuse-overlayfs and no unbounded fallback. GitHub documents the hosted Linux
+privilege model in its
 [hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges),
-and containers/storage documents the XFS project-quota requirement in its
-[storage configuration reference](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md#quotas).
+while the helper's capacity and loop-device checks supply the hard-cap
+attestation plain rootless Podman cannot.
 
-The real `podman --storage-opt size=1024m info` preflight refused that store:
+The production provider performs resolve, image verification, prepare, stdin
+handoff, inspect, stop, orphan discovery, adoption, and destroy on the bounded
+path. It verifies the pinned Ubuntu digest; empty host mounts, binds, and device
+requests; no engine socket; CPU/memory/pids controls; conflicting package
+versions isolated between simultaneous containers; a clean sibling; and the
+synthetic JIT sentinel absent from inspect, disabled logs, image history, and
+exported root filesystems. The cap probe writes 1,100 MiB of zeroes through the
+container overlay, requires `No space left on device`, and requires `df -B1` to
+show at least 512 MiB of real growth and no more than 1 MiB available before
+removing the partial file. An independent sweep then requires no container to
+remain before the helper, mount, loop image,
+graph root, and run root are removed.
 
-```text
-Filesystem does not support Project Quota: failed to mknod .../overlay/backingFsBlockDev.tmp: operation not permitted
-```
-
-This is a rootless Podman limitation, not a missing XFS mount option: Podman
-maintainers confirm that rootless users cannot create the device node and that
-project IDs are not namespaced
-([upstream issue](https://github.com/containers/podman/issues/16424)). The
-production provider returned the typed `DiskQuotaUnavailable` result before
-image allocation or JIT. CI requires that refusal and fails if Podman ever
-starts accepting the preflight, forcing the fixture to move to the full
-provider prepare path instead of silently retaining the reduced path.
-
-After proving the production refusal, the fixture omitted only the unavailable
-per-container storage option and exercised the remaining provider lifecycle on
-the hard-bounded 6 GiB loopback store. It verified the pinned Ubuntu amd64 image
-digest; empty host mounts, bind mounts and device requests; no Podman or Docker
-socket; CPU/memory/pids controls; two simultaneous containers installing
-versions 1.0 and 2.0 of the same generated Debian package without changing each
-other or the host; a fresh third container with neither package state nor tool;
-normal stop/destroy; and discovery of exactly one crash-gap orphan followed by
-owned cleanup. A 7 GiB `fallocate` failed against the 6 GiB backing filesystem.
-A synthetic JIT sentinel passed through provider stdin and was absent from
-container inspect, disabled logs, image history and exported root filesystems.
-All containers were independently swept before the XFS fixture was unmounted.
-
-This native gate does **not** claim a GitHub runner job. The repository has no
-JIT/fixture secrets for this job, and rootless Podman 4.9.3 cannot enforce the
-required per-container 1 GiB writable-layer cap even on XFS with project quotas.
-Consequently a full provider prepare/start remains unavailable with plain
-Podman, and real demand-to-JIT plus reboot continuity remain open. Managed WSL
-can use the separately attested bounded-store helper described above. Without
-that operator-provisioned helper, the hard per-container cap remains mandatory
-and affected policies continue to fail closed before JIT.
+This native gate does **not** claim a GitHub runner job; PR 74's separate live
+JIT workflow supplies that evidence. A full Windows reboot remains outside the
+hosted Linux boundary. Plain Podman still fails closed when no attested helper
+can enforce the requested cap.

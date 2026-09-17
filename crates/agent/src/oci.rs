@@ -889,8 +889,10 @@ mod boundary_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use runner_manager_domain::attempt::{AttemptOutcome, AttemptState};
     use runner_manager_domain::execution::ResourceLimits;
     use runner_manager_domain::model::Clock;
+    use runner_manager_domain::store::{SqliteStore, Store};
     use runner_manager_testkit::{clock::FakeClock, fixtures};
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
@@ -1569,23 +1571,65 @@ mod tests {
         assert_export_excludes(&id_one, sentinel_one);
         assert_export_excludes(&id_two, sentinel_two);
 
-        // The loopback store is a real hard upper bound. Remove the partially
-        // allocated file inside the same command so Podman's metadata database
-        // retains enough room to record the failed process and cleanly remove
-        // the container afterward.
-        let oversize = if production_quota_path { "1100M" } else { "7G" };
+        // Prove the loopback store's hard upper bound with real writes. A
+        // fallocate-only probe may fail because an overlay does not implement
+        // allocation, which says nothing about the backing filesystem's cap.
+        // `dd` writes zeroes through fuse-overlayfs until ext4/XFS returns
+        // ENOSPC; `df` records that the same filesystem reached zero available
+        // bytes. Remove the partial file before Podman needs to journal the
+        // process exit or destroy the container.
+        let oversize_mib = if production_quota_path {
+            "1100"
+        } else {
+            "7168"
+        };
         let exhaustion = podman(&[
             "exec",
             &id_one,
             "sh",
             "-c",
-            "if fallocate -l \"$1\" /backing-store-cap; then exit 0; else status=$?; rm -f /backing-store-cap; exit \"$status\"; fi",
+            "set +e; printf 'RM_FS_BEFORE '; df -B1 --output=size,used,avail / | tail -n 1; dd if=/dev/zero of=/backing-store-cap bs=1M count=\"$1\" conv=fsync status=none; status=$?; printf 'RM_FS_FULL '; df -B1 --output=size,used,avail / | tail -n 1; rm -f /backing-store-cap; sync; exit \"$status\"",
             "sh",
-            oversize,
+            oversize_mib,
         ]);
         assert!(
             !exhaustion.status.success(),
             "the backing-store hard cap allowed an oversized allocation"
+        );
+        let exhaustion_stdout = String::from_utf8(exhaustion.stdout).unwrap();
+        let exhaustion_stderr = String::from_utf8(exhaustion.stderr).unwrap();
+        assert!(
+            exhaustion_stderr.contains("No space left on device"),
+            "the write failed without ENOSPC: {exhaustion_stderr}"
+        );
+        let df_line = |marker: &str| {
+            exhaustion_stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(marker))
+                .map(|line| {
+                    line.split_whitespace()
+                        .map(|value| value.parse().expect("df emitted integer byte counts"))
+                        .collect::<Vec<u64>>()
+                })
+                .unwrap_or_else(|| {
+                    panic!("the write did not emit {marker:?} df evidence: {exhaustion_stdout}")
+                })
+        };
+        let before = df_line("RM_FS_BEFORE ");
+        let full = df_line("RM_FS_FULL ");
+        assert_eq!(
+            before.len(),
+            3,
+            "unexpected initial df evidence: {before:?}"
+        );
+        assert_eq!(full.len(), 3, "unexpected full df evidence: {full:?}");
+        assert!(
+            full[1] >= before[1] + 512 * 1024 * 1024,
+            "the ENOSPC probe did not perform substantial writes: before={before:?} full={full:?}"
+        );
+        assert!(
+            full[2] <= 1024 * 1024,
+            "ENOSPC left more than 1 MiB available: {full:?}"
         );
         stop_and_destroy(&provider, &one);
         stop_and_destroy(&provider, &two);
@@ -1669,6 +1713,277 @@ mod tests {
         );
     }
 
+    const RESTART_FIXTURE_ENV: &str = "RUNNER_MANAGER_OCI_RESTART_FIXTURE";
+
+    fn restart_fixture_root() -> PathBuf {
+        let root = PathBuf::from(std::env::var(RESTART_FIXTURE_ENV).unwrap_or_else(|_| {
+            panic!("{RESTART_FIXTURE_ENV} must name the durable fixture root")
+        }));
+        assert!(root.is_absolute() && !root.starts_with("/mnt"));
+        root
+    }
+
+    fn restart_attempt(
+        root: &Path,
+        policy: &ScalePolicy,
+        image: &ImageReference,
+        suffix: &str,
+        id: u128,
+        generation: &str,
+    ) -> RunnerAttempt {
+        let runtime = root.join("runtimes").join(suffix);
+        std::fs::create_dir_all(&runtime).unwrap();
+        write_listener(&runtime);
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(id),
+            policy.id,
+            runtime,
+            FakeClock::default().now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: generation.into(),
+            })
+            .unwrap();
+        attempt
+    }
+
+    fn prepare_restart_resource(
+        provider: &OciProcesses,
+        policy: &ScalePolicy,
+        attempt: &mut RunnerAttempt,
+    ) -> (PreparedEnvironment, String) {
+        attempt.begin_prepare(FakeClock::default().now()).unwrap();
+        let prepared = provider.prepare(attempt, policy).unwrap();
+        let EnvironmentIdentity::Isolated { environment_id, .. } =
+            prepared.identity().cloned().expect("isolated identity")
+        else {
+            panic!("OCI prepare returned a native identity")
+        };
+        (prepared, environment_id)
+    }
+
+    #[test]
+    #[ignore = "seeds real managed-WSL resources for the terminate/restart acceptance"]
+    fn live_rootless_managed_wsl_restart_seed() {
+        let root = restart_fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let journal = SqliteStore::open(root.join("attempts.sqlite3")).unwrap();
+        let image = ImageReference::new(
+            std::env::var(LIVE_IMAGE_ENV)
+                .unwrap_or_else(|_| panic!("{LIVE_IMAGE_ENV} must name a pinned image digest")),
+        )
+        .unwrap();
+        let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
+        let policy = isolated_policy(image.clone());
+        assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
+
+        let clock = FakeClock::default();
+        let mut prepared = restart_attempt(
+            &root,
+            &policy,
+            &image,
+            "prepared",
+            0xd101,
+            "restart-prepared",
+        );
+        let (_prepared_handle, prepared_id) =
+            prepare_restart_resource(&provider, &policy, &mut prepared);
+        prepared.prepared_environment(prepared_id).unwrap();
+        prepared.mark_prepared(clock.now()).unwrap();
+        journal.record_attempt(&prepared).unwrap();
+
+        let mut running =
+            restart_attempt(&root, &policy, &image, "running", 0xd102, "restart-running");
+        let (running_handle, running_id) =
+            prepare_restart_resource(&provider, &policy, &mut running);
+        running.prepared_environment(running_id.clone()).unwrap();
+        running.mark_prepared(clock.now()).unwrap();
+        running.jit_received(clock.now()).unwrap();
+        provider
+            .start(
+                running_handle,
+                &running,
+                OneTimeJitHandoff::new(&EncodedJitConfig::new(
+                    "rm-restart-sentinel-running-739ef4",
+                )),
+            )
+            .unwrap();
+        running.started_isolated(clock.now()).unwrap();
+        assert!(wait_for_container_file(
+            &running_id,
+            "/tmp/runner-manager-jit-received",
+            Instant::now() + Duration::from_secs(60),
+        ));
+        journal.record_attempt(&running).unwrap();
+
+        let mut deferred = restart_attempt(
+            &root,
+            &policy,
+            &image,
+            "cleanup-deferred",
+            0xd103,
+            "restart-deferred",
+        );
+        let (_deferred_handle, deferred_id) =
+            prepare_restart_resource(&provider, &policy, &mut deferred);
+        deferred.prepared_environment(deferred_id).unwrap();
+        deferred.mark_prepared(clock.now()).unwrap();
+        deferred.jit_received(clock.now()).unwrap();
+        deferred.started_isolated(clock.now()).unwrap();
+        deferred
+            .conclude(AttemptOutcome::Orphaned, clock.now())
+            .unwrap();
+        deferred.begin_destroy(clock.now()).unwrap();
+        deferred.defer_cleanup(clock.now()).unwrap();
+        journal.record_attempt(&deferred).unwrap();
+
+        // Crash gap: the provider resource exists, but its ID was never put in
+        // the journal. Recovery may adopt only the resource carrying this exact
+        // attempt and generation label.
+        let mut orphan = restart_attempt(
+            &root,
+            &policy,
+            &image,
+            "crash-gap-orphan",
+            0xd104,
+            "restart-orphan",
+        );
+        let (_orphan_handle, _orphan_id) =
+            prepare_restart_resource(&provider, &policy, &mut orphan);
+        journal.record_attempt(&orphan).unwrap();
+
+        let attempts = journal.uncleaned_ephemeral_attempts().unwrap();
+        assert_eq!(attempts.len(), 4);
+        assert!(attempts.iter().all(RunnerAttempt::counts_against_capacity));
+        assert_eq!(
+            provider.enumerate_owned(HostId::from_u128(LIVE_HOST)).len(),
+            4
+        );
+        std::fs::write(root.join("registration-count"), "0\n").unwrap();
+        std::fs::write(
+            root.join("seed-complete"),
+            "prepared running deferred orphan\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "recovers real managed-WSL resources after the distribution restarts"]
+    fn live_rootless_managed_wsl_restart_recover() {
+        let root = restart_fixture_root();
+        assert!(root.join("seed-complete").is_file());
+        let journal = SqliteStore::open(root.join("attempts.sqlite3")).unwrap();
+        let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
+        let mut attempts = journal.uncleaned_ephemeral_attempts().unwrap();
+        assert_eq!(attempts.len(), 4, "the durable journal lost an attempt");
+        assert!(attempts.iter().all(RunnerAttempt::counts_against_capacity));
+        let owned = provider.enumerate_owned(HostId::from_u128(LIVE_HOST));
+        assert_eq!(owned.len(), 4, "the remounted provider lost a resource");
+
+        let clock = FakeClock::default();
+        for attempt in &mut attempts {
+            if attempt.state() == AttemptState::Preparing {
+                let AttemptExecution::Isolated {
+                    resolved_image,
+                    generation,
+                    ..
+                } = attempt.execution()
+                else {
+                    unreachable!()
+                };
+                let mut wrong_generation = RunnerAttempt::allocate(
+                    attempt.id,
+                    attempt.policy_id,
+                    attempt.runtime_path(),
+                    clock.now(),
+                );
+                wrong_generation
+                    .allocate_execution(AttemptExecution::Isolated {
+                        provider_kind: Backend::Oci,
+                        environment_id: None,
+                        resolved_image: resolved_image.clone(),
+                        generation: format!("{generation}-wrong"),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    provider.recover(&wrong_generation).unwrap(),
+                    EnvironmentState::Missing,
+                    "a different generation adopted the crash-gap resource"
+                );
+                assert_eq!(
+                    provider.recover(attempt).unwrap(),
+                    EnvironmentState::Starting
+                );
+                let identity = owned
+                    .iter()
+                    .find(|identity| {
+                        matches!(identity, EnvironmentIdentity::Isolated {
+                            attempt: found_attempt,
+                            generation: found_generation,
+                            ..
+                        } if found_attempt == &attempt.id && found_generation == generation)
+                    })
+                    .cloned()
+                    .expect("the exact crash-gap identity is enumerable");
+                let EnvironmentIdentity::Isolated { environment_id, .. } = identity else {
+                    unreachable!()
+                };
+                attempt.prepared_environment(environment_id).unwrap();
+                attempt.mark_prepared(clock.now()).unwrap();
+            }
+
+            let state_after_restart = provider.inspect(attempt).unwrap();
+            assert_eq!(
+                state_after_restart,
+                EnvironmentState::Starting,
+                "the remounted provider did not retain the resource for recovery"
+            );
+            match attempt.state() {
+                AttemptState::Prepared => {
+                    attempt
+                        .conclude(AttemptOutcome::Orphaned, clock.now())
+                        .unwrap();
+                    attempt.begin_destroy(clock.now()).unwrap();
+                }
+                AttemptState::Starting => {
+                    attempt
+                        .conclude(AttemptOutcome::Orphaned, clock.now())
+                        .unwrap();
+                    attempt.begin_destroy(clock.now()).unwrap();
+                }
+                AttemptState::CleanupDeferred => attempt.begin_destroy(clock.now()).unwrap(),
+                state => panic!("unexpected restart state {state}"),
+            }
+            assert_eq!(
+                provider.destroy(attempt).unwrap(),
+                ProviderDestroy::Destroyed
+            );
+            attempt.clean_isolated(clock.now()).unwrap();
+            journal.record_attempt(attempt).unwrap();
+        }
+
+        assert!(journal.uncleaned_ephemeral_attempts().unwrap().is_empty());
+        assert!(
+            provider
+                .enumerate_owned(HostId::from_u128(LIVE_HOST))
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("registration-count")).unwrap(),
+            "0\n",
+            "restart recovery attempted a second JIT registration"
+        );
+        std::fs::write(
+            root.join("recovery-complete"),
+            "adopted destroyed capacity=0 registrations=0\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     #[ignore = "requires the CI-provisioned native rootless Podman/XFS project-quota fixture"]
     fn live_rootless_native_acceptance() {
@@ -1676,8 +1991,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the managed-WSL bounded-storage helper fixture"]
-    fn live_rootless_managed_wsl_bounded_acceptance() {
+    #[ignore = "requires a root-owned bounded-storage helper fixture"]
+    fn live_rootless_bounded_storage_acceptance() {
         run_live_rootless_acceptance(true);
     }
 

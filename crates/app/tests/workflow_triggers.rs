@@ -525,7 +525,7 @@ fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
     for required in [
         "if: github.event_name == 'pull_request'",
         "runs-on: ubuntu-24.04",
-        "name: rootless OCI native acceptance (linux-x86_64, quota preflight, no JIT)",
+        "name: rootless OCI bounded-store acceptance (linux-x86_64, no JIT)",
         "run: bash tests/native-linux-oci-acceptance.sh",
     ] {
         assert!(
@@ -542,14 +542,28 @@ fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
     let harness = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
     for required in [
-        "sudo mount -o loop,pquota",
-        "podman --storage-opt size=1024m info",
-        "oci::tests::live_rootless_native_acceptance",
+        "sudo mount -o loop,nodev,nosuid",
+        "runner-manager-oci-native-acceptance",
+        "oci::tests::live_rootless_bounded_storage_acceptance",
         "--ignored --exact --nocapture",
     ] {
         assert!(
             harness.contains(required),
             "the native OCI harness no longer contains `{required}`"
+        );
+    }
+
+    let provider = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("agent")
+        .join("src")
+        .join("oci.rs");
+    let provider = std::fs::read_to_string(&provider)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", provider.display()));
+    for required in ["dd if=/dev/zero", "No space left on device", "RM_FS_FULL"] {
+        assert!(
+            provider.contains(required),
+            "the bounded-store acceptance no longer contains `{required}`"
         );
     }
 }

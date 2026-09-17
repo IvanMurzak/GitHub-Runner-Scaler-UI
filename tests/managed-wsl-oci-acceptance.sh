@@ -133,9 +133,7 @@ if [[ -n "$requested" && "$requested" != "1024m" ]]; then
   exit 69
 fi
 
-if [[ -n "$requested" ]]; then
-  verify_bounded_store
-fi
+verify_bounded_store
 
 if [[ -n "$requested" && "$command_name" == "info" ]]; then
   raw="$(podman "${args[@]}")"
@@ -222,7 +220,7 @@ else
     RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
     RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE="$RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE" \
     "$cargo_bin" test -p runner-manager-agent \
-      'oci::tests::live_rootless_managed_wsl_bounded_acceptance' -- \
+      'oci::tests::live_rootless_bounded_storage_acceptance' -- \
       --ignored --exact --nocapture
 fi
 

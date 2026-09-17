@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Native Linux acceptance for d1's real rootless OCI adapter. GitHub documents
-# that its ordinary Ubuntu hosted runners are fresh VMs with passwordless sudo:
-# https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges
-# That lets this secret-free job create a disposable quota-capable filesystem.
-# containers/storage documents that overlay hard size limits require XFS mounted
-# with pquota, and that rootless users may select a dedicated storage.conf:
-# https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md#quotas
+# Secret-free native Linux acceptance for the production OCI path. GitHub's
+# hosted Ubuntu runner gives this job passwordless sudo for fixture setup only;
+# Podman and every provider operation remain rootless.
 
 die() {
   echo "native Linux OCI acceptance: $*" >&2
@@ -22,54 +18,132 @@ die() {
   die "RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE is not digest pinned"
 
 fixture="$RUNNER_TEMP/runner-manager-oci-acceptance"
-image_file="$fixture/rootless-storage.xfs"
-mount_point="$fixture/xfs"
-run_root="$fixture/runroot"
+image_file="$fixture/rootless-storage.ext4"
+mount_point="$fixture/store"
+graph_root="$mount_point/graph"
+run_root="$fixture/run"
 storage_conf="$fixture/storage.conf"
+runtime_helper="/usr/local/libexec/runner-manager-oci-native-acceptance"
 mounted=false
+helper_created=false
 
 cleanup() {
   status=$?
   set +e
-  podman rm --all --force >/dev/null 2>&1
-  podman system reset --force >/dev/null 2>&1
+  if [[ -x "$runtime_helper" ]]; then
+    "$runtime_helper" rm --all --force >/dev/null 2>&1
+    "$runtime_helper" system reset --force >/dev/null 2>&1
+  fi
   if $mounted; then
     sudo umount "$mount_point"
   fi
-  rm -rf "$fixture"
+  sudo rm -rf "$fixture"
+  if $helper_created; then
+    sudo rm -f "$runtime_helper"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
 
-mkdir -p "$fixture" "$mount_point" "$run_root"
-truncate -s 6G "$image_file"
-sudo mkfs.xfs -f -q "$image_file"
-sudo mount -o loop,pquota "$image_file" "$mount_point"
+rm -rf "$fixture"
+[[ ! -e "$runtime_helper" ]] || die "$runtime_helper already exists"
+mkdir -p "$mount_point" "$run_root"
+truncate -s 1024M "$image_file"
+sudo mkfs.ext4 -q -F -m 0 "$image_file"
+sudo mount -o loop,nodev,nosuid "$image_file" "$mount_point"
 mounted=true
 sudo chown "$(id -u):$(id -g)" "$mount_point"
 chmod 0700 "$mount_point" "$run_root"
-mkdir -p "$mount_point/graphroot"
+mkdir -p "$graph_root"
 
 cat > "$storage_conf" <<EOF
 [storage]
 driver = "overlay"
 runroot = "$run_root"
-graphroot = "$mount_point/graphroot"
-rootless_storage_path = "$mount_point/graphroot"
+graphroot = "$graph_root"
+rootless_storage_path = "$graph_root"
 
 [storage.options.overlay]
 mount_program = "/usr/bin/fuse-overlayfs"
 mountopt = "nodev"
 EOF
-chmod 0600 "$storage_conf"
+
+helper_source="$fixture/runtime-helper"
+cat > "$helper_source" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+storage_conf='__STORAGE_CONF__'
+graph_root='__GRAPH_ROOT__'
 export CONTAINERS_STORAGE_CONF="$storage_conf"
 
-findmnt -T "$mount_point" -no FSTYPE,OPTIONS | tee "$fixture/mount.txt"
-grep -Eq '^xfs .*(pquota|prjquota)' "$fixture/mount.txt" ||
-  die "the disposable XFS store is not mounted with project quotas"
+verify_bounded_store() {
+  [[ "$(findmnt -T "$graph_root" -no FSTYPE)" == "ext4" ]] || exit 78
+  source="$(findmnt -T "$graph_root" -no SOURCE)"
+  [[ "$source" == /dev/loop* ]] || exit 78
+  read -r block_size block_count < <(stat -f -c '%S %b' "$graph_root")
+  capacity=$((block_size * block_count))
+  ((capacity <= 1024 * 1024 * 1024)) || exit 78
+}
 
-podman info --format json > "$fixture/podman-info.json"
-python3 - "$fixture/podman-info.json" "$mount_point/graphroot" <<'PY'
+requested=""
+command_name=""
+args=()
+while (($#)); do
+  if [[ "$1" == "--storage-opt" ]]; then
+    (($# >= 2)) || exit 64
+    [[ "$2" == size=* ]] || exit 64
+    requested="${2#size=}"
+    shift 2
+    continue
+  fi
+  [[ -n "$command_name" || "$1" == -* ]] || command_name="$1"
+  args+=("$1")
+  shift
+done
+
+verify_bounded_store
+if [[ -n "$requested" && "$requested" != "1024m" ]]; then
+  echo "bounded store has no slot for requested size $requested" >&2
+  exit 69
+fi
+
+if [[ -n "$requested" && "$command_name" == "info" ]]; then
+  raw="$(podman "${args[@]}")"
+  BOUNDED_INFO="$raw" python3 - <<'PY'
+import json
+import os
+
+info = json.loads(os.environ["BOUNDED_INFO"])
+info["runnerManagerStorage"] = {
+    "schema": 1,
+    "mode": "exclusive-filesystem-pool",
+    "requestedMiB": 1024,
+    "hardCap": True,
+}
+print(json.dumps(info, separators=(",", ":")))
+PY
+  exit 0
+fi
+
+exec podman "${args[@]}"
+HELPER
+sed -i "s|__STORAGE_CONF__|$storage_conf|g; s|__GRAPH_ROOT__|$graph_root|g" "$helper_source"
+sudo install -d -m 0755 -o root -g root /usr/local/libexec
+sudo install -m 0755 -o root -g root "$helper_source" "$runtime_helper"
+helper_created=true
+sudo chown root:root "$storage_conf"
+sudo chmod 0644 "$storage_conf"
+
+mount_evidence="$(findmnt -T "$mount_point" -no TARGET,SOURCE,FSTYPE,OPTIONS)"
+echo "$mount_evidence"
+grep -Eq '^/.* /dev/loop[0-9]+ ext4 .*(nodev|nosuid)' <<<"$mount_evidence" ||
+  die "bounded store is not the disposable ext4 loop mount"
+[[ "$(stat -c '%u:%g %a' "$runtime_helper")" == "0:0 755" ]] ||
+  die "runtime helper is not immutable and root-owned"
+
+"$runtime_helper" --storage-opt size=1024m info --format=json > "$fixture/probe.json"
+python3 - "$fixture/probe.json" "$graph_root" <<'PY'
 import json
 import pathlib
 import sys
@@ -78,27 +152,24 @@ info = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert info["host"]["security"]["rootless"] is True
 assert info["host"]["cgroupVersion"] == "v2"
 assert {"cpu", "memory", "pids"} <= set(info["host"]["cgroupControllers"])
-assert info["store"]["graphRoot"] == sys.argv[2], info["store"]
-assert info["store"]["graphStatus"]["Backing Filesystem"] == "xfs", info["store"]
-assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["uidmap"])
-assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["gidmap"])
+assert info["store"]["graphRoot"] == sys.argv[2]
+assert info["store"]["graphStatus"]["Backing Filesystem"] == "extfs"
+assert info["runnerManagerStorage"] == {
+    "schema": 1,
+    "mode": "exclusive-filesystem-pool",
+    "requestedMiB": 1024,
+    "hardCap": True,
+}
 PY
 
-# Rootless Podman cannot create the block-device node containers/storage uses
-# for project quotas. The Rust acceptance requires the production adapter to
-# classify that real pre-JIT refusal as DiskQuotaUnavailable. It then exercises
-# the remaining lifecycle on this 6 GiB loopback store, whose filesystem size
-# supplies an independent host-enforced upper bound without pretending that it
-# meets the required per-container 1 GiB cap.
-if podman --storage-opt size=1024m info --format json >/dev/null 2>&1; then
-  die "Podman unexpectedly accepted rootless project quotas; update the acceptance to run the full provider prepare path"
-fi
+RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
+  cargo test -p runner-manager-agent \
+    'oci::tests::live_rootless_bounded_storage_acceptance' -- \
+    --ignored --exact --nocapture
 
-cargo test -p runner-manager-agent \
-  'oci::tests::live_rootless_native_acceptance' -- \
-  --ignored --exact --nocapture
-
-# The Rust fixture owns normal and orphan cleanup. This independent sweep makes
-# a leaked owned container fail the job before the disposable store is removed.
-remaining="$(podman ps --all --quiet)"
+remaining="$("$runtime_helper" ps --all --quiet)"
 [[ -z "$remaining" ]] || die "acceptance containers survived cleanup: $remaining"
+if grep -r -a -q 'rm-jit-sentinel-' "$graph_root"; then
+  die "a synthetic JIT sentinel survived in bounded runtime storage"
+fi
+echo "native Linux bounded-store acceptance passed"

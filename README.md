@@ -238,8 +238,12 @@ The helper contract is deliberately fail-closed:
 Missing or malformed attestation remains `DiskQuotaUnavailable`. An invalid, mutable,
 non-root-owned or DrvFS helper path is refused instead of falling back to `podman`. The
 disposable one-slot reference fixture in `tests/managed-wsl-oci-acceptance.sh` exercises
-this contract; a production helper may manage a larger pool but must preserve the same
-per-create hard bound and command routing.
+this contract with real writes until `df` reports at most filesystem bookkeeping space
+and ext4 returns `ENOSPC`; a production helper may manage a larger pool but must preserve
+the same per-create hard bound and command routing. On Windows,
+`tests/managed-wsl-oci-restart-acceptance.ps1` terminates only the named distribution and
+checks that the remounted helper recovers exact-generation resources and durable journal
+leases without another JIT registration.
 
 Queue a workflow, then watch the runner start and complete the job:
 
