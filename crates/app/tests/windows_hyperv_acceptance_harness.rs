@@ -27,6 +27,7 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
         "AllowEnableContainers",
         "AllowSwitchDockerToWindows",
         "AllowPullImage",
+        "AllowAdoptMachineCredential",
         "AllowReplaceService",
         "AllowServiceRestart",
         "AllowCreatePolicy",
@@ -65,6 +66,46 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
     assert!(script.contains("Remove-AcceptanceTrigger $State"));
     assert!(script.contains("'pr', 'edit', [string]$PullRequestNumber"));
     assert!(script.contains("'label', 'delete', $label"));
+}
+
+#[test]
+fn machine_credential_adoption_is_explicit_bounded_and_reversible() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    for needle in [
+        "Require-OptIn $AllowAdoptMachineCredential",
+        "IvanMurzak/runner-manager/secrets/user-access-token.dpapi",
+        "secrets/machine/user-access-token.dpapi",
+        "Assert-ProductMachineCredentialAcl $paths.source",
+        "AreAccessRulesProtected",
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-3-4",
+        "[IO.FileMode]::CreateNew",
+        "Protect-AdoptedCredential $paths.target",
+        "Assert-IsolatedCredentialPathIsPhysical",
+        "adopted encrypted credential hash does not match",
+        "Remove-AdoptedMachineCredential $State",
+    ] {
+        assert!(
+            script.contains(needle),
+            "missing credential adoption contract: {needle}"
+        );
+    }
+    assert!(
+        script
+            .matches("Remove-AdoptedMachineCredential $State")
+            .count()
+            >= 2,
+        "both cleanup and rollback must remove the adopted credential"
+    );
+    assert!(script.contains("source_path = $paths.source"));
+    assert!(script.contains("target_path = $paths.target"));
+    assert!(script.contains("sha256 = $hash"));
+    assert!(script.contains(
+        "provenance = 'audited product-standard LocalSystem boot service on this machine'"
+    ));
+    assert!(!script.contains("ConvertTo-SecureString"));
+    assert!(!script.contains("CryptUnprotectData"));
 }
 
 #[test]

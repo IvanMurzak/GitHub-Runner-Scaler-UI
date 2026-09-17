@@ -39,6 +39,7 @@ param(
     [switch]$AllowEnableContainers,
     [switch]$AllowSwitchDockerToWindows,
     [switch]$AllowPullImage,
+    [switch]$AllowAdoptMachineCredential,
     [switch]$AllowReplaceService,
     [switch]$AllowServiceRestart,
     [switch]$AllowCreatePolicy,
@@ -319,6 +320,7 @@ function New-AuditState {
         pull_request_number = $null
         trigger_label = $null
         trigger_label_created = $false
+        adopted_machine_credential = $null
         cleanup_complete = $false
         rollback_complete = $false
     }
@@ -337,6 +339,115 @@ function Protect-StateDirectory([string]$Directory) {
         [void]$acl.AddAccessRule($rule)
     }
     Set-Acl -LiteralPath $Directory -AclObject $acl
+}
+
+function Get-MachineCredentialPaths {
+    if (-not $env:ProgramData) { throw 'ProgramData is unavailable; the standard machine credential cannot be resolved' }
+    return [ordered]@{
+        source = Join-Path $env:ProgramData 'IvanMurzak/runner-manager/secrets/user-access-token.dpapi'
+        target = Join-Path $DataDir 'secrets/machine/user-access-token.dpapi'
+    }
+}
+
+function Assert-ProductMachineCredentialAcl([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "machine credential '$Path' is a reparse point" }
+    if ($item.Length -le 0) { throw "machine credential '$Path' is empty" }
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) { throw "machine credential '$Path' inherits access rules" }
+    $required = @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
+    # A product renewal deliberately carries forward an explicit grant for the
+    # operator that originally stored the token. On this privileged harness,
+    # that may only be the identity performing the audited adoption.
+    $allowed = @($required) + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $observed = @()
+    foreach ($rule in @($acl.Access)) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.IsInherited -or $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl -or
+            $sid -notin $allowed) {
+            throw "machine credential '$Path' has an unexpected access rule"
+        }
+        $observed += $sid
+    }
+    foreach ($sid in $required) {
+        if ($sid -notin $observed) { throw "machine credential '$Path' is missing required protected trustee '$sid'" }
+    }
+}
+
+function Protect-AdoptedCredential([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+    foreach ($account in @([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.Principal.SecurityIdentifier]'S-1-5-32-544', [Security.Principal.SecurityIdentifier]'S-1-5-18')) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($account, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)
+        [void]$acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Assert-IsolatedCredentialPathIsPhysical {
+    foreach ($path in @($DataDir, (Join-Path $DataDir 'secrets'), (Join-Path $DataDir 'secrets/machine'))) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "isolated credential directory '$path' is not a physical directory"
+        }
+    }
+}
+
+function Adopt-MachineCredential($State) {
+    Require-OptIn $AllowAdoptMachineCredential 'AllowAdoptMachineCredential' 'copying the audited same-machine boot credential into the isolated acceptance DataDir'
+    $restoreWithDefaultPaths = $State.service_record.PSObject.Properties.Name -contains 'restore_with_default_paths' -and $State.service_record.restore_with_default_paths
+    if (-not $State.runner_service.exists -or $State.runner_service.name -ne 'runner-manager' -or
+        $State.runner_service.account -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM') -or
+        -not $State.service_record.exists -or $State.service_record.start_mode -ne 'boot' -or -not $restoreWithDefaultPaths) {
+        throw 'the audited service is not the product-standard LocalSystem boot service; refusing credential adoption'
+    }
+    $paths = Get-MachineCredentialPaths
+    if (Test-SamePath $paths.source $paths.target) { throw 'source and isolated credential paths unexpectedly resolve to the same file' }
+    if (-not (Test-Path -LiteralPath $paths.source -PathType Leaf)) { throw "the audited machine credential '$($paths.source)' does not exist" }
+    Assert-ProductMachineCredentialAcl $paths.source
+    if (Test-Path -LiteralPath $paths.target) { throw "isolated credential target '$($paths.target)' already exists; refusing ambiguous adoption" }
+    Assert-IsolatedCredentialPathIsPhysical
+
+    # Prove the standard machine store is decryptable and accepted before any
+    # encrypted bytes are copied. Command output is deliberately discarded.
+    Invoke-External $RunnerManager @('auth', 'status') -DiscardOutput
+    $hash = (Get-FileHash -LiteralPath $paths.source -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-StateProperty $State adopted_machine_credential ([ordered]@{
+        source_path = $paths.source
+        target_path = $paths.target
+        sha256 = $hash
+        provenance = 'audited product-standard LocalSystem boot service on this machine'
+    })
+    Save-State $State
+    Protect-StateDirectory (Split-Path $paths.target -Parent)
+    try {
+        $source = [IO.File]::Open($paths.source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $target = [IO.File]::Open($paths.target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $source.CopyTo($target); $target.Flush($true) } finally { $target.Dispose() }
+        } finally { $source.Dispose() }
+        Protect-AdoptedCredential $paths.target
+        if ((Get-FileHash -LiteralPath $paths.target -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash) {
+            throw 'the adopted encrypted credential hash does not match its audited source'
+        }
+    } catch {
+        Remove-Item -LiteralPath $paths.target -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Remove-AdoptedMachineCredential($State) {
+    if ($State.PSObject.Properties.Name -notcontains 'adopted_machine_credential' -or -not $State.adopted_machine_credential) { return }
+    $expected = (Get-MachineCredentialPaths).target
+    $target = [string]$State.adopted_machine_credential.target_path
+    if (-not (Test-SamePath $target $expected)) { throw 'recorded adopted credential target is outside the exact isolated machine store path' }
+    Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $target) { throw "adopted credential '$target' remained after cleanup" }
+    Set-StateProperty $State adopted_machine_credential $null
+    Save-State $State
 }
 
 function Save-State($State) {
@@ -540,6 +651,7 @@ function Wait-ProviderContainer([string]$EvidenceDirectory, [int]$TimeoutSeconds
 
 function Invoke-RunJob($State) {
     foreach ($flag in @(
+        @($AllowAdoptMachineCredential, 'AllowAdoptMachineCredential', 'copying the audited same-machine boot credential into the isolated acceptance DataDir'),
         @($AllowReplaceService, 'AllowReplaceService', 'replacing the runner-manager service binary'),
         @($AllowServiceRestart, 'AllowServiceRestart', 'forcing a daemon crash/restart during the live job'),
         @($AllowCreatePolicy, 'AllowCreatePolicy', 'creating and enabling a temporary repository profile')
@@ -571,6 +683,7 @@ function Invoke-RunJob($State) {
     $preexisting = Invoke-External docker.exe @('ps', '-aq', '--filter', "label=$ProviderLabel") -AllowFailure
     if (@($preexisting | Where-Object { $_ -match '^[0-9a-f]{12,64}$' }).Count -ne 0) { throw 'a provider-owned container already exists; collect recovery-forensics and resolve it before starting acceptance' }
     Invoke-External gh.exe @('auth', 'status', '--hostname', 'github.com') -DiscardOutput
+    Adopt-MachineCredential $State
     Invoke-Runner @('auth', 'status') | Out-Null
     $prRaw = Invoke-External gh.exe @('pr', 'view', [string]$PullRequestNumber, '--repo', $Repository, '--json', 'headRefName,headRepositoryOwner,headRefOid')
     $pr = ($prRaw -join "`n") | ConvertFrom-Json
@@ -684,7 +797,11 @@ function Invoke-Forensics($State) {
 
 function Invoke-Cleanup($State) {
     Require-OptIn $AllowCleanup 'AllowCleanup' 'disabling and removing the temporary acceptance profile'
-    if ($State.cleanup_complete) { Write-Output 'Cleanup was already completed.'; return }
+    if ($State.cleanup_complete) {
+        Remove-AdoptedMachineCredential $State
+        Write-Output 'Cleanup was already completed.'
+        return
+    }
     Remove-AcceptanceTrigger $State
     if ($State.profile_created) {
         if (-not $PSCmdlet.ShouldProcess("repository profile $($State.profile_name)", 'disable, drain, and purge')) { return }
@@ -701,6 +818,7 @@ function Invoke-Cleanup($State) {
         Set-StateProperty $State profile_created $false
     }
     Set-StateProperty $State profile_name $null
+    Remove-AdoptedMachineCredential $State
     Set-StateProperty $State cleanup_complete $true
     Save-State $State
 }
@@ -768,12 +886,17 @@ function Restore-DockerAndFeatures($State) {
 
 function Invoke-Rollback($State) {
     Require-OptIn $AllowRollbackChanges 'AllowRollbackChanges' 'restoring the prior service, Docker engine mode/state, image inventory, and Containers feature state'
-    if ($State.rollback_complete) { Write-Output 'Rollback was already completed.'; return }
+    if ($State.rollback_complete) {
+        Remove-AdoptedMachineCredential $State
+        Write-Output 'Rollback was already completed.'
+        return
+    }
     $triggerRemains = $State.PSObject.Properties.Name -contains 'trigger_label_created' -and $State.trigger_label_created
     if ($State.profile_created -or $triggerRemains) {
         Require-OptIn $AllowCleanup 'AllowCleanup' 'removing the temporary acceptance profile during rollback'
         Invoke-Cleanup $State
     }
+    Remove-AdoptedMachineCredential $State
     if ($PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'restore all state recorded by the audit phase')) {
         Restore-ServiceState $State
         Restore-DockerAndFeatures $State
