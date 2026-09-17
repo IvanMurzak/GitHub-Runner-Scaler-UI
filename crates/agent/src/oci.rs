@@ -1918,7 +1918,7 @@ mod tests {
         assert!(attempts.iter().all(RunnerAttempt::counts_against_capacity));
         let image = match attempts[0].execution() {
             AttemptExecution::Isolated { resolved_image, .. } => resolved_image.clone(),
-            AttemptExecution::Native => unreachable!(),
+            _ => unreachable!(),
         };
         let owned = provider.enumerate_owned(HostId::from_u128(LIVE_HOST));
         assert_eq!(owned.len(), 5, "the remounted provider lost a resource");
