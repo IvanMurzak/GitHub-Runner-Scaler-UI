@@ -62,6 +62,34 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  macos-vm-helper:
+    name: macOS VM helper (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64
+            os: macos-latest
+            uname: arm64
+          - name: x86_64
+            os: macos-15-intel
+            uname: x86_64
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Assert native architecture
+        run: |
+          test "$(uname -m)" = "${{ matrix.uname }}"
+          swift --version
+
+      - name: Compile the Virtualization.framework helper
+        run: swift build --package-path native/macos-vm-helper
+
+      - name: Run deterministic helper tests
+        run: swift test --package-path native/macos-vm-helper
+
   check:
     name: check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
