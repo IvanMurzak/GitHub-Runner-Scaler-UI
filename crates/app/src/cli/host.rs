@@ -530,7 +530,7 @@ pub(crate) const fn sanitize_isolation_observation(
             IsolationBackend::WindowsHyperVContainer
         ) {
             Some(
-                "preview: native Windows client and Server job, restart, reboot, and resource-exhaustion acceptance is pending",
+                "preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot, and resource-exhaustion cases",
             )
         } else {
             None
@@ -893,6 +893,45 @@ mod tests {
 
     fn organization(name: &str) -> ScaleTarget {
         ScaleTarget::Organization(Org::new(name).expect("a valid organization"))
+    }
+
+    #[test]
+    fn isolation_status_keeps_windows_client_and_server_requirements_distinct() {
+        let mut text = Vec::new();
+        isolation_status(false, &mut text).expect("text status");
+        let text = String::from_utf8(text).expect("UTF-8 status");
+        assert!(
+            text.contains(
+                "use Windows 11 Pro or Enterprise with Docker Desktop in Windows-container mode"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Windows Server Standard or Datacenter with Moby or Mirantis Container Runtime"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Education"), "{text}");
+
+        let mut json = Vec::new();
+        isolation_status(true, &mut json).expect("JSON status");
+        let document: serde_json::Value =
+            serde_json::from_slice(&json).expect("parseable JSON status");
+        let windows = document["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["backend"] == "windows_hyper_v_container")
+            .expect("Windows provider");
+        assert_eq!(windows["state"], "unsupported");
+        assert!(
+            windows["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("use Windows 11 Pro or Enterprise")
+        );
+        assert!(!windows.to_string().contains("Education"));
     }
 
     fn budget_text(budget: &HostBudget) -> String {

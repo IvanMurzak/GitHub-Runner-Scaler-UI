@@ -298,8 +298,11 @@ runner-manager wsl detach --distribution NAME                  # Stop managing i
 
 On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
 containers** through a Docker-compatible Windows container runtime. Candidate
-hosts are Windows Pro, Enterprise, Education, or Server with both Hyper-V and
-Containers enabled; native client and Server acceptance is still pending.
+hosts are Windows 11 Pro or Enterprise with Docker Desktop switched to Windows
+containers, or Windows Server Standard or Datacenter with Moby or Mirantis
+Container Runtime. Both paths require Hyper-V and Containers; native client and
+Server acceptance is still pending. Docker Desktop on Windows Education can run
+Linux containers only, and Docker Desktop is not supported on Windows Server.
 Microsoft documents that Windows containers use a parent Job Object and that
 Hyper-V isolation applies resource controls to both that container job and its
 utility VM. Windows also supports [nested Job

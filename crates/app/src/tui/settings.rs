@@ -3316,9 +3316,10 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("remedy: use Windows Pro, Enterprise, Education, or Server"),
+            rendered.contains("remedy: use Windows 11 Pro or Enterprise with Docker Desktop"),
             "{rendered}"
         );
+        assert!(!rendered.contains("Education"), "{rendered}");
     }
 
     #[test]
@@ -5382,10 +5383,12 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use Windows Pro, Enterprise, Education, or Server with
-        Hyper-V support
-        Support: preview: native Windows client and Server job, restart, reboot, and resource-exhaustion
-        acceptance is pending
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
         Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
@@ -5434,10 +5437,12 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use Windows Pro, Enterprise, Education, or Server with
-        Hyper-V support
-        Support: preview: native Windows client and Server job, restart, reboot, and resource-exhaustion
-        acceptance is pending
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
         Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
@@ -5493,11 +5498,15 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use Windows Pro,
-        Enterprise, Education, or Server with Hyper-V support
-        Support: preview: native Windows client and Server job,
-        restart, reboot, and resource-exhaustion acceptance is
-        pending
+        Selected provider: unsupported; remedy: use Windows 11
+        Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or
+        Datacenter with Moby or Mirantis Container Runtime
+        Support: preview: native acceptance is pending for
+        Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported
+        server runtime, including job, restart, reboot, and
+        resource-exhaustion cases
         Unsupported workflows: desktop, devices,
         container_actions, service_containers
         Save execution [Enter/click]

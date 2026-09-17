@@ -277,9 +277,9 @@ impl WindowsHyperVHostState {
     pub const fn remedy(self) -> Option<&'static str> {
         match self {
             Self::Ready => None,
-            Self::UnsupportedHost => {
-                Some("use Windows Pro, Enterprise, Education, or Server with Hyper-V support")
-            }
+            Self::UnsupportedHost => Some(
+                "use Windows 11 Pro or Enterprise with Docker Desktop in Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container Runtime",
+            ),
             Self::HyperVUnavailable => Some("enable Hyper-V and restart Windows"),
             Self::ContainersUnavailable => {
                 Some("enable the Windows Containers feature and restart Windows")
@@ -1143,7 +1143,7 @@ fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
     if !cfg!(windows) {
         return WindowsHyperVHostState::UnsupportedHost;
     }
-    const PROBE: &str = "$edition=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -ErrorAction Stop).EditionID; $f=Get-CimInstance Win32_OptionalFeature -ErrorAction Stop; $hv=@($f | Where-Object { $_.Name -in @('Microsoft-Hyper-V','Microsoft-Hyper-V-All') -and $_.InstallState -eq 1 }).Count; $ct=@($f | Where-Object { $_.Name -eq 'Containers' -and $_.InstallState -eq 1 }).Count; Write-Output \"edition=$edition\"; Write-Output \"hyperv=$hv\"; Write-Output \"containers=$ct\"";
+    const PROBE: &str = "$os=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -ErrorAction Stop; $f=Get-CimInstance Win32_OptionalFeature -ErrorAction Stop; $hv=@($f | Where-Object { $_.Name -in @('Microsoft-Hyper-V','Microsoft-Hyper-V-All') -and $_.InstallState -eq 1 }).Count; $ct=@($f | Where-Object { $_.Name -eq 'Containers' -and $_.InstallState -eq 1 }).Count; Write-Output \"edition=$($os.EditionID)\"; Write-Output \"build=$($os.CurrentBuildNumber)\"; Write-Output \"hyperv=$hv\"; Write-Output \"containers=$ct\"";
     let system = match commands.run(
         "powershell.exe",
         &os_args([
@@ -1161,7 +1161,14 @@ fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
         _ => return WindowsHyperVHostState::RuntimeDegraded,
     };
     let edition = value(&system.stdout, "edition").unwrap_or_default();
-    if !supported_edition(edition) {
+    let Some(edition_family) = supported_edition(edition) else {
+        return WindowsHyperVHostState::UnsupportedHost;
+    };
+    let Some(build) = value(&system.stdout, "build").and_then(|build| build.parse::<u32>().ok())
+    else {
+        return WindowsHyperVHostState::RuntimeDegraded;
+    };
+    if !edition_family.supports_build(build) {
         return WindowsHyperVHostState::UnsupportedHost;
     }
     let Some(hyper_v_features) =
@@ -1276,13 +1283,35 @@ fn container_name(host: HostId, attempt: AttemptId, generation: &str) -> String 
     format!("runner-manager-{host}-{attempt}-{compact}")
 }
 
-fn supported_edition(edition: &str) -> bool {
-    let edition = edition.to_ascii_lowercase();
-    edition.contains("professional")
-        || edition.contains("enterprise")
-        || edition.contains("education")
-        || edition.contains("server")
-        || edition.contains("iotenterprise")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsEditionFamily {
+    Windows11Client,
+    WindowsServer,
+}
+
+impl WindowsEditionFamily {
+    const fn supports_build(self, build: u32) -> bool {
+        match self {
+            // Windows 11 starts at build 22000. The client runtime path is
+            // Docker Desktop, whose Windows-container support is limited to
+            // Pro and Enterprise rather than every Desktop-supported edition.
+            Self::Windows11Client => build >= 22_000,
+            // Windows containers first shipped in Windows Server 2016.
+            Self::WindowsServer => build >= 14_393,
+        }
+    }
+}
+
+fn supported_edition(edition: &str) -> Option<WindowsEditionFamily> {
+    if edition.eq_ignore_ascii_case("Professional") || edition.eq_ignore_ascii_case("Enterprise") {
+        Some(WindowsEditionFamily::Windows11Client)
+    } else if edition.eq_ignore_ascii_case("ServerStandard")
+        || edition.eq_ignore_ascii_case("ServerDatacenter")
+    {
+        Some(WindowsEditionFamily::WindowsServer)
+    } else {
+        None
+    }
 }
 
 #[cfg(any(not(test), windows))]
@@ -1349,18 +1378,31 @@ mod tests {
 
     #[test]
     fn editions_are_fail_closed() {
-        for supported in [
-            "Professional",
-            "EnterpriseS",
-            "Education",
-            "ServerStandard",
-            "IoTEnterprise",
+        for (supported, family) in [
+            ("Professional", WindowsEditionFamily::Windows11Client),
+            ("Enterprise", WindowsEditionFamily::Windows11Client),
+            ("ServerStandard", WindowsEditionFamily::WindowsServer),
+            ("ServerDatacenter", WindowsEditionFamily::WindowsServer),
         ] {
-            assert!(supported_edition(supported), "{supported}");
+            assert_eq!(supported_edition(supported), Some(family), "{supported}");
         }
-        for refused in ["", "Core", "Home", "Cloud", "mystery"] {
-            assert!(!supported_edition(refused), "{refused}");
+        for refused in [
+            "",
+            "Core",
+            "Home",
+            "Cloud",
+            "Education",
+            "ProfessionalEducation",
+            "EnterpriseS",
+            "IoTEnterprise",
+            "ServerStandardEval",
+            "mystery",
+        ] {
+            assert_eq!(supported_edition(refused), None, "{refused}");
         }
+        assert!(WindowsEditionFamily::Windows11Client.supports_build(22_000));
+        assert!(!WindowsEditionFamily::Windows11Client.supports_build(19_045));
+        assert!(WindowsEditionFamily::WindowsServer.supports_build(14_393));
     }
 
     #[cfg(windows)]
@@ -1368,62 +1410,81 @@ mod tests {
     fn host_probe_distinguishes_every_fail_closed_prerequisite() {
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=1\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=1\n"),
                 Some(output("windows\n")),
             ),
             WindowsHyperVHostState::Ready
         );
         assert_eq!(
-            host_probe(output("edition=Core\nhyperv=1\ncontainers=1\n"), None,),
+            host_probe(
+                output("edition=Core\nbuild=26100\nhyperv=1\ncontainers=1\n"),
+                None,
+            ),
             WindowsHyperVHostState::UnsupportedHost
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=0\ncontainers=1\n"),
+                output("edition=Professional\nbuild=19045\nhyperv=1\ncontainers=1\n"),
+                None,
+            ),
+            WindowsHyperVHostState::UnsupportedHost
+        );
+        assert_eq!(
+            host_probe(
+                output("edition=ServerStandard\nbuild=26100\nhyperv=1\ncontainers=1\n"),
+                Some(output("windows\n")),
+            ),
+            WindowsHyperVHostState::Ready
+        );
+        assert_eq!(
+            host_probe(
+                output("edition=Professional\nbuild=26100\nhyperv=0\ncontainers=1\n"),
                 None,
             ),
             WindowsHyperVHostState::HyperVUnavailable
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=0\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=0\n"),
                 None,
             ),
             WindowsHyperVHostState::ContainersUnavailable
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=1\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=1\n"),
                 Some(Err(CommandFailure::NotFound)),
             ),
             WindowsHyperVHostState::RuntimeNotInstalled
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=1\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=1\n"),
                 Some(output("linux\n")),
             ),
             WindowsHyperVHostState::RuntimeInLinuxMode
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=1\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=1\n"),
                 Some(Err(CommandFailure::PermissionDenied)),
             ),
             WindowsHyperVHostState::RuntimePermissionDenied
         );
         assert_eq!(
             host_probe(
-                output("edition=Professional\nhyperv=1\ncontainers=1\n"),
+                output("edition=Professional\nbuild=26100\nhyperv=1\ncontainers=1\n"),
                 Some(Err(CommandFailure::Failed)),
             ),
             WindowsHyperVHostState::RuntimeDegraded
         );
         for malformed in [
-            "edition=Professional\ncontainers=1\n",
-            "edition=Professional\nhyperv=not-a-count\ncontainers=1\n",
-            "edition=Professional\nhyperv=1\n",
-            "edition=Professional\nhyperv=1\ncontainers=not-a-count\n",
+            "edition=Professional\nhyperv=1\ncontainers=1\n",
+            "edition=Professional\nbuild=not-a-build\nhyperv=1\ncontainers=1\n",
+            "edition=Professional\nbuild=26100\ncontainers=1\n",
+            "edition=Professional\nbuild=26100\nhyperv=not-a-count\ncontainers=1\n",
+            "edition=Professional\nbuild=26100\nhyperv=1\n",
+            "edition=Professional\nbuild=26100\nhyperv=1\ncontainers=not-a-count\n",
         ] {
             assert_eq!(
                 host_probe(output(malformed), None),
@@ -1431,6 +1492,21 @@ mod tests {
                 "{malformed:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn education_is_refused_before_the_runtime_probe() {
+        let state = host_probe(
+            output("edition=Education\nbuild=26100\nhyperv=1\ncontainers=1\n"),
+            None,
+        );
+        assert_eq!(state, WindowsHyperVHostState::UnsupportedHost);
+        assert_eq!(state.capability(), ProviderCapability::Unsupported);
+        assert!(
+            !state.remedy().unwrap().contains("Education"),
+            "an unsupported edition must not be advertised by its remedy"
+        );
     }
 
     #[test]

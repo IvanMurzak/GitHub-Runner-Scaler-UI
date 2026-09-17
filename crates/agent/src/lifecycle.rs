@@ -4441,6 +4441,7 @@ mod tests {
     struct FakeIsolatedProvider {
         resources: Mutex<BTreeMap<AttemptId, (EnvironmentIdentity, EnvironmentState)>>,
         extra_resources: Mutex<Vec<EnvironmentIdentity>>,
+        unsupported_host: AtomicBool,
         permission_denied: AtomicBool,
         incompatible_image: AtomicBool,
         prepare_failure: AtomicBool,
@@ -4479,7 +4480,9 @@ mod tests {
 
     impl ExecutionProvider for FakeIsolatedProvider {
         fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
-            if self.permission_denied.load(Ordering::SeqCst) {
+            if self.unsupported_host.load(Ordering::SeqCst) {
+                ProviderCapability::Unsupported
+            } else if self.permission_denied.load(Ordering::SeqCst) {
                 ProviderCapability::PermissionDenied
             } else if policy.execution_policy().is_native() {
                 ProviderCapability::Unsupported
@@ -5260,6 +5263,34 @@ mod tests {
             assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
             assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_host_stops_before_jit_without_allocation_or_native_fallback() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        provider.unsupported_host.store(true, Ordering::SeqCst);
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let error = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect_err("unsupported host must be refused before JIT");
+
+        assert!(error.reason.to_string().contains("unavailable"));
+        assert!(harness.store.attempts().unwrap().is_empty());
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        assert!(provider.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
