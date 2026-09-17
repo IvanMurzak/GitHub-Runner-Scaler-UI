@@ -29,6 +29,8 @@ param(
     [ValidateScript({ [IO.Path]::IsPathRooted($_) })]
     [string]$DataDir,
     [string]$WorkflowRef,
+    [ValidateRange(1, 2147483647)]
+    [int]$PullRequestNumber = 77,
     [ValidateRange(60, 900)]
     [int]$JobHoldSeconds = 180,
     [ValidateRange(300, 3600)]
@@ -48,7 +50,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Image = 'mcr.microsoft.com/windows/servercore@sha256:22505496dd4229dba63453ba0c6dc31c06fd3e11810e5b8e429aa6b16dab2457'
-$Workflow = 'windows-hyperv-native-acceptance.yml'
 $ProviderLabel = 'runner-manager.provider=windows-hyper-v-container'
 $RepoRoot = Split-Path $PSScriptRoot -Parent
 
@@ -315,6 +316,9 @@ function New-AuditState {
         unique_label = $null
         workflow_run_id = $null
         evidence_dir = $null
+        pull_request_number = $null
+        trigger_label = $null
+        trigger_label_created = $false
         cleanup_complete = $false
         rollback_complete = $false
     }
@@ -496,16 +500,28 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'container-attestation.json') -Encoding UTF8
 }
 
-function Find-AcceptanceRun([string]$AcceptanceId, [DateTime]$After) {
+function Find-AcceptanceRun([string]$TriggerLabel, [DateTime]$After) {
     $deadline = [DateTime]::UtcNow.AddMinutes(2)
     do {
-        $json = Invoke-External gh.exe @('run', 'list', '--repo', $Repository, '--workflow', $Workflow, '--limit', '20', '--json', 'databaseId,displayTitle,createdAt,status,conclusion')
+        $json = Invoke-External gh.exe @('run', 'list', '--repo', $Repository, '--event', 'pull_request', '--branch', $WorkflowRef, '--limit', '30', '--json', 'databaseId,displayTitle,workflowName,createdAt,status,conclusion')
         foreach ($run in @(($json -join "`n") | ConvertFrom-Json)) {
-            if ($run.displayTitle -eq "windows-hyperv-$AcceptanceId" -and [DateTime]$run.createdAt -ge $After.AddMinutes(-1)) { return $run }
+            if ($run.workflowName -eq 'Windows Hyper-V native acceptance' -and $run.displayTitle -eq "windows-hyperv-$TriggerLabel" -and [DateTime]$run.createdAt -ge $After.AddMinutes(-1)) { return $run }
         }
         Start-Sleep -Seconds 3
     } until ([DateTime]::UtcNow -ge $deadline)
-    throw "could not find dispatched workflow run for acceptance id '$AcceptanceId'"
+    throw "could not find pull-request workflow run for one-time label '$TriggerLabel'"
+}
+
+function Remove-AcceptanceTrigger($State) {
+    if ($State.PSObject.Properties.Name -notcontains 'trigger_label_created' -or -not $State.trigger_label_created) { return }
+    $number = [string]$State.pull_request_number
+    $label = [string]$State.trigger_label
+    Invoke-External gh.exe @('pr', 'edit', $number, '--repo', $Repository, '--remove-label', $label) -AllowFailure -DiscardOutput
+    if ($LASTEXITCODE -ne 0) { throw "could not remove one-time label '$label' from PR $number" }
+    Invoke-External gh.exe @('label', 'delete', $label, '--repo', $Repository, '--yes') -AllowFailure -DiscardOutput
+    if ($LASTEXITCODE -ne 0) { throw "could not delete one-time repository label '$label'" }
+    Set-StateProperty $State trigger_label_created $false
+    Save-State $State
 }
 
 function Wait-ProviderContainer([string]$EvidenceDirectory, [int]$TimeoutSeconds) {
@@ -531,6 +547,8 @@ function Invoke-RunJob($State) {
     if ($State.acceptance_id) {
         throw "acceptance '$($State.acceptance_id)' already used this state file; finish recovery-forensics, cleanup, and rollback, then begin with a fresh audit"
     }
+    if ($JobHoldSeconds -ne 180) { throw 'the pull-request acceptance workflow has a fixed 180-second observation window' }
+    if ($PullRequestNumber -ne 77) { throw 'this reviewed one-time acceptance workflow is pinned to PR 77' }
     if ($State.runner_service.exists -and -not $State.service_record.exists) {
         $current = Get-ServiceSnapshot 'runner-manager'
         if ($current.exists -and $current.path_name -eq $State.runner_service.path_name -and $current.executable_sha256 -eq $State.runner_service.executable_sha256) {
@@ -554,10 +572,11 @@ function Invoke-RunJob($State) {
     if (@($preexisting | Where-Object { $_ -match '^[0-9a-f]{12,64}$' }).Count -ne 0) { throw 'a provider-owned container already exists; collect recovery-forensics and resolve it before starting acceptance' }
     Invoke-External gh.exe @('auth', 'status', '--hostname', 'github.com') -DiscardOutput
     Invoke-Runner @('auth', 'status') | Out-Null
-    if (-not $WorkflowRef) {
-        $WorkflowRef = ((Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name')) -join '').Trim()
-    }
-    Invoke-External gh.exe @('workflow', 'view', $Workflow, '--repo', $Repository, '--ref', $WorkflowRef) -DiscardOutput
+    $prRaw = Invoke-External gh.exe @('pr', 'view', [string]$PullRequestNumber, '--repo', $Repository, '--json', 'headRefName,headRepositoryOwner,headRefOid')
+    $pr = ($prRaw -join "`n") | ConvertFrom-Json
+    if ($pr.headRepositoryOwner.login -ne ($Repository -split '/', 2)[0]) { throw "PR $PullRequestNumber is not a same-repository pull request" }
+    if ($WorkflowRef -and $WorkflowRef -ne $pr.headRefName) { throw "WorkflowRef '$WorkflowRef' is not PR $PullRequestNumber head '$($pr.headRefName)'" }
+    $WorkflowRef = [string]$pr.headRefName
     $acceptanceId = ([DateTime]::UtcNow.ToString('yyyyMMddHHmmss') + '-' + ([Guid]::NewGuid().ToString('N').Substring(0, 8)))
     $profile = "d2-$acceptanceId"
     $label = "rm-d2-$acceptanceId"
@@ -567,6 +586,8 @@ function Invoke-RunJob($State) {
     Set-StateProperty $State profile_name $profile
     Set-StateProperty $State unique_label $label
     Set-StateProperty $State evidence_dir $evidence
+    Set-StateProperty $State pull_request_number $PullRequestNumber
+    Set-StateProperty $State trigger_label $label
     Save-State $State
 
     if (-not $PSCmdlet.ShouldProcess('runner-manager service', "install PR binary $RunnerManager")) { return }
@@ -577,11 +598,15 @@ function Invoke-RunJob($State) {
     Set-StateProperty $State profile_created $true
     Save-State $State
     Invoke-Runner @('repo', 'profile', 'add', $Repository, '--name', $profile, '--host-label', 'd2-acceptance', '--max-capacity', '1', '--label', 'self-hosted', '--label', 'windows', '--label', 'x64', '--label', $label, '--execution', 'isolated', '--backend', 'windows-hyper-v-container', '--image', $Image, '--cpu', '2000', '--memory', '4096', '--disk', '8192', '--enable') | Set-Content -LiteralPath (Join-Path $evidence 'profile-add.txt') -Encoding UTF8
+    Invoke-External gh.exe @('label', 'create', $label, '--repo', $Repository, '--color', '8250df', '--description', "One-time d2 native acceptance trigger for PR $PullRequestNumber") -DiscardOutput
+    Set-StateProperty $State trigger_label_created $true
+    Save-State $State
     $dispatchAt = [DateTime]::UtcNow
-    Invoke-External gh.exe @('workflow', 'run', $Workflow, '--repo', $Repository, '--ref', $WorkflowRef, '-f', "runner_label=$label", '-f', "acceptance_id=$acceptanceId", '-f', "hold_seconds=$JobHoldSeconds") -DiscardOutput
-    $run = Find-AcceptanceRun $acceptanceId $dispatchAt
+    Invoke-External gh.exe @('pr', 'edit', [string]$PullRequestNumber, '--repo', $Repository, '--add-label', $label) -DiscardOutput
+    $run = Find-AcceptanceRun $label $dispatchAt
     Set-StateProperty $State workflow_run_id ([string]$run.databaseId)
     Save-State $State
+    Remove-AcceptanceTrigger $State
     $container = Wait-ProviderContainer $evidence $JobTimeoutSeconds
 
     if ($PSCmdlet.ShouldProcess('runner-manager service process', 'force termination to exercise SCM restart and orphan adoption')) {
@@ -660,6 +685,7 @@ function Invoke-Forensics($State) {
 function Invoke-Cleanup($State) {
     Require-OptIn $AllowCleanup 'AllowCleanup' 'disabling and removing the temporary acceptance profile'
     if ($State.cleanup_complete) { Write-Output 'Cleanup was already completed.'; return }
+    Remove-AcceptanceTrigger $State
     if ($State.profile_created) {
         if (-not $PSCmdlet.ShouldProcess("repository profile $($State.profile_name)", 'disable, drain, and purge')) { return }
         Invoke-RunnerConfirmed @('repo', 'profile', 'set-scale', $Repository, '--profile', [string]$State.profile_name, '--enabled', 'false') -AllowFailure | Out-Null
@@ -743,7 +769,8 @@ function Restore-DockerAndFeatures($State) {
 function Invoke-Rollback($State) {
     Require-OptIn $AllowRollbackChanges 'AllowRollbackChanges' 'restoring the prior service, Docker engine mode/state, image inventory, and Containers feature state'
     if ($State.rollback_complete) { Write-Output 'Rollback was already completed.'; return }
-    if ($State.profile_created) {
+    $triggerRemains = $State.PSObject.Properties.Name -contains 'trigger_label_created' -and $State.trigger_label_created
+    if ($State.profile_created -or $triggerRemains) {
         Require-OptIn $AllowCleanup 'AllowCleanup' 'removing the temporary acceptance profile during rollback'
         Invoke-Cleanup $State
     }

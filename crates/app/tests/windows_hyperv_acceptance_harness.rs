@@ -61,6 +61,10 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
     assert!(
         script.contains("$current.executable_sha256 -eq $State.runner_service.executable_sha256")
     );
+    assert!(script.contains("Find-AcceptanceRun $label $dispatchAt"));
+    assert!(script.contains("Remove-AcceptanceTrigger $State"));
+    assert!(script.contains("'pr', 'edit', [string]$PullRequestNumber"));
+    assert!(script.contains("'label', 'delete', $label"));
 }
 
 #[test]
@@ -68,7 +72,7 @@ fn external_output_is_joined_only_after_each_invocation_returns() {
     let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
     for safe_call in [
         "$gitCommit = ((Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD')) -join '').Trim()",
-        "$WorkflowRef = ((Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name')) -join '').Trim()",
+        "$pr = ($prRaw -join \"`n\") | ConvertFrom-Json",
     ] {
         assert!(
             script.contains(safe_call),
@@ -76,15 +80,11 @@ fn external_output_is_joined_only_after_each_invocation_returns() {
         );
     }
 
-    for broken_call in [
-        "$gitCommit = (Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD') -join '').Trim()",
-        "$WorkflowRef = (Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name') -join '').Trim()",
-    ] {
-        assert!(
-            !script.contains(broken_call),
-            "PowerShell would bind -join as an Invoke-External parameter: {broken_call}"
-        );
-    }
+    let broken_call = "$gitCommit = (Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD') -join '').Trim()";
+    assert!(
+        !script.contains(broken_call),
+        "PowerShell would bind -join as an Invoke-External parameter: {broken_call}"
+    );
 }
 
 #[test]
@@ -107,7 +107,11 @@ fn harness_and_workflow_pin_the_production_provider_security_contract() {
         assert!(script.contains(needle), "missing evidence check {needle}");
     }
     for needle in [
-        "workflow_dispatch:",
+        "pull_request:",
+        "types: [labeled]",
+        "github.event.pull_request.number == 77",
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "startsWith(github.event.label.name, 'rm-d2-')",
         "runs-on: [self-hosted, windows, x64",
         "QueryInformationJobObject",
         "ActiveProcessLimit -ne 256",

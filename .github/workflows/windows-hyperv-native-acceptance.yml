@@ -1,43 +1,34 @@
 name: Windows Hyper-V native acceptance
-run-name: windows-hyperv-${{ inputs.acceptance_id }}
+run-name: windows-hyperv-${{ github.event.label.name }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      runner_label:
-        description: Unique label created by the elevated native acceptance harness
-        required: true
-        type: string
-      acceptance_id:
-        description: Non-secret correlation identifier
-        required: true
-        type: string
-      hold_seconds:
-        description: Seconds to keep the provider container observable by the host harness
-        required: true
-        default: '180'
-        type: string
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-hyperv-${{ inputs.runner_label }}
+  group: windows-hyperv-${{ github.event.label.name }}
   cancel-in-progress: false
 
 jobs:
   production-provider:
-    runs-on: [self-hosted, windows, x64, "${{ inputs.runner_label }}"]
+    if: >-
+      github.event.pull_request.number == 77 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.label.name, 'rm-d2-')
+    runs-on: [self-hosted, windows, x64, "${{ github.event.label.name }}"]
     timeout-minutes: 20
     steps:
       - name: Attest the nested runner Job Object
         shell: powershell
         env:
-          ACCEPTANCE_ID: ${{ inputs.acceptance_id }}
-          HOLD_SECONDS: ${{ inputs.hold_seconds }}
+          ACCEPTANCE_ID: ${{ github.event.label.name }}
+          HOLD_SECONDS: '180'
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:ACCEPTANCE_ID -notmatch '^[0-9]{14}-[0-9a-f]{8}$') {
+          if ($env:ACCEPTANCE_ID -notmatch '^rm-d2-[0-9]{14}-[0-9a-f]{8}$') {
             throw 'invalid non-secret acceptance id'
           }
           $hold = 0
