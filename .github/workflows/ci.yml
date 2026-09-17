@@ -114,9 +114,12 @@ jobs:
 
           RUNNER_MANAGER_MACOS_VM_ROOT="$probe_root" \
             "$binary" --protocol-version 1 probe --json > "$probe_json"
-          plutil -lint "$probe_json"
+          python3 -m json.tool "$probe_json" > /dev/null
 
-          read_probe() { plutil -extract "$1" raw -o - "$probe_json"; }
+          read_probe() {
+            python3 -c 'import json, sys; value=json.load(open(sys.argv[1]))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' \
+              "$probe_json" "$1"
+          }
           test "$(read_probe protocol_version)" = 1
           test "$(read_probe architecture)" = "${{ matrix.uname }}"
           test "$(read_probe macos_guest_entitlement)" = true
