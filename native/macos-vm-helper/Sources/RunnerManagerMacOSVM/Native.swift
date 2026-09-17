@@ -361,7 +361,7 @@ final class Supervisor {
               reply.generation == record.generation,
               reply.appliedProcessLimit == record.appliedProcessLimit,
               reply.processLimitMechanism == "rlimit_nproc_dedicated_uid",
-              reply.runnerUidExclusive,
+              reply.runnerUidExclusive == true,
               reply.runnerPid != nil
         else {
             throw HelperFailure.degraded("guest bootstrap did not attest the process limit")
