@@ -218,6 +218,29 @@ enabled until its execution provider reports ready; provider failure never start
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
 you explicitly accept that trust boundary.
 
+Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
+Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
+mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to
+an absolute Linux path for a root-owned, non-writable Podman-compatible storage helper.
+The helper contract is deliberately fail-closed:
+
+- every `--storage-opt size=Nm` probe and create is routed to a finite filesystem whose
+  writable capacity for that container is no larger than `N` MiB;
+- the helper owns slot allocation, serialization, ENOSPC recovery and orphan lookup for
+  every later Podman-compatible command; it never falls back to the ordinary unbounded
+  graph root;
+- `runtime --storage-opt size=Nm info --format=json` returns ordinary Podman info plus
+  `runnerManagerStorage` with schema `1`, mode `exclusive-filesystem-pool`,
+  `requestedMiB: N`, and `hardCap: true` only after checking the finite store; and
+- graph root, run root, helper and attempt runtime paths stay on the distribution's Linux
+  filesystems, never under `/mnt`.
+
+Missing or malformed attestation remains `DiskQuotaUnavailable`. An invalid, mutable,
+non-root-owned or DrvFS helper path is refused instead of falling back to `podman`. The
+disposable one-slot reference fixture in `tests/managed-wsl-oci-acceptance.sh` exercises
+this contract; a production helper may manage a larger pool but must preserve the same
+per-create hard bound and command routing.
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh

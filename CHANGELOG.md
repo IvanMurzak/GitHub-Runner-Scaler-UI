@@ -35,6 +35,11 @@ the version being prepared rather than the version in `Cargo.toml`.
 - The TUI header shows every service version it can see: the local service,
   each managed WSL host's service, and the app. A TUI started with
   `--host wsl:NAME` labels its service as that WSL host's.
+- Managed WSL isolated runners can use an operator-provisioned, root-owned OCI
+  storage helper backed by finite Linux filesystems. The provider requires the
+  helper's bounded-store attestation and keeps returning
+  `DiskQuotaUnavailable` for ordinary rootless Podman storage that cannot
+  enforce the requested disk cap.
 
 ## 0.4.25
 

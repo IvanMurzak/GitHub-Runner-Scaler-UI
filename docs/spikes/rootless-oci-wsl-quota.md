@@ -56,6 +56,40 @@ unprivileged `_apt` identity; the five named capabilities are therefore part
 of the provider's guest-local package installation profile. Both fixtures were
 removed by `podman run --rm`.
 
+## Managed WSL bounded-store helper acceptance
+
+The rootless project-quota failure does not prevent an operator from supplying a
+harder outer bound. On September 16, 2026, the same managed Ubuntu distribution
+passed `tests/managed-wsl-oci-acceptance.sh` with an operator-provisioned,
+root-owned Podman-compatible helper. The disposable helper routed the provider's
+`--storage-opt size=1024m` probe and create into a 1,024 MiB ext4 loop filesystem
+mounted inside the distribution. It removed only the unsupported Podman option;
+the whole graph root remained inside that finite filesystem. The helper checked
+the loop mount and capacity before attesting schema 1 mode
+`exclusive-filesystem-pool`. The production adapter accepted extfs only with
+that exact attestation. Plain Podman and incomplete or false attestations still
+returned `DiskQuotaUnavailable`.
+
+All Podman commands ran as UID 1000 through the configured helper. The graph
+root, run root, helper, build target, temporary attempt packages and runner
+runtime were absolute Linux paths outside `/mnt`; no host path, device, Podman
+socket or Docker socket entered a container. The production provider resolved
+the pinned Ubuntu digest, prepared and started two simultaneous containers,
+installed versions 1.0 and 2.0 of the same Debian package independently, and
+then proved a fresh sibling contained neither package state nor executable. A
+1,100 MiB `fallocate` failed with `ENOSPC` against the 1,024 MiB filesystem; the
+fixture removed the partial allocation inside that command so Podman retained
+space to journal the exit and perform normal owned cleanup.
+
+The same run exercised stdin-only synthetic JIT delivery, inspect/log/history
+and exported-rootfs sentinel scans, CPU/memory/pids controls, normal destruction,
+crash-gap orphan discovery and adoption, and a final independent container
+sweep. The root-owned helper, loop mount, loop image, graph root, cargo target
+and temporary files were removed after the evidence run. This closes the real
+managed-WSL container-boundary gate through the production prepare/start path.
+It does not claim a GitHub runner job or reboot continuity; those require JIT
+fixture secrets and a reboot-resumable host.
+
 ## GitHub-hosted native Linux acceptance
 
 CI run `35170389901` exercised the secret-free native fixture on GitHub's
@@ -100,7 +134,8 @@ All containers were independently swept before the XFS fixture was unmounted.
 This native gate does **not** claim a GitHub runner job. The repository has no
 JIT/fixture secrets for this job, and rootless Podman 4.9.3 cannot enforce the
 required per-container 1 GiB writable-layer cap even on XFS with project quotas.
-Consequently a full provider prepare/start and real demand-to-JIT job remain
-open, as do reboot continuity (a hosted runner cannot resume the job that
-reboots it) and managed WSL real-job/reboot acceptance. The hard per-container
-cap remains mandatory; affected policies continue to fail closed before JIT.
+Consequently a full provider prepare/start remains unavailable with plain
+Podman, and real demand-to-JIT plus reboot continuity remain open. Managed WSL
+can use the separately attested bounded-store helper described above. Without
+that operator-provisioned helper, the hard per-container cap remains mandatory
+and affected policies continue to fail closed before JIT.

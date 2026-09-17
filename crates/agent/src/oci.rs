@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -26,22 +27,36 @@ const ATTEMPT_LABEL: &str = "io.runner-manager.attempt";
 const GENERATION_LABEL: &str = "io.runner-manager.generation";
 const IMAGE_LABEL: &str = "io.runner-manager.image";
 const BOOTSTRAP: &str = "IFS= read -r jit || exit 43; export ACTIONS_RUNNER_INPUT_JITCONFIG=\"$jit\"; unset jit; cd /runner || exit 44; exec ./bin/Runner.Listener run";
+const OCI_RUNTIME_ENV: &str = "RUNNER_MANAGER_OCI_RUNTIME";
+const BOUNDED_STORAGE_SCHEMA: u64 = 1;
+const BOUNDED_STORAGE_MODE: &str = "exclusive-filesystem-pool";
+const QUOTA_PROBE_MIB: u64 = 1024;
 
 #[derive(Debug)]
 pub struct OciProcesses {
     host: HostId,
     native: NativeProcesses,
     runtime: String,
+    runtime_configuration_valid: bool,
     attached: Mutex<BTreeMap<AttemptId, Child>>,
 }
 
 impl OciProcesses {
     #[must_use]
     pub fn new(host: HostId) -> Self {
+        let (runtime, runtime_configuration_valid) = match std::env::var(OCI_RUNTIME_ENV) {
+            Ok(runtime) if operator_runtime_is_trusted(Path::new(&runtime)) => (runtime, true),
+            Ok(_) => ("/runner-manager-invalid-oci-runtime".into(), false),
+            Err(std::env::VarError::NotPresent) => ("podman".into(), true),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                ("/runner-manager-invalid-oci-runtime".into(), false)
+            }
+        };
         Self {
             host,
             native: NativeProcesses::new(),
-            runtime: "podman".into(),
+            runtime,
+            runtime_configuration_valid,
             attached: Mutex::new(BTreeMap::new()),
         }
     }
@@ -79,8 +94,15 @@ impl OciProcesses {
     }
 
     fn rootless_ready(&self) -> ProviderCapability {
+        self.rootless_ready_for(QUOTA_PROBE_MIB)
+    }
+
+    fn rootless_ready_for(&self, requested_mib: u64) -> ProviderCapability {
         if !cfg!(target_os = "linux") {
             return ProviderCapability::Unsupported;
+        }
+        if !self.runtime_configuration_valid {
+            return ProviderCapability::PermissionDenied;
         }
         let info = match self.command().args(["info", "--format=json"]).output() {
             Ok(output) if output.status.success() && output.stdout.len() <= 64 * 1024 => {
@@ -159,25 +181,33 @@ impl OciProcesses {
         {
             return ProviderCapability::PermissionDenied;
         }
-        // Podman's writable-layer size quota requires XFS project quotas.
-        // extfs (the default WSL distro filesystem) must be refused before JIT.
-        if info
+        let backing_filesystem = info
             .pointer("/store/graphStatus/Backing Filesystem")
-            .and_then(serde_json::Value::as_str)
-            != Some("xfs")
-        {
-            return ProviderCapability::DiskQuotaUnavailable;
+            .and_then(serde_json::Value::as_str);
+        let storage_size = format!("size={requested_mib}m");
+        let quota_probe =
+            match self.output(&["--storage-opt", &storage_size, "info", "--format=json"]) {
+                Ok(output) => output,
+                Err(_) => return ProviderCapability::DiskQuotaUnavailable,
+            };
+        // Native Podman writable-layer quotas require XFS project quotas. XFS
+        // alone is insufficient: rootless quota setup can still fail with
+        // EPERM, which the command above catches before allocation or JIT.
+        if backing_filesystem == Some("xfs") {
+            return ProviderCapability::Ready;
         }
-        // XFS alone is insufficient: rootless quota setup can fail with EPERM.
-        // Probe the storage driver before allocation or GitHub JIT, without
-        // creating a container or recording any job content.
-        if self
-            .status(&["--storage-opt", "size=1024m", "info", "--format=json"])
-            .is_err()
-        {
+        // Managed WSL can instead use an operator-provisioned runtime helper.
+        // The helper routes every `size=...` create into an exclusive finite
+        // filesystem and attests that contract in the quota-probe response.
+        // Plain Podman on extfs has no attestation and remains fail-closed.
+        let Ok(quota_info) = serde_json::from_str::<serde_json::Value>(&quota_probe) else {
             return ProviderCapability::DiskQuotaUnavailable;
+        };
+        if bounded_storage_attested(&quota_info, graph_root, run_root, requested_mib) {
+            ProviderCapability::Ready
+        } else {
+            ProviderCapability::DiskQuotaUnavailable
         }
-        ProviderCapability::Ready
     }
 
     fn capability_or(&self, fallback: FailureReason) -> FailureReason {
@@ -338,6 +368,66 @@ impl OciProcesses {
     }
 }
 
+#[cfg(unix)]
+fn operator_runtime_is_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if canonical == Path::new("/mnt") || canonical.starts_with("/mnt/") {
+        return false;
+    }
+    let Ok(metadata) = canonical.metadata() else {
+        return false;
+    };
+    let mode = metadata.permissions().mode();
+    metadata.is_file() && metadata.uid() == 0 && mode & 0o111 != 0 && mode & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn operator_runtime_is_trusted(_path: &Path) -> bool {
+    false
+}
+
+fn bounded_storage_attested(
+    info: &serde_json::Value,
+    graph_root: &str,
+    run_root: &str,
+    requested_mib: u64,
+) -> bool {
+    info.pointer("/host/security/rootless")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && info
+            .pointer("/store/graphRoot")
+            .and_then(serde_json::Value::as_str)
+            == Some(graph_root)
+        && info
+            .pointer("/store/runRoot")
+            .and_then(serde_json::Value::as_str)
+            == Some(run_root)
+        && info
+            .pointer("/runnerManagerStorage/schema")
+            .and_then(serde_json::Value::as_u64)
+            == Some(BOUNDED_STORAGE_SCHEMA)
+        && info
+            .pointer("/runnerManagerStorage/mode")
+            .and_then(serde_json::Value::as_str)
+            == Some(BOUNDED_STORAGE_MODE)
+        && info
+            .pointer("/runnerManagerStorage/requestedMiB")
+            .and_then(serde_json::Value::as_u64)
+            == Some(requested_mib)
+        && info
+            .pointer("/runnerManagerStorage/hardCap")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
 fn provider_failure() -> FailureReason {
     FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
 }
@@ -353,18 +443,23 @@ impl ExecutionProvider for OciProcesses {
         if policy.execution_policy().is_native() {
             return ProviderCapability::Ready;
         }
-        let ExecutionPolicy::Isolated { backend, image, .. } = policy.execution_policy() else {
+        let ExecutionPolicy::Isolated {
+            backend,
+            image,
+            resources,
+        } = policy.execution_policy()
+        else {
             return ProviderCapability::Unsupported;
         };
         if !matches!(backend, Backend::Auto | Backend::Oci) {
             return ProviderCapability::Unsupported;
         }
-        let capability = self.rootless_ready();
+        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
         if capability != ProviderCapability::Ready {
             return capability;
         }
         if self.image_ready(image).is_err() {
-            let capability = self.rootless_ready();
+            let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
             if capability == ProviderCapability::Ready {
                 ProviderCapability::ImageUnavailableOrIncompatible
             } else {
@@ -376,13 +471,18 @@ impl ExecutionProvider for OciProcesses {
     }
 
     fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
-        let ExecutionPolicy::Isolated { backend, image, .. } = policy.execution_policy() else {
+        let ExecutionPolicy::Isolated {
+            backend,
+            image,
+            resources,
+        } = policy.execution_policy()
+        else {
             return Ok(None);
         };
         if !matches!(backend, Backend::Auto | Backend::Oci) {
             return Err(ProviderCapability::Unsupported.refusal());
         }
-        let capability = self.rootless_ready();
+        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
         if capability != ProviderCapability::Ready {
             return Err(capability.refusal());
         }
@@ -420,7 +520,7 @@ impl ExecutionProvider for OciProcesses {
                 IsolationProviderFailure::UnsafeRuntimePath,
             ));
         }
-        let capability = self.rootless_ready();
+        let capability = self.rootless_ready_for(u64::from(resources.disk_mib));
         if capability != ProviderCapability::Ready {
             return Err(capability.refusal());
         }
@@ -872,6 +972,26 @@ mod tests {
             provider.rootless_ready(),
             ProviderCapability::DiskQuotaUnavailable
         );
+        let mut bounded: serde_json::Value = serde_json::from_str(&extfs).unwrap();
+        bounded["runnerManagerStorage"] = serde_json::json!({
+            "schema": BOUNDED_STORAGE_SCHEMA,
+            "mode": BOUNDED_STORAGE_MODE,
+            "requestedMiB": QUOTA_PROBE_MIB,
+            "hardCap": true
+        });
+        let (_root, provider) = fixture(&bounded.to_string());
+        assert_eq!(provider.rootless_ready(), ProviderCapability::Ready);
+        assert_eq!(
+            provider.rootless_ready_for(2048),
+            ProviderCapability::DiskQuotaUnavailable,
+            "the helper must attest the exact requested size"
+        );
+        bounded["runnerManagerStorage"]["hardCap"] = serde_json::json!(false);
+        let (_root, provider) = fixture(&bounded.to_string());
+        assert_eq!(
+            provider.rootless_ready(),
+            ProviderCapability::DiskQuotaUnavailable
+        );
         let (_root, provider) = fixture_with_quota(
             &info(true, "/home/ivan/.local/share/containers", 65536),
             false,
@@ -964,8 +1084,12 @@ mod tests {
     const LIVE_HOST: u128 = 0x00ac_ce7a_ce00_0000_0000_0000_0000_0001;
     const LIVE_PACKAGE: &str = "runner-manager-oci-conflict";
 
+    fn live_runtime() -> String {
+        std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| "podman".into())
+    }
+
     fn podman(args: &[&str]) -> std::process::Output {
-        Command::new("podman")
+        Command::new(live_runtime())
             .args(args)
             .output()
             .unwrap_or_else(|error| panic!("podman {args:?} did not execute: {error}"))
@@ -1054,12 +1178,13 @@ mod tests {
         policy
     }
 
-    fn prepare_structural_attempt(
+    fn prepare_live_attempt(
         provider: &OciProcesses,
         policy: &ScalePolicy,
         image: &ImageReference,
         version: Option<&str>,
         generation: &str,
+        production_quota_path: bool,
     ) -> (
         tempfile::TempDir,
         RunnerAttempt,
@@ -1085,6 +1210,15 @@ mod tests {
                 generation: generation.into(),
             })
             .unwrap();
+        if production_quota_path {
+            let prepared = provider.prepare(&attempt, policy).unwrap();
+            let EnvironmentIdentity::Isolated { environment_id, .. } =
+                prepared.identity().cloned().expect("isolated identity")
+            else {
+                panic!("OCI prepare returned a native identity")
+            };
+            return (runtime, attempt, prepared, environment_id);
+        }
         let ExecutionPolicy::Isolated { resources, .. } = policy.execution_policy() else {
             panic!("structural acceptance needs an isolated policy")
         };
@@ -1252,7 +1386,7 @@ mod tests {
     }
 
     fn assert_export_excludes(environment_id: &str, sentinel: &str) {
-        let mut child = Command::new("podman")
+        let mut child = Command::new(live_runtime())
             .args(["export", environment_id])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1291,9 +1425,7 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "requires the CI-provisioned native rootless Podman/XFS project-quota fixture"]
-    fn live_rootless_native_acceptance() {
+    fn run_live_rootless_acceptance(production_quota_path: bool) {
         let image = ImageReference::new(
             std::env::var(LIVE_IMAGE_ENV)
                 .unwrap_or_else(|_| panic!("{LIVE_IMAGE_ENV} must name a pinned image digest")),
@@ -1302,16 +1434,23 @@ mod tests {
         let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
         let policy = isolated_policy(image.clone());
 
-        assert_eq!(
-            provider.probe(&policy),
-            ProviderCapability::DiskQuotaUnavailable
-        );
-        assert_eq!(
-            provider.resolve(&policy),
-            Err(ProviderCapability::DiskQuotaUnavailable.refusal()),
-            "the production provider must fail before image allocation or JIT"
-        );
-        provider.image_ready(&image).unwrap();
+        if production_quota_path {
+            assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
+            let resolution = provider.resolve(&policy).unwrap().unwrap();
+            assert_eq!(resolution.provider_kind, Backend::Oci);
+            assert_eq!(resolution.image, image);
+        } else {
+            assert_eq!(
+                provider.probe(&policy),
+                ProviderCapability::DiskQuotaUnavailable
+            );
+            assert_eq!(
+                provider.resolve(&policy),
+                Err(ProviderCapability::DiskQuotaUnavailable.refusal()),
+                "the production provider must fail before image allocation or JIT"
+            );
+            provider.image_ready(&image).unwrap();
+        }
         assert!(
             !Command::new("dpkg-query")
                 .args(["-W", LIVE_PACKAGE])
@@ -1321,8 +1460,14 @@ mod tests {
             "acceptance package unexpectedly exists on the host"
         );
 
-        let (_runtime_one, mut one, prepared_one, id_one) =
-            prepare_structural_attempt(&provider, &policy, &image, Some("1.0"), "native-one");
+        let (_runtime_one, mut one, prepared_one, id_one) = prepare_live_attempt(
+            &provider,
+            &policy,
+            &image,
+            Some("1.0"),
+            "native-one",
+            production_quota_path,
+        );
         let sentinel_one = "rm-jit-sentinel-native-one-8eeb09c26b8a";
         start_live_attempt(&provider, &mut one, prepared_one, &id_one, sentinel_one);
         inspect_controls(&id_one, &image, sentinel_one);
@@ -1344,8 +1489,14 @@ mod tests {
             "1.0"
         );
 
-        let (_runtime_two, mut two, prepared_two, id_two) =
-            prepare_structural_attempt(&provider, &policy, &image, Some("2.0"), "native-two");
+        let (_runtime_two, mut two, prepared_two, id_two) = prepare_live_attempt(
+            &provider,
+            &policy,
+            &image,
+            Some("2.0"),
+            "native-two",
+            production_quota_path,
+        );
         let sentinel_two = "rm-jit-sentinel-native-two-62b2db40633b";
         start_live_attempt(&provider, &mut two, prepared_two, &id_two, sentinel_two);
         inspect_controls(&id_two, &image, sentinel_two);
@@ -1370,26 +1521,35 @@ mod tests {
         assert_export_excludes(&id_one, sentinel_one);
         assert_export_excludes(&id_two, sentinel_two);
 
-        // The loopback store is a real hard upper bound even though rootless
-        // Podman cannot divide it into the policy's required per-container
-        // project quotas. This must fail quickly without consuming 7 GiB.
+        // The loopback store is a real hard upper bound. Remove the partially
+        // allocated file inside the same command so Podman's metadata database
+        // retains enough room to record the failed process and cleanly remove
+        // the container afterward.
+        let oversize = if production_quota_path { "1100M" } else { "7G" };
         let exhaustion = podman(&[
             "exec",
             &id_one,
-            "fallocate",
-            "-l",
-            "7G",
-            "/backing-store-cap",
+            "sh",
+            "-c",
+            "if fallocate -l \"$1\" /backing-store-cap; then exit 0; else status=$?; rm -f /backing-store-cap; exit \"$status\"; fi",
+            "sh",
+            oversize,
         ]);
         assert!(
             !exhaustion.status.success(),
-            "the 6 GiB backing-store hard cap allowed a 7 GiB allocation"
+            "the backing-store hard cap allowed an oversized allocation"
         );
         stop_and_destroy(&provider, &one);
         stop_and_destroy(&provider, &two);
 
-        let (_runtime_fresh, mut fresh, prepared_fresh, id_fresh) =
-            prepare_structural_attempt(&provider, &policy, &image, None, "native-fresh");
+        let (_runtime_fresh, mut fresh, prepared_fresh, id_fresh) = prepare_live_attempt(
+            &provider,
+            &policy,
+            &image,
+            None,
+            "native-fresh",
+            production_quota_path,
+        );
         start_live_attempt(
             &provider,
             &mut fresh,
@@ -1421,8 +1581,14 @@ mod tests {
         // journalled. Recovery discovers and quarantines exactly the labelled
         // orphan; after the durable identity is restored, normal destroy owns
         // and removes it.
-        let (_runtime_orphan, mut orphan, prepared_orphan, orphan_id) =
-            prepare_structural_attempt(&provider, &policy, &image, None, "native-orphan");
+        let (_runtime_orphan, mut orphan, prepared_orphan, orphan_id) = prepare_live_attempt(
+            &provider,
+            &policy,
+            &image,
+            None,
+            "native-orphan",
+            production_quota_path,
+        );
         assert_eq!(
             provider.recover(&orphan).unwrap(),
             EnvironmentState::Starting
@@ -1453,6 +1619,18 @@ mod tests {
                 .success(),
             "container package installation mutated the host package database"
         );
+    }
+
+    #[test]
+    #[ignore = "requires the CI-provisioned native rootless Podman/XFS project-quota fixture"]
+    fn live_rootless_native_acceptance() {
+        run_live_rootless_acceptance(false);
+    }
+
+    #[test]
+    #[ignore = "requires the managed-WSL bounded-storage helper fixture"]
+    fn live_rootless_managed_wsl_bounded_acceptance() {
+        run_live_rootless_acceptance(true);
     }
 
     #[test]
