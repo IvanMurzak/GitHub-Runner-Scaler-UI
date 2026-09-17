@@ -7,9 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
+use std::io::{Read as _, Write as _};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use runner_manager_domain::attempt::{FailureReason, RunnerAttempt};
 use runner_manager_domain::execution::{
@@ -33,7 +34,216 @@ const LABEL_PROVIDER: &str = "runner-manager.provider";
 const PROVIDER_VALUE: &str = "windows-hyper-v-container";
 const MAX_CAPTURE: usize = 64 * 1024;
 const PREFLIGHT_INPUT: &str = "runner-manager-preflight-v1";
-const BOOTSTRAP: &str = "$ErrorActionPreference='Stop'; $payload=[Console]::In.ReadToEnd(); if ([String]::IsNullOrWhiteSpace($payload)) { exit 70 }; if ($payload -eq 'runner-manager-preflight-v1') { & C:\\runner\\bin\\Runner.Listener.exe --version *> $null; if ($LASTEXITCODE -ne 0) { exit 72 }; exit 0 }; $psi=[System.Diagnostics.ProcessStartInfo]::new(); $psi.FileName='C:\\runner\\bin\\Runner.Listener.exe'; $psi.Arguments='run'; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; $psi.EnvironmentVariables['ACTIONS_RUNNER_INPUT_JITCONFIG']=$payload; $listener=[System.Diagnostics.Process]::new(); $listener.StartInfo=$psi; try { $started=$listener.Start() } finally { $psi.EnvironmentVariables.Remove('ACTIONS_RUNNER_INPUT_JITCONFIG'); $payload=$null }; if (-not $started) { exit 71 }; $listener.WaitForExit(); exit $listener.ExitCode";
+#[cfg(test)]
+const BOOTSTRAP_SELF_TEST_INPUT: &str = "runner-manager-windows-job-self-test-v1";
+const BOOTSTRAP_REQUEST_PROTOCOL: &str = "runner-manager-windows-job-request-v1";
+const BOOTSTRAP_ATTESTATION_PROTOCOL: &str = "runner-manager-windows-job-ready-v1";
+const WINDOWS_PROCESS_LIMIT: u32 = 256;
+const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+const BOOTSTRAP_ATTESTATION_TIMEOUT: Duration = Duration::from_secs(60);
+const PREFLIGHT_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+// This script is immutable Docker container metadata. It creates a nested Job
+// Object inside the Windows container, installs and queries the active-process
+// limit, and only then acknowledges the host. Runner.Listener is created
+// suspended, assigned to the job, checked for membership, and resumed. Neither
+// breakaway flag is set, so ordinary descendants inherit the nested job.
+const BOOTSTRAP: &str = r#"
+$ErrorActionPreference='Stop'
+$source=@'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class RunnerManagerJobGuard : IDisposable {
+    const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint INFINITE = 0xffffffff;
+    const int JobObjectExtendedLimitInformation = 9;
+    IntPtr job;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BasicLimitInformation {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IoCounters {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ExtendedLimitInformation {
+        public BasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct StartupInfo {
+        public uint cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public uint dwX;
+        public uint dwY;
+        public uint dwXSize;
+        public uint dwYSize;
+        public uint dwXCountChars;
+        public uint dwYCountChars;
+        public uint dwFillAttribute;
+        public uint dwFlags;
+        public ushort wShowWindow;
+        public ushort cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ProcessInformation {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, IntPtr returnedLength);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    static extern bool CreateProcess(string applicationName, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool CloseHandle(IntPtr handle);
+
+    static void Check(bool ok) {
+        if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public RunnerManagerJobGuard(uint activeProcessLimit) {
+        job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        ExtendedLimitInformation limits = new ExtendedLimitInformation();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.ActiveProcessLimit = activeProcessLimit;
+        int size = Marshal.SizeOf(typeof(ExtendedLimitInformation));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            Marshal.StructureToPtr(limits, buffer, false);
+            Check(SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size));
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    public string Attest() {
+        int size = Marshal.SizeOf(typeof(ExtendedLimitInformation));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            Check(QueryInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size, IntPtr.Zero));
+            ExtendedLimitInformation limits = (ExtendedLimitInformation)Marshal.PtrToStructure(buffer, typeof(ExtendedLimitInformation));
+            uint required = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (limits.BasicLimitInformation.LimitFlags != required) throw new InvalidOperationException("unexpected job limit flags");
+            return limits.BasicLimitInformation.ActiveProcessLimit.ToString() + "|" + limits.BasicLimitInformation.LimitFlags.ToString();
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    public int Run(string executable, string arguments, string jit) {
+        StartupInfo startup = new StartupInfo();
+        startup.cb = (uint)Marshal.SizeOf(typeof(StartupInfo));
+        ProcessInformation process;
+        StringBuilder command = new StringBuilder("\"" + executable + "\" " + arguments);
+        string priorJit = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process);
+        bool created;
+        try {
+            if (jit != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jit, EnvironmentVariableTarget.Process);
+            created = CreateProcess(null, command, IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED, IntPtr.Zero, null, ref startup, out process);
+        } finally {
+            if (jit != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process);
+        }
+        Check(created);
+        bool assigned = false;
+        try {
+            Check(AssignProcessToJobObject(job, process.hProcess));
+            bool inJob;
+            Check(IsProcessInJob(process.hProcess, job, out inJob));
+            if (!inJob) throw new InvalidOperationException("runner did not enter process-limit job");
+            assigned = true;
+            if (ResumeThread(process.hThread) == 0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (WaitForSingleObject(process.hProcess, INFINITE) != 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            uint exitCode;
+            Check(GetExitCodeProcess(process.hProcess, out exitCode));
+            return unchecked((int)exitCode);
+        } finally {
+            if (!assigned) TerminateProcess(process.hProcess, 73);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+    }
+
+    public void Dispose() {
+        if (job != IntPtr.Zero) {
+            CloseHandle(job);
+            job = IntPtr.Zero;
+        }
+    }
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp
+$request=[Console]::In.ReadLine()
+$parts=$request.Split('|')
+if ($parts.Length -ne 3 -or $parts[0] -ne 'runner-manager-windows-job-request-v1' -or $parts[1] -notmatch '^[0-9a-f]{32}$') { exit 70 }
+$limit=0
+if (-not [UInt32]::TryParse($parts[2],[ref]$limit) -or $limit -lt 1 -or $limit -gt 4096) { exit 70 }
+$guard=[RunnerManagerJobGuard]::new($limit)
+try {
+    $proof=$guard.Attest()
+    [Console]::Out.WriteLine('runner-manager-windows-job-ready-v1|'+$parts[1]+'|'+$proof)
+    [Console]::Out.Flush()
+    $payload=[Console]::In.ReadToEnd()
+    if ([String]::IsNullOrWhiteSpace($payload)) { exit 70 }
+    if ($payload -eq 'runner-manager-windows-job-self-test-v1') { exit $guard.Run(($env:WINDIR+'\\System32\\cmd.exe'),'/d /c exit 0',$null) }
+    if ($payload -eq 'runner-manager-preflight-v1') { exit $guard.Run('C:\\runner\\bin\\Runner.Listener.exe','--version',$null) }
+    try { $code=$guard.Run('C:\\runner\\bin\\Runner.Listener.exe','run',$payload) } finally { $payload=$null }
+    exit $code
+} finally {
+    $guard.Dispose()
+}
+"#;
 
 /// Host-only preflight detail. It is a closed vocabulary and never carries
 /// provider output, so CLI/TUI surfaces cannot accidentally expose it.
@@ -46,7 +256,6 @@ pub enum WindowsHyperVHostState {
     RuntimeNotInstalled,
     RuntimePermissionDenied,
     RuntimeInLinuxMode,
-    ProcessLimitUnsupported,
     RuntimeDegraded,
 }
 
@@ -55,9 +264,7 @@ impl WindowsHyperVHostState {
     pub const fn capability(self) -> ProviderCapability {
         match self {
             Self::Ready => ProviderCapability::Ready,
-            Self::UnsupportedHost | Self::RuntimeInLinuxMode | Self::ProcessLimitUnsupported => {
-                ProviderCapability::Unsupported
-            }
+            Self::UnsupportedHost | Self::RuntimeInLinuxMode => ProviderCapability::Unsupported,
             Self::HyperVUnavailable | Self::ContainersUnavailable | Self::RuntimeNotInstalled => {
                 ProviderCapability::NotInstalled
             }
@@ -84,9 +291,6 @@ impl WindowsHyperVHostState {
                 Some("grant the runner-manager service account access to the container runtime")
             }
             Self::RuntimeInLinuxMode => Some("switch the container runtime to Windows containers"),
-            Self::ProcessLimitUnsupported => Some(
-                "the Docker/HCS Windows control surface does not expose an enforceable process-count limit; this preview backend cannot graduate",
-            ),
             Self::RuntimeDegraded => Some("repair or start the Windows container runtime"),
         }
     }
@@ -96,6 +300,7 @@ impl WindowsHyperVHostState {
 pub struct WindowsHyperVContainers {
     host_id: HostId,
     children: Mutex<BTreeMap<AttemptId, Child>>,
+    limits: Mutex<BTreeMap<AttemptId, ResourceLimits>>,
     diagnostics: Mutex<BTreeMap<AttemptId, Vec<ProviderDiagnostic>>>,
 }
 
@@ -105,6 +310,7 @@ impl WindowsHyperVContainers {
         Self {
             host_id,
             children: Mutex::new(BTreeMap::new()),
+            limits: Mutex::new(BTreeMap::new()),
             diagnostics: Mutex::new(BTreeMap::new()),
         }
     }
@@ -153,6 +359,118 @@ impl WindowsHyperVContainers {
             };
         }
         Ok(ResourceRecord::parse(result.stdout.trim()))
+    }
+
+    fn inspect_configuration(name: &str) -> Result<ContainerAttestation, CommandFailure> {
+        const FORMAT: &str = "{{.HostConfig.Isolation}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{index .HostConfig.StorageOpt \"size\"}}|{{.HostConfig.NetworkMode}}|{{len .Mounts}}|{{.HostConfig.Privileged}}|{{len .HostConfig.Binds}}|{{len .HostConfig.Devices}}|{{.Config.Image}}";
+        let result = Self::docker(&os_args(["inspect", "--format", FORMAT, name]))?;
+        if !result.success {
+            return Err(result.failure());
+        }
+        ContainerAttestation::parse(result.stdout.trim()).ok_or(CommandFailure::Failed)
+    }
+
+    fn configuration_is_exact(
+        name: &str,
+        image: &ImageReference,
+        resources: ResourceLimits,
+    ) -> bool {
+        Self::inspect_configuration(name)
+            .is_ok_and(|found| found == ContainerAttestation::expected(image, resources))
+    }
+
+    fn start_attested(name: &str) -> Result<(Child, ChildStdin), ()> {
+        let mut child = Command::new("docker")
+            .args([
+                OsStr::new("start"),
+                OsStr::new("--attach"),
+                OsStr::new("--interactive"),
+                OsStr::new(name),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let request = format!("{BOOTSTRAP_REQUEST_PROTOCOL}|{nonce}|{WINDOWS_PROCESS_LIMIT}\n");
+        if stdin
+            .write_all(request.as_bytes())
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::with_capacity(256);
+            let result = loop {
+                if bytes.len() == 1024 {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bootstrap attestation exceeded limit",
+                    ));
+                }
+                let mut byte = [0_u8; 1];
+                match stdout.read(&mut byte) {
+                    Ok(0) => {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "bootstrap closed before attestation",
+                        ));
+                    }
+                    Ok(_) if byte[0] == b'\n' => {
+                        break String::from_utf8(bytes).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "bootstrap attestation was not UTF-8",
+                            )
+                        });
+                    }
+                    Ok(_) => bytes.push(byte[0]),
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = sender.send((result, stdout));
+        });
+
+        let received = receiver.recv_timeout(BOOTSTRAP_ATTESTATION_TIMEOUT);
+        let Ok((Ok(line), mut stdout)) = received else {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        };
+        let Some(attestation) = JobAttestation::parse(line.trim_end_matches('\r')) else {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        };
+        if attestation
+            != (JobAttestation {
+                nonce,
+                active_process_limit: WINDOWS_PROCESS_LIMIT,
+                limit_flags: JOB_LIMIT_FLAGS,
+            })
+        {
+            stop_failed_bootstrap(&mut child, name);
+            return Err(());
+        }
+
+        // Runner.Listener inherits the attached output handles. Drain them so
+        // a verbose action cannot fill the pipe and stall the process tree.
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        });
+        Ok((child, stdin))
     }
 
     fn identity_for(
@@ -286,6 +604,13 @@ impl ExecutionProvider for WindowsHyperVContainers {
                 return Err(failure("Windows Hyper-V container creation failed"));
             }
         }
+        if !Self::configuration_is_exact(&expected.name, &expected.image, *resources) {
+            let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
+            self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+            return Err(failure(
+                "Windows Hyper-V resource or isolation attestation failed",
+            ));
+        }
 
         let source = format!(
             "{}{}.",
@@ -307,31 +632,21 @@ impl ExecutionProvider for WindowsHyperVContainers {
         // insufficient: an image can still lack PowerShell or the libraries
         // Runner.Listener needs. The fixed marker is non-secret and the same
         // stopped container is restarted later with the one-time JIT input.
-        let mut preflight = Command::new("docker")
-            .args([
-                OsStr::new("start"),
-                OsStr::new("--attach"),
-                OsStr::new("--interactive"),
-                OsStr::new(expected.name.as_str()),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let preflight_ok = match &mut preflight {
-            Ok(child) => {
-                child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| std::io::Error::other("docker stdin unavailable"))
-                    .and_then(|mut stdin| {
-                        stdin.write_all(PREFLIGHT_INPUT.as_bytes())?;
-                        stdin.flush()
-                    })
-                    .is_ok()
-                    && child.wait().is_ok_and(|status| status.success())
+        let preflight_ok = match Self::start_attested(&expected.name) {
+            Ok((mut child, mut stdin)) => {
+                let wrote = stdin
+                    .write_all(PREFLIGHT_INPUT.as_bytes())
+                    .and_then(|()| stdin.flush())
+                    .is_ok();
+                // ReadToEnd is the payload boundary.
+                drop(stdin);
+                let ok = wrote && wait_until_exit(&mut child, PREFLIGHT_EXIT_TIMEOUT);
+                if !ok {
+                    stop_failed_bootstrap(&mut child, &expected.name);
+                }
+                ok
             }
-            Err(_) => false,
+            Err(()) => false,
         };
         let preflight_record = Self::inspect_record(&expected.name).ok().flatten();
         if !preflight_ok
@@ -341,10 +656,6 @@ impl ExecutionProvider for WindowsHyperVContainers {
                     && record.exit_code == Some(0)
             })
         {
-            if let Ok(child) = &mut preflight {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
             let _ = Self::docker(&os_args(["rm", "--force", expected.name.as_str()]));
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
@@ -355,6 +666,10 @@ impl ExecutionProvider for WindowsHyperVContainers {
         let identity = self
             .identity_for(attempt, expected.name)
             .ok_or_else(|| failure("Windows Hyper-V identity is invalid"))?;
+        self.limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(attempt.id, *resources);
         Ok(PreparedEnvironment::isolated(attempt.id, identity))
     }
 
@@ -381,36 +696,39 @@ impl ExecutionProvider for WindowsHyperVContainers {
                 "Windows Hyper-V container ownership mismatch",
             )));
         }
+        let Some(resources) = self
+            .limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&attempt.id)
+            .copied()
+        else {
+            self.note(attempt.id, ProviderDiagnostic::StartFailed);
+            return Err(ProcessStartFailure::before_spawn(failure(
+                "Windows Hyper-V resource attestation is unavailable",
+            )));
+        };
+        if !Self::configuration_is_exact(&expected.name, &expected.image, resources) {
+            self.note(attempt.id, ProviderDiagnostic::StartFailed);
+            return Err(ProcessStartFailure::before_spawn(failure(
+                "Windows Hyper-V resource or isolation attestation failed",
+            )));
+        }
         // The script is constant container metadata. The JIT value is never an
         // argument, Docker environment setting, label, file, or layer; it is
-        // read from stdin and placed only in Runner.Listener's initial
-        // environment. Runner.Listener is the primary workload, so its exit
-        // makes the container observably exit.
-        let mut child = Command::new("docker")
-            .args([
-                OsStr::new("start"),
-                OsStr::new("--attach"),
-                OsStr::new("--interactive"),
-                OsStr::new(expected.name.as_str()),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| {
-                ProcessStartFailure::before_spawn(failure("Windows runner bootstrap failed"))
-            })?;
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("docker stdin unavailable"))
-            .and_then(|mut stdin| {
-                stdin.write_all(handoff.consume().expose().as_bytes())?;
-                stdin.flush()
-            });
+        // sent only after the nonce-bound Job Object attestation proves the
+        // active-process limit and kill-on-close flag. Runner.Listener is then
+        // created suspended, assigned, membership-checked, and resumed.
+        let (mut child, mut stdin) = Self::start_attested(&expected.name).map_err(|()| {
+            self.note(attempt.id, ProviderDiagnostic::StartFailed);
+            ProcessStartFailure::after_spawn_stopped()
+        })?;
+        let write_result = stdin
+            .write_all(handoff.consume().expose().as_bytes())
+            .and_then(|()| stdin.flush());
+        drop(stdin);
         if write_result.is_err() {
-            let _ = child.kill();
-            let _ = Self::docker(&os_args(["stop", "--time", "0", expected.name.as_str()]));
+            stop_failed_bootstrap(&mut child, &expected.name);
             self.note(attempt.id, ProviderDiagnostic::StartFailed);
             return Err(ProcessStartFailure::after_spawn_stopped());
         }
@@ -491,6 +809,10 @@ impl ExecutionProvider for WindowsHyperVContainers {
                 .flatten()
                 .is_none()
             {
+                self.limits
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&attempt.id);
                 Ok(ProviderDestroy::Destroyed)
             } else {
                 self.note(attempt.id, ProviderDiagnostic::OwnershipMismatch);
@@ -505,6 +827,10 @@ impl ExecutionProvider for WindowsHyperVContainers {
                 .flatten()
                 .is_none()
         {
+            self.limits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&attempt.id);
             return Ok(ProviderDestroy::Destroyed);
         }
         self.note(attempt.id, ProviderDiagnostic::CleanupDeferred);
@@ -651,6 +977,99 @@ impl ResourceRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerAttestation {
+    isolation: String,
+    nano_cpus: u64,
+    memory_bytes: u64,
+    storage_size: String,
+    network_mode: String,
+    mounts: u32,
+    privileged: bool,
+    binds: u32,
+    devices: u32,
+    image: ImageReference,
+}
+
+impl ContainerAttestation {
+    fn expected(image: &ImageReference, resources: ResourceLimits) -> Self {
+        Self {
+            isolation: "hyperv".into(),
+            nano_cpus: u64::from(resources.cpu_millis) * 1_000_000,
+            memory_bytes: u64::from(resources.memory_mib) * 1024 * 1024,
+            storage_size: format!("{}m", resources.disk_mib),
+            network_mode: "nat".into(),
+            mounts: 0,
+            privileged: false,
+            binds: 0,
+            devices: 0,
+            image: image.clone(),
+        }
+    }
+
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split('|');
+        let parsed = Self {
+            isolation: fields.next()?.to_owned(),
+            nano_cpus: fields.next()?.parse().ok()?,
+            memory_bytes: fields.next()?.parse().ok()?,
+            storage_size: fields.next()?.to_owned(),
+            network_mode: fields.next()?.to_owned(),
+            mounts: fields.next()?.parse().ok()?,
+            privileged: fields.next()?.parse().ok()?,
+            binds: fields.next()?.parse().ok()?,
+            devices: fields.next()?.parse().ok()?,
+            image: ImageReference::new(fields.next()?).ok()?,
+        };
+        fields.next().is_none().then_some(parsed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobAttestation {
+    nonce: String,
+    active_process_limit: u32,
+    limit_flags: u32,
+}
+
+impl JobAttestation {
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split('|');
+        if fields.next()? != BOOTSTRAP_ATTESTATION_PROTOCOL {
+            return None;
+        }
+        let nonce = fields.next()?;
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let parsed = Self {
+            nonce: nonce.to_owned(),
+            active_process_limit: fields.next()?.parse().ok()?,
+            limit_flags: fields.next()?.parse().ok()?,
+        };
+        fields.next().is_none().then_some(parsed)
+    }
+}
+
+fn stop_failed_bootstrap(child: &mut Child, name: &str) {
+    let _ = child.kill();
+    let _ = WindowsHyperVContainers::docker(&os_args(["stop", "--time", "0", name]));
+    let _ = child.wait();
+}
+
+fn wait_until_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CommandResult {
     success: bool,
@@ -779,12 +1198,10 @@ fn host_state_with(commands: &dyn CommandRunner) -> WindowsHyperVHostState {
     if runtime.stdout.trim() != "windows" {
         return WindowsHyperVHostState::RuntimeInLinuxMode;
     }
-    // Microsoft documents the Windows HCS controls exposed through Docker for
-    // CPU, memory, storage, and networking, but no active-process limit. Docker
-    // Engine's `.PidsLimit` info flag reports host-kernel PID-controller support
-    // and is not evidence for a Windows/HCS process-count control. Keep this
-    // typed refusal ahead of image resolution, preparation, and therefore JIT.
-    WindowsHyperVHostState::ProcessLimitUnsupported
+    // Process count is installed inside the container by the pinned bootstrap
+    // and proved again before JIT. Native client and Server acceptance remains
+    // a separate preview gate; the static host prerequisites are ready here.
+    WindowsHyperVHostState::Ready
 }
 
 fn inspect_image(image: &ImageReference) -> Result<bool, CommandFailure> {
@@ -954,7 +1371,7 @@ mod tests {
                 output("edition=Professional\nhyperv=1\ncontainers=1\n"),
                 Some(output("windows\n")),
             ),
-            WindowsHyperVHostState::ProcessLimitUnsupported
+            WindowsHyperVHostState::Ready
         );
         assert_eq!(
             host_probe(output("edition=Core\nhyperv=1\ncontainers=1\n"), None,),
@@ -1017,19 +1434,6 @@ mod tests {
     }
 
     #[test]
-    fn process_limit_capability_is_fail_closed() {
-        assert_eq!(
-            WindowsHyperVHostState::ProcessLimitUnsupported.capability(),
-            ProviderCapability::Unsupported
-        );
-        assert!(
-            WindowsHyperVHostState::ProcessLimitUnsupported
-                .remedy()
-                .is_some_and(|remedy| remedy.contains("cannot graduate"))
-        );
-    }
-
-    #[test]
     fn image_metadata_requires_the_windows_amd64_pair_exactly() {
         assert!(compatible_image_metadata("windows|amd64\n"));
         for rejected in [
@@ -1060,10 +1464,138 @@ mod tests {
     fn bootstrap_never_embeds_the_jit_value_in_docker_metadata() {
         assert!(BOOTSTRAP.contains("[Console]::In.ReadToEnd()"));
         assert!(BOOTSTRAP.contains("ACTIONS_RUNNER_INPUT_JITCONFIG"));
-        assert!(BOOTSTRAP.contains("ProcessStartInfo"));
+        assert!(BOOTSTRAP.contains("CREATE_SUSPENDED"));
+        assert!(BOOTSTRAP.contains("AssignProcessToJobObject"));
+        assert!(BOOTSTRAP.contains("IsProcessInJob"));
+        assert!(BOOTSTRAP.contains("JOB_OBJECT_LIMIT_ACTIVE_PROCESS"));
+        assert!(BOOTSTRAP.contains("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE"));
+        assert!(!BOOTSTRAP.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"));
+        assert!(!BOOTSTRAP.contains("JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK"));
         assert!(BOOTSTRAP.contains(PREFLIGHT_INPUT));
         assert!(!BOOTSTRAP.contains("$env:ACTIONS_RUNNER_INPUT_JITCONFIG"));
         assert!(!BOOTSTRAP.contains("fixture-jit-value"));
+    }
+
+    #[test]
+    fn job_attestation_is_typed_nonce_bound_and_exact() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let line = format!(
+            "{BOOTSTRAP_ATTESTATION_PROTOCOL}|{nonce}|{WINDOWS_PROCESS_LIMIT}|{JOB_LIMIT_FLAGS}"
+        );
+        assert_eq!(
+            JobAttestation::parse(&line),
+            Some(JobAttestation {
+                nonce: nonce.into(),
+                active_process_limit: WINDOWS_PROCESS_LIMIT,
+                limit_flags: JOB_LIMIT_FLAGS,
+            })
+        );
+        for rejected in [
+            line.replace(BOOTSTRAP_ATTESTATION_PROTOCOL, "untyped"),
+            line.replace(nonce, "short"),
+            line.replace(&WINDOWS_PROCESS_LIMIT.to_string(), "255"),
+            format!("{line}|extra"),
+        ] {
+            let parsed = JobAttestation::parse(&rejected);
+            assert!(
+                parsed
+                    != Some(JobAttestation {
+                        nonce: nonce.into(),
+                        active_process_limit: WINDOWS_PROCESS_LIMIT,
+                        limit_flags: JOB_LIMIT_FLAGS,
+                    }),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_installs_queries_and_uses_the_nested_job() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let compile_temp = tempfile::tempdir().expect("writable Add-Type directory");
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                BOOTSTRAP,
+            ])
+            .env("TEMP", compile_temp.path())
+            .env("TMP", compile_temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("PowerShell bootstrap starts");
+        let mut stdin = child.stdin.take().expect("bootstrap stdin");
+        write!(
+            stdin,
+            "{BOOTSTRAP_REQUEST_PROTOCOL}|{nonce}|{WINDOWS_PROCESS_LIMIT}\n{BOOTSTRAP_SELF_TEST_INPUT}"
+        )
+        .expect("bootstrap protocol write");
+        drop(stdin);
+        let success = wait_until_exit(&mut child, BOOTSTRAP_ATTESTATION_TIMEOUT);
+        if !success {
+            let _ = child.kill();
+        }
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("bootstrap stdout")
+            .read_to_string(&mut stdout)
+            .expect("bootstrap stdout is readable");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("bootstrap stderr")
+            .read_to_string(&mut stderr)
+            .expect("bootstrap stderr is readable");
+        assert!(success, "bootstrap failed: {stderr}");
+        assert_eq!(
+            stdout.trim(),
+            format!(
+                "{BOOTSTRAP_ATTESTATION_PROTOCOL}|{nonce}|{WINDOWS_PROCESS_LIMIT}|{JOB_LIMIT_FLAGS}"
+            )
+        );
+    }
+
+    #[test]
+    fn container_attestation_requires_exact_limits_and_no_host_surface() {
+        let image =
+            ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let resources = ResourceLimits {
+            cpu_millis: 2500,
+            memory_mib: 3072,
+            disk_mib: 8192,
+        };
+        let line = format!(
+            "hyperv|2500000000|3221225472|8192m|nat|0|false|0|0|{}",
+            image.as_str()
+        );
+        assert_eq!(
+            ContainerAttestation::parse(&line),
+            Some(ContainerAttestation::expected(&image, resources))
+        );
+        for rejected in [
+            line.replacen("hyperv", "process", 1),
+            line.replacen("2500000000", "2000000000", 1),
+            line.replacen("3221225472", "2147483648", 1),
+            line.replacen("8192m", "4096m", 1),
+            line.replacen("|0|false|0|0|", "|1|false|0|0|", 1),
+            line.replacen("|0|false|0|0|", "|0|true|0|0|", 1),
+            format!("{line}|extra"),
+        ] {
+            assert_ne!(
+                ContainerAttestation::parse(&rejected),
+                Some(ContainerAttestation::expected(&image, resources)),
+                "{rejected}"
+            );
+        }
     }
 
     #[test]

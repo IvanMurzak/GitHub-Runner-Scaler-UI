@@ -300,20 +300,34 @@ On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
 containers** through a Docker-compatible Windows container runtime. Candidate
 hosts are Windows Pro, Enterprise, Education, or Server with both Hyper-V and
 Containers enabled; native client and Server acceptance is still pending.
-Microsoft's current [Windows container resource-control
-surface](https://learn.microsoft.com/virtualization/windowscontainers/manage-containers/resource-controls)
-does not expose an enforceable process-count limit through Docker/HCS, so the
-backend fails closed during typed host preflight and cannot request a JIT
-registration or execute jobs. `host isolation status` reports this graduation
-block separately from missing features, runtime permission, Linux-container
-mode, and runtime degradation.
+Microsoft documents that Windows containers use a parent Job Object and that
+Hyper-V isolation applies resource controls to both that container job and its
+utility VM. Windows also supports [nested Job
+Objects](https://learn.microsoft.com/windows/win32/procthread/nested-jobs):
+ordinary descendants inherit the job chain, and the most restrictive limits
+remain effective. Runner Manager uses that supported nesting seam to install a
+256-process `ActiveProcessLimit` around `Runner.Listener` and its descendants.
+The bootstrap sets no breakaway flag.
 
-Once an enforceable process-count control is available and verified, the
-backend is designed to copy the verified runner package into a fresh container
-layer, set CPU, memory, process-count, and disk limits, and never mount a host
-directory, device, or container-runtime socket. Desktop/UI automation, host
-devices, container actions, and service containers remain explicitly
-unsupported. There is no process-isolation or native-execution fallback.
+The provider copies the verified runner package into a fresh writable layer
+and never mounts a host directory, device, credential, or container-runtime
+socket. Before JIT crosses container stdin, it reads back Docker's exact
+Hyper-V, pinned-image, CPU, memory, disk, network, mount, device, and privilege
+configuration. The in-container bootstrap then creates and queries the Job
+Object and returns a typed, one-use nonce attestation. Only an exact 256-process
+limit plus kill-on-close proof unlocks the private JIT channel;
+`Runner.Listener` is created suspended, assigned to the job, membership-checked,
+and then resumed. Any timeout, malformed proof, changed container setting, or
+assignment failure stops the container without a native fallback.
+
+This backend remains preview-held until real jobs, restart/recovery and
+resource-exhaustion tests pass on declared Windows client and Server variants.
+Desktop/UI automation, host devices, container actions, and service containers
+remain explicitly unsupported. The control provides dependency isolation for
+the documented trusted-workflow model; it is not a hostile-code containment
+claim. `host isolation status` still reports missing features, runtime
+permission, Linux-container mode, runtime degradation, and the pending native
+acceptance notice separately.
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.
