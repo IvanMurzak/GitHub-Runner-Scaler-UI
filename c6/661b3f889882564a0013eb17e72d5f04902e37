@@ -1,0 +1,30 @@
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_2cc87861e07beb 792,795,797-798,963-1062,1069-1129,1134-1137,1144-1157,1162-1180,1185-1188,1193-1202,1209-1215,1219-1224,1233-1361,1366-1372,1382-1392
+  s_5801a853f78e8a::t_876931c7af9229 1063-1068,1130-1133,1138-1143,1158-1161,1181-1184,1189-1192,1203-1208,1216-1218,1225-1232,1362-1365,1373-1381
+  s_5801a853f78e8a::t_218079c363c6f7 1393
+.github/workflows/ci.yml
+  s_5801a853f78e8a::t_3e2e40445632d8 65-100
+  s_5801a853f78e8a::t_dc30df5930d57f 101
+crates/app/tests/workflow_triggers.rs
+  s_5801a853f78e8a::t_d981374fa8e87a 521-552
+  s_5801a853f78e8a::t_40e7c12d15c8f7 520,553-556
+tests/native-linux-oci-acceptance.sh
+  s_5801a853f78e8a::t_3e2e40445632d8 1-18,20-97
+  s_5801a853f78e8a::t_3384d5f83c14cc 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c6661b3f889882564a0013eb17e72d5f04902e37",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
