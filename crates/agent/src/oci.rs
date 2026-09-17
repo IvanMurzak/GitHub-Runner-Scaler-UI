@@ -1444,25 +1444,6 @@ mod tests {
             "JIT reached the container process listing"
         );
 
-        let environments = podman(&[
-            "exec",
-            environment_id,
-            "sh",
-            "-c",
-            "for p in /proc/[0-9]*/environ; do cat \"$p\" 2>/dev/null || true; done",
-        ]);
-        assert!(
-            environments.status.success(),
-            "container environment scan failed"
-        );
-        assert!(
-            !environments
-                .stdout
-                .windows(jit.len())
-                .any(|window| window == jit.as_bytes()),
-            "JIT survived in a container process environment"
-        );
-
         let logs = podman(&["logs", environment_id]);
         assert!(
             !logs

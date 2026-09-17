@@ -104,9 +104,16 @@ a SHA-256-pinned Actions runner package, keeps its extracted bytes on the WSL
 Linux filesystem, and exercises production `OciProcesses::prepare` and
 `OciProcesses::start`. The workflow checks out the PR and writes package,
 process, and filesystem markers. The Rust acceptance scans container inspect,
-process environments, logs, image history, and the stopped writable layer for
-the JIT value before destroying the container. Neither the value nor an API
-token is written to an argument, environment variable, log, or evidence file.
+process arguments, logs, image history, and the stopped writable layer for the
+JIT value before destroying the container. Neither the value nor an API token
+is written to an argument, log, or evidence file.
+
+The live runner does retain GitHub's required `ACTIONS_RUNNER_INPUT_JITCONFIG`
+startup input in the listener process environment while that listener is alive.
+That environment is confined to the isolated container and disappears when the
+one-time runner exits; it is not included in inspect metadata, logs, history, or
+the exported writable layer. The current GitHub runner interface therefore does
+not support a stronger live-process-environment claim.
 
 ## GitHub-hosted native Linux acceptance
 
