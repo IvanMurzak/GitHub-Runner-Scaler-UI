@@ -41,5 +41,6 @@
 //! tripwire against the shape being reintroduced.
 
 pub mod lifecycle;
+pub mod oci;
 pub mod package;
 pub mod reconcile;

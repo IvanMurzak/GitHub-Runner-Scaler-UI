@@ -11,11 +11,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
+use runner_manager_agent::lifecycle::NativeProcesses;
 use runner_manager_agent::lifecycle::{
     CachedRuntimePackages, LifecycleGithub, LifecycleGithubObservation, LifecycleLauncher,
-    LifecyclePorts, NativeProcesses, NoAttemptEvents, PersistentDemand, RetryPolicy,
-    TokioRetryDelay,
+    LifecyclePorts, NoAttemptEvents, PersistentDemand, RetryPolicy, TokioRetryDelay,
 };
+use runner_manager_agent::oci::OciProcesses;
 use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
 };
@@ -285,7 +287,7 @@ async fn run_generation(
                 store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
                 github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
                 packages: Arc::new(CachedRuntimePackages::new(cache)),
-                processes: Arc::new(NativeProcesses::new()),
+                processes: Arc::new(OciProcesses::new(host.id)),
                 clock: Arc::clone(&clock),
                 demand: Arc::new(PersistentDemand),
                 delay: Arc::new(TokioRetryDelay),

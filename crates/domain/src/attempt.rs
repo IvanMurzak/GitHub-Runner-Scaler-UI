@@ -410,8 +410,46 @@ pub enum FailureReason {
     /// and read back afterwards. See [`RecoveryDecision::Terminate`] for the
     /// window that obligation closes.
     TerminatedAfterRegistrationTimeout,
+    /// A closed, credential-free isolation provider failure. Its category is
+    /// preserved in the attempt journal and operator activity rather than
+    /// flattened into free-form subprocess or adapter text.
+    IsolationProvider(IsolationProviderFailure),
     /// Anything else. Must carry no credential.
     Other(String),
+}
+
+/// Operator-actionable isolation failures. No variant carries provider output,
+/// image text, JIT content, or another string that could contain a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationProviderFailure {
+    Unsupported,
+    NotInstalled,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
+    Degraded,
+    RuntimeOperationFailed,
+    OwnershipMismatch,
+    UnsafeRuntimePath,
+    JitHandoffRejected,
+}
+
+impl fmt::Display for IsolationProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "isolation provider unsupported on this host",
+            Self::NotInstalled => "isolation provider not installed",
+            Self::PermissionDenied => "isolation provider permission denied",
+            Self::ImageUnavailableOrIncompatible => "isolated image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "rootless OCI writable-layer disk quota unavailable",
+            Self::Degraded => "isolation provider degraded",
+            Self::RuntimeOperationFailed => "rootless OCI runtime operation failed",
+            Self::OwnershipMismatch => "OCI environment ownership mismatch",
+            Self::UnsafeRuntimePath => "OCI runtime must be on the Linux filesystem",
+            Self::JitHandoffRejected => "OCI JIT handoff rejected before start",
+        })
+    }
 }
 
 impl FailureReason {
@@ -458,7 +496,7 @@ impl FailureReason {
     /// invocation are markedly worse to read and to `rustdoc`. That is a
     /// legibility trade, deliberately taken — not an impossibility. If the
     /// documentation ever thins out, the macro is the better answer.
-    pub const ALL: [FailureReason; 9] = [
+    pub const ALL: [FailureReason; 10] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
         FailureReason::RunnerPackageUnverified,
@@ -467,6 +505,7 @@ impl FailureReason {
         FailureReason::ProcessExitedUnexpectedly,
         FailureReason::RegistrationTimedOut,
         FailureReason::TerminatedAfterRegistrationTimeout,
+        FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed),
         FailureReason::Other(String::new()),
     ];
 }
@@ -503,6 +542,7 @@ impl fmt::Display for FailureReason {
                 "the agent stopped the runner process after it failed to \
                  register with GitHub before its startup deadline",
             ),
+            FailureReason::IsolationProvider(category) => category.fmt(f),
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
     }
@@ -2242,6 +2282,7 @@ mod tests {
             // first, and the process it signalled is the one that never
             // registered.
             FailureReason::TerminatedAfterRegistrationTimeout => AttemptState::Starting,
+            FailureReason::IsolationProvider(_) => AttemptState::Allocated,
             FailureReason::Other(_) => AttemptState::Busy,
         }
     }
@@ -2259,7 +2300,7 @@ mod tests {
         // The table is written out rather than derived so each pairing carries
         // its reason; `earliest_state_producing` above is what makes a new
         // variant a compile error, and the two are cross-checked below.
-        let cases: [(FailureReason, AttemptState); 9] = [
+        let cases: [(FailureReason, AttemptState); 10] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -2285,6 +2326,10 @@ mod tests {
             (
                 FailureReason::TerminatedAfterRegistrationTimeout,
                 AttemptState::Starting,
+            ),
+            (
+                FailureReason::IsolationProvider(IsolationProviderFailure::NotInstalled),
+                AttemptState::Allocated,
             ),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
@@ -2347,6 +2392,30 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{reason:?} from {from} must reload: {e}"));
             assert_eq!(restored, attempt);
         }
+    }
+
+    #[test]
+    fn isolation_failure_categories_round_trip_without_free_text() {
+        let categories = [
+            IsolationProviderFailure::NotInstalled,
+            IsolationProviderFailure::PermissionDenied,
+            IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            IsolationProviderFailure::DiskQuotaUnavailable,
+            IsolationProviderFailure::RuntimeOperationFailed,
+        ];
+        let mut rendered = std::collections::BTreeSet::new();
+        for category in categories {
+            let reason = FailureReason::IsolationProvider(category);
+            let journal = serde_json::to_string(&reason).unwrap();
+            assert!(!journal.contains("other"));
+            assert!(!journal.contains("ghp_secret"));
+            assert_eq!(
+                serde_json::from_str::<FailureReason>(&journal).unwrap(),
+                reason
+            );
+            rendered.insert(reason.to_string());
+        }
+        assert_eq!(rendered.len(), categories.len());
     }
 
     // =======================================================================
