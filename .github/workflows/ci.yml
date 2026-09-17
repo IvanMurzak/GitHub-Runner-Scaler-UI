@@ -107,8 +107,8 @@ jobs:
           # entitlement; it is deliberately not production-signing evidence.
           codesign --force --options runtime --entitlements "$entitlements" --sign - "$binary"
           codesign --verify --strict --verbose=2 "$binary"
-          codesign --display --entitlements :- "$binary" > "$actual_entitlements"
-          test "$(plutil -extract com.apple.security.virtualization raw -o - "$actual_entitlements")" = true
+          codesign --display --entitlements - "$binary" > "$actual_entitlements"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.virtualization' "$actual_entitlements")" = true
 
           RUNNER_MANAGER_MACOS_VM_ROOT="$probe_root" \
             "$binary" --protocol-version 1 probe --json > "$probe_json"
