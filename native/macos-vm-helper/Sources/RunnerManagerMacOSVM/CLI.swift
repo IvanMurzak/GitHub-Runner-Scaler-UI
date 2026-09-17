@@ -34,7 +34,11 @@ struct RunnerManagerMacOSVM {
             try expectOnly(arguments, ["--json"])
             let entitlement = hasVirtualizationEntitlement()
             let framework = virtualizationIsReady()
-            let clones = framework && supportsFreshClones(in: store.root)
+            // APFS clone readiness is an independent host prerequisite. Probe
+            // it even when Virtualization.framework is unavailable so the
+            // response identifies the actual blocked layer instead of hiding
+            // a usable filesystem behind a runtime failure.
+            let clones = supportsFreshClones(in: store.root)
             try writeJSON(ProbeResponse(
                 protocolVersion: protocolVersion,
                 architecture: hostArchitecture(),

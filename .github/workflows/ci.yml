@@ -87,8 +87,66 @@ jobs:
       - name: Compile the Virtualization.framework helper
         run: swift build --package-path native/macos-vm-helper
 
-      - name: Run deterministic helper tests
+      - name: Run Swift helper tests
         run: swift test --package-path native/macos-vm-helper
+
+      - name: Sign and execute the native host capability probe
+        run: |
+          set -euo pipefail
+          package=native/macos-vm-helper
+          swift build --package-path "$package" -c release
+          binary=$(swift build --package-path "$package" -c release --show-bin-path)/runner-manager-macos-vm
+          entitlements="$package/runner-manager-macos-vm.entitlements"
+          actual_entitlements="$RUNNER_TEMP/runner-manager-entitlements.plist"
+          probe_json="$RUNNER_TEMP/runner-manager-native-probe.json"
+          probe_root="$RUNNER_TEMP/runner-manager-native-probe-store"
+          trap 'rm -rf "$probe_root"' EXIT
+
+          # The hosted runner has no operator identity. Ad-hoc signing proves
+          # that the built executable carries and observes the committed
+          # entitlement; it is deliberately not production-signing evidence.
+          codesign --force --options runtime --entitlements "$entitlements" --sign - "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          codesign --display --entitlements :- "$binary" > "$actual_entitlements"
+          test "$(plutil -extract com.apple.security.virtualization raw -o - "$actual_entitlements")" = true
+
+          RUNNER_MANAGER_MACOS_VM_ROOT="$probe_root" \
+            "$binary" --protocol-version 1 probe --json > "$probe_json"
+          plutil -lint "$probe_json"
+
+          read_probe() { plutil -extract "$1" raw -o - "$probe_json"; }
+          test "$(read_probe protocol_version)" = 1
+          test "$(read_probe architecture)" = "${{ matrix.uname }}"
+          test "$(read_probe macos_guest_entitlement)" = true
+          test "$(read_probe fresh_writable_disks)" = true
+
+          framework=$(read_probe virtualization_framework)
+          test "$(read_probe private_jit_channel)" = "$framework"
+          test "$(read_probe resource_limits)" = "$framework"
+          test "$(read_probe process_limits)" = "$framework"
+
+          if [ "${{ matrix.uname }}" = x86_64 ]; then
+            # The shipped macOS guest path is Apple-silicon-only. Compilation,
+            # signing, APFS, or an Intel host must never make it ready.
+            test "$framework" = false
+            result='unsupported by the helper (fail closed)'
+          elif [ "$framework" = true ]; then
+            result='runtime available; real macOS boot still requires an operator template'
+          else
+            result='runtime unavailable on this hosted runner; real VM boot is blocked'
+          fi
+
+          cat "$probe_json"
+          {
+            echo "### macOS VM native capability probe (${{ matrix.uname }})"
+            echo
+            echo '| Gate | Result |'
+            echo '| --- | --- |'
+            echo "| Signed executable observes virtualization entitlement | $(read_probe macos_guest_entitlement) (ad-hoc identity) |"
+            echo "| Real APFS clonefile and cleanup | $(read_probe fresh_writable_disks) |"
+            echo "| VZVirtualMachine.isSupported | $framework |"
+            echo "| Product readiness | $result |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   check:
     name: check (${{ matrix.name }})

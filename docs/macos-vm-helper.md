@@ -38,6 +38,9 @@ as the platform configuration for macOS guests on Apple silicon. The package
 is compiled and unit-tested on both GitHub-hosted ARM64 and Intel Macs, but the
 Intel binary reports the macOS VM capability unavailable. An Intel compile is
 not evidence that an Intel host can boot this macOS guest configuration.
+The exact native operations exercised on hosted runners, and the remaining
+operator-hardware acceptance boundary, are recorded in
+[macOS VM hosted-native evidence](macos-vm-hosted-native-evidence.md).
 
 Every invocation begins with `--protocol-version 1`. Successful read commands
 write one JSON value to stdout and nothing sensitive to stderr. Responses are
