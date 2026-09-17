@@ -1,0 +1,24 @@
+native/macos-vm-helper/Tests/RunnerManagerMacOSVMTests/ProtocolTests.swift
+  s_5801a853f78e8a::t_bca5dfc3a83188 15,21-24
+  s_5801a853f78e8a::t_7221f1f5f29bb6 25-27
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/Native.swift
+  s_5801a853f78e8a::t_bca5dfc3a83188 437
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/Models.swift
+  s_5801a853f78e8a::t_bca5dfc3a83188 306-308,376,385-389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "43a66d1dc48b63e8c5e45063245f1830b34ea122",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
