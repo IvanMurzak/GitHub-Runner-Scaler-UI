@@ -61,10 +61,21 @@ function Assert-BootChanged {
         [Parameter(Mandatory)]$After
     )
 
-    $beforeBoot = [DateTimeOffset]::Parse($Before.lastBootUpTimeUtc)
-    $afterBoot = [DateTimeOffset]::Parse($After.lastBootUpTimeUtc)
-    $beforeEvent = [DateTimeOffset]::Parse($Before.kernelBootEventTimeUtc)
-    $afterEvent = [DateTimeOffset]::Parse($After.kernelBootEventTimeUtc)
+    $asUtc = {
+        param($Value)
+        if ($Value -is [DateTime]) {
+            return [DateTimeOffset]::new(([DateTime]$Value).ToUniversalTime())
+        }
+        return [DateTimeOffset]::Parse(
+            [string]$Value,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        ).ToUniversalTime()
+    }
+    $beforeBoot = & $asUtc $Before.lastBootUpTimeUtc
+    $afterBoot = & $asUtc $After.lastBootUpTimeUtc
+    $beforeEvent = & $asUtc $Before.kernelBootEventTimeUtc
+    $afterEvent = & $asUtc $After.kernelBootEventTimeUtc
     if ($afterBoot -le $beforeBoot -or $afterEvent -le $beforeEvent -or
         [long]$After.kernelBootEventRecordId -eq [long]$Before.kernelBootEventRecordId) {
         throw 'Windows boot identity and time did not both advance. Run verify-after-reboot only after a real Windows reboot.'

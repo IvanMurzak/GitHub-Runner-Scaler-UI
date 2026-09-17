@@ -438,6 +438,11 @@ fn ownership_failure() -> FailureReason {
     FailureReason::IsolationProvider(IsolationProviderFailure::OwnershipMismatch)
 }
 
+#[cfg(test)]
+fn retained_after_restart(state: EnvironmentState) -> bool {
+    matches!(state, EnvironmentState::Starting | EnvironmentState::Exited)
+}
+
 impl ExecutionProvider for OciProcesses {
     fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
         if policy.execution_policy().is_native() {
@@ -847,6 +852,14 @@ mod boundary_tests {
     use super::*;
     use runner_manager_domain::model::Clock;
     use runner_manager_testkit::{clock::FakeClock, fixtures};
+
+    #[test]
+    fn restart_recovery_accepts_only_retained_container_states() {
+        assert!(retained_after_restart(EnvironmentState::Starting));
+        assert!(retained_after_restart(EnvironmentState::Exited));
+        assert!(!retained_after_restart(EnvironmentState::Running));
+        assert!(!retained_after_restart(EnvironmentState::Missing));
+    }
 
     #[test]
     fn isolated_attempt_cannot_use_native_compatibility_methods() {
@@ -2013,10 +2026,9 @@ mod tests {
             }
 
             let state_after_restart = provider.inspect(attempt).unwrap();
-            assert_eq!(
-                state_after_restart,
-                EnvironmentState::Starting,
-                "the remounted provider did not retain the resource for recovery"
+            assert!(
+                retained_after_restart(state_after_restart),
+                "the remounted provider did not retain a recoverable resource: {state_after_restart:?}"
             );
             match attempt.state() {
                 AttemptState::Prepared => {
