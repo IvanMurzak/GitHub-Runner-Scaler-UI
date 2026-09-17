@@ -1,0 +1,31 @@
+.github/workflows/d1-live-jit-acceptance.yml
+  s_5801a853f78e8a::t_7586a47bcffa9e 39
+  s_5801a853f78e8a::t_9703ef85efc0b3 1-38,40-49
+docs/spikes/rootless-oci-wsl-quota.md
+  s_5801a853f78e8a::t_177e254f074552 93-110
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_9703ef85efc0b3 1416-1432,1437-1440,1444-1453,1458-1466,1479-1482,1703-1727,1734-1775,1780-1786,1791-1803,1808-1810
+  s_5801a853f78e8a::t_5b5cb2eb216bd6 1433-1436,1441-1443,1454-1457,1467-1478,1728-1733,1776-1779,1787-1790,1804-1807
+  s_5801a853f78e8a::t_5bde5afed52950 1811
+tests/managed-wsl-oci-acceptance.sh
+  s_5801a853f78e8a::t_9703ef85efc0b3 13-18,197-227
+crates/app/tests/workflow_triggers.rs
+  s_5801a853f78e8a::t_7586a47bcffa9e 558-605
+  s_5801a853f78e8a::t_91c05baf64c270 557,606-607
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c1428ef93330a3db0e4cdece936c6a1b5a27fbac",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
