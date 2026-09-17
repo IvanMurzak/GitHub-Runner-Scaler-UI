@@ -53,9 +53,9 @@ This file is the only live task-state record.
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
-| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / full Windows reboot gate pending | 2026-09-17 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / native Windows client+Server gates pending | 2026-09-17 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / real Apple Silicon VM gates pending; Intel unsupported | 2026-09-17 |
+| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / corrected full-reboot rerun pending | 2026-09-17 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / elevated client live-job gate + Server gate pending | 2026-09-17 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -249,3 +249,33 @@ d0e171c. The exact full local gate and seven CI/E2E checks passed. No signed
 entitled helper, real digest-pinned Virtualization.framework guest, Apple
 Silicon/Intel job, reboot/recovery drill, or guest/host secret forensic run was
 available, so PR #79 stays open and d3 stays `🟣`.
+
+**2026-09-17 — disruptive platform review completed.** A real Windows reboot
+advanced both prepared native gates. The d1 reboot receipt proved a new Windows
+boot and retained the bounded WSL OCI resource, but the recovery assertion
+incorrectly rejected Podman's truthful post-reboot `Exited` state. PR #74 head
+884c0e2 now accepts only retained `Starting` or `Exited` resources, still
+rejects `Missing` and unexpected `Running`, normalizes PowerShell 5.1/7 receipt
+timestamps, and passed the full local gate plus eight remote checks. The guarded
+harness recorded the failed receipt as cleanup-required; cleanup and one fresh
+prepare/reboot/verify cycle remain.
+
+PR #77 head ab9dfb4 passed the full local gate and seven remote checks. Its
+acceptance harness now safely backs up and restores an audited pre-existing
+service, and dispatches its PR-only native workflow through a one-time guarded
+label because GitHub cannot manually dispatch a new workflow absent from the
+default branch. This Windows client reboot is verified, but the elevated Docker
+service, live Hyper-V container job, restart/forensics, cleanup and rollback
+phases still require an interactive UAC-approved run. A separate native Windows
+Server host remains required for the declared Server gate.
+
+PR #79 head b53619b adds the missing reproducible native acceptance harness,
+including PR-only live-job dispatch, exact fresh-disk/no-share/resource/process
+attestation, daemon crash/restart, host-reboot receipt, orphan recovery, secret
+forensics and guarded cleanup/rollback. The full local and remote gates pass.
+The repository defines the RMV1 guest protocol but does not ship the operator's
+guest LaunchDaemon. Immutable native evidence still requires an
+operator-controlled bare-metal Apple Silicon Mac, APFS, the entitled signed
+helper and a digest-pinned Apple-authorized template containing that bootstrap;
+hosted macOS has no nested virtualization. Intel remains explicitly fail closed
+and is not a declared native macOS guest architecture.
