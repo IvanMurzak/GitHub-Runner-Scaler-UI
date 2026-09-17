@@ -238,7 +238,7 @@ function New-AuditState {
     $containers = if ($windows.family -eq 'server') {
         try { [string](Get-WindowsFeature -Name Containers -ErrorAction Stop).InstallState } catch { Get-OptionalFeatureState 'Containers' }
     } else { Get-OptionalFeatureState 'Containers' }
-    $gitCommit = (Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD') -join '').Trim()
+    $gitCommit = ((Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD')) -join '').Trim()
     $service = Get-ServiceSnapshot 'runner-manager'
     $serviceRecord = Join-Path $DataDir 'config/service.toml'
     $serviceRecordSnapshot = Get-ServiceRecordSnapshot $serviceRecord
@@ -506,7 +506,7 @@ function Invoke-RunJob($State) {
     Invoke-External gh.exe @('auth', 'status', '--hostname', 'github.com') -DiscardOutput
     Invoke-Runner @('auth', 'status') | Out-Null
     if (-not $WorkflowRef) {
-        $WorkflowRef = (Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name') -join '').Trim()
+        $WorkflowRef = ((Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name')) -join '').Trim()
     }
     Invoke-External gh.exe @('workflow', 'view', $Workflow, '--repo', $Repository, '--ref', $WorkflowRef) -DiscardOutput
     $acceptanceId = ([DateTime]::UtcNow.ToString('yyyyMMddHHmmss') + '-' + ([Guid]::NewGuid().ToString('N').Substring(0, 8)))

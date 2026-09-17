@@ -56,6 +56,30 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
 }
 
 #[test]
+fn external_output_is_joined_only_after_each_invocation_returns() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    for safe_call in [
+        "$gitCommit = ((Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD')) -join '').Trim()",
+        "$WorkflowRef = ((Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name')) -join '').Trim()",
+    ] {
+        assert!(
+            script.contains(safe_call),
+            "external command output must be grouped before PowerShell binds -join: {safe_call}"
+        );
+    }
+
+    for broken_call in [
+        "$gitCommit = (Invoke-External git.exe @('-C', $RepoRoot, 'rev-parse', 'HEAD') -join '').Trim()",
+        "$WorkflowRef = (Invoke-External gh.exe @('repo', 'view', $Repository, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name') -join '').Trim()",
+    ] {
+        assert!(
+            !script.contains(broken_call),
+            "PowerShell would bind -join as an Invoke-External parameter: {broken_call}"
+        );
+    }
+}
+
+#[test]
 fn harness_and_workflow_pin_the_production_provider_security_contract() {
     let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
     let workflow = repository_file(".github/workflows/windows-hyperv-native-acceptance.yml");
