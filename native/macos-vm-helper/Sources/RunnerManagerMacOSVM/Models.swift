@@ -303,9 +303,9 @@ struct GuestReply: Codable {
     let status: String
     let environmentId: String
     let generation: String
-    let appliedProcessLimit: UInt32
-    let processLimitMechanism: String
-    let runnerUidExclusive: Bool
+    let appliedProcessLimit: UInt32?
+    let processLimitMechanism: String?
+    let runnerUidExclusive: Bool?
     let runnerPid: Int32?
     let runnerExitCode: Int32?
 
@@ -373,7 +373,7 @@ func parsePinnedImage(_ image: String) throws -> (version: String, digest: Strin
     guard !version.isEmpty,
           version.unicodeScalars.allSatisfy(allowedVersion.contains),
           digest.count == 64,
-          digest.allSatisfy({ $0.isNumber || ("a"..."f").contains($0) })
+          digest.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) })
     else {
         throw HelperFailure.rejected("image must be versioned and digest pinned")
     }
@@ -382,7 +382,11 @@ func parsePinnedImage(_ image: String) throws -> (version: String, digest: Strin
 
 func validateIdentifier(_ value: String) throws {
     let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-    guard !value.isEmpty, value.count <= 192, value.unicodeScalars.allSatisfy(allowed.contains) else {
+    guard value.hasPrefix("rm-"),
+          !value.contains(".."),
+          value.count <= 192,
+          value.unicodeScalars.allSatisfy(allowed.contains)
+    else {
         throw HelperFailure.rejected("invalid environment identity")
     }
 }

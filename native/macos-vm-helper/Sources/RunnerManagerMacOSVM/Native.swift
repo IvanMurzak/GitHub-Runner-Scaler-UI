@@ -434,7 +434,7 @@ func streamFile(_ url: URL, to fd: Int32, deadline: Date) throws {
 
 func readReply(_ fd: Int32, deadline: Date?) throws -> GuestReply {
     let sizeData = try readExact(fd, count: 4, deadline: deadline)
-    let size = sizeData.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+    let size = sizeData.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
     guard size > 0, size <= maximumGuestReplyBytes else {
         throw HelperFailure.degraded("guest reply exceeded its bound")
     }

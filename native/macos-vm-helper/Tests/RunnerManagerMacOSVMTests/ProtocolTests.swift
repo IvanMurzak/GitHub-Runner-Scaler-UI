@@ -12,8 +12,16 @@ final class ProtocolTests: XCTestCase {
             "vm-version:v1@sha256:ABC",
             "vm-version:../v1@sha256:\(digest)",
             "vm-version:v1@sha256:\(String(repeating: "g", count: 64))",
+            "vm-version:v1@sha256:\(String(repeating: "١", count: 64))",
         ] {
             XCTAssertThrowsError(try parsePinnedImage(invalid), invalid)
+        }
+    }
+
+    func testEnvironmentIdentifiersCannotEscapeOrHideFromInventory() throws {
+        XCTAssertNoThrow(try validateIdentifier("rm-attempt-generation"))
+        for invalid in ["..", ".hidden", "rm-..", "other-environment", "rm-path/slash"] {
+            XCTAssertThrowsError(try validateIdentifier(invalid), invalid)
         }
     }
 
