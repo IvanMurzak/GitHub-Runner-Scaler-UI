@@ -1,0 +1,64 @@
+crates/app/src/cli/policy.rs
+  s_5801a853f78e8a::t_5bf36466160d9c 1364
+crates/agent/src/reconcile.rs
+  s_5801a853f78e8a::t_b346b4587d6fd2 114-116,1255-1270,5116-5130,5255
+crates/agent/src/lifecycle.rs
+  s_5801a853f78e8a::t_3231a6bfa8a127 4000-4016
+  s_5801a853f78e8a::t_5bf36466160d9c 25-27,51,1233,1271,1276-1283,1285-1298,1438,2789-2800,3276-3279,3281,3284-3285,3641-3646,3720,3729-3730,3734-3735,3768-3771,3775-3776,4515,4706,5068-5070,5107-5109,5232-5272,5284,5292-5295,5306-5311,5326-5329,5343-5388,5450-5453
+  s_5801a853f78e8a::t_b346b4587d6fd2 47,1599,1608,1615-1627,1724-1726
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_85afecf281910e 943-960
+  s_5801a853f78e8a::t_5bf36466160d9c 468,481,518-520,583
+.github/workflows/ci.yml
+  s_5801a853f78e8a::t_3d3369f1dbf2d7 65-100
+.github/workflows/d1-live-jit-acceptance.yml
+  s_5801a853f78e8a::t_359d06d26f8594 1-55
+.taskflow/2026-09-13-runner-sandbox-isolation/ROADMAP.md
+  s_5801a853f78e8a::t_0a8893146c10ca 5-6,56-58,222-291
+CHANGELOG.md
+  s_5801a853f78e8a::t_b09bbbf7789d72 38-44
+README.md
+  s_5801a853f78e8a::t_9cc62642f58dd6 221-250
+crates/agent/src/lib.rs
+  s_5801a853f78e8a::t_099d3df6c060f9 44
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_4a75cdc89c19fa 1-2218
+crates/app/src/tui/shell.rs
+  s_5801a853f78e8a::t_268109b155bb41 32-34,1431-1459,4368-4420
+crates/app/tests/workflow_triggers.rs
+  s_5801a853f78e8a::t_d071cdf24a2eae 520-622
+crates/app/tests/wsl_operator_documentation.rs
+  s_5801a853f78e8a::t_9e4119be1167cb 95-213
+crates/domain/src/attempt.rs
+  s_5801a853f78e8a::t_fccbbab318f69f 413-416,421-454,499,508,545,2285,2303,2330-2333,2397-2420
+docs/spikes/rootless-oci-wsl-quota.md
+  s_5801a853f78e8a::t_e1f5316708b79e 1-243
+tests/managed-wsl-oci-acceptance.sh
+  s_5801a853f78e8a::t_9ea4e01d5415e6 1-232
+tests/managed-wsl-oci-reboot-acceptance.ps1
+  s_5801a853f78e8a::t_2ad09ce4838227 1-284
+tests/managed-wsl-oci-reboot-contract.ps1
+  s_5801a853f78e8a::t_9a251d5d1d9ab1 1-79
+tests/managed-wsl-oci-restart-acceptance.ps1
+  s_5801a853f78e8a::t_142a41510bdbbb 1-57
+tests/managed-wsl-oci-restart-acceptance.sh
+  s_5801a853f78e8a::t_68496c680e0991 1-238
+tests/native-linux-oci-acceptance.sh
+  s_5801a853f78e8a::t_584dc0ca3ff925 1-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "31268f0c55ae80d7814db0db1ffa6c9792ca4f20",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
