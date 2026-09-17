@@ -961,7 +961,7 @@ mod tests {
     }
 
     const LIVE_IMAGE_ENV: &str = "RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE";
-    const LIVE_HOST: u128 = 0xacc_e7a_ce00_0000_0000_0000_0000_0001;
+    const LIVE_HOST: u128 = 0x00ac_ce7a_ce00_0000_0000_0000_0000_0001;
     const LIVE_PACKAGE: &str = "runner-manager-oci-conflict";
 
     fn podman(args: &[&str]) -> std::process::Output {

@@ -55,6 +55,7 @@ cat > "$storage_conf" <<EOF
 driver = "overlay"
 runroot = "$run_root"
 graphroot = "$mount_point/graphroot"
+rootless_storage_path = "$mount_point/graphroot"
 
 [storage.options.overlay]
 mount_program = "/usr/bin/fuse-overlayfs"
@@ -77,8 +78,8 @@ info = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert info["host"]["security"]["rootless"] is True
 assert info["host"]["cgroupVersion"] == "v2"
 assert {"cpu", "memory", "pids"} <= set(info["host"]["cgroupControllers"])
-assert info["store"]["graphRoot"] == sys.argv[2]
-assert info["store"]["graphStatus"]["Backing Filesystem"] == "xfs"
+assert info["store"]["graphRoot"] == sys.argv[2], info["store"]
+assert info["store"]["graphStatus"]["Backing Filesystem"] == "xfs", info["store"]
 assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["uidmap"])
 assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["gidmap"])
 PY
