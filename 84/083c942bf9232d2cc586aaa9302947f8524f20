@@ -1,0 +1,36 @@
+.gitignore
+  s_5801a853f78e8a::t_24a951e8d06ecf 12
+scripts/windows-hyperv-acceptance.ps1
+  s_5801a853f78e8a::t_5b62f0d7b53133 422,425,530,556-560,568-573,616,623-625
+  s_5801a853f78e8a::t_ab0aa69348934d 493-494
+  s_5801a853f78e8a::t_ea3aa796ae78b3 1-27,30-68,70-115,118-122,124-131,158-242,245-258,260-265,267-331,333,342-407,409-421,429-436,441-491,502-503,506-507,512-522,531-555,561-567,574-583,585-595,602-612,627,629-635,640,647,654-669,676-690,693-715
+  s_5801a853f78e8a::t_37f4c3faa59cc8 28-29,69,132-149,151-157,243-244,259,332,334-341,408,437-440,492,636-639,641-646,651-653,670-671
+  s_5801a853f78e8a::t_ece6322a2ce20c 150,496-501,648-650
+  s_5801a853f78e8a::t_20fda078eef4fb 613-615,617-622,626,628,691-692
+  s_5801a853f78e8a::t_ac8ea3e48d6544 266,423-424,426-428,495,504-505,523-529,584
+  s_5801a853f78e8a::t_e0908f915780fc 116-117,123,508-511,596-601,672-675
+crates/app/tests/windows_hyperv_acceptance_harness.rs
+  s_5801a853f78e8a::t_ea3aa796ae78b3 1-38,44,48-51,56-87
+  s_5801a853f78e8a::t_abd7a6e1e3d7ab 39-43,45-47,52-55
+docs/windows-hyperv-native-acceptance.md
+  s_5801a853f78e8a::t_ea3aa796ae78b3 1-71
+.github/workflows/windows-hyperv-native-acceptance.yml
+  s_5801a853f78e8a::t_ea3aa796ae78b3 1-73,75-91
+  s_5801a853f78e8a::t_7344a566f99256 74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "84083c942bf9232d2cc586aaa9302947f8524f20",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
