@@ -1,0 +1,54 @@
+name: macOS VM native acceptance
+run-name: macos-vm-${{ github.event.label.name }}
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-vm-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  production-provider:
+    if: >-
+      github.event.pull_request.number == 79 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.label.name, 'rm-d3-')
+    runs-on: [self-hosted, macos, arm64, "${{ github.event.label.name }}"]
+    timeout-minutes: 20
+    steps:
+      - name: Attest the disposable native macOS guest
+        shell: bash
+        env:
+          ACCEPTANCE_ID: ${{ github.event.label.name }}
+          HOLD_SECONDS: ${{ startsWith(github.event.label.name, 'rm-d3-reboot-') && '900' || '180' }}
+        run: |
+          set -euo pipefail
+          [[ "$ACCEPTANCE_ID" =~ ^rm-d3-(reboot-)?[0-9]{14}-[0-9a-f]{8}$ ]]
+          [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS >= 60 && HOLD_SECONDS <= 900 ))
+          [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]]
+          cpu=$(sysctl -n hw.ncpu)
+          memory_mib=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+          process_limit=$(ulimit -u)
+          [[ $cpu -eq 2 && $memory_mib -eq 4096 && $process_limit -eq 512 ]]
+          [[ -z ${ACTIONS_RUNNER_INPUT_JITCONFIG:-} ]]
+          host_shares=$(mount | awk 'tolower($0) ~ /(virtiofs|shared.*host|host.*shared)/ { count++ } END { print count+0 }')
+          [[ $host_shares -eq 0 ]]
+          if ps eww -axo command | grep -E '[A]CTIONS_RUNNER_INPUT_JITCONFIG=|gh[pousr]_[A-Za-z0-9_]{20,}' >/dev/null; then
+            echo 'credential-shaped content survived in the guest process table' >&2
+            exit 1
+          fi
+          for root in "$RUNNER_TEMP" "$GITHUB_WORKSPACE"; do
+            if grep -RIE --binary-files=without-match --exclude='.credentials*' \
+              'ACTIONS_RUNNER_INPUT_JITCONFIG[[:space:]]*=|gh[pousr]_[A-Za-z0-9_]{20,}' "$root" >/dev/null 2>&1; then
+              echo "credential-shaped content survived under $root" >&2
+              exit 1
+            fi
+          done
+          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$ACCEPTANCE_ID"
+          sleep "$HOLD_SECONDS"
+          echo "RM_ACCEPTANCE completed id=$ACCEPTANCE_ID"

@@ -205,6 +205,15 @@ documents never include those recovery fields.
 
 ### Required guest bootstrap protocol
 
+The repository does **not** ship this guest program. The operator who prepares
+the pinned image must install a boot LaunchDaemon implementing the contract
+below and validate that image with the native acceptance harness. The shipped
+Swift executable is the host helper: it configures Virtualization.framework,
+owns VM resources and speaks RMV1 to the operator-provided guest component.
+Template registration records the operator's assertion that the bootstrap is
+present; only a real boot and acknowledgement can establish acceptance
+evidence.
+
 Virtualization.framework has CPU-count and memory-size configuration and a
 fixed-size disk attachment, but it has no process-tree limit. A template may
 set `bootstrap_ready: true` only when it contains a boot LaunchDaemon that
@@ -271,8 +280,58 @@ names the failing image in its remedy.
 
 Native support is a platform gate. Protocol unit tests cover ownership,
 recovery behavior, fresh disks, resource arguments, and secret transport on
-every development host, but release acceptance must separately exercise Intel
-and Apple Silicon Macs that the product declares supported.
+every development host, but release acceptance must exercise real Apple-silicon
+hardware, the only architecture on which this provider currently declares
+native macOS guests available. Intel CI remains a required fail-closed probe.
+
+### Reproducible native acceptance
+
+GitHub-hosted ARM64 macOS runners cannot perform this gate because nested
+virtualization is unavailable. Use a physical Apple-silicon Mac or a dedicated
+bare-metal Apple-silicon host. Install the signed helper and register the
+operator-prepared template first, build the PR's `runner-manager` release
+binary, authenticate its dedicated absolute `--data-dir`, export `GH_TOKEN` for
+the fixture repository (with pull-request and issue-label write plus Actions
+write permissions), then run the guarded phases:
+
+```sh
+common=(
+  --repository OWNER/REPO
+  --image 'vm-version:macos-15.1-arm64-v3@sha256:<digest>'
+  --data-dir /var/db/runner-manager-d3-acceptance/data
+  --runner-manager "$PWD/target/release/runner-manager"
+  --pull-request 79
+  --workflow-ref worktree-01a0ac40-2810-7021-8119-413dbbb9884a
+)
+
+sudo -E scripts/macos-vm-acceptance.sh audit "${common[@]}"
+sudo -E scripts/macos-vm-acceptance.sh run-job "${common[@]}" \
+  --allow-service-install --allow-profile --allow-service-restart
+sudo -E scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
+  --allow-profile
+# Reboot macOS manually. The harness never invokes a reboot command.
+sudo -E scripts/macos-vm-acceptance.sh verify-after-reboot "${common[@]}"
+sudo -E scripts/macos-vm-acceptance.sh recovery-forensics "${common[@]}"
+sudo -E scripts/macos-vm-acceptance.sh cleanup "${common[@]}" --allow-cleanup
+sudo -E scripts/macos-vm-acceptance.sh rollback "${common[@]}" --allow-rollback
+```
+
+`audit` refuses a non-ARM host, a virtual host where
+`VZVirtualMachine.isSupported` is false, a missing entitlement, non-APFS clone
+support, an incompatible digest-pinned template, an existing helper resource,
+or missing GitHub/product authentication. `run-job` requires exact 2 CPU, 4096
+MiB, template-sized disk and 512-process attestations, no host shares, a fresh
+writable-disk identity, guest secret scans, and launchd restart/adoption while
+the job is live. `prepare-before-reboot` creates a second fresh-disk identity
+and durable receipt. `verify-after-reboot` requires the boot epoch to advance,
+the boot LaunchDaemon to return, provider resources and capacity to reach zero,
+and host secret scans to pass. Cleanup and rollback require separate flags and
+act only on identities stored in the receipt. The harness creates, applies, and
+deletes a unique repository label for each job. That `pull_request:labeled`
+trigger is deliberate: GitHub does not register a new `workflow_dispatch`
+workflow from an unmerged PR, so a dispatch-only gate could not validate the PR
+before merge. The workflow is pinned to same-repository PR 79 and rejects every
+other event.
 
 The Swift CI jobs establish source compatibility on GitHub-hosted ARM64 and
 Intel machines. Native acceptance still requires an operator-signed helper, a

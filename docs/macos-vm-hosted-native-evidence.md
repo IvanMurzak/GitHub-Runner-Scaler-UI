@@ -28,8 +28,11 @@ hosted labels used by this repository rather than inferring availability from
 the runner label. Apple documents that property as the runtime availability
 check and requires a macOS restore image to obtain the supported hardware model
 used to install a bootable macOS VM. CI has neither an operator signing identity
-nor an operator-prepared, digest-pinned template containing this project's
-guest bootstrap. Downloading Apple's current restore image would still not
+nor an operator-prepared, digest-pinned template containing an operator-provided
+guest bootstrap that implements this repository's RMV1 contract. The repository
+ships the host helper and defines that wire/process-control contract; it does
+not ship a guest LaunchDaemon or claim that registering a manifest proves one
+is present. Downloading Apple's current restore image would still not
 supply that bootstrap and would introduce a large mutable network input, so CI
 does not download, repackage, cache, or redistribute a macOS image.
 
@@ -39,6 +42,16 @@ signing identity, and an Apple-authorized restore image used to prepare the
 pinned template. That run must boot the helper's real configuration and verify
 the virtio socket bootstrap, JIT erasure, process/resource limits, stop/destroy,
 reboot recovery, disk isolation, and secret forensics.
+
+The reproducible operator procedure is
+[`scripts/macos-vm-acceptance.sh`](../scripts/macos-vm-acceptance.sh). Its
+workflow uses the production provider and a one-time JIT runner, while the
+harness records exact helper metadata, kills and observes restart of a
+disposable boot LaunchDaemon, prepares a durable pre-reboot receipt, verifies a
+different host boot, checks orphan cleanup and capacity accounting, scans host
+and guest surfaces for credential-shaped content, and removes only resources
+whose ownership it can prove. The harness never reboots the host or downloads a
+restore image.
 
 Primary references:
 

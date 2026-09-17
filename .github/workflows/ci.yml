@@ -90,6 +90,9 @@ jobs:
       - name: Run Swift helper tests
         run: swift test --package-path native/macos-vm-helper
 
+      - name: Verify the native acceptance harness contract
+        run: bash tests/macos-vm-acceptance-contract.sh
+
       - name: Sign and execute the native host capability probe
         run: |
           set -euo pipefail
