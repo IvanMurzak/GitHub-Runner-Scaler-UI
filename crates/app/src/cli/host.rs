@@ -465,6 +465,7 @@ pub enum IsolationReadiness {
     Unsupported,
     PermissionDenied,
     ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
     Degraded,
 }
 
@@ -477,6 +478,7 @@ impl IsolationReadiness {
             Self::Unsupported => "unsupported",
             Self::PermissionDenied => "permission denied",
             Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
             Self::Degraded => "degraded",
         }
     }
@@ -512,6 +514,9 @@ pub(crate) const fn sanitize_isolation_observation(
         (_, IsolationReadiness::Ready) => None,
         (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => {
             Some("install and configure an OCI execution provider")
+        }
+        (IsolationBackend::Oci, IsolationReadiness::DiskQuotaUnavailable) => {
+            Some("configure the required bounded OCI storage quota")
         }
         (IsolationBackend::WindowsHyperVContainer, IsolationReadiness::Unsupported) => {
             Some("use a supported host and provider")
@@ -575,6 +580,7 @@ const fn readiness_from_provider_capability(capability: ProviderCapability) -> I
         ProviderCapability::ImageUnavailableOrIncompatible => {
             IsolationReadiness::ImageUnavailableOrIncompatible
         }
+        ProviderCapability::DiskQuotaUnavailable => IsolationReadiness::DiskQuotaUnavailable,
         ProviderCapability::Degraded => IsolationReadiness::Degraded,
     }
 }
@@ -932,6 +938,24 @@ mod tests {
                 .starts_with("use Windows 11 Pro or Enterprise")
         );
         assert!(!windows.to_string().contains("Education"));
+    }
+
+    #[test]
+    fn oci_disk_quota_refusal_remains_distinct_in_operator_status() {
+        assert_eq!(
+            readiness_from_provider_capability(ProviderCapability::DiskQuotaUnavailable),
+            IsolationReadiness::DiskQuotaUnavailable
+        );
+        let capability = sanitize_isolation_observation(IsolationObservation {
+            backend: IsolationBackend::Oci,
+            state: IsolationReadiness::DiskQuotaUnavailable,
+            raw_output: Some("untrusted runtime output"),
+        });
+        assert_eq!(capability.state.display_name(), "disk quota unavailable");
+        assert_eq!(
+            capability.remedy,
+            Some("configure the required bounded OCI storage quota")
+        );
     }
 
     fn budget_text(budget: &HostBudget) -> String {

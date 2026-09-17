@@ -29,7 +29,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
-use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
+use runner_manager_domain::attempt::{
+    AttemptOutcome, AttemptState, FailureReason, IsolationProviderFailure, RunnerAttempt,
+};
 use runner_manager_domain::model::{Org, OwnerRepo, ScaleTarget, StartMode};
 use runner_manager_domain::store::Store as _;
 use runner_manager_github::device_flow::DeviceFlow;
@@ -1426,6 +1428,35 @@ fn failure_remediation(reason: &FailureReason) -> &'static str {
         FailureReason::RegistrationTimedOut | FailureReason::TerminatedAfterRegistrationTimeout => {
             "Check this host's network, DNS, proxy, firewall, and GitHub authorization."
         }
+        FailureReason::IsolationProvider(category) => match category {
+            IsolationProviderFailure::Unsupported | IsolationProviderFailure::NotInstalled => {
+                "Install a supported rootless isolation runtime on this host."
+            }
+            IsolationProviderFailure::PermissionDenied => {
+                "Check rootless runtime permissions and subordinate UID/GID mappings."
+            }
+            IsolationProviderFailure::ImageUnavailableOrIncompatible => {
+                "Verify the pinned image digest and registry access."
+            }
+            IsolationProviderFailure::DiskQuotaUnavailable => {
+                "Provide rootless OCI storage that enforces a hard writable-layer disk quota."
+            }
+            IsolationProviderFailure::Degraded => {
+                "Restore the runtime, cgroup controllers, and Linux filesystem storage."
+            }
+            IsolationProviderFailure::RuntimeOperationFailed => {
+                "Inspect the rootless OCI runtime and its redacted local diagnostic."
+            }
+            IsolationProviderFailure::OwnershipMismatch => {
+                "Inspect the quarantined environment's ownership labels before cleanup."
+            }
+            IsolationProviderFailure::UnsafeRuntimePath => {
+                "Move the OCI runner runtime to the distribution's Linux filesystem."
+            }
+            IsolationProviderFailure::JitHandoffRejected => {
+                "Inspect the provider bootstrap; do not retry the one-time JIT handoff."
+            }
+        },
         FailureReason::Other(_) => "Inspect the local runner log and the copy-safe diagnostic.",
     }
 }
@@ -4332,6 +4363,59 @@ mod tests {
             rows.iter()
                 .any(|row| row.outcome == screens::ActivityOutcome::CleanupComplete)
         );
+    }
+
+    #[test]
+    fn isolation_failures_render_distinct_copy_safe_operator_guidance() {
+        use runner_manager_domain::model::{AttemptId, PolicyId};
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-23T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let policy = PolicyId::from_u128(7);
+        let categories = [
+            IsolationProviderFailure::NotInstalled,
+            IsolationProviderFailure::PermissionDenied,
+            IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            IsolationProviderFailure::DiskQuotaUnavailable,
+            IsolationProviderFailure::RuntimeOperationFailed,
+        ];
+        let attempts: Vec<_> = categories
+            .into_iter()
+            .enumerate()
+            .map(|(index, category)| {
+                let mut attempt = RunnerAttempt::allocate(
+                    AttemptId::from_u128(index as u128 + 1),
+                    policy,
+                    "isolated",
+                    at,
+                );
+                attempt
+                    .conclude(
+                        AttemptOutcome::failed(FailureReason::IsolationProvider(category)),
+                        at,
+                    )
+                    .unwrap();
+                attempt
+            })
+            .collect();
+        let targets = HashMap::from([(policy, "acme/repo".to_owned())]);
+        let rows = activity_rows(&attempts, &targets);
+        let failures: Vec<_> = rows
+            .iter()
+            .filter(|row| row.outcome == screens::ActivityOutcome::Failed)
+            .collect();
+        assert_eq!(failures.len(), categories.len());
+        let summaries: HashSet<_> = failures.iter().map(|row| row.summary.as_str()).collect();
+        let remediations: HashSet<_> = failures
+            .iter()
+            .map(|row| row.remediation.as_str())
+            .collect();
+        assert_eq!(summaries.len(), categories.len());
+        assert_eq!(remediations.len(), categories.len());
+        assert!(failures.iter().all(|row| {
+            !row.summary.contains("ghp_secret") && !row.remediation.contains("ghp_secret")
+        }));
     }
 
     #[test]

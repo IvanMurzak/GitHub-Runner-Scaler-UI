@@ -218,6 +218,36 @@ enabled until its execution provider reports ready; provider failure never start
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
 you explicitly accept that trust boundary.
 
+Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
+Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
+mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to
+an absolute Linux path for a root-owned, non-writable Podman-compatible storage helper.
+The helper contract is deliberately fail-closed:
+
+- every `--storage-opt size=Nm` probe and create is routed to a finite filesystem whose
+  writable capacity for that container is no larger than `N` MiB;
+- the helper owns slot allocation, serialization, ENOSPC recovery and orphan lookup for
+  every later Podman-compatible command; it never falls back to the ordinary unbounded
+  graph root;
+- `runtime --storage-opt size=Nm info --format=json` returns ordinary Podman info plus
+  `runnerManagerStorage` with schema `1`, mode `exclusive-filesystem-pool`,
+  `requestedMiB: N`, and `hardCap: true` only after checking the finite store; and
+- graph root, run root, helper and attempt runtime paths stay on the distribution's Linux
+  filesystems, never under `/mnt`.
+
+Missing or malformed attestation remains `DiskQuotaUnavailable`. An invalid, mutable,
+non-root-owned or DrvFS helper path is refused instead of falling back to `podman`. The
+disposable one-slot reference fixture in `tests/managed-wsl-oci-acceptance.sh` exercises
+this contract with real writes until `df` reports at most filesystem bookkeeping space
+and ext4 returns `ENOSPC`; a production helper may manage a larger pool but must preserve
+the same per-create hard bound and command routing. On Windows,
+`tests/managed-wsl-oci-restart-acceptance.ps1` terminates only the named distribution and
+checks that the remounted helper recovers exact-generation resources and durable journal
+leases without another JIT registration. The separate
+`tests/managed-wsl-oci-reboot-acceptance.ps1` uses explicit `prepare`,
+`verify-after-reboot`, and `cleanup` phases for an operator-driven full Windows reboot.
+It records Windows kernel boot evidence but contains no command that reboots Windows.
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh

@@ -1361,6 +1361,7 @@ const fn provider_capability_name(capability: ProviderCapability) -> &'static st
         ProviderCapability::NotInstalled => "not installed",
         ProviderCapability::PermissionDenied => "permission denied",
         ProviderCapability::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+        ProviderCapability::DiskQuotaUnavailable => "disk quota unavailable",
         ProviderCapability::Degraded => "degraded",
     }
 }

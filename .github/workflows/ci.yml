@@ -62,6 +62,42 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # d1's secret-free native Linux acceptance. The hosted Ubuntu VM uses
+  # passwordless sudo only to mount a disposable 1 GiB ext4 loop filesystem and
+  # install its immutable helper; Podman and the provider remain rootless. The
+  # helper routes every command into that finite store, so the production quota
+  # path and a real ENOSPC boundary are both exercised before any JIT exists.
+  oci-native-acceptance:
+    name: rootless OCI bounded-store acceptance (linux-x86_64, no JIT)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE: docker.io/library/ubuntu@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      # GitHub's documented passwordless sudo is used only to install the OCI
+      # packages and mount a disposable loopback ext4 filesystem. Every Podman
+      # command and the adapter under test run as the ordinary runner user.
+      - name: Install rootless Podman and bounded-store tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman uidmap slirp4netns fuse-overlayfs e2fsprogs
+          podman --version
+
+      - name: Run native bounded-store OCI acceptance without GitHub JIT secrets
+        run: bash tests/native-linux-oci-acceptance.sh
+
   check:
     name: check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
