@@ -2,8 +2,8 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1, a2, b1, b2, c1 and c2 merged into the
-integration ref; d1, d2 and d3 are held at green PRs for native acceptance.
+**Implementation status:** a1, a2, b1, b2, c1, c2 and d1 merged into the
+integration ref; d2 and d3 are held at green PRs for native acceptance.
 **Repository:** `.` / `main`.
 **Last updated:** 2026-09-15.
 
@@ -53,7 +53,7 @@ This file is the only live task-state record.
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
-| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / corrected full-reboot rerun pending | 2026-09-17 |
+| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / elevated client live-job gate + Server gate pending | 2026-09-17 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
@@ -279,3 +279,13 @@ operator-controlled bare-metal Apple Silicon Mac, APFS, the entitled signed
 helper and a digest-pinned Apple-authorized template containing that bootstrap;
 hosted macOS has no nested virtualization. Intel remains explicitly fail closed
 and is not a declared native macOS guest architecture.
+
+**2026-09-17 — d1 integrated after native acceptance.** A second physical
+Windows reboot advanced both CIM and Kernel-General boot identities from the
+prepared receipt. The managed WSL recovery fixture remounted its fixed 1 GiB
+ext4 store, adopted and destroyed all retained OCI resources, returned durable
+capacity and GitHub registrations to zero, and found the nonce absent from
+provider durable surfaces. Native Ubuntu, managed WSL, real ENOSPC, one-time
+GitHub JIT, WSL terminate/restart and full Windows reboot gates now all pass.
+PR #74 remained green at head 884c0e2 and was squash-merged into
+`runner-sandbox-isolation` at b8b8f92. d1 is complete.
