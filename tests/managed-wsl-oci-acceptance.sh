@@ -10,6 +10,12 @@ die() {
 grep -qi microsoft /proc/sys/kernel/osrelease || die "this harness requires WSL2"
 [[ "$(id -u)" -eq 0 ]] || die "run this harness as WSL root to provision the loop mount"
 
+acceptance_mode="${RUNNER_MANAGER_OCI_ACCEPTANCE_MODE:-synthetic}"
+case "$acceptance_mode" in
+  synthetic|github-jit) ;;
+  *) die "RUNNER_MANAGER_OCI_ACCEPTANCE_MODE must be synthetic or github-jit" ;;
+esac
+
 managed_user="${RUNNER_MANAGER_WSL_USER:-}"
 [[ -n "$managed_user" ]] || die "RUNNER_MANAGER_WSL_USER must name the managed rootless user"
 managed_uid="$(id -u "$managed_user")"
@@ -188,14 +194,37 @@ PY
 cd "$source_root"
 cargo_bin="$managed_home/.cargo/bin/cargo"
 [[ -x "$cargo_bin" ]] || cargo_bin="$(command -v cargo)"
-as_managed env \
-  TMPDIR="$tmp_root" \
-  CARGO_TARGET_DIR="$cargo_target" \
-  RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
-  RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE="$RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE" \
-  "$cargo_bin" test -p runner-manager-agent \
-    'oci::tests::live_rootless_managed_wsl_bounded_acceptance' -- \
-    --ignored --exact --nocapture
+if [[ "$acceptance_mode" == github-jit ]]; then
+  : "${RUNNER_MANAGER_OCI_JIT_RUNNER_URL:?runner package URL is required in github-jit mode}"
+  : "${RUNNER_MANAGER_OCI_JIT_RUNNER_SHA256:?runner package SHA-256 is required in github-jit mode}"
+  runner_archive="$fixture/actions-runner.tar.gz"
+  runner_dir="$fixture/actions-runner"
+  as_managed curl --fail --location --silent --show-error \
+    "$RUNNER_MANAGER_OCI_JIT_RUNNER_URL" --output "$runner_archive"
+  printf '%s  %s\n' "$RUNNER_MANAGER_OCI_JIT_RUNNER_SHA256" "$runner_archive" | sha256sum --check --status ||
+    die "runner package checksum did not match"
+  install -d -m 0700 -o "$managed_uid" -g "$managed_gid" "$runner_dir"
+  as_managed tar -xzf "$runner_archive" -C "$runner_dir"
+  rm -f "$runner_archive"
+  as_managed env \
+    TMPDIR="$tmp_root" \
+    CARGO_TARGET_DIR="$cargo_target" \
+    RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
+    RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE="$RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE" \
+    RUNNER_MANAGER_OCI_JIT_RUNNER_DIR="$runner_dir" \
+    "$cargo_bin" test -p runner-manager-agent \
+      'oci::tests::live_rootless_github_jit_acceptance' -- \
+      --ignored --exact --nocapture
+else
+  as_managed env \
+    TMPDIR="$tmp_root" \
+    CARGO_TARGET_DIR="$cargo_target" \
+    RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
+    RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE="$RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE" \
+    "$cargo_bin" test -p runner-manager-agent \
+      'oci::tests::live_rootless_managed_wsl_bounded_acceptance' -- \
+      --ignored --exact --nocapture
+fi
 
 remaining="$(as_managed "$runtime_helper" ps --all --quiet)"
 [[ -z "$remaining" ]] || die "acceptance containers survived cleanup: $remaining"

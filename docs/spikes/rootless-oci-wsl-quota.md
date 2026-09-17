@@ -90,6 +90,24 @@ managed-WSL container-boundary gate through the production prepare/start path.
 It does not claim a GitHub runner job or reboot continuity; those require JIT
 fixture secrets and a reboot-resumable host.
 
+## One-time live JIT acceptance
+
+PR 74 also carries a temporary, label-gated workflow and a live mode in the
+managed-WSL harness. The workflow only queues for same-repository pull request
+74 when label `d1-live-jit-pr74-20260916` is added, and its job requires that
+unique self-hosted label. Removing the label leaves future pushes unable to
+queue the job.
+
+The operator generates one repository JIT configuration with the unique label
+and pipes only `encoded_jit_config` to the harness's stdin. The harness verifies
+a SHA-256-pinned Actions runner package, keeps its extracted bytes on the WSL
+Linux filesystem, and exercises production `OciProcesses::prepare` and
+`OciProcesses::start`. The workflow checks out the PR and writes package,
+process, and filesystem markers. The Rust acceptance scans container inspect,
+process environments, logs, image history, and the stopped writable layer for
+the JIT value before destroying the container. Neither the value nor an API
+token is written to an argument, environment variable, log, or evidence file.
+
 ## GitHub-hosted native Linux acceptance
 
 CI run `35170389901` exercised the secret-free native fixture on GitHub's

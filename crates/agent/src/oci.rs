@@ -1413,6 +1413,73 @@ mod tests {
         );
     }
 
+    fn wait_for_container_file(environment_id: &str, path: &str, deadline: Instant) -> bool {
+        loop {
+            if podman(&["exec", environment_id, "test", "-f", path])
+                .status
+                .success()
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    fn assert_live_jit_absent(environment_id: &str, image: &ImageReference, jit: &str) {
+        let inspect = podman_ok(&["container", "inspect", environment_id]);
+        assert!(
+            !inspect.contains(jit),
+            "JIT reached container inspect metadata"
+        );
+
+        let top = podman(&["top", environment_id, "pid,args"]);
+        assert!(top.status.success(), "container process listing failed");
+        assert!(
+            !top.stdout
+                .windows(jit.len())
+                .any(|window| window == jit.as_bytes()),
+            "JIT reached the container process listing"
+        );
+
+        let environments = podman(&[
+            "exec",
+            environment_id,
+            "sh",
+            "-c",
+            "for p in /proc/[0-9]*/environ; do cat \"$p\" 2>/dev/null || true; done",
+        ]);
+        assert!(
+            environments.status.success(),
+            "container environment scan failed"
+        );
+        assert!(
+            !environments
+                .stdout
+                .windows(jit.len())
+                .any(|window| window == jit.as_bytes()),
+            "JIT survived in a container process environment"
+        );
+
+        let logs = podman(&["logs", environment_id]);
+        assert!(
+            !logs
+                .stdout
+                .windows(jit.len())
+                .any(|window| window == jit.as_bytes())
+        );
+        assert!(
+            !logs
+                .stderr
+                .windows(jit.len())
+                .any(|window| window == jit.as_bytes())
+        );
+        let history = podman_ok(&["history", "--no-trunc", image.as_str()]);
+        assert!(!history.contains(jit), "JIT reached image history");
+    }
+
     fn stop_and_destroy(provider: &OciProcesses, attempt: &RunnerAttempt) {
         assert_eq!(provider.stop(attempt).unwrap(), ProviderStop::Stopped);
         assert_eq!(
@@ -1631,6 +1698,115 @@ mod tests {
     #[ignore = "requires the managed-WSL bounded-storage helper fixture"]
     fn live_rootless_managed_wsl_bounded_acceptance() {
         run_live_rootless_acceptance(true);
+    }
+
+    #[test]
+    #[ignore = "requires a queued same-repository Actions job and a real JIT config on stdin"]
+    fn live_rootless_github_jit_acceptance() {
+        let image = ImageReference::new(
+            std::env::var(LIVE_IMAGE_ENV)
+                .unwrap_or_else(|_| panic!("{LIVE_IMAGE_ENV} must name a pinned image digest")),
+        )
+        .unwrap();
+        let runner_root = PathBuf::from(
+            std::env::var("RUNNER_MANAGER_OCI_JIT_RUNNER_DIR")
+                .expect("RUNNER_MANAGER_OCI_JIT_RUNNER_DIR must name the extracted runner package"),
+        );
+        assert!(runner_root.is_absolute());
+        assert!(!runner_root.starts_with("/mnt"));
+        assert!(runner_root.join("bin/Runner.Listener").is_file());
+
+        let mut jit = String::new();
+        std::io::stdin()
+            .read_to_string(&mut jit)
+            .expect("JIT stdin could not be read");
+        while matches!(jit.as_bytes().last(), Some(b'\n' | b'\r')) {
+            jit.pop();
+        }
+        assert!(!jit.is_empty(), "JIT stdin was empty");
+        assert!(
+            jit.len() <= 64 * 1024,
+            "JIT stdin exceeded the provider limit"
+        );
+        assert!(
+            !jit.bytes()
+                .any(|byte| byte == b'\n' || byte == b'\r' || byte == 0),
+            "JIT stdin contained a forbidden delimiter"
+        );
+
+        let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
+        let policy = isolated_policy(image.clone());
+        assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
+        let resolution = provider.resolve(&policy).unwrap().unwrap();
+        assert_eq!(resolution.provider_kind, Backend::Oci);
+        assert_eq!(resolution.image, image);
+
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runner_root,
+            FakeClock::default().now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "github-jit".into(),
+            })
+            .unwrap();
+        let prepared = provider.prepare(&attempt, &policy).unwrap();
+        let EnvironmentIdentity::Isolated { environment_id, .. } =
+            prepared.identity().cloned().expect("isolated identity")
+        else {
+            panic!("OCI prepare returned a native identity")
+        };
+        attempt
+            .prepared_environment(environment_id.clone())
+            .unwrap();
+        let config = EncodedJitConfig::new(std::mem::take(&mut jit));
+        provider
+            .start(prepared, &attempt, OneTimeJitHandoff::new(&config))
+            .unwrap();
+
+        let started = wait_for_container_file(
+            &environment_id,
+            "/tmp/runner-manager-actions-job-started",
+            Instant::now() + Duration::from_secs(300),
+        );
+        assert!(
+            started,
+            "the queued Actions job was not claimed within five minutes"
+        );
+        assert_live_jit_absent(&environment_id, &image, config.expose());
+
+        let completed = wait_for_container_file(
+            &environment_id,
+            "/tmp/runner-manager-actions-job-complete",
+            Instant::now() + Duration::from_secs(600),
+        );
+        assert!(
+            completed,
+            "the Actions marker step did not complete within ten minutes"
+        );
+        let exit_deadline = Instant::now() + Duration::from_secs(120);
+        while provider.inspect(&attempt).unwrap() != EnvironmentState::Exited {
+            assert!(
+                Instant::now() < exit_deadline,
+                "the one-time runner did not exit after its job"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_export_excludes(&environment_id, config.expose());
+        assert_eq!(
+            provider.destroy(&attempt).unwrap(),
+            ProviderDestroy::Destroyed
+        );
+        assert_eq!(
+            provider.inspect(&attempt).unwrap(),
+            EnvironmentState::Missing
+        );
+        eprintln!("live GitHub JIT job completed through the OCI provider; evidence is redacted");
     }
 
     #[test]

@@ -555,6 +555,57 @@ fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
 }
 
 #[test]
+fn live_oci_jit_workflow_is_same_repo_label_gated_and_unique() {
+    let source = read_workflow("d1-live-jit-acceptance.yml");
+    assert_eq!(triggers(&source), vec!["pull_request".to_string()]);
+    assert_eq!(
+        inline_list_at(&source, &["on", "pull_request", "types"]),
+        Some(vec!["labeled".to_string()])
+    );
+    for required in [
+        "github.event.pull_request.number == 74",
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "github.event.label.name == 'd1-live-jit-pr74-20260916'",
+        "runs-on: [self-hosted, linux, x64, d1-live-jit-pr74-20260916]",
+        "uses: actions/checkout@v7",
+        "touch /tmp/runner-manager-actions-job-complete",
+    ] {
+        assert!(
+            source.contains(required),
+            "the temporary live JIT workflow no longer contains `{required}`"
+        );
+    }
+    for forbidden in ["pull_request_target", "encoded_jit_config", "secrets."] {
+        assert!(
+            !source.contains(forbidden),
+            "the temporary live JIT workflow contains forbidden text `{forbidden}`"
+        );
+    }
+
+    let harness = std::fs::read_to_string(
+        workflow_path("d1-live-jit-acceptance.yml")
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("managed-wsl-oci-acceptance.sh"),
+    )
+    .expect("managed WSL OCI harness must be readable");
+    for required in [
+        "RUNNER_MANAGER_OCI_ACCEPTANCE_MODE:-synthetic",
+        "RUNNER_MANAGER_OCI_JIT_RUNNER_SHA256",
+        "oci::tests::live_rootless_github_jit_acceptance",
+        "--ignored --exact --nocapture",
+    ] {
+        assert!(
+            harness.contains(required),
+            "the live JIT harness no longer contains `{required}`"
+        );
+    }
+}
+
+#[test]
 fn e2e_workflow_has_no_release_trigger_and_runs_when_ci_runs() {
     let source = read_workflow("e2e.yml");
 
