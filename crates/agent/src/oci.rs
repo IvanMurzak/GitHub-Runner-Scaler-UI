@@ -1779,6 +1779,17 @@ mod tests {
             "the queued Actions job was not claimed within five minutes"
         );
         assert_live_jit_absent(&environment_id, &image, config.expose());
+        assert!(
+            podman(&[
+                "exec",
+                &environment_id,
+                "touch",
+                "/tmp/runner-manager-provider-inspected",
+            ])
+            .status
+            .success(),
+            "could not release the Actions job after provider-side inspection"
+        );
 
         let completed = wait_for_container_file(
             &environment_id,

@@ -568,6 +568,7 @@ fn live_oci_jit_workflow_is_same_repo_label_gated_and_unique() {
         "github.event.label.name == 'd1-live-jit-pr74-20260916'",
         "runs-on: [self-hosted, linux, x64, d1-live-jit-pr74-20260916]",
         "uses: actions/checkout@v7",
+        "test ! -f /tmp/runner-manager-provider-inspected || exit 0",
         "touch /tmp/runner-manager-actions-job-complete",
     ] {
         assert!(

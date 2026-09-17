@@ -25,6 +25,12 @@ jobs:
           set -euo pipefail
           test "${RUNNER_ENVIRONMENT:-}" = self-hosted
           touch /tmp/runner-manager-actions-job-started
+          for _ in $(seq 1 60); do
+            test ! -f /tmp/runner-manager-provider-inspected || exit 0
+            sleep 1
+          done
+          echo 'provider-side inspection did not complete' >&2
+          exit 1
 
       - name: Check out the pull request
         uses: actions/checkout@v7
