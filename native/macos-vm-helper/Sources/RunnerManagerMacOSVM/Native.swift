@@ -183,7 +183,9 @@ func launchSupervisor(store: Store, record: EnvironmentRecord, jit: inout Data) 
     var starting = record
     starting.state = .booting
     try store.writeRecord(starting)
-    let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    guard let executable = Bundle.main.executableURL else {
+        throw HelperFailure.degraded("helper executable path is unavailable")
+    }
     let process = Process()
     process.executableURL = executable
     process.arguments = ["--internal-supervise", record.environmentId, record.supervisorToken]
