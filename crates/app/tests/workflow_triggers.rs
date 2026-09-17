@@ -525,7 +525,7 @@ fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
     for required in [
         "if: github.event_name == 'pull_request'",
         "runs-on: ubuntu-24.04",
-        "name: rootless OCI native acceptance (linux-x86_64, no JIT)",
+        "name: rootless OCI native acceptance (linux-x86_64, quota preflight, no JIT)",
         "run: bash tests/native-linux-oci-acceptance.sh",
     ] {
         assert!(

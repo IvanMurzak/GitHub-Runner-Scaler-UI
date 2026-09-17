@@ -69,7 +69,7 @@ jobs:
   # inputs are absent. This job therefore proves the provider/runtime boundary,
   # not demand-to-job completion or reboot continuity.
   oci-native-acceptance:
-    name: rootless OCI native acceptance (linux-x86_64, no JIT)
+    name: rootless OCI native acceptance (linux-x86_64, quota preflight, no JIT)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30

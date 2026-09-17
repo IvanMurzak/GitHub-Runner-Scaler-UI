@@ -84,9 +84,15 @@ assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["uidmap"
 assert any(item["size"] >= 65536 for item in info["host"]["idMappings"]["gidmap"])
 PY
 
-# This is the same pre-JIT hard-cap probe the adapter executes. Do not proceed
-# to an unbounded substitute if the installed runtime cannot enforce it.
-podman --storage-opt size=1024m info --format json >/dev/null
+# Rootless Podman cannot create the block-device node containers/storage uses
+# for project quotas. The Rust acceptance requires the production adapter to
+# classify that real pre-JIT refusal as DiskQuotaUnavailable. It then exercises
+# the remaining lifecycle on this 6 GiB loopback store, whose filesystem size
+# supplies an independent host-enforced upper bound without pretending that it
+# meets the required per-container 1 GiB cap.
+if podman --storage-opt size=1024m info --format json >/dev/null 2>&1; then
+  die "Podman unexpectedly accepted rootless project quotas; update the acceptance to run the full provider prepare path"
+fi
 
 cargo test -p runner-manager-agent \
   'oci::tests::live_rootless_native_acceptance' -- \

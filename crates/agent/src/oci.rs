@@ -1054,7 +1054,7 @@ mod tests {
         policy
     }
 
-    fn prepare_live_attempt(
+    fn prepare_structural_attempt(
         provider: &OciProcesses,
         policy: &ScalePolicy,
         image: &ImageReference,
@@ -1085,12 +1085,71 @@ mod tests {
                 generation: generation.into(),
             })
             .unwrap();
-        let prepared = provider.prepare(&attempt, policy).unwrap();
-        let EnvironmentIdentity::Isolated { environment_id, .. } =
-            prepared.identity().cloned().expect("isolated identity")
-        else {
-            panic!("OCI prepare returned a native identity")
+        let ExecutionPolicy::Isolated { resources, .. } = policy.execution_policy() else {
+            panic!("structural acceptance needs an isolated policy")
         };
+        let name = format!("rm-{}-{}", attempt.id, generation);
+        let cpu = format!("{:.3}", f64::from(resources.cpu_millis) / 1000.0);
+        let memory = format!("{}m", resources.memory_mib);
+        let host_label = format!("{HOST_LABEL}={}", provider.host);
+        let attempt_label = format!("{ATTEMPT_LABEL}={}", attempt.id);
+        let generation_label = format!("{GENERATION_LABEL}={generation}");
+        let image_label = format!("{IMAGE_LABEL}={}", image.as_str());
+        // Rootless Podman cannot initialize XFS project quotas because project
+        // IDs are not namespaced and an unprivileged user cannot create the
+        // backing block-device node. The acceptance first proves the production
+        // provider refuses that missing hard cap. This second, explicitly
+        // structural fixture omits only --storage-opt so the remaining real
+        // container boundary can still be measured on the hard-bounded loop FS.
+        let environment_id = provider
+            .output(&[
+                "create",
+                "--interactive",
+                "--name",
+                &name,
+                "--pull=never",
+                "--entrypoint=sh",
+                "--log-driver=none",
+                "--image-volume=ignore",
+                "--http-proxy=false",
+                "--userns=keep-id",
+                "--user=0",
+                "--cap-drop=all",
+                "--cap-add=CHOWN",
+                "--cap-add=SETUID",
+                "--cap-add=SETGID",
+                "--cap-add=DAC_OVERRIDE",
+                "--cap-add=FOWNER",
+                "--security-opt=no-new-privileges",
+                "--network=slirp4netns",
+                "--pids-limit=128",
+                "--cpus",
+                &cpu,
+                "--memory",
+                &memory,
+                "--label",
+                &host_label,
+                "--label",
+                &attempt_label,
+                "--label",
+                &generation_label,
+                "--label",
+                &image_label,
+                image.as_str(),
+                "-c",
+                BOOTSTRAP,
+            ])
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(!environment_id.is_empty());
+        let source = format!("{}/.", attempt.runtime_path().display());
+        let destination = format!("{environment_id}:/runner");
+        provider.status(&["cp", &source, &destination]).unwrap();
+        let identity = provider
+            .isolated_identity(&attempt, environment_id.clone())
+            .unwrap();
+        let prepared = PreparedEnvironment::isolated(attempt.id, identity);
         (runtime, attempt, prepared, environment_id)
     }
 
@@ -1243,10 +1302,16 @@ mod tests {
         let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
         let policy = isolated_policy(image.clone());
 
-        assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
-        let resolution = provider.resolve(&policy).unwrap().unwrap();
-        assert_eq!(resolution.provider_kind, Backend::Oci);
-        assert_eq!(resolution.image, image);
+        assert_eq!(
+            provider.probe(&policy),
+            ProviderCapability::DiskQuotaUnavailable
+        );
+        assert_eq!(
+            provider.resolve(&policy),
+            Err(ProviderCapability::DiskQuotaUnavailable.refusal()),
+            "the production provider must fail before image allocation or JIT"
+        );
+        provider.image_ready(&image).unwrap();
         assert!(
             !Command::new("dpkg-query")
                 .args(["-W", LIVE_PACKAGE])
@@ -1257,7 +1322,7 @@ mod tests {
         );
 
         let (_runtime_one, mut one, prepared_one, id_one) =
-            prepare_live_attempt(&provider, &policy, &image, Some("1.0"), "native-one");
+            prepare_structural_attempt(&provider, &policy, &image, Some("1.0"), "native-one");
         let sentinel_one = "rm-jit-sentinel-native-one-8eeb09c26b8a";
         start_live_attempt(&provider, &mut one, prepared_one, &id_one, sentinel_one);
         inspect_controls(&id_one, &image, sentinel_one);
@@ -1280,7 +1345,7 @@ mod tests {
         );
 
         let (_runtime_two, mut two, prepared_two, id_two) =
-            prepare_live_attempt(&provider, &policy, &image, Some("2.0"), "native-two");
+            prepare_structural_attempt(&provider, &policy, &image, Some("2.0"), "native-two");
         let sentinel_two = "rm-jit-sentinel-native-two-62b2db40633b";
         start_live_attempt(&provider, &mut two, prepared_two, &id_two, sentinel_two);
         inspect_controls(&id_two, &image, sentinel_two);
@@ -1305,27 +1370,26 @@ mod tests {
         assert_export_excludes(&id_one, sentinel_one);
         assert_export_excludes(&id_two, sentinel_two);
 
-        // The policy's minimum 1 GiB writable-layer quota must be enforced,
-        // rather than merely accepted as a create option.
+        // The loopback store is a real hard upper bound even though rootless
+        // Podman cannot divide it into the policy's required per-container
+        // project quotas. This must fail quickly without consuming 7 GiB.
         let exhaustion = podman(&[
             "exec",
             &id_one,
-            "dd",
-            "if=/dev/zero",
-            "of=/quota-fill",
-            "bs=1M",
-            "count=1100",
-            "status=none",
+            "fallocate",
+            "-l",
+            "7G",
+            "/backing-store-cap",
         ]);
         assert!(
             !exhaustion.status.success(),
-            "the 1 GiB writable-layer hard cap allowed a 1.1 GiB file"
+            "the 6 GiB backing-store hard cap allowed a 7 GiB allocation"
         );
         stop_and_destroy(&provider, &one);
         stop_and_destroy(&provider, &two);
 
         let (_runtime_fresh, mut fresh, prepared_fresh, id_fresh) =
-            prepare_live_attempt(&provider, &policy, &image, None, "native-fresh");
+            prepare_structural_attempt(&provider, &policy, &image, None, "native-fresh");
         start_live_attempt(
             &provider,
             &mut fresh,
@@ -1358,7 +1422,7 @@ mod tests {
         // orphan; after the durable identity is restored, normal destroy owns
         // and removes it.
         let (_runtime_orphan, mut orphan, prepared_orphan, orphan_id) =
-            prepare_live_attempt(&provider, &policy, &image, None, "native-orphan");
+            prepare_structural_attempt(&provider, &policy, &image, None, "native-orphan");
         assert_eq!(
             provider.recover(&orphan).unwrap(),
             EnvironmentState::Starting
