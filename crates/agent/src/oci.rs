@@ -789,9 +789,13 @@ mod boundary_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use runner_manager_domain::execution::ResourceLimits;
     use runner_manager_domain::model::Clock;
     use runner_manager_testkit::{clock::FakeClock, fixtures};
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     fn fixture(info: &str) -> (tempfile::TempDir, OciProcesses) {
         fixture_with_quota(info, true)
@@ -954,6 +958,437 @@ mod tests {
             .unwrap();
         assert!(matches!(identity, EnvironmentIdentity::NativeProcess(_)));
         provider.stop(&attempt).unwrap();
+    }
+
+    const LIVE_IMAGE_ENV: &str = "RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE";
+    const LIVE_HOST: u128 = 0xacc_e7a_ce00_0000_0000_0000_0000_0001;
+    const LIVE_PACKAGE: &str = "runner-manager-oci-conflict";
+
+    fn podman(args: &[&str]) -> std::process::Output {
+        Command::new("podman")
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("podman {args:?} did not execute: {error}"))
+    }
+
+    fn podman_ok(args: &[&str]) -> String {
+        let output = podman(args);
+        assert!(
+            output.status.success(),
+            "podman {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("podman emitted UTF-8")
+    }
+
+    fn write_listener(runtime: &Path) {
+        let bin = runtime.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let listener = bin.join("Runner.Listener");
+        // The real runner consumes the same environment variable. This fixture
+        // proves the provider's stdin-to-bootstrap handoff, then removes it
+        // before the long-lived child exists so the sentinel is not retained
+        // in the process environment or writable layer.
+        std::fs::write(
+            &listener,
+            "#!/bin/sh\n\
+             test -n \"${ACTIONS_RUNNER_INPUT_JITCONFIG:-}\" || exit 70\n\
+             unset ACTIONS_RUNNER_INPUT_JITCONFIG\n\
+             : > /tmp/runner-manager-jit-received\n\
+             exec sleep 600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&listener, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn build_conflicting_package(runtime: &Path, version: &str) -> PathBuf {
+        let root = runtime.join(format!("package-{version}"));
+        let debian = root.join("DEBIAN");
+        let bin = root.join("usr/local/bin");
+        std::fs::create_dir_all(&debian).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            debian.join("control"),
+            format!(
+                "Package: {LIVE_PACKAGE}\nVersion: {version}\nArchitecture: all\n\
+                 Maintainer: Runner Manager acceptance <nobody@example.invalid>\n\
+                 Description: isolated package database acceptance fixture\n"
+            ),
+        )
+        .unwrap();
+        let tool = bin.join("runner-manager-conflict");
+        std::fs::write(&tool, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let package = runtime.join("conflict.deb");
+        let output = Command::new("dpkg-deb")
+            .args(["--build", "--root-owner-group"])
+            .arg(&root)
+            .arg(&package)
+            .output()
+            .expect("dpkg-deb must be installed by the native acceptance job");
+        assert!(
+            output.status.success(),
+            "dpkg-deb failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        package
+    }
+
+    fn isolated_policy(image: ImageReference) -> ScalePolicy {
+        let mut policy = fixtures::policy()
+            .repository("octo/oci-native-acceptance")
+            .autoscale("isolated", 3)
+            .active()
+            .build();
+        policy
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image,
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 512,
+                    disk_mib: 1024,
+                },
+            })
+            .unwrap();
+        policy
+    }
+
+    fn prepare_live_attempt(
+        provider: &OciProcesses,
+        policy: &ScalePolicy,
+        image: &ImageReference,
+        version: Option<&str>,
+        generation: &str,
+    ) -> (
+        tempfile::TempDir,
+        RunnerAttempt,
+        PreparedEnvironment,
+        String,
+    ) {
+        let runtime = tempfile::tempdir().unwrap();
+        write_listener(runtime.path());
+        if let Some(version) = version {
+            build_conflicting_package(runtime.path(), version);
+        }
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            runtime.path(),
+            FakeClock::default().now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: generation.into(),
+            })
+            .unwrap();
+        let prepared = provider.prepare(&attempt, policy).unwrap();
+        let EnvironmentIdentity::Isolated { environment_id, .. } =
+            prepared.identity().cloned().expect("isolated identity")
+        else {
+            panic!("OCI prepare returned a native identity")
+        };
+        (runtime, attempt, prepared, environment_id)
+    }
+
+    fn start_live_attempt(
+        provider: &OciProcesses,
+        attempt: &mut RunnerAttempt,
+        prepared: PreparedEnvironment,
+        environment_id: &str,
+        sentinel: &str,
+    ) {
+        attempt
+            .prepared_environment(environment_id.to_owned())
+            .unwrap();
+        let config = EncodedJitConfig::new(sentinel);
+        provider
+            .start(prepared, attempt, OneTimeJitHandoff::new(&config))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let received = podman(&[
+                "exec",
+                environment_id,
+                "test",
+                "-f",
+                "/tmp/runner-manager-jit-received",
+            ]);
+            if received.status.success() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "listener did not consume JIT");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn inspect_controls(environment_id: &str, image: &ImageReference, sentinel: &str) {
+        let raw = podman_ok(&["container", "inspect", environment_id]);
+        assert!(
+            !raw.contains(sentinel),
+            "JIT sentinel reached inspect metadata"
+        );
+        assert!(!raw.contains("/run/podman/podman.sock"));
+        assert!(!raw.contains("/var/run/docker.sock"));
+        let inspect: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let item = &inspect[0];
+        assert_eq!(
+            item.pointer("/Mounts")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(
+            item.pointer("/HostConfig/Devices")
+                .is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty)),
+            "host devices were attached: {}",
+            item["HostConfig"]["Devices"]
+        );
+        assert!(
+            item.pointer("/HostConfig/Binds")
+                .is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty)),
+            "host bind mounts were attached: {}",
+            item["HostConfig"]["Binds"]
+        );
+        assert_eq!(item["HostConfig"]["PidsLimit"].as_i64(), Some(128));
+        assert_eq!(
+            item["HostConfig"]["Memory"].as_u64(),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            item["Config"]["Labels"][IMAGE_LABEL].as_str(),
+            Some(image.as_str())
+        );
+        let command = item["Config"]["CreateCommand"]
+            .as_array()
+            .expect("Podman records create command");
+        for forbidden in ["--device", "--mount", "--volume", "-v", "--privileged"] {
+            assert!(
+                !command.iter().any(|part| part.as_str() == Some(forbidden)),
+                "forbidden create option {forbidden} was present"
+            );
+        }
+        let socket_check = podman(&[
+            "exec",
+            environment_id,
+            "sh",
+            "-c",
+            "test ! -S /run/podman/podman.sock && test ! -S /var/run/docker.sock",
+        ]);
+        assert!(
+            socket_check.status.success(),
+            "a host runtime socket is visible"
+        );
+        let logs = podman(&["logs", environment_id]);
+        assert!(!String::from_utf8_lossy(&logs.stdout).contains(sentinel));
+        assert!(!String::from_utf8_lossy(&logs.stderr).contains(sentinel));
+        let history = podman_ok(&["history", "--no-trunc", image.as_str()]);
+        assert!(
+            !history.contains(sentinel),
+            "JIT sentinel reached image history"
+        );
+    }
+
+    fn assert_export_excludes(environment_id: &str, sentinel: &str) {
+        let mut child = Command::new("podman")
+            .args(["export", environment_id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("podman export starts");
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "podman export failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !bytes
+                .windows(sentinel.len())
+                .any(|window| window == sentinel.as_bytes()),
+            "JIT sentinel reached the container root filesystem"
+        );
+    }
+
+    fn stop_and_destroy(provider: &OciProcesses, attempt: &RunnerAttempt) {
+        assert_eq!(provider.stop(attempt).unwrap(), ProviderStop::Stopped);
+        assert_eq!(
+            provider.destroy(attempt).unwrap(),
+            ProviderDestroy::Destroyed
+        );
+        assert_eq!(
+            provider.inspect(attempt).unwrap(),
+            EnvironmentState::Missing
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the CI-provisioned native rootless Podman/XFS project-quota fixture"]
+    fn live_rootless_native_acceptance() {
+        let image = ImageReference::new(
+            std::env::var(LIVE_IMAGE_ENV)
+                .unwrap_or_else(|_| panic!("{LIVE_IMAGE_ENV} must name a pinned image digest")),
+        )
+        .unwrap();
+        let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
+        let policy = isolated_policy(image.clone());
+
+        assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
+        let resolution = provider.resolve(&policy).unwrap().unwrap();
+        assert_eq!(resolution.provider_kind, Backend::Oci);
+        assert_eq!(resolution.image, image);
+        assert!(
+            !Command::new("dpkg-query")
+                .args(["-W", LIVE_PACKAGE])
+                .status()
+                .unwrap()
+                .success(),
+            "acceptance package unexpectedly exists on the host"
+        );
+
+        let (_runtime_one, mut one, prepared_one, id_one) =
+            prepare_live_attempt(&provider, &policy, &image, Some("1.0"), "native-one");
+        let sentinel_one = "rm-jit-sentinel-native-one-8eeb09c26b8a";
+        start_live_attempt(&provider, &mut one, prepared_one, &id_one, sentinel_one);
+        inspect_controls(&id_one, &image, sentinel_one);
+        podman_ok(&["exec", &id_one, "dpkg", "-i", "/runner/conflict.deb"]);
+        assert_eq!(
+            podman_ok(&[
+                "exec",
+                &id_one,
+                "dpkg-query",
+                "-W",
+                "-f=${Version}",
+                LIVE_PACKAGE,
+            ])
+            .trim(),
+            "1.0"
+        );
+        assert_eq!(
+            podman_ok(&["exec", &id_one, "/usr/local/bin/runner-manager-conflict"]).trim(),
+            "1.0"
+        );
+
+        let (_runtime_two, mut two, prepared_two, id_two) =
+            prepare_live_attempt(&provider, &policy, &image, Some("2.0"), "native-two");
+        let sentinel_two = "rm-jit-sentinel-native-two-62b2db40633b";
+        start_live_attempt(&provider, &mut two, prepared_two, &id_two, sentinel_two);
+        inspect_controls(&id_two, &image, sentinel_two);
+        podman_ok(&["exec", &id_two, "dpkg", "-i", "/runner/conflict.deb"]);
+        assert_eq!(
+            podman_ok(&[
+                "exec",
+                &id_two,
+                "dpkg-query",
+                "-W",
+                "-f=${Version}",
+                LIVE_PACKAGE,
+            ])
+            .trim(),
+            "2.0"
+        );
+        assert_eq!(
+            podman_ok(&["exec", &id_one, "/usr/local/bin/runner-manager-conflict"]).trim(),
+            "1.0",
+            "the second package install mutated its sibling"
+        );
+        assert_export_excludes(&id_one, sentinel_one);
+        assert_export_excludes(&id_two, sentinel_two);
+
+        // The policy's minimum 1 GiB writable-layer quota must be enforced,
+        // rather than merely accepted as a create option.
+        let exhaustion = podman(&[
+            "exec",
+            &id_one,
+            "dd",
+            "if=/dev/zero",
+            "of=/quota-fill",
+            "bs=1M",
+            "count=1100",
+            "status=none",
+        ]);
+        assert!(
+            !exhaustion.status.success(),
+            "the 1 GiB writable-layer hard cap allowed a 1.1 GiB file"
+        );
+        stop_and_destroy(&provider, &one);
+        stop_and_destroy(&provider, &two);
+
+        let (_runtime_fresh, mut fresh, prepared_fresh, id_fresh) =
+            prepare_live_attempt(&provider, &policy, &image, None, "native-fresh");
+        start_live_attempt(
+            &provider,
+            &mut fresh,
+            prepared_fresh,
+            &id_fresh,
+            "rm-jit-sentinel-native-fresh-c1b9f470d09e",
+        );
+        assert!(
+            !podman(&["exec", &id_fresh, "dpkg-query", "-W", LIVE_PACKAGE])
+                .status
+                .success(),
+            "a fresh sibling inherited the earlier package database"
+        );
+        assert!(
+            !podman(&[
+                "exec",
+                &id_fresh,
+                "test",
+                "-e",
+                "/usr/local/bin/runner-manager-conflict",
+            ])
+            .status
+            .success(),
+            "a fresh sibling inherited an earlier writable-layer file"
+        );
+        stop_and_destroy(&provider, &fresh);
+
+        // Simulate the crash gap after create and before the environment ID is
+        // journalled. Recovery discovers and quarantines exactly the labelled
+        // orphan; after the durable identity is restored, normal destroy owns
+        // and removes it.
+        let (_runtime_orphan, mut orphan, prepared_orphan, orphan_id) =
+            prepare_live_attempt(&provider, &policy, &image, None, "native-orphan");
+        assert_eq!(
+            provider.recover(&orphan).unwrap(),
+            EnvironmentState::Starting
+        );
+        let owned = provider.enumerate_owned(HostId::from_u128(LIVE_HOST));
+        assert_eq!(owned.len(), 1, "recovery did not isolate one owned orphan");
+        assert!(matches!(
+            &owned[0],
+            EnvironmentIdentity::Isolated { environment_id, .. } if environment_id == &orphan_id
+        ));
+        orphan.prepared_environment(orphan_id).unwrap();
+        assert_eq!(
+            provider.destroy(&orphan).unwrap(),
+            ProviderDestroy::Destroyed
+        );
+        assert!(
+            provider
+                .enumerate_owned(HostId::from_u128(LIVE_HOST))
+                .is_empty()
+        );
+        drop(prepared_orphan);
+
+        assert!(
+            !Command::new("dpkg-query")
+                .args(["-W", LIVE_PACKAGE])
+                .status()
+                .unwrap()
+                .success(),
+            "container package installation mutated the host package database"
+        );
     }
 
     #[test]

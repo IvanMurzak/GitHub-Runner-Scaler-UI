@@ -518,6 +518,43 @@ fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point
 }
 
 #[test]
+fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
+    let source = read_workflow("ci.yml");
+    let job = locate(&source, &["jobs", "oci-native-acceptance"])
+        .expect("ci.yml must keep d1's native OCI acceptance job");
+    for required in [
+        "if: github.event_name == 'pull_request'",
+        "runs-on: ubuntu-24.04",
+        "name: rootless OCI native acceptance (linux-x86_64, no JIT)",
+        "run: bash tests/native-linux-oci-acceptance.sh",
+    ] {
+        assert!(
+            job.block.iter().any(|(_, line)| line == required),
+            "d1's native OCI acceptance job no longer contains `{required}`"
+        );
+    }
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("native-linux-oci-acceptance.sh");
+    let harness = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    for required in [
+        "sudo mount -o loop,pquota",
+        "podman --storage-opt size=1024m info",
+        "oci::tests::live_rootless_native_acceptance",
+        "--ignored --exact --nocapture",
+    ] {
+        assert!(
+            harness.contains(required),
+            "the native OCI harness no longer contains `{required}`"
+        );
+    }
+}
+
+#[test]
 fn e2e_workflow_has_no_release_trigger_and_runs_when_ci_runs() {
     let source = read_workflow("e2e.yml");
 

@@ -62,6 +62,43 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # d1's secret-free native Linux acceptance. The hosted Ubuntu VM can create a
+  # disposable XFS project-quota store with passwordless sudo; Podman itself
+  # remains rootless. A real GitHub runner job still needs fixture/JIT secrets
+  # and belongs to e2e.yml, whose guard labels that portion unavailable when the
+  # inputs are absent. This job therefore proves the provider/runtime boundary,
+  # not demand-to-job completion or reboot continuity.
+  oci-native-acceptance:
+    name: rootless OCI native acceptance (linux-x86_64, no JIT)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE: docker.io/library/ubuntu@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+
+      # GitHub's documented passwordless sudo is used only to install the OCI
+      # packages and mount a disposable loopback XFS filesystem. Every Podman
+      # command and the adapter under test run as the ordinary runner user.
+      - name: Install rootless Podman and XFS quota tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman uidmap slirp4netns fuse-overlayfs xfsprogs
+          podman --version
+
+      - name: Run native rootless OCI acceptance without GitHub JIT secrets
+        run: bash tests/native-linux-oci-acceptance.sh
+
   check:
     name: check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
