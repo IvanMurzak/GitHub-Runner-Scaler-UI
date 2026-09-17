@@ -53,9 +53,9 @@ This file is the only live task-state record.
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
-| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / native Windows client+Server gates pending | 2026-09-16 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / native Apple Silicon+Intel VM gates pending | 2026-09-16 |
+| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / full Windows reboot gate pending | 2026-09-17 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / native Windows client+Server gates pending | 2026-09-17 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / real Apple Silicon VM gates pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -219,6 +219,22 @@ it preview-only. The exact full local gate and seven CI/E2E checks passed.
 A real Hyper-V-isolated runner job, restart/recovery/forensic tests, and client
 plus Server native matrix remain unverified, so PR #77 stays open and d2 stays
 `🟣`.
+
+**2026-09-17 — platform acceptance advanced.** PR #74 at 64889cf now has a
+real one-time GitHub JIT job through the production managed-WSL OCI provider,
+native Ubuntu and WSL 1 GiB bounded stores with real `ENOSPC`, forensic secret
+scans, generation-safe WSL terminate/restart recovery, and a green guarded
+full-Windows-reboot harness. Only the disruptive full host reboot remains.
+PR #77 at 84083c9 now enforces the 256-process Job Object limit before JIT,
+attests every Windows container boundary, narrows editions truthfully, and has
+a green guarded maintenance/native-job/recovery harness. This physical Windows
+11 Pro host is ready after enabling Containers and rebooting; Server requires
+a separate host. PR #79 at 1fc5672 now includes and compiles a real Swift
+Virtualization.framework helper on ARM64 and Intel, with hosted APFS/socket/
+signature/entitlement probes. Hosted ARM64 reports
+`VZVirtualMachine.isSupported == false`; real Apple Silicon hardware plus a
+signed helper and authorized digest-pinned image remain required, while Apple
+does not expose native macOS guest APIs on Intel.
 
 **2026-09-16 — d3 dispatched.** The macOS VM task slot was provisioned from
 the verified remote integration ref after the latest `main` release update,
