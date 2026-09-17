@@ -151,9 +151,12 @@ struct RunnerManagerMacOSVM {
             flags: []
         )
         let record = try store.loadRecord(options.required("--environment"))
-        guard record.hostId == options.required("--host"),
-              record.attemptId == options.required("--attempt"),
-              record.generation == options.required("--generation")
+        let host = try options.required("--host")
+        let attempt = try options.required("--attempt")
+        let generation = try options.required("--generation")
+        guard record.hostId == host,
+              record.attemptId == attempt,
+              record.generation == generation
         else {
             throw HelperFailure.rejected("environment ownership mismatch")
         }

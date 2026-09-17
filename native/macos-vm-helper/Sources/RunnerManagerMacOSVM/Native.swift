@@ -8,9 +8,13 @@ func hasVirtualizationEntitlement() -> Bool {
     var code: SecCode?
     guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code else { return false }
     guard SecCodeCheckValidity(code, SecCSFlags(), nil) == errSecSuccess else { return false }
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode else {
+        return false
+    }
     var information: CFDictionary?
     let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
-    guard SecCodeCopySigningInformation(code, flags, &information) == errSecSuccess,
+    guard SecCodeCopySigningInformation(staticCode, flags, &information) == errSecSuccess,
           let values = information as? [String: Any],
           let entitlements = values[kSecCodeInfoEntitlementsDict as String] as? [String: Any]
     else {
@@ -24,14 +28,20 @@ func virtualizationIsReady() -> Bool {
 }
 
 func validateTemplateHardwareModel(_ url: URL) throws {
+#if arch(arm64)
     let data: Data
     do { data = try Data(contentsOf: url) } catch { throw HelperFailure.rejected("hardware model is invalid") }
     guard let model = VZMacHardwareModel(dataRepresentation: data), model.isSupported else {
         throw HelperFailure.rejected("hardware model is unsupported on this host")
     }
+#else
+    _ = url
+    throw HelperFailure.rejected("macOS guest templates require Apple silicon")
+#endif
 }
 
 func createMachineIdentifier(at url: URL) throws {
+#if arch(arm64)
     let identifier = VZMacMachineIdentifier()
     do {
         try identifier.dataRepresentation.write(to: url, options: [.atomic])
@@ -39,6 +49,10 @@ func createMachineIdentifier(at url: URL) throws {
     } catch {
         throw HelperFailure.degraded("machine identifier creation failed")
     }
+#else
+    _ = url
+    throw HelperFailure.rejected("macOS guest templates require Apple silicon")
+#endif
 }
 
 func validateResourceConfiguration(cpuMillis: UInt32, memoryMiB: UInt32) throws {
@@ -57,6 +71,7 @@ func validateResourceConfiguration(cpuMillis: UInt32, memoryMiB: UInt32) throws 
 }
 
 func makeConfiguration(record: EnvironmentRecord, directory: URL) throws -> VZVirtualMachineConfiguration {
+#if arch(arm64)
     try validateResourceConfiguration(cpuMillis: record.appliedCpuMillis, memoryMiB: record.appliedMemoryMib)
     let disk = directory.appendingPathComponent(Store.diskName)
     guard logicalSize(disk) == UInt64(record.appliedDiskMib) * 1024 * 1024 else {
@@ -114,6 +129,11 @@ func makeConfiguration(record: EnvironmentRecord, directory: URL) throws -> VZVi
         throw HelperFailure.rejected("Virtualization.framework rejected the exact resource configuration")
     }
     return configuration
+#else
+    _ = record
+    _ = directory
+    throw HelperFailure.rejected("macOS guests require Apple silicon")
+#endif
 }
 
 func supervisorMatches(_ record: EnvironmentRecord) -> Bool {
