@@ -1779,6 +1779,10 @@ mod tests {
         .unwrap();
         let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
         let policy = isolated_policy(image.clone());
+        let nonce = std::env::var("RUNNER_MANAGER_OCI_RESTART_NONCE").expect(
+            "RUNNER_MANAGER_OCI_RESTART_NONCE must contain the non-secret acceptance nonce",
+        );
+        assert!(nonce.starts_with("rm-reboot-nonce-") && nonce.len() == 48);
         assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
 
         let clock = FakeClock::default();
@@ -1807,9 +1811,7 @@ mod tests {
             .start(
                 running_handle,
                 &running,
-                OneTimeJitHandoff::new(&EncodedJitConfig::new(
-                    "rm-restart-sentinel-running-739ef4",
-                )),
+                OneTimeJitHandoff::new(&EncodedJitConfig::new(&nonce)),
             )
             .unwrap();
         running.started_isolated(clock.now()).unwrap();
@@ -1819,6 +1821,8 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         ));
         journal.record_attempt(&running).unwrap();
+        inspect_controls(&running_id, &image, &nonce);
+        assert_export_excludes(&running_id, &nonce);
 
         let mut deferred = restart_attempt(
             &root,
@@ -1841,6 +1845,23 @@ mod tests {
         deferred.defer_cleanup(clock.now()).unwrap();
         journal.record_attempt(&deferred).unwrap();
 
+        let mut orphaned = restart_attempt(
+            &root,
+            &policy,
+            &image,
+            "orphaned",
+            0xd104,
+            "restart-orphaned",
+        );
+        let (_orphaned_handle, orphaned_id) =
+            prepare_restart_resource(&provider, &policy, &mut orphaned);
+        orphaned.prepared_environment(orphaned_id).unwrap();
+        orphaned.mark_prepared(clock.now()).unwrap();
+        orphaned
+            .conclude(AttemptOutcome::Orphaned, clock.now())
+            .unwrap();
+        journal.record_attempt(&orphaned).unwrap();
+
         // Crash gap: the provider resource exists, but its ID was never put in
         // the journal. Recovery may adopt only the resource carrying this exact
         // attempt and generation label.
@@ -1849,7 +1870,7 @@ mod tests {
             &policy,
             &image,
             "crash-gap-orphan",
-            0xd104,
+            0xd105,
             "restart-orphan",
         );
         let (_orphan_handle, _orphan_id) =
@@ -1857,16 +1878,28 @@ mod tests {
         journal.record_attempt(&orphan).unwrap();
 
         let attempts = journal.uncleaned_ephemeral_attempts().unwrap();
-        assert_eq!(attempts.len(), 4);
+        assert_eq!(attempts.len(), 5);
         assert!(attempts.iter().all(RunnerAttempt::counts_against_capacity));
         assert_eq!(
             provider.enumerate_owned(HostId::from_u128(LIVE_HOST)).len(),
-            4
+            5
+        );
+        assert!(
+            !std::fs::read(root.join("attempts.sqlite3"))
+                .unwrap()
+                .windows(nonce.len())
+                .any(|window| window == nonce.as_bytes()),
+            "the non-secret JIT stand-in reached the durable attempt journal"
         );
         std::fs::write(root.join("registration-count"), "0\n").unwrap();
         std::fs::write(
             root.join("seed-complete"),
-            "prepared running deferred orphan\n",
+            "prepared starting cleanup_deferred orphaned crash_gap\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("security-scan-complete"),
+            "inspect logs history export journal: nonce absent; github registrations=0\n",
         )
         .unwrap();
     }
@@ -1878,11 +1911,54 @@ mod tests {
         assert!(root.join("seed-complete").is_file());
         let journal = SqliteStore::open(root.join("attempts.sqlite3")).unwrap();
         let provider = OciProcesses::new(HostId::from_u128(LIVE_HOST));
+        let nonce = std::env::var("RUNNER_MANAGER_OCI_RESTART_NONCE")
+            .expect("RUNNER_MANAGER_OCI_RESTART_NONCE must survive in the Windows manifest");
         let mut attempts = journal.uncleaned_ephemeral_attempts().unwrap();
-        assert_eq!(attempts.len(), 4, "the durable journal lost an attempt");
+        assert_eq!(attempts.len(), 5, "the durable journal lost an attempt");
         assert!(attempts.iter().all(RunnerAttempt::counts_against_capacity));
+        let image = match attempts[0].execution() {
+            AttemptExecution::Isolated { resolved_image, .. } => resolved_image.clone(),
+            AttemptExecution::Native => unreachable!(),
+        };
         let owned = provider.enumerate_owned(HostId::from_u128(LIVE_HOST));
-        assert_eq!(owned.len(), 4, "the remounted provider lost a resource");
+        assert_eq!(owned.len(), 5, "the remounted provider lost a resource");
+
+        for identity in &owned {
+            let EnvironmentIdentity::Isolated { environment_id, .. } = identity else {
+                unreachable!()
+            };
+            let inspect = podman_ok(&["container", "inspect", environment_id]);
+            assert!(
+                !inspect.contains(&nonce),
+                "nonce reached durable inspect metadata"
+            );
+            let logs = podman(&["logs", environment_id]);
+            assert!(
+                !logs
+                    .stdout
+                    .windows(nonce.len())
+                    .any(|window| window == nonce.as_bytes())
+            );
+            assert!(
+                !logs
+                    .stderr
+                    .windows(nonce.len())
+                    .any(|window| window == nonce.as_bytes())
+            );
+            assert_export_excludes(environment_id, &nonce);
+        }
+        let history = podman_ok(&["history", "--no-trunc", image.as_str()]);
+        assert!(
+            !history.contains(&nonce),
+            "nonce reached durable image history"
+        );
+        assert!(
+            !std::fs::read(root.join("attempts.sqlite3"))
+                .unwrap()
+                .windows(nonce.len())
+                .any(|window| window == nonce.as_bytes()),
+            "nonce reached the durable attempt journal"
+        );
 
         let clock = FakeClock::default();
         for attempt in &mut attempts {
@@ -1955,7 +2031,9 @@ mod tests {
                         .unwrap();
                     attempt.begin_destroy(clock.now()).unwrap();
                 }
-                AttemptState::CleanupDeferred => attempt.begin_destroy(clock.now()).unwrap(),
+                AttemptState::Orphaned | AttemptState::CleanupDeferred => {
+                    attempt.begin_destroy(clock.now()).unwrap()
+                }
                 state => panic!("unexpected restart state {state}"),
             }
             assert_eq!(

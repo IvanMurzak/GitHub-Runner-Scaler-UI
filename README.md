@@ -243,7 +243,10 @@ and ext4 returns `ENOSPC`; a production helper may manage a larger pool but must
 the same per-create hard bound and command routing. On Windows,
 `tests/managed-wsl-oci-restart-acceptance.ps1` terminates only the named distribution and
 checks that the remounted helper recovers exact-generation resources and durable journal
-leases without another JIT registration.
+leases without another JIT registration. The separate
+`tests/managed-wsl-oci-reboot-acceptance.ps1` uses explicit `prepare`,
+`verify-after-reboot`, and `cleanup` phases for an operator-driven full Windows reboot.
+It records Windows kernel boot evidence but contains no command that reboots Windows.
 
 Queue a workflow, then watch the runner start and complete the job:
 

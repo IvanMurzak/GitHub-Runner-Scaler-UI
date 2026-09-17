@@ -20,6 +20,7 @@ if ($LASTEXITCODE -ne 0 -or -not $managedHome -or -not $managedHome.StartsWith('
 }
 
 $harness = "$repoLinux/tests/managed-wsl-oci-restart-acceptance.sh"
+$acceptanceNonce = 'rm-reboot-nonce-' + [guid]::NewGuid().ToString('N')
 $fixtureOwned = $false
 try {
     & wsl.exe --distribution $Distribution --user root --exec bash -c @'
@@ -32,7 +33,7 @@ test ! -e "$1/.local/share/runner-manager-wsl-oci-restart"
     & wsl.exe --distribution $Distribution --user root --exec bash $harness setup $repoLinux $managedUser
     if ($LASTEXITCODE -ne 0) { throw 'Managed WSL restart fixture setup failed.' }
 
-    & wsl.exe --distribution $Distribution --user root --exec bash $harness seed $repoLinux $managedUser
+    & wsl.exe --distribution $Distribution --user root --exec bash $harness seed $repoLinux $managedUser $acceptanceNonce
     if ($LASTEXITCODE -ne 0) { throw 'Managed WSL restart fixture seed failed.' }
 
     & wsl.exe --terminate $Distribution
@@ -41,7 +42,7 @@ test ! -e "$1/.local/share/runner-manager-wsl-oci-restart"
     & wsl.exe --distribution $Distribution --user root --exec bash $harness remount $repoLinux $managedUser
     if ($LASTEXITCODE -ne 0) { throw 'Managed WSL bounded store remount failed.' }
 
-    & wsl.exe --distribution $Distribution --user root --exec bash $harness recover $repoLinux $managedUser
+    & wsl.exe --distribution $Distribution --user root --exec bash $harness recover $repoLinux $managedUser $acceptanceNonce
     if ($LASTEXITCODE -ne 0) { throw 'Managed WSL provider recovery failed.' }
 
     Write-Output 'managed WSL terminate/restart acceptance passed'

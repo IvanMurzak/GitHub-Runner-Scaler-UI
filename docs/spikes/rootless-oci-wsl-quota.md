@@ -98,9 +98,9 @@ measured separately below.
 On September 16, 2026,
 `tests/managed-wsl-oci-restart-acceptance.ps1 -Distribution Ubuntu` completed a
 real distribution stop/start boundary without rebooting Windows. The harness
-created the same root-owned 1,024 MiB ext4 helper, four production-provider
+created the same root-owned 1,024 MiB ext4 helper, five production-provider
 resources, and a durable SQLite journal containing `prepared`, running-like
-`starting`, `cleanup_deferred`, and crash-gap `preparing` attempts. It flushed
+`starting`, `cleanup_deferred`, `orphaned`, and crash-gap `preparing` attempts. It flushed
 the nested loop filesystem, recorded the WSL kernel boot ID and PID 1 start
 time, and then issued exactly `wsl --terminate Ubuntu`.
 
@@ -108,7 +108,7 @@ On the next distribution start, PID 1 had a new start time while the WSL kernel
 boot ID was unchanged, so the evidence is a distribution restart rather than a
 Windows or WSL VM reboot. The harness remounted the finite store, recreated the
 rootless `/run/user/1000` runtime directory, and started a fresh provider
-process. All four journal rows still counted against capacity and all four
+process. All five journal rows still counted against capacity and all five
 labelled resources were enumerable. Recovery refused a different generation,
 adopted the crash-gap resource carrying the exact attempt and generation,
 destroyed every owned resource, and left zero uncleaned journal rows and zero
@@ -118,7 +118,72 @@ cleanup removed the helper, loop mount, loop image, graph root, build target,
 runtime directories, and containers.
 
 This closes continuity across termination of the managed distribution. A full
-Windows reboot remains a separate host boot acceptance boundary.
+Windows reboot uses the separate operator procedure below.
+
+## Full Windows reboot acceptance
+
+Run this only on a disposable acceptance host. The fixture installs the same
+root-owned bounded-store helper used by the distribution-restart acceptance,
+creates a 1,024 MiB loop filesystem, and leaves five production-provider
+resources until the host has rebooted. It makes no GitHub API request. The only
+JIT-shaped input is a generated, non-secret nonce. Before the durable state is
+flushed, the production provider proves that nonce absent from container
+inspect metadata, logs, image history, exported root filesystems, and the
+SQLite journal. The state manifest contains that nonce and boot evidence; it
+contains no GitHub JIT configuration or token.
+
+Open PowerShell as Administrator, change to the repository checkout, and run
+the syntax and contract check followed by `prepare`:
+
+```powershell
+Set-Location C:\path\to\GitHub-Runner-Scaler-UI
+pwsh -NoProfile -File .\tests\managed-wsl-oci-reboot-contract.ps1
+pwsh -NoProfile -File .\tests\managed-wsl-oci-reboot-acceptance.ps1 -Phase prepare -Distribution Ubuntu
+```
+
+`prepare` fails before mutation when PowerShell is not elevated, the named
+distribution or a required Linux command is absent, the default WSL user is
+root, or the fixture namespace is occupied. Repeating it on the same Windows
+boot validates and reuses the existing fixture. It writes the reboot manifest
+to
+`C:\ProgramData\RunnerManager\acceptance\managed-wsl-reboot-Ubuntu.json`,
+flushes both the mounted filesystem and its backing image, and stops. The
+harness never schedules or initiates a reboot. Reboot Windows manually with the
+normal Windows user interface.
+
+After signing in, open a new Administrator PowerShell, return to the same
+checkout, and run:
+
+```powershell
+Set-Location C:\path\to\GitHub-Runner-Scaler-UI
+pwsh -NoProfile -File .\tests\managed-wsl-oci-reboot-acceptance.ps1 -Phase verify-after-reboot -Distribution Ubuntu
+```
+
+Verification refuses a WSL-only restart: both Windows' last-boot time and the
+latest kernel boot-event identity and time must advance. It then starts WSL,
+remounts the bounded helper store, requires a new WSL VM boot identity,
+reopens the durable journal, and sends the saved non-secret nonce only to the
+test provider. Recovery rejects a wrong generation before adopting the exact
+crash-gap resource. Prepared, starting, cleanup-deferred, orphaned, and
+crash-gap resources are destroyed, all capacity accounting reaches zero, the
+GitHub registration count remains zero, and the nonce remains absent from the
+provider's durable surfaces. The phase removes the Linux fixture even when
+verification fails. On success it retains only a non-secret JSON receipt, so
+repeating the phase is idempotent.
+
+To roll back before verification, remove remnants after a failed verification,
+or delete the successful receipt, run this exact elevated command from the
+same checkout:
+
+```powershell
+pwsh -NoProfile -File .\tests\managed-wsl-oci-reboot-acceptance.ps1 -Phase cleanup -Distribution Ubuntu
+```
+
+Cleanup is idempotent and only acts when the manifest proves ownership. It
+removes the five containers, helper, loop mount and image, graph and run roots,
+build target, fixture journal, and manifest. If the manifest was lost, the
+harness refuses to infer ownership; inspect the fixed paths named in
+`tests/managed-wsl-oci-restart-acceptance.sh` before removing anything by hand.
 
 ## One-time live JIT acceptance
 

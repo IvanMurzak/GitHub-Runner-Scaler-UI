@@ -13,9 +13,14 @@ grep -qi microsoft /proc/sys/kernel/osrelease || die "this harness requires WSL2
 phase="${1:-}"
 source_root="${2:-}"
 managed_user="${3:-}"
-[[ "$phase" =~ ^(setup|seed|remount|recover|cleanup)$ ]] ||
-  die "phase must be setup, seed, remount, recover, or cleanup"
+[[ "$phase" =~ ^(setup|seed|check-seed|remount|remount-after-host-reboot|recover|cleanup)$ ]] ||
+  die "unknown phase"
 [[ -n "$managed_user" ]] || die "managed user is required"
+acceptance_nonce="${4:-}"
+if [[ "$phase" =~ ^(seed|check-seed|recover)$ ]]; then
+  [[ "$acceptance_nonce" =~ ^rm-reboot-nonce-[0-9a-f]{32}$ ]] ||
+    die "the host-reboot acceptance nonce is missing or malformed"
+fi
 
 managed_uid="$(id -u "$managed_user")"
 managed_gid="$(id -g "$managed_user")"
@@ -118,6 +123,7 @@ run_test() {
     RUNNER_MANAGER_OCI_RUNTIME="$runtime_helper" \
     RUNNER_MANAGER_OCI_ACCEPTANCE_IMAGE="$acceptance_image" \
     RUNNER_MANAGER_OCI_RESTART_FIXTURE="$fixture" \
+    RUNNER_MANAGER_OCI_RESTART_NONCE="$acceptance_nonce" \
     "$cargo_bin" test -p runner-manager-agent "$test_name" -- \
       --ignored --exact --nocapture
 }
@@ -158,7 +164,7 @@ EOF
     cd "$source_root"
     run_test 'oci::tests::live_rootless_managed_wsl_restart_seed'
     resource_count="$(as_managed "$runtime_helper" ps --all --quiet | sed '/^$/d' | wc -l)"
-    [[ "$resource_count" -eq 4 ]] || die "seed did not leave four provider resources"
+    [[ "$resource_count" -eq 5 ]] || die "seed did not leave five provider resources"
     awk '{print $22}' /proc/1/stat > "$fixture/pid1-start-before"
     cat /proc/sys/kernel/random/boot_id > "$fixture/windows-session-boot-id"
     chown "$managed_uid:$managed_gid" "$fixture/pid1-start-before" "$fixture/windows-session-boot-id"
@@ -168,6 +174,13 @@ EOF
     sync -f "$mount_point"
     blockdev --flushbufs "$(findmnt -T "$graph_root" -no SOURCE)"
     sync "$image_file"
+    ;;
+  check-seed)
+    [[ -f "$fixture/seed-complete" && -f "$fixture/security-scan-complete" ]] ||
+      die "the prepared fixture is incomplete"
+    verify_mount
+    resource_count="$(as_managed "$runtime_helper" ps --all --quiet | sed '/^$/d' | wc -l)"
+    [[ "$resource_count" -eq 5 ]] || die "the prepared fixture no longer has five resources"
     ;;
   remount)
     [[ -f "$image_file" && -x "$runtime_helper" ]] || die "seed fixture is absent"
@@ -179,6 +192,22 @@ EOF
     [[ "$before" != "$after" ]] || die "PID 1 did not restart across wsl --terminate"
     [[ "$(cat "$fixture/windows-session-boot-id")" == "$(cat /proc/sys/kernel/random/boot_id)" ]] ||
       die "the WSL VM rebooted; this harness must not substitute a host reboot"
+    printf '%s\n' "$after" > "$fixture/pid1-start-after"
+    rm -rf "$run_root"
+    install -d -m 0700 -o "$managed_uid" -g "$managed_gid" "$run_root"
+    install -d -m 0700 -o "$managed_uid" -g "$managed_gid" "/run/user/$managed_uid"
+    verify_mount
+    ;;
+  remount-after-host-reboot)
+    [[ -f "$image_file" && -x "$runtime_helper" ]] || die "seed fixture is absent"
+    if ! mountpoint -q "$mount_point"; then
+      mount -o loop,nodev,nosuid "$image_file" "$mount_point"
+    fi
+    before="$(cat "$fixture/pid1-start-before")"
+    after="$(awk '{print $22}' /proc/1/stat)"
+    [[ "$before" != "$after" ]] || die "PID 1 did not restart across the Windows reboot"
+    [[ "$(cat "$fixture/windows-session-boot-id")" != "$(cat /proc/sys/kernel/random/boot_id)" ]] ||
+      die "the WSL VM boot identity did not change across the Windows reboot"
     printf '%s\n' "$after" > "$fixture/pid1-start-after"
     rm -rf "$run_root"
     install -d -m 0700 -o "$managed_uid" -g "$managed_gid" "$run_root"
