@@ -3,6 +3,32 @@ import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class ProtocolTests: XCTestCase {
+    func testProbeResponseUsesTheDocumentedWireKeys() throws {
+        let response = ProbeResponse(
+            protocolVersion: 1,
+            architecture: "arm64",
+            virtualizationFramework: false,
+            macosGuestEntitlement: true,
+            privateJitChannel: false,
+            freshWritableDisks: true,
+            resourceLimits: false,
+            processLimits: false
+        )
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: protocolEncoder.encode(response)) as? [String: Any]
+        )
+        XCTAssertEqual(Set(json.keys), Set([
+            "protocol_version",
+            "architecture",
+            "virtualization_framework",
+            "macos_guest_entitlement",
+            "private_jit_channel",
+            "fresh_writable_disks",
+            "resource_limits",
+            "process_limits",
+        ]))
+    }
+
     func testPinnedImageParserRejectsMutableAndNonCanonicalReferences() throws {
         let digest = String(repeating: "a", count: 64)
         XCTAssertEqual(try parsePinnedImage("vm-version:macos-15-arm64-v1@sha256:\(digest)").digest, digest)

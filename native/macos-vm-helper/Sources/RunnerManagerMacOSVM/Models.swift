@@ -36,6 +36,17 @@ struct ProbeResponse: Codable, Equatable {
     let freshWritableDisks: Bool
     let resourceLimits: Bool
     let processLimits: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case architecture
+        case virtualizationFramework = "virtualization_framework"
+        case macosGuestEntitlement = "macos_guest_entitlement"
+        case privateJitChannel = "private_jit_channel"
+        case freshWritableDisks = "fresh_writable_disks"
+        case resourceLimits = "resource_limits"
+        case processLimits = "process_limits"
+    }
 }
 
 struct ImageResponse: Codable, Equatable {
