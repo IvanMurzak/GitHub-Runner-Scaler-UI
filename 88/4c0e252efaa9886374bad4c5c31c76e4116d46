@@ -1,0 +1,25 @@
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_69aa4acf0c4248 441-445,856-863,2029-2031
+tests/managed-wsl-oci-reboot-contract.ps1
+  s_5801a853f78e8a::t_120f60f7ff5987 42-44,46-49,52-66
+  s_5801a853f78e8a::t_69aa4acf0c4248 8,32-41,45,50-51,67-77
+  s_5801a853f78e8a::t_21025420819907 78
+tests/managed-wsl-oci-reboot-acceptance.ps1
+  s_5801a853f78e8a::t_613d9874c77d22 64-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "884c0e252efaa9886374bad4c5c31c76e4116d46",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
