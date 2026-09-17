@@ -56,8 +56,51 @@ unprivileged `_apt` identity; the five named capabilities are therefore part
 of the provider's guest-local package installation profile. Both fixtures were
 removed by `podman run --rm`.
 
-Native Linux with quota-capable rootless storage was not available for this
-run. Managed WSL real-job, conflicting-package, reboot/orphan, resource
-exhaustion, and JIT credential-plane acceptance remain open until a rootless
-hard-quota-capable storage configuration is demonstrated. The provider keeps
-affected isolated policies closed and leaves native execution available.
+## GitHub-hosted native Linux acceptance
+
+CI run `35170389901` exercised the secret-free native fixture on GitHub's
+`ubuntu-24.04` image (Ubuntu 24.04.5, Podman 4.9.3). The harness used the hosted
+runner's documented passwordless `sudo` only to create and mount a disposable
+6 GiB XFS loopback filesystem with `prjquota`; every Podman and provider command
+ran as the ordinary runner user. Podman reported rootless mode, 65,536
+subordinate UIDs/GIDs, cgroup v2 CPU/memory/pids controllers, and the dedicated
+XFS graph root. GitHub documents the hosted Linux privilege model in its
+[hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges),
+and containers/storage documents the XFS project-quota requirement in its
+[storage configuration reference](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md#quotas).
+
+The real `podman --storage-opt size=1024m info` preflight refused that store:
+
+```text
+Filesystem does not support Project Quota: failed to mknod .../overlay/backingFsBlockDev.tmp: operation not permitted
+```
+
+This is a rootless Podman limitation, not a missing XFS mount option: Podman
+maintainers confirm that rootless users cannot create the device node and that
+project IDs are not namespaced
+([upstream issue](https://github.com/containers/podman/issues/16424)). The
+production provider returned the typed `DiskQuotaUnavailable` result before
+image allocation or JIT. CI requires that refusal and fails if Podman ever
+starts accepting the preflight, forcing the fixture to move to the full
+provider prepare path instead of silently retaining the reduced path.
+
+After proving the production refusal, the fixture omitted only the unavailable
+per-container storage option and exercised the remaining provider lifecycle on
+the hard-bounded 6 GiB loopback store. It verified the pinned Ubuntu amd64 image
+digest; empty host mounts, bind mounts and device requests; no Podman or Docker
+socket; CPU/memory/pids controls; two simultaneous containers installing
+versions 1.0 and 2.0 of the same generated Debian package without changing each
+other or the host; a fresh third container with neither package state nor tool;
+normal stop/destroy; and discovery of exactly one crash-gap orphan followed by
+owned cleanup. A 7 GiB `fallocate` failed against the 6 GiB backing filesystem.
+A synthetic JIT sentinel passed through provider stdin and was absent from
+container inspect, disabled logs, image history and exported root filesystems.
+All containers were independently swept before the XFS fixture was unmounted.
+
+This native gate does **not** claim a GitHub runner job. The repository has no
+JIT/fixture secrets for this job, and rootless Podman 4.9.3 cannot enforce the
+required per-container 1 GiB writable-layer cap even on XFS with project quotas.
+Consequently a full provider prepare/start and real demand-to-JIT job remain
+open, as do reboot continuity (a hosted runner cannot resume the job that
+reboots it) and managed WSL real-job/reboot acceptance. The hard per-container
+cap remains mandatory; affected policies continue to fail closed before JIT.
