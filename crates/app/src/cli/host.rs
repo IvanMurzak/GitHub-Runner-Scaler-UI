@@ -566,7 +566,9 @@ const fn readiness_from_provider_capability(
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
     let providers = isolation_capabilities();
     let document = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
+        "scope": "host prerequisites only",
+        "policy_template_check": "on enable and before JIT",
         "providers": providers,
     });
     if json {
@@ -593,7 +595,7 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
         }
         writeln!(
             out,
-            "Provider and pinned-template readiness are checked again before JIT registration."
+            "This command reports host prerequisites only. Each policy's exact template version and SHA-256 identity are checked on enable and again before JIT registration."
         )
         .map_err(write_failed("this provider status"))?;
     }

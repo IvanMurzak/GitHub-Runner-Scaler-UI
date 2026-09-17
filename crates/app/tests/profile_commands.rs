@@ -232,7 +232,9 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
     });
     assert_eq!(status.code, 0, "{}", status.both());
     let json: serde_json::Value = serde_json::from_str(&status.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["scope"], "host prerequisites only");
+    assert_eq!(json["policy_template_check"], "on enable and before JIT");
     let providers = json["providers"].as_array().expect("provider array");
     assert_eq!(providers.len(), 4);
     assert_eq!(

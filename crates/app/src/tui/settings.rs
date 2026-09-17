@@ -2232,7 +2232,7 @@ Select another profile in Repositories or create one with the CLI.",
                     "Pinned image",
                     &self.execution_image,
                     width,
-                    "(required: sha256, OCI digest, or vm-version)",
+                    "(VM: vm-version:<version>@sha256:<template-digest>)",
                 ))
                 .at(*control),
             );
@@ -2265,7 +2265,7 @@ Select another profile in Repositories or create one with the CLI.",
             ))
         }));
         lines.push(FormLine::text(
-            "Provider and pinned-template readiness are checked again before JIT registration.",
+            "Host readiness is shown here. The exact policy template and digest are checked on enable and again before JIT registration.",
         ));
         lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
         *control += 1;
@@ -5334,7 +5334,8 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: unsupported
-        Provider and pinned-template readiness are checked again before JIT registration.
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5382,7 +5383,8 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: unsupported
-        Provider and pinned-template readiness are checked again before JIT registration.
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5430,7 +5432,8 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: unsupported
-        Provider and pinned-template readiness are checked again before JIT registration.
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5530,7 +5533,8 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: unsupported
-        Provider and pinned-template readiness are checked again before JIT registration.
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5581,7 +5585,8 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: unsupported
-        Provider and pinned-template readiness are checked again before JIT registration.
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 

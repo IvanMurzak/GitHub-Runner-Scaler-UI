@@ -1250,7 +1250,8 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                let capability = MacOsVmProcesses::new(policy.host_id).probe(&policy);
+                let provider = MacOsVmProcesses::new(policy.host_id);
+                let capability = provider.probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
                         Failure::Conflict,
@@ -1259,7 +1260,7 @@ pub fn apply_policy_mutation_selected(
                             policy.profile_name(),
                             provider_capability_name(capability)
                         ),
-                        "runner-manager host isolation status",
+                        MacOsVmProcesses::policy_remedy(&policy, capability),
                     ));
                 }
             }

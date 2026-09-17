@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use runner_manager_domain::attempt::{FailureReason, RunnerAttempt};
 use runner_manager_domain::execution::{
@@ -19,6 +21,7 @@ use runner_manager_domain::execution::{
 use runner_manager_domain::model::{AttemptId, HostId};
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_github::jit::EncodedJitConfig;
+use secrecy::zeroize::Zeroize as _;
 use serde::Deserialize;
 
 use super::{
@@ -32,6 +35,8 @@ const PROTOCOL_VERSION: u16 = 1;
 const DEFAULT_HELPER: &str = "runner-manager-macos-vm";
 const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_DIAGNOSTICS: usize = 32;
+const HELPER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PROCESS_LIMIT: u32 = 512;
 
 /// A closed, non-secret summary of macOS VM readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,7 @@ pub enum MacOsVmHostState {
     UnsupportedArchitecture,
     HelperNotInstalled,
     HelperPermissionDenied,
+    HelperTimedOut,
     HelperIncompatible,
     EntitlementMissing,
     PrivateChannelUnavailable,
@@ -62,6 +68,7 @@ impl MacOsVmHostState {
             }
             Self::PrivateChannelUnavailable
             | Self::ResourceLimitsUnavailable
+            | Self::HelperTimedOut
             | Self::RuntimeDegraded => ProviderCapability::Degraded,
         }
     }
@@ -79,6 +86,9 @@ impl MacOsVmHostState {
             ),
             Self::HelperPermissionDenied => {
                 Some("allow the runner-manager service account to execute the macOS VM helper")
+            }
+            Self::HelperTimedOut => {
+                Some("repair the macOS VM helper operation that exceeded the five-minute timeout")
             }
             Self::HelperIncompatible => Some("install a helper that implements protocol version 1"),
             Self::EntitlementMissing => Some(
@@ -126,6 +136,43 @@ impl MacOsVmProcesses {
         provider.probe_host()
     }
 
+    /// An operator action scoped to the exact policy that failed readiness.
+    /// Host-wide status cannot diagnose a missing template because it has no
+    /// policy image, so image failures name the durable reference directly.
+    #[must_use]
+    pub fn policy_remedy(policy: &ScalePolicy, capability: ProviderCapability) -> String {
+        let (image, macos_vm) = match policy.execution_policy() {
+            ExecutionPolicy::Isolated { backend, image, .. } => (
+                Some(image.as_str()),
+                matches!(backend, Backend::Auto | Backend::VirtualMachine),
+            ),
+            ExecutionPolicy::Native => (None, false),
+        };
+        if !macos_vm {
+            return "runner-manager host isolation status".into();
+        }
+        match capability {
+            ProviderCapability::ImageUnavailableOrIncompatible => format!(
+                "install the exact pinned macOS VM template {} in the configured helper, verify its SHA-256 identity, then retry enabling this profile",
+                image.unwrap_or("from this profile")
+            ),
+            ProviderCapability::NotInstalled => {
+                "install and configure runner-manager-macos-vm for the daemon service account"
+                    .into()
+            }
+            ProviderCapability::PermissionDenied => {
+                "allow the daemon service account to execute the signed helper and read this profile's pinned template".into()
+            }
+            ProviderCapability::Unsupported => {
+                "use a supported macOS architecture and a protocol-version-1 helper".into()
+            }
+            ProviderCapability::Degraded => {
+                "repair the configured helper, its guest control channel, template store, resource enforcement, or timed-out operation".into()
+            }
+            ProviderCapability::Ready => "no remediation required".into(),
+        }
+    }
+
     fn probe_host(&self) -> MacOsVmHostState {
         if !self.host_supported {
             return MacOsVmHostState::UnsupportedHost;
@@ -139,7 +186,10 @@ impl MacOsVmProcesses {
             Err(HelperFailure::PermissionDenied) => {
                 return MacOsVmHostState::HelperPermissionDenied;
             }
-            Err(HelperFailure::Missing | HelperFailure::Rejected) => {
+            Err(HelperFailure::TimedOut) => return MacOsVmHostState::HelperTimedOut,
+            Err(
+                HelperFailure::Missing | HelperFailure::Rejected | HelperFailure::TemplateMismatch,
+            ) => {
                 return MacOsVmHostState::HelperIncompatible;
             }
             Err(HelperFailure::Degraded) => return MacOsVmHostState::RuntimeDegraded,
@@ -162,7 +212,7 @@ impl MacOsVmProcesses {
         if !probe.private_jit_channel {
             return MacOsVmHostState::PrivateChannelUnavailable;
         }
-        if !probe.fresh_writable_disks || !probe.resource_limits {
+        if !probe.fresh_writable_disks || !probe.resource_limits || !probe.process_limits {
             return MacOsVmHostState::ResourceLimitsUnavailable;
         }
         MacOsVmHostState::Ready
@@ -198,6 +248,9 @@ impl MacOsVmProcesses {
         )?;
         let image_response: ImageResponse =
             serde_json::from_slice(&output).map_err(|_| HelperFailure::Rejected)?;
+        if image.vm_template_digest() != Some(image_response.template_digest.as_str()) {
+            return Err(HelperFailure::TemplateMismatch);
+        }
         if image_response.protocol_version != PROTOCOL_VERSION
             || image_response.image != image.as_str()
             || image_response.guest_os != "macos"
@@ -236,7 +289,11 @@ impl MacOsVmProcesses {
         })
     }
 
-    fn inspect_named(&self, environment_id: &str) -> Result<Option<ResourceRecord>, FailureReason> {
+    fn inspect_named(
+        &self,
+        environment_id: &str,
+        attempt: Option<AttemptId>,
+    ) -> Result<Option<ResourceRecord>, FailureReason> {
         let output = self.helper.run(
             &[
                 "inspect".into(),
@@ -251,16 +308,27 @@ impl MacOsVmProcesses {
                 .map(Some)
                 .map_err(|_| failure("macOS VM helper returned invalid environment metadata")),
             Err(HelperFailure::Missing) => Ok(None),
-            Err(error) => Err(operation_helper_failure(error)),
+            Err(error) => {
+                if error == HelperFailure::TimedOut
+                    && let Some(attempt) = attempt
+                {
+                    self.note(attempt, ProviderDiagnostic::HelperTimedOut);
+                }
+                Err(operation_helper_failure(error))
+            }
         }
     }
 
     fn record_for(&self, attempt: &RunnerAttempt) -> Result<Option<ResourceRecord>, FailureReason> {
         let expected = self.expected(attempt)?;
-        self.inspect_named(&expected.environment_id)
+        self.inspect_named(&expected.environment_id, Some(attempt.id))
     }
 
-    fn list_records(&self, host: HostId) -> Result<Vec<ResourceRecord>, FailureReason> {
+    fn list_records(
+        &self,
+        host: HostId,
+        attempt: Option<AttemptId>,
+    ) -> Result<Vec<ResourceRecord>, FailureReason> {
         let output = self
             .helper
             .run(
@@ -272,7 +340,14 @@ impl MacOsVmProcesses {
                 ],
                 None,
             )
-            .map_err(operation_helper_failure)?;
+            .map_err(|error| {
+                if error == HelperFailure::TimedOut
+                    && let Some(attempt) = attempt
+                {
+                    self.note(attempt, ProviderDiagnostic::HelperTimedOut);
+                }
+                operation_helper_failure(error)
+            })?;
         serde_json::from_slice(&output)
             .map_err(|_| failure("macOS VM helper returned invalid owned-resource metadata"))
     }
@@ -323,7 +398,12 @@ impl MacOsVmProcesses {
                 None,
             )
             .map(|_| ())
-            .map_err(operation_helper_failure)
+            .map_err(|error| {
+                if error == HelperFailure::TimedOut {
+                    self.note(attempt.id, ProviderDiagnostic::HelperTimedOut);
+                }
+                operation_helper_failure(error)
+            })
     }
 
     fn intent_path(attempt: &RunnerAttempt) -> std::path::PathBuf {
@@ -350,10 +430,11 @@ impl ExecutionProvider for MacOsVmProcesses {
             Ok(_) => ProviderCapability::Ready,
             Err(HelperFailure::NotInstalled) => ProviderCapability::NotInstalled,
             Err(HelperFailure::PermissionDenied) => ProviderCapability::PermissionDenied,
-            Err(HelperFailure::Missing | HelperFailure::Rejected) => {
-                ProviderCapability::ImageUnavailableOrIncompatible
-            }
+            Err(
+                HelperFailure::Missing | HelperFailure::Rejected | HelperFailure::TemplateMismatch,
+            ) => ProviderCapability::ImageUnavailableOrIncompatible,
             Err(HelperFailure::Degraded) => ProviderCapability::Degraded,
+            Err(HelperFailure::TimedOut) => ProviderCapability::Degraded,
         }
     }
 
@@ -393,16 +474,46 @@ impl ExecutionProvider for MacOsVmProcesses {
         let ExecutionPolicy::Isolated { resources, .. } = policy.execution_policy() else {
             return Err(failure("macOS VM policy is invalid"));
         };
-        if self.probe_host() != MacOsVmHostState::Ready {
-            self.note(attempt.id, ProviderDiagnostic::CapabilityUnavailable);
+        let host_state = self.probe_host();
+        if host_state != MacOsVmHostState::Ready {
+            self.note(
+                attempt.id,
+                if host_state == MacOsVmHostState::HelperTimedOut {
+                    ProviderDiagnostic::HelperTimedOut
+                } else {
+                    ProviderDiagnostic::CapabilityUnavailable
+                },
+            );
             return Err(failure("macOS VM provider preflight failed"));
         }
-        self.inspect_image(expected.image).inspect_err(|_| {
-            self.note(attempt.id, ProviderDiagnostic::ImageRejected);
-        })?;
+        self.inspect_image_metadata(expected.image)
+            .map_err(|error| {
+                self.note(
+                    attempt.id,
+                    if error == HelperFailure::TemplateMismatch {
+                        ProviderDiagnostic::TemplateIdentityMismatch
+                    } else if error == HelperFailure::TimedOut {
+                        ProviderDiagnostic::HelperTimedOut
+                    } else {
+                        ProviderDiagnostic::ImageRejected
+                    },
+                );
+                image_helper_failure(error)
+            })?;
 
-        match self.inspect_named(&expected.environment_id)? {
-            Some(record) if record.same_owner(self.host, &expected) && record.is_prepared() => {}
+        match self.inspect_named(&expected.environment_id, Some(attempt.id))? {
+            Some(record)
+                if record.same_owner(self.host, &expected)
+                    && record.limits_match(*resources)
+                    && record.is_prepared() => {}
+            Some(record)
+                if record.same_owner(self.host, &expected) && !record.limits_match(*resources) =>
+            {
+                self.note(attempt.id, ProviderDiagnostic::ResourceLimitMismatch);
+                return Err(failure(
+                    "macOS VM applied resource limits do not match the requested policy",
+                ));
+            }
             Some(record) if record.same_owner(self.host, &expected) => {
                 self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
                 return Err(failure("macOS VM state is incompatible with preparation"));
@@ -414,25 +525,46 @@ impl ExecutionProvider for MacOsVmProcesses {
             None => {
                 let args = prepare_args(self.host, attempt, &expected, *resources);
                 self.helper.run(&args, None).map_err(|error| {
-                    self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+                    self.note(
+                        attempt.id,
+                        if error == HelperFailure::TimedOut {
+                            ProviderDiagnostic::HelperTimedOut
+                        } else {
+                            ProviderDiagnostic::PrepareFailed
+                        },
+                    );
                     operation_helper_failure(error)
                 })?;
             }
         }
 
         let record = self
-            .inspect_named(&expected.environment_id)?
+            .inspect_named(&expected.environment_id, Some(attempt.id))?
             .ok_or_else(|| failure("macOS VM helper did not create the environment"))?;
-        if !record.same_owner(self.host, &expected) || !record.is_prepared() {
+        if !record.same_owner(self.host, &expected) {
             self.note(attempt.id, ProviderDiagnostic::OwnershipMismatch);
             return Err(failure(
                 "macOS VM prepared resource failed ownership or isolation checks",
             ));
         }
-        if self.list_records(self.host)?.iter().any(|other| {
-            other.environment_id != record.environment_id
-                && other.writable_disk_id == record.writable_disk_id
-        }) {
+        if !record.limits_match(*resources) {
+            self.note(attempt.id, ProviderDiagnostic::ResourceLimitMismatch);
+            return Err(failure(
+                "macOS VM applied resource limits do not match the requested policy",
+            ));
+        }
+        if !record.is_prepared() {
+            self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
+            return Err(failure("macOS VM state is incompatible with preparation"));
+        }
+        if self
+            .list_records(self.host, Some(attempt.id))?
+            .iter()
+            .any(|other| {
+                other.environment_id != record.environment_id
+                    && other.writable_disk_id == record.writable_disk_id
+            })
+        {
             self.note(attempt.id, ProviderDiagnostic::PrepareFailed);
             return Err(failure(
                 "macOS VM helper reused a writable disk across attempts",
@@ -457,7 +589,10 @@ impl ExecutionProvider for MacOsVmProcesses {
         let identity = self
             .identity_for(attempt, expected.environment_id.clone())
             .map_err(ProcessStartFailure::before_spawn)?;
-        if prepared.identity() != Some(&identity) || !self.owns(attempt).unwrap_or(false) {
+        let owns = self
+            .owns(attempt)
+            .map_err(ProcessStartFailure::before_spawn)?;
+        if prepared.identity() != Some(&identity) || !owns {
             self.note(attempt.id, ProviderDiagnostic::OwnershipMismatch);
             return Err(ProcessStartFailure::before_spawn(failure(
                 "macOS VM prepared identity mismatch",
@@ -473,8 +608,15 @@ impl ExecutionProvider for MacOsVmProcesses {
             ],
             Some(payload),
         );
-        if result.is_err() {
-            self.note(attempt.id, ProviderDiagnostic::StartFailed);
+        if let Err(error) = result {
+            self.note(
+                attempt.id,
+                if error == HelperFailure::TimedOut {
+                    ProviderDiagnostic::HelperTimedOut
+                } else {
+                    ProviderDiagnostic::StartFailed
+                },
+            );
             let _ = self.run_resource_command("stop", attempt);
             return Err(ProcessStartFailure::after_spawn_stopped());
         }
@@ -486,7 +628,7 @@ impl ExecutionProvider for MacOsVmProcesses {
             return self.native.inspect(attempt);
         }
         let expected = self.expected(attempt)?;
-        let Some(record) = self.inspect_named(&expected.environment_id)? else {
+        let Some(record) = self.inspect_named(&expected.environment_id, Some(attempt.id))? else {
             return Ok(EnvironmentState::Missing);
         };
         if !record.same_owner(self.host, &expected) {
@@ -551,7 +693,7 @@ impl ExecutionProvider for MacOsVmProcesses {
     }
 
     fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
-        self.list_records(host_id)
+        self.list_records(host_id, None)
             .unwrap_or_default()
             .into_iter()
             .filter(|record| {
@@ -576,7 +718,7 @@ impl ExecutionProvider for MacOsVmProcesses {
         }
         let expected = self.expected(attempt)?;
         Ok(self
-            .inspect_named(&expected.environment_id)?
+            .inspect_named(&expected.environment_id, Some(attempt.id))?
             .is_some_and(|record| record.same_owner(self.host, &expected)))
     }
 
@@ -657,6 +799,7 @@ struct ProbeResponse {
     private_jit_channel: bool,
     fresh_writable_disks: bool,
     resource_limits: bool,
+    process_limits: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,6 +807,7 @@ struct ProbeResponse {
 struct ImageResponse {
     protocol_version: u16,
     image: String,
+    template_digest: String,
     guest_os: String,
     architecture: String,
     immutable: bool,
@@ -680,12 +824,17 @@ struct ResourceRecord {
     attempt_id: String,
     generation: String,
     image: String,
+    template_digest: String,
     guest_os: String,
     architecture: String,
     writable_disk_id: String,
     fresh_writable_disk: bool,
     shared_host_paths: Vec<String>,
     jit_channel: String,
+    applied_cpu_millis: u32,
+    applied_memory_mib: u32,
+    applied_disk_mib: u32,
+    applied_process_limit: u32,
     runner_exit_code: Option<i32>,
 }
 
@@ -697,12 +846,20 @@ impl ResourceRecord {
             && self.attempt_id == expected.attempt.to_string()
             && self.generation == expected.generation
             && self.image == expected.image.as_str()
+            && Some(self.template_digest.as_str()) == expected.image.vm_template_digest()
             && self.guest_os == "macos"
             && self.architecture == host_architecture()
             && !self.writable_disk_id.is_empty()
             && self.fresh_writable_disk
             && self.shared_host_paths.is_empty()
             && self.jit_channel == "private"
+    }
+
+    fn limits_match(&self, requested: ResourceLimits) -> bool {
+        self.applied_cpu_millis == requested.cpu_millis
+            && self.applied_memory_mib == requested.memory_mib
+            && self.applied_disk_mib == requested.disk_mib
+            && self.applied_process_limit == PROCESS_LIMIT
     }
 
     fn is_prepared(&self) -> bool {
@@ -725,6 +882,7 @@ impl ResourceRecord {
         let image = ImageReference::new(self.image).ok()?;
         if self.protocol_version != PROTOCOL_VERSION
             || self.guest_os != "macos"
+            || Some(self.template_digest.as_str()) != image.vm_template_digest()
             || self.architecture != host_architecture()
             || self.writable_disk_id.is_empty()
             || !self.fresh_writable_disk
@@ -769,6 +927,12 @@ fn prepare_args(
         expected.generation.to_owned(),
         "--image".into(),
         expected.image.as_str().into(),
+        "--template-digest".into(),
+        expected
+            .image
+            .vm_template_digest()
+            .expect("validated VM image reference")
+            .into(),
         "--architecture".into(),
         host_architecture().into(),
         "--cpu-millis".into(),
@@ -777,6 +941,8 @@ fn prepare_args(
         resources.memory_mib.to_string(),
         "--disk-mib".into(),
         resources.disk_mib.to_string(),
+        "--process-limit".into(),
+        PROCESS_LIMIT.to_string(),
         "--runner-source".into(),
         attempt.runtime_path().to_string_lossy().into_owned(),
         "--fresh-writable-disk".into(),
@@ -813,6 +979,10 @@ fn image_helper_failure(error: HelperFailure) -> FailureReason {
         HelperFailure::Missing | HelperFailure::Rejected => {
             failure("macOS VM image is unavailable or incompatible")
         }
+        HelperFailure::TemplateMismatch => {
+            failure("macOS VM template digest does not match policy")
+        }
+        HelperFailure::TimedOut => failure("macOS VM helper timed out"),
         HelperFailure::Degraded => failure("macOS VM helper is degraded"),
     }
 }
@@ -823,6 +993,8 @@ fn operation_helper_failure(error: HelperFailure) -> FailureReason {
         HelperFailure::PermissionDenied => failure("macOS VM helper permission denied"),
         HelperFailure::Missing => failure("macOS VM resource is absent"),
         HelperFailure::Rejected => failure("macOS VM helper rejected the operation"),
+        HelperFailure::TemplateMismatch => failure("macOS VM template digest mismatch"),
+        HelperFailure::TimedOut => failure("macOS VM helper operation timed out"),
         HelperFailure::Degraded => failure("macOS VM helper operation failed"),
     }
 }
@@ -837,6 +1009,8 @@ enum HelperFailure {
     PermissionDenied,
     Missing,
     Rejected,
+    TemplateMismatch,
+    TimedOut,
     Degraded,
 }
 
@@ -858,46 +1032,107 @@ impl SystemHelper {
     }
 
     fn invoke(&self, args: &[String], stdin: Option<&[u8]>) -> std::io::Result<Output> {
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .arg("--protocol-version")
             .arg(PROTOCOL_VERSION.to_string())
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        if let Some(payload) = stdin {
-            let mut pipe = child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("helper stdin unavailable"))?;
-            pipe.write_all(payload)?;
-            pipe.flush()?;
-            drop(pipe);
-        }
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("helper stdout unavailable"));
-        let stdout = match stdout.and_then(read_bounded_response) {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        let status = child.wait()?;
-        Ok(Output {
-            status,
-            stdout,
-            stderr: Vec::new(),
-        })
+            .args(args);
+        invoke_command(command, stdin, HELPER_TIMEOUT)
     }
+}
+
+/// Drive stdin, stdout, and process completion concurrently under one deadline.
+/// A helper that stops reading JIT input, stops closing stdout, or never exits
+/// must not pin the daemon's lifecycle worker indefinitely.
+fn invoke_command(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    let stdin_result = if let Some(payload) = stdin {
+        let mut pipe = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("helper stdin unavailable"))?;
+        let mut payload = payload.to_vec();
+        let (send, receive) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = (|| {
+                pipe.write_all(&payload)?;
+                pipe.flush()
+            })();
+            payload.zeroize();
+            let _ = send.send(result);
+        });
+        Some(receive)
+    } else {
+        None
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("helper stdout unavailable"))?;
+    let (stdout_send, stdout_receive) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_send.send(read_bounded_response(stdout));
+    });
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(helper_timeout());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    if let Some(result) = stdin_result {
+        receive_until(result, deadline, "helper stdin")?;
+    }
+    let stdout = receive_until(stdout_receive, deadline, "helper stdout")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+fn receive_until<T>(
+    receiver: mpsc::Receiver<std::io::Result<T>>,
+    deadline: Instant,
+    channel: &'static str,
+) -> std::io::Result<T> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(helper_timeout());
+    };
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(helper_timeout()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(format!(
+            "{channel} worker disconnected"
+        ))),
+    }
+}
+
+fn helper_timeout() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "macOS VM helper exceeded its five-minute operation timeout",
+    )
 }
 
 fn read_bounded_response(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
@@ -922,6 +1157,7 @@ impl HelperCommand for SystemHelper {
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::NotFound => HelperFailure::NotInstalled,
                 std::io::ErrorKind::PermissionDenied => HelperFailure::PermissionDenied,
+                std::io::ErrorKind::TimedOut => HelperFailure::TimedOut,
                 _ => HelperFailure::Degraded,
             })?;
         if output.status.success() {
@@ -952,6 +1188,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    const TEMPLATE_DIGEST: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_IMAGE: &str = concat!(
+        "vm-version:macos-test-v1@sha256:",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
 
     #[derive(Debug)]
     struct FakeHelper {
@@ -1026,15 +1269,20 @@ mod tests {
                 }
                 Some("prepare") => {
                     let environment = argument(args, "--environment").to_owned();
-                    let value = resource(
-                        &environment,
-                        argument(args, "--host"),
-                        argument(args, "--attempt"),
-                        argument(args, "--generation"),
-                        argument(args, "--image"),
-                        "prepared",
-                        None,
-                    );
+                    let value = resource(ResourceFixture {
+                        environment: &environment,
+                        host: argument(args, "--host"),
+                        attempt: argument(args, "--attempt"),
+                        generation: argument(args, "--generation"),
+                        image: argument(args, "--image"),
+                        template_digest: argument(args, "--template-digest"),
+                        cpu_millis: argument(args, "--cpu-millis").parse().unwrap(),
+                        memory_mib: argument(args, "--memory-mib").parse().unwrap(),
+                        disk_mib: argument(args, "--disk-mib").parse().unwrap(),
+                        process_limit: argument(args, "--process-limit").parse().unwrap(),
+                        state: "prepared",
+                        runner_exit_code: None,
+                    });
                     self.records.lock().unwrap().insert(environment, value);
                     Ok(b"{}".to_vec())
                 }
@@ -1088,14 +1336,16 @@ mod tests {
             "macos_guest_entitlement": true,
             "private_jit_channel": true,
             "fresh_writable_disks": true,
-            "resource_limits": true
+            "resource_limits": true,
+            "process_limits": true
         })
     }
 
     fn ready_image() -> Value {
         json!({
             "protocol_version": PROTOCOL_VERSION,
-            "image": "vm-version:macos-test-v1",
+            "image": TEST_IMAGE,
+            "template_digest": TEMPLATE_DIGEST,
             "guest_os": "macos",
             "architecture": host_architecture(),
             "immutable": true,
@@ -1103,30 +1353,42 @@ mod tests {
         })
     }
 
-    fn resource(
-        environment: &str,
-        host: &str,
-        attempt: &str,
-        generation: &str,
-        image: &str,
-        state: &str,
+    struct ResourceFixture<'a> {
+        environment: &'a str,
+        host: &'a str,
+        attempt: &'a str,
+        generation: &'a str,
+        image: &'a str,
+        template_digest: &'a str,
+        cpu_millis: u32,
+        memory_mib: u32,
+        disk_mib: u32,
+        process_limit: u32,
+        state: &'a str,
         runner_exit_code: Option<i32>,
-    ) -> Value {
+    }
+
+    fn resource(fixture: ResourceFixture<'_>) -> Value {
         json!({
             "protocol_version": PROTOCOL_VERSION,
-            "environment_id": environment,
-            "state": state,
-            "host_id": host,
-            "attempt_id": attempt,
-            "generation": generation,
-            "image": image,
+            "environment_id": fixture.environment,
+            "state": fixture.state,
+            "host_id": fixture.host,
+            "attempt_id": fixture.attempt,
+            "generation": fixture.generation,
+            "image": fixture.image,
+            "template_digest": fixture.template_digest,
             "guest_os": "macos",
             "architecture": host_architecture(),
-            "writable_disk_id": format!("disk-{environment}"),
+            "writable_disk_id": format!("disk-{}", fixture.environment),
             "fresh_writable_disk": true,
             "shared_host_paths": [],
             "jit_channel": "private",
-            "runner_exit_code": runner_exit_code
+            "applied_cpu_millis": fixture.cpu_millis,
+            "applied_memory_mib": fixture.memory_mib,
+            "applied_disk_mib": fixture.disk_mib,
+            "applied_process_limit": fixture.process_limit,
+            "runner_exit_code": fixture.runner_exit_code
         })
     }
 
@@ -1149,7 +1411,7 @@ mod tests {
         policy
             .set_execution_policy(ExecutionPolicy::Isolated {
                 backend: Backend::VirtualMachine,
-                image: ImageReference::new("vm-version:macos-test-v1").unwrap(),
+                image: ImageReference::new(TEST_IMAGE).unwrap(),
                 resources: ResourceLimits {
                     cpu_millis: 2_000,
                     memory_mib: 4_096,
@@ -1172,11 +1434,23 @@ mod tests {
             .allocate_execution(AttemptExecution::Isolated {
                 provider_kind: Backend::VirtualMachine,
                 environment_id: None,
-                resolved_image: ImageReference::new("vm-version:macos-test-v1").unwrap(),
+                resolved_image: ImageReference::new(TEST_IMAGE).unwrap(),
                 generation: format!("generation-{id}"),
             })
             .unwrap();
         attempt
+    }
+
+    #[test]
+    fn image_remedy_names_the_exact_policy_template() {
+        let policy = isolated_policy();
+        let remedy = MacOsVmProcesses::policy_remedy(
+            &policy,
+            ProviderCapability::ImageUnavailableOrIncompatible,
+        );
+        assert!(remedy.contains(TEST_IMAGE), "{remedy}");
+        assert!(remedy.contains("SHA-256"), "{remedy}");
+        assert!(!remedy.contains("host isolation status"), "{remedy}");
     }
 
     #[test]
@@ -1200,6 +1474,10 @@ mod tests {
             ),
             (
                 "resource_limits",
+                MacOsVmHostState::ResourceLimitsUnavailable,
+            ),
+            (
+                "process_limits",
                 MacOsVmHostState::ResourceLimitsUnavailable,
             ),
         ] {
@@ -1236,6 +1514,7 @@ mod tests {
                 HelperFailure::PermissionDenied,
                 MacOsVmHostState::HelperPermissionDenied,
             ),
+            (HelperFailure::TimedOut, MacOsVmHostState::HelperTimedOut),
             (HelperFailure::Missing, MacOsVmHostState::HelperIncompatible),
             (
                 HelperFailure::Rejected,
@@ -1260,6 +1539,7 @@ mod tests {
         assert_eq!(provider.probe(&policy), ProviderCapability::Ready);
 
         for (field, bad) in [
+            ("template_digest", json!("b".repeat(64))),
             ("guest_os", json!("linux")),
             ("architecture", json!("other")),
             ("immutable", json!(false)),
@@ -1300,6 +1580,11 @@ mod tests {
                 ProviderCapability::ImageUnavailableOrIncompatible,
             ),
             (HelperFailure::Degraded, ProviderCapability::Degraded),
+            (HelperFailure::TimedOut, ProviderCapability::Degraded),
+            (
+                HelperFailure::TemplateMismatch,
+                ProviderCapability::ImageUnavailableOrIncompatible,
+            ),
         ] {
             helper.set_image_failure(failure);
             assert_eq!(provider.probe(&policy), expected);
@@ -1328,6 +1613,8 @@ mod tests {
             "--cpu-millis",
             "--memory-mib",
             "--disk-mib",
+            "--process-limit",
+            "--template-digest",
         ] {
             assert!(
                 prepare.iter().any(|arg| arg == required),
@@ -1335,6 +1622,120 @@ mod tests {
             );
         }
         assert!(!prepare.iter().any(|arg| arg == "--mount"));
+        assert_eq!(
+            argument(prepare, "--process-limit"),
+            PROCESS_LIMIT.to_string()
+        );
+        assert_eq!(argument(prepare, "--template-digest"), TEMPLATE_DIGEST);
+    }
+
+    #[test]
+    fn prepare_rejects_applied_resource_or_process_limit_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = FakeHelper::ready();
+        let policy = isolated_policy();
+        let provider = provider(policy.host_id, Arc::clone(&helper));
+
+        for (id, field) in [
+            (12, "applied_cpu_millis"),
+            (13, "applied_memory_mib"),
+            (14, "applied_disk_mib"),
+            (15, "applied_process_limit"),
+        ] {
+            let attempt = isolated_attempt(&policy, id, root.path());
+            provider.prepare(&attempt, &policy).unwrap();
+            let environment = provider.expected(&attempt).unwrap().environment_id;
+            helper
+                .records
+                .lock()
+                .unwrap()
+                .get_mut(&environment)
+                .unwrap()[field] = json!(1);
+            assert!(
+                provider.prepare(&attempt, &policy).is_err(),
+                "field {field}"
+            );
+            assert_eq!(
+                provider.diagnostics(&attempt),
+                vec![ProviderDiagnostic::ResourceLimitMismatch],
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_digest_mismatch_is_typed_and_blocks_prepare() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = FakeHelper::ready();
+        let policy = isolated_policy();
+        let provider = provider(policy.host_id, Arc::clone(&helper));
+        let attempt = isolated_attempt(&policy, 16, root.path());
+        let mut image = ready_image();
+        image["template_digest"] = json!("b".repeat(64));
+        helper.set_image(image);
+
+        assert!(provider.prepare(&attempt, &policy).is_err());
+        assert_eq!(
+            provider.diagnostics(&attempt),
+            vec![ProviderDiagnostic::TemplateIdentityMismatch]
+        );
+    }
+
+    #[test]
+    fn helper_timeout_is_a_typed_attempt_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = FakeHelper::ready();
+        let policy = isolated_policy();
+        let provider = provider(policy.host_id, Arc::clone(&helper));
+        let attempt = isolated_attempt(&policy, 17, root.path());
+        helper.set_probe(Err(HelperFailure::TimedOut));
+
+        assert!(provider.prepare(&attempt, &policy).is_err());
+        assert_eq!(
+            provider.diagnostics(&attempt),
+            vec![ProviderDiagnostic::HelperTimedOut]
+        );
+    }
+
+    #[test]
+    fn helper_wait_stdout_and_blocked_stdin_share_one_deadline() {
+        for (command, input) in [
+            (blocking_command(false), None),
+            (blocking_command(true), None),
+            (blocking_command(false), Some(vec![b'x'; 4 * 1024 * 1024])),
+        ] {
+            let error = invoke_command(command, input.as_deref(), Duration::from_millis(50))
+                .expect_err("helper must time out");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[cfg(windows)]
+    fn blocking_command(writes_stdout: bool) -> Command {
+        let mut command = Command::new("cmd");
+        command.args([
+            "/C",
+            if writes_stdout {
+                "echo partial & ping -n 4 127.0.0.1 >NUL"
+            } else {
+                "ping -n 4 127.0.0.1 >NUL"
+            },
+        ]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn blocking_command(writes_stdout: bool) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            if writes_stdout {
+                "printf partial; sleep 3"
+            } else {
+                "sleep 3"
+            },
+        ]);
+        command
     }
 
     #[test]
@@ -1370,15 +1771,20 @@ mod tests {
         let first_name = provider.expected(&first).unwrap().environment_id;
         let second_expected = provider.expected(&second).unwrap();
         let reused_disk = helper.record(&first_name).unwrap()["writable_disk_id"].clone();
-        let mut second_record = resource(
-            &second_expected.environment_id,
-            &policy.host_id.to_string(),
-            &second.id.to_string(),
-            second_expected.generation,
-            second_expected.image.as_str(),
-            "prepared",
-            None,
-        );
+        let mut second_record = resource(ResourceFixture {
+            environment: &second_expected.environment_id,
+            host: &policy.host_id.to_string(),
+            attempt: &second.id.to_string(),
+            generation: second_expected.generation,
+            image: second_expected.image.as_str(),
+            template_digest: TEMPLATE_DIGEST,
+            cpu_millis: 2_000,
+            memory_mib: 4_096,
+            disk_mib: 32_768,
+            process_limit: PROCESS_LIMIT,
+            state: "prepared",
+            runner_exit_code: None,
+        });
         second_record["writable_disk_id"] = reused_disk;
         helper
             .records
@@ -1495,15 +1901,20 @@ mod tests {
         let policy = isolated_policy();
         let provider = provider(policy.host_id, Arc::clone(&helper));
         let environment = "rm-linux-impostor";
-        let mut record = resource(
+        let mut record = resource(ResourceFixture {
             environment,
-            &policy.host_id.to_string(),
-            &AttemptId::from_u128(61).to_string(),
-            "generation-61",
-            "vm-version:macos-test-v1",
-            "running",
-            None,
-        );
+            host: &policy.host_id.to_string(),
+            attempt: &AttemptId::from_u128(61).to_string(),
+            generation: "generation-61",
+            image: TEST_IMAGE,
+            template_digest: TEMPLATE_DIGEST,
+            cpu_millis: 2_000,
+            memory_mib: 4_096,
+            disk_mib: 32_768,
+            process_limit: PROCESS_LIMIT,
+            state: "running",
+            runner_exit_code: None,
+        });
         record["guest_os"] = json!("linux");
         helper
             .records

@@ -964,6 +964,8 @@ pub enum BackendMode {
 pub struct IsolationArgs {
     #[arg(long, value_enum)]
     pub backend: Option<BackendMode>,
+    /// Immutable image identity. Virtual-machine references use
+    /// vm-version:<version>@sha256:<template-digest>.
     #[arg(long)]
     pub image: Option<String>,
     #[arg(long)]

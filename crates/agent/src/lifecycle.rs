@@ -1320,6 +1320,9 @@ pub struct ResolvedEnvironment {
 pub enum ProviderDiagnostic {
     CapabilityUnavailable,
     ImageRejected,
+    TemplateIdentityMismatch,
+    ResourceLimitMismatch,
+    HelperTimedOut,
     PrepareFailed,
     StartFailed,
     OwnershipMismatch,
@@ -4326,8 +4329,11 @@ mod tests {
             Ok(Some(ResolvedEnvironment {
                 provider_kind: Backend::Oci,
                 image: if self.incompatible_image.load(Ordering::SeqCst) {
-                    ImageReference::new("vm-version:wrong-provider")
-                        .expect("valid but incompatible")
+                    ImageReference::new(format!(
+                        "vm-version:wrong-provider@sha256:{}",
+                        "f".repeat(64)
+                    ))
+                    .expect("valid but incompatible")
                 } else {
                     image.clone()
                 },
