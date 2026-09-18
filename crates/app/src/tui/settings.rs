@@ -2245,12 +2245,21 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let capability = backend_capability(self.execution_backend);
+            let capability = backend_capability(self.execution_backend, &form.provider_diagnostics);
             lines.push(FormLine::keep(format!(
                 "Selected provider: {}; remedy: {}",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
+            if !capability.unsupported_workflow_capabilities.is_empty() {
+                lines.push(FormLine::keep(format!(
+                    "Unsupported workflows: {}",
+                    capability.unsupported_workflow_capabilities.join(", ")
+                )));
+            }
         }
         if let Some(notice) = &self.execution_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -2265,7 +2274,7 @@ Select another profile in Repositories or create one with the CLI.",
             ))
         }));
         lines.push(FormLine::text(
-            "Isolated scaling remains unavailable until a provider is installed and integrated.",
+            "Provider readiness and the pinned image are checked again before JIT registration.",
         ));
         lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
         *control += 1;
@@ -2413,12 +2422,22 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let capability = backend_capability(self.create_execution_backend);
+            let capability =
+                backend_capability(self.create_execution_backend, &form.provider_diagnostics);
             lines.push(FormLine::keep(format!(
                 "Selected provider: {}; remedy: {}",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
+            if !capability.unsupported_workflow_capabilities.is_empty() {
+                lines.push(FormLine::keep(format!(
+                    "Unsupported workflows: {}",
+                    capability.unsupported_workflow_capabilities.join(", ")
+                )));
+            }
         }
         if let Some(notice) = &self.create_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -2813,7 +2832,10 @@ const fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
+fn backend_capability(
+    backend: BackendMode,
+    capabilities: &[cli::host::IsolationCapability],
+) -> cli::host::IsolationCapability {
     use cli::host::{IsolationBackend, IsolationObservation, IsolationReadiness};
 
     let (backend, state) = match backend {
@@ -2828,11 +2850,21 @@ fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
             IsolationReadiness::NotInstalled,
         ),
     };
-    cli::host::sanitize_isolation_observation(IsolationObservation {
+    let fallback = cli::host::sanitize_isolation_observation(IsolationObservation {
         backend,
         state,
         raw_output: None,
-    })
+    });
+    let wanted = if matches!(backend, IsolationBackend::Auto) && cfg!(windows) {
+        IsolationBackend::WindowsHyperVContainer
+    } else {
+        backend
+    };
+    capabilities
+        .iter()
+        .copied()
+        .find(|capability| capability.backend == wanted)
+        .unwrap_or(fallback)
 }
 
 fn invalid(source: impl std::fmt::Display) -> CliError {
@@ -3284,9 +3316,10 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("remedy: use a supported host and provider"),
+            rendered.contains("remedy: use Windows 11 Pro or Enterprise with Docker Desktop"),
             "{rendered}"
         );
+        assert!(!rendered.contains("Education"), "{rendered}");
     }
 
     #[test]
@@ -5308,7 +5341,7 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Provider readiness and the pinned image are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5350,13 +5383,19 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported host and provider
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
+        Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Provider readiness and the pinned image are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5398,13 +5437,19 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported host and provider
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
+        Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Provider readiness and the pinned image are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5453,8 +5498,17 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported
-        host and provider
+        Selected provider: unsupported; remedy: use Windows 11
+        Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or
+        Datacenter with Moby or Mirantis Container Runtime
+        Support: preview: native acceptance is pending for
+        Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported
+        server runtime, including job, restart, reboot, and
+        resource-exhaustion cases
+        Unsupported workflows: desktop, devices,
+        container_actions, service_containers
         Save execution [Enter/click]
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
@@ -5504,7 +5558,7 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Provider readiness and the pinned image are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5555,7 +5609,7 @@ mod tests {
         OCI provider: not installed
         Hyper-V container provider: unsupported
         Virtual machine provider: not installed
-        Isolated scaling remains unavailable until a provider is installed and integrated.
+        Provider readiness and the pinned image are checked again before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 

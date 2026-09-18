@@ -248,7 +248,7 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
         ]
     );
     for provider in providers {
-        assert_eq!(provider.as_object().unwrap().len(), 3, "{provider}");
+        assert_eq!(provider.as_object().unwrap().len(), 5, "{provider}");
         assert!(
             matches!(
                 provider["state"].as_str(),
@@ -263,6 +263,17 @@ fn isolated_configuration_is_pinned_and_cannot_arm_without_provider() {
             ),
             "{provider}"
         );
+        assert!(provider["unsupported_workflow_capabilities"].is_array());
+        if provider["backend"] == "windows_hyper_v_container" {
+            assert!(
+                provider["support_notice"]
+                    .as_str()
+                    .is_some_and(|notice| notice.contains("preview")),
+                "{provider}"
+            );
+        } else {
+            assert!(provider["support_notice"].is_null(), "{provider}");
+        }
     }
 }
 
