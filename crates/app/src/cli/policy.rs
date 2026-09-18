@@ -1259,7 +1259,7 @@ pub fn apply_policy_mutation_selected(
                         format!(
                             "isolated profile {} cannot be enabled: provider state is {}; nothing was changed",
                             policy.profile_name(),
-                            provider_capability_name(capability)
+                            capability.display_name()
                         ),
                         "runner-manager host isolation status",
                     ));
@@ -1352,18 +1352,6 @@ pub fn apply_policy_mutation_selected(
         }
     }
     Ok(())
-}
-
-const fn provider_capability_name(capability: ProviderCapability) -> &'static str {
-    match capability {
-        ProviderCapability::Ready => "ready",
-        ProviderCapability::Unsupported => "unsupported",
-        ProviderCapability::NotInstalled => "not installed",
-        ProviderCapability::PermissionDenied => "permission denied",
-        ProviderCapability::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
-        ProviderCapability::DiskQuotaUnavailable => "disk quota unavailable",
-        ProviderCapability::Degraded => "degraded",
-    }
 }
 
 fn confirm_disable(

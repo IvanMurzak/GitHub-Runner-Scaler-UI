@@ -1273,6 +1273,19 @@ pub enum ProviderCapability {
 }
 
 impl ProviderCapability {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unsupported => "unsupported",
+            Self::NotInstalled => "not installed",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
+            Self::Degraded => "degraded",
+        }
+    }
+
     pub(crate) fn refusal(self) -> FailureReason {
         FailureReason::IsolationProvider(match self {
             Self::Ready | Self::Degraded => IsolationProviderFailure::Degraded,
