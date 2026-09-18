@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use runner_manager_domain::attempt::{
-    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, RecoveryDecision,
-    RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize, recovery_decision,
+    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, IsolationProviderFailure,
+    RecoveryDecision, RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize,
+    recovery_decision,
 };
 use runner_manager_domain::execution::{AttemptExecution, Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
@@ -43,14 +44,17 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
+use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    ReplacementIntent, RunnerLauncher,
+    ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
 
 mod macos_vm;
 pub use macos_vm::{MacOsVmHostState, MacOsVmProcesses};
+mod windows_hyperv;
+pub use windows_hyperv::{WindowsHyperVContainers, WindowsHyperVHostState};
 
 const IDENTITY_FILE: &str = ".runner-process.json";
 const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
@@ -1228,7 +1232,7 @@ pub struct ProcessStartFailure {
 }
 
 impl ProcessStartFailure {
-    fn before_spawn(reason: FailureReason) -> Self {
+    pub(crate) fn before_spawn(reason: FailureReason) -> Self {
         Self {
             reason,
             retryable: true,
@@ -1266,24 +1270,47 @@ pub enum ProviderCapability {
     NotInstalled,
     PermissionDenied,
     ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
     Degraded,
 }
 
 impl ProviderCapability {
-    fn refusal(self) -> FailureReason {
-        FailureReason::Other(
-            match self {
-                Self::Ready => "provider reported ready",
-                Self::Unsupported => "execution provider unavailable",
-                Self::NotInstalled => "isolation provider not installed",
-                Self::PermissionDenied => "isolation provider permission denied",
-                Self::ImageUnavailableOrIncompatible => {
-                    "isolated image unavailable or incompatible"
-                }
-                Self::Degraded => "isolation provider degraded",
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unsupported => "unsupported",
+            Self::NotInstalled => "not installed",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    pub(crate) fn refusal(self) -> FailureReason {
+        FailureReason::IsolationProvider(match self {
+            Self::Ready | Self::Degraded => IsolationProviderFailure::Degraded,
+            Self::Unsupported => IsolationProviderFailure::Unsupported,
+            Self::NotInstalled => IsolationProviderFailure::NotInstalled,
+            Self::PermissionDenied => IsolationProviderFailure::PermissionDenied,
+            Self::ImageUnavailableOrIncompatible => {
+                IsolationProviderFailure::ImageUnavailableOrIncompatible
             }
-            .into(),
-        )
+            Self::DiskQuotaUnavailable => IsolationProviderFailure::DiskQuotaUnavailable,
+        })
+    }
+}
+
+/// Only the closed isolation category may cross from an adapter into the
+/// attempt journal or operator error. Arbitrary adapter text could echo JIT.
+fn safe_isolation_reason(
+    reason: FailureReason,
+    fallback: IsolationProviderFailure,
+) -> FailureReason {
+    match reason {
+        FailureReason::IsolationProvider(_) => reason,
+        _ => FailureReason::IsolationProvider(fallback),
     }
 }
 
@@ -1426,7 +1453,7 @@ impl fmt::Debug for OneTimeJitHandoff<'_> {
 }
 
 impl<'a> OneTimeJitHandoff<'a> {
-    fn new(config: &'a EncodedJitConfig) -> Self {
+    pub(crate) fn new(config: &'a EncodedJitConfig) -> Self {
         Self { config }
     }
 
@@ -1579,6 +1606,226 @@ pub struct NativeProcesses {
     post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     use_long_lived_test_listener: std::sync::atomic::AtomicBool,
+}
+
+/// Production provider set. Native and isolated allocations are routed by the
+/// immutable execution kind in the policy/journal; an unavailable isolated
+/// backend can never fall through to native process launch.
+#[derive(Debug)]
+pub struct PlatformExecutionProvider {
+    native: NativeProcesses,
+    oci: OciProcesses,
+    windows_hyper_v: WindowsHyperVContainers,
+    macos_vm: MacOsVmProcesses,
+}
+
+impl PlatformExecutionProvider {
+    #[must_use]
+    pub fn new(host_id: HostId) -> Self {
+        Self {
+            native: NativeProcesses::new(),
+            oci: OciProcesses::new(host_id),
+            windows_hyper_v: WindowsHyperVContainers::new(host_id),
+            macos_vm: MacOsVmProcesses::new(host_id),
+        }
+    }
+
+    /// Returns an operator action scoped to the selected provider and policy.
+    #[must_use]
+    pub fn policy_remedy(&self, policy: &ScalePolicy, capability: ProviderCapability) -> String {
+        let macos_vm = matches!(
+            policy.execution_policy(),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated {
+                backend: Backend::VirtualMachine,
+                ..
+            }
+        ) || (cfg!(target_os = "macos")
+            && matches!(
+                policy.execution_policy(),
+                runner_manager_domain::execution::ExecutionPolicy::Isolated {
+                    backend: Backend::Auto,
+                    ..
+                }
+            ));
+        if macos_vm {
+            MacOsVmProcesses::policy_remedy(policy, capability)
+        } else {
+            "runner-manager host isolation status".into()
+        }
+    }
+
+    fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
+        match backend {
+            Backend::Auto => {
+                #[cfg(target_os = "windows")]
+                {
+                    Some(&self.windows_hyper_v)
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    Some(&self.macos_vm)
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    Some(&self.oci)
+                }
+            }
+            Backend::Oci => Some(&self.oci),
+            Backend::WindowsHyperVContainer => Some(&self.windows_hyper_v),
+            Backend::VirtualMachine => Some(&self.macos_vm),
+        }
+    }
+
+    fn provider_for_attempt(&self, attempt: &RunnerAttempt) -> Option<&dyn ExecutionProvider> {
+        match attempt.execution() {
+            AttemptExecution::Native { .. } => Some(&self.native),
+            AttemptExecution::Isolated { provider_kind, .. } => {
+                self.isolated_provider(*provider_kind)
+            }
+        }
+    }
+
+    fn required_provider_for_attempt(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<&dyn ExecutionProvider, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))
+    }
+}
+
+impl ExecutionProvider for PlatformExecutionProvider {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => self.native.probe(policy),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .map_or(ProviderCapability::Unsupported, |provider| {
+                    provider.probe(policy)
+                }),
+        }
+    }
+
+    fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.resolve(policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .resolve(policy),
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.prepare(attempt, policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .prepare(attempt, policy),
+        }
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| {
+                ProcessStartFailure::before_spawn(FailureReason::Other(
+                    "execution provider unavailable".into(),
+                ))
+            })?
+            .start(prepared, attempt, handoff)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .inspect(attempt)
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.stop(attempt)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .destroy(attempt)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recover(attempt)
+    }
+
+    fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
+        let mut owned = self.oci.enumerate_owned(host_id);
+        owned.extend(self.windows_hyper_v.enumerate_owned(host_id));
+        owned.extend(self.macos_vm.enumerate_owned(host_id));
+        owned
+    }
+
+    fn diagnostics(&self, attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+        self.provider_for_attempt(attempt)
+            .map_or_else(Vec::new, |provider| provider.diagnostics(attempt))
+    }
+
+    fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.owns(attempt)
+    }
+
+    fn spawn(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+    ) -> Result<u32, ProcessStartFailure> {
+        if !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "native process launch refused for an isolated allocation".into(),
+            )));
+        }
+        self.native.spawn(attempt, config)
+    }
+
+    fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .is_alive(attempt)
+    }
+
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recovered_pid(attempt)
+    }
+
+    fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.completed_successfully(attempt))
+    }
+
+    fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .record_terminate_intent(attempt)
+    }
+
+    fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.has_terminate_intent(attempt))
+    }
+
+    fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .terminate(attempt)
+    }
 }
 
 #[cfg(test)]
@@ -2588,6 +2835,18 @@ impl LifecycleLauncher {
         {
             write_runner_id(attempt.runtime_path(), runner_id)?;
         }
+        // A successfully reaped one-shot listener is stronger evidence than a
+        // missing registration. Recovered guests have no attached child and
+        // still follow the conservative orphan path below.
+        if attempt.state() == AttemptState::Busy
+            && !live
+            && github.status == GithubRunnerObservation::NotRegistered
+            && self.ports.processes.completed_successfully(&attempt)
+        {
+            self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
+        }
         match recovery_decision(
             &attempt,
             RecoveryObservation {
@@ -3063,11 +3322,16 @@ impl LifecycleLauncher {
         })?;
         // Intentionally constructed from typed local facts, not runner output.
         // Raw child output can contain workflow secrets and is never copied.
+        let reason_kind = match outcome {
+            AttemptOutcome::Failed { reason } => failure_reason_kind(reason),
+            _ => "none",
+        };
         let diagnostic = format!(
-            "attempt_id={}\npolicy_id={}\noutcome={}\n",
+            "attempt_id={}\npolicy_id={}\noutcome={}\nreason={}\n",
             attempt.id,
             attempt.policy_id,
-            OutcomeKind::of(outcome).as_str()
+            OutcomeKind::of(outcome).as_str(),
+            reason_kind,
         );
         fs::write(
             self.diagnostics_root.join(format!("{}.log", attempt.id)),
@@ -3423,10 +3687,12 @@ impl LifecycleLauncher {
         if capability != ProviderCapability::Ready {
             return Err(LifecycleError::Failed(capability.refusal()));
         }
-        let resolved = self.ports.processes.resolve(policy).map_err(|_| {
-            LifecycleError::Failed(FailureReason::Other(
-                "isolation provider resolution failed".into(),
-            ))
+        let resolved = self.ports.processes.resolve(policy).map_err(|reason| {
+            LifecycleError::Failed(if policy.execution_policy().is_native() {
+                reason
+            } else {
+                safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
+            })
         })?;
         if policy.execution_policy().is_native() != resolved.is_none() {
             return Err(LifecycleError::Failed(FailureReason::Other(
@@ -3500,7 +3766,7 @@ impl LifecycleLauncher {
             Ok(prepared) => prepared,
             Err(reason) => {
                 let safe_reason = if resolved.is_some() {
-                    FailureReason::Other("isolated environment preparation failed".into())
+                    safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
                 } else {
                     reason
                 };
@@ -3509,13 +3775,13 @@ impl LifecycleLauncher {
         };
         if resolved.is_some() {
             let Some(identity) = prepared.identity() else {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider omitted environment identity".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             };
             if !identity_matches_intent(self.host_id, &attempt, identity) {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider ownership mismatch".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             }
             let EnvironmentIdentity::Isolated { environment_id, .. } = identity else {
@@ -3548,14 +3814,15 @@ impl LifecycleLauncher {
                 .ports
                 .processes
                 .start(prepared, &attempt, OneTimeJitHandoff::new(&config))
-                .map_err(|_| {
-                    LifecycleError::Failed(FailureReason::Other(
-                        "isolated environment start failed".into(),
+                .map_err(|failure| {
+                    LifecycleError::Failed(safe_isolation_reason(
+                        failure.reason,
+                        IsolationProviderFailure::RuntimeOperationFailed,
                     ))
                 })?;
             if !identity_matches_intent(self.host_id, &attempt, &started) {
-                return Err(LifecycleError::Failed(FailureReason::Other(
-                    "provider start identity mismatch".into(),
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
                 )));
             }
             attempt
@@ -3778,6 +4045,23 @@ mod tests {
     use runner_manager_github::jit::JitRunner;
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
+
+    #[test]
+    fn production_provider_set_routes_every_implemented_isolated_backend() {
+        let providers = PlatformExecutionProvider::new(HostId::from_u128(1));
+        assert!(providers.isolated_provider(Backend::Auto).is_some());
+        assert!(providers.isolated_provider(Backend::Oci).is_some());
+        assert!(
+            providers
+                .isolated_provider(Backend::WindowsHyperVContainer)
+                .is_some()
+        );
+        assert!(
+            providers
+                .isolated_provider(Backend::VirtualMachine)
+                .is_some()
+        );
+    }
 
     /// One event's fields, in the order they were recorded.
     type CapturedFields = Vec<(String, String)>;
@@ -4270,12 +4554,14 @@ mod tests {
     struct FakeIsolatedProvider {
         resources: Mutex<BTreeMap<AttemptId, (EnvironmentIdentity, EnvironmentState)>>,
         extra_resources: Mutex<Vec<EnvironmentIdentity>>,
+        unsupported_host: AtomicBool,
         permission_denied: AtomicBool,
         incompatible_image: AtomicBool,
         prepare_failure: AtomicBool,
         recovery_unavailable: AtomicBool,
         destroy_deferred: AtomicBool,
         handoffs: AtomicUsize,
+        completed_successfully: AtomicBool,
         native_calls: AtomicUsize,
         actions: Mutex<Vec<&'static str>>,
     }
@@ -4308,7 +4594,9 @@ mod tests {
 
     impl ExecutionProvider for FakeIsolatedProvider {
         fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
-            if self.permission_denied.load(Ordering::SeqCst) {
+            if self.unsupported_host.load(Ordering::SeqCst) {
+                ProviderCapability::Unsupported
+            } else if self.permission_denied.load(Ordering::SeqCst) {
                 ProviderCapability::PermissionDenied
             } else if policy.execution_policy().is_native() {
                 ProviderCapability::Unsupported
@@ -4467,7 +4755,7 @@ mod tests {
             panic!("native fallback")
         }
         fn completed_successfully(&self, _attempt: &RunnerAttempt) -> bool {
-            false
+            self.completed_successfully.load(Ordering::SeqCst)
         }
         fn record_terminate_intent(&self, _attempt: &RunnerAttempt) -> Result<(), FailureReason> {
             panic!("native fallback")
@@ -4829,11 +5117,9 @@ mod tests {
             .launch_result()
             .await
             .expect_err("provider is unavailable");
-        assert!(
-            failure
-                .reason
-                .to_string()
-                .contains("execution provider unavailable")
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
         );
 
         let runtime = harness.host_root().join("isolated-owned-environment");
@@ -4870,11 +5156,9 @@ mod tests {
             .launch_result()
             .await
             .expect_err("provider unavailable for this policy");
-        assert!(
-            failure
-                .reason
-                .to_string()
-                .contains("execution provider unavailable")
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
         );
         harness
             .launcher
@@ -4998,6 +5282,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_isolated_job_exit_is_recorded_as_completed() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let attempt = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .unwrap();
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        launcher.supervise(&harness.policy).await.unwrap();
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .get_mut(&attempt.id)
+            .unwrap()
+            .1 = EnvironmentState::Exited;
+        provider
+            .completed_successfully
+            .store(true, Ordering::SeqCst);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        launcher.supervise(&harness.policy).await.unwrap();
+        let cleaned = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+    }
+
+    #[tokio::test]
     async fn isolated_prepare_failure_stays_local_and_crash_gap_recovers_owned_resource() {
         let harness = isolated_harness();
         let provider = Arc::new(FakeIsolatedProvider::default());
@@ -5008,7 +5333,7 @@ mod tests {
             .await
             .expect("ready");
         let guard = harness.allocation_lock.acquire().await.unwrap();
-        launcher
+        let failure = launcher
             .launch(LaunchRequest {
                 host: &harness.host,
                 policy: &harness.policy,
@@ -5016,6 +5341,10 @@ mod tests {
             })
             .await
             .expect_err("prepare failed after creating resource");
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
         assert_eq!(provider.resource_count(), 1);
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
         assert!(
@@ -5026,6 +5355,12 @@ mod tests {
                 .contains("provider-secret-needle")
         );
         let id = harness.store.attempts().unwrap()[0].id;
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().outcome(),
+            Some(&AttemptOutcome::failed(FailureReason::IsolationProvider(
+                IsolationProviderFailure::RuntimeOperationFailed
+            )))
+        );
         let restarted = launcher_with_isolated(&harness, Arc::clone(&provider));
         restarted
             .recover_startup(std::slice::from_ref(&harness.policy))
@@ -5040,6 +5375,10 @@ mod tests {
             harness.store.attempt(id).unwrap().unwrap().state(),
             AttemptState::Cleaned
         );
+        let diagnostic =
+            fs::read_to_string(restarted.diagnostics_root.join(format!("{id}.log"))).unwrap();
+        assert!(diagnostic.contains("reason=isolation_runtime_operation_failed"));
+        assert!(!diagnostic.contains("provider-secret-needle"));
         assert_eq!(
             provider
                 .actions
@@ -5051,6 +5390,52 @@ mod tests {
             1
         );
         assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn isolation_capability_and_adapter_failures_keep_closed_categories() {
+        let cases = [
+            (
+                ProviderCapability::NotInstalled,
+                IsolationProviderFailure::NotInstalled,
+            ),
+            (
+                ProviderCapability::PermissionDenied,
+                IsolationProviderFailure::PermissionDenied,
+            ),
+            (
+                ProviderCapability::ImageUnavailableOrIncompatible,
+                IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            ),
+            (
+                ProviderCapability::DiskQuotaUnavailable,
+                IsolationProviderFailure::DiskQuotaUnavailable,
+            ),
+            (
+                ProviderCapability::Degraded,
+                IsolationProviderFailure::Degraded,
+            ),
+        ];
+        for (capability, category) in cases {
+            assert_eq!(
+                capability.refusal(),
+                FailureReason::IsolationProvider(category)
+            );
+        }
+        let raw = FailureReason::Other("ghp_secret_from_provider".into());
+        let safe = safe_isolation_reason(raw, IsolationProviderFailure::RuntimeOperationFailed);
+        assert_eq!(
+            safe,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
+        assert!(!safe.to_string().contains("ghp_secret"));
+        assert_eq!(
+            safe_isolation_reason(
+                FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied),
+                IsolationProviderFailure::RuntimeOperationFailed,
+            ),
+            FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied)
+        );
     }
 
     #[tokio::test]
@@ -5092,6 +5477,37 @@ mod tests {
             assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
             assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_host_stops_before_jit_without_allocation_or_native_fallback() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        provider.unsupported_host.store(true, Ordering::SeqCst);
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let error = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect_err("unsupported host must be refused before JIT");
+
+        assert_eq!(
+            error.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
+        );
+        assert!(harness.store.attempts().unwrap().is_empty());
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        assert!(provider.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

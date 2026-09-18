@@ -2,7 +2,9 @@
 
 use std::io::{self, Write};
 
-use runner_manager_agent::lifecycle::{ExecutionProvider, MacOsVmProcesses, ProviderCapability};
+use runner_manager_agent::lifecycle::{
+    ExecutionProvider, PlatformExecutionProvider, ProviderCapability,
+};
 use runner_manager_domain::execution::{Backend, ExecutionPolicy, ImageReference, ResourceLimits};
 use runner_manager_domain::model::{HostLabel, ProfileName, ScaleTarget};
 use runner_manager_domain::store::{Store, StoreError};
@@ -203,7 +205,7 @@ pub fn dispatch(
                 .set_execution_policy(execution)
                 .map_err(|error| CliError::new(Failure::InvalidArgument, error.to_string()))?;
             if policy.enabled() && !policy.execution_policy().is_native() {
-                let provider = MacOsVmProcesses::new(policy.host_id);
+                let provider = PlatformExecutionProvider::new(policy.host_id);
                 let capability = provider.probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
@@ -214,7 +216,7 @@ pub fn dispatch(
                         ),
                         format!(
                             "{}; or disable the profile first with runner-manager repo profile set-scale {target} --profile {} --enabled false",
-                            MacOsVmProcesses::policy_remedy(&policy, capability),
+                            provider.policy_remedy(&policy, capability),
                             policy.profile_name()
                         ),
                     ));
@@ -362,5 +364,18 @@ fn show_policy(
             .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?
     )
     .map_err(write_failed("this profile status"))?;
+    if matches!(
+        policy.execution_policy(),
+        ExecutionPolicy::Isolated {
+            backend: Backend::WindowsHyperVContainer,
+            ..
+        }
+    ) {
+        writeln!(
+            out,
+            "workflow compatibility: script and JavaScript actions supported; desktop, devices, container actions, and service containers unsupported"
+        )
+        .map_err(write_failed("this profile status"))?;
+    }
     Ok(())
 }

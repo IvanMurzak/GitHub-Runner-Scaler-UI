@@ -2,11 +2,10 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1, a2, b1, b2, c1 and c2 merged into the
-integration ref; d1 and d2 are held at green PRs for native acceptance, and d3
-is dispatched.
+**Implementation status:** a1, a2, b1, b2, c1, c2, d1 and d2 merged into the
+integration ref; d3 is held at a green PR for native acceptance.
 **Repository:** `.` / `main`.
-**Last updated:** 2026-09-15.
+**Last updated:** 2026-09-18.
 
 This file is the only live task-state record.
 
@@ -54,9 +53,9 @@ This file is the only live task-state record.
 | b2-isolated-lifecycle | `tasks/b2-isolated-lifecycle.md` | B | 2 | b1-execution-domain-provider, a2-routing-reconcile | . | main | 10/10 | top | ✅ | [PR #73](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/73) / 590619c | 2026-09-15 |
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
-| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | 🟣 | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / native Linux+WSL real-job gates pending | 2026-09-15 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / native Windows client+Server gates pending | 2026-09-16 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🔵 | worktree-d3-macos-vm / `implement-task` | 2026-09-16 |
+| d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / 69b2da3 | 2026-09-18 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -221,7 +220,125 @@ A real Hyper-V-isolated runner job, restart/recovery/forensic tests, and client
 plus Server native matrix remain unverified, so PR #77 stays open and d2 stays
 `🟣`.
 
+**2026-09-17 — platform acceptance advanced.** PR #74 at 64889cf now has a
+real one-time GitHub JIT job through the production managed-WSL OCI provider,
+native Ubuntu and WSL 1 GiB bounded stores with real `ENOSPC`, forensic secret
+scans, generation-safe WSL terminate/restart recovery, and a green guarded
+full-Windows-reboot harness. Only the disruptive full host reboot remains.
+PR #77 at 84083c9 now enforces the 256-process Job Object limit before JIT,
+attests every Windows container boundary, narrows editions truthfully, and has
+a green guarded maintenance/native-job/recovery harness. This physical Windows
+11 Pro host is ready after enabling Containers and rebooting; Server requires
+a separate host. PR #79 at 1fc5672 now includes and compiles a real Swift
+Virtualization.framework helper on ARM64 and Intel, with hosted APFS/socket/
+signature/entitlement probes. Hosted ARM64 reports
+`VZVirtualMachine.isSupported == false`; real Apple Silicon hardware plus a
+signed helper and authorized digest-pinned image remain required, while Apple
+does not expose native macOS guest APIs on Intel.
+
 **2026-09-16 — d3 dispatched.** The macOS VM task slot was provisioned from
 the verified remote integration ref after the latest `main` release update,
 with its branch-scoped PR base read back as `runner-sandbox-isolation`. Its
 native Codex `implement-task` session loop will run in the isolated checkout.
+
+**2026-09-16 — d3 PR held for native acceptance.** `implement-task` opened
+PR #79. Scheduler review required process-count enforcement, exact applied
+limit attestation, bounded helper calls, policy-specific image remedies, and a
+digest-pinned template identity; those fail-closed protocol fixes are in head
+d0e171c. The exact full local gate and seven CI/E2E checks passed. No signed
+entitled helper, real digest-pinned Virtualization.framework guest, Apple
+Silicon/Intel job, reboot/recovery drill, or guest/host secret forensic run was
+available, so PR #79 stays open and d3 stays `🟣`.
+
+**2026-09-17 — disruptive platform review completed.** A real Windows reboot
+advanced both prepared native gates. The d1 reboot receipt proved a new Windows
+boot and retained the bounded WSL OCI resource, but the recovery assertion
+incorrectly rejected Podman's truthful post-reboot `Exited` state. PR #74 head
+884c0e2 now accepts only retained `Starting` or `Exited` resources, still
+rejects `Missing` and unexpected `Running`, normalizes PowerShell 5.1/7 receipt
+timestamps, and passed the full local gate plus eight remote checks. The guarded
+harness recorded the failed receipt as cleanup-required; cleanup and one fresh
+prepare/reboot/verify cycle remain.
+
+PR #77 head ab9dfb4 passed the full local gate and seven remote checks. Its
+acceptance harness now safely backs up and restores an audited pre-existing
+service, and dispatches its PR-only native workflow through a one-time guarded
+label because GitHub cannot manually dispatch a new workflow absent from the
+default branch. This Windows client reboot is verified, but the elevated Docker
+service, live Hyper-V container job, restart/forensics, cleanup and rollback
+phases still require an interactive UAC-approved run. A separate native Windows
+Server host remains required for the declared Server gate.
+
+PR #79 head b53619b adds the missing reproducible native acceptance harness,
+including PR-only live-job dispatch, exact fresh-disk/no-share/resource/process
+attestation, daemon crash/restart, host-reboot receipt, orphan recovery, secret
+forensics and guarded cleanup/rollback. The full local and remote gates pass.
+The repository defines the RMV1 guest protocol but does not ship the operator's
+guest LaunchDaemon. Immutable native evidence still requires an
+operator-controlled bare-metal Apple Silicon Mac, APFS, the entitled signed
+helper and a digest-pinned Apple-authorized template containing that bootstrap;
+hosted macOS has no nested virtualization. Intel remains explicitly fail closed
+and is not a declared native macOS guest architecture.
+
+**2026-09-17 — d1 integrated after native acceptance.** A second physical
+Windows reboot advanced both CIM and Kernel-General boot identities from the
+prepared receipt. The managed WSL recovery fixture remounted its fixed 1 GiB
+ext4 store, adopted and destroyed all retained OCI resources, returned durable
+capacity and GitHub registrations to zero, and found the nonce absent from
+provider durable surfaces. Native Ubuntu, managed WSL, real ENOSPC, one-time
+GitHub JIT, WSL terminate/restart and full Windows reboot gates now all pass.
+PR #74 remained green at head 884c0e2 and was squash-merged into
+`runner-sandbox-isolation` at b8b8f92. d1 is complete.
+
+**2026-09-18 — d2 Windows client native acceptance passed.** PR #77 head
+6c903f9 is mergeable and all eight CI/E2E checks pass. On the physical
+Windows 10 Pro client, workflow run 35386267049 completed successfully through
+the Hyper-V-isolated provider. The live job attested Job Object membership,
+the 256-process active-process limit and kill-on-close policy. Provider
+inspection confirmed the expected Hyper-V boundary with no host mounts or
+devices. While the job was active, an SCM restart replaced daemon PID 36728
+with PID 11584 and the same provider container survived. Orphan recovery,
+secret forensics, provider cleanup, temporary profile/label/credential removal
+and rollback all passed; the original production service was restored healthy
+with binary SHA-256
+4AD3080C1219BA5654DFD32C6503A5AAF56A277F19291598DB84C2D1548E71C9.
+Docker was returned to Linux-container mode.
+
+The guarded wrapper's final summary rejected only its earlier evidence parser:
+it expected a different quoting shape after an otherwise successful live job.
+The retained real container inspection independently proves the decoded Docker
+`Config.Cmd` and `Args` shape. Current head validates ordinary quote characters,
+zero literal backslashes, and exactly one occurrence of each of the three
+fully-qualified reviewed JIT API references in both decoded arrays; its
+executable Windows acceptance contract passes. Evidence is retained under
+`C:\ProgramData\RunnerManager\acceptance\evidence-20260918192847-d792f5a8`.
+The immutable DoD also requires the declared Windows Server variant, for which
+no native host is available. PR #77 therefore remains open and d2 remains
+`🟣` until that external native gate passes.
+
+**2026-09-18 — d2 integrated after Windows client and Server acceptance.** A
+local Hyper-V Generation 2 VM running converted Windows Server 2025 Datacenter
+build 26100 supplied the remaining declared Server gate without changing the
+host's Linux-container Docker mode. Workflow run 35393261893 completed through
+the production Hyper-V-isolated provider for acceptance ID
+`20260918204613-a84eb593`. The workflow attested Job Object membership, the
+256-process active-process limit and kill-on-close policy. Exact container
+inspection confirmed Hyper-V isolation, the digest-pinned image, 2 CPUs, 4 GiB
+memory, an 8192 MiB disk, NAT, no mounts, binds, devices, privileged mode or JIT
+environment, and only the three reviewed JIT references in both decoded command
+surfaces. SCM restart changed daemon PID 5424 to 1728 while the same container
+survived; the following reconcile returned active attempts, cleanup blockers,
+capacity use and provider containers to zero. Secret forensics, guarded cleanup
+and rollback passed, and the original guest service was restored healthy with
+binary SHA-256
+7390e6b65804724f5a4025e1779142fd360fd7b1aff83f828787595f2d3c686c.
+Evidence is retained under
+`C:\ProgramData\RunnerManager\acceptance\server-vm\server-acceptance-20260918204613-a84eb593`.
+
+The live run exposed two Windows PowerShell 5.1 harness defects: native stderr
+could become terminating under the global Stop preference, and multiline `gh`
+JSON could be normalized into an object array. PR #77 head fb0efe1 fixes both,
+with exact executable contracts passing on the client and the Server VM under
+Windows PowerShell 5.1. All eight CI/E2E checks passed. Scheduler review verified
+that `main` and the latest integration ref are ancestors, then squash-merged
+PR #77 into `runner-sandbox-isolation` at 69b2da3. d2 is complete.

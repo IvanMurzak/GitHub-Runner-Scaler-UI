@@ -236,6 +236,36 @@ on ARM64 and Intel CI hosts. Apple exposes the macOS guest platform used here
 on Apple silicon, so the Intel build fails readiness closed and is compilation
 coverage rather than native VM acceptance.
 
+Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
+Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
+mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to
+an absolute Linux path for a root-owned, non-writable Podman-compatible storage helper.
+The helper contract is deliberately fail-closed:
+
+- every `--storage-opt size=Nm` probe and create is routed to a finite filesystem whose
+  writable capacity for that container is no larger than `N` MiB;
+- the helper owns slot allocation, serialization, ENOSPC recovery and orphan lookup for
+  every later Podman-compatible command; it never falls back to the ordinary unbounded
+  graph root;
+- `runtime --storage-opt size=Nm info --format=json` returns ordinary Podman info plus
+  `runnerManagerStorage` with schema `1`, mode `exclusive-filesystem-pool`,
+  `requestedMiB: N`, and `hardCap: true` only after checking the finite store; and
+- graph root, run root, helper and attempt runtime paths stay on the distribution's Linux
+  filesystems, never under `/mnt`.
+
+Missing or malformed attestation remains `DiskQuotaUnavailable`. An invalid, mutable,
+non-root-owned or DrvFS helper path is refused instead of falling back to `podman`. The
+disposable one-slot reference fixture in `tests/managed-wsl-oci-acceptance.sh` exercises
+this contract with real writes until `df` reports at most filesystem bookkeeping space
+and ext4 returns `ENOSPC`; a production helper may manage a larger pool but must preserve
+the same per-create hard bound and command routing. On Windows,
+`tests/managed-wsl-oci-restart-acceptance.ps1` terminates only the named distribution and
+checks that the remounted helper recovers exact-generation resources and durable journal
+leases without another JIT registration. The separate
+`tests/managed-wsl-oci-reboot-acceptance.ps1` uses explicit `prepare`,
+`verify-after-reboot`, and `cleanup` phases for an operator-driven full Windows reboot.
+It records Windows kernel boot evidence but contains no command that reboots Windows.
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh
@@ -313,6 +343,42 @@ runner-manager wsl install --distribution NAME [--capacity N]  # Make a WSL2 dis
 runner-manager wsl status --distribution NAME [--json]         # Report that host's real state
 runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
 ```
+
+On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
+containers** through a Docker-compatible Windows container runtime. Candidate
+hosts are Windows 11 Pro or Enterprise with Docker Desktop switched to Windows
+containers, or Windows Server Standard or Datacenter with Moby or Mirantis
+Container Runtime. Both paths require Hyper-V and Containers; native client and
+Server acceptance is still pending. Docker Desktop on Windows Education can run
+Linux containers only, and Docker Desktop is not supported on Windows Server.
+Microsoft documents that Windows containers use a parent Job Object and that
+Hyper-V isolation applies resource controls to both that container job and its
+utility VM. Windows also supports [nested Job
+Objects](https://learn.microsoft.com/windows/win32/procthread/nested-jobs):
+ordinary descendants inherit the job chain, and the most restrictive limits
+remain effective. Runner Manager uses that supported nesting seam to install a
+256-process `ActiveProcessLimit` around `Runner.Listener` and its descendants.
+The bootstrap sets no breakaway flag.
+
+The provider copies the verified runner package into a fresh writable layer
+and never mounts a host directory, device, credential, or container-runtime
+socket. Before JIT crosses container stdin, it reads back Docker's exact
+Hyper-V, pinned-image, CPU, memory, disk, network, mount, device, and privilege
+configuration. The in-container bootstrap then creates and queries the Job
+Object and returns a typed, one-use nonce attestation. Only an exact 256-process
+limit plus kill-on-close proof unlocks the private JIT channel;
+`Runner.Listener` is created suspended, assigned to the job, membership-checked,
+and then resumed. Any timeout, malformed proof, changed container setting, or
+assignment failure stops the container without a native fallback.
+
+This backend remains preview-held until real jobs, restart/recovery and
+resource-exhaustion tests pass on declared Windows client and Server variants.
+Desktop/UI automation, host devices, container actions, and service containers
+remain explicitly unsupported. The control provides dependency isolation for
+the documented trusted-workflow model; it is not a hostile-code containment
+claim. `host isolation status` still reports missing features, runtime
+permission, Linux-container mode, runtime degradation, and the pending native
+acceptance notice separately.
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.

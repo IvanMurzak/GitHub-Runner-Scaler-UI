@@ -1,7 +1,7 @@
 //! Non-secret execution configuration and immutable attempt allocation.
 //!
 //! Provider selection never treats `Auto` as permission to start a native
-//! process. The only executable provider in this release is native.
+//! process. Each isolated backend must resolve to a platform provider.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};

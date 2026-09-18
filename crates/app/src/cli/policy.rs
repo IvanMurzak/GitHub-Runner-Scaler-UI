@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::num::NonZeroU16;
 
-use runner_manager_agent::lifecycle::{ExecutionProvider, MacOsVmProcesses, ProviderCapability};
+use runner_manager_agent::lifecycle::{
+    ExecutionProvider, PlatformExecutionProvider, ProviderCapability,
+};
 use runner_manager_domain::attempt::active_count_for;
 use runner_manager_domain::execution::ExecutionPolicy;
 use runner_manager_domain::model::{
@@ -1250,7 +1252,7 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                let provider = MacOsVmProcesses::new(policy.host_id);
+                let provider = PlatformExecutionProvider::new(policy.host_id);
                 let capability = provider.probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
@@ -1258,9 +1260,9 @@ pub fn apply_policy_mutation_selected(
                         format!(
                             "isolated profile {} cannot be enabled: provider state is {}; nothing was changed",
                             policy.profile_name(),
-                            provider_capability_name(capability)
+                            capability.display_name()
                         ),
-                        MacOsVmProcesses::policy_remedy(&policy, capability),
+                        provider.policy_remedy(&policy, capability),
                     ));
                 }
             }
@@ -1351,17 +1353,6 @@ pub fn apply_policy_mutation_selected(
         }
     }
     Ok(())
-}
-
-const fn provider_capability_name(capability: ProviderCapability) -> &'static str {
-    match capability {
-        ProviderCapability::Ready => "ready",
-        ProviderCapability::Unsupported => "unsupported",
-        ProviderCapability::NotInstalled => "not installed",
-        ProviderCapability::PermissionDenied => "permission denied",
-        ProviderCapability::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
-        ProviderCapability::Degraded => "degraded",
-    }
 }
 
 fn confirm_disable(

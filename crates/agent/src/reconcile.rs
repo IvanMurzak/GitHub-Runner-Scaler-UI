@@ -111,7 +111,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use runner_manager_domain::attempt::{AttemptOutcome, AttemptState, FailureReason, RunnerAttempt};
+use runner_manager_domain::attempt::{
+    AttemptOutcome, AttemptState, FailureReason, IsolationProviderFailure, RunnerAttempt,
+};
 use runner_manager_domain::capacity::{Allocation, HostAllocator, LimitingFactor};
 use runner_manager_domain::model::{
     AttemptId, Clock, Host, Org, OwnerRepo, PolicyId, RefreshInterval, ScaleTarget, Timestamp,
@@ -1250,6 +1252,22 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
         FailureReason::TerminatedAfterRegistrationTimeout => {
             "terminated_after_registration_timeout"
         }
+        FailureReason::IsolationProvider(category) => match category {
+            IsolationProviderFailure::Unsupported => "isolation_provider_unsupported",
+            IsolationProviderFailure::NotInstalled => "isolation_provider_not_installed",
+            IsolationProviderFailure::PermissionDenied => "isolation_provider_permission_denied",
+            IsolationProviderFailure::ImageUnavailableOrIncompatible => {
+                "isolation_image_unavailable"
+            }
+            IsolationProviderFailure::DiskQuotaUnavailable => "isolation_disk_quota_unavailable",
+            IsolationProviderFailure::Degraded => "isolation_provider_degraded",
+            IsolationProviderFailure::RuntimeOperationFailed => {
+                "isolation_runtime_operation_failed"
+            }
+            IsolationProviderFailure::OwnershipMismatch => "isolation_ownership_mismatch",
+            IsolationProviderFailure::UnsafeRuntimePath => "isolation_unsafe_runtime_path",
+            IsolationProviderFailure::JitHandoffRejected => "isolation_jit_handoff_rejected",
+        },
         FailureReason::Other(_) => "other",
     }
 }
@@ -5095,6 +5113,21 @@ mod tests {
             "other",
             "the detail of an `Other` reason never reaches an event"
         );
+        let categories = [
+            IsolationProviderFailure::NotInstalled,
+            IsolationProviderFailure::PermissionDenied,
+            IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            IsolationProviderFailure::DiskQuotaUnavailable,
+            IsolationProviderFailure::RuntimeOperationFailed,
+        ];
+        let mut kinds = std::collections::BTreeSet::new();
+        for category in categories {
+            let kind = failure_reason_kind(&FailureReason::IsolationProvider(category));
+            assert_ne!(kind, "other");
+            assert!(!kind.contains("secret"));
+            kinds.insert(kind);
+        }
+        assert_eq!(kinds.len(), categories.len());
     }
 
     // =======================================================================
@@ -5219,6 +5252,11 @@ mod tests {
                 "lifecycle/macos_vm.rs",
                 include_str!("lifecycle/macos_vm.rs"),
             ),
+            (
+                "lifecycle/windows_hyperv.rs",
+                include_str!("lifecycle/windows_hyperv.rs"),
+            ),
+            ("oci.rs", include_str!("oci.rs")),
             ("package.rs", include_str!("package.rs")),
             ("reconcile.rs", include_str!("reconcile.rs")),
         ];

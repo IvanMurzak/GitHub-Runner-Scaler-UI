@@ -78,6 +78,11 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
 
+use runner_manager_agent::lifecycle::ProviderCapability;
+#[cfg(not(test))]
+use runner_manager_agent::lifecycle::WindowsHyperVContainers;
+#[cfg(test)]
+use runner_manager_agent::lifecycle::WindowsHyperVHostState;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::store::{Store, StoreError};
@@ -460,6 +465,7 @@ pub enum IsolationReadiness {
     Unsupported,
     PermissionDenied,
     ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
     Degraded,
 }
 
@@ -472,6 +478,7 @@ impl IsolationReadiness {
             Self::Unsupported => "unsupported",
             Self::PermissionDenied => "permission denied",
             Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
             Self::Degraded => "degraded",
         }
     }
@@ -485,6 +492,8 @@ pub struct IsolationCapability {
     pub backend: IsolationBackend,
     pub state: IsolationReadiness,
     pub remedy: Option<&'static str>,
+    pub support_notice: Option<&'static str>,
+    pub unsupported_workflow_capabilities: &'static [&'static str],
 }
 
 /// Untrusted probe input. `raw_output` exists only at the conversion boundary
@@ -506,6 +515,9 @@ pub(crate) const fn sanitize_isolation_observation(
         (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => {
             Some("install and configure an OCI execution provider")
         }
+        (IsolationBackend::Oci, IsolationReadiness::DiskQuotaUnavailable) => {
+            Some("configure the required bounded OCI storage quota")
+        }
         (IsolationBackend::WindowsHyperVContainer, IsolationReadiness::Unsupported) => {
             Some("use a supported host and provider")
         }
@@ -518,6 +530,58 @@ pub(crate) const fn sanitize_isolation_observation(
         backend: observation.backend,
         state: observation.state,
         remedy,
+        support_notice: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            Some(
+                "preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot, and resource-exhaustion cases",
+            )
+        } else {
+            None
+        },
+        unsupported_workflow_capabilities: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            &[
+                "desktop",
+                "devices",
+                "container_actions",
+                "service_containers",
+            ]
+        } else {
+            &[]
+        },
+    }
+}
+
+fn windows_hyper_v_capability() -> IsolationCapability {
+    #[cfg(test)]
+    let host = WindowsHyperVHostState::UnsupportedHost;
+    #[cfg(not(test))]
+    let host = WindowsHyperVContainers::host_state();
+    let state = readiness_from_provider_capability(host.capability());
+    let mut capability = sanitize_isolation_observation(IsolationObservation {
+        backend: IsolationBackend::WindowsHyperVContainer,
+        state,
+        raw_output: None,
+    });
+    capability.remedy = host.remedy();
+    capability
+}
+
+const fn readiness_from_provider_capability(capability: ProviderCapability) -> IsolationReadiness {
+    match capability {
+        ProviderCapability::Ready => IsolationReadiness::Ready,
+        ProviderCapability::Unsupported => IsolationReadiness::Unsupported,
+        ProviderCapability::NotInstalled => IsolationReadiness::NotInstalled,
+        ProviderCapability::PermissionDenied => IsolationReadiness::PermissionDenied,
+        ProviderCapability::ImageUnavailableOrIncompatible => {
+            IsolationReadiness::ImageUnavailableOrIncompatible
+        }
+        ProviderCapability::DiskQuotaUnavailable => IsolationReadiness::DiskQuotaUnavailable,
+        ProviderCapability::Degraded => IsolationReadiness::Degraded,
     }
 }
 
@@ -539,28 +603,9 @@ pub fn isolation_capabilities() -> Vec<IsolationCapability> {
     vec![
         capability(IsolationBackend::Native, IsolationReadiness::Ready),
         capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
-        capability(
-            IsolationBackend::WindowsHyperVContainer,
-            IsolationReadiness::Unsupported,
-        ),
+        windows_hyper_v_capability(),
         vm,
     ]
-}
-
-const fn readiness_from_provider_capability(
-    capability: runner_manager_agent::lifecycle::ProviderCapability,
-) -> IsolationReadiness {
-    use runner_manager_agent::lifecycle::ProviderCapability;
-    match capability {
-        ProviderCapability::Ready => IsolationReadiness::Ready,
-        ProviderCapability::Unsupported => IsolationReadiness::Unsupported,
-        ProviderCapability::NotInstalled => IsolationReadiness::NotInstalled,
-        ProviderCapability::PermissionDenied => IsolationReadiness::PermissionDenied,
-        ProviderCapability::ImageUnavailableOrIncompatible => {
-            IsolationReadiness::ImageUnavailableOrIncompatible
-        }
-        ProviderCapability::Degraded => IsolationReadiness::Degraded,
-    }
 }
 
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
@@ -591,6 +636,18 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
             if let Some(remedy) = provider.remedy {
                 writeln!(out, "  remedy: {remedy}")
                     .map_err(write_failed("this provider status"))?;
+            }
+            if let Some(notice) = provider.support_notice {
+                writeln!(out, "  support: {notice}")
+                    .map_err(write_failed("this provider status"))?;
+            }
+            if !provider.unsupported_workflow_capabilities.is_empty() {
+                writeln!(
+                    out,
+                    "  unsupported workflow capabilities: {}",
+                    provider.unsupported_workflow_capabilities.join(", ")
+                )
+                .map_err(write_failed("this provider status"))?;
             }
         }
         writeln!(
@@ -850,6 +907,63 @@ mod tests {
 
     fn organization(name: &str) -> ScaleTarget {
         ScaleTarget::Organization(Org::new(name).expect("a valid organization"))
+    }
+
+    #[test]
+    fn isolation_status_keeps_windows_client_and_server_requirements_distinct() {
+        let mut text = Vec::new();
+        isolation_status(false, &mut text).expect("text status");
+        let text = String::from_utf8(text).expect("UTF-8 status");
+        assert!(
+            text.contains(
+                "use Windows 11 Pro or Enterprise with Docker Desktop in Windows-container mode"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Windows Server Standard or Datacenter with Moby or Mirantis Container Runtime"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Education"), "{text}");
+
+        let mut json = Vec::new();
+        isolation_status(true, &mut json).expect("JSON status");
+        let document: serde_json::Value =
+            serde_json::from_slice(&json).expect("parseable JSON status");
+        let windows = document["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["backend"] == "windows_hyper_v_container")
+            .expect("Windows provider");
+        assert_eq!(windows["state"], "unsupported");
+        assert!(
+            windows["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("use Windows 11 Pro or Enterprise")
+        );
+        assert!(!windows.to_string().contains("Education"));
+    }
+
+    #[test]
+    fn oci_disk_quota_refusal_remains_distinct_in_operator_status() {
+        assert_eq!(
+            readiness_from_provider_capability(ProviderCapability::DiskQuotaUnavailable),
+            IsolationReadiness::DiskQuotaUnavailable
+        );
+        let capability = sanitize_isolation_observation(IsolationObservation {
+            backend: IsolationBackend::Oci,
+            state: IsolationReadiness::DiskQuotaUnavailable,
+            raw_output: Some("untrusted runtime output"),
+        });
+        assert_eq!(capability.state.display_name(), "disk quota unavailable");
+        assert_eq!(
+            capability.remedy,
+            Some("configure the required bounded OCI storage quota")
+        );
     }
 
     fn budget_text(budget: &HostBudget) -> String {

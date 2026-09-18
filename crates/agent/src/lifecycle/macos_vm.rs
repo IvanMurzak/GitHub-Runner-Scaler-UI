@@ -169,6 +169,9 @@ impl MacOsVmProcesses {
             ProviderCapability::Degraded => {
                 "repair the configured helper, its guest control channel, template store, resource enforcement, or timed-out operation".into()
             }
+            ProviderCapability::DiskQuotaUnavailable => {
+                "repair the configured isolation provider's bounded storage enforcement".into()
+            }
             ProviderCapability::Ready => "no remediation required".into(),
         }
     }

@@ -2245,12 +2245,21 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let capability = backend_capability(self.execution_backend);
+            let capability = backend_capability(self.execution_backend, &form.provider_diagnostics);
             lines.push(FormLine::keep(format!(
                 "Selected provider: {}; remedy: {}",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
+            if !capability.unsupported_workflow_capabilities.is_empty() {
+                lines.push(FormLine::keep(format!(
+                    "Unsupported workflows: {}",
+                    capability.unsupported_workflow_capabilities.join(", ")
+                )));
+            }
         }
         if let Some(notice) = &self.execution_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -2413,12 +2422,22 @@ Select another profile in Repositories or create one with the CLI.",
                 lines.push(FormLine::keep(format!("{label}: {value}{suffix}  [-/+]")).at(*control));
                 *control += 1;
             }
-            let capability = backend_capability(self.create_execution_backend);
+            let capability =
+                backend_capability(self.create_execution_backend, &form.provider_diagnostics);
             lines.push(FormLine::keep(format!(
                 "Selected provider: {}; remedy: {}",
                 capability.state.display_name(),
                 capability.remedy.unwrap_or("none required")
             )));
+            if let Some(notice) = capability.support_notice {
+                lines.push(FormLine::keep(format!("Support: {notice}")));
+            }
+            if !capability.unsupported_workflow_capabilities.is_empty() {
+                lines.push(FormLine::keep(format!(
+                    "Unsupported workflows: {}",
+                    capability.unsupported_workflow_capabilities.join(", ")
+                )));
+            }
         }
         if let Some(notice) = &self.create_notice {
             lines.push(FormLine::keep(notice.clone()));
@@ -2813,7 +2832,10 @@ const fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
+fn backend_capability(
+    backend: BackendMode,
+    capabilities: &[cli::host::IsolationCapability],
+) -> cli::host::IsolationCapability {
     use cli::host::{IsolationBackend, IsolationObservation, IsolationReadiness};
 
     let (backend, state) = match backend {
@@ -2833,13 +2855,20 @@ fn backend_capability(backend: BackendMode) -> cli::host::IsolationCapability {
         state,
         raw_output: None,
     });
-    let wanted = if matches!(backend, IsolationBackend::Auto) && cfg!(target_os = "macos") {
-        IsolationBackend::VirtualMachine
+    let wanted = if matches!(backend, IsolationBackend::Auto) {
+        if cfg!(windows) {
+            IsolationBackend::WindowsHyperVContainer
+        } else if cfg!(target_os = "macos") {
+            IsolationBackend::VirtualMachine
+        } else {
+            IsolationBackend::Oci
+        }
     } else {
         backend
     };
-    cli::host::isolation_capabilities()
-        .into_iter()
+    capabilities
+        .iter()
+        .copied()
         .find(|capability| capability.backend == wanted)
         .unwrap_or(fallback)
 }
@@ -3293,9 +3322,10 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("remedy: use a supported host and provider"),
+            rendered.contains("remedy: use Windows 11 Pro or Enterprise with Docker Desktop"),
             "{rendered}"
         );
+        assert!(!rendered.contains("Education"), "{rendered}");
     }
 
     #[test]
@@ -5377,7 +5407,13 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported host and provider
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
+        Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
         OCI provider: not installed
@@ -5426,7 +5462,13 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported host and provider
+        Selected provider: unsupported; remedy: use Windows 11 Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or Datacenter with Moby or Mirantis Container
+        Runtime
+        Support: preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot,
+        and resource-exhaustion cases
+        Unsupported workflows: desktop, devices, container_actions, service_containers
         Save execution [Enter/click]
         Native provider: ready
         OCI provider: not installed
@@ -5482,8 +5524,17 @@ mod tests {
         CPU: 2200m  [-/+]
         Memory: 3072MiB  [-/+]
         Disk: 10240MiB  [-/+]
-        Selected provider: unsupported; remedy: use a supported
-        host and provider
+        Selected provider: unsupported; remedy: use Windows 11
+        Pro or Enterprise with Docker Desktop in
+        Windows-container mode, or Windows Server Standard or
+        Datacenter with Moby or Mirantis Container Runtime
+        Support: preview: native acceptance is pending for
+        Windows 11 Pro/Enterprise with Docker Desktop and
+        Windows Server Standard/Datacenter with a supported
+        server runtime, including job, restart, reboot, and
+        resource-exhaustion cases
+        Unsupported workflows: desktop, devices,
+        container_actions, service_containers
         Save execution [Enter/click]
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
