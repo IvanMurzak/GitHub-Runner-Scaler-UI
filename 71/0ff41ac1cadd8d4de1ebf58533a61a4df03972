@@ -1,0 +1,20 @@
+crates/agent/src/lifecycle/windows_hyperv.rs
+  s_5801a853f78e8a::t_8a8ecba42952c8 185,191,194,197-199,244-246,1620-1623
+  s_5801a853f78e8a::t_823d08f5dba20b 1607-1619
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "710ff41ac1cadd8d4de1ebf58533a61a4df03972",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
