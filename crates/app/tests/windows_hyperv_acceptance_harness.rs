@@ -76,6 +76,7 @@ fn machine_credential_adoption_is_explicit_bounded_and_reversible() {
         "IvanMurzak/runner-manager/secrets/user-access-token.dpapi",
         "secrets/machine/user-access-token.dpapi",
         "Assert-ProductMachineCredentialAcl $paths.source",
+        "Find-AuditedLegacyDefaultBootRecord $State",
         "AreAccessRulesProtected",
         "S-1-5-18",
         "S-1-5-32-544",
@@ -106,6 +107,34 @@ fn machine_credential_adoption_is_explicit_bounded_and_reversible() {
     ));
     assert!(!script.contains("ConvertTo-SecureString"));
     assert!(!script.contains("CryptUnprotectData"));
+}
+
+#[test]
+fn legacy_default_boot_credential_migration_is_bound_to_the_audited_scm_record() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    for needle in [
+        "$current.path_name, [string]$audited.path_name",
+        "$current.executable_sha256 -ne $audited.executable_sha256",
+        "$audited.account -notin @('LocalSystem', 'NT AUTHORITY\\SYSTEM')",
+        "$audited.start_mode -ne 'Auto'",
+        "$record.manager -ne 'the Windows Service Control Manager'",
+        "$record.account -ne 'local_system'",
+        "Join-Path $env:LOCALAPPDATA 'IvanMurzak/runner-manager'",
+        "Join-Path $state 'bin/runner-manager.exe'",
+        "--service-config-dir",
+        "--service-state-dir",
+        "--service-runtime-dir",
+        "--service-logs-dir",
+        "--windows-service-host",
+        "Backup-ServiceRecord $State",
+    ] {
+        assert!(
+            script.contains(needle),
+            "legacy migration must remain bound to exact product evidence: {needle}"
+        );
+    }
+    assert!(script.contains("[StringComparison]::OrdinalIgnoreCase"));
+    assert!(script.contains("the live SCM registration does not exactly match"));
 }
 
 #[test]

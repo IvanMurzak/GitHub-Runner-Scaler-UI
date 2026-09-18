@@ -150,8 +150,10 @@ function Get-ServiceRecordSnapshot([string]$Path) {
     }
     $text = Get-Content -LiteralPath $Path -Raw
     $serviceName = Get-TomlString $text 'service_name'
+    $manager = Get-TomlString $text 'manager'
     $startModeValue = Get-TomlString $text 'start_mode'
     $startMode = if ($startModeValue) { $startModeValue.ToLowerInvariant() } else { $null }
+    $account = Get-TomlString $text 'account'
     $binary = Get-TomlString $text 'binary'
     $source = Get-TomlString $text 'source_binary'
     $restoreSource = if ($source -and (Test-Path -LiteralPath $source -PathType Leaf)) { $source } else { $binary }
@@ -159,13 +161,19 @@ function Get-ServiceRecordSnapshot([string]$Path) {
         exists = $true
         path = $Path
         service_name = $serviceName
+        manager = $manager
         start_mode = $startMode
+        account = $account
         binary = $binary
         binary_sha256 = if ($binary -and (Test-Path -LiteralPath $binary -PathType Leaf)) { (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
         source_binary = $source
         restore_source = $restoreSource
         restore_source_sha256 = if ($restoreSource -and (Test-Path -LiteralPath $restoreSource -PathType Leaf)) { (Get-FileHash -LiteralPath $restoreSource -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
         scheduled_task_state = $(try { [string](Get-ScheduledTask -TaskName 'runner-manager' -ErrorAction Stop).State } catch { $null })
+        config_dir = Get-TomlString $text 'config'
+        state_dir = Get-TomlString $text 'state'
+        runtime_dir = Get-TomlString $text 'runtime'
+        logs_dir = Get-TomlString $text 'logs'
         restore_with_default_paths = $false
     }
 }
@@ -184,6 +192,52 @@ function Find-DefaultServiceRecord($Service) {
     if (-not $record.exists -or $record.service_name -ne 'runner-manager' -or -not (Test-SamePath $record.binary $Service.executable)) { return $null }
     if (-not $record.binary_sha256 -or $record.binary_sha256 -ne $Service.executable_sha256) { return $null }
     $record.restore_with_default_paths = $true
+    return $record
+}
+
+function Quote-ServiceArgument([string]$Value) {
+    if ($Value -notmatch '[\s"]') { return $Value }
+    if ($Value.Contains('"')) { throw 'the product default service path contains a quote and cannot be attested safely' }
+    if ($Value.EndsWith('\')) { throw 'the product default service argument unexpectedly ends with a backslash' }
+    return '"' + $Value + '"'
+}
+
+function Find-AuditedLegacyDefaultBootRecord($State) {
+    $audited = $State.runner_service
+    $current = Get-ServiceSnapshot 'runner-manager'
+    if (-not $audited.exists -or -not $current.exists -or $audited.name -ne 'runner-manager' -or
+        $audited.account -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM') -or $current.account -ne $audited.account -or
+        $audited.start_mode -ne 'Auto' -or $current.start_mode -ne $audited.start_mode -or
+        [bool]$current.delayed_auto_start -ne [bool]$audited.delayed_auto_start -or
+        -not [string]::Equals([string]$current.path_name, [string]$audited.path_name, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-SamePath $current.executable $audited.executable) -or
+        -not $current.executable_sha256 -or $current.executable_sha256 -ne $audited.executable_sha256) {
+        return $null
+    }
+
+    $record = Find-DefaultServiceRecord $current
+    if (-not $record -or $record.start_mode -ne 'boot' -or $record.manager -ne 'the Windows Service Control Manager' -or
+        $record.account -ne 'local_system') { return $null }
+    $root = Join-Path $env:LOCALAPPDATA 'IvanMurzak/runner-manager'
+    $config = Join-Path $root 'config'
+    $state = Join-Path $root 'data/state'
+    $runtime = Join-Path $root 'data/runtime'
+    $logs = Join-Path $root 'data/logs'
+    $binary = Join-Path $state 'bin/runner-manager.exe'
+    if (-not (Test-SamePath $record.path (Join-Path $config 'service.toml')) -or
+        -not (Test-SamePath $record.binary $binary) -or
+        -not (Test-SamePath $record.config_dir $config) -or -not (Test-SamePath $record.state_dir $state) -or
+        -not (Test-SamePath $record.runtime_dir $runtime) -or -not (Test-SamePath $record.logs_dir $logs)) {
+        return $null
+    }
+    $arguments = @(
+        $binary, 'daemon', 'run', '--service-config-dir', $config, '--service-state-dir', $state,
+        '--service-runtime-dir', $runtime, '--service-logs-dir', $logs, '--windows-service-host'
+    )
+    $expectedCommandLine = ($arguments | ForEach-Object { Quote-ServiceArgument $_ }) -join ' '
+    if (-not [string]::Equals($expectedCommandLine, [string]$current.path_name, [StringComparison]::OrdinalIgnoreCase)) {
+        return $null
+    }
     return $record
 }
 
@@ -398,12 +452,16 @@ function Assert-IsolatedCredentialPathIsPhysical {
 
 function Adopt-MachineCredential($State) {
     Require-OptIn $AllowAdoptMachineCredential 'AllowAdoptMachineCredential' 'copying the audited same-machine boot credential into the isolated acceptance DataDir'
-    $restoreWithDefaultPaths = $State.service_record.PSObject.Properties.Name -contains 'restore_with_default_paths' -and $State.service_record.restore_with_default_paths
-    if (-not $State.runner_service.exists -or $State.runner_service.name -ne 'runner-manager' -or
-        $State.runner_service.account -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM') -or
-        -not $State.service_record.exists -or $State.service_record.start_mode -ne 'boot' -or -not $restoreWithDefaultPaths) {
-        throw 'the audited service is not the product-standard LocalSystem boot service; refusing credential adoption'
+    $record = Find-AuditedLegacyDefaultBootRecord $State
+    if (-not $record) {
+        throw 'the live SCM registration does not exactly match the audited product-default LocalSystem boot record; refusing credential adoption'
     }
+    # Refresh the rollback source from the record that was just bound to the
+    # unchanged audited SCM registration. This also upgrades older audit state
+    # that captured the legacy default-path record without its directory facts.
+    Set-StateProperty $State service_record $record
+    Backup-ServiceRecord $State
+    Save-State $State
     $paths = Get-MachineCredentialPaths
     if (Test-SamePath $paths.source $paths.target) { throw 'source and isolated credential paths unexpectedly resolve to the same file' }
     if (-not (Test-Path -LiteralPath $paths.source -PathType Leaf)) { throw "the audited machine credential '$($paths.source)' does not exist" }
