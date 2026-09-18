@@ -1,0 +1,23 @@
+scripts/windows-hyperv-acceptance.ps1
+  s_5801a853f78e8a::t_78d9b195a7d5f4 788-800,802-810
+tests/windows-hyperv-acceptance-contract.ps1
+  s_5801a853f78e8a::t_69200ddd01422c 43-48,129-138,177
+  s_5801a853f78e8a::t_ff953c02b46e6e 25-42,57
+  s_5801a853f78e8a::t_e6a1ea341262ee 149-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "493a1f920b659a1e88aed8d0621a68355ad9d486",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
