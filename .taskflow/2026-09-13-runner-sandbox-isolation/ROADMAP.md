@@ -54,7 +54,7 @@ This file is the only live task-state record.
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / elevated client live-job gate + Server gate pending | 2026-09-17 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / Windows client native gate passed; Server native gate pending | 2026-09-18 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
@@ -289,3 +289,29 @@ provider durable surfaces. Native Ubuntu, managed WSL, real ENOSPC, one-time
 GitHub JIT, WSL terminate/restart and full Windows reboot gates now all pass.
 PR #74 remained green at head 884c0e2 and was squash-merged into
 `runner-sandbox-isolation` at b8b8f92. d1 is complete.
+
+**2026-09-18 — d2 Windows client native acceptance passed.** PR #77 head
+6c903f9 is mergeable and all eight CI/E2E checks pass. On the physical
+Windows 10 Pro client, workflow run 35386267049 completed successfully through
+the Hyper-V-isolated provider. The live job attested Job Object membership,
+the 256-process active-process limit and kill-on-close policy. Provider
+inspection confirmed the expected Hyper-V boundary with no host mounts or
+devices. While the job was active, an SCM restart replaced daemon PID 36728
+with PID 11584 and the same provider container survived. Orphan recovery,
+secret forensics, provider cleanup, temporary profile/label/credential removal
+and rollback all passed; the original production service was restored healthy
+with binary SHA-256
+4AD3080C1219BA5654DFD32C6503A5AAF56A277F19291598DB84C2D1548E71C9.
+Docker was returned to Linux-container mode.
+
+The guarded wrapper's final summary rejected only its earlier evidence parser:
+it expected a different quoting shape after an otherwise successful live job.
+The retained real container inspection independently proves the decoded Docker
+`Config.Cmd` and `Args` shape. Current head validates ordinary quote characters,
+zero literal backslashes, and exactly one occurrence of each of the three
+fully-qualified reviewed JIT API references in both decoded arrays; its
+executable Windows acceptance contract passes. Evidence is retained under
+`C:\ProgramData\RunnerManager\acceptance\evidence-20260918192847-d792f5a8`.
+The immutable DoD also requires the declared Windows Server variant, for which
+no native host is available. PR #77 therefore remains open and d2 remains
+`🟣` until that external native gate passes.
