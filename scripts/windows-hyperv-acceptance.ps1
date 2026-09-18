@@ -82,8 +82,18 @@ function Invoke-External {
         [switch]$DiscardOutput,
         [string]$EvidencePath
     )
-    $output = & $FilePath @ArgumentList 2>&1
-    $exit = $LASTEXITCODE
+    # Windows PowerShell 5.1 represents redirected native stderr as
+    # NativeCommandError records.  The harness-wide Stop preference would turn
+    # those records into terminating errors before we can inspect the native
+    # exit code, including for commands whose failure is explicitly allowed.
+    $priorErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $FilePath @ArgumentList 2>&1)
+        $exit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $priorErrorActionPreference
+    }
     if ($EvidencePath) {
         # Evidence must survive a non-zero exit, but command diagnostics can
         # contain credentials. Persist only a small, explicit redaction surface;
@@ -106,6 +116,13 @@ function Invoke-External {
         throw "'$FilePath $safe' failed with exit code $exit$evidence"
     }
     if (-not $DiscardOutput) { return @($output | ForEach-Object { $_.ToString() }) }
+}
+
+function ConvertTo-ScalarString($Value) {
+    if ($null -eq $Value) { return $null }
+    $items = @($Value)
+    if ($items.Count -ne 1 -or $items[0] -is [Array]) { return $null }
+    return [Convert]::ToString($items[0], [Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Get-StringHash([string]$Value) {
@@ -831,9 +848,23 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
 function Find-AcceptanceRun([string]$TriggerSelector, [DateTime]$After) {
     $deadline = [DateTime]::UtcNow.AddMinutes(2)
     do {
-        $json = Invoke-External gh.exe @('run', 'list', '--repo', $Repository, '--event', 'pull_request', '--branch', $WorkflowRef, '--limit', '30', '--json', 'databaseId,displayTitle,workflowName,createdAt,status,conclusion')
-        foreach ($run in @(($json -join "`n") | ConvertFrom-Json)) {
-            if ($run.workflowName -eq 'Windows Hyper-V native acceptance' -and $run.displayTitle -eq "windows-hyperv-$TriggerSelector" -and [DateTime]$run.createdAt -ge $After.AddMinutes(-1)) { return $run }
+        $json = @(Invoke-External gh.exe @('run', 'list', '--repo', $Repository, '--event', 'pull_request', '--branch', $WorkflowRef, '--limit', '30', '--json', 'databaseId,displayTitle,workflowName,createdAt,status,conclusion'))
+        $payload = [string]::Join("`n", [string[]]@($json | ForEach-Object { $_.ToString() }))
+        $document = ConvertFrom-Json -InputObject $payload
+        foreach ($run in [object[]]$document) {
+            $workflowName = ConvertTo-ScalarString $run.workflowName
+            $displayTitle = ConvertTo-ScalarString $run.displayTitle
+            $createdAtText = ConvertTo-ScalarString $run.createdAt
+            $createdAt = [DateTime]::MinValue
+            $createdAtValid = $null -ne $createdAtText -and [DateTime]::TryParse(
+                $createdAtText,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind,
+                [ref]$createdAt
+            )
+            if ([string]::Equals($workflowName, 'Windows Hyper-V native acceptance', [StringComparison]::Ordinal) -and
+                [string]::Equals($displayTitle, "windows-hyperv-$TriggerSelector", [StringComparison]::Ordinal) -and
+                $createdAtValid -and $createdAt -ge $After.AddMinutes(-1)) { return $run }
         }
         Start-Sleep -Seconds 3
     } until ([DateTime]::UtcNow -ge $deadline)

@@ -7,13 +7,72 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($harness, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw "acceptance harness has PowerShell parse errors: $errors" }
-$definition = $ast.Find({
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Assert-ContainerEvidence'
-}, $true)
-if (-not $definition) { throw 'Assert-ContainerEvidence was not found in the acceptance harness' }
-Invoke-Expression $definition.Extent.Text
+function Import-HarnessFunction([string]$Name) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $Name
+    }, $true)
+    if (-not $definition) { throw "$Name was not found in the acceptance harness" }
+    $scriptDefinition = $definition.Extent.Text -replace ('^function\s+' + [regex]::Escape($Name)), "function script:$Name"
+    Invoke-Expression $scriptDefinition
+}
+
+Import-HarnessFunction 'Invoke-External'
+
+$nativeFixture = Join-Path ([IO.Path]::GetTempPath()) ("runner-manager-native-contract-" + [Guid]::NewGuid().ToString('N') + '.cmd')
+@'
+@echo off
+echo stdout-line
+echo ghp_contract_token_1234567890>&2
+exit /b 23
+'@ | Set-Content -LiteralPath $nativeFixture -Encoding ASCII
+try {
+    $evidence = "$nativeFixture.evidence.txt"
+    $allowed = @(Invoke-External $nativeFixture @('ignored') -AllowFailure -EvidencePath $evidence)
+    if ($allowed.Count -ne 2 -or $allowed[0] -ne 'stdout-line' -or $allowed[1] -ne 'ghp_contract_token_1234567890') {
+        throw "allowed native failure did not return normalized stdout and stderr: $($allowed -join ' | ')"
+    }
+    $saved = Get-Content -LiteralPath $evidence -Raw
+    if ($saved -match 'ghp_contract_token' -or $saved -notmatch '<redacted-github-token>') {
+        throw 'native failure evidence was not redacted'
+    }
+    try {
+        Invoke-External $nativeFixture @('ignored') -EvidencePath $evidence | Out-Null
+        throw 'disallowed native failure did not throw'
+    } catch {
+        $expected = "'$nativeFixture ignored' failed with exit code 23; redacted output was saved to '$evidence'"
+        if ($_.Exception.Message -ne $expected) {
+            throw "disallowed native failure was not exact and actionable: $($_.Exception.Message)"
+        }
+    }
+} finally {
+    Remove-Item -LiteralPath $nativeFixture -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$nativeFixture.evidence.txt" -Force -ErrorAction SilentlyContinue
+}
+
+Import-HarnessFunction 'ConvertTo-ScalarString'
+Import-HarnessFunction 'Find-AcceptanceRun'
+$Repository = 'owner/repository'
+$WorkflowRef = 'feature'
+$selector = 'd2-20260918204613-a84eb593'
+$after = [DateTime]::Parse('2026-09-18T20:46:00Z').ToUniversalTime()
+$script:RunJson = @'
+[
+  {"databaseId":1,"displayTitle":["windows-hyperv-d2-20260918204613-a84eb593","wrong"],"workflowName":"Windows Hyper-V native acceptance","createdAt":"2026-09-18T20:46:14Z"},
+  {"databaseId":2,"displayTitle":"windows-hyperv-d2-20260918204613-a84eb593","workflowName":"Windows Hyper-V native acceptance","createdAt":"2026-09-18T20:46:13Z"}
+]
+'@ -split "`n"
+function Invoke-External {
+    if ($args[0] -ne 'gh.exe') { throw "unexpected mocked executable '$($args[0])'" }
+    return @($script:RunJson)
+}
+$found = Find-AcceptanceRun $selector $after
+if ((ConvertTo-ScalarString $found.databaseId) -ne '2') {
+    throw 'run lookup did not reject a non-scalar title and select the exact scalar candidate'
+}
+
+Import-HarnessFunction 'Assert-ContainerEvidence'
 
 $script:InspectJson = $null
 $Image = 'mcr.microsoft.com/windows/servercore@sha256:test'

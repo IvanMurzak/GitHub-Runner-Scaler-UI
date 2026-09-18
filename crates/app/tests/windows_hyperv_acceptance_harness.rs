@@ -184,6 +184,29 @@ fn external_output_is_joined_only_after_each_invocation_returns() {
 }
 
 #[test]
+fn windows_powershell_native_failures_and_run_json_are_normalized_before_matching() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    for needle in [
+        "$priorErrorActionPreference = $ErrorActionPreference",
+        "$ErrorActionPreference = 'Continue'",
+        "$output = @(& $FilePath @ArgumentList 2>&1)",
+        "$ErrorActionPreference = $priorErrorActionPreference",
+        "ConvertFrom-Json -InputObject $payload",
+        "foreach ($run in [object[]]$document)",
+        "ConvertTo-ScalarString $run.workflowName",
+        "ConvertTo-ScalarString $run.displayTitle",
+        "ConvertTo-ScalarString $run.createdAt",
+        "[Globalization.DateTimeStyles]::RoundtripKind",
+        "[StringComparison]::Ordinal",
+    ] {
+        assert!(
+            script.contains(needle),
+            "missing WinPS normalization: {needle}"
+        );
+    }
+}
+
+#[test]
 fn service_replacement_is_bounded_diagnostic_and_rollback_safe() {
     let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
     for needle in [
