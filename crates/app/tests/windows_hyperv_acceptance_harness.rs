@@ -273,3 +273,33 @@ fn cancellation_keeps_trigger_and_profile_cleanup_reachable() {
     assert!(script.contains("'repo', 'profile', 'remove'"));
     assert!(script.contains("Remove-AcceptanceTrigger $State"));
 }
+
+#[test]
+fn cleanup_retries_profile_removal_with_redacted_actionable_evidence() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    let cleanup = script
+        .split_once("function Remove-AcceptanceProfile")
+        .expect("bounded profile cleanup helper exists")
+        .1
+        .split_once("function Assert-ContainerEvidence")
+        .expect("profile cleanup helper has a bounded body")
+        .0;
+
+    for needle in [
+        "AddSeconds(120)",
+        "profile-remove-$runStamp-{0:d2}.txt",
+        "profile-remove-$runStamp-verify-{0:d2}.txt",
+        "-AllowFailure -EvidencePath $removeEvidence",
+        "-AllowFailure -EvidencePath $showEvidence",
+        "Start-Sleep -Seconds 2",
+        "could not be removed within 120 seconds",
+        "last redacted command output",
+        "active-attempt or local-store error",
+    ] {
+        assert!(
+            cleanup.contains(needle),
+            "missing cleanup contract: {needle}"
+        );
+    }
+    assert!(script.contains("Remove-AcceptanceProfile $State"));
+}

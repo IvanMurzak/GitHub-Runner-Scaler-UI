@@ -723,6 +723,41 @@ function Invoke-RunnerConfirmed([string[]]$Arguments, [switch]$AllowFailure) {
     return @($output | ForEach-Object { $_.ToString() })
 }
 
+function Remove-AcceptanceProfile($State) {
+    $evidence = [string]$State.evidence_dir
+    if ([string]::IsNullOrWhiteSpace($evidence)) {
+        $evidence = Join-Path (Split-Path $StatePath -Parent) 'cleanup-evidence'
+    }
+    if (-not (Test-Path -LiteralPath $evidence -PathType Container)) {
+        Protect-StateDirectory $evidence
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
+    $attempt = 0
+    $lastCause = 'profile removal was not attempted'
+    $lastEvidence = $null
+    do {
+        $attempt++
+        $removeEvidence = Join-Path $evidence ("profile-remove-$runStamp-{0:d2}.txt" -f $attempt)
+        $lastEvidence = $removeEvidence
+        Invoke-Runner @('repo', 'profile', 'remove', $Repository, '--profile', [string]$State.profile_name, '--purge') -AllowFailure -EvidencePath $removeEvidence | Out-Null
+        $removeExit = $LASTEXITCODE
+        if ($removeExit -eq 0) {
+            $showEvidence = Join-Path $evidence ("profile-remove-$runStamp-verify-{0:d2}.txt" -f $attempt)
+            $lastEvidence = $showEvidence
+            Invoke-Runner @('repo', 'profile', 'show', $Repository, '--profile', [string]$State.profile_name) -AllowFailure -EvidencePath $showEvidence | Out-Null
+            $showExit = $LASTEXITCODE
+            if ($showExit -ne 0) { return }
+            $lastCause = "remove exited successfully, but profile show still found '$($State.profile_name)'"
+        } else {
+            $lastCause = "profile remove exited with code $removeExit"
+        }
+        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds 2 }
+    } until ([DateTime]::UtcNow -ge $deadline)
+
+    throw "temporary profile '$($State.profile_name)' could not be removed within 120 seconds: $lastCause. Review the last redacted command output at '$lastEvidence' and resolve any active-attempt or local-store error before retrying cleanup."
+}
+
 function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirectory) {
     $raw = Invoke-External docker.exe @('inspect', $ContainerId)
     $path = Join-Path $EvidenceDirectory 'container-inspect.json'
@@ -1000,9 +1035,7 @@ function Invoke-Cleanup($State) {
             if (@($ids | Where-Object { $_ -match '^[0-9a-f]{12,64}$' }).Count -eq 0) { break }
             Start-Sleep -Seconds 2
         } until ([DateTime]::UtcNow -ge $deadline)
-        Invoke-Runner @('repo', 'profile', 'remove', $Repository, '--profile', [string]$State.profile_name, '--purge') -AllowFailure | Out-Null
-        Invoke-Runner @('repo', 'profile', 'show', $Repository, '--profile', [string]$State.profile_name) -AllowFailure | Out-Null
-        if ($LASTEXITCODE -eq 0) { throw "temporary profile '$($State.profile_name)' still exists after cleanup" }
+        Remove-AcceptanceProfile $State
         Set-StateProperty $State profile_created $false
     }
     Set-StateProperty $State profile_name $null

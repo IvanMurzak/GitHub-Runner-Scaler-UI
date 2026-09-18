@@ -350,7 +350,7 @@ impl WindowsHyperVContainers {
              {{{{index .Config.Labels \"{LABEL_IMAGE}\"}}}}|\
              {{{{index .Config.Labels \"{LABEL_PROVIDER}\"}}}}"
         );
-        let result = Self::docker(&os_args(["inspect", "--format", &format, name]))?;
+        let result = Self::docker(&container_inspect_args(name, &format))?;
         if !result.success {
             return if result.is_missing_resource() {
                 Ok(None)
@@ -363,7 +363,7 @@ impl WindowsHyperVContainers {
 
     fn inspect_configuration(name: &str) -> Result<ContainerAttestation, CommandFailure> {
         const FORMAT: &str = "{{.HostConfig.Isolation}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{index .HostConfig.StorageOpt \"size\"}}|{{.HostConfig.NetworkMode}}|{{len .Mounts}}|{{.HostConfig.Privileged}}|{{len .HostConfig.Binds}}|{{len .HostConfig.Devices}}|{{.Config.Image}}";
-        let result = Self::docker(&os_args(["inspect", "--format", FORMAT, name]))?;
+        let result = Self::docker(&container_inspect_args(name, FORMAT))?;
         if !result.success {
             return Err(result.failure());
         }
@@ -1229,6 +1229,15 @@ fn inspect_image(image: &ImageReference) -> Result<bool, CommandFailure> {
     Ok(compatible_image_metadata(&result.stdout))
 }
 
+fn container_inspect_args(name: &str, format: &str) -> Vec<OsString> {
+    // Generic `docker inspect` probes every supported object kind. When a
+    // container is absent, that fallback reaches the managed-plugin endpoint;
+    // Windows Docker Engine rejects that endpoint before the provider can
+    // classify the container as missing. Keep this lookup type-scoped so a
+    // missing owned container remains an ordinary, recoverable state.
+    os_args(["container", "inspect", "--format", format, name])
+}
+
 fn compatible_image_metadata(metadata: &str) -> bool {
     let mut fields = metadata.trim().split('|');
     fields.next() == Some("windows") && fields.next() == Some("amd64") && fields.next().is_none()
@@ -1403,6 +1412,20 @@ mod tests {
         assert!(WindowsEditionFamily::Windows11Client.supports_build(22_000));
         assert!(!WindowsEditionFamily::Windows11Client.supports_build(19_045));
         assert!(WindowsEditionFamily::WindowsServer.supports_build(14_393));
+    }
+
+    #[test]
+    fn container_inspection_never_falls_through_to_windows_plugin_lookup() {
+        assert_eq!(
+            container_inspect_args("runner-manager-owned", "{{.State.Status}}"),
+            os_args([
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                "runner-manager-owned",
+            ])
+        );
     }
 
     #[cfg(windows)]
