@@ -44,11 +44,15 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
+use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
     ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
+
+mod windows_hyperv;
+pub use windows_hyperv::{WindowsHyperVContainers, WindowsHyperVHostState};
 
 const IDENTITY_FILE: &str = ".runner-process.json";
 const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
@@ -1269,6 +1273,19 @@ pub enum ProviderCapability {
 }
 
 impl ProviderCapability {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unsupported => "unsupported",
+            Self::NotInstalled => "not installed",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
+            Self::Degraded => "degraded",
+        }
+    }
+
     pub(crate) fn refusal(self) -> FailureReason {
         FailureReason::IsolationProvider(match self {
             Self::Ready | Self::Degraded => IsolationProviderFailure::Degraded,
@@ -1584,6 +1601,195 @@ pub struct NativeProcesses {
     post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     use_long_lived_test_listener: std::sync::atomic::AtomicBool,
+}
+
+/// Production provider set. Native and isolated allocations are routed by the
+/// immutable execution kind in the policy/journal; an unavailable isolated
+/// backend can never fall through to native process launch.
+#[derive(Debug)]
+pub struct PlatformExecutionProvider {
+    native: NativeProcesses,
+    oci: OciProcesses,
+    windows_hyper_v: WindowsHyperVContainers,
+}
+
+impl PlatformExecutionProvider {
+    #[must_use]
+    pub fn new(host_id: HostId) -> Self {
+        Self {
+            native: NativeProcesses::new(),
+            oci: OciProcesses::new(host_id),
+            windows_hyper_v: WindowsHyperVContainers::new(host_id),
+        }
+    }
+
+    fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
+        match backend {
+            Backend::Auto => {
+                #[cfg(target_os = "windows")]
+                {
+                    Some(&self.windows_hyper_v)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Some(&self.oci)
+                }
+            }
+            Backend::Oci => Some(&self.oci),
+            Backend::WindowsHyperVContainer => Some(&self.windows_hyper_v),
+            Backend::VirtualMachine => None,
+        }
+    }
+
+    fn provider_for_attempt(&self, attempt: &RunnerAttempt) -> Option<&dyn ExecutionProvider> {
+        match attempt.execution() {
+            AttemptExecution::Native { .. } => Some(&self.native),
+            AttemptExecution::Isolated { provider_kind, .. } => {
+                self.isolated_provider(*provider_kind)
+            }
+        }
+    }
+
+    fn required_provider_for_attempt(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<&dyn ExecutionProvider, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))
+    }
+}
+
+impl ExecutionProvider for PlatformExecutionProvider {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => self.native.probe(policy),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .map_or(ProviderCapability::Unsupported, |provider| {
+                    provider.probe(policy)
+                }),
+        }
+    }
+
+    fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.resolve(policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .resolve(policy),
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.prepare(attempt, policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .prepare(attempt, policy),
+        }
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| {
+                ProcessStartFailure::before_spawn(FailureReason::Other(
+                    "execution provider unavailable".into(),
+                ))
+            })?
+            .start(prepared, attempt, handoff)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .inspect(attempt)
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.stop(attempt)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .destroy(attempt)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recover(attempt)
+    }
+
+    fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
+        let mut owned = self.oci.enumerate_owned(host_id);
+        owned.extend(self.windows_hyper_v.enumerate_owned(host_id));
+        owned
+    }
+
+    fn diagnostics(&self, attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+        self.provider_for_attempt(attempt)
+            .map_or_else(Vec::new, |provider| provider.diagnostics(attempt))
+    }
+
+    fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.owns(attempt)
+    }
+
+    fn spawn(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+    ) -> Result<u32, ProcessStartFailure> {
+        if !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "native process launch refused for an isolated allocation".into(),
+            )));
+        }
+        self.native.spawn(attempt, config)
+    }
+
+    fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .is_alive(attempt)
+    }
+
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recovered_pid(attempt)
+    }
+
+    fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.completed_successfully(attempt))
+    }
+
+    fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .record_terminate_intent(attempt)
+    }
+
+    fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.has_terminate_intent(attempt))
+    }
+
+    fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .terminate(attempt)
+    }
 }
 
 #[cfg(test)]
@@ -3804,6 +4010,23 @@ mod tests {
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
 
+    #[test]
+    fn production_provider_set_routes_every_implemented_isolated_backend() {
+        let providers = PlatformExecutionProvider::new(HostId::from_u128(1));
+        assert!(providers.isolated_provider(Backend::Auto).is_some());
+        assert!(providers.isolated_provider(Backend::Oci).is_some());
+        assert!(
+            providers
+                .isolated_provider(Backend::WindowsHyperVContainer)
+                .is_some()
+        );
+        assert!(
+            providers
+                .isolated_provider(Backend::VirtualMachine)
+                .is_none()
+        );
+    }
+
     /// One event's fields, in the order they were recorded.
     type CapturedFields = Vec<(String, String)>;
 
@@ -4295,6 +4518,7 @@ mod tests {
     struct FakeIsolatedProvider {
         resources: Mutex<BTreeMap<AttemptId, (EnvironmentIdentity, EnvironmentState)>>,
         extra_resources: Mutex<Vec<EnvironmentIdentity>>,
+        unsupported_host: AtomicBool,
         permission_denied: AtomicBool,
         incompatible_image: AtomicBool,
         prepare_failure: AtomicBool,
@@ -4334,7 +4558,9 @@ mod tests {
 
     impl ExecutionProvider for FakeIsolatedProvider {
         fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
-            if self.permission_denied.load(Ordering::SeqCst) {
+            if self.unsupported_host.load(Ordering::SeqCst) {
+                ProviderCapability::Unsupported
+            } else if self.permission_denied.load(Ordering::SeqCst) {
                 ProviderCapability::PermissionDenied
             } else if policy.execution_policy().is_native() {
                 ProviderCapability::Unsupported
@@ -5212,6 +5438,37 @@ mod tests {
             assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
             assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_host_stops_before_jit_without_allocation_or_native_fallback() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        provider.unsupported_host.store(true, Ordering::SeqCst);
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let error = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect_err("unsupported host must be refused before JIT");
+
+        assert_eq!(
+            error.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
+        );
+        assert!(harness.store.attempts().unwrap().is_empty());
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        assert!(provider.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

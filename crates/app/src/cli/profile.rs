@@ -2,6 +2,9 @@
 
 use std::io::{self, Write};
 
+use runner_manager_agent::lifecycle::{
+    ExecutionProvider, PlatformExecutionProvider, ProviderCapability,
+};
 use runner_manager_domain::execution::{Backend, ExecutionPolicy, ImageReference, ResourceLimits};
 use runner_manager_domain::model::{HostLabel, ProfileName, ScaleTarget};
 use runner_manager_domain::store::{Store, StoreError};
@@ -183,19 +186,6 @@ pub fn dispatch(
             let execution = execution(args.mode, &args.isolation)?;
             let store = context.store()?;
             let mut policy = policy::find_policy_selected(&store, &target, profile)?;
-            if policy.enabled() && !execution.is_native() {
-                return Err(CliError::with_remedy(
-                    Failure::Conflict,
-                    format!(
-                        "profile {} is enabled and no integrated isolation provider is ready; execution was not changed",
-                        policy.profile_name()
-                    ),
-                    format!(
-                        "runner-manager repo profile set-scale {target} --profile {} --enabled false",
-                        policy.profile_name()
-                    ),
-                ));
-            }
             let expected = policy.revision();
             let uncleaned = store
                 .uncleaned_attempts_for_policy(policy.id)
@@ -214,6 +204,23 @@ pub fn dispatch(
             policy
                 .set_execution_policy(execution)
                 .map_err(|error| CliError::new(Failure::InvalidArgument, error.to_string()))?;
+            if policy.enabled()
+                && !policy.execution_policy().is_native()
+                && PlatformExecutionProvider::new(policy.host_id).probe(&policy)
+                    != ProviderCapability::Ready
+            {
+                return Err(CliError::with_remedy(
+                    Failure::Conflict,
+                    format!(
+                        "profile {} is enabled and the selected isolation provider is not ready; execution was not changed",
+                        policy.profile_name()
+                    ),
+                    format!(
+                        "runner-manager repo profile set-scale {target} --profile {} --enabled false",
+                        policy.profile_name()
+                    ),
+                ));
+            }
             if policy.revision() != expected {
                 store
                     .update_policy_confirming_uncleaned_count(&policy, expected, 0)
@@ -356,5 +363,18 @@ fn show_policy(
             .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?
     )
     .map_err(write_failed("this profile status"))?;
+    if matches!(
+        policy.execution_policy(),
+        ExecutionPolicy::Isolated {
+            backend: Backend::WindowsHyperVContainer,
+            ..
+        }
+    ) {
+        writeln!(
+            out,
+            "workflow compatibility: script and JavaScript actions supported; desktop, devices, container actions, and service containers unsupported"
+        )
+        .map_err(write_failed("this profile status"))?;
+    }
     Ok(())
 }
