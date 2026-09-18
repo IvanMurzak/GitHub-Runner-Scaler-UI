@@ -362,8 +362,7 @@ impl WindowsHyperVContainers {
     }
 
     fn inspect_configuration(name: &str) -> Result<ContainerAttestation, CommandFailure> {
-        const FORMAT: &str = "{{.HostConfig.Isolation}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{index .HostConfig.StorageOpt \"size\"}}|{{.HostConfig.NetworkMode}}|{{len .Mounts}}|{{.HostConfig.Privileged}}|{{len .HostConfig.Binds}}|{{len .HostConfig.Devices}}|{{.Config.Image}}";
-        let result = Self::docker(&container_inspect_args(name, FORMAT))?;
+        let result = Self::docker(&container_configuration_inspect_args(name))?;
         if !result.success {
             return Err(result.failure());
         }
@@ -1238,6 +1237,16 @@ fn container_inspect_args(name: &str, format: &str) -> Vec<OsString> {
     os_args(["container", "inspect", "--format", format, name])
 }
 
+fn container_configuration_inspect_args(name: &str) -> Vec<OsString> {
+    // Docker serializes absent Windows collections as JSON null. Go template's
+    // `len` rejects a nil pointer, so normalize only those absent collections
+    // to zero before the strict ten-field parser validates the result. Values
+    // whose absence is invalid (including StorageOpt.size) remain unguarded and
+    // therefore fail closed.
+    const FORMAT: &str = "{{.HostConfig.Isolation}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{index .HostConfig.StorageOpt \"size\"}}|{{.HostConfig.NetworkMode}}|{{if .Mounts}}{{len .Mounts}}{{else}}0{{end}}|{{.HostConfig.Privileged}}|{{if .HostConfig.Binds}}{{len .HostConfig.Binds}}{{else}}0{{end}}|{{if .HostConfig.Devices}}{{len .HostConfig.Devices}}{{else}}0{{end}}|{{.Config.Image}}";
+    container_inspect_args(name, FORMAT)
+}
+
 fn compatible_image_metadata(metadata: &str) -> bool {
     let mut fields = metadata.trim().split('|');
     fields.next() == Some("windows") && fields.next() == Some("amd64") && fields.next().is_none()
@@ -1423,6 +1432,21 @@ mod tests {
                 "inspect",
                 "--format",
                 "{{.State.Status}}",
+                "runner-manager-owned",
+            ])
+        );
+    }
+
+    #[test]
+    fn configuration_inspection_normalizes_every_nullable_collection() {
+        let expected_format = "{{.HostConfig.Isolation}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{index .HostConfig.StorageOpt \"size\"}}|{{.HostConfig.NetworkMode}}|{{if .Mounts}}{{len .Mounts}}{{else}}0{{end}}|{{.HostConfig.Privileged}}|{{if .HostConfig.Binds}}{{len .HostConfig.Binds}}{{else}}0{{end}}|{{if .HostConfig.Devices}}{{len .HostConfig.Devices}}{{else}}0{{end}}|{{.Config.Image}}";
+        assert_eq!(
+            container_configuration_inspect_args("runner-manager-owned"),
+            os_args([
+                "container",
+                "inspect",
+                "--format",
+                expected_format,
                 "runner-manager-owned",
             ])
         );
@@ -1687,6 +1711,9 @@ mod tests {
             line.replacen("8192m", "4096m", 1),
             line.replacen("|0|false|0|0|", "|1|false|0|0|", 1),
             line.replacen("|0|false|0|0|", "|0|true|0|0|", 1),
+            line.replacen("|0|false|0|0|", "||false|0|0|", 1),
+            line.replacen("|0|false|0|0|", "|0|false||0|", 1),
+            line.replacen("|0|false|0|0|", "|0|false|0||", 1),
             format!("{line}|extra"),
         ] {
             assert_ne!(
