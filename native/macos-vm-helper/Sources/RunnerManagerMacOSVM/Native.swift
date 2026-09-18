@@ -176,6 +176,10 @@ func stopEnvironment(store: Store, record original: EnvironmentRecord) throws {
     try store.writeRecord(record)
 }
 
+func supervisorEnvironment(storeRoot: URL) -> [String: String] {
+    ["RUNNER_MANAGER_MACOS_VM_ROOT": storeRoot.path]
+}
+
 func launchSupervisor(store: Store, record: EnvironmentRecord, jit: inout Data) throws {
     guard record.state == .prepared else {
         throw HelperFailure.rejected("environment is not prepared")
@@ -189,9 +193,11 @@ func launchSupervisor(store: Store, record: EnvironmentRecord, jit: inout Data) 
     let process = Process()
     process.executableURL = executable
     process.arguments = ["--internal-supervise", record.environmentId, record.supervisorToken]
-    var childEnvironment = ProcessInfo.processInfo.environment
-    childEnvironment["RUNNER_MANAGER_MACOS_VM_ROOT"] = store.root.path
-    process.environment = childEnvironment
+    // The supervisor needs only the private store location. Inheriting the
+    // daemon's ambient environment would copy unrelated credentials into a
+    // long-lived provider process where host-process forensics could recover
+    // them.
+    process.environment = supervisorEnvironment(storeRoot: store.root)
     let input = Pipe()
     let status = Pipe()
     process.standardInput = input
@@ -203,6 +209,16 @@ func launchSupervisor(store: Store, record: EnvironmentRecord, jit: inout Data) 
         starting.state = .stopped
         try? store.writeRecord(starting)
         throw HelperFailure.degraded("VM supervisor launch failed")
+    }
+    // Persist the child identity before sending JIT or waiting for readiness.
+    // If the supervisor stalls before it can write its own boot record, the
+    // caller's bounded timeout can still find and stop this exact process.
+    starting.supervisorPid = process.processIdentifier
+    do {
+        try store.writeRecord(starting)
+    } catch {
+        process.terminate()
+        throw HelperFailure.degraded("VM supervisor identity could not be recorded")
     }
     do {
         try input.fileHandleForWriting.write(contentsOf: jit)

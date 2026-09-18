@@ -3,6 +3,14 @@ import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class ProtocolTests: XCTestCase {
+    func testSupervisorReceivesOnlyThePrivateStoreLocation() {
+        let root = URL(fileURLWithPath: "/private/runner-manager-vm-store", isDirectory: true)
+        XCTAssertEqual(
+            supervisorEnvironment(storeRoot: root),
+            ["RUNNER_MANAGER_MACOS_VM_ROOT": root.path]
+        )
+    }
+
     func testProbeResponseUsesTheDocumentedWireKeys() throws {
         let response = ProbeResponse(
             protocolVersion: 1,
