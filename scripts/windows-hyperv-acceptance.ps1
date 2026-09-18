@@ -786,14 +786,20 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
         throw 'container metadata exposed the JIT configuration environment input'
     }
     # Config.Cmd contains the reviewed bootstrap source and therefore names the
-    # JIT environment key three times. Remove only those exact source fragments;
-    # the identifier anywhere else remains an exposure.
+    # JIT environment key in exactly three backslash-escaped C# calls. Require
+    # every complete call exactly once before removing it; the identifier in
+    # any other command shape remains an exposure.
     $unreviewedCommand = $commands -join "`n"
     foreach ($reviewedReference in @(
-        'GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)',
-        'SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process)',
-        'SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process)'
-    )) { $unreviewedCommand = $unreviewedCommand.Replace($reviewedReference, '') }
+        'Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)',
+        'Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", jitValue, EnvironmentVariableTarget.Process)',
+        'Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", priorJit, EnvironmentVariableTarget.Process)'
+    )) {
+        if ([regex]::Matches($unreviewedCommand, [regex]::Escape($reviewedReference)).Count -ne 1) {
+            throw 'container metadata exposed the JIT configuration input outside the reviewed bootstrap source'
+        }
+        $unreviewedCommand = $unreviewedCommand.Replace($reviewedReference, '')
+    }
     if ($unreviewedCommand -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG' -or
         ($arguments -join "`n") -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG') {
         throw 'container metadata exposed the JIT configuration input outside the reviewed bootstrap source'

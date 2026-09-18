@@ -22,17 +22,19 @@ function Invoke-External {
     return @($script:InspectJson)
 }
 
+$script:ReviewedCommand = @('powershell.exe', '-Command', @'
+Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process);
+Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", jitValue, EnvironmentVariableTarget.Process);
+Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", priorJit, EnvironmentVariableTarget.Process);
+'@)
+
 function New-InspectJson {
     param(
         $Mounts = $null,
         $Binds = $null,
         $Devices = $null,
         [object[]]$Environment = @('Path=C:\Windows\System32'),
-        [object[]]$Command = @('powershell.exe', '-Command', @'
-Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process);
-Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process);
-Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process);
-'@),
+        [object[]]$Command = $script:ReviewedCommand,
         [object[]]$Arguments = @()
     )
     @([ordered]@{
@@ -93,9 +95,11 @@ Assert-Passes 'null optional collections and reviewed bootstrap source' (New-Ins
 Assert-Rejected 'nonempty bind array' (New-InspectJson -Binds @('C:\host:C:\guest')) 'host mount'
 Assert-Rejected 'nonempty device array' (New-InspectJson -Devices @(@{ PathOnHost = 'COM1' })) 'device or privileged mode'
 Assert-Rejected 'JIT value in environment' (New-InspectJson -Environment @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret')) 'JIT configuration environment input'
-Assert-Rejected 'unreviewed JIT assignment in command metadata' (New-InspectJson -Command @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret')) 'outside the reviewed bootstrap source'
+Assert-Rejected 'unreviewed JIT assignment in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret'))) 'outside the reviewed bootstrap source'
+Assert-Rejected 'unescaped reviewed JIT call in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)'))) 'outside the reviewed bootstrap source'
+Assert-Rejected 'duplicate reviewed JIT call in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)'))) 'outside the reviewed bootstrap source'
 Assert-Rejected 'JIT input in argument metadata' (New-InspectJson -Arguments @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret')) 'outside the reviewed bootstrap source'
-Assert-Rejected 'GitHub token in command metadata' (New-InspectJson -Command @('ghp_abcdefghijklmnopqrstuvwxyz123456')) 'credential-shaped value'
+Assert-Rejected 'GitHub token in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ghp_abcdefghijklmnopqrstuvwxyz123456'))) 'credential-shaped value'
 Assert-Rejected 'JIT-shaped value in argument metadata' (New-InspectJson -Arguments @('eyJhZ2VudE5hbWUiOiJydW5uZXItbWFuYWdlciIsImVuY29kZWQiOiJhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLz09In0=')) 'credential-shaped value'
 Assert-Rejected 'socket path in environment metadata' (New-InspectJson -Environment @('ENDPOINT=npipe://docker.sock')) 'credential-shaped value'
 
