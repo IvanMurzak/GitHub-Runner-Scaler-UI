@@ -79,15 +79,31 @@ function Invoke-External {
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string[]]$ArgumentList,
         [switch]$AllowFailure,
-        [switch]$DiscardOutput
+        [switch]$DiscardOutput,
+        [string]$EvidencePath
     )
     $output = & $FilePath @ArgumentList 2>&1
     $exit = $LASTEXITCODE
+    if ($EvidencePath) {
+        # Evidence must survive a non-zero exit, but command diagnostics can
+        # contain credentials. Persist only a small, explicit redaction surface;
+        # callers that need machine-readable output continue to receive the
+        # original in memory and never opt into evidence capture.
+        $redacted = @($output | ForEach-Object {
+            $line = $_.ToString()
+            $line = [Regex]::Replace($line, '(?i)\bgh[pousr]_[A-Za-z0-9_]+\b', '<redacted-github-token>')
+            $line = [Regex]::Replace($line, '(?i)(authorization\s*:\s*(?:bearer\s+)?)[^\s"'']+', '$1<redacted>')
+            $line = [Regex]::Replace($line, '(?i)((?:access[_ -]?token|jit(?:config)?|secret)\s*[:=]\s*)("[^"]*"|''[^'']*''|[^\s]+)', '$1<redacted>')
+            $line
+        })
+        $redacted | Set-Content -LiteralPath $EvidencePath -Encoding UTF8
+    }
     if (($exit -ne 0) -and (-not $AllowFailure)) {
         $safe = ($ArgumentList | ForEach-Object {
             if ($_ -match '(?i)(token|jit|secret|authorization)') { '<redacted-argument>' } else { $_ }
         }) -join ' '
-        throw "'$FilePath $safe' failed with exit code $exit"
+        $evidence = if ($EvidencePath) { "; redacted output was saved to '$EvidencePath'" } else { '' }
+        throw "'$FilePath $safe' failed with exit code $exit$evidence"
     }
     if (-not $DiscardOutput) { return @($output | ForEach-Object { $_.ToString() }) }
 }
@@ -365,6 +381,7 @@ function New-AuditState {
         switched_docker = $false
         pulled_image = $false
         replaced_service = $false
+        service_replacement_started = $false
         acceptance_id = $null
         profile_name = $null
         profile_created = $false
@@ -625,9 +642,77 @@ function Get-RunnerArgs {
     return @()
 }
 
-function Invoke-Runner([string[]]$Arguments, [switch]$AllowFailure) {
+function Invoke-Runner([string[]]$Arguments, [switch]$AllowFailure, [string]$EvidencePath) {
     $all = @(Get-RunnerArgs) + $Arguments
-    Invoke-External $RunnerManager $all -AllowFailure:$AllowFailure
+    Invoke-External $RunnerManager $all -AllowFailure:$AllowFailure -EvidencePath $EvidencePath
+}
+
+function Stop-AuditedServiceForReplacement($State, [string]$EvidencePath) {
+    $current = Get-ServiceSnapshot 'runner-manager'
+    $audited = $State.runner_service
+    if (-not $current.exists -or -not $audited.exists -or
+        $current.path_name -cne $audited.path_name -or
+        $current.executable_sha256 -ne $audited.executable_sha256 -or
+        $current.account -ne $audited.account -or $current.start_mode -ne $audited.start_mode -or
+        $current.delayed_auto_start -ne $audited.delayed_auto_start) {
+        throw 'the service changed after credential adoption; refusing to stop or replace it'
+    }
+
+    # Mark the transaction before its first service mutation. Rollback must
+    # restore the audited registration even when the product installer fails
+    # after DeleteService but before it can write its isolated install record.
+    Set-StateProperty $State service_replacement_started $true
+    Save-State $State
+
+    if ($current.state -ne 'Stopped') {
+        # ServiceController.Stop only submits SERVICE_CONTROL_STOP; unlike a
+        # convenience cmdlet it does not own the bounded wait below.
+        $controller = Get-Service -Name 'runner-manager' -ErrorAction Stop
+        try { $controller.Stop() } finally { $controller.Dispose() }
+        $deadline = [DateTime]::UtcNow.AddSeconds(90)
+        do {
+            Start-Sleep -Milliseconds 500
+            $stopped = Get-ServiceSnapshot 'runner-manager'
+            if ($stopped.exists -and $stopped.state -eq 'Stopped') { break }
+        } until ([DateTime]::UtcNow -ge $deadline)
+
+        if (-not $stopped.exists -or $stopped.state -ne 'Stopped') {
+            # A legacy daemon can predate the bounded SCM stop behavior. The
+            # force fallback is allowed only for the unchanged audited PID and
+            # executable, and only after SCM had 90 seconds to stop it cleanly.
+            $stuck = Get-ServiceSnapshot 'runner-manager'
+            if (-not $stuck.exists -or $stuck.process_id -eq 0 -or
+                $stuck.process_id -ne $current.process_id -or
+                $stuck.path_name -cne $audited.path_name -or
+                $stuck.executable_sha256 -ne $audited.executable_sha256) {
+                throw 'the audited service did not stop and its live identity changed; refusing force termination'
+            }
+            Require-OptIn $AllowServiceRestart 'AllowServiceRestart' 'force-terminating the unchanged audited legacy service after its bounded SCM stop timed out'
+            Stop-Process -Id $stuck.process_id -Force -ErrorAction Stop
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+                Start-Sleep -Milliseconds 500
+                $stopped = Get-ServiceSnapshot 'runner-manager'
+                if ($stopped.exists -and $stopped.state -eq 'Stopped') { break }
+            } until ([DateTime]::UtcNow -ge $deadline)
+            if (-not $stopped.exists -or $stopped.state -ne 'Stopped') {
+                throw 'the audited service remained non-stopped after bounded force termination; refusing replacement'
+            }
+        }
+    } else {
+        $stopped = $current
+    }
+
+    [ordered]@{
+        observed_utc = [DateTime]::UtcNow.ToString('o')
+        service_name = $stopped.name
+        state = $stopped.state
+        account = $stopped.account
+        start_mode = $stopped.start_mode
+        path_name = $stopped.path_name
+        executable_sha256 = $stopped.executable_sha256
+        provenance = 'exact audited service stopped before reviewed replacement'
+    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8
 }
 
 function Invoke-RunnerConfirmed([string[]]$Arguments, [switch]$AllowFailure) {
@@ -762,7 +847,8 @@ function Invoke-RunJob($State) {
     Save-State $State
 
     if (-not $PSCmdlet.ShouldProcess('runner-manager service', "install PR binary $RunnerManager")) { return }
-    Invoke-Runner @('service', 'install', '--start-at', 'boot') | Set-Content -LiteralPath (Join-Path $evidence 'service-install.txt') -Encoding UTF8
+    Stop-AuditedServiceForReplacement $State (Join-Path $evidence 'service-replacement-preflight.json')
+    Invoke-Runner @('service', 'install', '--start-at', 'boot') -EvidencePath (Join-Path $evidence 'service-install.txt') | Out-Null
     Set-StateProperty $State replaced_service $true
     Save-State $State
     if (-not $PSCmdlet.ShouldProcess("repository profile $profile", 'create and enable isolated execution')) { return }
@@ -882,7 +968,8 @@ function Invoke-Cleanup($State) {
 }
 
 function Restore-ServiceState($State) {
-    if (-not $State.replaced_service) { return }
+    $replacementStarted = $State.PSObject.Properties.Name -contains 'service_replacement_started' -and $State.service_replacement_started
+    if (-not $State.replaced_service -and -not $replacementStarted) { return }
     Invoke-Runner @('service', 'uninstall') -AllowFailure | Out-Null
     if ($State.service_record.exists) {
         $priorDirectory = Join-Path (Split-Path $StatePath -Parent) 'prior-service'
@@ -908,6 +995,9 @@ function Restore-ServiceState($State) {
         if ($mode -eq 'boot' -and $State.runner_service.state -ne 'Running') { Stop-Service -Name runner-manager -Force -ErrorAction SilentlyContinue }
         if ($mode -eq 'login' -and $State.service_record.scheduled_task_state -ne 'Running') { Stop-ScheduledTask -TaskName runner-manager -ErrorAction SilentlyContinue }
     }
+    Set-StateProperty $State service_replacement_started $false
+    Set-StateProperty $State replaced_service $false
+    Save-State $State
 }
 
 function Restore-DockerAndFeatures($State) {

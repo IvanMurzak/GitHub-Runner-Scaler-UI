@@ -158,6 +158,50 @@ fn external_output_is_joined_only_after_each_invocation_returns() {
 }
 
 #[test]
+fn service_replacement_is_bounded_diagnostic_and_rollback_safe() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    for needle in [
+        "function Stop-AuditedServiceForReplacement",
+        "the service changed after credential adoption",
+        "Set-StateProperty $State service_replacement_started $true",
+        "$controller.Stop()",
+        "AddSeconds(90)",
+        "$stuck.process_id -ne $current.process_id",
+        "$stuck.path_name -cne $audited.path_name",
+        "Require-OptIn $AllowServiceRestart",
+        "service-replacement-preflight.json",
+        "-EvidencePath (Join-Path $evidence 'service-install.txt')",
+        "redacted output was saved",
+        "<redacted-github-token>",
+        "$State.PSObject.Properties.Name -contains 'service_replacement_started'",
+        "Set-StateProperty $State service_replacement_started $false",
+    ] {
+        assert!(
+            script.contains(needle),
+            "missing bounded replacement contract: {needle}"
+        );
+    }
+
+    let transaction = script
+        .find("Set-StateProperty $State service_replacement_started $true")
+        .expect("replacement transaction is recorded");
+    let stop = script
+        .find("$controller.Stop()")
+        .expect("audited service is stopped");
+    let install = script
+        .find("Invoke-Runner @('service', 'install', '--start-at', 'boot')")
+        .expect("replacement install exists");
+    assert!(
+        transaction < stop && stop < install,
+        "rollback state must be durable before stop, and stop must finish before install"
+    );
+    assert!(
+        script
+            .contains("Invoke-Runner @('service', 'install', '--start-at', 'boot') -EvidencePath")
+    );
+}
+
+#[test]
 fn harness_and_workflow_pin_the_production_provider_security_contract() {
     let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
     let workflow = repository_file(".github/workflows/windows-hyperv-native-acceptance.yml");
