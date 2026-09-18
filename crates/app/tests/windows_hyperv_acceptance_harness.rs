@@ -3,10 +3,36 @@
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
 
 fn repository_file(path: &str) -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     fs::read_to_string(root.join(path)).expect("acceptance asset is readable")
+}
+
+#[test]
+#[cfg(windows)]
+fn container_evidence_contract_executes_under_windows_powershell() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "tests/windows-hyperv-acceptance-contract.ps1",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("Windows PowerShell runs the Hyper-V acceptance contract");
+    assert!(
+        output.status.success(),
+        "Hyper-V acceptance PowerShell contract failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

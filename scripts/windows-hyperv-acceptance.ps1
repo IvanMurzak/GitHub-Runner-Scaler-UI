@@ -770,10 +770,36 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
     if ([int64]$item.HostConfig.Memory -ne 4294967296) { throw 'live container did not receive the configured 4096 MiB memory limit' }
     if ([string]$item.HostConfig.StorageOpt.size -ne '8192m') { throw 'live container did not receive the configured 8192 MiB disk limit' }
     if ($item.HostConfig.NetworkMode -ne 'nat') { throw 'live container did not use the expected NAT network' }
-    if (@($item.Mounts).Count -ne 0 -or @($item.HostConfig.Binds).Count -ne 0) { throw 'live container exposed a host mount' }
-    if (@($item.HostConfig.Devices).Count -ne 0 -or $item.HostConfig.Privileged) { throw 'live container exposed a device or privileged mode' }
-    $surface = @($item.Config.Env) + @($item.Config.Cmd) + @($item.Args) + @($item.Mounts | ConvertTo-Json -Compress)
-    if (($surface -join "`n") -match '(?i)(docker\.sock|ACTIONS_RUNNER_INPUT_JITCONFIG|gh[pousr]_[A-Za-z0-9_]{20,})') {
+    # Docker serializes absent optional collections as JSON null. PowerShell's
+    # array subexpression operator counts that scalar null as one item, so
+    # discard null itself while retaining every real collection entry.
+    $mounts = @($item.Mounts | Where-Object { $null -ne $_ })
+    $binds = @($item.HostConfig.Binds | Where-Object { $null -ne $_ })
+    $devices = @($item.HostConfig.Devices | Where-Object { $null -ne $_ })
+    if ($mounts.Count -ne 0 -or $binds.Count -ne 0) { throw 'live container exposed a host mount' }
+    if ($devices.Count -ne 0 -or $item.HostConfig.Privileged) { throw 'live container exposed a device or privileged mode' }
+
+    $environment = @($item.Config.Env | Where-Object { $null -ne $_ })
+    $commands = @($item.Config.Cmd | Where-Object { $null -ne $_ })
+    $arguments = @($item.Args | Where-Object { $null -ne $_ })
+    if (@($environment | Where-Object { [string]$_ -match '(?i)^ACTIONS_RUNNER_INPUT_JITCONFIG(?:=|$)' }).Count -ne 0) {
+        throw 'container metadata exposed the JIT configuration environment input'
+    }
+    # Config.Cmd contains the reviewed bootstrap source and therefore names the
+    # JIT environment key three times. Remove only those exact source fragments;
+    # the identifier anywhere else remains an exposure.
+    $unreviewedCommand = $commands -join "`n"
+    foreach ($reviewedReference in @(
+        'GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)',
+        'SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process)',
+        'SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process)'
+    )) { $unreviewedCommand = $unreviewedCommand.Replace($reviewedReference, '') }
+    if ($unreviewedCommand -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG' -or
+        ($arguments -join "`n") -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG') {
+        throw 'container metadata exposed the JIT configuration input outside the reviewed bootstrap source'
+    }
+    $surface = $environment + $commands + $arguments + @($mounts | ConvertTo-Json -Compress)
+    if (($surface -join "`n") -match '(?i)(docker\.sock|gh[pousr]_[A-Za-z0-9_]{20,}|encoded_jit_config\s*[:=]|eyJ[A-Za-z0-9_+/=-]{40,})') {
         throw 'container metadata exposed a socket or credential-shaped value'
     }
     [ordered]@{
@@ -784,8 +810,8 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
         memory = $item.HostConfig.Memory
         storage_opt = $item.HostConfig.StorageOpt
         network_mode = $item.HostConfig.NetworkMode
-        mounts = @($item.Mounts).Count
-        devices = @($item.HostConfig.Devices).Count
+        mounts = $mounts.Count
+        devices = $devices.Count
         privileged = [bool]$item.HostConfig.Privileged
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'container-attestation.json') -Encoding UTF8
 }
