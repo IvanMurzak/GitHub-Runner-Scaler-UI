@@ -1,0 +1,89 @@
+crates/agent/src/lifecycle/macos_vm.rs
+  s_5801a853f78e8a::t_a3ea6d418811f5 172-174
+crates/app/src/cli/profile.rs
+  s_5801a853f78e8a::t_ecb1cf0fb702e2 5-7,208,219,367-379
+crates/app/src/cli/daemon.rs
+  s_5801a853f78e8a::t_fef608960d163e 18,290
+README.md
+  s_5801a853f78e8a::t_b406a6aec0fccd 239-268,347-382
+crates/app/src/tui/settings.rs
+  s_5801a853f78e8a::t_bf30e866f349c9 2248,2254-2262,2425-2426,2432-2440,2835-2838,2858-2865,2869-2871,3325,3328,5410-5416,5465-5471,5527-5537
+crates/agent/src/lifecycle.rs
+  s_5801a853f78e8a::t_ecb1cf0fb702e2 1622,1624,1630-1659
+  s_5801a853f78e8a::t_70be272855655d 1775-1780
+  s_5801a853f78e8a::t_fef608960d163e 25-27,47,51,56-57,1235,1273,1278-1298,1300-1313,1456,1611-1621,1623,1625-1629,1660-1774,1781-1830,2838-2849,3325-3328,3330,3333-3334,3690-3695,3769,3778-3779,3783-3784,3817-3820,3824-3825,4049-4065,4557,4564,4597-4599,4758,5120-5122,5159-5161,5284-5324,5336,5344-5347,5358-5363,5378-5381,5395-5440,5482-5512
+crates/app/src/cli/policy.rs
+  s_5801a853f78e8a::t_ecb1cf0fb702e2 9-11,1255,1263,1265
+crates/agent/src/reconcile.rs
+  s_5801a853f78e8a::t_fef608960d163e 114-116,1255-1270,5116-5130,5255-5259
+crates/app/src/cli/host.rs
+  s_5801a853f78e8a::t_8b00b596e26ca9 81-85,468,481,495-496,518-520,533-584,606,640-651,912-968
+CHANGELOG.md
+  s_5801a853f78e8a::t_b406a6aec0fccd 44-50
+.github/workflows/ci.yml
+  s_5801a853f78e8a::t_1cf797b6cef99e 159-194
+.github/workflows/d1-live-jit-acceptance.yml
+  s_5801a853f78e8a::t_a566dd9c5f6112 1-55
+.github/workflows/windows-hyperv-native-acceptance.yml
+  s_5801a853f78e8a::t_907600ca43691d 1-84
+.gitignore
+  s_5801a853f78e8a::t_b711ff44b92227 12
+.taskflow/2026-09-13-runner-sandbox-isolation/ROADMAP.md
+  s_5801a853f78e8a::t_ba1789e6f17c75 5-6,8,56-58,223-238,243-344
+crates/agent/src/lib.rs
+  s_5801a853f78e8a::t_7a15dc40d59a23 44
+crates/agent/src/lifecycle/windows_hyperv.rs
+  s_5801a853f78e8a::t_95870fa29aec8f 1-1788
+crates/agent/src/oci.rs
+  s_5801a853f78e8a::t_be6202e3f4342a 1-2218
+crates/app/src/tui/shell.rs
+  s_5801a853f78e8a::t_b0549823e26d82 32-34,1431-1459,4368-4420
+crates/app/tests/profile_commands.rs
+  s_5801a853f78e8a::t_8eca28e0b718aa 253,268-278
+crates/app/tests/windows_hyperv_acceptance_harness.rs
+  s_5801a853f78e8a::t_12bdcd4ef938ab 1-354
+crates/app/tests/workflow_triggers.rs
+  s_5801a853f78e8a::t_bae57fb9bbcdef 520-622
+crates/app/tests/wsl_operator_documentation.rs
+  s_5801a853f78e8a::t_8eca2c6ecb2904 95-213
+crates/domain/src/attempt.rs
+  s_5801a853f78e8a::t_7f057a34306fd3 413-416,421-454,499,508,545,2285,2303,2330-2333,2397-2420
+crates/domain/src/execution.rs
+  s_5801a853f78e8a::t_ac99babf5ff339 4
+docs/spikes/rootless-oci-wsl-quota.md
+  s_5801a853f78e8a::t_36ac7696de69ef 1-243
+docs/windows-hyperv-native-acceptance.md
+  s_5801a853f78e8a::t_b75a09e9d60adc 1-72
+scripts/windows-hyperv-acceptance.ps1
+  s_5801a853f78e8a::t_d78872078657f3 1-1213
+tests/managed-wsl-oci-acceptance.sh
+  s_5801a853f78e8a::t_d8274dcc019d2f 1-232
+tests/managed-wsl-oci-reboot-acceptance.ps1
+  s_5801a853f78e8a::t_4450c66f18c313 1-284
+tests/managed-wsl-oci-reboot-contract.ps1
+  s_5801a853f78e8a::t_b1477101dad7ab 1-79
+tests/managed-wsl-oci-restart-acceptance.ps1
+  s_5801a853f78e8a::t_08ac73e0e99dd6 1-57
+tests/managed-wsl-oci-restart-acceptance.sh
+  s_5801a853f78e8a::t_5b11c3d12cbc39 1-238
+tests/native-linux-oci-acceptance.sh
+  s_5801a853f78e8a::t_7ba54b422007c0 1-175
+tests/windows-hyperv-acceptance-contract.ps1
+  s_5801a853f78e8a::t_1975c9ac5ab45b 1-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0875d65156e52e08493a4c57d36f72146fa40696",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
