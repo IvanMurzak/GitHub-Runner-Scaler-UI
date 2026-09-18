@@ -54,9 +54,30 @@ function New-InspectJson {
     }) | ConvertTo-Json -Depth 8
 }
 
+$script:OwnedFixtureDirectories = [Collections.Generic.List[string]]::new()
+function Remove-OwnedFixtureDirectory([string]$Path) {
+    $lastError = $null
+    foreach ($attempt in 1..20) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        } catch {
+            $lastError = $_
+            try {
+                [IO.Directory]::Delete($Path, $true)
+            } catch {
+                $lastError = $_
+            }
+        }
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        if ($attempt -lt 20) { Start-Sleep -Milliseconds 250 }
+    }
+    throw "owned test fixture directory '$Path' remains after cleanup retries: $($lastError.Exception.Message)"
+}
+
 function Assert-Passes([string]$Name, [string]$Json, [scriptblock]$Check = {}) {
     $script:InspectJson = $Json
     $directory = Join-Path ([IO.Path]::GetTempPath()) ("runner-manager-hyperv-contract-" + [Guid]::NewGuid().ToString('N'))
+    $script:OwnedFixtureDirectories.Add($directory)
     New-Item -ItemType Directory -Path $directory | Out-Null
     try {
         Assert-ContainerEvidence '0123456789abcdef' $directory
@@ -64,13 +85,14 @@ function Assert-Passes([string]$Name, [string]$Json, [scriptblock]$Check = {}) {
     } catch {
         throw "expected '$Name' to pass: $($_.Exception.Message)"
     } finally {
-        Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-OwnedFixtureDirectory $directory
     }
 }
 
 function Assert-Rejected([string]$Name, [string]$Json, [string]$Message) {
     $script:InspectJson = $Json
     $directory = Join-Path ([IO.Path]::GetTempPath()) ("runner-manager-hyperv-contract-" + [Guid]::NewGuid().ToString('N'))
+    $script:OwnedFixtureDirectories.Add($directory)
     New-Item -ItemType Directory -Path $directory | Out-Null
     try {
         Assert-ContainerEvidence '0123456789abcdef' $directory
@@ -81,7 +103,7 @@ function Assert-Rejected([string]$Name, [string]$Json, [string]$Message) {
             throw "'$Name' failed for the wrong reason: $($_.Exception.Message)"
         }
     } finally {
-        Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-OwnedFixtureDirectory $directory
     }
 }
 
@@ -102,5 +124,10 @@ Assert-Rejected 'JIT input in argument metadata' (New-InspectJson -Arguments @('
 Assert-Rejected 'GitHub token in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ghp_abcdefghijklmnopqrstuvwxyz123456'))) 'credential-shaped value'
 Assert-Rejected 'JIT-shaped value in argument metadata' (New-InspectJson -Arguments @('eyJhZ2VudE5hbWUiOiJydW5uZXItbWFuYWdlciIsImVuY29kZWQiOiJhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLz09In0=')) 'credential-shaped value'
 Assert-Rejected 'socket path in environment metadata' (New-InspectJson -Environment @('ENDPOINT=npipe://docker.sock')) 'credential-shaped value'
+
+$fixtureResidue = @($script:OwnedFixtureDirectories | Where-Object { Test-Path -LiteralPath $_ })
+if ($fixtureResidue.Count -ne 0) {
+    throw "owned test fixture directories remain after contract: $($fixtureResidue -join ', ')"
+}
 
 Write-Output 'Windows Hyper-V acceptance contract passed'
