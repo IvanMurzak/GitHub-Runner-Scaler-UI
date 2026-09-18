@@ -249,16 +249,23 @@ fn harness_and_workflow_pin_the_production_provider_security_contract() {
 #[test]
 fn cancellation_keeps_trigger_and_profile_cleanup_reachable() {
     let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
-    let created = script
+    let run_job = script
+        .split_once("function Invoke-RunJob")
+        .expect("run-job function exists")
+        .1
+        .split_once("function Assert-NoSecrets")
+        .expect("run-job function has a bounded body")
+        .0;
+    let created = run_job
         .find("Set-StateProperty $State trigger_label_created $true")
         .expect("trigger creation is durable");
-    let found = script
+    let found = run_job
         .find("$run = Find-AcceptanceRun $selector $dispatchAt")
         .expect("the exact-selector run is found");
-    let removed = script
-        .find("Remove-AcceptanceTrigger $State\n    $container")
+    let removed = run_job
+        .find("Remove-AcceptanceTrigger $State")
         .expect("the trigger is removed before waiting for a container");
-    let watched = script
+    let watched = run_job
         .find("Wait-ProviderContainer $evidence $JobTimeoutSeconds")
         .expect("the run is watched while waiting");
     assert!(created < found && found < removed && removed < watched);
