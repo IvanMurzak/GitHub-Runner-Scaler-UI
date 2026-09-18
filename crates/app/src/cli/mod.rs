@@ -44,6 +44,7 @@ pub mod auth;
 pub mod daemon;
 pub mod host;
 pub mod policy;
+pub mod profile;
 pub mod service;
 pub mod status;
 pub mod ui;
@@ -809,6 +810,15 @@ pub enum HostCommand {
     ResetRuntimeRoot,
     /// Show this machine's capacity, store, and projected REST budget.
     Show,
+    /// Inspect this host's execution provider capabilities.
+    #[command(subcommand)]
+    Isolation(HostIsolationCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostIsolationCommand {
+    /// Report provider readiness and installation remedies.
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -881,6 +891,134 @@ pub enum RepoCommand {
     SetWorkspace(RepoSetWorkspaceArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(RepoRemoveArgs),
+    /// Create, inspect and change named runner profiles.
+    #[command(subcommand)]
+    Profile(RepoProfileCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoProfileCommand {
+    Add(RepoProfileAddArgs),
+    List(RepoProfileTargetArgs),
+    Show(RepoProfileSelectArgs),
+    SetCapacity(RepoProfileCapacityArgs),
+    SetScale(RepoProfileScaleArgs),
+    AddLabel(RepoProfileLabelArgs),
+    RemoveLabel(RepoProfileLabelArgs),
+    SetWorkspace(RepoProfileWorkspaceArgs),
+    SetExecution(RepoProfileExecutionArgs),
+    Remove(RepoProfileRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RepoProfileTargetArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoProfileSelectArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoProfileAddArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub host_label: Option<String>,
+    #[arg(long)]
+    pub max_capacity: Option<u16>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long, value_enum, default_value = "native")]
+    pub execution: ExecutionMode,
+    #[command(flatten)]
+    pub isolation: IsolationArgs,
+    #[arg(long)]
+    pub enable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExecutionMode {
+    #[default]
+    Native,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendMode {
+    #[default]
+    Auto,
+    Oci,
+    WindowsHyperVContainer,
+    VirtualMachine,
+}
+
+#[derive(Debug, Args)]
+pub struct IsolationArgs {
+    #[arg(long, value_enum)]
+    pub backend: Option<BackendMode>,
+    #[arg(long)]
+    pub image: Option<String>,
+    #[arg(long)]
+    pub cpu: Option<u32>,
+    #[arg(long)]
+    pub memory: Option<u32>,
+    #[arg(long)]
+    pub disk: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoProfileCapacityArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long)]
+    pub max_capacity: u16,
+}
+#[derive(Debug, Args)]
+pub struct RepoProfileScaleArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub enabled: bool,
+}
+#[derive(Debug, Args)]
+pub struct RepoProfileLabelArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long = "label", required = true)]
+    pub labels: Vec<String>,
+}
+#[derive(Debug, Args)]
+pub struct RepoProfileWorkspaceArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long, value_enum)]
+    pub mode: WorkspaceMode,
+    #[arg(long, required_if_eq("mode", "persistent"))]
+    pub path: Option<String>,
+}
+#[derive(Debug, Args)]
+pub struct RepoProfileExecutionArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long, value_enum)]
+    pub mode: ExecutionMode,
+    #[command(flatten)]
+    pub isolation: IsolationArgs,
+}
+#[derive(Debug, Args)]
+pub struct RepoProfileRemoveArgs {
+    #[command(flatten)]
+    pub selection: RepoProfileSelectArgs,
+    #[arg(long)]
+    pub purge: bool,
 }
 
 /// `--mode`, mapped onto `a1`'s [`WorkspaceKind`].
@@ -928,6 +1066,8 @@ pub struct RepoSetWorkspaceArgs {
     /// The repository whose workspace behaviour is being set.
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     /// `ephemeral` discards the workspace after every job; `persistent` keeps
     /// each slot's `_work` directory for the next job on the same slot.
     #[arg(long, value_name = "MODE")]
@@ -973,6 +1113,8 @@ pub struct RepoAddArgs {
 pub struct RepoLabelArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     /// The label to add or remove, repeatable.
     #[arg(long = "label", value_name = "LABEL", required = true)]
     pub labels: Vec<String>,
@@ -982,6 +1124,8 @@ pub struct RepoLabelArgs {
 pub struct RepoSetCapacityArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     #[arg(long, value_name = "N")]
     pub max_capacity: u16,
 }
@@ -990,6 +1134,8 @@ pub struct RepoSetCapacityArgs {
 pub struct RepoSetScaleArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub enabled: bool,
 }
@@ -998,6 +1144,8 @@ pub struct RepoSetScaleArgs {
 pub struct RepoRemoveArgs {
     #[arg(value_name = "OWNER/REPO")]
     pub repository: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Also delete the runner package cache and historical diagnostics.
     #[arg(long)]
     pub purge: bool,

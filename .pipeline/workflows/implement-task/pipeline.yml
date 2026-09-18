@@ -1,12 +1,12 @@
 schema: 2
 
 name: implement-task
-description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish once and squash-merge into main only after the full PR check rollup is green.
+description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish a PR after the full PR check rollup is green.
 
 execution: sequential
-runner: manager
+runner: session
 isolation: run
-base_branch: main
+base_branch: runner-sandbox-isolation
 
 steps:
   - name: implement

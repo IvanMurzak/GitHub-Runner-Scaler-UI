@@ -200,6 +200,54 @@ jobs:
     runs-on: rm-home-win-x64
 ```
 
+`repo add` creates the `default` runner profile. A repository can also have named profiles:
+
+```sh
+runner-manager repo profile add OWNER/REPO --name native --max-capacity 2 --execution native
+runner-manager repo profile add OWNER/REPO --name isolated --max-capacity 2 \
+  --execution isolated --backend oci --image registry.example/runner@sha256:<64-hex-digest>
+runner-manager repo profile list OWNER/REPO
+runner-manager host isolation status --json
+```
+
+Each named profile prints its immutable selector and a copyable `runs-on` label. Put that
+literal selector in each job's `runs-on`; a matrix expression such as `${{ matrix.runner }}`
+cannot be resolved for automatic scaling. Commands that change a repository policy need
+`--profile NAME` once the repository has several profiles. An isolated profile cannot be
+enabled until its execution provider reports ready; provider failure never starts it as a
+native runner. Keep fork and untrusted pull-request workflows off a personal host unless
+you explicitly accept that trust boundary.
+
+Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
+Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
+mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to
+an absolute Linux path for a root-owned, non-writable Podman-compatible storage helper.
+The helper contract is deliberately fail-closed:
+
+- every `--storage-opt size=Nm` probe and create is routed to a finite filesystem whose
+  writable capacity for that container is no larger than `N` MiB;
+- the helper owns slot allocation, serialization, ENOSPC recovery and orphan lookup for
+  every later Podman-compatible command; it never falls back to the ordinary unbounded
+  graph root;
+- `runtime --storage-opt size=Nm info --format=json` returns ordinary Podman info plus
+  `runnerManagerStorage` with schema `1`, mode `exclusive-filesystem-pool`,
+  `requestedMiB: N`, and `hardCap: true` only after checking the finite store; and
+- graph root, run root, helper and attempt runtime paths stay on the distribution's Linux
+  filesystems, never under `/mnt`.
+
+Missing or malformed attestation remains `DiskQuotaUnavailable`. An invalid, mutable,
+non-root-owned or DrvFS helper path is refused instead of falling back to `podman`. The
+disposable one-slot reference fixture in `tests/managed-wsl-oci-acceptance.sh` exercises
+this contract with real writes until `df` reports at most filesystem bookkeeping space
+and ext4 returns `ENOSPC`; a production helper may manage a larger pool but must preserve
+the same per-create hard bound and command routing. On Windows,
+`tests/managed-wsl-oci-restart-acceptance.ps1` terminates only the named distribution and
+checks that the remounted helper recovers exact-generation resources and durable journal
+leases without another JIT registration. The separate
+`tests/managed-wsl-oci-reboot-acceptance.ps1` uses explicit `prepare`,
+`verify-after-reboot`, and `cleanup` phases for an operator-driven full Windows reboot.
+It records Windows kernel boot evidence but contains no command that reboots Windows.
+
 Queue a workflow, then watch the runner start and complete the job:
 
 ```sh
@@ -225,19 +273,34 @@ runner-manager host show                                       # Show capacity, 
 runner-manager host set-capacity N                             # Limit concurrent runners on this machine
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
+runner-manager host isolation status [--json]                  # Report execution provider readiness
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
   --max-capacity N [--label LABEL] [--enable]                  # Allow runners for a repository
 runner-manager repo list                                       # List repository policies
-runner-manager repo set-capacity OWNER/REPO --max-capacity N   # Change repository capacity
-runner-manager repo set-scale OWNER/REPO --enabled BOOL        # Enable scaling or drain runners
-runner-manager repo add-label OWNER/REPO --label LABEL         # Add a runs-on label
-runner-manager repo remove-label OWNER/REPO --label LABEL      # Remove a runs-on label
-runner-manager repo set-workspace OWNER/REPO --mode ephemeral  # Discard the workspace after every job
+runner-manager repo set-capacity OWNER/REPO [--profile NAME] --max-capacity N
+runner-manager repo set-scale OWNER/REPO [--profile NAME] --enabled BOOL
+runner-manager repo add-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo remove-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo set-workspace OWNER/REPO [--profile NAME] --mode ephemeral
 runner-manager repo set-workspace OWNER/REPO \
-  --mode persistent --path PATH                                # Keep each slot's _work between jobs
-runner-manager repo remove OWNER/REPO [--purge]                # Remove a policy and optional retained data
+  [--profile NAME] --mode persistent --path PATH               # Keep each slot's _work between jobs
+runner-manager repo remove OWNER/REPO [--profile NAME] [--purge]
+runner-manager repo profile add OWNER/REPO --name NAME          # Add a named runner profile
+runner-manager repo profile list OWNER/REPO                    # List profiles and selectors
+runner-manager repo profile show OWNER/REPO [--profile NAME]   # Inspect one unambiguous profile
+runner-manager repo profile set-capacity OWNER/REPO [--profile NAME] --max-capacity N
+runner-manager repo profile set-scale OWNER/REPO [--profile NAME] --enabled BOOL
+runner-manager repo profile add-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo profile remove-label OWNER/REPO [--profile NAME] --label LABEL
+runner-manager repo profile set-workspace OWNER/REPO [--profile NAME] --mode ephemeral
+runner-manager repo profile set-workspace OWNER/REPO [--profile NAME] \
+  --mode persistent --path PATH
+runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode native
+runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode isolated \
+  --backend auto --image PINNED-REFERENCE [--cpu N --memory N --disk N]
+runner-manager repo profile remove OWNER/REPO [--profile NAME] [--purge]
 
 runner-manager org add ORG --host-label HOST                   # Add an organization in monitor-only mode
 runner-manager org add ORG --host-label HOST \
@@ -262,6 +325,42 @@ runner-manager wsl install --distribution NAME [--capacity N]  # Make a WSL2 dis
 runner-manager wsl status --distribution NAME [--json]         # Report that host's real state
 runner-manager wsl detach --distribution NAME                  # Stop managing it, deleting no Linux data
 ```
+
+On Windows, the preview isolated backend targets **Hyper-V-isolated Windows
+containers** through a Docker-compatible Windows container runtime. Candidate
+hosts are Windows 11 Pro or Enterprise with Docker Desktop switched to Windows
+containers, or Windows Server Standard or Datacenter with Moby or Mirantis
+Container Runtime. Both paths require Hyper-V and Containers; native client and
+Server acceptance is still pending. Docker Desktop on Windows Education can run
+Linux containers only, and Docker Desktop is not supported on Windows Server.
+Microsoft documents that Windows containers use a parent Job Object and that
+Hyper-V isolation applies resource controls to both that container job and its
+utility VM. Windows also supports [nested Job
+Objects](https://learn.microsoft.com/windows/win32/procthread/nested-jobs):
+ordinary descendants inherit the job chain, and the most restrictive limits
+remain effective. Runner Manager uses that supported nesting seam to install a
+256-process `ActiveProcessLimit` around `Runner.Listener` and its descendants.
+The bootstrap sets no breakaway flag.
+
+The provider copies the verified runner package into a fresh writable layer
+and never mounts a host directory, device, credential, or container-runtime
+socket. Before JIT crosses container stdin, it reads back Docker's exact
+Hyper-V, pinned-image, CPU, memory, disk, network, mount, device, and privilege
+configuration. The in-container bootstrap then creates and queries the Job
+Object and returns a typed, one-use nonce attestation. Only an exact 256-process
+limit plus kill-on-close proof unlocks the private JIT channel;
+`Runner.Listener` is created suspended, assigned to the job, membership-checked,
+and then resumed. Any timeout, malformed proof, changed container setting, or
+assignment failure stops the container without a native fallback.
+
+This backend remains preview-held until real jobs, restart/recovery and
+resource-exhaustion tests pass on declared Windows client and Server variants.
+Desktop/UI automation, host devices, container actions, and service containers
+remain explicitly unsupported. The control provides dependency isolation for
+the documented trusted-workflow model; it is not a hostile-code containment
+claim. `host isolation status` still reports missing features, runtime
+permission, Linux-container mode, runtime degradation, and the pending native
+acceptance notice separately.
 
 Add `--help` to any command to see every option. Failures name the command that fixes them
 and use a distinct exit code for each failure class.
@@ -542,11 +641,14 @@ action you need:
 `d` dashboard · `r` repositories · `n` runners · `a` activity · `s` repository settings ·
 `h` host settings · `/` filter · `o` sort · `c` copy · `F5` refresh · `?` help · `q` quit
 
-The repositories view lists each policy's `runs-on` labels beside its capacity and health;
-`s` opens the settings for the selected repository, where the optional labels can be edited
-in place. The host label above them is fixed, because it is the identity that keeps two
-machines from answering each other's jobs, so only the descriptive labels are editable.
-Saving makes the stored set equal exactly what is on the line.
+The repositories view groups runner profiles beneath each repository. Select the exact profile
+row before pressing `s`; Repository Settings never guesses among siblings. The screen shows the
+profile's immutable selector and copyable `runs-on`, and exposes its capacity, scaling, optional
+labels, workspace, native/isolated execution mode, backend, pinned image and resource limits. It
+also creates sibling profiles, drains or removes only the selected profile, and reports provider
+readiness with a concrete remedy. Static `runs-on` selectors are required; matrix expressions are
+not resolved. The selector stays fixed because it is the routing identity that prevents sibling
+profiles or different hosts from answering the same job.
 
 Every status is also written in words, so the dashboard remains usable without colour or
 box-drawing characters.

@@ -518,6 +518,109 @@ fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point
 }
 
 #[test]
+fn pull_requests_gate_the_secret_free_native_rootless_oci_acceptance() {
+    let source = read_workflow("ci.yml");
+    let job = locate(&source, &["jobs", "oci-native-acceptance"])
+        .expect("ci.yml must keep d1's native OCI acceptance job");
+    for required in [
+        "if: github.event_name == 'pull_request'",
+        "runs-on: ubuntu-24.04",
+        "name: rootless OCI bounded-store acceptance (linux-x86_64, no JIT)",
+        "run: bash tests/native-linux-oci-acceptance.sh",
+    ] {
+        assert!(
+            job.block.iter().any(|(_, line)| line == required),
+            "d1's native OCI acceptance job no longer contains `{required}`"
+        );
+    }
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("native-linux-oci-acceptance.sh");
+    let harness = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    for required in [
+        "sudo mount -o loop,nodev,nosuid",
+        "runner-manager-oci-native-acceptance",
+        "oci::tests::live_rootless_bounded_storage_acceptance",
+        "--ignored --exact --nocapture",
+    ] {
+        assert!(
+            harness.contains(required),
+            "the native OCI harness no longer contains `{required}`"
+        );
+    }
+
+    let provider = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("agent")
+        .join("src")
+        .join("oci.rs");
+    let provider = std::fs::read_to_string(&provider)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", provider.display()));
+    for required in ["dd if=/dev/zero", "No space left on device", "RM_FS_FULL"] {
+        assert!(
+            provider.contains(required),
+            "the bounded-store acceptance no longer contains `{required}`"
+        );
+    }
+}
+
+#[test]
+fn live_oci_jit_workflow_is_same_repo_label_gated_and_unique() {
+    let source = read_workflow("d1-live-jit-acceptance.yml");
+    assert_eq!(triggers(&source), vec!["pull_request".to_string()]);
+    assert_eq!(
+        inline_list_at(&source, &["on", "pull_request", "types"]),
+        Some(vec!["labeled".to_string()])
+    );
+    for required in [
+        "github.event.pull_request.number == 74",
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "github.event.label.name == 'd1-live-jit-pr74-20260916'",
+        "runs-on: [self-hosted, linux, x64, d1-live-jit-pr74-20260916]",
+        "uses: actions/checkout@v7",
+        "test ! -f /tmp/runner-manager-provider-inspected || exit 0",
+        "touch /tmp/runner-manager-actions-job-complete",
+    ] {
+        assert!(
+            source.contains(required),
+            "the temporary live JIT workflow no longer contains `{required}`"
+        );
+    }
+    for forbidden in ["pull_request_target", "encoded_jit_config", "secrets."] {
+        assert!(
+            !source.contains(forbidden),
+            "the temporary live JIT workflow contains forbidden text `{forbidden}`"
+        );
+    }
+
+    let harness = std::fs::read_to_string(
+        workflow_path("d1-live-jit-acceptance.yml")
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("managed-wsl-oci-acceptance.sh"),
+    )
+    .expect("managed WSL OCI harness must be readable");
+    for required in [
+        "RUNNER_MANAGER_OCI_ACCEPTANCE_MODE:-synthetic",
+        "RUNNER_MANAGER_OCI_JIT_RUNNER_SHA256",
+        "oci::tests::live_rootless_github_jit_acceptance",
+        "--ignored --exact --nocapture",
+    ] {
+        assert!(
+            harness.contains(required),
+            "the live JIT harness no longer contains `{required}`"
+        );
+    }
+}
+
+#[test]
 fn e2e_workflow_has_no_release_trigger_and_runs_when_ci_runs() {
     let source = read_workflow("e2e.yml");
 

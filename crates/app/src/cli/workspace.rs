@@ -825,6 +825,10 @@ impl WorkspaceChange {
 /// # Errors
 /// As [`set_host_runner_root`], plus [`Failure::NotFound`] when no policy for
 /// `target` exists.
+#[allow(
+    dead_code,
+    reason = "shared compatibility handler retained for TUI/tests"
+)]
 pub fn set_repository_workspace(
     context: &Context,
     store: &dyn Store,
@@ -832,18 +836,19 @@ pub fn set_repository_workspace(
     kind: WorkspaceKind,
     path: Option<LocalAbsolutePath>,
 ) -> Result<WorkspaceChange, CliError> {
+    set_repository_workspace_selected(context, store, target, None, kind, path)
+}
+
+pub fn set_repository_workspace_selected(
+    context: &Context,
+    store: &dyn Store,
+    target: &ScaleTarget,
+    profile: Option<&str>,
+    kind: WorkspaceKind,
+    path: Option<LocalAbsolutePath>,
+) -> Result<WorkspaceChange, CliError> {
     let policies = store.policies().map_err(read_failure)?;
-    let mut policy = policies
-        .iter()
-        .find(|policy| &policy.target == target)
-        .cloned()
-        .ok_or_else(|| {
-            CliError::with_remedy(
-                Failure::NotFound,
-                format!("no policy for {target} exists"),
-                "runner-manager repo list",
-            )
-        })?;
+    let mut policy = super::policy::find_policy_selected(store, target, profile)?;
     let previous = policy.workspace_policy().clone();
     let expected_revision = policy.revision();
     let host = super::host::local_host(store)?;
@@ -891,14 +896,18 @@ pub fn set_repository_workspace(
         }
     };
 
+    policy
+        .set_workspace_policy(requested.clone())
+        .map_err(|source| CliError::new(Failure::InvalidArgument, source.to_string()))?;
+
+    // Validate the complete policy shape before creating a requested root.
+    // In particular, isolated execution requires an ephemeral workspace, and
+    // that refusal must leave no directory behind.
     let created = match requested.root() {
         Some(root) => validated_leaf(context.paths(), &host_root, &policies, &owner, root)?,
         None => None,
     };
 
-    policy
-        .set_workspace_policy(requested.clone())
-        .map_err(|source| CliError::new(Failure::InvalidArgument, source.to_string()))?;
     if policy.revision() != expected_revision {
         store
             .update_policy_confirming_uncleaned_count(&policy, expected_revision, affected.total())

@@ -71,9 +71,10 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::attempt::{AttemptError, AttemptOutcome, AttemptState, PersistedAttempt, RunnerAttempt};
+use crate::execution::{AttemptExecution, ExecutionPolicy};
 use crate::model::{
-    Arch, AttemptId, CachePolicy, Clock, Host, HostId, HostLabel, Os, PolicyId, RefreshInterval,
-    ScaleTarget, StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
+    Arch, AttemptId, CachePolicy, Clock, Host, HostId, HostLabel, Os, PolicyId, ProfileName,
+    RefreshInterval, ScaleTarget, StartMode, SystemClock, TargetScope, Timestamp, ValidationError,
 };
 use crate::path::LocalAbsolutePath;
 use crate::policy::{PersistedPolicy, PolicyError, PolicyState, RoutingLabels, ScalePolicy};
@@ -207,6 +208,11 @@ pub enum StoreError {
         found: u16,
     },
 
+    #[error(
+        "attempt {id} tried to change its journalled execution allocation; nothing was written"
+    )]
+    ExecutionAllocationChanged { id: AttemptId },
+
     /// Two uncleaned persistent attempts cannot hold one slot.
     ///
     /// Raised when a journal write collides with the partial unique index
@@ -241,6 +247,21 @@ pub enum StoreError {
         #[source]
         source: PolicyError,
     },
+
+    #[error("policy {id} has a selector that does not derive from its profile and host")]
+    CorruptProfileSelector { id: PolicyId },
+
+    #[error("policy {id} has a selector/optional-label collision with sibling policy {sibling}")]
+    ProfileLabelConflict { id: PolicyId, sibling: PolicyId },
+
+    #[error("policy {id} has the same selector as sibling policy {sibling}")]
+    ProfileSelectorConflict { id: PolicyId, sibling: PolicyId },
+
+    #[error("a named profile refers to host {host}, which is absent from the database")]
+    ProfileHostMissing { host: HostId },
+
+    #[error("policy {id} cannot change its profile, host, target or named selector after creation")]
+    ProfileIdentityChanged { id: PolicyId },
 
     /// A stored attempt is not a legal attempt: its state, outcome and
     /// timestamps do not pair the way this crate's own transitions pair them.
@@ -397,6 +418,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "workspace_locations",
         sql: include_str!("store/migrations/0003_workspace_locations.sql"),
     },
+    Migration {
+        version: 4,
+        name: "runner_profiles",
+        sql: include_str!("store/migrations/0004_runner_profiles.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "execution_domain",
+        sql: include_str!("store/migrations/0005_execution_domain.sql"),
+    },
 ];
 
 /// The schema version this build writes and understands.
@@ -404,7 +435,7 @@ const MIGRATIONS: &[Migration] = &[
 /// A database above this is refused with [`StoreError::SchemaTooNew`]; a database
 /// below it is migrated up on open. Both directions are decided from the
 /// `schema_migrations` table, which records every applied step and when.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Created outside the numbered chain, because the chain needs somewhere to
 /// record itself before its first step runs.
@@ -781,7 +812,9 @@ pub trait Store: fmt::Debug + Send + Sync {
 // `tests::the_attempt_set_predicates_follow_the_domain` asserts the two agree
 // state by state.
 
-/// `WHERE`-fragment for the attempts that still occupy a capacity slot.
+/// `WHERE`-fragment for attempts that still occupy capacity. Native attempts
+/// follow the legacy live-state set; isolated environments also hold capacity
+/// after the runner exits, until provider cleanup reaches `cleaned`.
 fn active_sql() -> String {
     let states = AttemptState::ALL
         .into_iter()
@@ -789,7 +822,10 @@ fn active_sql() -> String {
         .map(|state| format!("'{}'", token(&state)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("state IN ({states})")
+    format!(
+        "(state IN ({states}) OR (json_extract(execution, '$.kind') = 'isolated' AND {}))",
+        uncleaned_sql()
+    )
 }
 
 /// `WHERE`-fragment for the attempts whose cleanup has not completed.
@@ -1237,6 +1273,9 @@ impl SqliteStore {
         // check-to-write interval inside this transaction either.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         after_write_fence();
+        ensure_profile_identity(&tx, policy)?;
+        ensure_execution_mutation_safe(&tx, policy)?;
+        validate_profile_in_target(&tx, policy)?;
         let changed = tx.execute(
             &format!(
                 "UPDATE policies SET
@@ -1245,6 +1284,8 @@ impl SqliteStore {
                      installation_id = :installation_id,
                      host_id         = :host_id,
                      requested_host_label = :requested_host_label,
+                     profile_name = :profile_name,
+                     profile_selector = :profile_selector,
                      routing_labels  = :routing_labels,
                      min_capacity    = :min_capacity,
                      max_capacity    = :max_capacity,
@@ -1253,6 +1294,7 @@ impl SqliteStore {
                      cache_policy    = :cache_policy,
                      workspace_mode  = :workspace_mode,
                      workspace_path  = :workspace_path,
+                     execution_policy = :execution_policy,
                      revision        = :revision
                  WHERE id = :id
                    AND revision = :expected_revision
@@ -1502,16 +1544,18 @@ impl Store for SqliteStore {
     fn insert_policy(&self, policy: &ScalePolicy) -> Result<(), StoreError> {
         let fields = policy.to_persisted();
         let params = policy_params(&fields)?;
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_profile_in_target(&tx, policy)?;
+        tx.execute(
             "INSERT INTO policies (
                  id, target_scope, target_slug, installation_id, host_id,
-                 requested_host_label, routing_labels, min_capacity, max_capacity, enabled, state,
-                 cache_policy, workspace_mode, workspace_path, revision
+                 requested_host_label, profile_name, profile_selector, routing_labels, min_capacity, max_capacity, enabled, state,
+                 cache_policy, workspace_mode, workspace_path, execution_policy, revision
              ) VALUES (
                  :id, :target_scope, :target_slug, :installation_id, :host_id,
-                 :requested_host_label, :routing_labels, :min_capacity, :max_capacity, :enabled, :state,
-                 :cache_policy, :workspace_mode, :workspace_path, :revision
+                 :requested_host_label, :profile_name, :profile_selector, :routing_labels, :min_capacity, :max_capacity, :enabled, :state,
+                 :cache_policy, :workspace_mode, :workspace_path, :execution_policy, :revision
              )",
             &bind(&params)[..],
         )
@@ -1525,6 +1569,7 @@ impl Store for SqliteStore {
                 StoreError::Sqlite(source)
             }
         })?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1568,6 +1613,9 @@ impl Store for SqliteStore {
         // write lock up front costs one uncontended acquisition and removes the
         // hazard before anyone can introduce it.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_profile_identity(&tx, policy)?;
+        ensure_execution_mutation_safe(&tx, policy)?;
+        validate_profile_in_target(&tx, policy)?;
         let changed = tx.execute(
             "UPDATE policies SET
                  target_scope    = :target_scope,
@@ -1575,6 +1623,8 @@ impl Store for SqliteStore {
                  installation_id = :installation_id,
                  host_id         = :host_id,
                  requested_host_label = :requested_host_label,
+                 profile_name = :profile_name,
+                 profile_selector = :profile_selector,
                  routing_labels  = :routing_labels,
                  min_capacity    = :min_capacity,
                  max_capacity    = :max_capacity,
@@ -1583,6 +1633,7 @@ impl Store for SqliteStore {
                  cache_policy    = :cache_policy,
                  workspace_mode  = :workspace_mode,
                  workspace_path  = :workspace_path,
+                 execution_policy = :execution_policy,
                  revision        = :revision
              WHERE id = :id AND revision = :expected_revision",
             &bind(&params)[..],
@@ -1646,7 +1697,11 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare("SELECT * FROM policies WHERE id = :id")?;
         let mut rows = stmt.query(named_params! { ":id": uuid_text(id.as_uuid()) })?;
         match rows.next()? {
-            Some(row) => Ok(Some(policy_from_row(row)?)),
+            Some(row) => {
+                let policy = policy_from_row(row)?;
+                validate_profile_in_target(&conn, &policy)?;
+                Ok(Some(policy))
+            }
             None => Ok(None),
         }
     }
@@ -1657,7 +1712,9 @@ impl Store for SqliteStore {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(policy_from_row(row)?);
+            let policy = policy_from_row(row)?;
+            validate_profile_in_target(&conn, &policy)?;
+            out.push(policy);
         }
         Ok(out)
     }
@@ -1665,15 +1722,33 @@ impl Store for SqliteStore {
     fn record_attempt(&self, attempt: &RunnerAttempt) -> Result<(), StoreError> {
         let fields = self.normalise(attempt.to_persisted());
         let params = attempt_params(&fields)?;
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare("SELECT execution FROM attempts WHERE id = :id")?;
+            let mut rows = stmt.query(named_params! { ":id": uuid_text(fields.id.as_uuid()) })?;
+            if let Some(row) = rows.next()? {
+                let stored = json_column::<AttemptExecution>(
+                    row,
+                    "attempts",
+                    "execution",
+                    &fields.id.to_string(),
+                    "an attempt execution identity",
+                )?
+                .ok_or(StoreError::ExecutionAllocationChanged { id: fields.id })?;
+                if !stored.can_advance_to(&fields.execution) {
+                    return Err(StoreError::ExecutionAllocationChanged { id: fields.id });
+                }
+            }
+        }
+        tx.execute(
             "INSERT INTO attempts (
                  id, policy_id, github_runner_id, state, outcome, process_id,
-                 runtime_path, workspace_mode, workspace_slot,
+                 runtime_path, workspace_mode, workspace_slot, execution,
                  created_at, terminal_at, last_state_change_at
              ) VALUES (
                  :id, :policy_id, :github_runner_id, :state, :outcome, :process_id,
-                 :runtime_path, :workspace_mode, :workspace_slot,
+                 :runtime_path, :workspace_mode, :workspace_slot, :execution,
                  :created_at, :terminal_at, :last_state_change_at
              )
              ON CONFLICT(id) DO UPDATE SET
@@ -1682,6 +1757,7 @@ impl Store for SqliteStore {
                  state                = excluded.state,
                  outcome              = excluded.outcome,
                  process_id           = excluded.process_id,
+                 execution            = excluded.execution,
                  runtime_path         = excluded.runtime_path,
                  terminal_at          = excluded.terminal_at,
                  last_state_change_at = excluded.last_state_change_at",
@@ -1703,6 +1779,7 @@ impl Store for SqliteStore {
             &bind(&params)[..],
         )
         .map_err(|source| slot_lease_error(attempt, source))?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1817,6 +1894,16 @@ fn policy_params(fields: &PersistedPolicy) -> Result<NamedParams, StoreError> {
             )?),
         ),
         (":host_id", text(uuid_text(fields.host_id.as_uuid()))),
+        (":profile_name", text(fields.profile_name.as_str())),
+        (
+            ":profile_selector",
+            opt_text(
+                fields
+                    .routing_labels
+                    .as_ref()
+                    .map(|labels| labels.host_label().as_str().to_string()),
+            ),
+        ),
         (
             ":requested_host_label",
             text(fields.requested_host_label.to_string()),
@@ -1834,6 +1921,7 @@ fn policy_params(fields: &PersistedPolicy) -> Result<NamedParams, StoreError> {
         (":state", text(token(&fields.state))),
         (":cache_policy", text(token(&fields.cache_policy))),
         (":workspace_mode", text(token(&fields.workspace_kind))),
+        (":execution_policy", text(json(&fields.execution_policy))),
         (
             ":workspace_path",
             opt_text(
@@ -1874,6 +1962,7 @@ fn attempt_params(fields: &PersistedAttempt) -> Result<NamedParams, StoreError> 
         (":state", text(token(&fields.state))),
         (":outcome", opt_text(fields.outcome.as_ref().map(json))),
         (":process_id", opt_int(fields.process_id.map(i64::from))),
+        (":execution", text(json(&fields.execution))),
         (":runtime_path", text(runtime_path)),
         (":workspace_mode", text(token(&fields.workspace_kind))),
         (
@@ -1984,6 +2073,17 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
         None => None,
     };
 
+    let raw_profile_name: String = row.get("profile_name")?;
+    if raw_profile_name.trim() != raw_profile_name {
+        return Err(StoreError::CorruptColumn {
+            table: TABLE,
+            column: "profile_name",
+            id: key.clone(),
+            value: format!("{} bytes", raw_profile_name.len()),
+            expected: "a profile name without leading or trailing whitespace",
+        });
+    }
+
     let fields = PersistedPolicy {
         id,
         target,
@@ -1994,6 +2094,12 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
                 id,
                 source: PolicyError::Invalid(source),
             })?,
+        profile_name: ProfileName::new(raw_profile_name).map_err(|source| {
+            StoreError::CorruptPolicy {
+                id,
+                source: PolicyError::Invalid(source),
+            }
+        })?,
         routing_labels,
         min_capacity: u16_column(row, TABLE, "min_capacity", &key)?,
         max_capacity,
@@ -2016,11 +2122,168 @@ fn policy_from_row(row: &Row<'_>) -> Result<ScalePolicy, StoreError> {
                 id,
                 source: PolicyError::Workspace(WorkspaceError::from(source)),
             })?,
+        execution_policy: json_column::<ExecutionPolicy>(
+            row,
+            TABLE,
+            "execution_policy",
+            &key,
+            "an execution policy",
+        )?
+        .ok_or(StoreError::CorruptColumn {
+            table: TABLE,
+            column: "execution_policy",
+            id: key.clone(),
+            value: "NULL".to_string(),
+            expected: "a native or isolated execution policy",
+        })?,
         revision: u64_column(row, TABLE, "revision", &key)?,
     };
 
+    // Validate the domain shape before the redundant selector column, so a
+    // malformed mode retains its precise typed error.
+    let policy = ScalePolicy::from_persisted(fields)
+        .map_err(|source| StoreError::CorruptPolicy { id, source })?;
+    let stored_selector: Option<String> = row.get("profile_selector")?;
+    let expected_selector = policy
+        .routing_labels()
+        .map(|labels| labels.host_label().as_str());
+    if stored_selector.as_deref() != expected_selector {
+        return Err(StoreError::CorruptColumn {
+            table: TABLE,
+            column: "profile_selector",
+            id: key,
+            value: stored_selector
+                .map_or_else(|| "NULL".to_string(), |raw| format!("{} bytes", raw.len())),
+            expected: "the immutable routing selector in routing_labels",
+        });
+    }
+
     // D19's shape rules and `min <= max` run here, on every load.
-    ScalePolicy::from_persisted(fields).map_err(|source| StoreError::CorruptPolicy { id, source })
+    Ok(policy)
+}
+
+/// Validate the selector against the authoritative host and every sibling's
+/// optional labels. Run this inside the same write transaction as mutation.
+fn validate_profile_in_target(
+    conn: &Connection,
+    candidate: &ScalePolicy,
+) -> Result<(), StoreError> {
+    if !candidate.profile_name().is_default() {
+        let mut host_stmt = conn.prepare("SELECT * FROM hosts WHERE id = ?1")?;
+        let mut host_rows = host_stmt.query([uuid_text(candidate.host_id.as_uuid())])?;
+        let host = match host_rows.next()? {
+            Some(row) => host_from_row(row)?,
+            None => {
+                return Err(StoreError::ProfileHostMissing {
+                    host: candidate.host_id,
+                });
+            }
+        };
+        if let Some(found) = candidate.routing_labels() {
+            let expected = RoutingLabels::derive_for_profile(
+                &candidate.requested_host_label,
+                host.os,
+                host.architecture,
+                candidate.profile_name(),
+            );
+            if found.host_label() != expected.host_label() {
+                return Err(StoreError::CorruptProfileSelector { id: candidate.id });
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT * FROM policies WHERE host_id = ?1 AND target_scope = ?2 COLLATE NOCASE \
+         AND target_slug = ?3 COLLATE NOCASE AND id <> ?4",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        uuid_text(candidate.host_id.as_uuid()),
+        token(&candidate.target.scope()),
+        candidate.target.slug(),
+        uuid_text(candidate.id.as_uuid()),
+    ])?;
+    while let Some(row) = rows.next()? {
+        let sibling = policy_from_row(row)?;
+        // The database's composite profile-name index reports duplicate
+        // identities as AlreadyExists. Only distinct profiles need the
+        // selector/optional-label cross-checks below.
+        if sibling.profile_name() == candidate.profile_name() {
+            continue;
+        }
+        let (Some(own), Some(other)) = (candidate.routing_labels(), sibling.routing_labels())
+        else {
+            continue;
+        };
+        if own.host_label() == other.host_label() {
+            return Err(StoreError::ProfileSelectorConflict {
+                id: candidate.id,
+                sibling: sibling.id,
+            });
+        }
+        if other.additional().any(|label| label == own.host_label()) {
+            return Err(StoreError::ProfileLabelConflict {
+                id: candidate.id,
+                sibling: sibling.id,
+            });
+        }
+        if own.additional().any(|label| label == other.host_label()) {
+            return Err(StoreError::ProfileLabelConflict {
+                id: candidate.id,
+                sibling: sibling.id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_profile_identity(conn: &Connection, candidate: &ScalePolicy) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("SELECT * FROM policies WHERE id = ?1")?;
+    let mut rows = stmt.query([uuid_text(candidate.id.as_uuid())])?;
+    let Some(row) = rows.next()? else {
+        return Ok(());
+    };
+    let stored = policy_from_row(row)?;
+    if stored.profile_name() != candidate.profile_name()
+        || stored.host_id != candidate.host_id
+        || stored.target != candidate.target
+        || (stored.routing_labels().is_some()
+            && stored.routing_labels().map(RoutingLabels::host_label)
+                != candidate.routing_labels().map(RoutingLabels::host_label))
+    {
+        return Err(StoreError::ProfileIdentityChanged { id: candidate.id });
+    }
+    Ok(())
+}
+
+/// An execution-mode change cannot rewrite an existing attempt's provider
+/// allocation. The caller's IMMEDIATE transaction fences inserts and cleanup.
+fn ensure_execution_mutation_safe(
+    conn: &Connection,
+    candidate: &ScalePolicy,
+) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("SELECT * FROM policies WHERE id = ?1")?;
+    let mut rows = stmt.query([uuid_text(candidate.id.as_uuid())])?;
+    let Some(row) = rows.next()? else {
+        return Ok(());
+    };
+    let stored = policy_from_row(row)?;
+    if stored.execution_policy() == candidate.execution_policy() {
+        return Ok(());
+    }
+    let found: i64 = conn.query_row(
+        &CountedAttempts::Uncleaned.count_sql(),
+        named_params! { ":id": uuid_text(candidate.id.as_uuid()) },
+        |row| row.get(0),
+    )?;
+    let found = clamped_count(found);
+    if found != 0 {
+        return Err(StoreError::UncleanedCountChanged {
+            subject: format!("policy {} execution", candidate.id),
+            expected: 0,
+            found,
+        });
+    }
+    Ok(())
 }
 
 fn persisted_attempt_from_row(row: &Row<'_>) -> Result<PersistedAttempt, StoreError> {
@@ -2036,6 +2299,20 @@ fn persisted_attempt_from_row(row: &Row<'_>) -> Result<PersistedAttempt, StoreEr
         state: token_column::<AttemptState>(row, TABLE, "state", &key)?,
         outcome: json_column::<AttemptOutcome>(row, TABLE, "outcome", &key, "an attempt outcome")?,
         process_id: u32_option_column(row, TABLE, "process_id", &key)?,
+        execution: json_column::<AttemptExecution>(
+            row,
+            TABLE,
+            "execution",
+            &key,
+            "an attempt execution identity",
+        )?
+        .ok_or(StoreError::CorruptColumn {
+            table: TABLE,
+            column: "execution",
+            id: key.clone(),
+            value: "NULL".to_string(),
+            expected: "a native or isolated attempt execution identity",
+        })?,
         runtime_path: PathBuf::from(runtime_path),
         // As for policies, the pair is rebuilt by the domain --
         // `AttemptWorkspace::from_persisted`, called first thing in
@@ -2197,10 +2474,10 @@ pub const ECHO_LIMIT: usize = 60;
 /// whose shape the *schema* fixes, so no captured text can reach them, and they
 /// keep the full [`clip`] echo the diagnosability argument was made for.
 ///
-/// **Why this list has one entry.** `attempts.outcome` is the column
+/// **Why this list originally had one entry.** `attempts.outcome` is the column
 /// `the_token_scanner_can_actually_fail` in `tests/store_journal.rs` proves is a
 /// carrier, by planting a `ghu_…` in exactly that field.
-/// `policies.routing_labels` is the other column read through `json_column`, and
+/// `policies.routing_labels` was the other column read through `json_column`, and
 /// it is off the list on a narrower rule than "free-form".
 ///
 /// **The rule is: text the *agent* captured from a failure.** Not "text a caller
@@ -2221,9 +2498,14 @@ pub const ECHO_LIMIT: usize = 60;
 /// there": no test plants one in most columns, and a column nobody has attacked
 /// is not thereby a column that cannot carry a secret. If `routing_labels` ever
 /// starts being populated from something the agent captured rather than
-/// something an operator typed, it belongs on this list — which is a list, and
-/// not a hard-coded pair, so that adding it costs nothing in the decoder.
-const FREE_FORM_COLUMNS: &[(&str, &str)] = &[("attempts", "outcome")];
+/// something an operator typed, it belongs on this list. Execution policy and
+/// attempt identity now join it because image/environment fields are external
+/// provider text and a corrupt value must never be quoted into logs.
+const FREE_FORM_COLUMNS: &[(&str, &str)] = &[
+    ("attempts", "outcome"),
+    ("policies", "execution_policy"),
+    ("attempts", "execution"),
+];
 
 /// Whether this column may hold text the agent captured from a failure.
 fn carries_free_form_text(table: &str, column: &str) -> bool {
@@ -2584,7 +2866,7 @@ mod tests {
 
     use crate::attempt::FailureReason;
     use crate::model::Label;
-    use crate::policy::PolicyMode;
+    use crate::policy::{NamedProfileSpec, PolicyMode};
     use crate::workspace::{AttemptWorkspace, WorkspacePolicy};
 
     // `b1`'s fixture ids, spelled as the UUID text a row holds, so a row written
@@ -2698,6 +2980,7 @@ mod tests {
         target_slug: String,
         installation_id: i64,
         host_id: String,
+        profile_selector: Option<String>,
         routing_labels: Option<String>,
         min_capacity: i64,
         max_capacity: Option<i64>,
@@ -2717,6 +3000,7 @@ mod tests {
                 target_slug: "o/r".to_string(),
                 installation_id: 1,
                 host_id: HOST_UUID.to_string(),
+                profile_selector: Some("rm-home-win-x64".to_string()),
                 routing_labels: Some(LABELS_JSON.to_string()),
                 min_capacity: 0,
                 max_capacity: Some(2),
@@ -2738,11 +3022,11 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO policies (
                          id, target_scope, target_slug, installation_id, host_id,
-                         routing_labels, min_capacity, max_capacity, enabled,
+                         profile_selector, routing_labels, min_capacity, max_capacity, enabled,
                          state, cache_policy, workspace_mode, workspace_path, revision
                      ) VALUES (
                          :id, :target_scope, :target_slug, :installation_id, :host_id,
-                         :routing_labels, :min_capacity, :max_capacity, :enabled,
+                         :profile_selector, :routing_labels, :min_capacity, :max_capacity, :enabled,
                          :state, :cache_policy, :workspace_mode, :workspace_path, :revision
                      )",
                     named_params! {
@@ -2751,6 +3035,7 @@ mod tests {
                         ":target_slug": self.target_slug,
                         ":installation_id": self.installation_id,
                         ":host_id": self.host_id,
+                        ":profile_selector": self.profile_selector,
                         ":routing_labels": self.routing_labels,
                         ":min_capacity": self.min_capacity,
                         ":max_capacity": self.max_capacity,
@@ -2808,11 +3093,12 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO attempts (
                          id, policy_id, github_runner_id, state, outcome, process_id,
-                         runtime_path, workspace_mode, workspace_slot,
+                         runtime_path, workspace_mode, workspace_slot, execution,
                          created_at, terminal_at, last_state_change_at
                      ) VALUES (
                          :id, :policy_id, :github_runner_id, :state, :outcome, :process_id,
                          :runtime_path, :workspace_mode, :workspace_slot,
+                         json_object('kind', 'native', 'process_id', :process_id),
                          :created_at, :terminal_at, :last_state_change_at
                      )",
                     named_params! {
@@ -2864,6 +3150,8 @@ mod tests {
         // unpinned token.
         for (state, expected) in [
             (AttemptState::Allocated, "allocated"),
+            (AttemptState::Preparing, "preparing"),
+            (AttemptState::Prepared, "prepared"),
             (AttemptState::JitReceived, "jit_received"),
             (AttemptState::Starting, "starting"),
             (AttemptState::Idle, "idle"),
@@ -2871,13 +3159,15 @@ mod tests {
             (AttemptState::Finished, "finished"),
             (AttemptState::Failed, "failed"),
             (AttemptState::Orphaned, "orphaned"),
+            (AttemptState::Destroying, "destroying"),
+            (AttemptState::CleanupDeferred, "cleanup_deferred"),
             (AttemptState::Cleaned, "cleaned"),
         ] {
             assert_eq!(token(&state), expected);
         }
         assert_eq!(
             AttemptState::ALL.len(),
-            9,
+            13,
             "a new AttemptState needs a pinned token above"
         );
 
@@ -3196,6 +3486,24 @@ mod tests {
             "an upgrade must not retain a workspace the operator never selected"
         );
         assert_eq!(policy.requested_host_label.as_str(), "host");
+        assert_eq!(policy.profile_name().as_str(), "default");
+        assert_eq!(
+            policy.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64"
+        );
+        let (stored_json, selector): (String, String) = store
+            .lock()
+            .query_row(
+                "SELECT routing_labels, profile_selector FROM policies WHERE id = ?1",
+                [POLICY_UUID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy routing columns");
+        assert_eq!(
+            stored_json, LABELS_JSON,
+            "migration may not rewrite existing routing bytes"
+        );
+        assert_eq!(selector, "rm-home-win-x64");
 
         let attempt = store
             .attempt(attempt_id())
@@ -3233,7 +3541,11 @@ mod tests {
             .expect("queried")
             .collect::<Result<_, _>>()
             .expect("collected");
-        assert_eq!(applied, vec![1, 2, 3], "the full chain, in order, once");
+        assert_eq!(
+            applied,
+            vec![1, 2, 3, 4, 5],
+            "the full chain, in order, once"
+        );
     }
 
     #[test]
@@ -3252,6 +3564,189 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(&path).expect("reopens");
         assert_everything_migrated_to_ephemeral(&reopened);
+    }
+
+    #[test]
+    fn a_clean_version_three_database_preserves_legacy_rows_as_default() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("runner-manager.sqlite3");
+        a_database_at_version(&path, 3);
+
+        // Compare SQLite values with their original column names, rather than
+        // domain objects that could normalize a rewritten legacy value on load.
+        let snapshot = |conn: &Connection, table: &str, id: &str| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} WHERE id = ?1"))
+                .expect("legacy row query");
+            let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+            let values: Vec<rusqlite::types::Value> = stmt
+                .query_row([id], |row| {
+                    (0..columns.len())
+                        .map(|index| row.get(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("legacy row");
+            columns.into_iter().zip(values).collect::<Vec<_>>()
+        };
+
+        let conn = Connection::open(&path).expect("open version three");
+        let policy_before = snapshot(&conn, "policies", POLICY_UUID);
+        let host_before = snapshot(&conn, "hosts", HOST_UUID);
+        let attempt_before = snapshot(&conn, "attempts", ATTEMPT_UUID);
+        assert_eq!(policy_before.len(), 15, "all version-three policy columns");
+        assert_eq!(current_version(&conn).expect("version three"), 3);
+        drop(conn);
+
+        let store = SqliteStore::open(&path).expect("clean version three upgrades");
+        assert_everything_migrated_to_ephemeral(&store);
+        let conn = store.lock();
+        let policy_after = snapshot(&conn, "policies", POLICY_UUID);
+        assert_eq!(policy_after.len(), policy_before.len() + 3);
+        assert_eq!(
+            &policy_after[..policy_before.len()],
+            policy_before.as_slice(),
+            "migration four must preserve every pre-existing policy field"
+        );
+        assert_eq!(snapshot(&conn, "hosts", HOST_UUID), host_before);
+        let attempt_after = snapshot(&conn, "attempts", ATTEMPT_UUID);
+        assert_eq!(
+            &attempt_after[..attempt_before.len()],
+            attempt_before.as_slice(),
+            "recovery must retain the original runtime path, state, lease, and timestamps"
+        );
+        assert_eq!(
+            policy_after[policy_before.len()],
+            (
+                "profile_name".to_string(),
+                rusqlite::types::Value::Text("default".to_string())
+            )
+        );
+        assert_eq!(
+            policy_after[policy_before.len() + 1],
+            (
+                "profile_selector".to_string(),
+                rusqlite::types::Value::Text("rm-home-win-x64".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn a_live_version_four_attempt_migrates_to_native_identity_and_is_adopted() {
+        use crate::attempt::{
+            GithubRunnerObservation, RecoveryDecision, RecoveryObservation, RecoveryTimeouts,
+            recovery_decision,
+        };
+        use crate::execution::{AttemptExecution, ExecutionPolicy};
+
+        #[derive(Debug)]
+        struct FixedClock(Timestamp);
+        impl crate::model::Clock for FixedClock {
+            fn now(&self) -> Timestamp {
+                self.0
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let path = dir.path().join("live-version-four.sqlite3");
+        a_database_at_version(&path, 4);
+        let conn = Connection::open(&path).expect("version-four database opens");
+        conn.execute(
+            "UPDATE policies SET profile_selector = \
+             json_extract(routing_labels, '$.host_label') WHERE id = ?1",
+            [POLICY_UUID],
+        )
+        .expect("version-four selector is journalled");
+        conn.execute(
+            "UPDATE attempts SET state = 'idle', process_id = 4242, github_runner_id = 73 \
+             WHERE id = ?1",
+            [ATTEMPT_UUID],
+        )
+        .expect("legacy live process is journalled");
+        assert_eq!(current_version(&conn).expect("version readable"), 4);
+        drop(conn);
+
+        let store = SqliteStore::open(&path).expect("forward migration succeeds");
+        assert_eq!(store.schema_version(), 5);
+        assert_eq!(
+            store
+                .policy(policy_id())
+                .expect("policy loads")
+                .expect("present")
+                .execution_policy(),
+            &ExecutionPolicy::Native
+        );
+        let attempt = store
+            .attempt(attempt_id())
+            .expect("attempt loads")
+            .expect("present");
+        assert_eq!(attempt.state(), AttemptState::Idle);
+        assert_eq!(attempt.process_id(), Some(4242));
+        assert_eq!(
+            attempt.execution(),
+            &AttemptExecution::Native {
+                process_id: Some(4242)
+            }
+        );
+        assert_eq!(
+            recovery_decision(
+                &attempt,
+                RecoveryObservation {
+                    process_alive: true,
+                    github: GithubRunnerObservation::NotRegistered,
+                },
+                RecoveryTimeouts::provisional(),
+                &FixedClock(ts(1_000)),
+            ),
+            RecoveryDecision::Adopt
+        );
+        store
+            .record_attempt(&attempt)
+            .expect("migrated native row remains writable");
+        assert_eq!(store.attempt(attempt.id).expect("reloads"), Some(attempt));
+    }
+
+    #[test]
+    fn ambiguous_legacy_target_rows_fail_migration_without_rewriting_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ambiguous.sqlite3");
+        a_database_at_version(&path, 3);
+        let conn = Connection::open(&path).expect("open version 3");
+        conn.execute(
+            "INSERT INTO policies SELECT ?1, target_scope, target_slug, installation_id, host_id, \
+             routing_labels, min_capacity, max_capacity, enabled, state, cache_policy, revision, \
+             requested_host_label, workspace_mode, workspace_path FROM policies WHERE id = ?2",
+            rusqlite::params![uuid_text(PolicyId::from_u128(0x11).as_uuid()), POLICY_UUID],
+        )
+        .expect("version 3 permits ambiguous siblings");
+        let before: String = conn
+            .query_row(
+                "SELECT routing_labels FROM policies WHERE id = ?1",
+                [POLICY_UUID],
+                |row| row.get(0),
+            )
+            .expect("routing bytes");
+        drop(conn);
+        let error =
+            SqliteStore::open(&path).expect_err("composite uniqueness must refuse ambiguity");
+        assert!(
+            matches!(error, StoreError::Migration { version: 4, .. }),
+            "{error:?}"
+        );
+        let conn = Connection::open(&path).expect("reopen after rollback");
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("version");
+        assert_eq!(version, 3);
+        let after: String = conn
+            .query_row(
+                "SELECT routing_labels FROM policies WHERE id = ?1",
+                [POLICY_UUID],
+                |row| row.get(0),
+            )
+            .expect("routing bytes");
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -4608,7 +5103,10 @@ mod tests {
                 FailureReason::ProcessExitedUnexpectedly,
             )),
             AttemptState::Orphaned => Some(AttemptOutcome::Orphaned),
-            AttemptState::Finished | AttemptState::Cleaned => Some(AttemptOutcome::CompletedJob),
+            AttemptState::Finished
+            | AttemptState::Destroying
+            | AttemptState::CleanupDeferred
+            | AttemptState::Cleaned => Some(AttemptOutcome::CompletedJob),
             _ => None,
         }
     }
@@ -4620,6 +5118,24 @@ mod tests {
     fn attempt_in_state(attempt: &RunnerAttempt, state: AttemptState) -> RunnerAttempt {
         let mut fields = attempt.to_persisted();
         fields.state = state;
+        if matches!(
+            state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) {
+            fields.execution = crate::execution::AttemptExecution::Isolated {
+                provider_kind: crate::execution::Backend::Oci,
+                environment_id: (state != AttemptState::Preparing).then(|| "owned-fixture".into()),
+                resolved_image: crate::execution::ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .expect("pinned fixture"),
+                generation: "generation-fixture".into(),
+            };
+        }
         fields.outcome = outcome_for(state);
         fields.terminal_at = state.is_terminal().then(|| ts(2_000));
         fields.last_state_change_at = ts(2_000);
@@ -4814,9 +5330,11 @@ mod tests {
                 .expect("journalled");
         }
 
-        let expected_active = AttemptState::ALL
-            .into_iter()
-            .filter(|state| state.counts_against_capacity())
+        let expected_active = store
+            .attempts()
+            .expect("all states load")
+            .iter()
+            .filter(|attempt| attempt.counts_against_capacity())
             .count();
         let expected_uncleaned = AttemptState::ALL
             .into_iter()
@@ -5406,6 +5924,484 @@ mod tests {
             matches!(error, StoreError::AlreadyExists { what: "policy", .. }),
             "got {error:?}"
         );
+    }
+
+    fn named_test_policy_with_host(name: &str, host_label: &str, id: u128) -> ScalePolicy {
+        ScalePolicy::new_named(
+            PolicyId::from_u128(id),
+            ScaleTarget::repository("o/r").expect("target"),
+            1,
+            host_id(),
+            NamedProfileSpec {
+                requested_host_label: HostLabel::new(host_label).expect("host label"),
+                os: Os::Windows,
+                arch: Arch::X64,
+                profile_name: ProfileName::new(name).expect("profile"),
+                min_capacity: 0,
+                max_capacity: NonZeroU16::new(2).expect("non-zero"),
+            },
+            CachePolicy::default(),
+        )
+        .expect("named policy")
+    }
+
+    fn named_test_policy(name: &str, id: u128) -> ScalePolicy {
+        named_test_policy_with_host(name, "home", id)
+    }
+
+    fn native_test_policy() -> ScalePolicy {
+        ScalePolicy::new(
+            policy_id(),
+            ScaleTarget::repository("o/r").expect("target"),
+            1,
+            host_id(),
+            PolicyMode::autoscale(
+                RoutingLabels::derive(
+                    &HostLabel::new("home").expect("host label"),
+                    Os::Windows,
+                    Arch::X64,
+                ),
+                0,
+                NonZeroU16::new(2).expect("non-zero"),
+            )
+            .expect("mode"),
+            CachePolicy::default(),
+        )
+    }
+
+    fn isolated_test_execution() -> ExecutionPolicy {
+        ExecutionPolicy::Isolated {
+            backend: crate::execution::Backend::Oci,
+            image: crate::execution::ImageReference::new(format!(
+                "registry.example/runner@sha256:{}",
+                "a".repeat(64)
+            ))
+            .expect("pinned image"),
+            resources: crate::execution::ResourceLimits {
+                cpu_millis: 1000,
+                memory_mib: 1024,
+                disk_mib: 4096,
+            },
+        }
+    }
+
+    #[test]
+    fn execution_mode_and_environment_identity_survive_journal_reloads() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let native = native_test_policy();
+        let mut isolated = named_test_policy("py", 0x11);
+        store.insert_policy(&native).expect("native profile");
+        // An uncleaned native sibling must not fence the idle py profile.
+        let native_attempt =
+            RunnerAttempt::allocate(attempt_id(), native.id, "runtime/native", ts(1000));
+        store
+            .record_attempt(&native_attempt)
+            .expect("native journal");
+        store.insert_policy(&isolated).expect("py profile");
+        let revision = isolated.revision();
+        isolated
+            .set_execution_policy(isolated_test_execution())
+            .expect("valid isolation");
+        store
+            .update_policy(&isolated, revision)
+            .expect("only py is idle");
+        assert_eq!(
+            store
+                .policy(isolated.id)
+                .expect("loads")
+                .expect("present")
+                .execution_policy(),
+            isolated.execution_policy()
+        );
+
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x123),
+            isolated.id,
+            "runtime/isolated",
+            ts(1000),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: crate::execution::Backend::Oci,
+                environment_id: None,
+                resolved_image: crate::execution::ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .expect("pinned image"),
+                generation: "generation-123".into(),
+            })
+            .expect("provider intent");
+        store
+            .record_attempt(&attempt)
+            .expect("intent is durable before prepare");
+        assert_eq!(
+            store.attempt(attempt.id).expect("loads").expect("present"),
+            attempt
+        );
+        attempt
+            .prepared_environment("env-123".into())
+            .expect("identity transition");
+        store
+            .record_attempt(&attempt)
+            .expect("prepared identity is durable");
+        assert_eq!(
+            store.attempt(attempt.id).expect("loads").expect("present"),
+            attempt
+        );
+
+        attempt
+            .conclude(
+                AttemptOutcome::failed(crate::attempt::FailureReason::ProcessStartFailed),
+                ts(1001),
+            )
+            .expect("terminal provider attempt");
+        store
+            .record_attempt(&attempt)
+            .expect("terminal identity is durable");
+        assert!(
+            attempt.counts_against_capacity(),
+            "an unremoved environment still holds capacity"
+        );
+        assert_eq!(
+            store
+                .active_attempts_for_policy(isolated.id)
+                .expect("count")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            attempt.clean(ts(1002)),
+            Err(AttemptError::Execution(
+                crate::execution::ExecutionError::IsolatedCleanupUnproven
+            ))
+        ));
+        let mut rewritten = attempt.to_persisted();
+        if let AttemptExecution::Isolated { environment_id, .. } = &mut rewritten.execution {
+            *environment_id = Some("different-environment".into());
+        }
+        let rewritten = RunnerAttempt::from_persisted(rewritten).expect("shape is valid");
+        assert!(matches!(
+            store.record_attempt(&rewritten),
+            Err(StoreError::ExecutionAllocationChanged { .. })
+        ));
+        assert_eq!(
+            store.attempt(attempt.id).expect("loads").expect("present"),
+            attempt
+        );
+
+        let revision = isolated.revision();
+        isolated
+            .set_execution_policy(ExecutionPolicy::Native)
+            .expect("domain mutation");
+        assert!(matches!(
+            store.update_policy(&isolated, revision),
+            Err(StoreError::UncleanedCountChanged { found: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn corrupted_execution_shapes_refuse_load_without_echoing_payloads() {
+        let store = store();
+        RawHost::default().insert(&store);
+        store
+            .insert_policy(&native_test_policy())
+            .expect("native policy");
+        let attempt =
+            RunnerAttempt::allocate(attempt_id(), policy_id(), "runtime/native", ts(1000));
+        store.record_attempt(&attempt).expect("native attempt");
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET execution_policy = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    r#"{"mode":"isolated","backend":"future_provider"}"#,
+                    POLICY_UUID
+                ],
+            )
+            .expect("corruption injected");
+        let policy_error = store
+            .policy(policy_id())
+            .expect_err("unknown provider is corrupt");
+        assert!(!policy_error.to_string().contains("future_provider"));
+        assert!(matches!(
+            policy_error,
+            StoreError::CorruptColumn {
+                column: "execution_policy",
+                ..
+            }
+        ));
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET execution_policy = '{\"mode\":\"native\"}' WHERE id = ?1",
+                [POLICY_UUID],
+            )
+            .expect("policy restored");
+        store.lock().execute(
+            "UPDATE attempts SET execution = '{\"kind\":\"native\",\"process_id\":7}' WHERE id = ?1",
+            [ATTEMPT_UUID],
+        ).expect("identity mismatch injected");
+        assert!(matches!(
+            store.attempt(attempt_id()),
+            Err(StoreError::CorruptAttempt {
+                source: AttemptError::Execution(
+                    crate::execution::ExecutionError::AttemptIdentityMismatch
+                ),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn named_profiles_share_one_target_and_round_trip_with_derived_selectors() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let native = native_test_policy();
+        let py = named_test_policy("Py-Isolated", 0x11);
+        let rust = named_test_policy("rust", 0x12);
+        let watch = ScalePolicy::new_named_monitor(
+            PolicyId::from_u128(0x13),
+            ScaleTarget::repository("o/r").expect("target"),
+            1,
+            host_id(),
+            HostLabel::new("home").expect("host label"),
+            ProfileName::new("watch").expect("profile"),
+            CachePolicy::default(),
+        )
+        .expect("named monitor");
+        for policy in [&native, &py, &rust, &watch] {
+            store
+                .insert_policy(policy)
+                .expect("distinct profiles may share a target");
+            assert_eq!(
+                store.policy(policy.id).expect("load").expect("present"),
+                *policy
+            );
+        }
+        assert_eq!(py.profile_name().as_str(), "py-isolated");
+        assert_eq!(
+            py.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64-py-isolated"
+        );
+        assert_eq!(store.policies().expect("list").len(), 4);
+        assert!(watch.routing_labels().is_none());
+    }
+
+    #[test]
+    fn profile_identity_is_unique_case_insensitively_but_sibling_names_are_allowed() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let first = named_test_policy("PY", 0x11);
+        let duplicate = named_test_policy("py", 0x12);
+        store.insert_policy(&first).expect("first");
+        let error = store
+            .insert_policy(&duplicate)
+            .expect_err("same profile identity");
+        assert!(
+            matches!(error, StoreError::AlreadyExists { what: "policy", .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn equal_derived_selectors_from_distinct_names_fail_on_write_and_load() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let first = named_test_policy_with_host("c", "a-win-x64-b", 0x11);
+        let colliding = named_test_policy_with_host("b-win-x64-c", "a", 0x12);
+        assert_eq!(
+            first.routing_labels().unwrap().host_label(),
+            colliding.routing_labels().unwrap().host_label(),
+            "the separator makes these distinct identities derive one selector"
+        );
+        store.insert_policy(&first).expect("first profile");
+        assert!(matches!(
+            store.insert_policy(&colliding),
+            Err(StoreError::ProfileSelectorConflict { .. })
+        ));
+
+        let other = named_test_policy("b-win-x64-c", 0x12);
+        store.insert_policy(&other).expect("non-colliding selector");
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET requested_host_label = ?1, routing_labels = ?2, \
+                 profile_selector = ?3 WHERE id = ?4",
+                rusqlite::params![
+                    colliding.requested_host_label.as_str(),
+                    json(colliding.routing_labels().unwrap()),
+                    colliding.routing_labels().unwrap().host_label().as_str(),
+                    uuid_text(other.id.as_uuid()),
+                ],
+            )
+            .expect("tamper persisted selector");
+        assert!(matches!(
+            store.policy(other.id),
+            Err(StoreError::ProfileSelectorConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn an_existing_default_selector_cannot_be_changed_through_update() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let native = native_test_policy();
+        store.insert_policy(&native).expect("default profile");
+        let mut fields = native.to_persisted();
+        fields.routing_labels = Some(RoutingLabels::derive(
+            &HostLabel::new("other").expect("host label"),
+            Os::Windows,
+            Arch::X64,
+        ));
+        let changed = ScalePolicy::from_persisted(fields).expect("well-formed alternate selector");
+        assert!(matches!(
+            store.update_policy(&changed, native.revision()),
+            Err(StoreError::ProfileIdentityChanged { .. })
+        ));
+        assert_eq!(
+            store.policy(native.id).expect("load").expect("present"),
+            native
+        );
+    }
+
+    #[test]
+    fn whitespace_cannot_make_two_stored_profile_names_semantically_ambiguous() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let py = named_test_policy("py", 0x11);
+        let rust = named_test_policy("rust", 0x12);
+        store.insert_policy(&py).expect("py");
+        store.insert_policy(&rust).expect("rust");
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET profile_name = ' py ' WHERE id = ?1",
+                [uuid_text(rust.id.as_uuid())],
+            )
+            .expect("raw SQLite index permits whitespace distinct from py");
+        let error = store
+            .policies()
+            .expect_err("load must reject normalized duplicate");
+        assert!(
+            matches!(
+                error,
+                StoreError::CorruptColumn {
+                    column: "profile_name",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_cannot_be_renamed_through_an_update() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let first = named_test_policy("py", 0x11);
+        store.insert_policy(&first).expect("insert");
+        let renamed = named_test_policy("rust", 0x11);
+        let error = store
+            .update_policy(&renamed, first.revision())
+            .expect_err("immutable profile identity");
+        assert!(
+            matches!(error, StoreError::ProfileIdentityChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            store.policy(first.id).expect("load").expect("present"),
+            first
+        );
+    }
+
+    #[test]
+    fn a_named_selector_override_fails_closed_on_load() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let named = named_test_policy("py", 0x11);
+        store.insert_policy(&named).expect("insert");
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET routing_labels = ?1, profile_selector = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    r#"{"host_label":"rm-other-win-x64-py","additional":[]}"#,
+                    "rm-other-win-x64-py",
+                    uuid_text(named.id.as_uuid())
+                ],
+            )
+            .expect("tamper");
+        assert!(matches!(
+            store.policy(named.id),
+            Err(StoreError::CorruptProfileSelector { .. })
+        ));
+    }
+
+    #[test]
+    fn a_corrupt_profile_selector_error_does_not_echo_its_payload() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let named = named_test_policy("py", 0x11);
+        store.insert_policy(&named).expect("insert");
+        let planted = "ghs_9tokenish";
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET profile_selector = ?1 WHERE id = ?2",
+                rusqlite::params![planted, uuid_text(named.id.as_uuid())],
+            )
+            .expect("tamper");
+        let error = store.policy(named.id).expect_err("selector mismatch");
+        assert!(matches!(
+            error,
+            StoreError::CorruptColumn {
+                column: "profile_selector",
+                ..
+            }
+        ));
+        assert!(!format!("{error:?}").contains(planted));
+        assert!(!error.to_string().contains(planted));
+    }
+
+    #[test]
+    fn a_sibling_selector_cannot_be_written_or_loaded_as_an_optional_label() {
+        let store = store();
+        RawHost::default().insert(&store);
+        let named = named_test_policy("py", 0x11);
+        store.insert_policy(&named).expect("insert named");
+        let native = native_test_policy();
+        store.insert_policy(&native).expect("insert default");
+        let mut fields = native.to_persisted();
+        fields
+            .routing_labels
+            .as_mut()
+            .unwrap()
+            .add(named.routing_labels().unwrap().host_label().clone());
+        let altered =
+            ScalePolicy::from_persisted(fields).expect("legacy optional labels remain expressible");
+        let write_error = store
+            .update_policy(&altered, native.revision())
+            .expect_err("sibling selector write");
+        assert!(
+            matches!(write_error, StoreError::ProfileLabelConflict { .. }),
+            "{write_error:?}"
+        );
+        store
+            .lock()
+            .execute(
+                "UPDATE policies SET routing_labels = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    json(altered.routing_labels().unwrap()),
+                    uuid_text(native.id.as_uuid())
+                ],
+            )
+            .expect("tamper");
+        assert!(matches!(
+            store.policy(native.id),
+            Err(StoreError::ProfileLabelConflict { .. })
+        ));
     }
 
     // -- the journal --------------------------------------------------------

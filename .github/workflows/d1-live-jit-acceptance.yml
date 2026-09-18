@@ -1,0 +1,55 @@
+name: D1 live OCI JIT acceptance
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  live-oci-jit:
+    name: live OCI JIT acceptance (temporary PR 74 gate)
+    if: >-
+      github.event.pull_request.number == 74 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.label.name == 'd1-live-jit-pr74-20260916'
+    runs-on: [self-hosted, linux, x64, d1-live-jit-pr74-20260916]
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mark the claimed one-time runner
+        run: |
+          set -euo pipefail
+          test "${RUNNER_ENVIRONMENT:-}" = self-hosted
+          touch /tmp/runner-manager-actions-job-started
+          for _ in $(seq 1 60); do
+            test ! -f /tmp/runner-manager-provider-inspected || exit 0
+            sleep 1
+          done
+          echo 'provider-side inspection did not complete' >&2
+          exit 1
+
+      - name: Check out the pull request
+        uses: actions/checkout@v7
+
+      - name: Verify package, process, filesystem, and isolation markers
+        run: |
+          set -euo pipefail
+          test -f Cargo.toml
+          runner_root="$(cd "$RUNNER_TEMP/../.." && pwd -P)"
+          test -x "$runner_root/bin/Runner.Listener"
+          test -x "$runner_root/bin/Runner.Worker"
+          cat /proc/[0-9]*/comm 2>/dev/null | grep -Fx 'Runner.Worker' >/dev/null
+          test ! -S /run/podman/podman.sock
+          test ! -S /var/run/docker.sock
+          test ! -e /runner-manager-host-sentinel
+          mkdir -p target/d1-live-jit-acceptance
+          printf '%s\n' "${GITHUB_SHA}" > target/d1-live-jit-acceptance/checkout-head
+          printf '%s\n' "package=present process=present filesystem=isolated" \
+            > target/d1-live-jit-acceptance/markers
+          test "$(cat target/d1-live-jit-acceptance/checkout-head)" = "${GITHUB_SHA}"
+          touch /tmp/runner-manager-actions-job-complete
+          echo 'live OCI JIT package/process/filesystem markers passed'

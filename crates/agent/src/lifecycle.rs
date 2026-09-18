@@ -22,9 +22,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use runner_manager_domain::attempt::{
-    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, RecoveryDecision,
-    RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize, recovery_decision,
+    AttemptOutcome, AttemptState, FailureReason, GithubRunnerObservation, IsolationProviderFailure,
+    RecoveryDecision, RecoveryObservation, RecoveryTimeouts, RunnerAttempt, authorize,
+    recovery_decision,
 };
+use runner_manager_domain::execution::{AttemptExecution, Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::path::LocalAbsolutePath;
 use runner_manager_domain::policy::ScalePolicy;
@@ -42,11 +44,15 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
+use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    ReplacementIntent, RunnerLauncher,
+    ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
+
+mod windows_hyperv;
+pub use windows_hyperv::{WindowsHyperVContainers, WindowsHyperVHostState};
 
 const IDENTITY_FILE: &str = ".runner-process.json";
 const FALLBACK_IDENTITY_FILE: &str = ".runner-process.recovery.json";
@@ -174,6 +180,9 @@ pub enum AttemptEvent {
     Cleaned {
         attempt: AttemptId,
         outcome: OutcomeKind,
+    },
+    QuarantinedOwnedResource {
+        attempt: AttemptId,
     },
 }
 
@@ -1221,7 +1230,7 @@ pub struct ProcessStartFailure {
 }
 
 impl ProcessStartFailure {
-    fn before_spawn(reason: FailureReason) -> Self {
+    pub(crate) fn before_spawn(reason: FailureReason) -> Self {
         Self {
             reason,
             retryable: true,
@@ -1250,7 +1259,314 @@ impl ProcessStartFailure {
     }
 }
 
-pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
+/// A credential-free capability report. An isolated policy never treats a
+/// native-ready result as permission to launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCapability {
+    Ready,
+    Unsupported,
+    NotInstalled,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
+    Degraded,
+}
+
+impl ProviderCapability {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unsupported => "unsupported",
+            Self::NotInstalled => "not installed",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    pub(crate) fn refusal(self) -> FailureReason {
+        FailureReason::IsolationProvider(match self {
+            Self::Ready | Self::Degraded => IsolationProviderFailure::Degraded,
+            Self::Unsupported => IsolationProviderFailure::Unsupported,
+            Self::NotInstalled => IsolationProviderFailure::NotInstalled,
+            Self::PermissionDenied => IsolationProviderFailure::PermissionDenied,
+            Self::ImageUnavailableOrIncompatible => {
+                IsolationProviderFailure::ImageUnavailableOrIncompatible
+            }
+            Self::DiskQuotaUnavailable => IsolationProviderFailure::DiskQuotaUnavailable,
+        })
+    }
+}
+
+/// Only the closed isolation category may cross from an adapter into the
+/// attempt journal or operator error. Arbitrary adapter text could echo JIT.
+fn safe_isolation_reason(
+    reason: FailureReason,
+    fallback: IsolationProviderFailure,
+) -> FailureReason {
+    match reason {
+        FailureReason::IsolationProvider(_) => reason,
+        _ => FailureReason::IsolationProvider(fallback),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedEnvironment {
+    attempt: AttemptId,
+    identity: Option<EnvironmentIdentity>,
+}
+
+impl PreparedEnvironment {
+    /// An adapter must return the identity independently recorded on its resource.
+    #[must_use]
+    pub fn isolated(attempt: AttemptId, identity: EnvironmentIdentity) -> Self {
+        Self {
+            attempt,
+            identity: Some(identity),
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> Option<&EnvironmentIdentity> {
+        self.identity.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEnvironment {
+    pub provider_kind: Backend,
+    pub image: ImageReference,
+}
+
+/// Closed, non-secret provider diagnostics; adapters cannot attach arbitrary output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDiagnostic {
+    CapabilityUnavailable,
+    ImageRejected,
+    PrepareFailed,
+    StartFailed,
+    OwnershipMismatch,
+    CleanupDeferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentIdentity {
+    NativeProcess(u32),
+    Isolated {
+        host: HostId,
+        attempt: AttemptId,
+        provider_kind: Backend,
+        environment_id: String,
+        resolved_image: ImageReference,
+        generation: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentState {
+    Starting,
+    Running,
+    Exited,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStop {
+    Stopped,
+    StillRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDestroy {
+    Destroyed,
+    Deferred(&'static str),
+}
+
+fn identity_matches_intent(
+    host: HostId,
+    attempt: &RunnerAttempt,
+    identity: &EnvironmentIdentity,
+) -> bool {
+    identity_same_allocation(host, attempt, identity)
+        && match (attempt.execution(), identity) {
+            (
+                AttemptExecution::Isolated { environment_id, .. },
+                EnvironmentIdentity::Isolated {
+                    environment_id: id, ..
+                },
+            ) => environment_id
+                .as_ref()
+                .is_none_or(|journal_id| journal_id == id),
+            _ => false,
+        }
+}
+
+fn identity_same_allocation(
+    host: HostId,
+    attempt: &RunnerAttempt,
+    identity: &EnvironmentIdentity,
+) -> bool {
+    match (attempt.execution(), identity) {
+        (
+            AttemptExecution::Isolated {
+                provider_kind,
+                environment_id: _,
+                resolved_image,
+                generation,
+            },
+            EnvironmentIdentity::Isolated {
+                host: owner,
+                attempt: owner_attempt,
+                provider_kind: kind,
+                environment_id: _,
+                resolved_image: image,
+                generation: resource_generation,
+            },
+        ) => {
+            *owner == host
+                && *owner_attempt == attempt.id
+                && provider_kind == kind
+                && resolved_image == image
+                && generation == resource_generation
+        }
+        _ => false,
+    }
+}
+
+/// The JIT value can be passed into a provider start exactly once. It must never
+/// become a provider identity, label, argument, persisted configuration or log field.
+pub struct OneTimeJitHandoff<'a> {
+    config: &'a EncodedJitConfig,
+}
+
+impl fmt::Debug for OneTimeJitHandoff<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OneTimeJitHandoff([redacted])")
+    }
+}
+
+impl<'a> OneTimeJitHandoff<'a> {
+    pub(crate) fn new(config: &'a EncodedJitConfig) -> Self {
+        Self { config }
+    }
+
+    /// Consuming the handoff prevents the same token being delivered twice by one call.
+    pub fn consume(self) -> &'a EncodedJitConfig {
+        self.config
+    }
+}
+
+/// Provider lifecycle and native process supervision. The default lifecycle
+/// methods adapt the existing native spawn/recovery implementation, and refuse
+/// every isolated allocation. Future platform adapters must implement their
+/// own prepare/start/inspect/stop/destroy paths rather than fall back here.
+pub trait ExecutionProvider: fmt::Debug + Send + Sync {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        if policy.execution_policy().is_native() {
+            ProviderCapability::Ready
+        } else {
+            ProviderCapability::Unsupported
+        }
+    }
+
+    /// Resolve Auto and image identity before allocation or GitHub JIT. Native has no image.
+    fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+        if policy.execution_policy().is_native() {
+            Ok(None)
+        } else {
+            Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ))
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        if !attempt.execution().is_native() || !policy.execution_policy().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        Ok(PreparedEnvironment {
+            attempt: attempt.id,
+            identity: None,
+        })
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        if prepared.attempt != attempt.id || !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "execution provider identity mismatch".into(),
+            )));
+        }
+        self.spawn(attempt, handoff.consume())
+            .map(EnvironmentIdentity::NativeProcess)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.is_alive(attempt).map(|alive| {
+            if alive {
+                EnvironmentState::Running
+            } else {
+                EnvironmentState::Missing
+            }
+        })
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.terminate(attempt).map(|()| ProviderStop::Stopped)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        if !attempt.execution().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        // Native termination is already settled by the existing recovery
+        // decision before workspace cleanup. There is no separate sandbox
+        // resource to destroy, and repeating an observation here changes the
+        // established native cleanup behaviour.
+        Ok(ProviderDestroy::Destroyed)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.inspect(attempt)
+    }
+
+    fn enumerate_owned(&self, _host_id: HostId) -> Vec<EnvironmentIdentity> {
+        Vec::new() // Native processes have no independent provider resources.
+    }
+
+    fn diagnostics(&self, _attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+        Vec::new() // No job or JIT output enters provider metadata.
+    }
+
+    /// Independent resource metadata must match the journal before destructive calls.
+    fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        Ok(attempt.execution().is_native())
+    }
+
     fn spawn(
         &self,
         attempt: &RunnerAttempt,
@@ -1268,6 +1584,9 @@ pub trait ProcessSupervisor: fmt::Debug + Send + Sync {
     fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason>;
 }
 
+/// Compatibility name for existing native process tests and callers.
+pub use ExecutionProvider as ProcessSupervisor;
+
 /// Native process supervision.  The start token is stored beside the runtime;
 /// recovery never trusts a recycled PID merely because SQLite contains it.
 #[derive(Debug, Default)]
@@ -1282,6 +1601,195 @@ pub struct NativeProcesses {
     post_spawn_stop_failures: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     use_long_lived_test_listener: std::sync::atomic::AtomicBool,
+}
+
+/// Production provider set. Native and isolated allocations are routed by the
+/// immutable execution kind in the policy/journal; an unavailable isolated
+/// backend can never fall through to native process launch.
+#[derive(Debug)]
+pub struct PlatformExecutionProvider {
+    native: NativeProcesses,
+    oci: OciProcesses,
+    windows_hyper_v: WindowsHyperVContainers,
+}
+
+impl PlatformExecutionProvider {
+    #[must_use]
+    pub fn new(host_id: HostId) -> Self {
+        Self {
+            native: NativeProcesses::new(),
+            oci: OciProcesses::new(host_id),
+            windows_hyper_v: WindowsHyperVContainers::new(host_id),
+        }
+    }
+
+    fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
+        match backend {
+            Backend::Auto => {
+                #[cfg(target_os = "windows")]
+                {
+                    Some(&self.windows_hyper_v)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Some(&self.oci)
+                }
+            }
+            Backend::Oci => Some(&self.oci),
+            Backend::WindowsHyperVContainer => Some(&self.windows_hyper_v),
+            Backend::VirtualMachine => None,
+        }
+    }
+
+    fn provider_for_attempt(&self, attempt: &RunnerAttempt) -> Option<&dyn ExecutionProvider> {
+        match attempt.execution() {
+            AttemptExecution::Native { .. } => Some(&self.native),
+            AttemptExecution::Isolated { provider_kind, .. } => {
+                self.isolated_provider(*provider_kind)
+            }
+        }
+    }
+
+    fn required_provider_for_attempt(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<&dyn ExecutionProvider, FailureReason> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))
+    }
+}
+
+impl ExecutionProvider for PlatformExecutionProvider {
+    fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => self.native.probe(policy),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .map_or(ProviderCapability::Unsupported, |provider| {
+                    provider.probe(policy)
+                }),
+        }
+    }
+
+    fn resolve(&self, policy: &ScalePolicy) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.resolve(policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .resolve(policy),
+        }
+    }
+
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        match policy.execution_policy() {
+            runner_manager_domain::execution::ExecutionPolicy::Native => {
+                self.native.prepare(attempt, policy)
+            }
+            runner_manager_domain::execution::ExecutionPolicy::Isolated { backend, .. } => self
+                .isolated_provider(*backend)
+                .ok_or_else(|| FailureReason::Other("execution provider unavailable".into()))?
+                .prepare(attempt, policy),
+        }
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        self.provider_for_attempt(attempt)
+            .ok_or_else(|| {
+                ProcessStartFailure::before_spawn(FailureReason::Other(
+                    "execution provider unavailable".into(),
+                ))
+            })?
+            .start(prepared, attempt, handoff)
+    }
+
+    fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .inspect(attempt)
+    }
+
+    fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.stop(attempt)
+    }
+
+    fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .destroy(attempt)
+    }
+
+    fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recover(attempt)
+    }
+
+    fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
+        let mut owned = self.oci.enumerate_owned(host_id);
+        owned.extend(self.windows_hyper_v.enumerate_owned(host_id));
+        owned
+    }
+
+    fn diagnostics(&self, attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+        self.provider_for_attempt(attempt)
+            .map_or_else(Vec::new, |provider| provider.diagnostics(attempt))
+    }
+
+    fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?.owns(attempt)
+    }
+
+    fn spawn(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+    ) -> Result<u32, ProcessStartFailure> {
+        if !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "native process launch refused for an isolated allocation".into(),
+            )));
+        }
+        self.native.spawn(attempt, config)
+    }
+
+    fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .is_alive(attempt)
+    }
+
+    fn recovered_pid(&self, attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .recovered_pid(attempt)
+    }
+
+    fn completed_successfully(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.completed_successfully(attempt))
+    }
+
+    fn record_terminate_intent(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .record_terminate_intent(attempt)
+    }
+
+    fn has_terminate_intent(&self, attempt: &RunnerAttempt) -> bool {
+        self.provider_for_attempt(attempt)
+            .is_some_and(|provider| provider.has_terminate_intent(attempt))
+    }
+
+    fn terminate(&self, attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+        self.required_provider_for_attempt(attempt)?
+            .terminate(attempt)
+    }
 }
 
 #[cfg(test)]
@@ -1663,7 +2171,7 @@ pub struct LifecyclePorts {
     pub store: Arc<dyn Store>,
     pub github: Arc<dyn LifecycleGithub>,
     pub packages: Arc<dyn RuntimePackages>,
-    pub processes: Arc<dyn ProcessSupervisor>,
+    pub processes: Arc<dyn ExecutionProvider>,
     pub clock: Arc<dyn Clock>,
     pub demand: Arc<dyn DemandPersistence>,
     pub delay: Arc<dyn RetryDelay>,
@@ -1712,6 +2220,8 @@ pub enum LifecycleError {
     /// recovery must not take unrelated repositories offline because of it.
     #[error("attempt workspace could not be removed")]
     WorkspaceCleanupDeferred,
+    #[error("isolated environment cleanup is deferred")]
+    EnvironmentCleanupDeferred,
     #[error("runner lifecycle failed: {0}")]
     Failed(FailureReason),
 }
@@ -1728,6 +2238,7 @@ impl LifecycleError {
             // sentence, so the two cannot drift apart.
             Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
             Self::WorkspaceCleanupDeferred => FailureReason::Other(self.to_string()),
+            Self::EnvironmentCleanupDeferred => FailureReason::Other(self.to_string()),
         }
     }
 }
@@ -1791,23 +2302,80 @@ impl LifecycleLauncher {
         &self,
         policies: &[ScalePolicy],
     ) -> Result<Vec<ReplacementIntent>, LifecycleError> {
+        *self
+            .recovery_complete
+            .lock()
+            .map_err(|_| LifecycleError::Journal)? = false;
         let by_id: BTreeMap<_, _> = policies.iter().map(|policy| (policy.id, policy)).collect();
         let attempts = self
             .ports
             .store
             .attempts()
             .map_err(|_| LifecycleError::Journal)?;
+        let owned = self.ports.processes.enumerate_owned(self.host_id);
+        for identity in &owned {
+            if let EnvironmentIdentity::Isolated { attempt: id, .. } = identity
+                && !attempts.iter().any(|attempt| {
+                    attempt.state() != AttemptState::Cleaned
+                        && identity_matches_intent(self.host_id, attempt, identity)
+                })
+            {
+                // Enumeration is discovery, not authority to delete.
+                self.ports
+                    .events
+                    .emit(AttemptEvent::QuarantinedOwnedResource { attempt: *id });
+                tracing::warn!(host_id = %self.host_id, attempt_id = %id, reason = "owned_isolated_resource_without_matching_journal", "provider resource quarantined for operator review");
+            }
+        }
         let mut unresolved = false;
-        for attempt in attempts {
+        for mut attempt in attempts {
             let Some(policy) = by_id.get(&attempt.policy_id) else {
-                if !attempt.is_terminal() && attempt.state() != AttemptState::Cleaned {
+                if attempt.counts_against_capacity() {
                     unresolved = true;
                 }
                 continue;
             };
             authorize(self.host_id, policy, &attempt).map_err(|_| LifecycleError::Journal)?;
+            let allocation_resources = owned
+                .iter()
+                .filter(|identity| identity_same_allocation(self.host_id, &attempt, identity))
+                .collect::<Vec<_>>();
+            if allocation_resources.len() > 1 {
+                self.ports
+                    .events
+                    .emit(AttemptEvent::QuarantinedOwnedResource {
+                        attempt: attempt.id,
+                    });
+                tracing::warn!(attempt_id = %attempt.id, reason = "duplicate_isolated_resource_ownership", "provider resources quarantined for operator review");
+            }
+            if attempt.state() != AttemptState::Cleaned
+                && matches!(
+                    attempt.execution(),
+                    AttemptExecution::Isolated {
+                        environment_id: None,
+                        ..
+                    }
+                )
+                && allocation_resources.len() == 1
+                && let Some(EnvironmentIdentity::Isolated { environment_id, .. }) =
+                    allocation_resources.first().copied()
+            {
+                attempt
+                    .prepared_environment(environment_id.clone())
+                    .map_err(|_| LifecycleError::Transition)?;
+                if attempt.state() == AttemptState::Preparing {
+                    attempt
+                        .mark_prepared(self.ports.clock.now())
+                        .map_err(|_| LifecycleError::Transition)?;
+                }
+                self.record(&attempt)?;
+            }
             match self.reconcile_one(policy, attempt).await? {
-                ReconcileProgress::Deferred => unresolved = true,
+                ReconcileProgress::Deferred => {
+                    if policy.execution_policy().is_native() {
+                        unresolved = true;
+                    }
+                }
                 ReconcileProgress::Replacement { attempt, operation } => {
                     self.pending_replacements
                         .lock()
@@ -1882,6 +2450,9 @@ impl LifecycleLauncher {
         policy: &ScalePolicy,
         mut attempt: RunnerAttempt,
     ) -> Result<ReconcileProgress, LifecycleError> {
+        if !attempt.execution().is_native() {
+            return self.reconcile_isolated_one(policy, attempt).await;
+        }
         if attempt.state() == AttemptState::Cleaned {
             // A child of Runner.Worker can outlive the runner process briefly.
             // If it recreates `_work` after `clean_attempt` removed the tree but
@@ -1928,8 +2499,9 @@ impl LifecycleLauncher {
         let process_alive = self
             .ports
             .processes
-            .is_alive(&attempt)
-            .map_err(LifecycleError::Failed)?;
+            .inspect(&attempt)
+            .map_err(LifecycleError::Failed)?
+            == EnvironmentState::Running;
         let github = self
             .ports
             .github
@@ -2114,15 +2686,21 @@ impl LifecycleLauncher {
                 self.ports.events.emit(AttemptEvent::TerminateIntent {
                     attempt: attempt.id,
                 });
-                self.ports
-                    .processes
-                    .terminate(&attempt)
-                    .map_err(LifecycleError::Failed)?;
                 if self
                     .ports
                     .processes
-                    .is_alive(&attempt)
+                    .stop(&attempt)
                     .map_err(LifecycleError::Failed)?
+                    == ProviderStop::StillRunning
+                {
+                    return Ok(ReconcileProgress::Deferred);
+                }
+                if self
+                    .ports
+                    .processes
+                    .inspect(&attempt)
+                    .map_err(LifecycleError::Failed)?
+                    == EnvironmentState::Running
                 {
                     return Ok(ReconcileProgress::Deferred);
                 }
@@ -2153,6 +2731,139 @@ impl LifecycleLauncher {
                         operation: "registration_timeout_replacement",
                     })
                 }
+            }
+        }
+    }
+
+    async fn reconcile_isolated_one(
+        &self,
+        policy: &ScalePolicy,
+        mut attempt: RunnerAttempt,
+    ) -> Result<ReconcileProgress, LifecycleError> {
+        if attempt.state() == AttemptState::Cleaned {
+            return Ok(ReconcileProgress::Reconciled);
+        }
+        if attempt.is_terminal() {
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
+        }
+        if matches!(
+            attempt.state(),
+            AttemptState::Allocated | AttemptState::Preparing | AttemptState::Prepared
+        ) {
+            // No JIT was requested yet. Restart can safely retire this attempt;
+            // a matching owned resource is stopped by the durable cleanup path.
+            self.conclude(
+                &mut attempt,
+                AttemptOutcome::failed(FailureReason::Other(
+                    "isolated preparation interrupted".into(),
+                )),
+            )?;
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
+        }
+        let Ok(provider_state) = self.ports.processes.recover(&attempt) else {
+            return Ok(ReconcileProgress::Deferred);
+        };
+        if provider_state != EnvironmentState::Missing {
+            let Ok(owned) = self.ports.processes.owns(&attempt) else {
+                return Ok(ReconcileProgress::Deferred);
+            };
+            if !owned {
+                self.ports
+                    .events
+                    .emit(AttemptEvent::QuarantinedOwnedResource {
+                        attempt: attempt.id,
+                    });
+                tracing::warn!(attempt_id = %attempt.id, reason = "isolated_resource_ownership_mismatch", "provider resource quarantined for operator review");
+                return Ok(ReconcileProgress::Deferred);
+            }
+        }
+        let live = matches!(
+            provider_state,
+            EnvironmentState::Starting | EnvironmentState::Running
+        );
+        if attempt.state() == AttemptState::JitReceived && live {
+            attempt
+                .started_isolated(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
+        }
+        let github = self
+            .ports
+            .github
+            .observe(&policy.target, attempt.id, &self.cancel)
+            .await;
+        if let Some(runner_id) = github.runner_id
+            && read_runner_id(attempt.runtime_path()).is_none()
+        {
+            write_runner_id(attempt.runtime_path(), runner_id)?;
+        }
+        // A successfully reaped one-shot listener is stronger evidence than a
+        // missing registration. Recovered guests have no attached child and
+        // still follow the conservative orphan path below.
+        if attempt.state() == AttemptState::Busy
+            && !live
+            && github.status == GithubRunnerObservation::NotRegistered
+            && self.ports.processes.completed_successfully(&attempt)
+        {
+            self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(ReconcileProgress::Reconciled);
+        }
+        match recovery_decision(
+            &attempt,
+            RecoveryObservation {
+                process_alive: live,
+                github: github.status,
+            },
+            self.timeouts,
+            self.ports.clock.as_ref(),
+        ) {
+            RecoveryDecision::Nothing | RecoveryDecision::Wait => Ok(ReconcileProgress::Reconciled),
+            RecoveryDecision::Defer => Ok(ReconcileProgress::Deferred),
+            RecoveryDecision::Adopt => {
+                self.ports.events.emit(AttemptEvent::Adopted {
+                    attempt: attempt.id,
+                });
+                Ok(ReconcileProgress::Reconciled)
+            }
+            RecoveryDecision::Clean => {
+                self.clean_or_quarantine(&mut attempt)?;
+                Ok(ReconcileProgress::Reconciled)
+            }
+            RecoveryDecision::Observe(state) => {
+                let runner_id = github
+                    .runner_id
+                    .or_else(|| read_runner_id(attempt.runtime_path()))
+                    .ok_or(LifecycleError::Transition)?;
+                match state {
+                    AttemptState::Idle => attempt
+                        .registered_idle(runner_id, self.ports.clock.now())
+                        .map_err(|_| LifecycleError::Transition)?,
+                    AttemptState::Busy => attempt
+                        .assigned_job(runner_id, self.ports.clock.now())
+                        .map_err(|_| LifecycleError::Transition)?,
+                    _ => return Err(LifecycleError::Transition),
+                }
+                self.record(&attempt)?;
+                Ok(ReconcileProgress::Reconciled)
+            }
+            RecoveryDecision::Conclude(outcome) | RecoveryDecision::Terminate(outcome) => {
+                let replacement = replacement_operation(&outcome);
+                if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
+                    self.deregister_runner(policy, &attempt).await;
+                }
+                self.conclude(&mut attempt, outcome)?;
+                self.clean_or_quarantine(&mut attempt)?;
+                Ok(
+                    replacement.map_or(ReconcileProgress::Reconciled, |operation| {
+                        ReconcileProgress::Replacement {
+                            attempt: attempt.id,
+                            operation,
+                        }
+                    }),
+                )
             }
         }
     }
@@ -2269,11 +2980,35 @@ impl LifecycleLauncher {
                     });
                 Ok(())
             }
+            Err(LifecycleError::EnvironmentCleanupDeferred) => {
+                self.ports
+                    .reconcile_events
+                    .emit(LifecycleEvent::AttemptCleanFailed {
+                        policy: attempt.policy_id,
+                        attempt: attempt.id,
+                        reason: "isolated_environment_cleanup_deferred",
+                    });
+                Ok(())
+            }
             other => other,
         }
     }
 
     fn clean_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
+        if !attempt.execution().is_native() {
+            return self.clean_isolated_attempt(attempt);
+        }
+        match self
+            .ports
+            .processes
+            .destroy(attempt)
+            .map_err(LifecycleError::Failed)?
+        {
+            ProviderDestroy::Destroyed => {}
+            ProviderDestroy::Deferred(reason) => {
+                return Err(LifecycleError::Failed(FailureReason::Other(reason.into())));
+            }
+        }
         let outcome = attempt
             .outcome()
             .cloned()
@@ -2301,6 +3036,135 @@ impl LifecycleLauncher {
                 outcome: kind,
             });
         Ok(())
+    }
+
+    fn clean_isolated_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
+        if attempt.state() != AttemptState::Destroying {
+            attempt
+                .begin_destroy(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(attempt)?;
+        }
+        let provider = self.ports.processes.as_ref();
+        let allocation_resources = provider.enumerate_owned(self.host_id);
+        let matching_allocation = allocation_resources
+            .iter()
+            .filter(|identity| identity_same_allocation(self.host_id, attempt, identity))
+            .collect::<Vec<_>>();
+        if matching_allocation.len() > 1
+            || matching_allocation
+                .iter()
+                .any(|identity| !identity_matches_intent(self.host_id, attempt, identity))
+        {
+            self.ports
+                .events
+                .emit(AttemptEvent::QuarantinedOwnedResource {
+                    attempt: attempt.id,
+                });
+            tracing::warn!(attempt_id = %attempt.id, reason = "duplicate_or_mismatched_isolated_ownership", "provider resources quarantined for operator review");
+            return Err(self.defer_environment_cleanup(attempt)?);
+        }
+        let has_identity = matches!(
+            attempt.execution(),
+            AttemptExecution::Isolated {
+                environment_id: Some(_),
+                ..
+            }
+        );
+        if !has_identity
+            && allocation_resources
+                .iter()
+                .any(|identity| identity_matches_intent(self.host_id, attempt, identity))
+        {
+            return Err(self.defer_environment_cleanup(attempt)?);
+        }
+        let current = if has_identity {
+            provider.inspect(attempt)
+        } else {
+            // A prepare effect may have succeeded before its identity could be
+            // journalled. Empty enumeration alone is not proof of absence.
+            provider.recover(attempt)
+        };
+        let current = match current {
+            Ok(state) => state,
+            Err(_) => return Err(self.defer_environment_cleanup(attempt)?),
+        };
+        if !has_identity && current != EnvironmentState::Missing {
+            return Err(self.defer_environment_cleanup(attempt)?);
+        }
+        if current != EnvironmentState::Missing {
+            if !matches!(provider.owns(attempt), Ok(true)) {
+                self.ports
+                    .events
+                    .emit(AttemptEvent::QuarantinedOwnedResource {
+                        attempt: attempt.id,
+                    });
+                tracing::warn!(attempt_id = %attempt.id, reason = "isolated_resource_ownership_mismatch", "provider resource quarantined for operator review");
+                return Err(self.defer_environment_cleanup(attempt)?);
+            }
+            if matches!(
+                current,
+                EnvironmentState::Starting | EnvironmentState::Running
+            ) && !matches!(provider.stop(attempt), Ok(ProviderStop::Stopped))
+            {
+                return Err(self.defer_environment_cleanup(attempt)?);
+            }
+            if !matches!(provider.destroy(attempt), Ok(ProviderDestroy::Destroyed)) {
+                return Err(self.defer_environment_cleanup(attempt)?);
+            }
+            if !matches!(provider.inspect(attempt), Ok(EnvironmentState::Missing)) {
+                return Err(self.defer_environment_cleanup(attempt)?);
+            }
+        }
+        if provider
+            .enumerate_owned(self.host_id)
+            .iter()
+            .any(|identity| identity_same_allocation(self.host_id, attempt, identity))
+        {
+            return Err(self.defer_environment_cleanup(attempt)?);
+        }
+        let outcome = attempt
+            .outcome()
+            .cloned()
+            .ok_or(LifecycleError::Transition)?;
+        // Provider diagnostics are a closed vocabulary and bounded before they
+        // can enter tracing, even if an adapter returns an unbounded vector.
+        for diagnostic in provider.diagnostics(attempt).into_iter().take(32) {
+            tracing::debug!(attempt_id = %attempt.id, provider_diagnostic = ?diagnostic, "provider lifecycle diagnostic");
+        }
+        self.preserve_diagnostics(attempt, &outcome)?;
+        self.scrub_workspace(attempt)?;
+        self.ports
+            .packages
+            .release(attempt.id)
+            .map_err(LifecycleError::Failed)?;
+        attempt
+            .clean_isolated(self.ports.clock.now())
+            .map_err(|_| LifecycleError::Transition)?;
+        self.record(attempt)?;
+        self.ports.events.emit(AttemptEvent::Cleaned {
+            attempt: attempt.id,
+            outcome: OutcomeKind::of(&outcome),
+        });
+        self.ports
+            .reconcile_events
+            .emit(LifecycleEvent::AttemptCleaned {
+                policy: attempt.policy_id,
+                attempt: attempt.id,
+                outcome: OutcomeKind::of(&outcome),
+            });
+        Ok(())
+    }
+
+    fn defer_environment_cleanup(
+        &self,
+        attempt: &mut RunnerAttempt,
+    ) -> Result<LifecycleError, LifecycleError> {
+        attempt
+            .defer_cleanup(self.ports.clock.now())
+            .map_err(|_| LifecycleError::Transition)?;
+        self.record(attempt)?;
+        Ok(LifecycleError::EnvironmentCleanupDeferred)
     }
 
     /// Undo an attempt's placement by the algorithm its journalled workspace
@@ -2422,11 +3286,16 @@ impl LifecycleLauncher {
         })?;
         // Intentionally constructed from typed local facts, not runner output.
         // Raw child output can contain workflow secrets and is never copied.
+        let reason_kind = match outcome {
+            AttemptOutcome::Failed { reason } => failure_reason_kind(reason),
+            _ => "none",
+        };
         let diagnostic = format!(
-            "attempt_id={}\npolicy_id={}\noutcome={}\n",
+            "attempt_id={}\npolicy_id={}\noutcome={}\nreason={}\n",
             attempt.id,
             attempt.policy_id,
-            OutcomeKind::of(outcome).as_str()
+            OutcomeKind::of(outcome).as_str(),
+            reason_kind,
         );
         fs::write(
             self.diagnostics_root.join(format!("{}.log", attempt.id)),
@@ -2778,6 +3647,41 @@ impl LifecycleLauncher {
         {
             return Err(LifecycleError::RecoveryIncomplete);
         }
+        let capability = self.ports.processes.probe(policy);
+        if capability != ProviderCapability::Ready {
+            return Err(LifecycleError::Failed(capability.refusal()));
+        }
+        let resolved = self.ports.processes.resolve(policy).map_err(|reason| {
+            LifecycleError::Failed(if policy.execution_policy().is_native() {
+                reason
+            } else {
+                safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
+            })
+        })?;
+        if policy.execution_policy().is_native() != resolved.is_none() {
+            return Err(LifecycleError::Failed(FailureReason::Other(
+                "provider resolution mismatch".into(),
+            )));
+        }
+        if let Some(resolution) = &resolved {
+            if resolution.provider_kind == Backend::Auto {
+                return Err(LifecycleError::Failed(FailureReason::Other(
+                    "provider resolution mismatch".into(),
+                )));
+            }
+            AttemptExecution::Isolated {
+                provider_kind: resolution.provider_kind,
+                environment_id: None,
+                resolved_image: resolution.image.clone(),
+                generation: "generation-check".into(),
+            }
+            .validate()
+            .map_err(|_| {
+                LifecycleError::Failed(FailureReason::Other(
+                    "resolved image is incompatible".into(),
+                ))
+            })?;
+        }
         let labels = policy
             .routing_labels()
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
@@ -2790,6 +3694,16 @@ impl LifecycleLauncher {
             placement.workspace,
             self.ports.clock.now(),
         );
+        if let Some(resolution) = &resolved {
+            attempt
+                .allocate_execution(AttemptExecution::Isolated {
+                    provider_kind: resolution.provider_kind,
+                    environment_id: None,
+                    resolved_image: resolution.image.clone(),
+                    generation: uuid::Uuid::new_v4().to_string(),
+                })
+                .map_err(|_| LifecycleError::Transition)?;
+        }
         // This is deliberately the first effect after directory allocation, and
         // for a persistent attempt it is also what makes the slot lease durable
         // before any package or GitHub effect
@@ -2806,6 +3720,46 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
 
+        if resolved.is_some() {
+            attempt
+                .begin_prepare(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
+        }
+        let prepared = match self.ports.processes.prepare(&attempt, policy) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                let safe_reason = if resolved.is_some() {
+                    safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
+                } else {
+                    reason
+                };
+                return self.fail_launch(&mut attempt, safe_reason);
+            }
+        };
+        if resolved.is_some() {
+            let Some(identity) = prepared.identity() else {
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
+                )));
+            };
+            if !identity_matches_intent(self.host_id, &attempt, identity) {
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
+                )));
+            }
+            let EnvironmentIdentity::Isolated { environment_id, .. } = identity else {
+                unreachable!()
+            };
+            attempt
+                .prepared_environment(environment_id.clone())
+                .map_err(|_| LifecycleError::Transition)?;
+            attempt
+                .mark_prepared(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
+        }
+
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
         let registration = match self.register_with_retry(policy, id, &jit_request).await {
@@ -2819,11 +3773,45 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
         let config = registration.into_config();
+        if resolved.is_some() {
+            let started = self
+                .ports
+                .processes
+                .start(prepared, &attempt, OneTimeJitHandoff::new(&config))
+                .map_err(|failure| {
+                    LifecycleError::Failed(safe_isolation_reason(
+                        failure.reason,
+                        IsolationProviderFailure::RuntimeOperationFailed,
+                    ))
+                })?;
+            if !identity_matches_intent(self.host_id, &attempt, &started) {
+                return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
+                    IsolationProviderFailure::OwnershipMismatch,
+                )));
+            }
+            attempt
+                .started_isolated(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
+            return Ok(attempt);
+        }
         let mut issued = 0_u32;
         let pid = loop {
             issued = issued.saturating_add(1);
-            match self.ports.processes.spawn(&attempt, &config) {
-                Ok(pid) => break pid,
+            match self.ports.processes.start(
+                prepared.clone(),
+                &attempt,
+                OneTimeJitHandoff::new(&config),
+            ) {
+                Ok(EnvironmentIdentity::NativeProcess(pid)) => break pid,
+                Ok(EnvironmentIdentity::Isolated { .. }) => {
+                    // No isolated launch sequence is wired in this task. Keep
+                    // the nonterminal JIT journal as a capacity fence rather
+                    // than treating an unexpected resource as a native PID.
+                    return Err(LifecycleError::Failed(FailureReason::Other(
+                        "unexpected isolated environment identity".into(),
+                    )));
+                }
                 Err(error) => {
                     if let Some(pid) = error.live_pid {
                         attempt
@@ -3022,6 +4010,23 @@ mod tests {
     use runner_manager_testkit::clock::FakeClock;
     use runner_manager_testkit::fixtures;
 
+    #[test]
+    fn production_provider_set_routes_every_implemented_isolated_backend() {
+        let providers = PlatformExecutionProvider::new(HostId::from_u128(1));
+        assert!(providers.isolated_provider(Backend::Auto).is_some());
+        assert!(providers.isolated_provider(Backend::Oci).is_some());
+        assert!(
+            providers
+                .isolated_provider(Backend::WindowsHyperVContainer)
+                .is_some()
+        );
+        assert!(
+            providers
+                .isolated_provider(Backend::VirtualMachine)
+                .is_none()
+        );
+    }
+
     /// One event's fields, in the order they were recorded.
     type CapturedFields = Vec<(String, String)>;
 
@@ -3186,6 +4191,7 @@ mod tests {
         /// The runner name the request carried, i.e. [`runner_name`] of the
         /// registering attempt.
         runner_name: String,
+        journal_states: Vec<AttemptState>,
     }
 
     impl FakeGithubLifecycle {
@@ -3229,9 +4235,8 @@ mod tests {
         ) -> Result<JitRegistration, JitRequestFailure> {
             self.registrations.fetch_add(1, Ordering::SeqCst);
             if let Some(store) = self.journal.lock().unwrap().as_ref() {
-                let slots = store
-                    .attempts()
-                    .expect("the journal is readable")
+                let attempts = store.attempts().expect("the journal is readable");
+                let slots = attempts
                     .iter()
                     .filter_map(|attempt| attempt.workspace().slot_number())
                     .collect();
@@ -3242,6 +4247,7 @@ mod tests {
                         leased_slots: slots,
                         work_folder: request.work_folder().to_string(),
                         runner_name: request.name().to_string(),
+                        journal_states: attempts.iter().map(RunnerAttempt::state).collect(),
                     });
             }
             if let Some(terminal) = self.registration_failures.lock().unwrap().pop_front() {
@@ -3509,6 +4515,228 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct FakeIsolatedProvider {
+        resources: Mutex<BTreeMap<AttemptId, (EnvironmentIdentity, EnvironmentState)>>,
+        extra_resources: Mutex<Vec<EnvironmentIdentity>>,
+        unsupported_host: AtomicBool,
+        permission_denied: AtomicBool,
+        incompatible_image: AtomicBool,
+        prepare_failure: AtomicBool,
+        recovery_unavailable: AtomicBool,
+        destroy_deferred: AtomicBool,
+        handoffs: AtomicUsize,
+        completed_successfully: AtomicBool,
+        native_calls: AtomicUsize,
+        actions: Mutex<Vec<&'static str>>,
+    }
+
+    impl FakeIsolatedProvider {
+        fn identity(attempt: &RunnerAttempt, host: HostId) -> EnvironmentIdentity {
+            let AttemptExecution::Isolated {
+                provider_kind,
+                resolved_image,
+                generation,
+                ..
+            } = attempt.execution()
+            else {
+                panic!("isolated intent required")
+            };
+            EnvironmentIdentity::Isolated {
+                host,
+                attempt: attempt.id,
+                provider_kind: *provider_kind,
+                environment_id: format!("environment-{}", attempt.id),
+                resolved_image: resolved_image.clone(),
+                generation: generation.clone(),
+            }
+        }
+
+        fn resource_count(&self) -> usize {
+            self.resources.lock().unwrap().len()
+        }
+    }
+
+    impl ExecutionProvider for FakeIsolatedProvider {
+        fn probe(&self, policy: &ScalePolicy) -> ProviderCapability {
+            if self.unsupported_host.load(Ordering::SeqCst) {
+                ProviderCapability::Unsupported
+            } else if self.permission_denied.load(Ordering::SeqCst) {
+                ProviderCapability::PermissionDenied
+            } else if policy.execution_policy().is_native() {
+                ProviderCapability::Unsupported
+            } else {
+                ProviderCapability::Ready
+            }
+        }
+
+        fn resolve(
+            &self,
+            policy: &ScalePolicy,
+        ) -> Result<Option<ResolvedEnvironment>, FailureReason> {
+            let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+                policy.execution_policy()
+            else {
+                return Err(FailureReason::Other("isolated policy required".into()));
+            };
+            Ok(Some(ResolvedEnvironment {
+                provider_kind: Backend::Oci,
+                image: if self.incompatible_image.load(Ordering::SeqCst) {
+                    ImageReference::new("vm-version:wrong-provider")
+                        .expect("valid but incompatible")
+                } else {
+                    image.clone()
+                },
+            }))
+        }
+
+        fn prepare(
+            &self,
+            attempt: &RunnerAttempt,
+            policy: &ScalePolicy,
+        ) -> Result<PreparedEnvironment, FailureReason> {
+            assert_eq!(
+                attempt.state(),
+                AttemptState::Preparing,
+                "intent must be durable before provider effect"
+            );
+            self.actions.lock().unwrap().push("prepare");
+            let identity = Self::identity(attempt, policy.host_id);
+            self.resources
+                .lock()
+                .unwrap()
+                .insert(attempt.id, (identity.clone(), EnvironmentState::Starting));
+            if self.prepare_failure.swap(false, Ordering::SeqCst) {
+                return Err(FailureReason::Other("provider-secret-needle".into()));
+            }
+            Ok(PreparedEnvironment::isolated(attempt.id, identity))
+        }
+
+        fn start(
+            &self,
+            prepared: PreparedEnvironment,
+            attempt: &RunnerAttempt,
+            handoff: OneTimeJitHandoff<'_>,
+        ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+            assert_eq!(prepared.attempt, attempt.id);
+            assert_eq!(attempt.state(), AttemptState::JitReceived);
+            assert_eq!(handoff.consume().expose(), JIT);
+            self.handoffs.fetch_add(1, Ordering::SeqCst);
+            self.actions.lock().unwrap().push("start");
+            let mut resources = self.resources.lock().unwrap();
+            let (identity, state) = resources.get_mut(&attempt.id).expect("prepared resource");
+            *state = EnvironmentState::Running;
+            Ok(identity.clone())
+        }
+
+        fn inspect(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+            self.actions.lock().unwrap().push("inspect");
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .get(&attempt.id)
+                .map_or(EnvironmentState::Missing, |(_, state)| *state))
+        }
+
+        fn recover(&self, attempt: &RunnerAttempt) -> Result<EnvironmentState, FailureReason> {
+            if self.recovery_unavailable.load(Ordering::SeqCst) {
+                return Err(FailureReason::Other(
+                    "provider discovery unavailable".into(),
+                ));
+            }
+            self.inspect(attempt)
+        }
+
+        fn owns(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .get(&attempt.id)
+                .is_some_and(|(identity, _)| {
+                    identity_matches_intent(attempt_host(identity), attempt, identity)
+                }))
+        }
+
+        fn stop(&self, attempt: &RunnerAttempt) -> Result<ProviderStop, FailureReason> {
+            assert!(self.owns(attempt)?);
+            self.actions.lock().unwrap().push("stop");
+            if let Some((_, state)) = self.resources.lock().unwrap().get_mut(&attempt.id) {
+                *state = EnvironmentState::Exited;
+            }
+            Ok(ProviderStop::Stopped)
+        }
+
+        fn destroy(&self, attempt: &RunnerAttempt) -> Result<ProviderDestroy, FailureReason> {
+            assert!(self.owns(attempt)?);
+            self.actions.lock().unwrap().push("destroy");
+            if self.destroy_deferred.load(Ordering::SeqCst) {
+                return Ok(ProviderDestroy::Deferred("provider busy"));
+            }
+            self.resources.lock().unwrap().remove(&attempt.id);
+            Ok(ProviderDestroy::Destroyed)
+        }
+
+        fn enumerate_owned(&self, host: HostId) -> Vec<EnvironmentIdentity> {
+            let mut owned = self
+                .resources
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|(identity, _)| attempt_host(identity) == host)
+                .map(|(identity, _)| identity.clone())
+                .collect::<Vec<_>>();
+            owned.extend(
+                self.extra_resources
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|identity| attempt_host(identity) == host)
+                    .cloned(),
+            );
+            owned
+        }
+
+        fn diagnostics(&self, _attempt: &RunnerAttempt) -> Vec<ProviderDiagnostic> {
+            vec![ProviderDiagnostic::CleanupDeferred; 40]
+        }
+
+        fn spawn(
+            &self,
+            _attempt: &RunnerAttempt,
+            _config: &EncodedJitConfig,
+        ) -> Result<u32, ProcessStartFailure> {
+            self.native_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("isolated provider must never spawn natively")
+        }
+        fn is_alive(&self, _attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
+            panic!("native fallback")
+        }
+        fn recovered_pid(&self, _attempt: &RunnerAttempt) -> Result<Option<u32>, FailureReason> {
+            panic!("native fallback")
+        }
+        fn completed_successfully(&self, _attempt: &RunnerAttempt) -> bool {
+            self.completed_successfully.load(Ordering::SeqCst)
+        }
+        fn record_terminate_intent(&self, _attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+            panic!("native fallback")
+        }
+        fn has_terminate_intent(&self, _attempt: &RunnerAttempt) -> bool {
+            false
+        }
+        fn terminate(&self, _attempt: &RunnerAttempt) -> Result<(), FailureReason> {
+            panic!("native fallback")
+        }
+    }
+
+    fn attempt_host(identity: &EnvironmentIdentity) -> HostId {
+        let EnvironmentIdentity::Isolated { host, .. } = identity else {
+            panic!("isolated identity")
+        };
+        *host
+    }
+
+    #[derive(Debug, Default)]
     struct FakeDemand {
         answers: Mutex<VecDeque<bool>>,
     }
@@ -3771,6 +4999,988 @@ mod tests {
         fn only_attempt(&self) -> RunnerAttempt {
             self.store.attempts().unwrap().into_iter().next().unwrap()
         }
+    }
+
+    fn isolated_harness() -> Harness {
+        use runner_manager_domain::execution::{ExecutionPolicy, ResourceLimits};
+        let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_host_runner_root();
+        let image =
+            ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+                .expect("pinned image");
+        harness
+            .policy
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image,
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            })
+            .expect("isolated policy");
+        harness.github.watch_journal(Arc::clone(&harness.store));
+        harness
+    }
+
+    fn launcher_with_isolated(
+        harness: &Harness,
+        provider: Arc<FakeIsolatedProvider>,
+    ) -> LifecycleLauncher {
+        Harness::launcher_over(
+            harness.policy.host_id,
+            &harness.app_paths,
+            LifecyclePorts {
+                store: Arc::clone(&harness.store) as Arc<dyn Store>,
+                github: Arc::clone(&harness.github) as Arc<dyn LifecycleGithub>,
+                packages: Arc::clone(&harness.packages) as Arc<dyn RuntimePackages>,
+                processes: provider as Arc<dyn ExecutionProvider>,
+                clock: Arc::clone(&harness.clock) as Arc<dyn Clock>,
+                demand: Arc::clone(&harness.demand),
+                delay: Arc::clone(&harness.delay) as Arc<dyn RetryDelay>,
+                events: Arc::clone(&harness.events) as Arc<dyn AttemptEventSink>,
+                reconcile_events: Arc::clone(&harness.reconcile_events) as Arc<dyn EventSink>,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn isolated_policy_and_journal_never_enter_native_provider_or_jit() {
+        use runner_manager_domain::execution::{
+            AttemptExecution, Backend, ExecutionPolicy, ImageReference, ResourceLimits,
+        };
+
+        let mut harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand))
+            .with_host_runner_root();
+        let image =
+            ImageReference::new(format!("registry.example/runner@sha256:{}", "a".repeat(64)))
+                .expect("pinned image");
+        harness
+            .policy
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: image.clone(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 1024,
+                    disk_mib: 4096,
+                },
+            })
+            .expect("valid isolated profile");
+
+        harness.ready().await;
+        assert_eq!(
+            harness.processes.probe(&harness.policy),
+            ProviderCapability::Unsupported
+        );
+        let failure = harness
+            .launch_result()
+            .await
+            .expect_err("provider is unavailable");
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
+        );
+
+        let runtime = harness.host_root().join("isolated-owned-environment");
+        fs::create_dir_all(&runtime).expect("provider resource fixture");
+        fs::write(runtime.join("owned-marker"), "non-secret").expect("fixture marker");
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x123),
+            harness.policy.id,
+            runtime.clone(),
+            harness.clock.now(),
+        );
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image,
+                generation: "generation-123".into(),
+            })
+            .expect("isolated intent");
+        attempt
+            .prepared_environment("environment-123".into())
+            .expect("prepared identity");
+        harness
+            .store
+            .record_attempt(&attempt)
+            .expect("durable isolated journal");
+
+        harness
+            .launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("unsupported isolated cleanup is profile-local");
+        let failure = harness
+            .launch_result()
+            .await
+            .expect_err("provider unavailable for this policy");
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
+        );
+        harness
+            .launcher
+            .supervise(&harness.policy)
+            .await
+            .expect("unavailable attempt is deferred");
+        assert!(harness.launcher.clean(attempt.id).await.is_err());
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::CleanupDeferred
+        );
+        assert!(matches!(
+            harness.launcher.recover_startup(&[]).await,
+            Err(LifecycleError::RecoveryIncomplete)
+        ));
+        assert!(
+            runtime.join("owned-marker").is_file(),
+            "native cleanup touched the isolated environment"
+        );
+        assert!(
+            harness.processes.actions.lock().unwrap().is_empty(),
+            "native recovery inspected an isolated identity"
+        );
+        assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.packages.materializations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn isolated_prepare_is_durable_before_jit_and_start_uses_one_handoff() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("ready");
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let attempt = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect("isolated launch");
+        assert_eq!(attempt.state(), AttemptState::Starting);
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(provider.handoffs.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
+        let fact = harness
+            .github
+            .registration_facts()
+            .pop()
+            .expect("JIT registration");
+        assert_eq!(
+            fact.journal_states,
+            vec![AttemptState::Prepared],
+            "provider readiness preceded GitHub JIT"
+        );
+        assert_eq!(
+            harness
+                .events
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    AttemptEvent::State { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                AttemptState::Allocated,
+                AttemptState::Preparing,
+                AttemptState::Prepared,
+                AttemptState::JitReceived,
+                AttemptState::Starting
+            ]
+        );
+        let restarted = launcher_with_isolated(&harness, Arc::clone(&provider));
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("adopt live sandbox");
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(
+            harness.github.registrations.load(Ordering::SeqCst),
+            1,
+            "restart cannot issue duplicate JIT"
+        );
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        restarted
+            .supervise(&harness.policy)
+            .await
+            .expect("job observed");
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::Busy
+        );
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .get_mut(&attempt.id)
+            .unwrap()
+            .1 = EnvironmentState::Exited;
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        restarted
+            .supervise(&harness.policy)
+            .await
+            .expect("terminal cleanup");
+        assert_eq!(provider.resource_count(), 0);
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_isolated_job_exit_is_recorded_as_completed() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let attempt = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .unwrap();
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        launcher.supervise(&harness.policy).await.unwrap();
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .get_mut(&attempt.id)
+            .unwrap()
+            .1 = EnvironmentState::Exited;
+        provider
+            .completed_successfully
+            .store(true, Ordering::SeqCst);
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        launcher.supervise(&harness.policy).await.unwrap();
+        let cleaned = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn isolated_prepare_failure_stays_local_and_crash_gap_recovers_owned_resource() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        provider.prepare_failure.store(true, Ordering::SeqCst);
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("ready");
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let failure = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect_err("prepare failed after creating resource");
+        assert_eq!(
+            failure.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert!(
+            !harness
+                .store
+                .dump_text()
+                .unwrap()
+                .contains("provider-secret-needle")
+        );
+        let id = harness.store.attempts().unwrap()[0].id;
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().outcome(),
+            Some(&AttemptOutcome::failed(FailureReason::IsolationProvider(
+                IsolationProviderFailure::RuntimeOperationFailed
+            )))
+        );
+        let restarted = launcher_with_isolated(&harness, Arc::clone(&provider));
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("profile-local recovery");
+        assert_eq!(
+            provider.resource_count(),
+            0,
+            "the exact owned resource was destroyed once"
+        );
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
+        let diagnostic =
+            fs::read_to_string(restarted.diagnostics_root.join(format!("{id}.log"))).unwrap();
+        assert!(diagnostic.contains("reason=isolation_runtime_operation_failed"));
+        assert!(!diagnostic.contains("provider-secret-needle"));
+        assert_eq!(
+            provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count(),
+            1
+        );
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn isolation_capability_and_adapter_failures_keep_closed_categories() {
+        let cases = [
+            (
+                ProviderCapability::NotInstalled,
+                IsolationProviderFailure::NotInstalled,
+            ),
+            (
+                ProviderCapability::PermissionDenied,
+                IsolationProviderFailure::PermissionDenied,
+            ),
+            (
+                ProviderCapability::ImageUnavailableOrIncompatible,
+                IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            ),
+            (
+                ProviderCapability::DiskQuotaUnavailable,
+                IsolationProviderFailure::DiskQuotaUnavailable,
+            ),
+            (
+                ProviderCapability::Degraded,
+                IsolationProviderFailure::Degraded,
+            ),
+        ];
+        for (capability, category) in cases {
+            assert_eq!(
+                capability.refusal(),
+                FailureReason::IsolationProvider(category)
+            );
+        }
+        let raw = FailureReason::Other("ghp_secret_from_provider".into());
+        let safe = safe_isolation_reason(raw, IsolationProviderFailure::RuntimeOperationFailed);
+        assert_eq!(
+            safe,
+            FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed)
+        );
+        assert!(!safe.to_string().contains("ghp_secret"));
+        assert_eq!(
+            safe_isolation_reason(
+                FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied),
+                IsolationProviderFailure::RuntimeOperationFailed,
+            ),
+            FailureReason::IsolationProvider(IsolationProviderFailure::PermissionDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_permission_and_image_failures_stop_before_jit_without_native_fallback() {
+        for image_failure in [false, true] {
+            let harness = isolated_harness();
+            let provider = Arc::new(FakeIsolatedProvider::default());
+            provider
+                .permission_denied
+                .store(!image_failure, Ordering::SeqCst);
+            provider
+                .incompatible_image
+                .store(image_failure, Ordering::SeqCst);
+            let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+            launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .unwrap();
+            let guard = harness.allocation_lock.acquire().await.unwrap();
+            let error = launcher
+                .launch(LaunchRequest {
+                    host: &harness.host,
+                    policy: &harness.policy,
+                    allocation_guard: &guard,
+                })
+                .await
+                .expect_err("pre-JIT refusal");
+            let expected = if image_failure {
+                "resolved image is incompatible"
+            } else {
+                "permission denied"
+            };
+            assert!(error.reason.to_string().contains(expected));
+            assert!(
+                harness.store.attempts().unwrap().is_empty(),
+                "no allocation was journalled"
+            );
+            assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_host_stops_before_jit_without_allocation_or_native_fallback() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        provider.unsupported_host.store(true, Ordering::SeqCst);
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .unwrap();
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let error = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect_err("unsupported host must be refused before JIT");
+
+        assert_eq!(
+            error.reason,
+            FailureReason::IsolationProvider(IsolationProviderFailure::Unsupported)
+        );
+        assert!(harness.store.attempts().unwrap().is_empty());
+        assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.handoffs.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        assert!(provider.actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_journalled_environment_id_waits_for_provider_absence_proof() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let runtime = harness.host_root().join("prepare-without-identity");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt = RunnerAttempt::allocate(
+            AttemptId::from_u128(0x9191),
+            harness.policy.id,
+            runtime,
+            harness.clock.now(),
+        );
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "prepare-generation".into(),
+            })
+            .unwrap();
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::Other("prepare interrupted".into())),
+                harness.clock.now(),
+            )
+            .unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+
+        provider.recovery_unavailable.store(true, Ordering::SeqCst);
+        launcher
+            .clean(attempt.id)
+            .await
+            .expect_err("absence unproven");
+        let deferred = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(deferred.state(), AttemptState::CleanupDeferred);
+        assert!(deferred.counts_against_capacity());
+
+        provider.recovery_unavailable.store(false, Ordering::SeqCst);
+        launcher.clean(attempt.id).await.expect("absence proven");
+        assert_eq!(
+            harness.store.attempt(attempt.id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_terminal_capacity_waits_for_confirmed_absence_and_generation_matches() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("ready");
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let mut attempt = launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+            })
+            .await
+            .expect("launch");
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::ProcessStartFailed),
+                harness.clock.now(),
+            )
+            .unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        provider.destroy_deferred.store(true, Ordering::SeqCst);
+        launcher
+            .clean(attempt.id)
+            .await
+            .expect_err("provider deferred destroy");
+        let deferred = harness.store.attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(deferred.state(), AttemptState::CleanupDeferred);
+        assert!(deferred.counts_against_capacity());
+        assert_eq!(provider.resource_count(), 1);
+        provider.destroy_deferred.store(false, Ordering::SeqCst);
+        let restarted = launcher_with_isolated(&harness, Arc::clone(&provider));
+        restarted
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("retry cleanup");
+        assert_eq!(provider.resource_count(), 0);
+        assert!(
+            !harness
+                .store
+                .attempt(attempt.id)
+                .unwrap()
+                .unwrap()
+                .counts_against_capacity()
+        );
+
+        // A reused runtime name with a different generation is not ours to delete.
+        let second_id = AttemptId::from_u128(0x9999);
+        let second_runtime = harness.host_root().join("generation-mismatch");
+        fs::create_dir_all(&second_runtime).unwrap();
+        let mut terminal = RunnerAttempt::allocate(
+            second_id,
+            harness.policy.id,
+            second_runtime,
+            harness.clock.now(),
+        );
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        terminal
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "expected-generation".into(),
+            })
+            .unwrap();
+        let mut stranger = FakeIsolatedProvider::identity(&terminal, harness.policy.host_id);
+        let EnvironmentIdentity::Isolated { environment_id, .. } = &stranger else {
+            unreachable!()
+        };
+        terminal.begin_prepare(harness.clock.now()).unwrap();
+        terminal
+            .prepared_environment(environment_id.clone())
+            .unwrap();
+        terminal.mark_prepared(harness.clock.now()).unwrap();
+        terminal.jit_received(harness.clock.now()).unwrap();
+        terminal.started_isolated(harness.clock.now()).unwrap();
+        terminal
+            .conclude(
+                AttemptOutcome::failed(FailureReason::ProcessStartFailed),
+                harness.clock.now(),
+            )
+            .unwrap();
+        harness.store.record_attempt(&terminal).unwrap();
+        let EnvironmentIdentity::Isolated { generation, .. } = &mut stranger else {
+            unreachable!()
+        };
+        *generation = "another-generation".into();
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .insert(second_id, (stranger, EnvironmentState::Running));
+        restarted
+            .clean(terminal.id)
+            .await
+            .expect_err("ownership mismatch quarantined");
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(
+            harness.store.attempt(terminal.id).unwrap().unwrap().state(),
+            AttemptState::CleanupDeferred
+        );
+        assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn isolated_restart_at_each_transition_adopts_or_destroys_one_resource() {
+        for stage in [
+            AttemptState::Allocated,
+            AttemptState::Preparing,
+            AttemptState::Prepared,
+            AttemptState::JitReceived,
+            AttemptState::Starting,
+            AttemptState::Idle,
+            AttemptState::Busy,
+            AttemptState::Finished,
+            AttemptState::Failed,
+            AttemptState::Orphaned,
+            AttemptState::Destroying,
+            AttemptState::CleanupDeferred,
+        ] {
+            let harness = isolated_harness();
+            let provider = Arc::new(FakeIsolatedProvider::default());
+            let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+            let id = AttemptId::from_u128(0x1000 + stage as u128);
+            let runtime = harness.host_root().join(format!("phase-{stage}"));
+            fs::create_dir_all(&runtime).unwrap();
+            let mut attempt =
+                RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
+            let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+                harness.policy.execution_policy()
+            else {
+                unreachable!()
+            };
+            attempt
+                .allocate_execution(AttemptExecution::Isolated {
+                    provider_kind: Backend::Oci,
+                    environment_id: None,
+                    resolved_image: image.clone(),
+                    generation: format!("generation-{stage}"),
+                })
+                .unwrap();
+            if stage != AttemptState::Allocated {
+                attempt.begin_prepare(harness.clock.now()).unwrap();
+            }
+            let identity = FakeIsolatedProvider::identity(&attempt, harness.policy.host_id);
+            if stage != AttemptState::Allocated {
+                let resource_state = if matches!(
+                    stage,
+                    AttemptState::Finished
+                        | AttemptState::Failed
+                        | AttemptState::Orphaned
+                        | AttemptState::Destroying
+                        | AttemptState::CleanupDeferred
+                ) {
+                    EnvironmentState::Exited
+                } else {
+                    EnvironmentState::Running
+                };
+                provider
+                    .resources
+                    .lock()
+                    .unwrap()
+                    .insert(id, (identity.clone(), resource_state));
+            }
+            if !matches!(stage, AttemptState::Allocated | AttemptState::Preparing) {
+                let EnvironmentIdentity::Isolated { environment_id, .. } = &identity else {
+                    unreachable!()
+                };
+                attempt
+                    .prepared_environment(environment_id.clone())
+                    .unwrap();
+                attempt.mark_prepared(harness.clock.now()).unwrap();
+            }
+            if matches!(
+                stage,
+                AttemptState::JitReceived
+                    | AttemptState::Starting
+                    | AttemptState::Idle
+                    | AttemptState::Busy
+                    | AttemptState::Finished
+                    | AttemptState::Failed
+                    | AttemptState::Orphaned
+                    | AttemptState::Destroying
+                    | AttemptState::CleanupDeferred
+            ) {
+                attempt.jit_received(harness.clock.now()).unwrap();
+            }
+            if matches!(
+                stage,
+                AttemptState::Starting
+                    | AttemptState::Idle
+                    | AttemptState::Busy
+                    | AttemptState::Finished
+                    | AttemptState::Failed
+                    | AttemptState::Orphaned
+                    | AttemptState::Destroying
+                    | AttemptState::CleanupDeferred
+            ) {
+                attempt.started_isolated(harness.clock.now()).unwrap();
+            }
+            if matches!(
+                stage,
+                AttemptState::Idle | AttemptState::Busy | AttemptState::Finished
+            ) {
+                attempt.registered_idle(73, harness.clock.now()).unwrap();
+            }
+            if matches!(stage, AttemptState::Busy | AttemptState::Finished) {
+                attempt.assigned_job(73, harness.clock.now()).unwrap();
+            }
+            if matches!(
+                stage,
+                AttemptState::Finished
+                    | AttemptState::Failed
+                    | AttemptState::Orphaned
+                    | AttemptState::Destroying
+                    | AttemptState::CleanupDeferred
+            ) {
+                let outcome = match stage {
+                    AttemptState::Finished => AttemptOutcome::CompletedJob,
+                    AttemptState::Orphaned => AttemptOutcome::Orphaned,
+                    _ => AttemptOutcome::failed(FailureReason::ProcessStartFailed),
+                };
+                attempt.conclude(outcome, harness.clock.now()).unwrap();
+            }
+            if matches!(
+                stage,
+                AttemptState::Destroying | AttemptState::CleanupDeferred
+            ) {
+                attempt.begin_destroy(harness.clock.now()).unwrap();
+            }
+            if stage == AttemptState::CleanupDeferred {
+                attempt.defer_cleanup(harness.clock.now()).unwrap();
+            }
+            harness.store.record_attempt(&attempt).unwrap();
+            launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .unwrap_or_else(|error| panic!("restart from {stage}: {error}"));
+            let resumed = harness.store.attempt(id).unwrap().unwrap();
+            if matches!(
+                stage,
+                AttemptState::Allocated
+                    | AttemptState::Preparing
+                    | AttemptState::Prepared
+                    | AttemptState::Finished
+                    | AttemptState::Failed
+                    | AttemptState::Orphaned
+                    | AttemptState::Destroying
+                    | AttemptState::CleanupDeferred
+            ) {
+                assert_eq!(
+                    resumed.state(),
+                    AttemptState::Cleaned,
+                    "{stage} must retire after restart"
+                );
+            } else {
+                assert!(resumed.counts_against_capacity(), "live {stage} is adopted");
+                assert_eq!(provider.resource_count(), 1);
+                provider.resources.lock().unwrap().get_mut(&id).unwrap().1 =
+                    EnvironmentState::Exited;
+                launcher.supervise(&harness.policy).await.unwrap();
+                assert_eq!(
+                    harness.store.attempt(id).unwrap().unwrap().state(),
+                    AttemptState::Cleaned
+                );
+            }
+            assert_eq!(
+                provider.resource_count(),
+                0,
+                "{stage} resource cleaned exactly once"
+            );
+            let destroyed = provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count();
+            assert_eq!(
+                destroyed,
+                usize::from(stage != AttemptState::Allocated),
+                "{stage} destroy count"
+            );
+            assert_eq!(
+                harness.github.registrations.load(Ordering::SeqCst),
+                0,
+                "restart from {stage} cannot duplicate JIT"
+            );
+            assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_provider_ownership_is_quarantined_until_unambiguous() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let id = AttemptId::from_u128(0x7777);
+        let runtime = harness.host_root().join("duplicate-provider-ownership");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "duplicate-generation".into(),
+            })
+            .unwrap();
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        let first = FakeIsolatedProvider::identity(&attempt, harness.policy.host_id);
+        let mut second = first.clone();
+        let EnvironmentIdentity::Isolated { environment_id, .. } = &mut second else {
+            unreachable!()
+        };
+        *environment_id = "another-environment".into();
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .insert(id, (first, EnvironmentState::Running));
+        provider.extra_resources.lock().unwrap().push(second);
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("duplicate is local");
+        let deferred = harness.store.attempt(id).unwrap().unwrap();
+        assert_eq!(deferred.state(), AttemptState::CleanupDeferred);
+        assert!(deferred.counts_against_capacity());
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(
+            provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count(),
+            0
+        );
+        provider.extra_resources.lock().unwrap().clear();
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("single identity recovered");
+        assert_eq!(provider.resource_count(), 0);
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_resource_without_live_journal_is_surfaced_but_never_deleted() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let id = AttemptId::from_u128(0x8888);
+        let runtime = harness.host_root().join("orphan-provider-resource");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, runtime, harness.clock.now());
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "orphan-generation".into(),
+            })
+            .unwrap();
+        let identity = FakeIsolatedProvider::identity(&attempt, harness.policy.host_id);
+        provider
+            .resources
+            .lock()
+            .unwrap()
+            .insert(id, (identity, EnvironmentState::Running));
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("orphan cannot block host");
+        assert_eq!(provider.resource_count(), 1);
+        assert!(
+            harness
+                .events
+                .events()
+                .contains(&AttemptEvent::QuarantinedOwnedResource { attempt: id })
+        );
+        assert_eq!(
+            provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count(),
+            0
+        );
+
+        let EnvironmentIdentity::Isolated { environment_id, .. } = provider
+            .resources
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .0
+            .clone()
+        else {
+            unreachable!()
+        };
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        attempt.prepared_environment(environment_id).unwrap();
+        attempt.mark_prepared(harness.clock.now()).unwrap();
+        attempt.jit_received(harness.clock.now()).unwrap();
+        attempt.started_isolated(harness.clock.now()).unwrap();
+        attempt
+            .conclude(
+                AttemptOutcome::failed(FailureReason::ProcessStartFailed),
+                harness.clock.now(),
+            )
+            .unwrap();
+        attempt.begin_destroy(harness.clock.now()).unwrap();
+        attempt.clean_isolated(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+        launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("cleaned row cannot authorize deletion");
+        assert_eq!(provider.resource_count(), 1);
+        assert_eq!(
+            provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count(),
+            0
+        );
     }
 
     /// The wiring the three-hour outage needed and did not have.

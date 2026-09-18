@@ -336,6 +336,7 @@ mod tests {
             state,
             outcome,
             process_id: None,
+            execution: crate::execution::AttemptExecution::Native { process_id: None },
             runtime_path: "runtime/p/a".into(),
             workspace_kind: WorkspaceKind::Ephemeral,
             workspace_slot: None,

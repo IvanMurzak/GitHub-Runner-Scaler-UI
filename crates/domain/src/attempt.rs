@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution::{AttemptExecution, ExecutionError};
 use crate::model::{AttemptId, Clock, Elapsed, HostId, PolicyId, Timestamp};
 use crate::policy::ScalePolicy;
 use crate::workspace::{AttemptWorkspace, WorkspaceError, WorkspaceKind};
@@ -37,6 +38,8 @@ use crate::workspace::{AttemptWorkspace, WorkspaceError, WorkspaceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttemptError {
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
     #[error("{to} is not a legal transition from {from}")]
     IllegalTransition {
         from: AttemptState,
@@ -178,6 +181,8 @@ pub enum OwnershipError {
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
     Allocated,
+    Preparing,
+    Prepared,
     JitReceived,
     Starting,
     Idle,
@@ -185,12 +190,16 @@ pub enum AttemptState {
     Finished,
     Failed,
     Orphaned,
+    Destroying,
+    CleanupDeferred,
     Cleaned,
 }
 
 impl AttemptState {
-    pub const ALL: [AttemptState; 9] = [
+    pub const ALL: [AttemptState; 13] = [
         AttemptState::Allocated,
+        AttemptState::Preparing,
+        AttemptState::Prepared,
         AttemptState::JitReceived,
         AttemptState::Starting,
         AttemptState::Idle,
@@ -198,6 +207,8 @@ impl AttemptState {
         AttemptState::Finished,
         AttemptState::Failed,
         AttemptState::Orphaned,
+        AttemptState::Destroying,
+        AttemptState::CleanupDeferred,
         AttemptState::Cleaned,
     ];
 
@@ -205,6 +216,9 @@ impl AttemptState {
     pub const LEGAL: &'static [(AttemptState, AttemptState)] = &[
         // `allocated -> jit_received -> starting -> idle | busy`.
         (AttemptState::Allocated, AttemptState::JitReceived),
+        (AttemptState::Allocated, AttemptState::Preparing),
+        (AttemptState::Preparing, AttemptState::Prepared),
+        (AttemptState::Prepared, AttemptState::JitReceived),
         (AttemptState::JitReceived, AttemptState::Starting),
         (AttemptState::Starting, AttemptState::Idle),
         (AttemptState::Starting, AttemptState::Busy),
@@ -213,6 +227,10 @@ impl AttemptState {
         // `allocated | jit_received | starting -> failed | orphaned`.
         (AttemptState::Allocated, AttemptState::Failed),
         (AttemptState::Allocated, AttemptState::Orphaned),
+        (AttemptState::Preparing, AttemptState::Failed),
+        (AttemptState::Preparing, AttemptState::Orphaned),
+        (AttemptState::Prepared, AttemptState::Failed),
+        (AttemptState::Prepared, AttemptState::Orphaned),
         (AttemptState::JitReceived, AttemptState::Failed),
         (AttemptState::JitReceived, AttemptState::Orphaned),
         (AttemptState::Starting, AttemptState::Failed),
@@ -228,6 +246,12 @@ impl AttemptState {
         (AttemptState::Finished, AttemptState::Cleaned),
         (AttemptState::Failed, AttemptState::Cleaned),
         (AttemptState::Orphaned, AttemptState::Cleaned),
+        (AttemptState::Finished, AttemptState::Destroying),
+        (AttemptState::Failed, AttemptState::Destroying),
+        (AttemptState::Orphaned, AttemptState::Destroying),
+        (AttemptState::Destroying, AttemptState::CleanupDeferred),
+        (AttemptState::CleanupDeferred, AttemptState::Destroying),
+        (AttemptState::Destroying, AttemptState::Cleaned),
     ];
 
     /// The five states an attempt can still be concluded from: every
@@ -238,6 +262,8 @@ impl AttemptState {
     /// edge, and that equality is a property worth failing loudly on.
     pub const CONCLUDABLE_FROM: &'static [AttemptState] = &[
         AttemptState::Allocated,
+        AttemptState::Preparing,
+        AttemptState::Prepared,
         AttemptState::JitReceived,
         AttemptState::Starting,
         AttemptState::Idle,
@@ -260,6 +286,8 @@ impl AttemptState {
             AttemptState::Finished
                 | AttemptState::Failed
                 | AttemptState::Orphaned
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
                 | AttemptState::Cleaned
         )
     }
@@ -289,6 +317,8 @@ impl fmt::Display for AttemptState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             AttemptState::Allocated => "allocated",
+            AttemptState::Preparing => "preparing",
+            AttemptState::Prepared => "prepared",
             AttemptState::JitReceived => "jit_received",
             AttemptState::Starting => "starting",
             AttemptState::Idle => "idle",
@@ -296,6 +326,8 @@ impl fmt::Display for AttemptState {
             AttemptState::Finished => "finished",
             AttemptState::Failed => "failed",
             AttemptState::Orphaned => "orphaned",
+            AttemptState::Destroying => "destroying",
+            AttemptState::CleanupDeferred => "cleanup_deferred",
             AttemptState::Cleaned => "cleaned",
         })
     }
@@ -378,8 +410,46 @@ pub enum FailureReason {
     /// and read back afterwards. See [`RecoveryDecision::Terminate`] for the
     /// window that obligation closes.
     TerminatedAfterRegistrationTimeout,
+    /// A closed, credential-free isolation provider failure. Its category is
+    /// preserved in the attempt journal and operator activity rather than
+    /// flattened into free-form subprocess or adapter text.
+    IsolationProvider(IsolationProviderFailure),
     /// Anything else. Must carry no credential.
     Other(String),
+}
+
+/// Operator-actionable isolation failures. No variant carries provider output,
+/// image text, JIT content, or another string that could contain a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationProviderFailure {
+    Unsupported,
+    NotInstalled,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
+    Degraded,
+    RuntimeOperationFailed,
+    OwnershipMismatch,
+    UnsafeRuntimePath,
+    JitHandoffRejected,
+}
+
+impl fmt::Display for IsolationProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "isolation provider unsupported on this host",
+            Self::NotInstalled => "isolation provider not installed",
+            Self::PermissionDenied => "isolation provider permission denied",
+            Self::ImageUnavailableOrIncompatible => "isolated image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "rootless OCI writable-layer disk quota unavailable",
+            Self::Degraded => "isolation provider degraded",
+            Self::RuntimeOperationFailed => "rootless OCI runtime operation failed",
+            Self::OwnershipMismatch => "OCI environment ownership mismatch",
+            Self::UnsafeRuntimePath => "OCI runtime must be on the Linux filesystem",
+            Self::JitHandoffRejected => "OCI JIT handoff rejected before start",
+        })
+    }
 }
 
 impl FailureReason {
@@ -426,7 +496,7 @@ impl FailureReason {
     /// invocation are markedly worse to read and to `rustdoc`. That is a
     /// legibility trade, deliberately taken — not an impossibility. If the
     /// documentation ever thins out, the macro is the better answer.
-    pub const ALL: [FailureReason; 9] = [
+    pub const ALL: [FailureReason; 10] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
         FailureReason::RunnerPackageUnverified,
@@ -435,6 +505,7 @@ impl FailureReason {
         FailureReason::ProcessExitedUnexpectedly,
         FailureReason::RegistrationTimedOut,
         FailureReason::TerminatedAfterRegistrationTimeout,
+        FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed),
         FailureReason::Other(String::new()),
     ];
 }
@@ -471,6 +542,7 @@ impl fmt::Display for FailureReason {
                 "the agent stopped the runner process after it failed to \
                  register with GitHub before its startup deadline",
             ),
+            FailureReason::IsolationProvider(category) => category.fmt(f),
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
     }
@@ -601,6 +673,7 @@ pub struct RunnerAttempt {
     state: AttemptState,
     outcome: Option<AttemptOutcome>,
     process_id: Option<u32>,
+    execution: AttemptExecution,
     runtime_path: PathBuf,
     /// Which cleanup algorithm this attempt's directory is entitled to, and the
     /// slot it leases if any.
@@ -650,6 +723,7 @@ pub struct PersistedAttempt {
     pub state: AttemptState,
     pub outcome: Option<AttemptOutcome>,
     pub process_id: Option<u32>,
+    pub execution: AttemptExecution,
     pub runtime_path: PathBuf,
     /// `ephemeral` or `persistent`, stored beside the slot below.
     pub workspace_kind: WorkspaceKind,
@@ -683,6 +757,7 @@ impl RunnerAttempt {
             state: self.state,
             outcome: self.outcome.clone(),
             process_id: self.process_id,
+            execution: self.execution.clone(),
             runtime_path: self.runtime_path.clone(),
             workspace_kind: self.workspace.kind(),
             workspace_slot: self.workspace.slot_number(),
@@ -736,6 +811,7 @@ impl RunnerAttempt {
             state: AttemptState::Allocated,
             outcome: None,
             process_id: None,
+            execution: AttemptExecution::Native { process_id: None },
             runtime_path: runtime_path.into(),
             workspace,
             created_at: now,
@@ -759,6 +835,7 @@ impl RunnerAttempt {
             state,
             outcome,
             process_id,
+            execution,
             runtime_path,
             workspace_kind,
             workspace_slot,
@@ -774,6 +851,14 @@ impl RunnerAttempt {
         // `04-security-recovery.md` requires that to fail closed rather than to
         // fall back to the destructive branch.
         let workspace = AttemptWorkspace::from_persisted(workspace_kind, workspace_slot)?;
+        execution.validate()?;
+        match &execution {
+            AttemptExecution::Native {
+                process_id: identity_pid,
+            } if *identity_pid == process_id => {}
+            AttemptExecution::Isolated { .. } if process_id.is_none() => {}
+            _ => return Err(ExecutionError::AttemptIdentityMismatch.into()),
+        }
 
         match (&outcome, state.is_terminal()) {
             (None, true) => return Err(AttemptError::TerminalWithoutOutcome { state }),
@@ -785,7 +870,13 @@ impl RunnerAttempt {
             }
             (Some(outcome), true) => {
                 let expected = outcome.terminal_state();
-                if state != expected && state != AttemptState::Cleaned {
+                let allowed_isolated_cleanup = !execution.is_native()
+                    && matches!(
+                        state,
+                        AttemptState::Destroying | AttemptState::CleanupDeferred
+                    );
+                if ![expected, AttemptState::Cleaned].contains(&state) && !allowed_isolated_cleanup
+                {
                     return Err(AttemptError::OutcomeStateMismatch {
                         state,
                         outcome: outcome.clone(),
@@ -807,6 +898,33 @@ impl RunnerAttempt {
             (None, true) => return Err(AttemptError::TerminalWithoutTimestamp { state }),
             (Some(_), false) => return Err(AttemptError::NonTerminalWithTimestamp { state }),
             _ => {}
+        }
+
+        if matches!(
+            state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) && execution.is_native()
+        {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        if matches!(
+            state,
+            AttemptState::Prepared
+                | AttemptState::JitReceived
+                | AttemptState::Starting
+                | AttemptState::Idle
+                | AttemptState::Busy
+        ) && matches!(
+            &execution,
+            AttemptExecution::Isolated {
+                environment_id: None,
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
         }
 
         // Presence was checked above; *ordering* is checked here, and it is a
@@ -844,6 +962,7 @@ impl RunnerAttempt {
             state,
             outcome,
             process_id,
+            execution,
             runtime_path,
             workspace,
             created_at,
@@ -870,6 +989,89 @@ impl RunnerAttempt {
     #[must_use]
     pub const fn process_id(&self) -> Option<u32> {
         self.process_id
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &AttemptExecution {
+        &self.execution
+    }
+
+    /// Choose the provider intent before the first journal write.
+    pub fn allocate_execution(&mut self, execution: AttemptExecution) -> Result<(), AttemptError> {
+        if self.state != AttemptState::Allocated || self.process_id.is_some() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        execution.validate()?;
+        if matches!(
+            execution,
+            AttemptExecution::Native {
+                process_id: Some(_)
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.execution = execution;
+        Ok(())
+    }
+
+    /// Fill the provider identity through a durable journal write before an
+    /// isolated runner receives JIT. A second or changed identity is refused.
+    pub fn prepared_environment(&mut self, environment_id: String) -> Result<(), AttemptError> {
+        if !matches!(
+            self.state,
+            AttemptState::Allocated
+                | AttemptState::Preparing
+                | AttemptState::Failed
+                | AttemptState::Orphaned
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        let AttemptExecution::Isolated {
+            environment_id: stored,
+            ..
+        } = &mut self.execution
+        else {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        };
+        if stored.is_some() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        *stored = Some(environment_id);
+        if let Err(error) = self.execution.validate() {
+            if let AttemptExecution::Isolated {
+                environment_id: stored,
+                ..
+            } = &mut self.execution
+            {
+                *stored = None;
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Persist intent before a provider performs an external prepare effect.
+    pub fn begin_prepare(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Preparing, now)
+    }
+
+    /// Persist the returned provider identity before requesting JIT.
+    pub fn mark_prepared(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if !matches!(
+            self.execution,
+            AttemptExecution::Isolated {
+                environment_id: Some(_),
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Prepared, now)
     }
 
     #[must_use]
@@ -916,9 +1118,12 @@ impl RunnerAttempt {
     }
 
     /// Whether this attempt still holds one of the host's capacity slots.
+    /// Isolated environments retain the slot through terminal runner states
+    /// until provider absence has been proved and cleanup is journalled.
     #[must_use]
     pub const fn counts_against_capacity(&self) -> bool {
         self.state.counts_against_capacity()
+            || (!self.execution.is_native() && !matches!(self.state, AttemptState::Cleaned))
     }
 
     fn move_to(&mut self, next: AttemptState, now: Timestamp) -> Result<(), AttemptError> {
@@ -946,9 +1151,29 @@ impl RunnerAttempt {
     /// # Errors
     /// [`AttemptError::IllegalTransition`] from any other state.
     pub fn started(&mut self, process_id: u32, now: Timestamp) -> Result<(), AttemptError> {
+        if !self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
         self.move_to(AttemptState::Starting, now)?;
         self.process_id = Some(process_id);
+        self.execution = AttemptExecution::Native {
+            process_id: Some(process_id),
+        };
         Ok(())
+    }
+
+    /// An isolated environment has no host PID; its immutable identity is already journalled.
+    pub fn started_isolated(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if !matches!(
+            self.execution,
+            AttemptExecution::Isolated {
+                environment_id: Some(_),
+                ..
+            }
+        ) {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Starting, now)
     }
 
     /// `starting -> idle`: the runner registered and is awaiting its one
@@ -1018,6 +1243,39 @@ impl RunnerAttempt {
     pub fn clean(&mut self, now: Timestamp) -> Result<(), AttemptError> {
         if self.state == AttemptState::Busy {
             return Err(AttemptError::BusyCannotBeCleaned);
+        }
+        if !self.execution.is_native() {
+            return Err(ExecutionError::IsolatedCleanupUnproven.into());
+        }
+        if !self.state.is_concluded() {
+            return Err(AttemptError::IllegalTransition {
+                from: self.state,
+                to: AttemptState::Cleaned,
+            });
+        }
+        self.move_to(AttemptState::Cleaned, now)
+    }
+
+    /// Durable cleanup intent, recorded before stop or destroy is attempted.
+    pub fn begin_destroy(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() || self.outcome.is_none() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::Destroying, now)
+    }
+
+    /// The provider still owns resources; preserve the capacity lease for a retry.
+    pub fn defer_cleanup(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
+        }
+        self.move_to(AttemptState::CleanupDeferred, now)
+    }
+
+    /// Only the lifecycle may call this after an independent missing observation.
+    pub fn clean_isolated(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.execution.is_native() {
+            return Err(ExecutionError::AttemptIdentityMismatch.into());
         }
         self.move_to(AttemptState::Cleaned, now)
     }
@@ -1540,7 +1798,8 @@ pub fn recovery_decision(
             }
         }
 
-        S::Finished | S::Failed | S::Orphaned | S::Cleaned => {
+        S::Preparing | S::Prepared => RecoveryDecision::Wait,
+        S::Finished | S::Failed | S::Orphaned | S::Destroying | S::CleanupDeferred | S::Cleaned => {
             unreachable!("terminal states are handled above")
         }
     }
@@ -1668,6 +1927,9 @@ mod tests {
         // Line 1.
         let mut edges = vec![
             (Allocated, JitReceived),
+            (Allocated, Preparing),
+            (Preparing, Prepared),
+            (Prepared, JitReceived),
             (JitReceived, Starting),
             (Starting, Idle),
             (Starting, Busy),
@@ -1675,7 +1937,7 @@ mod tests {
         // Line 2, added by the 2026-08-21 amendment.
         edges.push((Idle, Busy));
         // Line 3, added by the same amendment.
-        for from in [Allocated, JitReceived, Starting] {
+        for from in [Allocated, Preparing, Prepared, JitReceived, Starting] {
             for to in [Failed, Orphaned] {
                 edges.push((from, to));
             }
@@ -1689,7 +1951,13 @@ mod tests {
         // Line 5.
         for from in [Finished, Failed, Orphaned] {
             edges.push((from, Cleaned));
+            edges.push((from, Destroying));
         }
+        edges.extend([
+            (Destroying, CleanupDeferred),
+            (CleanupDeferred, Destroying),
+            (Destroying, Cleaned),
+        ]);
         edges
     }
 
@@ -1698,7 +1966,7 @@ mod tests {
         let expected = diagram_edges();
         assert_eq!(
             expected.len(),
-            20,
+            33,
             "the transcription itself changed; check it against the diagram"
         );
 
@@ -1735,8 +2003,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_seen, 20);
-        assert_eq!(illegal_seen, 81 - 20);
+        assert_eq!(legal_seen, 33);
+        assert_eq!(illegal_seen, 13 * 13 - 33);
 
         // And the published constant matches the transcription.
         let mut published = AttemptState::LEGAL.to_vec();
@@ -2014,6 +2282,7 @@ mod tests {
             // first, and the process it signalled is the one that never
             // registered.
             FailureReason::TerminatedAfterRegistrationTimeout => AttemptState::Starting,
+            FailureReason::IsolationProvider(_) => AttemptState::Allocated,
             FailureReason::Other(_) => AttemptState::Busy,
         }
     }
@@ -2031,7 +2300,7 @@ mod tests {
         // The table is written out rather than derived so each pairing carries
         // its reason; `earliest_state_producing` above is what makes a new
         // variant a compile error, and the two are cross-checked below.
-        let cases: [(FailureReason, AttemptState); 9] = [
+        let cases: [(FailureReason, AttemptState); 10] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -2057,6 +2326,10 @@ mod tests {
             (
                 FailureReason::TerminatedAfterRegistrationTimeout,
                 AttemptState::Starting,
+            ),
+            (
+                FailureReason::IsolationProvider(IsolationProviderFailure::NotInstalled),
+                AttemptState::Allocated,
             ),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
@@ -2119,6 +2392,30 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{reason:?} from {from} must reload: {e}"));
             assert_eq!(restored, attempt);
         }
+    }
+
+    #[test]
+    fn isolation_failure_categories_round_trip_without_free_text() {
+        let categories = [
+            IsolationProviderFailure::NotInstalled,
+            IsolationProviderFailure::PermissionDenied,
+            IsolationProviderFailure::ImageUnavailableOrIncompatible,
+            IsolationProviderFailure::DiskQuotaUnavailable,
+            IsolationProviderFailure::RuntimeOperationFailed,
+        ];
+        let mut rendered = std::collections::BTreeSet::new();
+        for category in categories {
+            let reason = FailureReason::IsolationProvider(category);
+            let journal = serde_json::to_string(&reason).unwrap();
+            assert!(!journal.contains("other"));
+            assert!(!journal.contains("ghp_secret"));
+            assert_eq!(
+                serde_json::from_str::<FailureReason>(&journal).unwrap(),
+                reason
+            );
+            rendered.insert(reason.to_string());
+        }
+        assert_eq!(rendered.len(), categories.len());
     }
 
     // =======================================================================
@@ -2410,6 +2707,9 @@ mod tests {
             state,
             outcome,
             process_id: Some(9),
+            execution: AttemptExecution::Native {
+                process_id: Some(9),
+            },
             runtime_path: "runtime/p/a".into(),
             workspace_kind: WorkspaceKind::Ephemeral,
             workspace_slot: None,
