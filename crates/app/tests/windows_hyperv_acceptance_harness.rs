@@ -62,7 +62,7 @@ fn windows_hyperv_harness_keeps_each_system_effect_explicit_and_reversible() {
     assert!(
         script.contains("$current.executable_sha256 -eq $State.runner_service.executable_sha256")
     );
-    assert!(script.contains("Find-AcceptanceRun $label $dispatchAt"));
+    assert!(script.contains("Find-AcceptanceRun $selector $dispatchAt"));
     assert!(script.contains("Remove-AcceptanceTrigger $State"));
     assert!(script.contains("'pr', 'edit', [string]$PullRequestNumber"));
     assert!(script.contains("'label', 'delete', $label"));
@@ -217,6 +217,14 @@ fn harness_and_workflow_pin_the_production_provider_security_contract() {
         "gh.exe auth token",
         "Stop-Process -Id $before.process_id -Force",
         "provider-owned orphan remained",
+        "function Resolve-AcceptanceProfileSelector",
+        "profile-status.json",
+        "status did not expose exactly one immutable selector",
+        "Set-StateProperty $State profile_selector $value",
+        "--host-label', 'd2'",
+        "'status,conclusion,url'",
+        "completed with conclusion '$conclusion' before a provider container appeared",
+        "Wait-ProviderContainer $evidence $JobTimeoutSeconds ([string]$run.databaseId)",
     ] {
         assert!(script.contains(needle), "missing evidence check {needle}");
     }
@@ -225,8 +233,10 @@ fn harness_and_workflow_pin_the_production_provider_security_contract() {
         "types: [labeled]",
         "github.event.pull_request.number == 77",
         "github.event.pull_request.head.repo.full_name == github.repository",
-        "startsWith(github.event.label.name, 'rm-d2-')",
+        "startsWith(github.event.label.name, 'rm-d2-win-x64-d2-')",
         "runs-on: [self-hosted, windows, x64",
+        "ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}",
+        "^rm-d2-win-x64-(d2-([0-9]{14}-[0-9a-f]{8}))$",
         "QueryInformationJobObject",
         "ActiveProcessLimit -ne 256",
         "0x2000",
@@ -234,4 +244,25 @@ fn harness_and_workflow_pin_the_production_provider_security_contract() {
     ] {
         assert!(workflow.contains(needle), "missing workflow check {needle}");
     }
+}
+
+#[test]
+fn cancellation_keeps_trigger_and_profile_cleanup_reachable() {
+    let script = repository_file("scripts/windows-hyperv-acceptance.ps1");
+    let created = script
+        .find("Set-StateProperty $State trigger_label_created $true")
+        .expect("trigger creation is durable");
+    let found = script
+        .find("$run = Find-AcceptanceRun $selector $dispatchAt")
+        .expect("the exact-selector run is found");
+    let removed = script
+        .find("Remove-AcceptanceTrigger $State\n    $container")
+        .expect("the trigger is removed before waiting for a container");
+    let watched = script
+        .find("Wait-ProviderContainer $evidence $JobTimeoutSeconds")
+        .expect("the run is watched while waiting");
+    assert!(created < found && found < removed && removed < watched);
+    assert!(script.contains("if ($State.profile_created)"));
+    assert!(script.contains("'repo', 'profile', 'remove'"));
+    assert!(script.contains("Remove-AcceptanceTrigger $State"));
 }

@@ -17,20 +17,22 @@ jobs:
     if: >-
       github.event.pull_request.number == 77 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      startsWith(github.event.label.name, 'rm-d2-')
+      startsWith(github.event.label.name, 'rm-d2-win-x64-d2-')
     runs-on: [self-hosted, windows, x64, "${{ github.event.label.name }}"]
     timeout-minutes: 20
     steps:
       - name: Attest the nested runner Job Object
         shell: powershell
         env:
-          ACCEPTANCE_ID: ${{ github.event.label.name }}
+          ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}
           HOLD_SECONDS: '180'
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:ACCEPTANCE_ID -notmatch '^rm-d2-[0-9]{14}-[0-9a-f]{8}$') {
-            throw 'invalid non-secret acceptance id'
+          $selector = [Regex]::Match($env:ACCEPTANCE_SELECTOR, '^rm-d2-win-x64-(d2-([0-9]{14}-[0-9a-f]{8}))$')
+          if (-not $selector.Success) {
+            throw 'invalid immutable acceptance profile selector'
           }
+          $acceptanceId = $selector.Groups[2].Value
           $hold = 0
           if (-not [int]::TryParse($env:HOLD_SECONDS, [ref]$hold) -or $hold -lt 60 -or $hold -gt 900) {
             throw 'hold_seconds must be from 60 through 900'
@@ -77,6 +79,6 @@ jobs:
             throw "unexpected Job Object limits: active=$($limits.BasicLimitInformation.ActiveProcessLimit), flags=$flags"
           }
           if ($env:ACTIONS_RUNNER_INPUT_JITCONFIG) { throw 'JIT configuration survived into the workflow environment' }
-          Write-Output "RM_ACCEPTANCE job_object=in_job active_process_limit=256 active_process_flag=true kill_on_close=true id=$env:ACCEPTANCE_ID"
+          Write-Output "RM_ACCEPTANCE job_object=in_job active_process_limit=256 active_process_flag=true kill_on_close=true id=$acceptanceId selector=$env:ACCEPTANCE_SELECTOR"
           Start-Sleep -Seconds $hold
-          Write-Output "RM_ACCEPTANCE completed id=$env:ACCEPTANCE_ID"
+          Write-Output "RM_ACCEPTANCE completed id=$acceptanceId selector=$env:ACCEPTANCE_SELECTOR"

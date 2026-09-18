@@ -384,6 +384,7 @@ function New-AuditState {
         service_replacement_started = $false
         acceptance_id = $null
         profile_name = $null
+        profile_selector = $null
         profile_created = $false
         unique_label = $null
         workflow_run_id = $null
@@ -754,16 +755,50 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'container-attestation.json') -Encoding UTF8
 }
 
-function Find-AcceptanceRun([string]$TriggerLabel, [DateTime]$After) {
+function Find-AcceptanceRun([string]$TriggerSelector, [DateTime]$After) {
     $deadline = [DateTime]::UtcNow.AddMinutes(2)
     do {
         $json = Invoke-External gh.exe @('run', 'list', '--repo', $Repository, '--event', 'pull_request', '--branch', $WorkflowRef, '--limit', '30', '--json', 'databaseId,displayTitle,workflowName,createdAt,status,conclusion')
         foreach ($run in @(($json -join "`n") | ConvertFrom-Json)) {
-            if ($run.workflowName -eq 'Windows Hyper-V native acceptance' -and $run.displayTitle -eq "windows-hyperv-$TriggerLabel" -and [DateTime]$run.createdAt -ge $After.AddMinutes(-1)) { return $run }
+            if ($run.workflowName -eq 'Windows Hyper-V native acceptance' -and $run.displayTitle -eq "windows-hyperv-$TriggerSelector" -and [DateTime]$run.createdAt -ge $After.AddMinutes(-1)) { return $run }
         }
         Start-Sleep -Seconds 3
     } until ([DateTime]::UtcNow -ge $deadline)
-    throw "could not find pull-request workflow run for one-time label '$TriggerLabel'"
+    throw "could not find pull-request workflow run for immutable profile selector '$TriggerSelector'"
+}
+
+function Resolve-AcceptanceProfileSelector($State, [string]$EvidenceDirectory) {
+    $raw = Invoke-Runner @('status', '--json')
+    $raw | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'profile-status.json') -Encoding UTF8
+    $document = ($raw -join "`n") | ConvertFrom-Json
+    $matches = @($document.policies | Where-Object {
+        [string]::Equals([string]$_.target, $Repository, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals([string]$_.profile_name, [string]$State.profile_name, [StringComparison]::Ordinal)
+    })
+    if ($matches.Count -ne 1) { throw 'status did not contain exactly one newly-created acceptance profile' }
+    $policy = $matches[0]
+    if (-not $policy.enabled -or $policy.mode -ne 'autoscale' -or $policy.max_capacity -ne 1) {
+        throw 'the newly-created acceptance profile is not the enabled single-capacity autoscale policy that was reviewed'
+    }
+    $labels = @($policy.routing_labels | ForEach-Object { [string]$_ })
+    $known = @([string]$State.unique_label, 'self-hosted', 'windows', 'x64')
+    $selector = @($labels | Where-Object { $_ -notin $known })
+    if ($labels.Count -ne 5 -or @($labels | Select-Object -Unique).Count -ne 5 -or $selector.Count -ne 1) {
+        throw 'status did not expose exactly one immutable selector plus the four reviewed acceptance labels'
+    }
+    foreach ($required in $known) {
+        if ($required -notin $labels) { throw "acceptance profile routing labels omitted '$required'" }
+    }
+    $value = $selector[0]
+    if ($value.Length -gt 50 -or
+        $value -notmatch '^rm-d2-win-x64-d2-[0-9]{14}-[0-9a-f]{8}$' -or
+        -not $value.EndsWith("-$($State.profile_name)", [StringComparison]::Ordinal)) {
+        throw "status returned an invalid or ambiguously-bound acceptance profile selector '$value'"
+    }
+    Set-StateProperty $State profile_selector $value
+    Set-StateProperty $State trigger_label $value
+    Save-State $State
+    return $value
 }
 
 function Remove-AcceptanceTrigger($State) {
@@ -778,16 +813,24 @@ function Remove-AcceptanceTrigger($State) {
     Save-State $State
 }
 
-function Wait-ProviderContainer([string]$EvidenceDirectory, [int]$TimeoutSeconds) {
+function Wait-ProviderContainer([string]$EvidenceDirectory, [int]$TimeoutSeconds, [string]$RunId) {
+    if ($RunId -notmatch '^[0-9]+$') { throw 'acceptance workflow run id is invalid' }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
+        $runRaw = Invoke-External gh.exe @('run', 'view', $RunId, '--repo', $Repository, '--json', 'status,conclusion,url')
+        $runRaw | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'workflow-status.json') -Encoding UTF8
+        $runState = ($runRaw -join "`n") | ConvertFrom-Json
+        if ($runState.status -eq 'completed') {
+            $conclusion = if ($runState.conclusion) { [string]$runState.conclusion } else { 'unknown' }
+            throw "acceptance workflow run $RunId completed with conclusion '$conclusion' before a provider container appeared"
+        }
         $ids = Invoke-External docker.exe @('ps', '-q', '--filter', "label=$ProviderLabel") -AllowFailure
         $id = @($ids | Where-Object { $_ -match '^[0-9a-f]{12,64}$' } | Select-Object -First 1)
         if ($id.Count -gt 0) {
             Assert-ContainerEvidence $id[0] $EvidenceDirectory
             return $id[0]
         }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
     } until ([DateTime]::UtcNow -ge $deadline)
     throw 'no production provider-owned Windows container appeared before timeout'
 }
@@ -843,7 +886,7 @@ function Invoke-RunJob($State) {
     Set-StateProperty $State unique_label $label
     Set-StateProperty $State evidence_dir $evidence
     Set-StateProperty $State pull_request_number $PullRequestNumber
-    Set-StateProperty $State trigger_label $label
+    Set-StateProperty $State trigger_label $null
     Save-State $State
 
     if (-not $PSCmdlet.ShouldProcess('runner-manager service', "install PR binary $RunnerManager")) { return }
@@ -854,17 +897,18 @@ function Invoke-RunJob($State) {
     if (-not $PSCmdlet.ShouldProcess("repository profile $profile", 'create and enable isolated execution')) { return }
     Set-StateProperty $State profile_created $true
     Save-State $State
-    Invoke-Runner @('repo', 'profile', 'add', $Repository, '--name', $profile, '--host-label', 'd2-acceptance', '--max-capacity', '1', '--label', 'self-hosted', '--label', 'windows', '--label', 'x64', '--label', $label, '--execution', 'isolated', '--backend', 'windows-hyper-v-container', '--image', $Image, '--cpu', '2000', '--memory', '4096', '--disk', '8192', '--enable') | Set-Content -LiteralPath (Join-Path $evidence 'profile-add.txt') -Encoding UTF8
-    Invoke-External gh.exe @('label', 'create', $label, '--repo', $Repository, '--color', '8250df', '--description', "One-time d2 native acceptance trigger for PR $PullRequestNumber") -DiscardOutput
+    Invoke-Runner @('repo', 'profile', 'add', $Repository, '--name', $profile, '--host-label', 'd2', '--max-capacity', '1', '--label', 'self-hosted', '--label', 'windows', '--label', 'x64', '--label', $label, '--execution', 'isolated', '--backend', 'windows-hyper-v-container', '--image', $Image, '--cpu', '2000', '--memory', '4096', '--disk', '8192', '--enable') | Set-Content -LiteralPath (Join-Path $evidence 'profile-add.txt') -Encoding UTF8
+    $selector = Resolve-AcceptanceProfileSelector $State $evidence
+    Invoke-External gh.exe @('label', 'create', $selector, '--repo', $Repository, '--color', '8250df', '--description', "One-time d2 native acceptance trigger for PR $PullRequestNumber") -DiscardOutput
     Set-StateProperty $State trigger_label_created $true
     Save-State $State
     $dispatchAt = [DateTime]::UtcNow
-    Invoke-External gh.exe @('pr', 'edit', [string]$PullRequestNumber, '--repo', $Repository, '--add-label', $label) -DiscardOutput
-    $run = Find-AcceptanceRun $label $dispatchAt
+    Invoke-External gh.exe @('pr', 'edit', [string]$PullRequestNumber, '--repo', $Repository, '--add-label', $selector) -DiscardOutput
+    $run = Find-AcceptanceRun $selector $dispatchAt
     Set-StateProperty $State workflow_run_id ([string]$run.databaseId)
     Save-State $State
     Remove-AcceptanceTrigger $State
-    $container = Wait-ProviderContainer $evidence $JobTimeoutSeconds
+    $container = Wait-ProviderContainer $evidence $JobTimeoutSeconds ([string]$run.databaseId)
 
     if ($PSCmdlet.ShouldProcess('runner-manager service process', 'force termination to exercise SCM restart and orphan adoption')) {
         $before = Get-ServiceSnapshot 'runner-manager'
