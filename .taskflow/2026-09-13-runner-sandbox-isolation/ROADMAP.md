@@ -2,10 +2,10 @@
 
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
-**Implementation status:** a1, a2, b1, b2, c1, c2 and d1 merged into the
-integration ref; d2 and d3 are held at green PRs for native acceptance.
+**Implementation status:** a1, a2, b1, b2, c1, c2, d1 and d2 merged into the
+integration ref; d3 is held at a green PR for native acceptance.
 **Repository:** `.` / `main`.
-**Last updated:** 2026-09-15.
+**Last updated:** 2026-09-18.
 
 This file is the only live task-state record.
 
@@ -54,7 +54,7 @@ This file is the only live task-state record.
 | c1-profile-cli | `tasks/c1-profile-cli.md` | C | 1 | a2-routing-reconcile, b1-execution-domain-provider | . | main | 8/7 | top | ✅ | [PR #75](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/75) / d36a459 | 2026-09-15 |
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
-| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / Windows client native gate passed; Server native gate pending | 2026-09-18 |
+| d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / 69b2da3 | 2026-09-18 |
 | d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
@@ -315,3 +315,30 @@ executable Windows acceptance contract passes. Evidence is retained under
 The immutable DoD also requires the declared Windows Server variant, for which
 no native host is available. PR #77 therefore remains open and d2 remains
 `🟣` until that external native gate passes.
+
+**2026-09-18 — d2 integrated after Windows client and Server acceptance.** A
+local Hyper-V Generation 2 VM running converted Windows Server 2025 Datacenter
+build 26100 supplied the remaining declared Server gate without changing the
+host's Linux-container Docker mode. Workflow run 35393261893 completed through
+the production Hyper-V-isolated provider for acceptance ID
+`20260918204613-a84eb593`. The workflow attested Job Object membership, the
+256-process active-process limit and kill-on-close policy. Exact container
+inspection confirmed Hyper-V isolation, the digest-pinned image, 2 CPUs, 4 GiB
+memory, an 8192 MiB disk, NAT, no mounts, binds, devices, privileged mode or JIT
+environment, and only the three reviewed JIT references in both decoded command
+surfaces. SCM restart changed daemon PID 5424 to 1728 while the same container
+survived; the following reconcile returned active attempts, cleanup blockers,
+capacity use and provider containers to zero. Secret forensics, guarded cleanup
+and rollback passed, and the original guest service was restored healthy with
+binary SHA-256
+7390e6b65804724f5a4025e1779142fd360fd7b1aff83f828787595f2d3c686c.
+Evidence is retained under
+`C:\ProgramData\RunnerManager\acceptance\server-vm\server-acceptance-20260918204613-a84eb593`.
+
+The live run exposed two Windows PowerShell 5.1 harness defects: native stderr
+could become terminating under the global Stop preference, and multiline `gh`
+JSON could be normalized into an object array. PR #77 head fb0efe1 fixes both,
+with exact executable contracts passing on the client and the Server VM under
+Windows PowerShell 5.1. All eight CI/E2E checks passed. Scheduler review verified
+that `main` and the latest integration ref are ancestors, then squash-merged
+PR #77 into `runner-sandbox-isolation` at 69b2da3. d2 is complete.
