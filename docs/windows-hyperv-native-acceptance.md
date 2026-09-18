@@ -8,8 +8,8 @@ Hyper-V-isolated Docker provider. It never reboots the machine.
 Run every phase from an elevated Windows PowerShell. Start with a release build
 of this PR and a `runner-manager` credential already stored for boot service
 mode. `gh auth status` must also succeed. The manual workflow must exist on the
-ref passed to `-WorkflowRef`; GitHub normally requires a `workflow_dispatch`
-workflow to be present on the default branch.
+pull request branch, and this reviewed harness is pinned to same-repository PR
+77. The job phase adds a one-time label that triggers the pull-request workflow.
 
 ```powershell
 cargo build --release
@@ -40,7 +40,8 @@ reconciler must adopt the journalled container and remove it after the job.
 
 ```powershell
 .\scripts\windows-hyperv-acceptance.ps1 @common -Phase run-job `
-  -AllowReplaceService -AllowServiceRestart -AllowCreatePolicy
+  -AllowAdoptMachineCredential -AllowReplaceService `
+  -AllowServiceRestart -AllowCreatePolicy
 ```
 
 The workflow queries the Job Object inherited by its PowerShell process and
