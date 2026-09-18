@@ -182,18 +182,21 @@ public sealed class RunnerManagerJobGuard : IDisposable {
         }
     }
 
-    public int Run(string executable, string arguments, string jit) {
+    public int Run(string executable, string arguments, char[] jit) {
         StartupInfo startup = new StartupInfo();
         startup.cb = (uint)Marshal.SizeOf(typeof(StartupInfo));
         ProcessInformation process;
         StringBuilder command = new StringBuilder("\"" + executable + "\" " + arguments);
         string priorJit = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process);
+        string jitValue = jit == null ? null : new string(jit);
         bool created;
         try {
-            if (jit != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jit, EnvironmentVariableTarget.Process);
+            if (jitValue != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process);
             created = CreateProcess(null, command, IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED, IntPtr.Zero, null, ref startup, out process);
         } finally {
-            if (jit != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process);
+            if (jitValue != null) Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process);
+            if (jit != null) Array.Clear(jit, 0, jit.Length);
+            jitValue = null;
         }
         Check(created);
         bool assigned = false;
@@ -238,7 +241,9 @@ try {
     if ([String]::IsNullOrWhiteSpace($payload)) { exit 70 }
     if ($payload -eq 'runner-manager-windows-job-self-test-v1') { exit $guard.Run(($env:WINDIR+'\\System32\\cmd.exe'),'/d /c exit 0',$null) }
     if ($payload -eq 'runner-manager-preflight-v1') { exit $guard.Run('C:\\runner\\bin\\Runner.Listener.exe','--version',$null) }
-    try { $code=$guard.Run('C:\\runner\\bin\\Runner.Listener.exe','run',$payload) } finally { $payload=$null }
+    $jit=$payload.ToCharArray()
+    $payload=$null
+    try { $code=$guard.Run('C:\\runner\\bin\\Runner.Listener.exe','run',$jit) } finally { [Array]::Clear($jit,0,$jit.Length); $jit=$null }
     exit $code
 } finally {
     $guard.Dispose()
@@ -1597,6 +1602,23 @@ mod tests {
         assert!(BOOTSTRAP.contains(PREFLIGHT_INPUT));
         assert!(!BOOTSTRAP.contains("$env:ACTIONS_RUNNER_INPUT_JITCONFIG"));
         assert!(!BOOTSTRAP.contains("fixture-jit-value"));
+    }
+
+    #[test]
+    fn bootstrap_clears_the_one_time_jit_handoff_before_waiting_for_the_runner() {
+        let run = BOOTSTRAP
+            .split_once("public int Run")
+            .expect("guard run method")
+            .1;
+        let clear = run
+            .find("Array.Clear(jit, 0, jit.Length)")
+            .expect("JIT clear");
+        let wait = run.find("if (WaitForSingleObject").expect("runner wait");
+        assert!(
+            clear < wait,
+            "the mutable JIT handoff must be cleared before the job wait"
+        );
+        assert!(BOOTSTRAP.contains("$jit=$payload.ToCharArray()\n    $payload=$null"));
     }
 
     #[test]
