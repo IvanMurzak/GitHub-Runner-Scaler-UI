@@ -22,11 +22,30 @@ function Invoke-External {
     return @($script:InspectJson)
 }
 
-$script:ReviewedCommand = @('powershell.exe', '-Command', @'
-Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process);
-Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", jitValue, EnvironmentVariableTarget.Process);
-Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", priorJit, EnvironmentVariableTarget.Process);
-'@)
+$script:ReviewedReferences = @(
+    'Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)',
+    'Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process)',
+    'Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process)'
+)
+$script:ReviewedBootstrap = @'
+Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process);
+Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process);
+Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process);
+'@
+$script:ReviewedCommand = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $script:ReviewedBootstrap)
+$script:ReviewedArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $script:ReviewedBootstrap)
+
+if ($script:ReviewedCommand.Count -ne 5 -or $script:ReviewedArguments.Count -ne 5) {
+    throw 'decoded Docker command fixtures must each contain five entries'
+}
+if (($script:ReviewedCommand -join "`n").Contains('\')) {
+    throw 'decoded Docker command fixture must contain zero backslash characters'
+}
+if ($script:ReviewedReferences[0].Length -ne 103 -or
+    @($script:ReviewedReferences[0].ToCharArray() | Where-Object { [int]$_ -eq 34 }).Count -ne 2 -or
+    @($script:ReviewedReferences[0].ToCharArray() | Where-Object { [int]$_ -eq 92 }).Count -ne 0) {
+    throw 'decoded reviewed GetEnvironmentVariable reference must be 103 characters with two quotes and zero backslashes'
+}
 
 function New-InspectJson {
     param(
@@ -35,7 +54,7 @@ function New-InspectJson {
         $Devices = $null,
         [object[]]$Environment = @('Path=C:\Windows\System32'),
         [object[]]$Command = $script:ReviewedCommand,
-        [object[]]$Arguments = @()
+        [object[]]$Arguments = $script:ReviewedArguments
     )
     @([ordered]@{
         HostConfig = [ordered]@{
@@ -107,6 +126,16 @@ function Assert-Rejected([string]$Name, [string]$Json, [string]$Message) {
     }
 }
 
+$decodedFixture = New-InspectJson | ConvertFrom-Json
+if (@($decodedFixture[0].Config.Cmd).Count -ne 5 -or @($decodedFixture[0].Args).Count -ne 5) {
+    throw 'decoded Docker fixture did not preserve the five-entry command and argument arrays'
+}
+foreach ($surface in @($decodedFixture[0].Config.Cmd, $decodedFixture[0].Args)) {
+    if ([regex]::Matches(($surface -join "`n"), 'ACTIONS_RUNNER_INPUT_JITCONFIG').Count -ne 3) {
+        throw 'decoded Docker fixture must contain three reviewed JIT references in each command surface'
+    }
+}
+
 Assert-Passes 'null optional collections and reviewed bootstrap source' (New-InspectJson) {
     param($directory)
     $attestation = Get-Content -LiteralPath (Join-Path $directory 'container-attestation.json') -Raw | ConvertFrom-Json
@@ -117,12 +146,35 @@ Assert-Passes 'null optional collections and reviewed bootstrap source' (New-Ins
 Assert-Rejected 'nonempty bind array' (New-InspectJson -Binds @('C:\host:C:\guest')) 'host mount'
 Assert-Rejected 'nonempty device array' (New-InspectJson -Devices @(@{ PathOnHost = 'COM1' })) 'device or privileged mode'
 Assert-Rejected 'JIT value in environment' (New-InspectJson -Environment @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret')) 'JIT configuration environment input'
-Assert-Rejected 'unreviewed JIT assignment in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret'))) 'outside the reviewed bootstrap source'
-Assert-Rejected 'unescaped reviewed JIT call in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)'))) 'outside the reviewed bootstrap source'
-Assert-Rejected 'duplicate reviewed JIT call in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)'))) 'outside the reviewed bootstrap source'
-Assert-Rejected 'JIT input in argument metadata' (New-InspectJson -Arguments @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret')) 'outside the reviewed bootstrap source'
+$commandMissing = @($script:ReviewedCommand)
+$commandMissing[4] = $commandMissing[4].Replace($script:ReviewedReferences[0], '')
+$commandDuplicate = @($script:ReviewedCommand)
+$commandDuplicate[4] += "`n$($script:ReviewedReferences[0])"
+$commandUnqualified = @($script:ReviewedCommand)
+$commandUnqualified[4] = $commandUnqualified[4].Replace($script:ReviewedReferences[0], 'GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)')
+$commandLiteralBackslash = @($script:ReviewedCommand)
+$commandLiteralBackslash[4] = $commandLiteralBackslash[4].Replace($script:ReviewedReferences[0], 'Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)')
+Assert-Rejected 'missing reviewed JIT call in command metadata' (New-InspectJson -Command $commandMissing) 'outside the reviewed bootstrap source in Config.Cmd'
+Assert-Rejected 'duplicate reviewed JIT call in command metadata' (New-InspectJson -Command $commandDuplicate) 'outside the reviewed bootstrap source in Config.Cmd'
+Assert-Rejected 'unqualified reviewed JIT call in command metadata' (New-InspectJson -Command $commandUnqualified) 'outside the reviewed bootstrap source in Config.Cmd'
+Assert-Rejected 'literal-backslash reviewed JIT call in command metadata' (New-InspectJson -Command $commandLiteralBackslash) 'outside the reviewed bootstrap source in Config.Cmd'
+Assert-Rejected 'additional JIT reference in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret'))) 'outside the reviewed bootstrap source in Config.Cmd'
+
+$argumentsMissing = @($script:ReviewedArguments)
+$argumentsMissing[4] = $argumentsMissing[4].Replace($script:ReviewedReferences[0], '')
+$argumentsDuplicate = @($script:ReviewedArguments)
+$argumentsDuplicate[4] += "`n$($script:ReviewedReferences[0])"
+$argumentsUnqualified = @($script:ReviewedArguments)
+$argumentsUnqualified[4] = $argumentsUnqualified[4].Replace($script:ReviewedReferences[0], 'GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)')
+$argumentsLiteralBackslash = @($script:ReviewedArguments)
+$argumentsLiteralBackslash[4] = $argumentsLiteralBackslash[4].Replace($script:ReviewedReferences[0], 'Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)')
+Assert-Rejected 'missing reviewed JIT call in argument metadata' (New-InspectJson -Arguments $argumentsMissing) 'outside the reviewed bootstrap source in Args'
+Assert-Rejected 'duplicate reviewed JIT call in argument metadata' (New-InspectJson -Arguments $argumentsDuplicate) 'outside the reviewed bootstrap source in Args'
+Assert-Rejected 'unqualified reviewed JIT call in argument metadata' (New-InspectJson -Arguments $argumentsUnqualified) 'outside the reviewed bootstrap source in Args'
+Assert-Rejected 'literal-backslash reviewed JIT call in argument metadata' (New-InspectJson -Arguments $argumentsLiteralBackslash) 'outside the reviewed bootstrap source in Args'
+Assert-Rejected 'additional JIT reference in argument metadata' (New-InspectJson -Arguments ($script:ReviewedArguments + @('ACTIONS_RUNNER_INPUT_JITCONFIG=secret'))) 'outside the reviewed bootstrap source in Args'
 Assert-Rejected 'GitHub token in command metadata' (New-InspectJson -Command ($script:ReviewedCommand + @('ghp_abcdefghijklmnopqrstuvwxyz123456'))) 'credential-shaped value'
-Assert-Rejected 'JIT-shaped value in argument metadata' (New-InspectJson -Arguments @('eyJhZ2VudE5hbWUiOiJydW5uZXItbWFuYWdlciIsImVuY29kZWQiOiJhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLz09In0=')) 'credential-shaped value'
+Assert-Rejected 'JIT-shaped value in argument metadata' (New-InspectJson -Arguments ($script:ReviewedArguments + @('eyJhZ2VudE5hbWUiOiJydW5uZXItbWFuYWdlciIsImVuY29kZWQiOiJhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLz09In0='))) 'credential-shaped value'
 Assert-Rejected 'socket path in environment metadata' (New-InspectJson -Environment @('ENDPOINT=npipe://docker.sock')) 'credential-shaped value'
 
 $fixtureResidue = @($script:OwnedFixtureDirectories | Where-Object { Test-Path -LiteralPath $_ })

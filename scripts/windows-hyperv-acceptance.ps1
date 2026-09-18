@@ -785,24 +785,30 @@ function Assert-ContainerEvidence([string]$ContainerId, [string]$EvidenceDirecto
     if (@($environment | Where-Object { [string]$_ -match '(?i)^ACTIONS_RUNNER_INPUT_JITCONFIG(?:=|$)' }).Count -ne 0) {
         throw 'container metadata exposed the JIT configuration environment input'
     }
-    # Config.Cmd contains the reviewed bootstrap source and therefore names the
-    # JIT environment key in exactly three backslash-escaped C# calls. Require
-    # every complete call exactly once before removing it; the identifier in
-    # any other command shape remains an exposure.
-    $unreviewedCommand = $commands -join "`n"
-    foreach ($reviewedReference in @(
-        'Environment.GetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", EnvironmentVariableTarget.Process)',
-        'Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", jitValue, EnvironmentVariableTarget.Process)',
-        'Environment.SetEnvironmentVariable(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", priorJit, EnvironmentVariableTarget.Process)'
+    # ConvertFrom-Json has already decoded Docker's JSON escaping. Both
+    # Config.Cmd and Args repeat the reviewed bootstrap source with ordinary
+    # quote characters. Require every complete call exactly once in each
+    # surface before removing it; any other identifier shape remains an
+    # exposure and fails closed.
+    $reviewedReferences = @(
+        'Environment.GetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", EnvironmentVariableTarget.Process)',
+        'Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", jitValue, EnvironmentVariableTarget.Process)',
+        'Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", priorJit, EnvironmentVariableTarget.Process)'
+    )
+    foreach ($surface in @(
+        [pscustomobject]@{ Name = 'Config.Cmd'; Entries = $commands },
+        [pscustomobject]@{ Name = 'Args'; Entries = $arguments }
     )) {
-        if ([regex]::Matches($unreviewedCommand, [regex]::Escape($reviewedReference)).Count -ne 1) {
-            throw 'container metadata exposed the JIT configuration input outside the reviewed bootstrap source'
+        $unreviewed = @($surface.Entries) -join "`n"
+        foreach ($reviewedReference in $reviewedReferences) {
+            if ([regex]::Matches($unreviewed, [regex]::Escape($reviewedReference)).Count -ne 1) {
+                throw "container metadata exposed the JIT configuration input outside the reviewed bootstrap source in $($surface.Name)"
+            }
+            $unreviewed = $unreviewed.Replace($reviewedReference, '')
         }
-        $unreviewedCommand = $unreviewedCommand.Replace($reviewedReference, '')
-    }
-    if ($unreviewedCommand -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG' -or
-        ($arguments -join "`n") -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG') {
-        throw 'container metadata exposed the JIT configuration input outside the reviewed bootstrap source'
+        if ($unreviewed -match '(?i)ACTIONS_RUNNER_INPUT_JITCONFIG') {
+            throw "container metadata exposed the JIT configuration input outside the reviewed bootstrap source in $($surface.Name)"
+        }
     }
     $surface = $environment + $commands + $arguments + @($mounts | ConvertTo-Json -Compress)
     if (($surface -join "`n") -match '(?i)(docker\.sock|gh[pousr]_[A-Za-z0-9_]{20,}|encoded_jit_config\s*[:=]|eyJ[A-Za-z0-9_+/=-]{40,})') {
