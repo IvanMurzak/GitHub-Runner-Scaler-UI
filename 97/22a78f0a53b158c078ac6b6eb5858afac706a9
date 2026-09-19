@@ -1,0 +1,27 @@
+scripts/macos-vm-acceptance.sh
+  s_5801a853f78e8a::t_f962b228aac20d 330-338,446,448-449,452,482,484-485,490
+tests/macos-vm-acceptance-contract.sh
+  s_5801a853f78e8a::t_2a2ce74e196492 151,170-189,195-200
+  s_5801a853f78e8a::t_4feb64becc0b54 133-141,143,148-150,163-166,229-235
+  s_5801a853f78e8a::t_340fdeb9f50c32 190-194
+  s_5801a853f78e8a::t_12a80c58cf3a15 152-154
+  s_5801a853f78e8a::t_fde4a7765630de 201
+.github/workflows/macos-vm-native-acceptance.yml
+  s_5801a853f78e8a::t_0e82e6e30bf9a6 16,20-44,50-52,55-56,77,79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9722a78f0a53b158c078ac6b6eb5858afac706a9",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
