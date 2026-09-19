@@ -17,18 +17,19 @@ jobs:
     if: >-
       github.event.pull_request.number == 79 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      startsWith(github.event.label.name, 'rm-d3-')
+      startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-')
     runs-on: [self-hosted, macos, arm64, "${{ github.event.label.name }}"]
     timeout-minutes: 20
     steps:
       - name: Attest the disposable native macOS guest
         shell: bash
         env:
-          ACCEPTANCE_ID: ${{ github.event.label.name }}
-          HOLD_SECONDS: ${{ startsWith(github.event.label.name, 'rm-d3-reboot-') && '900' || '180' }}
+          ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}
+          HOLD_SECONDS: ${{ startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-reboot-') && '900' || '180' }}
         run: |
           set -euo pipefail
-          [[ "$ACCEPTANCE_ID" =~ ^rm-d3-(reboot-)?[0-9]{14}-[0-9a-f]{8}$ ]]
+          [[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]
+          acceptance_id=${BASH_REMATCH[2]}
           [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS >= 60 && HOLD_SECONDS <= 900 ))
           [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]]
           cpu=$(sysctl -n hw.ncpu)
@@ -49,6 +50,6 @@ jobs:
               exit 1
             fi
           done
-          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$ACCEPTANCE_ID"
+          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$acceptance_id selector=$ACCEPTANCE_SELECTOR"
           sleep "$HOLD_SECONDS"
-          echo "RM_ACCEPTANCE completed id=$ACCEPTANCE_ID"
+          echo "RM_ACCEPTANCE completed id=$acceptance_id selector=$ACCEPTANCE_SELECTOR"

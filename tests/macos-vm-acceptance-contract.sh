@@ -120,6 +120,33 @@ set -e
 BASH
 rm -f "$pid_sentinel" "$wait_marker"
 
+# A profile's immutable selector is the label that must be present on the job.
+# Exercise the harness's real derivation for both phases, and prove malformed
+# profile names cannot silently produce a trigger label that no profile owns.
+profile_selector_definition=$(
+  awk '
+    /^profile_selector\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+PROFILE_SELECTOR_DEFINITION=$profile_selector_definition bash -u <<'BASH'
+eval "$PROFILE_SELECTOR_DEFINITION"
+die() { printf '%s\n' "$*" >&2; return 42; }
+id=20260919010203-deadbeef
+[[ $(profile_selector "d3-$id") == "rm-d3-acceptance-osx-arm64-d3-$id" ]]
+[[ $(profile_selector "d3-reboot-$id") == "rm-d3-acceptance-osx-arm64-d3-reboot-$id" ]]
+for invalid in \
+  "d3-$id-extra" \
+  'd3-20260919010203-DEADBEEF' \
+  'rm-d3-20260919010203-deadbeef'; do
+  if profile_selector "$invalid" >/dev/null 2>&1; then
+    printf 'invalid acceptance profile produced a selector: %s\n' "$invalid" >&2
+    exit 1
+  fi
+done
+BASH
+
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
   '--allow-service-install' '--allow-profile' '--allow-service-restart' \
@@ -147,8 +174,11 @@ done
 
 for required in 'pull_request:' 'types: [labeled]' 'github.event.pull_request.number == 79' \
   'github.event.pull_request.head.repo.full_name == github.repository' \
-  "startsWith(github.event.label.name, 'rm-d3-')" \
-  'runs-on: [self-hosted, macos, arm64' \
+  "startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-')" \
+  'runs-on: [self-hosted, macos, arm64, "${{ github.event.label.name }}"]' \
+  'ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}' \
+  '[[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]' \
+  'acceptance_id=${BASH_REMATCH[2]}' \
   'cpu=$(sysctl -n hw.ncpu)' 'process_limit=$(ulimit -u)' 'host_shares=$(mount' \
   'ACTIONS_RUNNER_INPUT_JITCONFIG' 'gh[pousr]_' 'jit_env=absent' \
   'permissions:' 'contents: read'; do
