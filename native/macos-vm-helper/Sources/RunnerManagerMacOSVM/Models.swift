@@ -57,6 +57,16 @@ struct ImageResponse: Codable, Equatable {
     let architecture: String
     let immutable: Bool
     let bootstrapReady: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case image
+        case templateDigest = "template_digest"
+        case guestOs = "guest_os"
+        case architecture
+        case immutable
+        case bootstrapReady = "bootstrap_ready"
+    }
 }
 
 enum EnvironmentState: String, Codable {

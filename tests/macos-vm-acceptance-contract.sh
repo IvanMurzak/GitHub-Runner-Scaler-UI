@@ -4,9 +4,13 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 harness="$root/scripts/macos-vm-acceptance.sh"
 workflow="$root/.github/workflows/macos-vm-native-acceptance.yml"
+ci_workflow="$root/.github/workflows/ci.yml"
+cli_json_contract="$root/tests/macos-vm-helper-cli-json-contract.sh"
 
 bash -n "$harness"
+bash -n "$cli_json_contract"
 test -f "$workflow"
+grep -F 'run: bash tests/macos-vm-helper-cli-json-contract.sh' "$ci_workflow" >/dev/null
 
 # Bash 3.2 expands every assignment in one `local` command before assigning
 # any of them. Execute the harness's real output-path declarations with nounset
