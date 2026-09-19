@@ -66,23 +66,16 @@ import sys
 response = json.loads(pathlib.Path(sys.argv[1]).read_text())
 image = sys.argv[2]
 architecture = sys.argv[3]
-expected_keys = {
-    "protocol_version",
-    "image",
-    "template_digest",
-    "guest_os",
-    "architecture",
-    "immutable",
-    "bootstrap_ready",
+expected = {
+    "protocol_version": 1,
+    "image": image,
+    "template_digest": image.split("@sha256:", 1)[1],
+    "guest_os": "macos",
+    "architecture": architecture,
+    "immutable": True,
+    "bootstrap_ready": True,
 }
-assert set(response) == expected_keys, response
-assert response["protocol_version"] == 1, response
-assert response["image"] == image, response
-assert response["template_digest"] == image.split("@sha256:", 1)[1], response
-assert response["guest_os"] == "macos", response
-assert response["architecture"] == architecture, response
-assert response["immutable"] is True, response
-assert response["bootstrap_ready"] is True, response
+assert response == expected, response
 PY
 
 echo 'macOS VM helper CLI JSON contract passed'
