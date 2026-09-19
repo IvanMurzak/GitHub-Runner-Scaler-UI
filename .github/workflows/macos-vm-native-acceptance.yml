@@ -13,23 +13,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  production-provider:
+  route:
     if: >-
       github.event.pull_request.number == 79 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-')
-    runs-on: [self-hosted, macos, arm64, "${{ github.event.label.name }}"]
+      startsWith(github.event.label.name, 'rm-d3-')
+    runs-on: ubuntu-latest
+    outputs:
+      acceptance_id: ${{ steps.selector.outputs.acceptance_id }}
+      reboot: ${{ steps.selector.outputs.reboot }}
+      selector: ${{ steps.selector.outputs.selector }}
+    steps:
+      - name: Resolve the exact profile selector
+        id: selector
+        shell: bash
+        env:
+          TRIGGER_LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGER_LABEL" =~ ^rm-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]
+          reboot=${BASH_REMATCH[1]}
+          acceptance_id=${BASH_REMATCH[2]}
+          selector="rm-d3-acceptance-osx-arm64-d3-${reboot}${acceptance_id}"
+          printf 'acceptance_id=%s\nreboot=%s\nselector=%s\n' \
+            "$acceptance_id" "$([[ -n $reboot ]] && printf true || printf false)" "$selector" \
+            >>"$GITHUB_OUTPUT"
+
+  production-provider:
+    needs: route
+    runs-on: [self-hosted, macos, arm64, "${{ needs.route.outputs.selector }}"]
     timeout-minutes: 20
     steps:
       - name: Attest the disposable native macOS guest
         shell: bash
         env:
-          ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}
-          HOLD_SECONDS: ${{ startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-reboot-') && '900' || '180' }}
+          ACCEPTANCE_ID: ${{ needs.route.outputs.acceptance_id }}
+          ACCEPTANCE_SELECTOR: ${{ needs.route.outputs.selector }}
+          HOLD_SECONDS: ${{ needs.route.outputs.reboot == 'true' && '900' || '180' }}
         run: |
           set -euo pipefail
-          [[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]
-          acceptance_id=${BASH_REMATCH[2]}
+          [[ "$ACCEPTANCE_ID" =~ ^[0-9]{14}-[0-9a-f]{8}$ ]]
+          [[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?${ACCEPTANCE_ID}$ ]]
           [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS >= 60 && HOLD_SECONDS <= 900 ))
           [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]]
           cpu=$(sysctl -n hw.ncpu)
@@ -50,6 +74,6 @@ jobs:
               exit 1
             fi
           done
-          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$acceptance_id selector=$ACCEPTANCE_SELECTOR"
+          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"
           sleep "$HOLD_SECONDS"
-          echo "RM_ACCEPTANCE completed id=$acceptance_id selector=$ACCEPTANCE_SELECTOR"
+          echo "RM_ACCEPTANCE completed id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"

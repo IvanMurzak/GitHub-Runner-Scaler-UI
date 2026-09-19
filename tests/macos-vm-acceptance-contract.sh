@@ -130,12 +130,28 @@ profile_selector_definition=$(
     in_function && /^}/ { exit }
   ' "$harness"
 )
-PROFILE_SELECTOR_DEFINITION=$profile_selector_definition bash -u <<'BASH'
+trigger_label_definition=$(
+  awk '
+    /^trigger_label\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+PROFILE_SELECTOR_DEFINITION=$profile_selector_definition \
+  TRIGGER_LABEL_DEFINITION=$trigger_label_definition bash -u <<'BASH'
 eval "$PROFILE_SELECTOR_DEFINITION"
+eval "$TRIGGER_LABEL_DEFINITION"
 die() { printf '%s\n' "$*" >&2; return 42; }
 id=20260919010203-deadbeef
 [[ $(profile_selector "d3-$id") == "rm-d3-acceptance-osx-arm64-d3-$id" ]]
 [[ $(profile_selector "d3-reboot-$id") == "rm-d3-acceptance-osx-arm64-d3-reboot-$id" ]]
+[[ $(trigger_label "d3-$id") == "rm-d3-$id" ]]
+[[ $(trigger_label "d3-reboot-$id") == "rm-d3-reboot-$id" ]]
+[[ $(profile_selector "d3-$id") != "$(trigger_label "d3-$id")" ]]
+(( ${#id} == 23 ))
+normal_trigger=$(trigger_label "d3-$id")
+reboot_trigger=$(trigger_label "d3-reboot-$id")
+(( ${#normal_trigger} <= 50 && ${#reboot_trigger} <= 50 ))
 for invalid in \
   "d3-$id-extra" \
   'd3-20260919010203-DEADBEEF' \
@@ -144,8 +160,44 @@ for invalid in \
     printf 'invalid acceptance profile produced a selector: %s\n' "$invalid" >&2
     exit 1
   fi
+  if trigger_label "$invalid" >/dev/null 2>&1; then
+    printf 'invalid acceptance profile produced a trigger label: %s\n' "$invalid" >&2
+    exit 1
+  fi
 done
 BASH
+
+# Execute the workflow's real routing script. The short repository label is
+# only a unique event trigger; the downstream job must receive the profile's
+# exact immutable selector and malformed IDs must fail before it is scheduled.
+route_script=$(
+  awk '
+    /- name: Resolve the exact profile selector/ { in_step = 1 }
+    in_step && /^[[:space:]]+run: \|$/ { in_run = 1; next }
+    in_run && /^  production-provider:/ { exit }
+    in_run { sub(/^          /, ""); print }
+  ' "$workflow"
+)
+route_case() {
+  local trigger=$1 expected_id=$2 expected_reboot=$3 expected_selector=$4 output
+  output=$(mktemp)
+  TRIGGER_LABEL=$trigger GITHUB_OUTPUT=$output bash -euo pipefail -c "$route_script"
+  grep -Fx "acceptance_id=$expected_id" "$output" >/dev/null
+  grep -Fx "reboot=$expected_reboot" "$output" >/dev/null
+  grep -Fx "selector=$expected_selector" "$output" >/dev/null
+  rm -f "$output"
+}
+route_id=20260919010203-deadbeef
+route_case "rm-d3-$route_id" "$route_id" false "rm-d3-acceptance-osx-arm64-d3-$route_id"
+route_case "rm-d3-reboot-$route_id" "$route_id" true \
+  "rm-d3-acceptance-osx-arm64-d3-reboot-$route_id"
+for invalid in "rm-d3-$route_id-extra" 'rm-d3-20260919010203-DEADBEEF' "d3-$route_id"; do
+  if TRIGGER_LABEL=$invalid GITHUB_OUTPUT=/dev/null bash -euo pipefail -c "$route_script" \
+    >/dev/null 2>&1; then
+    printf 'invalid workflow trigger routed a job: %s\n' "$invalid" >&2
+    exit 1
+  fi
+done
 
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
@@ -174,11 +226,13 @@ done
 
 for required in 'pull_request:' 'types: [labeled]' 'github.event.pull_request.number == 79' \
   'github.event.pull_request.head.repo.full_name == github.repository' \
-  "startsWith(github.event.label.name, 'rm-d3-acceptance-osx-arm64-d3-')" \
-  'runs-on: [self-hosted, macos, arm64, "${{ github.event.label.name }}"]' \
-  'ACCEPTANCE_SELECTOR: ${{ github.event.label.name }}' \
-  '[[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]' \
-  'acceptance_id=${BASH_REMATCH[2]}' \
+  "startsWith(github.event.label.name, 'rm-d3-')" \
+  '[[ "$TRIGGER_LABEL" =~ ^rm-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]' \
+  'selector="rm-d3-acceptance-osx-arm64-d3-${reboot}${acceptance_id}"' \
+  'runs-on: [self-hosted, macos, arm64, "${{ needs.route.outputs.selector }}"]' \
+  'ACCEPTANCE_SELECTOR: ${{ needs.route.outputs.selector }}' \
+  '[[ "$ACCEPTANCE_ID" =~ ^[0-9]{14}-[0-9a-f]{8}$ ]]' \
+  '[[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?${ACCEPTANCE_ID}$ ]]' \
   'cpu=$(sysctl -n hw.ncpu)' 'process_limit=$(ulimit -u)' 'host_shares=$(mount' \
   'ACTIONS_RUNNER_INPUT_JITCONFIG' 'gh[pousr]_' 'jit_env=absent' \
   'permissions:' 'contents: read'; do

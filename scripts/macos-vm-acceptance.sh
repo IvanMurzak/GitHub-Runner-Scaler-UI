@@ -327,6 +327,15 @@ profile_selector() {
   printf 'rm-d3-acceptance-osx-arm64-%s\n' "$profile"
 }
 
+trigger_label() {
+  local profile=$1
+  if [[ ! $profile =~ ^d3-(reboot-)?[0-9]{14}-[0-9a-f]{8}$ ]]; then
+    die "cannot derive a trigger label from invalid acceptance profile '$profile'"
+    return 1
+  fi
+  printf 'rm-%s\n' "$profile"
+}
+
 dispatch_job() {
   local label=$1
   gh label create "$label" --repo "$repository" --color 8250df \
@@ -434,12 +443,13 @@ run_job() {
   [[ $(state_get phase) == audited ]] || die 'run-job requires an audited receipt'
   [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before run-job'
   workflow_ref=$(state_get workflow_ref); disk_mib=$(state_get disk_mib)
-  local acceptance_id profile selector evidence run_id env_json before_pid after_pid
+  local acceptance_id profile selector trigger evidence run_id env_json before_pid after_pid
   acceptance_id=$(new_acceptance_id | tr -d '\n')
-  profile="d3-$acceptance_id"; selector=$(profile_selector "$profile")
+  profile="d3-$acceptance_id"
+  selector=$(profile_selector "$profile"); trigger=$(trigger_label "$profile")
   evidence="$evidence_root/run-$acceptance_id"; mkdir -m 700 "$evidence"
   install_service_and_profile "$profile" "$selector" "$evidence"
-  run_id=$(dispatch_job "$selector")
+  run_id=$(dispatch_job "$trigger")
   state_set normal_run_id "$run_id"
   env_json="$evidence/environment-live.json"
   capture_single_environment "$env_json" 600 >/dev/null
@@ -469,14 +479,15 @@ prepare_reboot() {
   [[ $(state_get phase) == normal-job-verified ]] || die 'prepare-before-reboot requires a verified normal job'
   [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before reboot preparation'
   workflow_ref=$(state_get workflow_ref); disk_mib=$(state_get disk_mib)
-  local acceptance_id profile selector evidence run_id env_json disk_id
+  local acceptance_id profile selector trigger evidence run_id env_json disk_id
   acceptance_id=$(new_acceptance_id | tr -d '\n')
-  profile="d3-reboot-$acceptance_id"; selector=$(profile_selector "$profile")
+  profile="d3-reboot-$acceptance_id"
+  selector=$(profile_selector "$profile"); trigger=$(trigger_label "$profile")
   evidence="$evidence_root/reboot-$acceptance_id"; mkdir -m 700 "$evidence"
   require_opt_in "$allow_profile" --allow-profile 'creating the reboot-recovery profile'
   ensure_profile "$profile" "$selector" "$evidence"
   state_set profile_created true bool; state_set profile_name "$profile"; state_set unique_label "$selector"
-  run_id=$(dispatch_job "$selector"); state_set reboot_run_id "$run_id"
+  run_id=$(dispatch_job "$trigger"); state_set reboot_run_id "$run_id"
   env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" 600 >/dev/null
   disk_id=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")
   [[ $disk_id != "$(state_get normal_writable_disk_id)" ]] || die 'two attempts reused one writable guest disk identity'
