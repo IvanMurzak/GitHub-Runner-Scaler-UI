@@ -218,6 +218,24 @@ enabled until its execution provider reports ready; provider failure never start
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
 you explicitly accept that trust boundary.
 
+On macOS, `--backend virtual-machine --image
+vm-version:<version>@sha256:<template-digest>` uses an
+operator-installed `runner-manager-macos-vm` helper backed by
+Virtualization.framework. Runner Manager never installs a macOS image. The
+helper, entitlement, same-architecture digest-pinned template, private guest
+channel, fresh-disk support, and CPU/memory/disk/process enforcement must all
+pass before the profile can be enabled or JIT can be requested. `runner-manager
+host isolation status` reports host prerequisites; policy enablement checks the
+exact template. Native VM acceptance remains held until signed-helper, real-VM,
+reboot, resource, and secret-forensic gates pass independently on Apple Silicon
+and Intel. See [the macOS VM helper protocol](docs/macos-vm-helper.md).
+
+The helper source, signing entitlement, and installer live in
+[`native/macos-vm-helper`](native/macos-vm-helper). Its Swift package is built
+on ARM64 and Intel CI hosts. Apple exposes the macOS guest platform used here
+on Apple silicon, so the Intel build fails readiness closed and is compilation
+coverage rather than native VM acceptance.
+
 Rootless Podman normally has to enforce `--storage-opt size=...` itself. On managed WSL,
 Podman 4.9 cannot initialize that project quota as a rootless user, even on an XFS loop
 mount. An operator may instead set `RUNNER_MANAGER_OCI_RUNTIME` in the managed service to

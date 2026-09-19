@@ -35,6 +35,12 @@ the version being prepared rather than the version in `Cargo.toml`.
 - The TUI header shows every service version it can see: the local service,
   each managed WSL host's service, and the app. A TUI started with
   `--host wsl:NAME` labels its service as that WSL host's.
+- Operators can build, sign, and install the bundled macOS
+  Virtualization.framework helper for digest-pinned disposable Apple silicon
+  VMs. It creates fresh APFS disks, exposes no host directory shares, transfers
+  runner and JIT data through a private virtio socket, and fails closed unless
+  the guest attests the required process limit. Intel builds remain diagnostic
+  only because Apple's macOS guest platform API is Apple silicon-only.
 - Managed WSL isolated runners can use an operator-provisioned, root-owned OCI
   storage helper backed by finite Linux filesystems. The provider requires the
   helper's bounded-store attestation and keeps returning

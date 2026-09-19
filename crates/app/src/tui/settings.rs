@@ -2232,7 +2232,7 @@ Select another profile in Repositories or create one with the CLI.",
                     "Pinned image",
                     &self.execution_image,
                     width,
-                    "(required: sha256, OCI digest, or vm-version)",
+                    "(VM: vm-version:<version>@sha256:<template-digest>)",
                 ))
                 .at(*control),
             );
@@ -2274,7 +2274,7 @@ Select another profile in Repositories or create one with the CLI.",
             ))
         }));
         lines.push(FormLine::text(
-            "Provider readiness and the pinned image are checked again before JIT registration.",
+            "Host readiness is shown here. The exact policy template and digest are checked on enable and again before JIT registration.",
         ));
         lines.push(FormLine::keep("Drain selected profile [Enter/click]").at(*control));
         *control += 1;
@@ -2855,8 +2855,14 @@ fn backend_capability(
         state,
         raw_output: None,
     });
-    let wanted = if matches!(backend, IsolationBackend::Auto) && cfg!(windows) {
-        IsolationBackend::WindowsHyperVContainer
+    let wanted = if matches!(backend, IsolationBackend::Auto) {
+        if cfg!(windows) {
+            IsolationBackend::WindowsHyperVContainer
+        } else if cfg!(target_os = "macos") {
+            IsolationBackend::VirtualMachine
+        } else {
+            IsolationBackend::Oci
+        }
     } else {
         backend
     };
@@ -4258,6 +4264,23 @@ mod tests {
         // placeholder in the field is what keeps that window from ever
         // opening, whatever a host's temporary directory happens to be named.
         let mut ui = ui.clone();
+        // The VM diagnostic is another host-specific value: a macOS test host
+        // without the helper reports `not installed`, while the other CI hosts
+        // report `unsupported`. This snapshot measures the settings states and
+        // layout, so give its fixture one deterministic provider observation;
+        // production screens continue to render the live host probe.
+        if let SettingsView::Policy(form) = &mut ui.view {
+            let vm = form
+                .provider_diagnostics
+                .iter_mut()
+                .find(|provider| provider.backend == cli::host::IsolationBackend::VirtualMachine)
+                .expect("the settings fixture includes the VM provider");
+            *vm = cli::host::sanitize_isolation_observation(cli::host::IsolationObservation {
+                backend: cli::host::IsolationBackend::VirtualMachine,
+                state: cli::host::IsolationReadiness::Unsupported,
+                raw_output: None,
+            });
+        }
         let host_root = redact(&ui.host_root.text());
         ui.host_root.reset_to(&host_root);
         let workspace_path = redact(&ui.workspace_path.text());
@@ -5340,8 +5363,9 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Provider readiness and the pinned image are checked again before JIT registration.
+        Virtual machine provider: unsupported
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5394,8 +5418,9 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Provider readiness and the pinned image are checked again before JIT registration.
+        Virtual machine provider: unsupported
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5448,8 +5473,9 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Provider readiness and the pinned image are checked again before JIT registration.
+        Virtual machine provider: unsupported
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5557,8 +5583,9 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Provider readiness and the pinned image are checked again before JIT registration.
+        Virtual machine provider: unsupported
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 
@@ -5608,8 +5635,9 @@ mod tests {
         Native provider: ready
         OCI provider: not installed
         Hyper-V container provider: unsupported
-        Virtual machine provider: not installed
-        Provider readiness and the pinned image are checked again before JIT registration.
+        Virtual machine provider: unsupported
+        Host readiness is shown here. The exact policy template and digest are checked on enable and again
+        before JIT registration.
         Drain selected profile [Enter/click]
         Remove selected profile [Enter twice/click twice]
 

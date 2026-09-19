@@ -1252,7 +1252,8 @@ pub fn apply_policy_mutation_selected(
     if let Some(enabled) = mutation.enabled {
         if enabled {
             if !policy.execution_policy().is_native() {
-                let capability = PlatformExecutionProvider::new(policy.host_id).probe(&policy);
+                let provider = PlatformExecutionProvider::new(policy.host_id);
+                let capability = provider.probe(&policy);
                 if capability != ProviderCapability::Ready {
                     return Err(CliError::with_remedy(
                         Failure::Conflict,
@@ -1261,7 +1262,7 @@ pub fn apply_policy_mutation_selected(
                             policy.profile_name(),
                             capability.display_name()
                         ),
-                        "runner-manager host isolation status",
+                        provider.policy_remedy(&policy, capability),
                     ));
                 }
             }

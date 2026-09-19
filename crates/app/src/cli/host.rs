@@ -522,7 +522,7 @@ pub(crate) const fn sanitize_isolation_observation(
             Some("use a supported host and provider")
         }
         (IsolationBackend::VirtualMachine, IsolationReadiness::NotInstalled) => {
-            Some("install and configure a virtual machine execution provider")
+            Some("install and configure the macOS Virtualization.framework helper")
         }
         _ => Some("install and configure an integrated isolation provider"),
     };
@@ -594,21 +594,26 @@ pub fn isolation_capabilities() -> Vec<IsolationCapability> {
             raw_output: None,
         })
     };
+    let host = runner_manager_agent::lifecycle::MacOsVmProcesses::host_state();
+    let mut vm = capability(
+        IsolationBackend::VirtualMachine,
+        readiness_from_provider_capability(host.capability()),
+    );
+    vm.remedy = host.remedy();
     vec![
         capability(IsolationBackend::Native, IsolationReadiness::Ready),
         capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
         windows_hyper_v_capability(),
-        capability(
-            IsolationBackend::VirtualMachine,
-            IsolationReadiness::NotInstalled,
-        ),
+        vm,
     ]
 }
 
 pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
     let providers = isolation_capabilities();
     let document = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
+        "scope": "host prerequisites only",
+        "policy_template_check": "on enable and before JIT",
         "providers": providers,
     });
     if json {
@@ -645,7 +650,10 @@ pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError>
                 .map_err(write_failed("this provider status"))?;
             }
         }
-        writeln!(out, "Provider readiness is checked again, including the pinned image, before JIT registration.")
+        writeln!(
+            out,
+            "This command reports host prerequisites only. Each policy's exact template version and SHA-256 identity are checked on enable and again before JIT registration."
+        )
         .map_err(write_failed("this provider status"))?;
     }
     Ok(())

@@ -51,6 +51,8 @@ use crate::reconcile::{
     ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
 
+mod macos_vm;
+pub use macos_vm::{MacOsVmHostState, MacOsVmProcesses};
 mod windows_hyperv;
 pub use windows_hyperv::{WindowsHyperVContainers, WindowsHyperVHostState};
 
@@ -1345,6 +1347,9 @@ pub struct ResolvedEnvironment {
 pub enum ProviderDiagnostic {
     CapabilityUnavailable,
     ImageRejected,
+    TemplateIdentityMismatch,
+    ResourceLimitMismatch,
+    HelperTimedOut,
     PrepareFailed,
     StartFailed,
     OwnershipMismatch,
@@ -1611,6 +1616,7 @@ pub struct PlatformExecutionProvider {
     native: NativeProcesses,
     oci: OciProcesses,
     windows_hyper_v: WindowsHyperVContainers,
+    macos_vm: MacOsVmProcesses,
 }
 
 impl PlatformExecutionProvider {
@@ -1620,6 +1626,31 @@ impl PlatformExecutionProvider {
             native: NativeProcesses::new(),
             oci: OciProcesses::new(host_id),
             windows_hyper_v: WindowsHyperVContainers::new(host_id),
+            macos_vm: MacOsVmProcesses::new(host_id),
+        }
+    }
+
+    /// Returns an operator action scoped to the selected provider and policy.
+    #[must_use]
+    pub fn policy_remedy(&self, policy: &ScalePolicy, capability: ProviderCapability) -> String {
+        let macos_vm = matches!(
+            policy.execution_policy(),
+            runner_manager_domain::execution::ExecutionPolicy::Isolated {
+                backend: Backend::VirtualMachine,
+                ..
+            }
+        ) || (cfg!(target_os = "macos")
+            && matches!(
+                policy.execution_policy(),
+                runner_manager_domain::execution::ExecutionPolicy::Isolated {
+                    backend: Backend::Auto,
+                    ..
+                }
+            ));
+        if macos_vm {
+            MacOsVmProcesses::policy_remedy(policy, capability)
+        } else {
+            "runner-manager host isolation status".into()
         }
     }
 
@@ -1630,14 +1661,18 @@ impl PlatformExecutionProvider {
                 {
                     Some(&self.windows_hyper_v)
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "macos")]
+                {
+                    Some(&self.macos_vm)
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 {
                     Some(&self.oci)
                 }
             }
             Backend::Oci => Some(&self.oci),
             Backend::WindowsHyperVContainer => Some(&self.windows_hyper_v),
-            Backend::VirtualMachine => None,
+            Backend::VirtualMachine => Some(&self.macos_vm),
         }
     }
 
@@ -1736,6 +1771,7 @@ impl ExecutionProvider for PlatformExecutionProvider {
     fn enumerate_owned(&self, host_id: HostId) -> Vec<EnvironmentIdentity> {
         let mut owned = self.oci.enumerate_owned(host_id);
         owned.extend(self.windows_hyper_v.enumerate_owned(host_id));
+        owned.extend(self.macos_vm.enumerate_owned(host_id));
         owned
     }
 
@@ -4023,7 +4059,7 @@ mod tests {
         assert!(
             providers
                 .isolated_provider(Backend::VirtualMachine)
-                .is_none()
+                .is_some()
         );
     }
 
@@ -4581,8 +4617,11 @@ mod tests {
             Ok(Some(ResolvedEnvironment {
                 provider_kind: Backend::Oci,
                 image: if self.incompatible_image.load(Ordering::SeqCst) {
-                    ImageReference::new("vm-version:wrong-provider")
-                        .expect("valid but incompatible")
+                    ImageReference::new(format!(
+                        "vm-version:wrong-provider@sha256:{}",
+                        "f".repeat(64)
+                    ))
+                    .expect("valid but incompatible")
                 } else {
                     image.clone()
                 },
