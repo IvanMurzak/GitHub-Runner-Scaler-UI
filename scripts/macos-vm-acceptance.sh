@@ -154,7 +154,9 @@ assert_state_identity() {
 }
 
 assert_probe_and_image() {
-  local out=$1 probe="$out/probe.json" inspected="$out/image.json"
+  local out=$1
+  local probe="$out/probe.json"
+  local inspected="$out/image.json"
   helper_command probe --json >"$probe"
   helper_command image inspect --image "$image" --json >"$inspected"
   python3 - "$probe" "$inspected" "$image" "${disk_mib:-}" <<'PY'

@@ -8,6 +8,27 @@ workflow="$root/.github/workflows/macos-vm-native-acceptance.yml"
 bash -n "$harness"
 test -f "$workflow"
 
+# Bash 3.2 expands every assignment in one `local` command before assigning
+# any of them. Execute the harness's real output-path declarations with nounset
+# enabled so a future same-command dependency fails on the oldest supported
+# macOS shell instead of during a privileged acceptance run.
+probe_path_declarations=$(
+  awk '
+    /^assert_probe_and_image\(\) \{/ { in_function = 1; next }
+    in_function && /helper_command probe/ { exit }
+    in_function && /^[[:space:]]+local (out|probe|inspected)=/ { print }
+  ' "$harness"
+)
+PROBE_PATH_DECLARATIONS=$probe_path_declarations bash -u <<'BASH'
+eval "probe_paths() {
+$PROBE_PATH_DECLARATIONS
+printf '%s\n%s\n' \"\$probe\" \"\$inspected\"
+}"
+actual=$(probe_paths '/tmp/runner manager')
+expected=$(printf '%s\n%s\n' '/tmp/runner manager/probe.json' '/tmp/runner manager/image.json')
+[[ $actual == "$expected" ]]
+BASH
+
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
   '--allow-service-install' '--allow-profile' '--allow-service-restart' \
