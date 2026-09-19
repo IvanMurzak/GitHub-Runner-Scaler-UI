@@ -118,6 +118,14 @@ fn safe_oci_segment(segment: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
+fn backend_accepts_image(backend: Backend, image: &ImageReference) -> bool {
+    match backend {
+        Backend::Oci | Backend::WindowsHyperVContainer => image.vm_template_digest().is_none(),
+        Backend::VirtualMachine => image.vm_template_digest().is_some(),
+        Backend::Auto => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
@@ -197,10 +205,7 @@ impl ExecutionPolicy {
             }
             resources.validate()?;
             ImageReference::new(image.as_str())?;
-            if (matches!(backend, Backend::Oci | Backend::WindowsHyperVContainer)
-                && image.vm_template_digest().is_some())
-                || (*backend == Backend::VirtualMachine && image.vm_template_digest().is_none())
-            {
+            if !backend_accepts_image(*backend, image) {
                 return Err(ExecutionError::BackendImageMismatch);
             }
         }
@@ -314,13 +319,7 @@ impl AttemptExecution {
                 return Err(ExecutionError::UnresolvedProvider);
             }
             ImageReference::new(resolved_image.as_str())?;
-            if (matches!(
-                provider_kind,
-                Backend::Oci | Backend::WindowsHyperVContainer
-            ) && resolved_image.vm_template_digest().is_some())
-                || (*provider_kind == Backend::VirtualMachine
-                    && resolved_image.vm_template_digest().is_none())
-            {
+            if !backend_accepts_image(*provider_kind, resolved_image) {
                 return Err(ExecutionError::BackendImageMismatch);
             }
             if !non_secret_id(generation)
