@@ -55,7 +55,7 @@ This file is the only live task-state record.
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / 69b2da3 | 2026-09-18 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / bare-metal Apple Silicon gate pending; Intel unsupported | 2026-09-17 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / a65f749; bare-metal Apple Silicon gate pending | 2026-09-18 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -342,3 +342,15 @@ with exact executable contracts passing on the client and the Server VM under
 Windows PowerShell 5.1. All eight CI/E2E checks passed. Scheduler review verified
 that `main` and the latest integration ref are ancestors, then squash-merged
 PR #77 into `runner-sandbox-isolation` at 69b2da3. d2 is complete.
+
+**2026-09-18 — d3 synchronized after d2 integration.** PR #79 merged the
+verified integration ref 9ab9531 at 0875d65. Conflict review ran through the
+full `implement-task` pipeline and found two supervisor-launch defects: the
+helper PID now persists before JIT/readiness timeout handling, and the helper
+receives only `RUNNER_MANAGER_MACOS_VM_ROOT` rather than the daemon's ambient
+environment. Head a65f749 is clean and mergeable; all ten CI/E2E checks, the
+independent formatting check and the macOS VM acceptance contract pass. The PR
+remains open because CI cannot replace the immutable native gate. Completion
+still requires an operator-controlled bare-metal Apple Silicon Mac with APFS,
+the signed entitled helper, and a digest-pinned Apple-authorized macOS template
+containing the RMV1 bootstrap.
