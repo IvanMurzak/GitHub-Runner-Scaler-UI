@@ -188,6 +188,7 @@ environment_dirs() {
   for directory in "$helper_root"/environments/*; do
     [[ -d $directory && ! -L $directory ]] && printf '%s\n' "$directory"
   done
+  return 0
 }
 
 environment_count() { environment_dirs | awk 'END { print NR+0 }'; }
@@ -240,6 +241,15 @@ wait_no_environments() {
     sleep 2
   done
   die 'provider-owned VM remained after the cleanup deadline'
+}
+
+wait_service_absent() {
+  local deadline=$((SECONDS + ${1:-30}))
+  while (( SECONDS < deadline )); do
+    [[ -z $(service_pid) ]] && return
+    sleep 1
+  done
+  die 'disposable LaunchDaemon still exists after uninstall'
 }
 
 cancel_recorded_runs() {
@@ -537,7 +547,7 @@ rollback() {
   [[ $(state_get profile_created) == false ]] || die 'cleanup the temporary profile before rollback'
   [[ $(environment_count) -eq 0 ]] || die 'cleanup helper environments before rollback'
   if [[ $(state_get service_installed) == true ]]; then runner service uninstall >/dev/null; fi
-  [[ -z $(service_pid) ]] || die 'disposable LaunchDaemon still exists after uninstall'
+  wait_service_absent 30
   rm -f "$state_path"
   printf 'Disposable service and receipt rolled back. Evidence remains at %s\n' "$evidence_root"
 }

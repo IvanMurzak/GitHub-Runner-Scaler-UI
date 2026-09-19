@@ -53,6 +53,73 @@ state_path=$STATE_PATH
 [[ $(state_get service_installed) == true ]]
 BASH
 
+# An existing but empty environments directory is a successful listing. Under
+# `set -e`, capture must enter its wait/retry path rather than abort at the
+# assignment that invokes environment_dirs.
+environment_definitions=$(
+  awk '
+    /^environment_dirs\(\) \{/ { in_function = 1 }
+    /^capture_single_environment\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { in_function = 0 }
+  ' "$harness"
+)
+empty_helper_root=$(mktemp -d)
+mkdir "$empty_helper_root/environments"
+empty_capture=$(mktemp)
+empty_wait_marker=$(mktemp)
+rm -f "$empty_wait_marker"
+ENVIRONMENT_DEFINITIONS=$environment_definitions HELPER_ROOT=$empty_helper_root \
+  CAPTURE_OUTPUT=$empty_capture WAIT_MARKER=$empty_wait_marker bash -u <<'BASH'
+set -e
+eval "$ENVIRONMENT_DEFINITIONS"
+helper_root=$HELPER_ROOT
+image='vm-version:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+disk_mib=1
+helper_command() { return 99; }
+die() { printf '%s\n' "$*" >&2; exit 42; }
+sleep() { printf 'waited\n' >>"$WAIT_MARKER"; SECONDS=$((SECONDS + 10)); }
+environment_dirs
+set +e
+(capture_single_environment "$CAPTURE_OUTPUT" 1) 2>/dev/null
+status=$?
+set -e
+[[ $status -eq 42 ]]
+[[ -s $WAIT_MARKER ]]
+BASH
+rm -rf "$empty_helper_root" "$empty_capture" "$empty_wait_marker"
+
+# launchd teardown is asynchronous. Exercise the real bounded wait through one
+# retry, then prove the timeout remains fail closed when the PID never leaves.
+wait_service_definition=$(
+  awk '
+    /^wait_service_absent\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+pid_sentinel=$(mktemp)
+wait_marker=$(mktemp)
+rm -f "$wait_marker"
+WAIT_SERVICE_DEFINITION=$wait_service_definition PID_SENTINEL=$pid_sentinel \
+  WAIT_MARKER=$wait_marker bash -u <<'BASH'
+set -e
+eval "$WAIT_SERVICE_DEFINITION"
+service_pid() { [[ -f $PID_SENTINEL ]] && { rm -f "$PID_SENTINEL"; printf '123\n'; }; }
+sleep() { printf 'waited\n' >>"$WAIT_MARKER"; SECONDS=$((SECONDS + 1)); }
+die() { printf '%s\n' "$*" >&2; exit 42; }
+wait_service_absent 5
+[[ -s $WAIT_MARKER ]]
+
+service_pid() { printf '123\n'; }
+set +e
+(wait_service_absent 1) 2>/dev/null
+status=$?
+set -e
+[[ $status -eq 42 ]]
+BASH
+rm -f "$pid_sentinel" "$wait_marker"
+
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
   '--allow-service-install' '--allow-profile' '--allow-service-restart' \
@@ -65,7 +132,8 @@ for required in \
   'helper_sha256' 'local HEAD' 'cancel_recorded_runs' \
   'scan_service_process_no_secrets' 'ps eww -p' \
   'gh[pousr]_' 'runner service install --start-at boot' \
-  'kill -9' 'runner status --json' 'helper_command destroy'; do
+  'kill -9' 'runner status --json' 'helper_command destroy' \
+  'wait_service_absent 30'; do
   grep -F -- "$required" "$harness" >/dev/null || { echo "missing harness contract: $required" >&2; exit 1; }
 done
 
