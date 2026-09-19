@@ -33,6 +33,26 @@ expected=$(printf '%s\n%s\n' '/tmp/runner manager/probe.json' '/tmp/runner manag
 [[ $actual == "$expected" ]]
 BASH
 
+# A failed run-job can install the service and exit before ensure_profile writes
+# profile_name. Exercise the harness's real receipt reader against that durable
+# partial state: cleanup must see an empty optional name instead of crashing.
+state_get_definition=$(
+  awk '
+    /^state_get\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+partial_receipt=$(mktemp)
+trap 'rm -f "$partial_receipt"' EXIT
+printf '%s\n' '{"schema_version":1,"service_installed":true,"profile_created":false}' >"$partial_receipt"
+STATE_GET_DEFINITION=$state_get_definition STATE_PATH=$partial_receipt bash -u <<'BASH'
+eval "$STATE_GET_DEFINITION"
+state_path=$STATE_PATH
+[[ -z $(state_get profile_name) ]]
+[[ $(state_get service_installed) == true ]]
+BASH
+
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
   '--allow-service-install' '--allow-profile' '--allow-service-restart' \

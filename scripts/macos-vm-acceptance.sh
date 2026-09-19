@@ -118,6 +118,9 @@ p = pathlib.Path(sys.argv[1])
 if not p.is_file(): raise SystemExit(3)
 v = json.loads(p.read_text())
 for part in sys.argv[2].split('.'):
+    if not isinstance(v, dict) or part not in v:
+        v = None
+        break
     v = v[part]
 if v is None: print('')
 elif isinstance(v, bool): print(str(v).lower())
@@ -379,6 +382,7 @@ doc={'schema_version':1,'phase':'audited','repository':sys.argv[2],'image':sys.a
  'helper_root':sys.argv[7],'workflow_ref':sys.argv[8],
  'disk_mib':int(sys.argv[9]),'git_commit':sys.argv[10],
  'audit_boot_epoch':int(sys.argv[11]),'service_installed':False,'profile_created':False,
+ 'profile_name':'',
  'pull_request':79,'trigger_label':'','trigger_label_created':False,
  'normal_run_id':'','normal_environment_id':'','normal_writable_disk_id':'','reboot_run_id':'',
  'reboot_environment_id':'','reboot_writable_disk_id':'',

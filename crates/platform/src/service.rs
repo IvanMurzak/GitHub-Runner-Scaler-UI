@@ -814,6 +814,7 @@ pub struct InstallRequest {
     binary: Option<PathBuf>,
     source_binary: Option<PathBuf>,
     arguments: Vec<OsString>,
+    environment: BTreeMap<String, String>,
     restart: RestartPolicy,
     on_demand: bool,
 }
@@ -827,6 +828,7 @@ impl InstallRequest {
             binary: None,
             source_binary: None,
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
+            environment: BTreeMap::new(),
             restart: RestartPolicy::default(),
             on_demand: false,
         }
@@ -892,6 +894,22 @@ impl InstallRequest {
         self
     }
 
+    /// Adds non-secret environment entries required by a specialized service
+    /// fixture. Production registrations leave this map empty.
+    #[must_use]
+    pub fn with_environment<I, K, V>(mut self, environment: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.environment = environment
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
+    }
+
     /// Replace the restart-on-failure policy. Defaults to
     /// [`RestartPolicy::default`].
     #[must_use]
@@ -920,6 +938,7 @@ pub struct InstallPlan {
     binary: PathBuf,
     source_binary: Option<PathBuf>,
     arguments: Vec<OsString>,
+    environment: BTreeMap<String, String>,
     account: ServiceAccount,
     restart: RestartPolicy,
     directories: ServiceDirectories,
@@ -960,6 +979,7 @@ impl InstallPlan {
             binary,
             source_binary: request.source_binary.clone(),
             arguments: request.arguments.clone(),
+            environment: request.environment.clone(),
             account: ServiceAccount::for_start_mode(request.start_mode),
             restart: request.restart,
             directories,
@@ -987,6 +1007,7 @@ impl InstallPlan {
             binary: binary.into(),
             source_binary: None,
             arguments: DAEMON_ARGUMENTS.iter().map(OsString::from).collect(),
+            environment: BTreeMap::new(),
             account: ServiceAccount::for_start_mode(start_mode),
             restart: RestartPolicy::default(),
             directories,
@@ -1077,6 +1098,27 @@ impl InstallPlan {
     #[must_use]
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
+    }
+
+    /// Non-secret environment entries recorded for this registration.
+    #[must_use]
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    /// Overrides the registered environment on an already-built plan.
+    #[must_use]
+    pub fn with_environment<I, K, V>(mut self, environment: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.environment = environment
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
     }
 
     /// The account it runs under.
@@ -1632,6 +1674,18 @@ pub fn launchd_plist(plan: &InstallPlan) -> String {
         ));
     }
     out.push_str("  </array>\n");
+
+    if !plan.environment().is_empty() {
+        out.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
+        for (key, value) in plan.environment() {
+            out.push_str(&format!(
+                "    <key>{}</key>\n    <string>{}</string>\n",
+                xml_escape(key),
+                xml_escape(value)
+            ));
+        }
+        out.push_str("  </dict>\n");
+    }
 
     out.push_str("  <key>RunAtLoad</key>\n  <true/>\n");
     out.push_str("  <key>KeepAlive</key>\n  <dict>\n");
@@ -2783,6 +2837,11 @@ pub struct InstallRecord {
     pub installed_at: DateTime<Utc>,
     /// Which build of the product made it.
     pub installed_by_version: String,
+    /// Non-secret environment explicitly attached to this registration.
+    /// Empty for production services and for records written before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
     // A TOML table has to follow every scalar at its level, so this field is
     // last by necessity rather than by taste.
     /// The four directories the registration was installed against. Item 2's
@@ -2812,6 +2871,7 @@ impl InstallRecord {
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect(),
+            environment: plan.environment().clone(),
             restart_delay_secs: plan.restart().delay().as_secs(),
             restart_reset_secs: plan.restart().reset_after().as_secs(),
             starts_on_demand: plan.is_on_demand(),
@@ -2840,6 +2900,7 @@ impl InstallRecord {
             self.directories.clone(),
         )
         .with_arguments(self.arguments.clone())
+        .with_environment(self.environment.clone())
         .with_restart(self.restart());
         let plan = if self.starts_on_demand {
             plan.started_on_demand()
@@ -7125,6 +7186,33 @@ mod tests {
     }
 
     #[test]
+    fn a_launchd_fixture_receives_its_explicit_environment_and_production_defaults_to_none() {
+        let production = launchd_plist(&linux_plan(StartMode::Boot));
+        assert!(
+            !production.contains("<key>EnvironmentVariables</key>"),
+            "production defaults must remain unchanged:\n{production}"
+        );
+
+        let fixture = linux_plan(StartMode::Boot).with_environment([
+            ("RUNNER_MANAGER_MACOS_VM_HELPER", "/opt/helper<&>"),
+            ("RUNNER_MANAGER_MACOS_VM_ROOT", "/var/lib/mac vm"),
+            ("RUNNER_MANAGER_SERVICE_NAME_TAG", "d3-native-acceptance"),
+        ]);
+        let plist = launchd_plist(&fixture);
+        assert!(
+            plist.contains("<key>EnvironmentVariables</key>\n  <dict>"),
+            "{plist}"
+        );
+        for expected in [
+            "<key>RUNNER_MANAGER_MACOS_VM_HELPER</key>\n    <string>/opt/helper&lt;&amp;&gt;</string>",
+            "<key>RUNNER_MANAGER_MACOS_VM_ROOT</key>\n    <string>/var/lib/mac vm</string>",
+            "<key>RUNNER_MANAGER_SERVICE_NAME_TAG</key>\n    <string>d3-native-acceptance</string>",
+        ] {
+            assert!(plist.contains(expected), "missing {expected}:\n{plist}");
+        }
+    }
+
+    #[test]
     fn the_launchd_label_is_the_product_identity_in_reverse_domain_form() {
         assert_eq!(
             ServiceIdentity::product().launchd_label(),
@@ -7726,9 +7814,13 @@ mod tests {
     #[test]
     fn the_record_round_trips_through_toml() {
         let host = Host::new();
+        let request = host.request(StartMode::Boot).with_environment([
+            ("RUNNER_MANAGER_MACOS_VM_HELPER", "/opt/helper"),
+            ("RUNNER_MANAGER_SERVICE_NAME_TAG", "d3-native-acceptance"),
+        ]);
         let plan = InstallPlan::resolve(
             ServiceIdentity::product(),
-            &host.request(StartMode::Boot),
+            &request,
             ServiceDirectories::of(&host.paths),
         )
         .expect("a resolvable plan");
@@ -7741,6 +7833,11 @@ mod tests {
         assert_eq!(read, record);
         assert_eq!(read.binary, host.binary);
         assert!(read.binary.is_absolute());
+        assert_eq!(
+            read.plan(ServiceIdentity::product()).environment(),
+            plan.environment(),
+            "status and mode changes must reconstruct the installed environment"
+        );
     }
 
     #[test]
