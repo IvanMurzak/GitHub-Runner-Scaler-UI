@@ -105,7 +105,11 @@ export RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag"
 
 runner() { "$runner_manager" --data-dir "$data_dir" "$@"; }
 helper_command() { "$helper" --protocol-version 1 "$@"; }
-boot_epoch() { sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/'; }
+boot_epoch() {
+  sysctl -n kern.boottime |
+    sed -E -n 's/^[[:space:]]*\{[[:space:]]*sec[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*,.*/\1/p' |
+    grep -E '^[0-9]+$'
+}
 service_pid() {
   launchctl print "system/$service_label" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
 }
