@@ -27,7 +27,7 @@ use runner_manager_domain::attempt::{
 };
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::path::LocalAbsolutePath;
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{RoutingLabels, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::{AttemptWorkspace, WorkspacePolicy};
 use runner_manager_github::jit::{
@@ -535,15 +535,29 @@ impl<'a> PruneAuthority<'a> {
 #[derive(Debug)]
 pub struct CachedRuntimePackages {
     cache: Arc<PackageCache>,
-    seeds: Arc<SeedFingerprints>,
+    trusted: Arc<TrustedTrees>,
 }
 
 impl CachedRuntimePackages {
+    /// Run `work` against a package tree on the blocking pool: a fingerprint
+    /// walks ~9,000 entries and a copy can take minutes.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        root: &Path,
+        work: impl FnOnce(&TrustedTrees, &Path) -> T + Send + 'static,
+    ) -> Result<T, FailureReason> {
+        let trusted = Arc::clone(&self.trusted);
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || work(&trusted, &root))
+            .await
+            .map_err(|_| FailureReason::ProcessStartFailed)
+    }
+
     #[must_use]
     pub fn new(cache: Arc<PackageCache>) -> Self {
         Self {
             cache,
-            seeds: Arc::default(),
+            trusted: Arc::default(),
         }
     }
 }
@@ -551,20 +565,28 @@ impl CachedRuntimePackages {
 #[async_trait]
 impl RuntimePackages for CachedRuntimePackages {
     async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason> {
-        let installed = self
+        let mut installed = self
             .cache
             .ensure_installed()
             .await
             .map_err(package_failure)?;
+        // A cache entry this process did not install, or one that has changed
+        // since, may hold a job's edits; replace it with one downloaded and
+        // verified now. See `TrustedTrees`.
+        if !self.blocking(installed.root(), TrustedTrees::holds).await? {
+            installed = self.cache.reinstall().await.map_err(package_failure)?;
+            self.blocking(installed.root(), TrustedTrees::record)
+                .await?
+                .map_err(|_| FailureReason::ProcessStartFailed)?;
+        }
         // Off the async thread: the daemon runs a current-thread runtime, and a
         // copy (or a seed rebuild) can take minutes on a busy disk.
-        let source = installed.root().to_path_buf();
         let destination = attempt.runtime_path().to_path_buf();
-        let seeds = Arc::clone(&self.seeds);
-        tokio::task::spawn_blocking(move || copy_package_tree(&source, &destination, &seeds))
-            .await
-            .map_err(|_| FailureReason::ProcessStartFailed)?
-            .map_err(|_| FailureReason::ProcessStartFailed)?;
+        self.blocking(installed.root(), move |trusted, source| {
+            copy_package_tree(source, &destination, trusted)
+        })
+        .await?
+        .map_err(|_| FailureReason::ProcessStartFailed)?;
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
             // slot's `_work` is retained across attempts, and this rollback
@@ -1308,7 +1330,7 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 fn copy_package_tree(
     source: &Path,
     destination: &Path,
-    seeds: &SeedFingerprints,
+    seeds: &TrustedTrees,
 ) -> std::io::Result<()> {
     refuse_work_folder(source)?;
 
@@ -1359,7 +1381,7 @@ const PACKAGE_SEED_DIR: &str = ".runner-package";
 ///
 /// The seed sits one `..` from every job's runtime and is owned by the account
 /// jobs run as, so it is only reused while it is provably the tree this
-/// process built: see [`SeedFingerprints`].
+/// process built: see [`TrustedTrees`].
 ///
 /// Only on macOS, where the runner root is all but certainly APFS and a clone
 /// is free. On a Linux filesystem without reflinks a seed would only move every
@@ -1368,7 +1390,7 @@ const PACKAGE_SEED_DIR: &str = ".runner-package";
 fn package_seed(
     source: &Path,
     destination: &Path,
-    seeds: &SeedFingerprints,
+    seeds: &TrustedTrees,
 ) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1384,25 +1406,68 @@ fn package_seed(
     refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR), seeds)
 }
 
-/// What each seed looked like when this process finished building it.
+/// The package trees this process built or installed, and what each looked
+/// like right after: the cache entry runtimes are copied from and the seeds
+/// they are cloned from.
 ///
-/// A job runs as the account that owns the seed and can edit any file in it,
-/// so a seed is reused only while its [`seed_fingerprint`] still matches the
-/// one taken right after it was built. Every edit, replacement or rename moves
-/// the change time (`ctime`) of the entry or of its directory, and only the
-/// superuser can set a change time, so a tampered seed cannot keep the print.
+/// Both are owned by the account jobs run as, so a job can edit any file in
+/// them, and nothing on disk can say what they should hold: the published
+/// digest covers the archive, not the extracted tree, and a record kept on disk
+/// could be rewritten by the same account. So a tree is trusted only while its
+/// [`tree_fingerprint`] matches the one recorded here. Every edit, replacement
+/// or rename moves the change time (`ctime`) of the entry or of its directory,
+/// and only the superuser can set a change time. A tree without a record, as
+/// every tree has after a restart, is rebuilt before it is used.
 ///
-/// Held in memory, never on disk where the same account could rewrite it; a
-/// restarted daemon therefore rebuilds each seed once before trusting it.
+/// Unix only. On Windows every tree is trusted, as before.
 #[derive(Debug, Default)]
-pub(crate) struct SeedFingerprints(
-    #[cfg(unix)] Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
-);
+pub(crate) struct TrustedTrees {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    prints: Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
+}
 
-/// A digest of every entry under `root`: its relative path, type, inode,
-/// size, mode, owner and change time.
+impl TrustedTrees {
+    /// Whether `root` is a tree recorded here and still looks as it did.
+    fn holds(&self, root: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let recorded = self
+                .prints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(root)
+                .copied();
+            recorded.is_some_and(|recorded| {
+                tree_fingerprint(root).is_ok_and(|current| current == recorded)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            true
+        }
+    }
+
+    /// Trust `root` as it is now; called right after this process made it.
+    fn record(&self, root: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let print = tree_fingerprint(root)?;
+            self.prints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(root.to_path_buf(), print);
+        }
+        #[cfg(not(unix))]
+        let _ = root;
+        Ok(())
+    }
+}
+
+/// A digest of every entry under `root`: its relative path, inode, size, mode,
+/// owner and change time.
 #[cfg(unix)]
-fn seed_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
+fn tree_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
     use sha2::{Digest as _, Sha256};
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1445,7 +1510,7 @@ fn seed_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
 fn refresh_package_seed(
     source: &Path,
     seeds: &Path,
-    trusted: &SeedFingerprints,
+    trusted: &TrustedTrees,
 ) -> std::io::Result<PathBuf> {
     use crate::package::MANIFEST_FILE;
 
@@ -1454,17 +1519,10 @@ fn refresh_package_seed(
         .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
     let seed = seeds.join(version);
     let manifest = fs::read(source.join(MANIFEST_FILE))?;
-    let mut prints = trusted
-        .0
-        .lock()
-        .map_err(|_| std::io::Error::other("the seed fingerprints are poisoned"))?;
-    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest)
-        && let Some(recorded) = prints.get(&seed)
-        && seed_fingerprint(&seed).is_ok_and(|current| current == *recorded)
+    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest) && trusted.holds(&seed)
     {
         return Ok(seed);
     }
-    prints.remove(&seed);
 
     // Superseded versions, a stale seed and interrupted stagings all go.
     match remove_runtime_tree(seeds) {
@@ -1480,7 +1538,7 @@ fn refresh_package_seed(
         return Err(error);
     }
     // After the rename, which itself moves the seed directory's change time.
-    prints.insert(seed.clone(), seed_fingerprint(&seed)?);
+    trusted.record(&seed)?;
     Ok(seed)
 }
 
@@ -2892,6 +2950,15 @@ impl LifecycleLauncher {
         Ok(host.runner_root_override.clone())
     }
 
+    /// `Host.runner_root_override`, or the platform default when that resolves;
+    /// `None` when neither does. Unlike [`Self::effective_host_root`] it records
+    /// no refusal, for callers to whom an unresolvable root is not a failure.
+    fn resolvable_host_root(&self) -> Result<Option<LocalAbsolutePath>, LifecycleError> {
+        Ok(self
+            .configured_host_root()?
+            .or_else(|| default_runner_root(&self.app_paths).ok()))
+    }
+
     /// `Host.runner_root_override`, or the platform default standing in for it.
     ///
     /// Takes the policy because an unresolvable default is a refusal like any
@@ -3035,9 +3102,7 @@ impl LifecycleLauncher {
         // failure and propagates, because silently continuing would drop the
         // overlap check entirely and accept a repository root that sits inside
         // the host root — the pair `RootPreflight` exists to refuse.
-        let host_root = self
-            .configured_host_root()?
-            .or_else(|| default_runner_root(&self.app_paths).ok());
+        let host_root = self.resolvable_host_root()?;
         let mut preflight = RootPreflight::new(&self.app_paths);
         if let Some(host_root) = host_root {
             preflight = preflight.against(RootOwner::Host, host_root);
@@ -3102,30 +3167,27 @@ impl LifecycleLauncher {
         allocation_guard: &AllocationGuard,
         lock_wait: Duration,
     ) -> Result<RunnerAttempt, LifecycleError> {
+        let (attempt, labels) = self.allocate_attempt(policy)?;
+        let id = attempt.id;
         let mut stopwatch = LaunchStopwatch::new(lock_wait);
-        let mut allocated = None;
         let result = self
-            .launch_steps(policy, allocation_guard, &mut stopwatch, &mut allocated)
+            .launch_steps(policy, allocation_guard, attempt, labels, &mut stopwatch)
             .await;
         stopwatch.finish();
-        // Only an attempt that reached the journal has an id to report against.
-        if let Some(attempt) = allocated {
-            self.ports.events.emit(AttemptEvent::Launched {
-                attempt,
-                started: result.is_ok(),
-                timings: stopwatch.timings,
-            });
-        }
+        self.ports.events.emit(AttemptEvent::Launched {
+            attempt: id,
+            started: result.is_ok(),
+            timings: stopwatch.timings,
+        });
         result
     }
 
-    async fn launch_steps(
+    /// Place and journal a new attempt: everything before its first external
+    /// effect, and so before there is anything to time.
+    fn allocate_attempt<'p>(
         &self,
-        policy: &ScalePolicy,
-        allocation_guard: &AllocationGuard,
-        stopwatch: &mut LaunchStopwatch,
-        allocated: &mut Option<AttemptId>,
-    ) -> Result<RunnerAttempt, LifecycleError> {
+        policy: &'p ScalePolicy,
+    ) -> Result<(RunnerAttempt, &'p RoutingLabels), LifecycleError> {
         if !*self
             .recovery_complete
             .lock()
@@ -3138,7 +3200,7 @@ impl LifecycleLauncher {
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
         let placement = self.allocate_workspace(policy, id)?;
-        let mut attempt = RunnerAttempt::allocate_in(
+        let attempt = RunnerAttempt::allocate_in(
             id,
             policy.id,
             placement.runtime,
@@ -3150,8 +3212,18 @@ impl LifecycleLauncher {
         // before any package or GitHub effect
         // (`02-target-architecture.md`, "Slot allocation", step 7).
         self.record_allocation(&attempt)?;
-        *allocated = Some(id);
+        Ok((attempt, labels))
+    }
 
+    async fn launch_steps(
+        &self,
+        policy: &ScalePolicy,
+        allocation_guard: &AllocationGuard,
+        mut attempt: RunnerAttempt,
+        labels: &RoutingLabels,
+        stopwatch: &mut LaunchStopwatch,
+    ) -> Result<RunnerAttempt, LifecycleError> {
+        let id = attempt.id;
         stopwatch.begin(LaunchStep::Materialize);
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
@@ -3246,7 +3318,7 @@ impl LifecycleLauncher {
                 &attempts,
             )
             .map_err(LifecycleError::Failed)?;
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
         self.prune_abandoned_seeds(&attempts);
         Ok(())
     }
@@ -3262,18 +3334,13 @@ impl LifecycleLauncher {
     /// under the allocation lock, so no launch is cloning from a seed it
     /// removes, and it is best-effort: a seed left behind costs disk, never a
     /// launch.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn prune_abandoned_seeds(&self, attempts: &[RunnerAttempt]) {
         let Ok(policies) = self.ports.store.policies() else {
             return;
         };
-        let host_root = match self.configured_host_root() {
-            Ok(Some(configured)) => configured,
-            Ok(None) => match default_runner_root(&self.app_paths) {
-                Ok(default) => default,
-                Err(_) => return,
-            },
-            Err(_) => return,
+        let Ok(Some(host_root)) = self.resolvable_host_root() else {
+            return;
         };
         let in_use: BTreeSet<PathBuf> = policies
             .iter()
@@ -3283,21 +3350,20 @@ impl LifecycleLauncher {
             })
             .chain(std::iter::once(canonical_or_raw(host_root.as_path())))
             .collect();
-        let used: BTreeSet<PathBuf> = attempts
+        // Distinct parents first: the journal keeps every attempt ever made.
+        let used: BTreeSet<&Path> = attempts
             .iter()
             .filter_map(|attempt| attempt.runtime_path().parent())
-            .map(canonical_or_raw)
             .collect();
-        for root in used.difference(&in_use) {
-            let seeds = root.join(PACKAGE_SEED_DIR);
-            if seeds.is_dir() {
-                let _ = remove_runtime_tree(&seeds);
+        for root in used.into_iter().map(canonical_or_raw) {
+            if !in_use.contains(&root) {
+                let _ = remove_runtime_tree(&root.join(PACKAGE_SEED_DIR));
             }
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn canonical_or_raw(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -4170,13 +4236,20 @@ mod tests {
         }
 
         async fn launch_result(&self) -> Result<RunnerAttempt, LaunchFailure> {
+            self.launch_after_waiting(Duration::ZERO).await
+        }
+
+        async fn launch_after_waiting(
+            &self,
+            lock_wait: Duration,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
             let guard = self.allocation_lock.acquire().await.unwrap();
             self.launcher
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy: &self.policy,
                     allocation_guard: &guard,
-                    lock_wait: Duration::ZERO,
+                    lock_wait,
                 })
                 .await
         }
@@ -4277,17 +4350,7 @@ mod tests {
             Arc::new(PersistentDemand),
         );
         harness.ready().await;
-        let guard = harness.allocation_lock.acquire().await.unwrap();
-        let failed = harness
-            .launcher
-            .launch(LaunchRequest {
-                host: &harness.host,
-                policy: &harness.policy,
-                allocation_guard: &guard,
-                lock_wait: Duration::from_secs(90),
-            })
-            .await;
-        drop(guard);
+        let failed = harness.launch_after_waiting(Duration::from_secs(90)).await;
         assert!(failed.is_err());
 
         let timings = harness
@@ -4308,7 +4371,7 @@ mod tests {
         assert!(timings.total() >= Duration::from_secs(90));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_launch_removes_the_seed_of_a_root_no_longer_in_use() {
         let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
@@ -6378,7 +6441,7 @@ mod tests {
         fs::create_dir_all(&retained).unwrap();
         fs::write(retained.join("checkout.txt"), b"from the first job").unwrap();
 
-        copy_package_tree(&package, &slot, &SeedFingerprints::default())
+        copy_package_tree(&package, &slot, &TrustedTrees::default())
             .expect("the package lays out around `_work`");
         assert!(slot.join("bin").join("Runner.Listener").exists());
         assert!(
@@ -6392,7 +6455,7 @@ mod tests {
 
         // A package that ever grew a top-level `_work` is refused, not merged.
         fs::create_dir(package.join(DEFAULT_WORK_FOLDER)).unwrap();
-        let error = copy_package_tree(&package, &slot, &SeedFingerprints::default()).unwrap_err();
+        let error = copy_package_tree(&package, &slot, &TrustedTrees::default()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
             fs::read_to_string(retained.join("checkout.txt")).unwrap(),
@@ -7433,7 +7496,7 @@ mod tests {
         fs::create_dir_all(&nested_work).unwrap();
         fs::write(nested_work.join("allowed.txt"), b"allowed").unwrap();
 
-        copy_package_tree(&source, &dest, &SeedFingerprints::default()).unwrap();
+        copy_package_tree(&source, &dest, &TrustedTrees::default()).unwrap();
 
         assert_eq!(fs::read_to_string(dest.join("file1.txt")).unwrap(), "hello");
         assert_eq!(
@@ -7498,7 +7561,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
         let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
-        let trusted = SeedFingerprints::default();
+        let trusted = TrustedTrees::default();
 
         let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
         assert_eq!(seed, seeds.join("2.336.0"));
@@ -7521,7 +7584,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
         let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
-        let trusted = SeedFingerprints::default();
+        let trusted = TrustedTrees::default();
         let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
 
         // A job rewrites the binary in place and leaves the manifest alone.
@@ -7535,7 +7598,7 @@ mod tests {
 
         // A restarted daemon has no print of a seed it did not build.
         let built = listener_inode(&seed);
-        refresh_package_seed(&source, &seeds, &SeedFingerprints::default()).unwrap();
+        refresh_package_seed(&source, &seeds, &TrustedTrees::default()).unwrap();
         assert_ne!(
             listener_inode(&seed),
             built,
@@ -7548,7 +7611,7 @@ mod tests {
     fn a_package_seed_is_rebuilt_for_a_new_entry_and_drops_every_other() {
         let root = tempfile::tempdir().unwrap();
         let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
-        let trusted = SeedFingerprints::default();
+        let trusted = TrustedTrees::default();
         let old = package_entry(root.path(), "2.335.0", "{\"digest\":\"old\"}");
         refresh_package_seed(&old, &seeds, &trusted).unwrap();
         fs::create_dir_all(seeds.join(".staging-interrupted")).unwrap();
@@ -7583,7 +7646,7 @@ mod tests {
         let runtime = root.path().join("runners").join("attempt");
         fs::create_dir_all(&runtime).unwrap();
 
-        let trusted = SeedFingerprints::default();
+        let trusted = TrustedTrees::default();
         assert_eq!(package_seed(&source, &runtime, &trusted).unwrap(), source);
         copy_package_tree(&source, &runtime, &trusted).unwrap();
         assert!(runtime.join("bin").join("Runner.Listener").exists());
@@ -7603,7 +7666,7 @@ mod tests {
         let top_work = source.join(DEFAULT_WORK_FOLDER);
         fs::create_dir_all(&top_work).unwrap();
 
-        let err = copy_package_tree(&source, &dest, &SeedFingerprints::default()).unwrap_err();
+        let err = copy_package_tree(&source, &dest, &TrustedTrees::default()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -19,11 +19,15 @@ the version being prepared rather than the version in `Cargo.toml`.
 - The macOS package copy in `.runner-package/` is removed from a runner root the
   host no longer uses, such as after the host root override changes or a
   persistent repository is removed or moves its workspace.
-- A job runs as the account that owns `.runner-package/`, so it could replace the
-  runner binaries every later runner on the host was cloned from. The daemon
-  now records a fingerprint of each copy it builds, from every file's inode,
-  size, mode, owner and change time, and rebuilds a copy whose fingerprint has
-  moved. A restarted daemon rebuilds each copy once before using it.
+- A job runs as the account that owns the runner package cache under `state/`
+  and the macOS copy in `.runner-package/`, so it could replace the runner
+  binaries every later runner on the host was copied from. The daemon now
+  records a fingerprint of each package tree it installs or builds, from every
+  file's inode, size, mode, owner and change time, and uses a tree only while
+  its fingerprint still matches. A cache entry it did not install in this run,
+  or one that has changed, is downloaded again and verified against GitHub's
+  published checksum, so a restarted daemon downloads the runner package once
+  before its first launch. Not on Windows.
 
 ## 0.4.27
 

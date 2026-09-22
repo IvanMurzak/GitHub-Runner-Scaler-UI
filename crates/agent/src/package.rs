@@ -1146,6 +1146,39 @@ impl PackageCache {
 
     // -- installation ------------------------------------------------------
 
+    /// Install the published package afresh, setting every entry aside first.
+    ///
+    /// For a caller that cannot trust what is on disk. An entry is owned by the
+    /// account runners execute as, so a job can rewrite it, and the published
+    /// digest covers the archive rather than the extracted tree, so nothing can
+    /// re-verify an entry after the fact. What this returns was downloaded and
+    /// checked against GitHub's digest by this call, and it is the only entry
+    /// left. The entries set aside are removed once it returns.
+    ///
+    /// # Errors
+    /// Those of [`Self::ensure_installed`], and an I/O failure setting an entry
+    /// aside. Either way the cache may now be empty, which the next launch's
+    /// install repairs.
+    pub async fn reinstall(&self) -> Result<InstalledPackage, PackageError> {
+        let staging_root = self.staging_root();
+        create_dir_all(&staging_root)?;
+        let mut set_aside = Vec::new();
+        for entry in self.installed()? {
+            let aside = staging_root.join(format!("untrusted-{}", uuid::Uuid::new_v4()));
+            fs::rename(entry.root(), &aside).map_err(|source| PackageError::Io {
+                what: "set aside a runner package to reinstall it",
+                path: entry.root().to_path_buf(),
+                source,
+            })?;
+            set_aside.push(StagingGuard::new(aside));
+        }
+        *self
+            .last_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.ensure_installed().await
+    }
+
     /// Make a verified runner package available, and answer which one.
     ///
     /// **This is the cold-start path.** It decides three things in order:
@@ -4167,6 +4200,40 @@ mod tests {
             .state(state)
             .runtime_path(runtime.to_string_lossy().to_string())
             .build()
+    }
+
+    #[tokio::test]
+    async fn reinstall_replaces_a_tampered_entry_with_a_verified_download() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let first = cache.ensure_installed().await.expect("the first install");
+        assert_eq!(harness.fetcher.count(), 1);
+
+        // A job rewrites a file in the entry it can reach.
+        let planted = first.root().join("planted");
+        fs::write(&planted, b"from a job").unwrap();
+
+        let fresh = cache.reinstall().await.expect("the reinstall");
+
+        assert_eq!(fresh.version(), first.version());
+        assert_eq!(
+            harness.fetcher.count(),
+            2,
+            "the package was downloaded again"
+        );
+        assert!(!planted.exists(), "the tampered tree is gone");
+        assert_eq!(
+            cache.installed().unwrap().len(),
+            1,
+            "the reinstalled entry is the only one left"
+        );
+        assert!(
+            fs::read_dir(cache.staging_root())
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+                == 0,
+            "the set-aside tree is removed"
+        );
     }
 
     async fn cache_with_one_entry(harness: &Harness) -> PackageCache {
