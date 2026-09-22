@@ -3158,8 +3158,61 @@ impl LifecycleLauncher {
                 version,
                 &attempts,
             )
-            .map_err(LifecycleError::Failed)
+            .map_err(LifecycleError::Failed)?;
+        #[cfg(unix)]
+        self.prune_abandoned_seeds(&attempts);
+        Ok(())
     }
+
+    /// Remove the package seed from every runner root this host once placed a
+    /// runtime in and no longer does: a changed host root override, a removed
+    /// persistent policy, or one that moved its workspace.
+    ///
+    /// The roots ever used are the parents of the journal's runtime paths; the
+    /// roots in use are the effective host root and every persistent policy's
+    /// root. When the effective host root cannot be resolved nothing is
+    /// removed, because a seed still in use cannot then be told apart. Runs
+    /// under the allocation lock, so no launch is cloning from a seed it
+    /// removes, and it is best-effort: a seed left behind costs disk, never a
+    /// launch.
+    #[cfg(unix)]
+    fn prune_abandoned_seeds(&self, attempts: &[RunnerAttempt]) {
+        let Ok(policies) = self.ports.store.policies() else {
+            return;
+        };
+        let host_root = match self.configured_host_root() {
+            Ok(Some(configured)) => configured,
+            Ok(None) => match default_runner_root(&self.app_paths) {
+                Ok(default) => default,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let in_use: BTreeSet<PathBuf> = policies
+            .iter()
+            .filter_map(|policy| match policy.workspace_policy() {
+                WorkspacePolicy::Persistent { root } => Some(canonical_or_raw(root.as_path())),
+                WorkspacePolicy::Ephemeral => None,
+            })
+            .chain(std::iter::once(canonical_or_raw(host_root.as_path())))
+            .collect();
+        let used: BTreeSet<PathBuf> = attempts
+            .iter()
+            .filter_map(|attempt| attempt.runtime_path().parent())
+            .map(canonical_or_raw)
+            .collect();
+        for root in used.difference(&in_use) {
+            let seeds = root.join(PACKAGE_SEED_DIR);
+            if seeds.is_dir() {
+                let _ = remove_runtime_tree(&seeds);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn canonical_or_raw(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[async_trait]
@@ -4166,6 +4219,37 @@ mod tests {
         assert_eq!(timings.lock_wait, Duration::from_secs(90));
         assert_eq!(timings.spawn, Duration::ZERO, "spawn was never reached");
         assert!(timings.total() >= Duration::from_secs(90));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launch_removes_the_seed_of_a_root_no_longer_in_use() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+
+        // A runtime this host once placed under a root it no longer uses.
+        let old_root = harness._root.path().join("old-root");
+        let old_runtime = old_root.join("abandoned");
+        fs::create_dir_all(old_root.join(PACKAGE_SEED_DIR).join("2.335.0")).unwrap();
+        fs::create_dir_all(&old_runtime).unwrap();
+        let old = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            harness.policy.id,
+            &old_runtime,
+            harness.clock.now(),
+        );
+        harness.store.record_attempt(&old).unwrap();
+        let kept = harness.host_root().join(PACKAGE_SEED_DIR);
+        fs::create_dir_all(kept.join("2.336.0")).unwrap();
+
+        harness.launch().await;
+
+        assert!(
+            !old_root.join(PACKAGE_SEED_DIR).exists(),
+            "the abandoned root's seed is removed"
+        );
+        assert!(old_runtime.exists(), "only the seed is touched");
+        assert!(kept.exists(), "the host root's own seed is kept");
     }
 
     #[tokio::test]
