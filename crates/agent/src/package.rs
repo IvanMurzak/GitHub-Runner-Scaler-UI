@@ -122,7 +122,7 @@ const STAGING_DIR: &str = ".staging";
 const LEASES_DIR: &str = ".leases";
 const LEASE_EXTENSION: &str = "lease";
 /// The manifest, written inside the staging directory before the entry lands.
-const MANIFEST_FILE: &str = ".runner-package.json";
+pub(crate) const MANIFEST_FILE: &str = ".runner-package.json";
 
 /// How far behind the latest release a cached package may be before it is
 /// refreshed. GitHub rejects runners past this and plans to block them at
