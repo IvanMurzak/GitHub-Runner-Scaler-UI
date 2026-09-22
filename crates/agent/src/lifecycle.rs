@@ -42,7 +42,7 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
-use crate::package::{MANIFEST_FILE, PackageCache, PackageError, RunnerVersion};
+use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
     AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
     ReplacementIntent, RunnerLauncher,
@@ -1269,6 +1269,7 @@ fn refuse_work_folder(source: &Path) -> std::io::Result<()> {
 }
 
 /// Where runtime copies of the package are cloned from, beside the runtimes.
+#[cfg(unix)]
 const PACKAGE_SEED_DIR: &str = ".runner-package";
 
 /// A copy of the cache entry on the destination's volume, so that every
@@ -1307,6 +1308,8 @@ fn package_seed(source: &Path, destination: &Path) -> std::io::Result<PathBuf> {
 /// The seed of `source` under `seeds`, rebuilt unless its manifest matches.
 #[cfg(unix)]
 fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf> {
+    use crate::package::MANIFEST_FILE;
+
     let version = source
         .file_name()
         .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
@@ -7180,7 +7183,7 @@ mod tests {
     fn package_entry(root: &Path, version: &str, manifest: &str) -> PathBuf {
         let entry = root.join("packages").join(version);
         fs::create_dir_all(entry.join("bin")).unwrap();
-        fs::write(entry.join(MANIFEST_FILE), manifest).unwrap();
+        fs::write(entry.join(crate::package::MANIFEST_FILE), manifest).unwrap();
         fs::write(entry.join("bin").join("Runner.Listener"), version).unwrap();
         entry
     }
@@ -7226,7 +7229,11 @@ mod tests {
         assert_eq!(left, ["2.336.0"]);
 
         // A reinstalled entry of the same version has a different manifest.
-        fs::write(new.join(MANIFEST_FILE), "{\"digest\":\"again\"}").unwrap();
+        fs::write(
+            new.join(crate::package::MANIFEST_FILE),
+            "{\"digest\":\"again\"}",
+        )
+        .unwrap();
         fs::write(seed.join("marker"), b"stale").unwrap();
         refresh_package_seed(&new, &seeds).unwrap();
         assert!(!seed.join("marker").exists(), "a stale seed is rebuilt");
