@@ -490,7 +490,13 @@ impl RuntimePackages for CachedRuntimePackages {
             .ensure_installed()
             .await
             .map_err(package_failure)?;
-        copy_package_tree(installed.root(), attempt.runtime_path())
+        // Off the async thread: the daemon runs a current-thread runtime, and a
+        // copy (or a seed rebuild) can take minutes on a busy disk.
+        let source = installed.root().to_path_buf();
+        let destination = attempt.runtime_path().to_path_buf();
+        tokio::task::spawn_blocking(move || copy_package_tree(&source, &destination))
+            .await
+            .map_err(|_| FailureReason::ProcessStartFailed)?
             .map_err(|_| FailureReason::ProcessStartFailed)?;
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
@@ -1238,7 +1244,12 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         // A seed that cannot be made is a slower launch, not a failed one.
-        let origin = package_seed(source, destination).unwrap_or_else(|_| source.to_path_buf());
+        // The seed sits under the runner root, beside job runtimes, so the
+        // refusal is re-checked on it; a seed that fails it is bypassed.
+        let origin = package_seed(source, destination)
+            .ok()
+            .filter(|seed| refuse_work_folder(seed).is_ok())
+            .unwrap_or_else(|| source.to_path_buf());
         clone_tree(&origin, destination)
     }
     #[cfg(not(unix))]
@@ -1273,10 +1284,17 @@ const PACKAGE_SEED_DIR: &str = ".runner-package";
 ///
 /// The seed is exactly as trustworthy as the cache entry it was cloned from:
 /// both are owned by the account runners execute as.
+///
+/// Only on macOS, where the runner root is all but certainly APFS and a clone
+/// is free. On a Linux filesystem without reflinks a seed would only move every
+/// copy's reads onto the runner root's own, possibly busy, disk.
 #[cfg(unix)]
 fn package_seed(source: &Path, destination: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
 
+    if !cfg!(target_os = "macos") {
+        return Ok(source.to_path_buf());
+    }
     let root = destination
         .parent()
         .ok_or_else(|| std::io::Error::other("a runtime directory has no parent"))?;
@@ -1306,8 +1324,11 @@ fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf>
     fs::create_dir_all(seeds)?;
     let staging = seeds.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&staging)?;
-    clone_tree(source, &staging)?;
-    fs::rename(&staging, &seed)?;
+    // A half-made staging would hold the disk space the fallback copy needs.
+    if let Err(error) = clone_tree(source, &staging).and_then(|()| fs::rename(&staging, &seed)) {
+        let _ = remove_runtime_tree(&staging);
+        return Err(error);
+    }
     Ok(seed)
 }
 
