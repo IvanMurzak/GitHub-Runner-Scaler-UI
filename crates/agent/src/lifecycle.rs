@@ -147,13 +147,13 @@ pub enum AttemptEvent {
         operation: &'static str,
         delay: Duration,
     },
-    /// How long each step of a launch took, so a slow start can be attributed
-    /// to the package copy, the JIT request, or the process start.
+    /// How long each step of a launch took, whether or not it started a
+    /// runner, so a slow or failed start can be attributed to the wait for the
+    /// allocation lock, the package copy, the JIT request, or the process start.
     Launched {
         attempt: AttemptId,
-        materialize: Duration,
-        register: Duration,
-        spawn: Duration,
+        started: bool,
+        timings: LaunchTimings,
     },
     Adopted {
         attempt: AttemptId,
@@ -217,6 +217,67 @@ impl AttemptEventSink for NoAttemptEvents {
     fn emit(&self, _event: AttemptEvent) {}
 }
 
+/// Where one launch spent its time. A step the launch never reached is zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchTimings {
+    /// Waiting for the host allocation lock, which another launch may hold.
+    pub lock_wait: Duration,
+    pub materialize: Duration,
+    pub register: Duration,
+    pub spawn: Duration,
+}
+
+impl LaunchTimings {
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.lock_wait + self.materialize + self.register + self.spawn
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaunchStep {
+    Materialize,
+    Register,
+    Spawn,
+}
+
+/// Times a launch's steps; beginning one ends the one before, so an early
+/// return still leaves the step it failed in measured once [`Self::finish`]
+/// runs.
+#[derive(Debug)]
+struct LaunchStopwatch {
+    timings: LaunchTimings,
+    running: Option<(LaunchStep, std::time::Instant)>,
+}
+
+impl LaunchStopwatch {
+    fn new(lock_wait: Duration) -> Self {
+        Self {
+            timings: LaunchTimings {
+                lock_wait,
+                ..LaunchTimings::default()
+            },
+            running: None,
+        }
+    }
+
+    fn begin(&mut self, step: LaunchStep) {
+        self.finish();
+        self.running = Some((step, std::time::Instant::now()));
+    }
+
+    fn finish(&mut self) {
+        if let Some((step, since)) = self.running.take() {
+            let slot = match step {
+                LaunchStep::Materialize => &mut self.timings.materialize,
+                LaunchStep::Register => &mut self.timings.register,
+                LaunchStep::Spawn => &mut self.timings.spawn,
+            };
+            *slot = since.elapsed();
+        }
+    }
+}
+
 /// A launch slower than this is logged as a warning, with its steps.
 ///
 /// A healthy launch is a few seconds; a queued job waits for all of it, and
@@ -247,24 +308,25 @@ impl AttemptEventSink for TracingAttemptEvents {
             ),
             AttemptEvent::Launched {
                 attempt,
-                materialize,
-                register,
-                spawn,
+                started,
+                timings,
             } => {
-                let total = materialize + register + spawn;
                 macro_rules! launched {
                     ($level:ident, $name:literal) => {
                         tracing::$level!(
                             event = $name,
                             attempt_id = %attempt,
-                            duration_ms = millis(total),
-                            materialize_ms = millis(materialize),
-                            register_ms = millis(register),
-                            spawn_ms = millis(spawn),
+                            duration_ms = millis(timings.total()),
+                            lock_wait_ms = millis(timings.lock_wait),
+                            materialize_ms = millis(timings.materialize),
+                            register_ms = millis(timings.register),
+                            spawn_ms = millis(timings.spawn),
                         )
                     };
                 }
-                if total >= SLOW_LAUNCH {
+                if !started {
+                    launched!(warn, "attempt_launch_failed");
+                } else if timings.total() >= SLOW_LAUNCH {
                     launched!(warn, "attempt_launch_slow");
                 } else {
                     launched!(info, "attempt_launched");
@@ -2951,6 +3013,31 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         allocation_guard: &AllocationGuard,
+        lock_wait: Duration,
+    ) -> Result<RunnerAttempt, LifecycleError> {
+        let mut stopwatch = LaunchStopwatch::new(lock_wait);
+        let mut allocated = None;
+        let result = self
+            .launch_steps(policy, allocation_guard, &mut stopwatch, &mut allocated)
+            .await;
+        stopwatch.finish();
+        // Only an attempt that reached the journal has an id to report against.
+        if let Some(attempt) = allocated {
+            self.ports.events.emit(AttemptEvent::Launched {
+                attempt,
+                started: result.is_ok(),
+                timings: stopwatch.timings,
+            });
+        }
+        result
+    }
+
+    async fn launch_steps(
+        &self,
+        policy: &ScalePolicy,
+        allocation_guard: &AllocationGuard,
+        stopwatch: &mut LaunchStopwatch,
+        allocated: &mut Option<AttemptId>,
     ) -> Result<RunnerAttempt, LifecycleError> {
         if !*self
             .recovery_complete
@@ -2976,8 +3063,9 @@ impl LifecycleLauncher {
         // before any package or GitHub effect
         // (`02-target-architecture.md`, "Slot allocation", step 7).
         self.record_allocation(&attempt)?;
+        *allocated = Some(id);
 
-        let started_at = std::time::Instant::now();
+        stopwatch.begin(LaunchStep::Materialize);
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
@@ -2987,15 +3075,15 @@ impl LifecycleLauncher {
             .lock()
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
-        let materialized_at = std::time::Instant::now();
 
+        stopwatch.begin(LaunchStep::Register);
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
         let registration = match self.register_with_retry(policy, id, &jit_request).await {
             Ok(registration) => registration,
             Err(error) => return self.fail_launch(&mut attempt, error.reason()),
         };
-        let registered_at = std::time::Instant::now();
+        stopwatch.begin(LaunchStep::Spawn);
         let runner_id = registration.runner().id;
         write_runner_id(attempt.runtime_path(), runner_id)?;
         attempt
@@ -3039,12 +3127,6 @@ impl LifecycleLauncher {
             .started(pid, self.ports.clock.now())
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
-        self.ports.events.emit(AttemptEvent::Launched {
-            attempt: attempt.id,
-            materialize: materialized_at - started_at,
-            register: registered_at - materialized_at,
-            spawn: registered_at.elapsed(),
-        });
         Ok(attempt)
     }
 
@@ -3100,7 +3182,7 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
-        self.launch_attempt(request.policy, request.allocation_guard)
+        self.launch_attempt(request.policy, request.allocation_guard, request.lock_wait)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -3954,6 +4036,7 @@ mod tests {
                     host: &self.host,
                     policy: &self.policy,
                     allocation_guard: &guard,
+                    lock_wait: Duration::ZERO,
                 })
                 .await
         }
@@ -4045,6 +4128,44 @@ mod tests {
             .position(|event| matches!(event, AttemptEvent::State { attempt, state: AttemptState::Starting } if *attempt == started.id))
             .unwrap();
         assert!(starting < launched, "timings follow the start: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_still_reports_its_step_timings() {
+        let harness = Harness::new(
+            FakeGithubLifecycle::default().fail(true),
+            Arc::new(PersistentDemand),
+        );
+        harness.ready().await;
+        let guard = harness.allocation_lock.acquire().await.unwrap();
+        let failed = harness
+            .launcher
+            .launch(LaunchRequest {
+                host: &harness.host,
+                policy: &harness.policy,
+                allocation_guard: &guard,
+                lock_wait: Duration::from_secs(90),
+            })
+            .await;
+        drop(guard);
+        assert!(failed.is_err());
+
+        let timings = harness
+            .events
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                AttemptEvent::Launched {
+                    started: false,
+                    timings,
+                    ..
+                } => Some(timings),
+                _ => None,
+            })
+            .expect("a launch that failed at registration reports its timings");
+        assert_eq!(timings.lock_wait, Duration::from_secs(90));
+        assert_eq!(timings.spawn, Duration::ZERO, "spawn was never reached");
+        assert!(timings.total() >= Duration::from_secs(90));
     }
 
     #[tokio::test]
@@ -6475,6 +6596,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("the host can still launch");
@@ -7168,6 +7290,7 @@ mod tests {
             "reason",
             "retry_in_ms",
             "duration_ms",
+            "lock_wait_ms",
             "materialize_ms",
             "register_ms",
             "spawn_ms",

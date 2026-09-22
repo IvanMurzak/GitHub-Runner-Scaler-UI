@@ -831,6 +831,8 @@ pub struct LaunchRequest<'a> {
     // package pruning. A caller holding an unrelated public AllocationLock can
     // no longer assemble a LaunchRequest and present that guard as authority.
     pub(crate) allocation_guard: &'a AllocationGuard,
+    /// How long this loop waited for that lock, for the launch's timings.
+    pub lock_wait: Duration,
 }
 
 /// Why one runner could not be started.
@@ -2201,6 +2203,7 @@ impl Reconciler {
         let mut budget = intent.to_start;
 
         while budget > 0 {
+            let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -2214,6 +2217,7 @@ impl Reconciler {
                     break;
                 }
             };
+            let lock_wait = waiting_since.elapsed();
 
             // The read and the decision are both inside the hold, and so is the
             // creation below. Two concurrent passes therefore serialise on the
@@ -2252,6 +2256,7 @@ impl Reconciler {
                     host: &self.host,
                     policy,
                     allocation_guard: &guard,
+                    lock_wait,
                 })
                 .await;
             drop(guard);
