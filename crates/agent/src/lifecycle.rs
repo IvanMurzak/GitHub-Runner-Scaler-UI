@@ -147,6 +147,14 @@ pub enum AttemptEvent {
         operation: &'static str,
         delay: Duration,
     },
+    /// How long each step of a launch took, so a slow start can be attributed
+    /// to the package copy, the JIT request, or the process start.
+    Launched {
+        attempt: AttemptId,
+        materialize: Duration,
+        register: Duration,
+        spawn: Duration,
+    },
     Adopted {
         attempt: AttemptId,
     },
@@ -207,6 +215,68 @@ pub struct NoAttemptEvents;
 
 impl AttemptEventSink for NoAttemptEvents {
     fn emit(&self, _event: AttemptEvent) {}
+}
+
+/// A launch slower than this is logged as a warning, with its steps.
+///
+/// A healthy launch is a few seconds; a queued job waits for all of it, and
+/// the daemon's default filter drops the `info` line that times every launch.
+const SLOW_LAUNCH: Duration = Duration::from_secs(60);
+
+/// The daemon's sink for retries and launch timings; the other attempt events
+/// already reach the log through the reconcile sink.
+///
+/// Every field name is on `d1`'s allow-list, or the redacting layer would log
+/// `[redacted]` in its place; `tests::every_field_name_the_attempt_sink_emits_is_allowed`
+/// keeps that true.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TracingAttemptEvents;
+
+impl AttemptEventSink for TracingAttemptEvents {
+    fn emit(&self, event: AttemptEvent) {
+        match event {
+            AttemptEvent::Retry {
+                attempt,
+                operation,
+                delay,
+            } => tracing::warn!(
+                event = "attempt_retry",
+                attempt_id = %attempt,
+                reason = operation,
+                retry_in_ms = millis(delay),
+            ),
+            AttemptEvent::Launched {
+                attempt,
+                materialize,
+                register,
+                spawn,
+            } => {
+                let total = materialize + register + spawn;
+                macro_rules! launched {
+                    ($level:ident, $name:literal) => {
+                        tracing::$level!(
+                            event = $name,
+                            attempt_id = %attempt,
+                            duration_ms = millis(total),
+                            materialize_ms = millis(materialize),
+                            register_ms = millis(register),
+                            spawn_ms = millis(spawn),
+                        )
+                    };
+                }
+                if total >= SLOW_LAUNCH {
+                    launched!(warn, "attempt_launch_slow");
+                } else {
+                    launched!(info, "attempt_launched");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether the demand that justified a retry still exists.
@@ -420,7 +490,13 @@ impl RuntimePackages for CachedRuntimePackages {
             .ensure_installed()
             .await
             .map_err(package_failure)?;
-        copy_package_tree(installed.root(), attempt.runtime_path())
+        // Off the async thread: the daemon runs a current-thread runtime, and a
+        // copy (or a seed rebuild) can take minutes on a busy disk.
+        let source = installed.root().to_path_buf();
+        let destination = attempt.runtime_path().to_path_buf();
+        tokio::task::spawn_blocking(move || copy_package_tree(&source, &destination))
+            .await
+            .map_err(|_| FailureReason::ProcessStartFailed)?
             .map_err(|_| FailureReason::ProcessStartFailed)?;
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
@@ -1156,7 +1232,31 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 ///   job workspace of the attempt before it. The refusal is top-level only,
 ///   because the retained directory is a direct child of the slot; a `_work`
 ///   nested inside the package's own tree is an ordinary name.
+///
+/// On Unix the copy is a copy-on-write clone where the filesystem offers one,
+/// taken from a [`package_seed`] on the destination's own volume. A plain
+/// byte copy of the ~9,000-file package across volumes took four minutes on a
+/// host whose runner root shared a busy disk with a build, and a queued job
+/// waits for every second of it.
 fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    refuse_work_folder(source)?;
+
+    #[cfg(unix)]
+    {
+        // A seed that cannot be made is a slower launch, not a failed one.
+        // The seed sits under the runner root, beside job runtimes, so the
+        // refusal is re-checked on it; a seed that fails it is bypassed.
+        let origin = package_seed(source, destination)
+            .ok()
+            .filter(|seed| refuse_work_folder(seed).is_ok())
+            .unwrap_or_else(|| source.to_path_buf());
+        clone_tree(&origin, destination)
+    }
+    #[cfg(not(unix))]
+    copy_package_entries(source, destination, true)
+}
+
+fn refuse_work_folder(source: &Path) -> std::io::Result<()> {
     if source.join(DEFAULT_WORK_FOLDER).exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1165,22 +1265,103 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
              extracts to prevent data leakage",
         ));
     }
+    Ok(())
+}
 
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("cp")
-            .arg("-a")
-            .arg(format!("{}/.", source.display()))
-            .arg(destination)
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("cp failed"))
-        }
+/// Where runtime copies of the package are cloned from, beside the runtimes.
+#[cfg(unix)]
+const PACKAGE_SEED_DIR: &str = ".runner-package";
+
+/// A copy of the cache entry on the destination's volume, so that every
+/// runtime after the first is a same-volume clone rather than a cross-volume
+/// byte copy. Returns `source` itself when it already shares the volume.
+///
+/// The seed lives at `<runner root>/.runner-package/<version>` and is replaced
+/// whenever its manifest stops matching the cache entry's, which covers both a
+/// new version and a reinstalled one. Superseded versions and interrupted
+/// stagings are removed on that same pass. Launches hold the host allocation
+/// lock for the whole materialization, so no other launch is cloning from a
+/// seed while it is replaced.
+///
+/// The seed is exactly as trustworthy as the cache entry it was cloned from:
+/// both are owned by the account runners execute as.
+///
+/// Only on macOS, where the runner root is all but certainly APFS and a clone
+/// is free. On a Linux filesystem without reflinks a seed would only move every
+/// copy's reads onto the runner root's own, possibly busy, disk.
+#[cfg(unix)]
+fn package_seed(source: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !cfg!(target_os = "macos") {
+        return Ok(source.to_path_buf());
     }
-    #[cfg(not(unix))]
-    copy_package_entries(source, destination, true)
+    let root = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a runtime directory has no parent"))?;
+    if fs::metadata(source)?.dev() == fs::metadata(root)?.dev() {
+        return Ok(source.to_path_buf());
+    }
+    refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR))
+}
+
+/// The seed of `source` under `seeds`, rebuilt unless its manifest matches.
+#[cfg(unix)]
+fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf> {
+    use crate::package::MANIFEST_FILE;
+
+    let version = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
+    let seed = seeds.join(version);
+    let manifest = fs::read(source.join(MANIFEST_FILE))?;
+    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest) {
+        return Ok(seed);
+    }
+
+    // Superseded versions, a stale seed and interrupted stagings all go.
+    match remove_runtime_tree(seeds) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::create_dir_all(seeds)?;
+    let staging = seeds.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+    // A half-made staging would hold the disk space the fallback copy needs.
+    if let Err(error) = clone_tree(source, &staging).and_then(|()| fs::rename(&staging, &seed)) {
+        let _ = remove_runtime_tree(&staging);
+        return Err(error);
+    }
+    Ok(seed)
+}
+
+/// `cp -a`, asking for a copy-on-write clone where the platform's `cp` can.
+///
+/// macOS `cp -c` and GNU `--reflink=auto` both fall back to a byte copy across
+/// volumes; a `cp` that does not know the flag at all gets a plain `cp -a`.
+#[cfg(unix)]
+fn clone_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    const CLONE: &[&str] = &["-c"];
+    #[cfg(target_os = "linux")]
+    const CLONE: &[&str] = &["--reflink=auto"];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const CLONE: &[&str] = &[];
+
+    let from = format!("{}/.", source.display());
+    let cp = |extra: &[&str]| {
+        std::process::Command::new("cp")
+            .arg("-a")
+            .args(extra)
+            .arg(&from)
+            .arg(destination)
+            .status()
+    };
+    if cp(CLONE)?.success() || cp(&[])?.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("cp failed"))
+    }
 }
 
 #[cfg(not(unix))]
@@ -2796,6 +2977,7 @@ impl LifecycleLauncher {
         // (`02-target-architecture.md`, "Slot allocation", step 7).
         self.record_allocation(&attempt)?;
 
+        let started_at = std::time::Instant::now();
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
@@ -2805,6 +2987,7 @@ impl LifecycleLauncher {
             .lock()
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
+        let materialized_at = std::time::Instant::now();
 
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
@@ -2812,6 +2995,7 @@ impl LifecycleLauncher {
             Ok(registration) => registration,
             Err(error) => return self.fail_launch(&mut attempt, error.reason()),
         };
+        let registered_at = std::time::Instant::now();
         let runner_id = registration.runner().id;
         write_runner_id(attempt.runtime_path(), runner_id)?;
         attempt
@@ -2855,6 +3039,12 @@ impl LifecycleLauncher {
             .started(pid, self.ports.clock.now())
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
+        self.ports.events.emit(AttemptEvent::Launched {
+            attempt: attempt.id,
+            materialize: materialized_at - started_at,
+            register: registered_at - materialized_at,
+            spawn: registered_at.elapsed(),
+        });
         Ok(attempt)
     }
 
@@ -3838,6 +4028,23 @@ mod tests {
 
         clear_runner_root_refusal(&harness.app_paths, &harness.policy.id.to_string())
             .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_launch_reports_how_long_each_step_took() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        let events = harness.events.events();
+        let launched = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::Launched { attempt, .. } if *attempt == started.id))
+            .expect("a successful launch reports its step timings");
+        let starting = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::State { attempt, state: AttemptState::Starting } if *attempt == started.id))
+            .unwrap();
+        assert!(starting < launched, "timings follow the start: {events:?}");
     }
 
     #[tokio::test]
@@ -6948,6 +7155,102 @@ mod tests {
             .unwrap(),
             "allowed"
         );
+    }
+
+    #[test]
+    fn every_field_name_the_attempt_sink_emits_is_allowed() {
+        use runner_manager_platform::logging::is_field_allowed;
+
+        // Kept beside the sink rather than derived from it, as in `reconcile`.
+        for field in [
+            "event",
+            "attempt_id",
+            "reason",
+            "retry_in_ms",
+            "duration_ms",
+            "materialize_ms",
+            "register_ms",
+            "spawn_ms",
+        ] {
+            assert!(
+                is_field_allowed(field),
+                "`{field}` would be logged as `[redacted]`"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn package_entry(root: &Path, version: &str, manifest: &str) -> PathBuf {
+        let entry = root.join("packages").join(version);
+        fs::create_dir_all(entry.join("bin")).unwrap();
+        fs::write(entry.join(crate::package::MANIFEST_FILE), manifest).unwrap();
+        fs::write(entry.join("bin").join("Runner.Listener"), version).unwrap();
+        entry
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_seed_is_built_once_and_reused_while_its_manifest_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+
+        let seed = refresh_package_seed(&source, &seeds).unwrap();
+        assert_eq!(seed, seeds.join("2.336.0"));
+        assert_eq!(
+            fs::read_to_string(seed.join("bin").join("Runner.Listener")).unwrap(),
+            "2.336.0"
+        );
+
+        // A marker survives only if the second call reuses rather than rebuilds.
+        fs::write(seed.join("marker"), b"kept").unwrap();
+        assert_eq!(refresh_package_seed(&source, &seeds).unwrap(), seed);
+        assert!(seed.join("marker").exists(), "a matching seed is reused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_seed_is_rebuilt_for_a_new_entry_and_drops_every_other() {
+        let root = tempfile::tempdir().unwrap();
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let old = package_entry(root.path(), "2.335.0", "{\"digest\":\"old\"}");
+        refresh_package_seed(&old, &seeds).unwrap();
+        fs::create_dir_all(seeds.join(".staging-interrupted")).unwrap();
+        fs::write(seeds.join("stray"), b"").unwrap();
+
+        let new = package_entry(root.path(), "2.336.0", "{\"digest\":\"new\"}");
+        let seed = refresh_package_seed(&new, &seeds).unwrap();
+
+        let mut left: Vec<_> = fs::read_dir(&seeds)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["2.336.0"]);
+
+        // A reinstalled entry of the same version has a different manifest.
+        fs::write(
+            new.join(crate::package::MANIFEST_FILE),
+            "{\"digest\":\"again\"}",
+        )
+        .unwrap();
+        fs::write(seed.join("marker"), b"stale").unwrap();
+        refresh_package_seed(&new, &seeds).unwrap();
+        assert!(!seed.join("marker").exists(), "a stale seed is rebuilt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_on_the_runtime_volume_is_its_own_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{}");
+        let runtime = root.path().join("runners").join("attempt");
+        fs::create_dir_all(&runtime).unwrap();
+
+        assert_eq!(package_seed(&source, &runtime).unwrap(), source);
+        copy_package_tree(&source, &runtime).unwrap();
+        assert!(runtime.join("bin").join("Runner.Listener").exists());
+        assert!(!root.path().join("runners").join(PACKAGE_SEED_DIR).exists());
     }
 
     #[test]

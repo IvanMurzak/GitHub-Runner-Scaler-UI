@@ -7,6 +7,23 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.27
+
+### Fixes
+
+- A runner took minutes to come online when the runner root was on a different
+  volume from the package cache and that disk was busy: every launch copied the
+  whole runner package (about 9,000 files) byte for byte, while holding the
+  host allocation lock that every other launch waits for. On one macOS host a
+  queued job waited four minutes for that copy. On macOS the daemon now keeps
+  one copy of the package in `.runner-package/` under the runner root and makes
+  each runner an APFS clone of it, so a launch copies no package data after the
+  first. On Linux the copy is a reflink where the filesystem supports one.
+- Launch retries and step timings are logged. A retried package copy, JIT
+  request or process start is a warning, and a launch that takes longer than a
+  minute logs a warning naming how long the package copy, the JIT request and
+  the process start each took.
+
 ## 0.4.26
 
 ### Fixes
