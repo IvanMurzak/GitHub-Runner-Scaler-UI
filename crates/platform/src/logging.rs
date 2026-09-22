@@ -182,6 +182,7 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "job_id",
     "label",
     "lock",
+    "lock_wait_ms",
     "materialize_ms",
     "message",
     "mode",

@@ -7,6 +7,28 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.28
+
+### Fixes
+
+- A launch's timings now include how long it waited for the host allocation
+  lock while another runner was being launched, and that wait counts toward the
+  one-minute slow-launch warning. A launch that fails now logs
+  `attempt_launch_failed` with the same step timings, including the step it
+  failed in.
+- The macOS package copy in `.runner-package/` is removed from a runner root the
+  host no longer uses, such as after the host root override changes or a
+  persistent repository is removed or moves its workspace.
+- A job runs as the account that owns the runner package cache under `state/`
+  and the macOS copy in `.runner-package/`, so it could replace the runner
+  binaries every later runner on the host was copied from. The daemon now
+  records a fingerprint of each package tree it installs or builds, from every
+  file's inode, size, mode, owner and change time, and uses a tree only while
+  its fingerprint still matches. A cache entry it did not install in this run,
+  or one that has changed, is downloaded again and verified against GitHub's
+  published checksum, so a restarted daemon downloads the runner package once
+  before its first launch. Not on Windows.
+
 ## 0.4.27
 
 ### Fixes
