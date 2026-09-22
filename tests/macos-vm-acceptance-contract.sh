@@ -12,6 +12,33 @@ bash -n "$cli_json_contract"
 test -f "$workflow"
 grep -F 'run: bash tests/macos-vm-helper-cli-json-contract.sh' "$ci_workflow" >/dev/null
 
+# macOS reports kern.boottime as a struct containing both `sec` and `usec`.
+# Execute the harness's real parser so the `sec` suffix in `usec` can never be
+# mistaken for the boot epoch, including on the system Bash 3.2 used by macOS.
+boot_epoch_definition=$(
+  awk '
+    /^boot_epoch\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+BOOT_EPOCH_DEFINITION=$boot_epoch_definition bash -u <<'BASH'
+eval "$BOOT_EPOCH_DEFINITION"
+sysctl() {
+  [[ $1 == -n && $2 == kern.boottime ]]
+  printf '%s\n' "$SYSCTL_OUTPUT"
+}
+SYSCTL_OUTPUT='{ sec = 1790020731, usec = 612365 }'
+[[ $(boot_epoch) == 1790020731 ]]
+SYSCTL_OUTPUT='  { sec = 1790020731, usec = 999999 } Tue Sep 22 03:58:51 2026'
+[[ $(boot_epoch) == 1790020731 ]]
+SYSCTL_OUTPUT='{ usec = 612365 }'
+if boot_epoch >/dev/null; then
+  printf 'boot epoch parser accepted output without a seconds field\n' >&2
+  exit 1
+fi
+BASH
+
 # Bash 3.2 expands every assignment in one `local` command before assigning
 # any of them. Execute the harness's real output-path declarations with nounset
 # enabled so a future same-command dependency fails on the oldest supported
