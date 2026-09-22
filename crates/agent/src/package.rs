@@ -1155,6 +1155,10 @@ impl PackageCache {
     /// checked against GitHub's digest by this call, and it is the only entry
     /// left. The entries set aside are removed once it returns.
     ///
+    /// The install is forced: an entry that reappears at the published
+    /// version's path while this runs, as one a job recreated would, is set
+    /// aside in turn rather than adopted.
+    ///
     /// # Errors
     /// Those of [`Self::ensure_installed`], and an I/O failure setting an entry
     /// aside. Either way the cache may now be empty, which the next launch's
@@ -1164,19 +1168,26 @@ impl PackageCache {
         create_dir_all(&staging_root)?;
         let mut set_aside = Vec::new();
         for entry in self.installed()? {
-            let aside = staging_root.join(format!("untrusted-{}", uuid::Uuid::new_v4()));
-            fs::rename(entry.root(), &aside).map_err(|source| PackageError::Io {
-                what: "set aside a runner package to reinstall it",
-                path: entry.root().to_path_buf(),
-                source,
-            })?;
-            set_aside.push(StagingGuard::new(aside));
+            set_aside.push(self.set_aside(entry.root())?);
         }
-        *self
-            .last_check
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.ensure_installed().await
+        let installed = self.install(true).await;
+        // Removing ~9,000 files per tree is blocking work, kept off the
+        // daemon's current-thread runtime.
+        let _ = tokio::task::spawn_blocking(move || drop(set_aside)).await;
+        installed.map(|(package, _)| package)
+    }
+
+    /// Move `root` into staging, to be removed when the guard drops.
+    fn set_aside(&self, root: &Path) -> Result<StagingGuard, PackageError> {
+        let aside = self
+            .staging_root()
+            .join(format!("untrusted-{}", uuid::Uuid::new_v4()));
+        fs::rename(root, &aside).map_err(|source| PackageError::Io {
+            what: "set aside a runner package to reinstall it",
+            path: root.to_path_buf(),
+            source,
+        })?;
+        Ok(StagingGuard::new(aside))
     }
 
     /// Make a verified runner package available, and answer which one.
@@ -1198,20 +1209,40 @@ impl PackageCache {
     /// [`Self::with_retry_budget`] times and then wrapped in
     /// [`PackageError::Exhausted`].
     pub async fn ensure_installed(&self) -> Result<InstalledPackage, PackageError> {
+        self.ensure_installed_reporting()
+            .await
+            .map(|(package, _)| package)
+    }
+
+    /// [`Self::ensure_installed`], and whether this call downloaded, verified
+    /// and committed the entry it returns rather than finding one on disk.
+    ///
+    /// # Errors
+    /// Those of [`Self::ensure_installed`].
+    pub async fn ensure_installed_reporting(
+        &self,
+    ) -> Result<(InstalledPackage, bool), PackageError> {
+        self.install(false).await
+    }
+
+    /// The body of [`Self::ensure_installed`]; `force` skips every reuse of an
+    /// entry already on disk, for [`Self::reinstall`].
+    async fn install(&self, force: bool) -> Result<(InstalledPackage, bool), PackageError> {
         // Before the catalog, before the fetcher, before anything touches the
         // network: an unsupported pair has no package and never will.
         host_os::validate(self.os, self.arch)?;
 
         let now = self.ports.clock.now();
-        if !self.check_is_due(now)?
+        if !force
+            && !self.check_is_due(now)?
             && let Some(entry) = self.newest_installed()?
         {
-            return Ok(entry);
+            return Ok((entry, false));
         }
 
         let mut last: Option<PackageError> = None;
         for attempt in 1..=self.retry_budget {
-            match self.install_once().await {
+            match self.install_once(force).await {
                 Ok(package) => {
                     *self
                         .last_check
@@ -1296,7 +1327,7 @@ impl PackageCache {
     }
 
     /// One attempt: resolve, decide, and install if a download is warranted.
-    async fn install_once(&self) -> Result<InstalledPackage, PackageError> {
+    async fn install_once(&self, force: bool) -> Result<(InstalledPackage, bool), PackageError> {
         let published = self.ports.catalog.published().await?;
 
         // Selection: this host's OS and architecture, from GitHub's metadata.
@@ -1313,21 +1344,22 @@ impl PackageCache {
         let version = RunnerVersion::from_filename(&download.filename)?;
 
         // Already held: no fetch, no extraction, no rewrite.
-        if let Some(entry) = self.entry(&version)? {
-            return Ok(entry);
+        if !force && let Some(entry) = self.entry(&version)? {
+            return Ok((entry, false));
         }
 
         // A different version is published. Whether that warrants 150-300 MB is
         // the freshness question, and only that question.
         let now = self.ports.clock.now();
-        if let Some(newest) = self.newest_installed()?
+        if !force
+            && let Some(newest) = self.newest_installed()?
             && !self.is_stale(&newest, now)
         {
-            return Ok(newest);
+            return Ok((newest, false));
         }
 
         let digest = self.required_digest(download, &version)?;
-        self.download_verify_and_install(download, &version, &digest, now)
+        self.download_verify_and_install(download, &version, &digest, now, force)
             .await
     }
 
@@ -1400,7 +1432,8 @@ impl PackageCache {
         version: &RunnerVersion,
         expected: &Sha256Hex,
         now: Timestamp,
-    ) -> Result<InstalledPackage, PackageError> {
+        force: bool,
+    ) -> Result<(InstalledPackage, bool), PackageError> {
         let (_, kind) = ArchiveKind::split(&download.filename)?;
         let staging_root = self.staging_root();
         create_dir_all(&staging_root)?;
@@ -1432,16 +1465,24 @@ impl PackageCache {
         let target = self.version_dir(version);
         create_dir_all(&self.root)?;
 
+        // A forced install trusts nothing already at the target, which a job
+        // may have put there since the reinstall set the old entries aside.
+        let _displaced = if force && fs::symlink_metadata(&target).is_ok() {
+            Some(self.set_aside(&target)?)
+        } else {
+            None
+        };
+
         // The single commit point. `rename` onto an existing directory fails on
         // Windows and replaces nothing on Unix, and either way the answer is the
         // same: someone already installed this version, and an installed entry
-        // is never overwritten.
+        // is never overwritten. A forced install adopts nothing and fails.
         match fs::rename(&extracted, &target) {
             Ok(()) => {}
             Err(source) => {
-                if let Some(entry) = self.entry(version)? {
+                if !force && let Some(entry) = self.entry(version)? {
                     guard.disarm_into_sweep();
-                    return Ok(entry);
+                    return Ok((entry, false));
                 }
                 return Err(PackageError::Io {
                     what: "commit the extracted runner package",
@@ -1452,12 +1493,15 @@ impl PackageCache {
         }
         guard.disarm_into_sweep();
 
-        Ok(InstalledPackage {
-            version: version.clone(),
-            root: target,
-            installed_at: now,
-            digest: expected.clone(),
-        })
+        Ok((
+            InstalledPackage {
+                version: version.clone(),
+                root: target,
+                installed_at: now,
+                digest: expected.clone(),
+            },
+            true,
+        ))
     }
 
     /// Everything between the fetch and the commit: the ordering this module
@@ -4234,6 +4278,18 @@ mod tests {
                 == 0,
             "the set-aside tree is removed"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_reports_only_the_install_that_downloaded() {
+        let (harness, _, _) = linux_fixture();
+        let cache = harness.cache();
+        let (first, downloaded) = cache.ensure_installed_reporting().await.unwrap();
+        assert!(downloaded, "an empty cache downloads");
+        let (again, downloaded) = cache.ensure_installed_reporting().await.unwrap();
+        assert_eq!(again.root(), first.root());
+        assert!(!downloaded, "an entry on disk is reused, not downloaded");
+        assert_eq!(harness.fetcher.count(), 1);
     }
 
     async fn cache_with_one_entry(harness: &Harness) -> PackageCache {

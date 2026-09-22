@@ -565,16 +565,24 @@ impl CachedRuntimePackages {
 #[async_trait]
 impl RuntimePackages for CachedRuntimePackages {
     async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason> {
-        let mut installed = self
+        let (mut installed, downloaded) = self
             .cache
-            .ensure_installed()
+            .ensure_installed_reporting()
             .await
             .map_err(package_failure)?;
         // A cache entry this process did not install, or one that has changed
         // since, may hold a job's edits; replace it with one downloaded and
-        // verified now. See `TrustedTrees`.
-        if !self.blocking(installed.root(), TrustedTrees::holds).await? {
+        // verified now. One this call just downloaded is trusted as it lands.
+        // See `TrustedTrees`.
+        let fresh = if downloaded {
+            true
+        } else if self.blocking(installed.root(), TrustedTrees::holds).await? {
+            false
+        } else {
             installed = self.cache.reinstall().await.map_err(package_failure)?;
+            true
+        };
+        if fresh {
             self.blocking(installed.root(), TrustedTrees::record)
                 .await?
                 .map_err(|_| FailureReason::ProcessStartFailed)?;
@@ -582,11 +590,26 @@ impl RuntimePackages for CachedRuntimePackages {
         // Off the async thread: the daemon runs a current-thread runtime, and a
         // copy (or a seed rebuild) can take minutes on a busy disk.
         let destination = attempt.runtime_path().to_path_buf();
-        self.blocking(installed.root(), move |trusted, source| {
-            copy_package_tree(source, &destination, trusted)
-        })
-        .await?
-        .map_err(|_| FailureReason::ProcessStartFailed)?;
+        let copied = self
+            .blocking(installed.root(), move |trusted, source| {
+                copy_package_tree(source, &destination, trusted)?;
+                // Checked again after the copy: an edit a job made while it ran
+                // moved the entry's print, and the runtime may hold it.
+                if trusted.holds(source) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        "the runner package changed while copied",
+                    ))
+                }
+            })
+            .await?;
+        if copied.is_err() {
+            // Nothing a failed or tainted copy left may reach a retry's copy,
+            // which lays out over the same runtime.
+            let _ = remove_materialized_package(attempt);
+            return Err(FailureReason::ProcessStartFailed);
+        }
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
             // slot's `_work` is retained across attempts, and this rollback
@@ -1343,7 +1366,15 @@ fn copy_package_tree(
             .ok()
             .filter(|seed| refuse_work_folder(seed).is_ok())
             .unwrap_or_else(|| source.to_path_buf());
-        clone_tree(&origin, destination)
+        clone_tree(&origin, destination)?;
+        // A seed a job edited during the clone no longer holds; the caller
+        // re-checks the cache entry itself.
+        if origin != source && !seeds.holds(&origin) {
+            return Err(std::io::Error::other(
+                "the package seed changed while cloned",
+            ));
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
