@@ -535,12 +535,16 @@ impl<'a> PruneAuthority<'a> {
 #[derive(Debug)]
 pub struct CachedRuntimePackages {
     cache: Arc<PackageCache>,
+    seeds: Arc<SeedFingerprints>,
 }
 
 impl CachedRuntimePackages {
     #[must_use]
     pub fn new(cache: Arc<PackageCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            seeds: Arc::default(),
+        }
     }
 }
 
@@ -556,7 +560,8 @@ impl RuntimePackages for CachedRuntimePackages {
         // copy (or a seed rebuild) can take minutes on a busy disk.
         let source = installed.root().to_path_buf();
         let destination = attempt.runtime_path().to_path_buf();
-        tokio::task::spawn_blocking(move || copy_package_tree(&source, &destination))
+        let seeds = Arc::clone(&self.seeds);
+        tokio::task::spawn_blocking(move || copy_package_tree(&source, &destination, &seeds))
             .await
             .map_err(|_| FailureReason::ProcessStartFailed)?
             .map_err(|_| FailureReason::ProcessStartFailed)?;
@@ -1300,7 +1305,11 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 /// byte copy of the ~9,000-file package across volumes took four minutes on a
 /// host whose runner root shared a busy disk with a build, and a queued job
 /// waits for every second of it.
-fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn copy_package_tree(
+    source: &Path,
+    destination: &Path,
+    seeds: &SeedFingerprints,
+) -> std::io::Result<()> {
     refuse_work_folder(source)?;
 
     #[cfg(unix)]
@@ -1308,14 +1317,17 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
         // A seed that cannot be made is a slower launch, not a failed one.
         // The seed sits under the runner root, beside job runtimes, so the
         // refusal is re-checked on it; a seed that fails it is bypassed.
-        let origin = package_seed(source, destination)
+        let origin = package_seed(source, destination, seeds)
             .ok()
             .filter(|seed| refuse_work_folder(seed).is_ok())
             .unwrap_or_else(|| source.to_path_buf());
         clone_tree(&origin, destination)
     }
     #[cfg(not(unix))]
-    copy_package_entries(source, destination, true)
+    {
+        let _ = seeds;
+        copy_package_entries(source, destination, true)
+    }
 }
 
 fn refuse_work_folder(source: &Path) -> std::io::Result<()> {
@@ -1345,14 +1357,19 @@ const PACKAGE_SEED_DIR: &str = ".runner-package";
 /// lock for the whole materialization, so no other launch is cloning from a
 /// seed while it is replaced.
 ///
-/// The seed is exactly as trustworthy as the cache entry it was cloned from:
-/// both are owned by the account runners execute as.
+/// The seed sits one `..` from every job's runtime and is owned by the account
+/// jobs run as, so it is only reused while it is provably the tree this
+/// process built: see [`SeedFingerprints`].
 ///
 /// Only on macOS, where the runner root is all but certainly APFS and a clone
 /// is free. On a Linux filesystem without reflinks a seed would only move every
 /// copy's reads onto the runner root's own, possibly busy, disk.
 #[cfg(unix)]
-fn package_seed(source: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+fn package_seed(
+    source: &Path,
+    destination: &Path,
+    seeds: &SeedFingerprints,
+) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
 
     if !cfg!(target_os = "macos") {
@@ -1364,12 +1381,72 @@ fn package_seed(source: &Path, destination: &Path) -> std::io::Result<PathBuf> {
     if fs::metadata(source)?.dev() == fs::metadata(root)?.dev() {
         return Ok(source.to_path_buf());
     }
-    refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR))
+    refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR), seeds)
 }
 
-/// The seed of `source` under `seeds`, rebuilt unless its manifest matches.
+/// What each seed looked like when this process finished building it.
+///
+/// A job runs as the account that owns the seed and can edit any file in it,
+/// so a seed is reused only while its [`seed_fingerprint`] still matches the
+/// one taken right after it was built. Every edit, replacement or rename moves
+/// the change time (`ctime`) of the entry or of its directory, and only the
+/// superuser can set a change time, so a tampered seed cannot keep the print.
+///
+/// Held in memory, never on disk where the same account could rewrite it; a
+/// restarted daemon therefore rebuilds each seed once before trusting it.
+#[derive(Debug, Default)]
+pub(crate) struct SeedFingerprints(
+    #[cfg(unix)] Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
+);
+
+/// A digest of every entry under `root`: its relative path, type, inode,
+/// size, mode, owner and change time.
 #[cfg(unix)]
-fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf> {
+fn seed_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    fn walk(root: &Path, path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        for field in [
+            metadata.ino(),
+            metadata.size(),
+            u64::from(metadata.mode()),
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+        ] {
+            hasher.update(field.to_le_bytes());
+        }
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+        if metadata.is_dir() {
+            let mut children = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            children.sort();
+            for child in children {
+                walk(root, &child, hasher)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    walk(root, root, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+/// The seed of `source` under `seeds`, rebuilt unless its manifest matches the
+/// cache entry's and its fingerprint the one this process recorded.
+#[cfg(unix)]
+fn refresh_package_seed(
+    source: &Path,
+    seeds: &Path,
+    trusted: &SeedFingerprints,
+) -> std::io::Result<PathBuf> {
     use crate::package::MANIFEST_FILE;
 
     let version = source
@@ -1377,9 +1454,17 @@ fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf>
         .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
     let seed = seeds.join(version);
     let manifest = fs::read(source.join(MANIFEST_FILE))?;
-    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest) {
+    let mut prints = trusted
+        .0
+        .lock()
+        .map_err(|_| std::io::Error::other("the seed fingerprints are poisoned"))?;
+    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest)
+        && let Some(recorded) = prints.get(&seed)
+        && seed_fingerprint(&seed).is_ok_and(|current| current == *recorded)
+    {
         return Ok(seed);
     }
+    prints.remove(&seed);
 
     // Superseded versions, a stale seed and interrupted stagings all go.
     match remove_runtime_tree(seeds) {
@@ -1394,6 +1479,8 @@ fn refresh_package_seed(source: &Path, seeds: &Path) -> std::io::Result<PathBuf>
         let _ = remove_runtime_tree(&staging);
         return Err(error);
     }
+    // After the rename, which itself moves the seed directory's change time.
+    prints.insert(seed.clone(), seed_fingerprint(&seed)?);
     Ok(seed)
 }
 
@@ -6291,7 +6378,8 @@ mod tests {
         fs::create_dir_all(&retained).unwrap();
         fs::write(retained.join("checkout.txt"), b"from the first job").unwrap();
 
-        copy_package_tree(&package, &slot).expect("the package lays out around `_work`");
+        copy_package_tree(&package, &slot, &SeedFingerprints::default())
+            .expect("the package lays out around `_work`");
         assert!(slot.join("bin").join("Runner.Listener").exists());
         assert!(
             slot.join("externals").join(DEFAULT_WORK_FOLDER).is_dir(),
@@ -6304,7 +6392,7 @@ mod tests {
 
         // A package that ever grew a top-level `_work` is refused, not merged.
         fs::create_dir(package.join(DEFAULT_WORK_FOLDER)).unwrap();
-        let error = copy_package_tree(&package, &slot).unwrap_err();
+        let error = copy_package_tree(&package, &slot, &SeedFingerprints::default()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
             fs::read_to_string(retained.join("checkout.txt")).unwrap(),
@@ -7345,7 +7433,7 @@ mod tests {
         fs::create_dir_all(&nested_work).unwrap();
         fs::write(nested_work.join("allowed.txt"), b"allowed").unwrap();
 
-        copy_package_tree(&source, &dest).unwrap();
+        copy_package_tree(&source, &dest, &SeedFingerprints::default()).unwrap();
 
         assert_eq!(fs::read_to_string(dest.join("file1.txt")).unwrap(), "hello");
         assert_eq!(
@@ -7395,24 +7483,64 @@ mod tests {
         entry
     }
 
+    /// The seed's binary's inode: a rebuilt seed holds a new file.
+    #[cfg(unix)]
+    fn listener_inode(seed: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(seed.join("bin").join("Runner.Listener"))
+            .unwrap()
+            .ino()
+    }
+
     #[cfg(unix)]
     #[test]
-    fn a_package_seed_is_built_once_and_reused_while_its_manifest_matches() {
+    fn a_package_seed_is_built_once_and_reused_while_untouched() {
         let root = tempfile::tempdir().unwrap();
         let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
         let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = SeedFingerprints::default();
 
-        let seed = refresh_package_seed(&source, &seeds).unwrap();
+        let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
         assert_eq!(seed, seeds.join("2.336.0"));
         assert_eq!(
             fs::read_to_string(seed.join("bin").join("Runner.Listener")).unwrap(),
             "2.336.0"
         );
 
-        // A marker survives only if the second call reuses rather than rebuilds.
-        fs::write(seed.join("marker"), b"kept").unwrap();
-        assert_eq!(refresh_package_seed(&source, &seeds).unwrap(), seed);
-        assert!(seed.join("marker").exists(), "a matching seed is reused");
+        let built = listener_inode(&seed);
+        assert_eq!(
+            refresh_package_seed(&source, &seeds, &trusted).unwrap(),
+            seed
+        );
+        assert_eq!(listener_inode(&seed), built, "an untouched seed is reused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tampered_or_unrecorded_seed_is_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = SeedFingerprints::default();
+        let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
+
+        // A job rewrites the binary in place and leaves the manifest alone.
+        fs::write(seed.join("bin").join("Runner.Listener"), b"planted").unwrap();
+        refresh_package_seed(&source, &seeds, &trusted).unwrap();
+        assert_eq!(
+            fs::read_to_string(seed.join("bin").join("Runner.Listener")).unwrap(),
+            "2.336.0",
+            "a seed whose print moved is rebuilt from the cache entry"
+        );
+
+        // A restarted daemon has no print of a seed it did not build.
+        let built = listener_inode(&seed);
+        refresh_package_seed(&source, &seeds, &SeedFingerprints::default()).unwrap();
+        assert_ne!(
+            listener_inode(&seed),
+            built,
+            "an unrecorded seed is rebuilt"
+        );
     }
 
     #[cfg(unix)]
@@ -7420,13 +7548,14 @@ mod tests {
     fn a_package_seed_is_rebuilt_for_a_new_entry_and_drops_every_other() {
         let root = tempfile::tempdir().unwrap();
         let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = SeedFingerprints::default();
         let old = package_entry(root.path(), "2.335.0", "{\"digest\":\"old\"}");
-        refresh_package_seed(&old, &seeds).unwrap();
+        refresh_package_seed(&old, &seeds, &trusted).unwrap();
         fs::create_dir_all(seeds.join(".staging-interrupted")).unwrap();
         fs::write(seeds.join("stray"), b"").unwrap();
 
         let new = package_entry(root.path(), "2.336.0", "{\"digest\":\"new\"}");
-        let seed = refresh_package_seed(&new, &seeds).unwrap();
+        let seed = refresh_package_seed(&new, &seeds, &trusted).unwrap();
 
         let mut left: Vec<_> = fs::read_dir(&seeds)
             .unwrap()
@@ -7441,9 +7570,9 @@ mod tests {
             "{\"digest\":\"again\"}",
         )
         .unwrap();
-        fs::write(seed.join("marker"), b"stale").unwrap();
-        refresh_package_seed(&new, &seeds).unwrap();
-        assert!(!seed.join("marker").exists(), "a stale seed is rebuilt");
+        let built = listener_inode(&seed);
+        refresh_package_seed(&new, &seeds, &trusted).unwrap();
+        assert_ne!(listener_inode(&seed), built, "a stale seed is rebuilt");
     }
 
     #[cfg(unix)]
@@ -7454,8 +7583,9 @@ mod tests {
         let runtime = root.path().join("runners").join("attempt");
         fs::create_dir_all(&runtime).unwrap();
 
-        assert_eq!(package_seed(&source, &runtime).unwrap(), source);
-        copy_package_tree(&source, &runtime).unwrap();
+        let trusted = SeedFingerprints::default();
+        assert_eq!(package_seed(&source, &runtime, &trusted).unwrap(), source);
+        copy_package_tree(&source, &runtime, &trusted).unwrap();
         assert!(runtime.join("bin").join("Runner.Listener").exists());
         assert!(!root.path().join("runners").join(PACKAGE_SEED_DIR).exists());
     }
@@ -7473,7 +7603,7 @@ mod tests {
         let top_work = source.join(DEFAULT_WORK_FOLDER);
         fs::create_dir_all(&top_work).unwrap();
 
-        let err = copy_package_tree(&source, &dest).unwrap_err();
+        let err = copy_package_tree(&source, &dest, &SeedFingerprints::default()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
