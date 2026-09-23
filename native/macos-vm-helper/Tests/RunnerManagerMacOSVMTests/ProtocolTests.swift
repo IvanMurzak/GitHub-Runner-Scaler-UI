@@ -3,6 +3,30 @@ import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class ProtocolTests: XCTestCase {
+    func testStorePermissionErrorsRemainTypedAndRedacted() {
+        let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [
+            NSLocalizedDescriptionKey: "token=secret path=/private/guest-output",
+        ])
+        let denied = sanitized(
+            NSError(domain: NSCocoaErrorDomain, code: 999, userInfo: [
+                NSUnderlyingErrorKey: underlying,
+                NSLocalizedDescriptionKey: "credential=secret",
+            ]),
+            "helper store initialization failed"
+        )
+        XCTAssertEqual(denied.exit, .permission)
+        XCTAssertEqual(denied.message, "helper store permission denied")
+
+        let other = sanitized(
+            NSError(domain: NSCocoaErrorDomain, code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "credential=secret",
+            ]),
+            "helper store initialization failed"
+        )
+        XCTAssertEqual(other.exit, .failure)
+        XCTAssertEqual(other.message, "helper store initialization failed")
+    }
+
     func testSupervisorReceivesOnlyThePrivateStoreLocation() {
         let root = URL(fileURLWithPath: "/private/runner-manager-vm-store", isDirectory: true)
         XCTAssertEqual(
