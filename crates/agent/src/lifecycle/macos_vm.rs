@@ -1200,12 +1200,14 @@ fn read_bounded_response(mut reader: impl std::io::Read) -> std::io::Result<Vec<
 
 fn read_bounded_stderr(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut stderr = Vec::new();
-    reader
-        .by_ref()
-        .take((MAX_HELPER_STDERR + 1) as u64)
-        .read_to_end(&mut stderr)?;
-    if stderr.len() > MAX_HELPER_STDERR {
-        stderr.truncate(MAX_HELPER_STDERR);
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_HELPER_STDERR.saturating_sub(stderr.len());
+        stderr.extend_from_slice(&buffer[..count.min(remaining)]);
     }
     Ok(stderr)
 }
@@ -1818,8 +1820,10 @@ mod tests {
     #[test]
     fn helper_stderr_is_captured_with_a_hard_bound() {
         let oversized = vec![b'x'; MAX_HELPER_STDERR + 4096];
-        let captured = read_bounded_stderr(std::io::Cursor::new(oversized)).unwrap();
+        let mut input = std::io::Cursor::new(oversized);
+        let captured = read_bounded_stderr(&mut input).unwrap();
         assert_eq!(captured.len(), MAX_HELPER_STDERR);
+        assert_eq!(input.position(), (MAX_HELPER_STDERR + 4096) as u64);
     }
 
     #[cfg(windows)]
