@@ -23,9 +23,17 @@ struct Store {
         root = URL(fileURLWithPath: configured, isDirectory: true).standardizedFileURL
         templates = root.appendingPathComponent("templates", isDirectory: true)
         environments = root.appendingPathComponent("environments", isDirectory: true)
-        try ensureDirectory(root)
-        try ensureDirectory(templates)
-        try ensureDirectory(environments)
+        do {
+            try ensureDirectory(root)
+            try ensureDirectory(templates)
+            try ensureDirectory(environments)
+        } catch {
+            // A boot LaunchDaemon can have a different macOS volume-access
+            // context from the interactive operator who registered a template.
+            // Preserve that distinction through the helper protocol instead of
+            // falling through main's generic exit-1 failure.
+            throw sanitized(error, "helper store initialization failed")
+        }
     }
 
     func templateDirectory(_ digest: String) -> URL {
@@ -372,8 +380,26 @@ func archiveRunner(source: URL, destination: URL) throws {
 
 func sanitized(_ error: Error, _ fallback: String) -> HelperFailure {
     if let failure = error as? HelperFailure { return failure }
-    if (error as NSError).code == Int(EACCES) || (error as NSError).code == Int(EPERM) {
+    if isPermissionDenied(error) {
         return HelperFailure(exit: .permission, message: "helper store permission denied")
     }
     return HelperFailure.degraded(fallback)
+}
+
+private func isPermissionDenied(_ error: Error) -> Bool {
+    let cocoa = error as NSError
+    if cocoa.domain == NSPOSIXErrorDomain,
+       cocoa.code == Int(EACCES) || cocoa.code == Int(EPERM)
+    {
+        return true
+    }
+    if cocoa.domain == NSCocoaErrorDomain,
+       cocoa.code == NSFileReadNoPermissionError || cocoa.code == NSFileWriteNoPermissionError
+    {
+        return true
+    }
+    if let underlying = cocoa.userInfo[NSUnderlyingErrorKey] as? Error {
+        return isPermissionDenied(underlying)
+    }
+    return false
 }

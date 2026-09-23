@@ -52,6 +52,12 @@ JIT stdin, bounded stdout, and process completion. On expiry it terminates the
 helper and reports a typed timeout diagnostic; no operation retries a JIT
 handoff.
 
+Runner Manager captures at most 4 KiB of helper stderr, but accepts only exact,
+closed diagnostics emitted by this repository's helper. It never copies
+arbitrary stderr, guest output, environment values, paths, or credentials into
+provider failures. A store permission failure is reported as a typed
+service-account permission problem instead of the generic degraded state.
+
 ## Readiness and image contract
 
 `probe --json` returns:
@@ -271,6 +277,15 @@ memory, disk, bootstrap, signing, or host-architecture combinations fail
 before JIT is requested or consumed.
 
 ## Operator validation
+
+The interactive operator and a boot LaunchDaemon can have different macOS
+volume access. The helper store must be reachable by the service context as
+well as by the account that registered the template. This is especially
+relevant when the default path under `/Library/Application Support` is a
+symlink to `/Volumes`: a successful interactive `probe` or `image inspect`
+does not prove that the background service can open the target volume. Move the
+store to a service-accessible volume or grant the signed helper the required
+volume access before enabling the profile.
 
 Run `runner-manager host isolation status` as the daemon service account. This
 reports host prerequisites only because it has no policy image. A ready helper

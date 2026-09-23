@@ -34,6 +34,7 @@ use super::{
 const PROTOCOL_VERSION: u16 = 1;
 const DEFAULT_HELPER: &str = "runner-manager-macos-vm";
 const MAX_RESPONSE: usize = 64 * 1024;
+const MAX_HELPER_STDERR: usize = 4 * 1024;
 const MAX_DIAGNOSTICS: usize = 32;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROCESS_LIMIT: u32 = 512;
@@ -46,7 +47,10 @@ pub enum MacOsVmHostState {
     UnsupportedArchitecture,
     HelperNotInstalled,
     HelperPermissionDenied,
+    HelperStorePermissionDenied,
     HelperTimedOut,
+    HelperIoFailed,
+    HelperExitedUnexpectedly,
     HelperIncompatible,
     EntitlementMissing,
     PrivateChannelUnavailable,
@@ -63,12 +67,14 @@ impl MacOsVmHostState {
                 ProviderCapability::Unsupported
             }
             Self::HelperNotInstalled => ProviderCapability::NotInstalled,
-            Self::HelperPermissionDenied | Self::EntitlementMissing => {
-                ProviderCapability::PermissionDenied
-            }
+            Self::HelperPermissionDenied
+            | Self::HelperStorePermissionDenied
+            | Self::EntitlementMissing => ProviderCapability::PermissionDenied,
             Self::PrivateChannelUnavailable
             | Self::ResourceLimitsUnavailable
             | Self::HelperTimedOut
+            | Self::HelperIoFailed
+            | Self::HelperExitedUnexpectedly
             | Self::RuntimeDegraded => ProviderCapability::Degraded,
         }
     }
@@ -87,9 +93,18 @@ impl MacOsVmHostState {
             Self::HelperPermissionDenied => {
                 Some("allow the runner-manager service account to execute the macOS VM helper")
             }
+            Self::HelperStorePermissionDenied => Some(
+                "move the macOS VM helper store to a volume the background service can access, or grant the signed helper access to that volume",
+            ),
             Self::HelperTimedOut => {
                 Some("repair the macOS VM helper operation that exceeded the five-minute timeout")
             }
+            Self::HelperIoFailed => {
+                Some("repair the macOS VM helper process I/O channel and retry the operation")
+            }
+            Self::HelperExitedUnexpectedly => Some(
+                "inspect the signed macOS VM helper installation and retry the failed operation",
+            ),
             Self::HelperIncompatible => Some("install a helper that implements protocol version 1"),
             Self::EntitlementMissing => Some(
                 "install and sign the helper with the required Virtualization.framework entitlement",
@@ -189,13 +204,19 @@ impl MacOsVmProcesses {
             Err(HelperFailure::PermissionDenied) => {
                 return MacOsVmHostState::HelperPermissionDenied;
             }
+            Err(HelperFailure::StorePermissionDenied) => {
+                return MacOsVmHostState::HelperStorePermissionDenied;
+            }
             Err(HelperFailure::TimedOut) => return MacOsVmHostState::HelperTimedOut,
+            Err(HelperFailure::IoFailed) => return MacOsVmHostState::HelperIoFailed,
+            Err(HelperFailure::UnexpectedExit) => {
+                return MacOsVmHostState::HelperExitedUnexpectedly;
+            }
             Err(
                 HelperFailure::Missing | HelperFailure::Rejected | HelperFailure::TemplateMismatch,
             ) => {
                 return MacOsVmHostState::HelperIncompatible;
             }
-            Err(HelperFailure::Degraded) => return MacOsVmHostState::RuntimeDegraded,
         };
         let Ok(probe) = serde_json::from_slice::<ProbeResponse>(&response) else {
             return MacOsVmHostState::HelperIncompatible;
@@ -432,12 +453,15 @@ impl ExecutionProvider for MacOsVmProcesses {
         match self.inspect_image_metadata(image) {
             Ok(_) => ProviderCapability::Ready,
             Err(HelperFailure::NotInstalled) => ProviderCapability::NotInstalled,
-            Err(HelperFailure::PermissionDenied) => ProviderCapability::PermissionDenied,
+            Err(HelperFailure::PermissionDenied | HelperFailure::StorePermissionDenied) => {
+                ProviderCapability::PermissionDenied
+            }
             Err(
                 HelperFailure::Missing | HelperFailure::Rejected | HelperFailure::TemplateMismatch,
             ) => ProviderCapability::ImageUnavailableOrIncompatible,
-            Err(HelperFailure::Degraded) => ProviderCapability::Degraded,
-            Err(HelperFailure::TimedOut) => ProviderCapability::Degraded,
+            Err(
+                HelperFailure::TimedOut | HelperFailure::IoFailed | HelperFailure::UnexpectedExit,
+            ) => ProviderCapability::Degraded,
         }
     }
 
@@ -979,6 +1003,9 @@ fn image_helper_failure(error: HelperFailure) -> FailureReason {
     match error {
         HelperFailure::NotInstalled => failure("macOS VM helper is not installed"),
         HelperFailure::PermissionDenied => failure("macOS VM helper permission denied"),
+        HelperFailure::StorePermissionDenied => {
+            failure("macOS VM helper store is inaccessible to the service account")
+        }
         HelperFailure::Missing | HelperFailure::Rejected => {
             failure("macOS VM image is unavailable or incompatible")
         }
@@ -986,7 +1013,8 @@ fn image_helper_failure(error: HelperFailure) -> FailureReason {
             failure("macOS VM template digest does not match policy")
         }
         HelperFailure::TimedOut => failure("macOS VM helper timed out"),
-        HelperFailure::Degraded => failure("macOS VM helper is degraded"),
+        HelperFailure::IoFailed => failure("macOS VM helper process I/O failed"),
+        HelperFailure::UnexpectedExit => failure("macOS VM helper exited unexpectedly"),
     }
 }
 
@@ -994,11 +1022,15 @@ fn operation_helper_failure(error: HelperFailure) -> FailureReason {
     match error {
         HelperFailure::NotInstalled => failure("macOS VM helper is not installed"),
         HelperFailure::PermissionDenied => failure("macOS VM helper permission denied"),
+        HelperFailure::StorePermissionDenied => {
+            failure("macOS VM helper store is inaccessible to the service account")
+        }
         HelperFailure::Missing => failure("macOS VM resource is absent"),
         HelperFailure::Rejected => failure("macOS VM helper rejected the operation"),
         HelperFailure::TemplateMismatch => failure("macOS VM template digest mismatch"),
         HelperFailure::TimedOut => failure("macOS VM helper operation timed out"),
-        HelperFailure::Degraded => failure("macOS VM helper operation failed"),
+        HelperFailure::IoFailed => failure("macOS VM helper process I/O failed"),
+        HelperFailure::UnexpectedExit => failure("macOS VM helper exited unexpectedly"),
     }
 }
 
@@ -1010,11 +1042,15 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 enum HelperFailure {
     NotInstalled,
     PermissionDenied,
+    /// The helper's closed diagnostic reported that its store cannot be used
+    /// from this process context. No helper-provided text is retained.
+    StorePermissionDenied,
     Missing,
     Rejected,
     TemplateMismatch,
     TimedOut,
-    Degraded,
+    IoFailed,
+    UnexpectedExit,
 }
 
 trait HelperCommand: std::fmt::Debug + Send + Sync {
@@ -1059,7 +1095,7 @@ fn invoke_command(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let deadline = Instant::now() + timeout;
 
@@ -1090,6 +1126,14 @@ fn invoke_command(
     thread::spawn(move || {
         let _ = stdout_send.send(read_bounded_response(stdout));
     });
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("helper stderr unavailable"))?;
+    let (stderr_send, stderr_receive) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stderr_send.send(read_bounded_stderr(stderr));
+    });
 
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -1107,10 +1151,11 @@ fn invoke_command(
         receive_until(result, deadline, "helper stdin")?;
     }
     let stdout = receive_until(stdout_receive, deadline, "helper stdout")?;
+    let stderr = receive_until(stderr_receive, deadline, "helper stderr")?;
     Ok(Output {
         status,
         stdout,
-        stderr: Vec::new(),
+        stderr,
     })
 }
 
@@ -1153,6 +1198,30 @@ fn read_bounded_response(mut reader: impl std::io::Read) -> std::io::Result<Vec<
     Ok(response)
 }
 
+fn read_bounded_stderr(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut stderr = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_HELPER_STDERR + 1) as u64)
+        .read_to_end(&mut stderr)?;
+    if stderr.len() > MAX_HELPER_STDERR {
+        stderr.truncate(MAX_HELPER_STDERR);
+    }
+    Ok(stderr)
+}
+
+/// Translate only diagnostics emitted by the helper shipped in this repository.
+/// The returned type carries no text, so an alternate helper, guest output, an
+/// environment dump, or a credential-shaped value can never cross this seam.
+fn closed_helper_diagnostic(stderr: &[u8]) -> Option<HelperFailure> {
+    match stderr {
+        b"runner-manager-macos-vm: helper store permission denied\n" => {
+            Some(HelperFailure::StorePermissionDenied)
+        }
+        _ => None,
+    }
+}
+
 impl HelperCommand for SystemHelper {
     fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<Vec<u8>, HelperFailure> {
         let output = self
@@ -1161,16 +1230,19 @@ impl HelperCommand for SystemHelper {
                 std::io::ErrorKind::NotFound => HelperFailure::NotInstalled,
                 std::io::ErrorKind::PermissionDenied => HelperFailure::PermissionDenied,
                 std::io::ErrorKind::TimedOut => HelperFailure::TimedOut,
-                _ => HelperFailure::Degraded,
+                _ => HelperFailure::IoFailed,
             })?;
         if output.status.success() {
             return Ok(output.stdout);
+        }
+        if let Some(failure) = closed_helper_diagnostic(&output.stderr) {
+            return Err(failure);
         }
         Err(match output.status.code() {
             Some(66) => HelperFailure::Missing,
             Some(77) => HelperFailure::PermissionDenied,
             Some(78) => HelperFailure::Rejected,
-            _ => HelperFailure::Degraded,
+            _ => HelperFailure::UnexpectedExit,
         })
     }
 }
@@ -1517,13 +1589,21 @@ mod tests {
                 HelperFailure::PermissionDenied,
                 MacOsVmHostState::HelperPermissionDenied,
             ),
+            (
+                HelperFailure::StorePermissionDenied,
+                MacOsVmHostState::HelperStorePermissionDenied,
+            ),
             (HelperFailure::TimedOut, MacOsVmHostState::HelperTimedOut),
+            (HelperFailure::IoFailed, MacOsVmHostState::HelperIoFailed),
+            (
+                HelperFailure::UnexpectedExit,
+                MacOsVmHostState::HelperExitedUnexpectedly,
+            ),
             (HelperFailure::Missing, MacOsVmHostState::HelperIncompatible),
             (
                 HelperFailure::Rejected,
                 MacOsVmHostState::HelperIncompatible,
             ),
-            (HelperFailure::Degraded, MacOsVmHostState::RuntimeDegraded),
         ] {
             helper.set_probe(Err(failure));
             assert_eq!(provider.probe_host(), expected);
@@ -1575,6 +1655,10 @@ mod tests {
                 ProviderCapability::PermissionDenied,
             ),
             (
+                HelperFailure::StorePermissionDenied,
+                ProviderCapability::PermissionDenied,
+            ),
+            (
                 HelperFailure::Missing,
                 ProviderCapability::ImageUnavailableOrIncompatible,
             ),
@@ -1582,8 +1666,9 @@ mod tests {
                 HelperFailure::Rejected,
                 ProviderCapability::ImageUnavailableOrIncompatible,
             ),
-            (HelperFailure::Degraded, ProviderCapability::Degraded),
             (HelperFailure::TimedOut, ProviderCapability::Degraded),
+            (HelperFailure::IoFailed, ProviderCapability::Degraded),
+            (HelperFailure::UnexpectedExit, ProviderCapability::Degraded),
             (
                 HelperFailure::TemplateMismatch,
                 ProviderCapability::ImageUnavailableOrIncompatible,
@@ -1711,6 +1796,30 @@ mod tests {
                 .expect_err("helper must time out");
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         }
+    }
+
+    #[test]
+    fn helper_stderr_accepts_only_a_closed_non_secret_diagnostic() {
+        assert_eq!(
+            closed_helper_diagnostic(b"runner-manager-macos-vm: helper store permission denied\n"),
+            Some(HelperFailure::StorePermissionDenied)
+        );
+
+        for untrusted in [
+            b"runner output: ACTIONS_RUNNER_INPUT_JITCONFIG=secret\n".as_slice(),
+            b"runner-manager-macos-vm: helper store permission denied token=secret\n".as_slice(),
+            b"runner-manager-macos-vm: helper store permission denied\nextra guest output\n"
+                .as_slice(),
+        ] {
+            assert_eq!(closed_helper_diagnostic(untrusted), None);
+        }
+    }
+
+    #[test]
+    fn helper_stderr_is_captured_with_a_hard_bound() {
+        let oversized = vec![b'x'; MAX_HELPER_STDERR + 4096];
+        let captured = read_bounded_stderr(std::io::Cursor::new(oversized)).unwrap();
+        assert_eq!(captured.len(), MAX_HELPER_STDERR);
     }
 
     #[cfg(windows)]
