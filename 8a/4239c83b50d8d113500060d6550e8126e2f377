@@ -1,0 +1,35 @@
+crates/agent/src/lifecycle/macos_vm.rs
+  s_5801a853f78e8a::t_efb2d90604ae68 1240,1592-1595,1657-1659,1801-1803,1805-1822
+  s_5801a853f78e8a::t_effa7bb2c9fe24 37,50,70-71,96-97,207-208,456-457,1006-1007,1025-1027,1045-1047,1098,1129-1136,1154,1158,1201-1221,1238-1239
+  s_5801a853f78e8a::t_3e4970809a1644 1597-1601,1670-1671
+  s_5801a853f78e8a::t_4a1abb5ea6cdf0 52-53,72,76-77,98,102-104,209,211-214,458,462,464,1008,1016-1017,1032-1033,1052-1053,1222,1224,1233,1245,1660,1804,1823-1824
+  s_5801a853f78e8a::t_23aa69e0dfa37b 105-107,463
+  s_5801a853f78e8a::t_08f81c92ac26d4 1223
+native/macos-vm-helper/Tests/RunnerManagerMacOSVMTests/ProtocolTests.swift
+  s_5801a853f78e8a::t_f589d935251e1c 6,10,14-27
+  s_5801a853f78e8a::t_0d68b671dbe5f4 7-9,11-13
+  s_5801a853f78e8a::t_2e0c4354378d0c 28-29
+docs/macos-vm-helper.md
+  s_5801a853f78e8a::t_9b82d3c0b42553 55-60,281-288
+  s_5801a853f78e8a::t_863e8cd2c1c498 289
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/Store.swift
+  s_5801a853f78e8a::t_effa7bb2c9fe24 27-35
+  s_5801a853f78e8a::t_0d68b671dbe5f4 383,388-405
+  s_5801a853f78e8a::t_718ee2219820c8 26,36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8a4239c83b50d8d113500060d6550e8126e2f377",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
