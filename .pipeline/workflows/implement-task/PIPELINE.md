@@ -8,9 +8,9 @@ the contract to maintainers.
 ## End state
 
 The requested change and its tests are committed on a run worktree branch,
-reviewed with fixes, simplified where useful, and proposed against `runner-sandbox-isolation` through a
-pull request. The completed worktree and local run branch are then reaped by the
-pipeline CLI.
+reviewed with fixes, simplified where useful, and proposed against the
+manifest's `base_branch` through a pull request. The completed worktree and
+local run branch are then reaped by the pipeline CLI.
 
 ## Publishing invariant
 
@@ -47,8 +47,12 @@ committed normally from the main checkout instead.
 ## Start a run
 
 ```text
-/pipeline:run <repo>/.pipeline/workflows/implement-task '<task text, issue reference, or .taskflow task path>'
+/pipeline:run <repo>/.pipeline/workflows/implement-task --var PP_TASK='<task text, issue reference, or .taskflow task path>'
 ```
+
+`PP_TASK` is deliberately shared with all four steps so implementation,
+review, simplification, and publication use the same scope. An empty value is
+invalid task input and must make the executor stop rather than invent work.
 
 A run halted at `land` keeps its worktree. Resume the same run after addressing
 the reported blocker; `land` reuses an existing open PR for the run branch.
