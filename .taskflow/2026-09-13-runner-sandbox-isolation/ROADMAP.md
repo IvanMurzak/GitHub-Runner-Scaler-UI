@@ -385,3 +385,6 @@ Read-only recovery forensics were exported, the run was cancelled, and guarded
 cleanup plus rollback removed the temporary profile, service and receipt.
 Native acceptance remains blocked only on granting Full Disk Access to the
 actual runner and helper executables before a fresh retry.
+Audit was then rerun only to recreate the protected runner executable for the
+owner's Full Disk Access selection. Its receipt is intentionally retained;
+there is no temporary profile, disposable service or VM environment.
