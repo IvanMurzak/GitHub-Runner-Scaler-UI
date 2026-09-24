@@ -161,7 +161,7 @@ fn help_for(path: &[&str]) -> String {
 }
 
 #[test]
-fn version_reports_the_package_version() {
+fn version_reports_a_distinguishable_build_version() {
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let outcome = run({
         let mut command = runner_manager(temporary.path());
@@ -171,9 +171,13 @@ fn version_reports_the_package_version() {
     assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
     assert_eq!(
         outcome.stdout.trim(),
-        format!("runner-manager {}", env!("CARGO_PKG_VERSION")),
+        format!("runner-manager {}", env!("RUNNER_MANAGER_BUILD_VERSION")),
         "Journey 0 step 2 is `runner-manager --version` to confirm the install, so the \
-         output has to name the product and its version and nothing else"
+         output has to name the product and its build version and nothing else"
+    );
+    assert!(
+        env!("RUNNER_MANAGER_BUILD_VERSION").starts_with(env!("CARGO_PKG_VERSION")),
+        "the build identity must retain the package version"
     );
 }
 
