@@ -1,0 +1,31 @@
+.pipeline/workflows/implement-task/PIPELINE.md
+  s_5801a853f78e8a::t_d54d88b5459629 11-13,50,53-56
+.pipeline/workflows/implement-task/pipeline.yml
+  s_5801a853f78e8a::t_0d68e887a54d5c 11-13,18,25,32,39
+.pipeline/workflows/implement-task/_shared/task-input.md
+  s_7da33c11c5bbcc::t_a36d7df70faa49 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "29ed974580d8f8a3e55228a83774e6b7728fee96",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_7da33c11c5bbcc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d0e3-ba90-7a52-9066-64832bbc7001",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
