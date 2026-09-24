@@ -1,0 +1,18 @@
+crates/agent/src/lifecycle.rs
+  h_8325a340bf5897 2850-2882,5710-5785
+scripts/macos-vm-acceptance.sh
+  h_8325a340bf5897 201,208,213,218,220-225,383-388,572-573
+tests/macos-vm-acceptance-contract.sh
+  h_8325a340bf5897 119-158,269-346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9901bad244d13bb67449d78fe962a5e77c42831e",
+  "prompts": {},
+  "humans": {
+    "h_8325a340bf5897": {
+      "author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
