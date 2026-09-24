@@ -792,10 +792,13 @@ fn upgraded_version(path: &std::path::Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let reported = String::from_utf8(output.stdout).ok()?;
+    changed_build_version(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn changed_build_version(reported: &str) -> Option<String> {
     // `--version` prints `runner-manager X.Y.Z`; the last token is the version.
     let reported = reported.split_whitespace().last()?.to_string();
-    (reported != env!("CARGO_PKG_VERSION")).then_some(reported)
+    (reported != env!("RUNNER_MANAGER_BUILD_VERSION")).then_some(reported)
 }
 
 /// Resolves when a different, runnable version has replaced this daemon's own
@@ -2054,6 +2057,20 @@ mod tests {
         assert!(
             upgraded_version(std::path::Path::new("no-such-binary")).is_none(),
             "a path that cannot be executed is never reported as an upgrade"
+        );
+        assert_eq!(
+            changed_build_version(concat!(
+                "runner-manager ",
+                env!("RUNNER_MANAGER_BUILD_VERSION"),
+                "\n"
+            )),
+            None,
+            "a commit-qualified source build must recognize its own identity"
+        );
+        assert_eq!(
+            changed_build_version("runner-manager 9.9.9\n").as_deref(),
+            Some("9.9.9"),
+            "a genuinely different build must still trigger handover"
         );
     }
 
