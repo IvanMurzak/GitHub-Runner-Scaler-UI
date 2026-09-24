@@ -296,9 +296,13 @@ PY
 owned_environment_count() { owned_environment_dirs | awk 'END { print NR+0 }'; }
 
 wait_no_owned_environments() {
-  local deadline=$((SECONDS + ${1:-300}))
+  local deadline=$((SECONDS + ${1:-300})) count
   while (( SECONDS < deadline )); do
-    [[ $(owned_environment_count) -eq 0 ]] && return
+    if ! count=$(owned_environment_count); then
+      die 'could not verify whether receipt-owned provider VMs remain'
+    fi
+    [[ $count =~ ^[0-9]+$ ]] || die 'receipt-owned environment count was not numeric'
+    [[ $count -eq 0 ]] && return
     sleep 2
   done
   die 'receipt-owned provider VM remained after the cleanup deadline'
@@ -307,12 +311,15 @@ wait_no_owned_environments() {
 wait_profile_inactive() {
   local profile=$1 deadline=$((SECONDS + ${2:-90})) remaining
   while (( SECONDS < deadline )); do
-    remaining=$(runner status --json | python3 -c '
+    if ! remaining=$(runner status --json | python3 -c '
 import json, sys
 document=json.load(sys.stdin)
 profiles=[p for p in document["policies"] if p["target"]==sys.argv[1] and p["profile_name"]==sys.argv[2]]
 print(0 if not profiles else profiles[0]["active_attempts"] + profiles[0]["cleanup_blocked_attempts"])
-' "$repository" "$profile")
+' "$repository" "$profile"); then
+      die "could not verify whether receipt-owned profile '$profile' still holds attempts"
+    fi
+    [[ $remaining =~ ^[0-9]+$ ]] || die "receipt-owned profile '$profile' reported a non-numeric attempt count"
     [[ $remaining -eq 0 ]] && return
     sleep 2
   done
@@ -329,11 +336,26 @@ wait_service_absent() {
 }
 
 cancel_recorded_runs() {
-  local key run_id
+  local key run_id status failures=0
   for key in normal_run_id reboot_run_id; do
-    run_id=$(state_get "$key")
-    [[ -z $run_id ]] || gh run cancel "$run_id" --repo "$repository" >/dev/null 2>&1 || true
+    if ! run_id=$(state_get "$key"); then
+      printf "could not read recorded workflow run field '%s'\n" "$key" >&2
+      failures=1
+      continue
+    fi
+    [[ -z $run_id ]] && continue
+    if ! status=$(gh run view "$run_id" --repo "$repository" --json status --jq .status); then
+      printf "could not inspect recorded workflow run '%s' before cancellation\n" "$run_id" >&2
+      failures=1
+      continue
+    fi
+    [[ $status == completed ]] && continue
+    if ! gh run cancel "$run_id" --repo "$repository" >/dev/null; then
+      printf "could not cancel recorded workflow run '%s'\n" "$run_id" >&2
+      failures=1
+    fi
   done
+  return "$failures"
 }
 
 wait_for_run() {
@@ -464,22 +486,25 @@ trigger_label() {
 }
 
 dispatch_job() {
-  local label=$1
+  local label=$1 run_key=$2
   gh label create "$label" --repo "$repository" --color 8250df \
-    --description "One-time d3 native acceptance trigger for PR $pull_request"
-  state_set trigger_label "$label"
-  state_set trigger_label_created true bool
-  gh pr edit "$pull_request" --repo "$repository" --add-label "$label" >/dev/null
+    --description "One-time d3 native acceptance trigger for PR $pull_request" || return 1
+  state_set trigger_label "$label" || return 1
+  state_set trigger_label_created true bool || return 1
+  gh pr edit "$pull_request" --repo "$repository" --add-label "$label" >/dev/null || return 1
   local run_id
-  run_id=$(find_run "$label")
-  remove_trigger_label
+  run_id=$(find_run "$label") || return 1
+  state_set "$run_key" "$run_id" || return 1
+  remove_trigger_label || return 1
   printf '%s\n' "$run_id"
 }
 
 remove_trigger_label() {
-  [[ $(state_get trigger_label_created) == true ]] || return 0
-  local label
-  label=$(state_get trigger_label)
+  local created label
+  created=$(state_get trigger_label_created) || die 'could not read trigger-label ownership from the receipt'
+  [[ $created == true ]] || return 0
+  label=$(state_get trigger_label) || die 'could not read the owned trigger label from the receipt'
+  [[ -n $label ]] || die 'receipt says it owns a trigger label but records no label name'
   gh pr edit "$pull_request" --repo "$repository" --remove-label "$label" >/dev/null || \
     die "could not remove one-time label '$label' from PR $pull_request"
   gh label delete "$label" --repo "$repository" --yes >/dev/null || \
@@ -554,7 +579,10 @@ r=json.load(open(sys.argv[1])); print(r['environment_id'],r['host_id'],r['attemp
 PY
 )
     [[ $environment == rm-* ]] || die 'refusing to destroy an unrecognized environment'
-    helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"
+    if ! helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"; then
+      printf "could not destroy receipt-owned environment '%s'\n" "$environment" >&2
+      return 1
+    fi
   done <<<"$listing"
 }
 
@@ -583,21 +611,32 @@ run_job_failure_cleanup() {
   run_job_cleanup_armed=false
   run_job_cleanup_running=true
   set +e
-  preserve_failure_evidence "$evidence"
   cancel_recorded_runs || failures=1
   (remove_trigger_label) || failures=1
   profile=$(state_get profile_name 2>/dev/null || true)
   if [[ $(state_get profile_created 2>/dev/null || true) == true && -n $profile ]]; then
-    disable_profile "$profile" || failures=1
-    (destroy_receipt_owned_environments) || failures=1
-    (wait_no_owned_environments 60) || failures=1
-    (wait_profile_inactive "$profile" 90) || failures=1
-    purge_profile "$profile" || failures=1
-    if [[ $failures -eq 0 ]]; then
-      state_set profile_created false bool
-      state_set profile_name ''
-      state_set cleanup_complete true bool
+    if ! disable_profile "$profile"; then
+      failures=1
+      preserve_failure_evidence "$evidence"
+    else
+      preserve_failure_evidence "$evidence"
+      if ! (destroy_receipt_owned_environments); then
+        failures=1
+      elif ! (wait_no_owned_environments 60); then
+        failures=1
+      elif ! (wait_profile_inactive "$profile" 90); then
+        failures=1
+      elif ! purge_profile "$profile"; then
+        failures=1
+      elif ! state_set profile_created false bool ||
+           ! state_set profile_name '' ||
+           ! state_set cleanup_complete true bool; then
+          printf 'receipt-owned resources were removed, but the cleanup result could not be persisted\n' >&2
+          failures=1
+      fi
     fi
+  else
+    preserve_failure_evidence "$evidence"
   fi
   if [[ $failures -eq 0 ]]; then
     printf 'run-job failed with status %s; receipt-owned run, profile, and environments were cleaned. Evidence: %s\n' \
@@ -682,8 +721,7 @@ run_job() {
   run_job_cleanup_armed=true
   trap 'run_job_failure_cleanup "$?"' EXIT
   install_service_and_profile "$profile" "$selector" "$evidence"
-  run_id=$(dispatch_job "$trigger")
-  state_set normal_run_id "$run_id"
+  run_id=$(dispatch_job "$trigger" normal_run_id)
   env_json="$evidence/environment-live.json"
   capture_single_environment "$env_json" 600 >/dev/null
   state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
@@ -722,7 +760,7 @@ prepare_reboot() {
   evidence="$evidence_root/reboot-$acceptance_id"; mkdir -m 700 "$evidence"
   require_opt_in "$allow_profile" --allow-profile 'creating the reboot-recovery profile'
   ensure_profile "$profile" "$selector" "$evidence"
-  run_id=$(dispatch_job "$trigger"); state_set reboot_run_id "$run_id"
+  run_id=$(dispatch_job "$trigger" reboot_run_id)
   env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" 600 >/dev/null
   disk_id=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")
   [[ $disk_id != "$(state_get normal_writable_disk_id)" ]] || die 'two attempts reused one writable guest disk identity'
@@ -771,16 +809,25 @@ forensics() {
 
 cleanup() {
   assert_state_identity; require_opt_in "$allow_cleanup" --allow-cleanup 'acceptance cleanup'
-  local profile
-  cancel_recorded_runs
-  remove_trigger_label
+  local profile profile_id github_failures=0
+  cancel_recorded_runs || github_failures=1
+  (remove_trigger_label) || github_failures=1
   profile=$(state_get profile_name)
+  profile_id=$(state_get profile_id)
+  if [[ -n $profile && -z $profile_id ]]; then
+    die "receipt-owned profile '$profile' has no durable profile id; refusing unprovable environment cleanup"
+  fi
   [[ -z $profile ]] || disable_profile "$profile" || die "could not disable receipt-owned profile '$profile'"
-  destroy_receipt_owned_environments
-  wait_no_owned_environments 60
+  if [[ -n $profile_id ]]; then
+    destroy_receipt_owned_environments
+    wait_no_owned_environments 60
+  fi
   [[ -z $profile ]] || wait_profile_inactive "$profile" 90
   [[ -z $profile ]] || purge_profile "$profile" || die "could not purge receipt-owned profile '$profile'"
   state_set profile_created false bool; state_set profile_name ''
+  if [[ $github_failures -ne 0 ]]; then
+    die 'local receipt-owned profile and environments were cleaned, but recorded GitHub run or label cleanup was incomplete; retry cleanup'
+  fi
   state_set cleanup_complete true bool
   printf 'Owned profiles and helper environments are clean.\n'
 }

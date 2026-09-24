@@ -266,6 +266,35 @@ for invalid in "rm-d3-$route_id-extra" 'rm-d3-20260919010203-DEADBEEF' "d3-$rout
   fi
 done
 
+# Persist the discovered run id before trigger-label removal so the EXIT trap
+# can cancel it even when the label cleanup itself fails. The dispatcher must
+# propagate that failure despite running inside command substitution.
+dispatch_definition=$(
+  awk '
+    /^dispatch_job\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+dispatch_state=$(mktemp)
+DISPATCH_DEFINITION=$dispatch_definition DISPATCH_STATE=$dispatch_state bash -u <<'BASH'
+set -o pipefail
+eval "$DISPATCH_DEFINITION"
+repository=octo/repo
+pull_request=79
+gh() { :; }
+state_set() { printf '%s=%s\n' "$1" "$2" >>"$DISPATCH_STATE"; }
+find_run() { printf '17\n'; }
+remove_trigger_label() { return 19; }
+set +e
+output=$(dispatch_job rm-d3-test normal_run_id)
+status=$?
+set -e
+[[ $status -eq 1 && -z $output ]]
+grep -Fx 'normal_run_id=17' "$DISPATCH_STATE" >/dev/null
+BASH
+rm -f "$dispatch_state"
+
 # Profile disable failures must remain visible. Cleanup disables the exact
 # receipt-owned profile before touching environments so replacements cannot
 # multiply while the destructive work is in progress.
@@ -294,6 +323,39 @@ grep -F 'profile still has one active isolated attempt' "$REMOVE_ERROR" >/dev/nu
 grep -F "could not disable temporary profile 'd3-test'" "$REMOVE_ERROR" >/dev/null
 BASH
 rm -f "$remove_error"
+
+# Recorded runs must either already be complete or be cancelled successfully.
+# An API failure stays visible so cleanup cannot claim success while a run is
+# still able to create replacement work.
+cancel_runs_definition=$(
+  awk '
+    /^cancel_recorded_runs\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+cancel_error=$(mktemp)
+CANCEL_RUNS_DEFINITION=$cancel_runs_definition CANCEL_ERROR=$cancel_error bash -u <<'BASH'
+set -o pipefail
+eval "$CANCEL_RUNS_DEFINITION"
+repository=octo/repo
+state_get() { [[ $1 == normal_run_id ]] && printf '17\n' || printf '\n'; }
+gh() {
+  if [[ $1 == run && $2 == view ]]; then
+    printf 'in_progress\n'
+    return
+  fi
+  [[ $1 == run && $2 == cancel ]]
+  return 19
+}
+set +e
+cancel_recorded_runs 2>"$CANCEL_ERROR"
+status=$?
+set -e
+[[ $status -eq 1 ]]
+grep -F "could not cancel recorded workflow run '17'" "$CANCEL_ERROR" >/dev/null
+BASH
+rm -f "$cancel_error"
 
 # Environment ownership is derived from the exact profile id in the receipt and
 # the durable attempt journal, not from the first environment id or a global
@@ -344,6 +406,34 @@ fi
 BASH
 rm -rf "$ownership_root"
 
+# An ownership-query failure is not the same as an empty owned-resource set.
+# This remains explicit even when the EXIT handler has disabled errexit.
+owned_count_definition=$(grep -F 'owned_environment_count() {' "$harness")
+wait_no_owned_definition=$(
+  awk '
+    /^wait_no_owned_environments\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+ownership_error=$(mktemp)
+OWNED_COUNT_DEFINITION=$owned_count_definition WAIT_NO_OWNED_DEFINITION=$wait_no_owned_definition \
+  OWNERSHIP_ERROR=$ownership_error bash -u <<'BASH'
+set -o pipefail
+eval "$OWNED_COUNT_DEFINITION"
+eval "$WAIT_NO_OWNED_DEFINITION"
+owned_environment_dirs() { return 19; }
+die() { printf '%s\n' "$*" >&2; exit 42; }
+SECONDS=0
+set +e
+(wait_no_owned_environments 60) 2>"$OWNERSHIP_ERROR"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+grep -F 'could not verify whether receipt-owned provider VMs remain' "$OWNERSHIP_ERROR" >/dev/null
+BASH
+rm -f "$ownership_error"
+
 # Replacement environments need not have the first environment id. Exercise
 # the real destroy loop with two profile-owned attempts and leave an unrelated
 # environment untouched.
@@ -376,6 +466,26 @@ destroy_receipt_owned_environments
 [[ ! -d $DESTROY_ROOT/rm-replacement ]]
 [[ -d $DESTROY_ROOT/rm-unrelated ]]
 BASH
+
+# Helper destruction failures propagate even while the caller is collecting
+# cleanup failures under `set +e`.
+DESTROY_DEFINITION=$destroy_definition DESTROY_ROOT=$destroy_root bash -u <<'BASH'
+set -o pipefail
+eval "$DESTROY_DEFINITION"
+mkdir -p "$DESTROY_ROOT/rm-failing"
+printf '%s\n' '{"environment_id":"rm-failing","host_id":"host-1","attempt_id":"attempt-1","generation":"generation-1"}' \
+  >"$DESTROY_ROOT/rm-failing/metadata.json"
+owned_environment_dirs() { printf '%s\n' "$DESTROY_ROOT/rm-failing"; }
+helper_command() { return 19; }
+die() { printf '%s\n' "$*" >&2; exit 42; }
+set +e
+destroy_receipt_owned_environments 2>"$DESTROY_ROOT/destroy-error.txt"
+status=$?
+set -e
+[[ $status -eq 1 ]]
+grep -F "could not destroy receipt-owned environment 'rm-failing'" \
+  "$DESTROY_ROOT/destroy-error.txt" >/dev/null
+BASH
 rm -rf "$destroy_root"
 
 # Execute the real cleanup body with bounded fakes and assert cancellation,
@@ -407,6 +517,7 @@ purge_profile() { [[ $1 == d3-owned ]]; printf 'purge\n' >>"$CLEANUP_ACTIONS"; }
 state_get() {
   case "$1" in
     profile_name) printf 'd3-owned\n' ;;
+    profile_id) printf 'profile-owned\n' ;;
     *) printf '\n' ;;
   esac
 }
@@ -416,6 +527,49 @@ expected=$(printf 'cancel\nlabel\ndisable\ndestroy\ninactive\npurge')
 [[ $(cat "$CLEANUP_ACTIONS") == "$expected" ]]
 BASH
 rm -rf "$cleanup_root" "$cleanup_actions"
+
+# GitHub cleanup failures remain actionable, but they do not leave the local
+# profile enabled. The receipt does not claim complete cleanup until both sides
+# have succeeded.
+cleanup_actions=$(mktemp)
+cleanup_error=$(mktemp)
+CLEANUP_DEFINITION=$cleanup_definition CLEANUP_ACTIONS=$cleanup_actions \
+  CLEANUP_ERROR=$cleanup_error bash -u <<'BASH'
+set -e
+eval "$CLEANUP_DEFINITION"
+allow_cleanup=true
+assert_state_identity() { :; }
+require_opt_in() { :; }
+cancel_recorded_runs() { printf 'cancel\n' >>"$CLEANUP_ACTIONS"; return 19; }
+remove_trigger_label() { printf 'label\n' >>"$CLEANUP_ACTIONS"; return 19; }
+disable_profile() { printf 'disable\n' >>"$CLEANUP_ACTIONS"; }
+destroy_receipt_owned_environments() { printf 'destroy\n' >>"$CLEANUP_ACTIONS"; }
+wait_no_owned_environments() { printf 'no-owned\n' >>"$CLEANUP_ACTIONS"; }
+wait_profile_inactive() { printf 'inactive\n' >>"$CLEANUP_ACTIONS"; }
+purge_profile() { printf 'purge\n' >>"$CLEANUP_ACTIONS"; }
+state_get() {
+  case "$1" in
+    profile_name) printf 'd3-owned\n' ;;
+    profile_id) printf 'profile-owned\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+state_set() { printf 'state:%s=%s\n' "$1" "$2" >>"$CLEANUP_ACTIONS"; }
+die() { printf '%s\n' "$*" >&2; exit 42; }
+set +e
+(cleanup) 2>"$CLEANUP_ERROR"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+expected=$(printf 'cancel\nlabel\ndisable\ndestroy\nno-owned\ninactive\npurge\nstate:profile_created=false\nstate:profile_name=')
+[[ $(cat "$CLEANUP_ACTIONS") == "$expected" ]]
+grep -F 'recorded GitHub run or label cleanup was incomplete' "$CLEANUP_ERROR" >/dev/null
+if grep -F 'state:cleanup_complete=' "$CLEANUP_ACTIONS" >/dev/null; then
+  printf 'cleanup claimed completion after a GitHub cleanup failure\n' >&2
+  exit 1
+fi
+BASH
+rm -f "$cleanup_actions" "$cleanup_error"
 
 # The EXIT handler preserves evidence, cancels the recorded run, removes the
 # trigger, disables the exact profile, and waits for its capacity to release
@@ -451,11 +605,46 @@ state_get() {
 }
 state_set() { :; }
 run_job_failure_cleanup 19 2>/dev/null
-expected=$(printf 'evidence\ncancel\nlabel\ndisable\ndestroy\nno-owned\ninactive\npurge')
+expected=$(printf 'cancel\nlabel\ndisable\nevidence\ndestroy\nno-owned\ninactive\npurge')
 [[ $(cat "$FAILURE_ACTIONS") == "$expected" ]]
 [[ $run_job_cleanup_armed == false && $run_job_cleanup_running == true ]]
 BASH
 rm -f "$failure_actions"
+
+# Fail closed if the profile cannot be disabled: do not destroy an environment
+# or purge a still-enabled profile, because either action can race replacement
+# allocation and weaken receipt ownership.
+failure_actions=$(mktemp)
+failure_error=$(mktemp)
+FAILURE_CLEANUP_DEFINITION=$failure_cleanup_definition FAILURE_ACTIONS=$failure_actions \
+  FAILURE_ERROR=$failure_error bash -u <<'BASH'
+set -e
+eval "$FAILURE_CLEANUP_DEFINITION"
+run_job_cleanup_armed=true
+run_job_cleanup_running=false
+run_job_cleanup_evidence=/evidence
+preserve_failure_evidence() { printf 'evidence\n' >>"$FAILURE_ACTIONS"; }
+cancel_recorded_runs() { printf 'cancel\n' >>"$FAILURE_ACTIONS"; }
+remove_trigger_label() { printf 'label\n' >>"$FAILURE_ACTIONS"; }
+disable_profile() { printf 'disable\n' >>"$FAILURE_ACTIONS"; return 19; }
+destroy_receipt_owned_environments() { printf 'unexpected-destroy\n' >>"$FAILURE_ACTIONS"; }
+wait_no_owned_environments() { printf 'unexpected-no-owned\n' >>"$FAILURE_ACTIONS"; }
+wait_profile_inactive() { printf 'unexpected-inactive\n' >>"$FAILURE_ACTIONS"; }
+purge_profile() { printf 'unexpected-purge\n' >>"$FAILURE_ACTIONS"; }
+state_get() {
+  case "$1" in
+    profile_name) printf 'd3-owned\n' ;;
+    profile_created) printf 'true\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+state_set() { printf 'unexpected-state-set\n' >>"$FAILURE_ACTIONS"; }
+run_job_failure_cleanup 19 2>"$FAILURE_ERROR"
+expected=$(printf 'cancel\nlabel\ndisable\nevidence')
+[[ $(cat "$FAILURE_ACTIONS") == "$expected" ]]
+grep -F 'automatic cleanup was incomplete' "$FAILURE_ERROR" >/dev/null
+BASH
+rm -f "$failure_actions" "$failure_error"
 
 # Polling is explicitly bounded and low-frequency; no gh run watch subprocess
 # can spin against the user API budget indefinitely.
