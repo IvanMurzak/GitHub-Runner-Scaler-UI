@@ -394,3 +394,6 @@ Forensics were retained and guarded cleanup plus rollback again removed the
 temporary profile, disposable service, receipt and environments. A subsequent
 retry must grant Full Disk Access to the actual runtime executable after audit
 has recreated it.
+Audit has now recreated that runtime executable and its receipt is deliberately
+retained while the owner selects it in Full Disk Access. No temporary profile,
+disposable service or VM environment is active.
