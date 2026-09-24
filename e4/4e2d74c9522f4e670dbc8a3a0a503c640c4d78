@@ -1,0 +1,19 @@
+crates/agent/src/lifecycle.rs
+  s_7da33c11c5bbcc::t_44691c67d8f640 2850-2859,5796-5863
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e44e2d74c9522f4e670dbc8a3a0a503c640c4d78",
+  "prompts": {},
+  "sessions": {
+    "s_7da33c11c5bbcc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d0e3-ba90-7a52-9066-64832bbc7001",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
