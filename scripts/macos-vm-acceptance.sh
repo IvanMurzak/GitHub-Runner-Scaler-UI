@@ -60,6 +60,11 @@ allow_profile=false
 allow_service_restart=false
 allow_cleanup=false
 allow_rollback=false
+run_wait_timeout_seconds=3600
+run_poll_seconds=30
+run_job_cleanup_armed=false
+run_job_cleanup_running=false
+run_job_cleanup_evidence=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repository) repository=${2-}; shift 2 ;;
@@ -253,6 +258,67 @@ wait_no_environments() {
   die 'provider-owned VM remained after the cleanup deadline'
 }
 
+owned_environment_dirs() {
+  local profile_id database
+  profile_id=$(state_get profile_id)
+  [[ -n $profile_id ]] || die 'receipt has no profile id, so environment ownership cannot be proved'
+  database="$data_dir/config/runner-manager.sqlite3"
+  [[ -r $database ]] || die "runner-manager database '$database' is unreadable, so environment ownership cannot be proved"
+  python3 - "$database" "$helper_root" "$profile_id" "$image" <<'PY'
+import json, pathlib, sqlite3, sys
+database, helper_root, profile_id, image = sys.argv[1:]
+with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as connection:
+    attempts = {
+        str(row[0]).lower()
+        for row in connection.execute('SELECT id FROM attempts WHERE policy_id = ?', (profile_id,))
+    }
+root = pathlib.Path(helper_root) / 'environments'
+if not root.is_dir():
+    raise SystemExit(0)
+for directory in sorted(root.iterdir()):
+    if not directory.is_dir() or directory.is_symlink():
+        continue
+    metadata = directory / 'metadata.json'
+    try:
+        record = json.loads(metadata.read_text())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot verify environment ownership at {directory}: {error}")
+    if str(record.get('attempt_id', '')).lower() not in attempts:
+        continue
+    if record.get('environment_id') != directory.name:
+        raise SystemExit(f"owned environment metadata/path mismatch at {directory}")
+    if record.get('image') != image or record.get('template_digest') != image.split('@sha256:', 1)[1]:
+        raise SystemExit(f"owned environment image identity mismatch at {directory}")
+    print(directory)
+PY
+}
+
+owned_environment_count() { owned_environment_dirs | awk 'END { print NR+0 }'; }
+
+wait_no_owned_environments() {
+  local deadline=$((SECONDS + ${1:-300}))
+  while (( SECONDS < deadline )); do
+    [[ $(owned_environment_count) -eq 0 ]] && return
+    sleep 2
+  done
+  die 'receipt-owned provider VM remained after the cleanup deadline'
+}
+
+wait_profile_inactive() {
+  local profile=$1 deadline=$((SECONDS + ${2:-90})) remaining
+  while (( SECONDS < deadline )); do
+    remaining=$(runner status --json | python3 -c '
+import json, sys
+document=json.load(sys.stdin)
+profiles=[p for p in document["policies"] if p["target"]==sys.argv[1] and p["profile_name"]==sys.argv[2]]
+print(0 if not profiles else profiles[0]["active_attempts"] + profiles[0]["cleanup_blocked_attempts"])
+' "$repository" "$profile")
+    [[ $remaining -eq 0 ]] && return
+    sleep 2
+  done
+  die "receipt-owned profile '$profile' still holds attempts after the cleanup deadline"
+}
+
 wait_service_absent() {
   local deadline=$((SECONDS + ${1:-30}))
   while (( SECONDS < deadline )); do
@@ -268,6 +334,57 @@ cancel_recorded_runs() {
     run_id=$(state_get "$key")
     [[ -z $run_id ]] || gh run cancel "$run_id" --repo "$repository" >/dev/null 2>&1 || true
   done
+}
+
+wait_for_run() {
+  local run_id=$1 evidence=$2 deadline=$((SECONDS + run_wait_timeout_seconds)) status conclusion
+  while (( SECONDS < deadline )); do
+    gh run view "$run_id" --repo "$repository" --json status,conclusion >"$evidence/run-state.json"
+    read -r status conclusion < <(python3 - "$evidence/run-state.json" <<'PY' | tr -d '\r'
+import json, sys
+run=json.load(open(sys.argv[1]))
+print(run.get('status') or '', run.get('conclusion') or '')
+PY
+)
+    if [[ $status == completed ]]; then
+      [[ $conclusion == success ]] || die "workflow run $run_id completed with conclusion '$conclusion'; state is preserved at $evidence/run-state.json"
+      return
+    fi
+    case "$status" in
+      queued|in_progress|pending|requested|waiting) ;;
+      *) die "workflow run $run_id reported unexpected status '$status'; state is preserved at $evidence/run-state.json" ;;
+    esac
+    sleep "$run_poll_seconds"
+  done
+  die "workflow run $run_id did not complete within $run_wait_timeout_seconds seconds; last state is preserved at $evidence/run-state.json"
+}
+
+wait_for_registered_runner() {
+  local selector=$1 evidence=$2 deadline=$((SECONDS + 180)) runner_id
+  while (( SECONDS < deadline )); do
+    gh api "repos/$repository/actions/runners?per_page=100" >"$evidence/github-runners.json"
+    runner_id=$(python3 - "$evidence/github-runners.json" "$selector" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1])); required={sys.argv[2].lower()}
+matches=[]
+for runner in document.get('runners', []):
+    labels={str(label.get('name', '')).lower() for label in runner.get('labels', [])}
+    if sys.argv[2].lower() in labels:
+        matches.append((runner, labels))
+if len(matches) > 1:
+    raise SystemExit(f'more than one runner carries acceptance selector {sys.argv[2]}')
+if matches:
+    runner, labels=matches[0]
+    missing=sorted(required-labels)
+    if missing:
+        raise SystemExit(f"runner {runner.get('id')} is missing required labels: {missing}")
+    print(runner['id'])
+PY
+)
+    [[ -z $runner_id ]] || { printf '%s\n' "$runner_id"; return; }
+    sleep 10
+  done
+  die "no GitHub runner registered with every workflow-required label before the 180-second deadline; last inventory is preserved at $evidence/github-runners.json"
 }
 
 assert_status_clean() {
@@ -373,22 +490,123 @@ remove_trigger_label() {
 ensure_profile() {
   local profile=$1 label=$2 evidence=$3
   runner repo profile add "$repository" --name "$profile" --host-label d3-acceptance \
-    --max-capacity 1 --label self-hosted --label macos --label arm64 --label "$label" \
+    --max-capacity 1 \
     --execution isolated --backend virtual-machine --image "$image" \
     --cpu 2000 --memory 4096 --disk "$disk_mib" --enable >"$evidence/profile-add.txt"
+  state_set profile_created true bool
+  state_set profile_name "$profile"
+  state_set unique_label "$label"
+  runner status --json >"$evidence/profile-status.json"
+  local profile_id
+  profile_id=$(python3 - "$evidence/profile-status.json" "$repository" "$profile" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1]))
+matches=[p for p in document['policies'] if p['target']==sys.argv[2] and p['profile_name']==sys.argv[3]]
+assert len(matches)==1, matches
+print(matches[0]['id'])
+PY
+)
+  state_set profile_id "$profile_id"
+  python3 - "$evidence/profile-status.json" "$repository" "$profile" "$label" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1]))
+matches=[p for p in document['policies'] if p['target']==sys.argv[2] and p['profile_name']==sys.argv[3]]
+assert len(matches)==1 and matches[0]['routing_labels']==[sys.argv[4]], matches
+PY
+}
+
+disable_profile() {
+  local profile=$1
+  if ! printf 'yes\n' | runner repo profile set-scale "$repository" --profile "$profile" --enabled false; then
+    printf "could not disable temporary profile '%s'; resolve the runner-manager error above before retrying cleanup\n" "$profile" >&2
+    return 1
+  fi
+}
+
+purge_profile() {
+  local profile=$1
+  if ! printf 'yes\n' | runner repo profile remove "$repository" --profile "$profile" --purge; then
+    printf "could not remove temporary profile '%s'; resolve the runner-manager error above before retrying cleanup\n" "$profile" >&2
+    return 1
+  fi
+  if runner repo profile show "$repository" --profile "$profile" >/dev/null 2>&1; then
+    printf "temporary profile '%s' still exists after removal\n" "$profile" >&2
+    return 1
+  fi
 }
 
 remove_profile() {
   local profile=$1
-  if ! printf 'yes\n' | runner repo profile set-scale "$repository" --profile "$profile" --enabled false; then
-    die "could not disable temporary profile '$profile'; resolve the runner-manager error above before retrying cleanup"
+  disable_profile "$profile" || die "could not disable receipt-owned profile '$profile'"
+  purge_profile "$profile" || die "could not purge receipt-owned profile '$profile'"
+}
+
+destroy_receipt_owned_environments() {
+  local listing directory metadata environment host attempt generation
+  listing=$(owned_environment_dirs) || die 'could not enumerate receipt-owned environments'
+  while IFS= read -r directory; do
+    [[ -n $directory ]] || continue
+    metadata="$directory/metadata.json"
+    [[ -r $metadata ]] || die "cannot prove ownership for '$directory'"
+    read -r environment host attempt generation < <(python3 - "$metadata" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); print(r['environment_id'],r['host_id'],r['attempt_id'],r['generation'])
+PY
+)
+    [[ $environment == rm-* ]] || die 'refusing to destroy an unrecognized environment'
+    helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"
+  done <<<"$listing"
+}
+
+preserve_failure_evidence() {
+  local evidence=$1 run_id directory
+  mkdir -p "$evidence"
+  runner status --json >"$evidence/failure-status.json" 2>&1 || true
+  runner service status >"$evidence/failure-service-status.txt" 2>&1 || true
+  launchctl print "system/$service_label" >"$evidence/failure-launchd.txt" 2>&1 || true
+  run_id=$(state_get normal_run_id 2>/dev/null || true)
+  if [[ -n $run_id ]]; then
+    gh run view "$run_id" --repo "$repository" --json status,conclusion,jobs \
+      >"$evidence/failure-run.json" 2>&1 || true
+    gh run view "$run_id" --repo "$repository" --log \
+      >"$evidence/failure-workflow.log" 2>&1 || true
   fi
-  if ! printf 'yes\n' | runner repo profile remove "$repository" --profile "$profile" --purge; then
-    die "could not remove temporary profile '$profile'; resolve the runner-manager error above before retrying cleanup"
+  while IFS= read -r directory; do
+    helper_command inspect --environment "$(basename "$directory")" --json \
+      >>"$evidence/failure-environments.jsonl" 2>&1 || true
+  done < <(environment_dirs)
+}
+
+run_job_failure_cleanup() {
+  local original_status=$1 profile failures=0 evidence=$run_job_cleanup_evidence
+  [[ $run_job_cleanup_armed == true && $run_job_cleanup_running == false ]] || return 0
+  run_job_cleanup_armed=false
+  run_job_cleanup_running=true
+  set +e
+  preserve_failure_evidence "$evidence"
+  cancel_recorded_runs || failures=1
+  (remove_trigger_label) || failures=1
+  profile=$(state_get profile_name 2>/dev/null || true)
+  if [[ $(state_get profile_created 2>/dev/null || true) == true && -n $profile ]]; then
+    disable_profile "$profile" || failures=1
+    (destroy_receipt_owned_environments) || failures=1
+    (wait_no_owned_environments 60) || failures=1
+    (wait_profile_inactive "$profile" 90) || failures=1
+    purge_profile "$profile" || failures=1
+    if [[ $failures -eq 0 ]]; then
+      state_set profile_created false bool
+      state_set profile_name ''
+      state_set cleanup_complete true bool
+    fi
   fi
-  if runner repo profile show "$repository" --profile "$profile" >/dev/null 2>&1; then
-    die "temporary profile '$profile' still exists after removal"
+  if [[ $failures -eq 0 ]]; then
+    printf 'run-job failed with status %s; receipt-owned run, profile, and environments were cleaned. Evidence: %s\n' \
+      "$original_status" "$evidence" >&2
+  else
+    printf 'run-job failed with status %s and automatic cleanup was incomplete. Evidence: %s. Re-run cleanup with --allow-cleanup.\n' \
+      "$original_status" "$evidence" >&2
   fi
+  return 0
 }
 
 run_audit() {
@@ -425,8 +643,9 @@ doc={'schema_version':1,'phase':'audited','repository':sys.argv[2],'image':sys.a
  'disk_mib':int(sys.argv[9]),'git_commit':sys.argv[10],
  'audit_boot_epoch':int(sys.argv[11]),'service_installed':False,'profile_created':False,
  'profile_name':'',
+ 'profile_id':'',
  'pull_request':79,'trigger_label':'','trigger_label_created':False,
- 'normal_run_id':'','normal_environment_id':'','normal_writable_disk_id':'','reboot_run_id':'',
+ 'normal_run_id':'','normal_runner_id':'','normal_environment_id':'','normal_writable_disk_id':'','reboot_run_id':'',
  'reboot_environment_id':'','reboot_writable_disk_id':'',
  'prepared_boot_epoch':0,'cleanup_complete':False,'rollback_complete':False}
 p.write_text(json.dumps(doc,sort_keys=True,indent=2)+'\n'); os.chmod(p,0o600)
@@ -447,9 +666,6 @@ install_service_and_profile() {
   [[ -n $pid ]] || die 'disposable LaunchDaemon did not start'
   if [[ $(state_get profile_created) == true ]]; then die 'receipt already owns a temporary profile; clean it first'; fi
   ensure_profile "$profile" "$label" "$evidence"
-  state_set profile_created true bool
-  state_set profile_name "$profile"
-  state_set unique_label "$label"
 }
 
 run_job() {
@@ -462,6 +678,9 @@ run_job() {
   profile="d3-$acceptance_id"
   selector=$(profile_selector "$profile"); trigger=$(trigger_label "$profile")
   evidence="$evidence_root/run-$acceptance_id"; mkdir -m 700 "$evidence"
+  run_job_cleanup_evidence="$evidence"
+  run_job_cleanup_armed=true
+  trap 'run_job_failure_cleanup "$?"' EXIT
   install_service_and_profile "$profile" "$selector" "$evidence"
   run_id=$(dispatch_job "$trigger")
   state_set normal_run_id "$run_id"
@@ -469,6 +688,7 @@ run_job() {
   capture_single_environment "$env_json" 600 >/dev/null
   state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set normal_writable_disk_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")"
+  state_set normal_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
   require_opt_in "$allow_service_restart" --allow-service-restart 'forcing a disposable LaunchDaemon crash/restart'
   before_pid=$(service_pid); [[ -n $before_pid ]] || die 'LaunchDaemon PID is unavailable'
   kill -9 "$before_pid"
@@ -476,7 +696,7 @@ run_job() {
   [[ -n ${after_pid:-} && $after_pid != "$before_pid" ]] || die 'launchd did not restart the service with a new PID'
   helper_command inspect --environment "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")" --json >"$evidence/environment-after-service-crash.json"
   printf '{"old_pid":%s,"new_pid":%s}\n' "$before_pid" "$after_pid" >"$evidence/service-restart.json"
-  gh run watch "$run_id" --repo "$repository" --exit-status
+  wait_for_run "$run_id" "$evidence"
   gh run view "$run_id" --repo "$repository" --log >"$evidence/workflow.log"
   grep -F 'RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=2 memory_mib=4096 process_limit=512 host_shares=0 jit_env=absent' "$evidence/workflow.log" >/dev/null || die 'workflow omitted exact guest attestation'
   wait_no_environments 300
@@ -485,6 +705,8 @@ run_job() {
   scan_service_process_no_secrets "$evidence/service-process-secret-scan.txt"
   remove_profile "$profile"; state_set profile_created false bool; state_set profile_name ''
   state_set phase normal-job-verified
+  run_job_cleanup_armed=false
+  trap - EXIT
   printf 'Live JIT job and service-crash recovery passed. Evidence: %s\n' "$evidence"
 }
 
@@ -500,7 +722,6 @@ prepare_reboot() {
   evidence="$evidence_root/reboot-$acceptance_id"; mkdir -m 700 "$evidence"
   require_opt_in "$allow_profile" --allow-profile 'creating the reboot-recovery profile'
   ensure_profile "$profile" "$selector" "$evidence"
-  state_set profile_created true bool; state_set profile_name "$profile"; state_set unique_label "$selector"
   run_id=$(dispatch_job "$trigger"); state_set reboot_run_id "$run_id"
   env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" 600 >/dev/null
   disk_id=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")
@@ -550,26 +771,15 @@ forensics() {
 
 cleanup() {
   assert_state_identity; require_opt_in "$allow_cleanup" --allow-cleanup 'acceptance cleanup'
-  local profile directory metadata environment host attempt generation
-  remove_trigger_label
+  local profile
   cancel_recorded_runs
-  while IFS= read -r directory; do
-    metadata="$directory/metadata.json"
-    [[ -r $metadata ]] || die "cannot prove ownership for '$directory'"
-    read -r environment host attempt generation < <(python3 - "$metadata" <<'PY'
-import json,sys
-r=json.load(open(sys.argv[1])); print(r['environment_id'],r['host_id'],r['attempt_id'],r['generation'])
-PY
-)
-    [[ $environment == rm-* ]] || die 'refusing to destroy an unrecognized environment'
-    case "$environment" in
-      "$(state_get normal_environment_id)"|"$(state_get reboot_environment_id)") ;;
-      *) die "refusing to destroy environment '$environment' because the receipt does not own it" ;;
-    esac
-    helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"
-  done < <(environment_dirs)
-  wait_no_environments 60
-  profile=$(state_get profile_name); [[ -z $profile ]] || remove_profile "$profile"
+  remove_trigger_label
+  profile=$(state_get profile_name)
+  [[ -z $profile ]] || disable_profile "$profile" || die "could not disable receipt-owned profile '$profile'"
+  destroy_receipt_owned_environments
+  wait_no_owned_environments 60
+  [[ -z $profile ]] || wait_profile_inactive "$profile" 90
+  [[ -z $profile ]] || purge_profile "$profile" || die "could not purge receipt-owned profile '$profile'"
   state_set profile_created false bool; state_set profile_name ''
   state_set cleanup_complete true bool
   printf 'Owned profiles and helper environments are clean.\n'
