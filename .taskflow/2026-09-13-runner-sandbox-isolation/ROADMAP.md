@@ -406,3 +406,33 @@ clean. The remaining native blocker is to inspect the root-owned forensic
 snapshot and determine whether the visible duplicate Full Disk Access entry
 represents a stale code identity or whether macOS requires a different TCC
 registration/restart sequence for the protected launchd runtime.
+
+**2026-09-24 — d3 crossed the native provider boundary and exposed recovery
+races.** The machine-scoped Runner Manager credential was refreshed after its
+previous token was revoked, and audit again passed at exact PR #79 head
+f0f6d5a. With Full Disk Access applied to the protected runtime copy and the
+signed helper, workflow run 35969049832 created the first production-owned
+macOS VM environment. Exact inspection proved the digest-pinned template,
+fresh writable disk, private JIT channel, no host shares, 2 CPUs, 4 GiB memory,
+47,684 MiB disk and the 512-process limit. This proves the earlier TCC blocker
+is resolved.
+
+The acceptance harness then inspected the environment during its legitimate
+`prepared` state and immediately asserted that it must already be `booting` or
+`running`, cancelling the workflow before the runner could accept the job. The
+capture loop must poll transient `prepared` state instead of failing on its
+first inspect. Recovery also exposed a product defect: after the stopped owned
+environment was destroyed, the journal retained one active isolated attempt.
+The disposable launchd service now exits with local-state code 14 and the exact
+diagnostic `startup recovery ... attempt lifecycle transition was refused`;
+the disabled profile remains draining with one active attempt while the helper
+environment set is empty. The harness additionally tries to remove the profile
+before destroying owned environments and suppresses the useful removal error.
+Evidence is retained under run `run-20260924071911-b5212ca4`, forensics
+`forensics-20260924072831` and `forensics-20260924073739`; exported live-log
+SHA-256 is
+`758d37ae173626b0738da376ed5842467f6bcbc92c062853ac5804309b6f06cc`.
+Do not edit SQLite manually. Correct the harness polling/cleanup order and the
+missing-isolated-environment startup transition through `implement-task`, then
+use the corrected binary to recover this preserved disposable receipt before
+resuming native acceptance.
