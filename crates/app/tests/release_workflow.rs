@@ -2072,8 +2072,10 @@ fn release_and_source_build_identities_cannot_be_confused() {
         .expect("the build identity script must exist");
     assert!(
         build_script.contains("+git.{sha}")
-            && build_script.contains("RUNNER_MANAGER_RELEASE_BUILD"),
-        "source builds need a commit-qualified identity and releases need an explicit opt-in"
+            && build_script.contains("RUNNER_MANAGER_RELEASE_BUILD")
+            && build_script.contains("symbolic-ref")
+            && build_script.contains("ls-files"),
+        "source builds need a current commit-qualified identity and releases need an explicit opt-in"
     );
 }
 
