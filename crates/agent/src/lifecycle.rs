@@ -2847,25 +2847,25 @@ impl LifecycleLauncher {
             self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
-        // A missing provider resource makes the local half terminal, but an
-        // unreachable GitHub API cannot prove whether a registration still
-        // needs removing. Keep the attempt live until a later pass can observe
-        // and deregister it; cleaning it here would discard the only durable
-        // runner identity and leave a stale registration behind permanently.
-        if provider_state == EnvironmentState::Missing
-            && github.status == GithubRunnerObservation::Unreachable
-        {
-            return Ok(ReconcileProgress::Deferred);
-        }
-        // Provider absence is stronger than a stale GitHub registration. In
-        // particular, a crash after JIT was journalled can leave the attempt at
-        // `jit_received` while GitHub already knows the runner. The generic
-        // recovery decision then asks us to observe `starting`, but isolated
-        // recovery may only take that edge after observing a live provider
-        // environment. Retire the missing environment instead: this is legal
-        // from every live attempt state and lets a draining profile release its
-        // capacity without inventing a native or provider process.
         if provider_state == EnvironmentState::Missing {
+            // The local half is terminal, but an unreachable GitHub API cannot
+            // prove whether a registration still needs removing. Keep the
+            // attempt live until a later pass can observe and deregister it;
+            // cleaning it here would discard the only durable runner identity
+            // and leave a stale registration behind permanently.
+            if github.status == GithubRunnerObservation::Unreachable {
+                return Ok(ReconcileProgress::Deferred);
+            }
+
+            // Provider absence is stronger than a stale GitHub registration.
+            // In particular, a crash after JIT was journalled can leave the
+            // attempt at `jit_received` while GitHub already knows the runner.
+            // The generic recovery decision then asks us to observe `starting`,
+            // but isolated recovery may only take that edge after observing a
+            // live provider environment. Retire the missing environment
+            // instead: this is legal from every live attempt state and lets a
+            // draining profile release its capacity without inventing a native
+            // or provider process.
             if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
                 self.deregister_runner(policy, &attempt).await;
             }
