@@ -198,25 +198,31 @@ environment_dirs() {
 environment_count() { environment_dirs | awk 'END { print NR+0 }'; }
 
 capture_single_environment() {
-  local output=$1 deadline=$((SECONDS + ${2:-300})) listing count envdir
+  local output=$1 deadline=$((SECONDS + ${2:-300})) listing count envdir state
   while (( SECONDS < deadline )); do
     listing=$(environment_dirs)
     count=$(printf '%s\n' "$listing" | awk 'NF { count++ } END { print count+0 }')
     if [[ $count -eq 1 ]]; then
       envdir=$listing
       helper_command inspect --environment "$(basename "$envdir")" --json >"$output"
-      python3 - "$output" "$image" "$disk_mib" <<'PY'
+      state=$(python3 - "$output" "$image" "$disk_mib" <<'PY'
 import json, sys
 r=json.load(open(sys.argv[1]))
 assert r['protocol_version']==1 and r['guest_os']=='macos' and r['architecture']=='arm64', r
 assert r['image']==sys.argv[2] and r['template_digest']==sys.argv[2].split('@sha256:',1)[1], r
-assert r['state'] in ('booting','running') and r['fresh_writable_disk'] is True, r
+assert r['state'] in ('prepared','booting','running') and r['fresh_writable_disk'] is True, r
 assert r['shared_host_paths']==[] and r['jit_channel']=='private', r
 assert r['applied_cpu_millis']==2000 and r['applied_memory_mib']==4096, r
 assert r['applied_disk_mib']==int(sys.argv[3]) and r['applied_process_limit']==512, r
 assert r['writable_disk_id'] and r['environment_id'].startswith('rm-'), r
-print(r['environment_id'])
+print(r['state'])
 PY
+)
+      if [[ $state == prepared ]]; then
+        sleep 2
+        continue
+      fi
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_id"])' "$output"
       return
     fi
     [[ $count -eq 0 ]] || die 'more than one helper environment exists; refusing ambiguous ownership'
@@ -374,8 +380,12 @@ ensure_profile() {
 
 remove_profile() {
   local profile=$1
-  printf 'yes\n' | runner repo profile set-scale "$repository" --profile "$profile" --enabled false >/dev/null 2>&1 || true
-  printf 'yes\n' | runner repo profile remove "$repository" --profile "$profile" --purge >/dev/null 2>&1 || true
+  if ! printf 'yes\n' | runner repo profile set-scale "$repository" --profile "$profile" --enabled false; then
+    die "could not disable temporary profile '$profile'; resolve the runner-manager error above before retrying cleanup"
+  fi
+  if ! printf 'yes\n' | runner repo profile remove "$repository" --profile "$profile" --purge; then
+    die "could not remove temporary profile '$profile'; resolve the runner-manager error above before retrying cleanup"
+  fi
   if runner repo profile show "$repository" --profile "$profile" >/dev/null 2>&1; then
     die "temporary profile '$profile' still exists after removal"
   fi
@@ -543,8 +553,6 @@ cleanup() {
   local profile directory metadata environment host attempt generation
   remove_trigger_label
   cancel_recorded_runs
-  profile=$(state_get profile_name); [[ -z $profile ]] || remove_profile "$profile"
-  state_set profile_created false bool; state_set profile_name ''
   while IFS= read -r directory; do
     metadata="$directory/metadata.json"
     [[ -r $metadata ]] || die "cannot prove ownership for '$directory'"
@@ -561,6 +569,8 @@ PY
     helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"
   done < <(environment_dirs)
   wait_no_environments 60
+  profile=$(state_get profile_name); [[ -z $profile ]] || remove_profile "$profile"
+  state_set profile_created false bool; state_set profile_name ''
   state_set cleanup_complete true bool
   printf 'Owned profiles and helper environments are clean.\n'
 }

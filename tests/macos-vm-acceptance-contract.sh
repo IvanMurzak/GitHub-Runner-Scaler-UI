@@ -116,6 +116,46 @@ set -e
 BASH
 rm -rf "$empty_helper_root" "$empty_capture" "$empty_wait_marker"
 
+# A newly-created production environment is legitimately `prepared` before the
+# helper consumes the private JIT handoff and begins booting. Exercise the real
+# capture loop across that transition: all immutable properties are checked on
+# both observations, but only booting/running completes the capture.
+prepared_helper_root=$(mktemp -d)
+mkdir -p "$prepared_helper_root/environments/rm-prepared"
+prepared_capture=$(mktemp)
+prepared_count=$(mktemp)
+prepared_wait_marker=$(mktemp)
+printf '0\n' >"$prepared_count"
+rm -f "$prepared_wait_marker"
+ENVIRONMENT_DEFINITIONS=$environment_definitions HELPER_ROOT=$prepared_helper_root \
+  CAPTURE_OUTPUT=$prepared_capture INSPECT_COUNT=$prepared_count \
+  WAIT_MARKER=$prepared_wait_marker bash -u <<'BASH'
+set -e
+eval "$ENVIRONMENT_DEFINITIONS"
+helper_root=$HELPER_ROOT
+image='vm-version:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+disk_mib=47684
+helper_command() {
+  count=$(cat "$INSPECT_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$INSPECT_COUNT"
+  if [[ $count -eq 1 ]]; then state=prepared; else state=booting; fi
+  printf '{"protocol_version":1,"guest_os":"macos","architecture":"arm64","image":"%s","template_digest":"%s","state":"%s","fresh_writable_disk":true,"shared_host_paths":[],"jit_channel":"private","applied_cpu_millis":2000,"applied_memory_mib":4096,"applied_disk_mib":47684,"applied_process_limit":512,"writable_disk_id":"disk-1","environment_id":"rm-prepared"}\n' \
+    "$image" "${image##*@sha256:}" "$state"
+}
+die() { printf '%s\n' "$*" >&2; exit 42; }
+sleep() { printf 'waited\n' >>"$WAIT_MARKER"; SECONDS=$((SECONDS + 2)); }
+environment=$(capture_single_environment "$CAPTURE_OUTPUT" 10)
+[[ $environment == rm-prepared ]]
+[[ $(cat "$INSPECT_COUNT") -eq 2 ]]
+[[ -s $WAIT_MARKER ]]
+python3 - "$CAPTURE_OUTPUT" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['state'] == 'booting'
+PY
+BASH
+rm -rf "$prepared_helper_root" "$prepared_capture" "$prepared_count" "$prepared_wait_marker"
+
 # launchd teardown is asynchronous. Exercise the real bounded wait through one
 # retry, then prove the timeout remains fail closed when the PID never leaves.
 wait_service_definition=$(
@@ -225,6 +265,84 @@ for invalid in "rm-d3-$route_id-extra" 'rm-d3-20260919010203-DEADBEEF' "d3-$rout
     exit 1
   fi
 done
+
+# Profile mutation failures must remain visible. The real function used to
+# redirect both streams and accept every failure, hiding the active-attempt
+# error that explained why cleanup could not remove the d3 profile.
+remove_profile_definition=$(
+  awk '
+    /^remove_profile\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+remove_error=$(mktemp)
+REMOVE_PROFILE_DEFINITION=$remove_profile_definition REMOVE_ERROR=$remove_error bash -u <<'BASH'
+set -o pipefail
+eval "$REMOVE_PROFILE_DEFINITION"
+repository=octo/repo
+runner() {
+  printf 'profile still has one active isolated attempt\n' >&2
+  return 19
+}
+die() { printf 'macOS VM acceptance: %s\n' "$*" >&2; exit 42; }
+set +e
+(remove_profile d3-test) 2>"$REMOVE_ERROR"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+grep -F 'profile still has one active isolated attempt' "$REMOVE_ERROR" >/dev/null
+grep -F "could not disable temporary profile 'd3-test'" "$REMOVE_ERROR" >/dev/null
+BASH
+rm -f "$remove_error"
+
+# Cleanup must destroy only receipt-owned helper environments before it asks
+# Runner Manager to remove the profile. Execute the real cleanup body with
+# bounded fakes and assert the destructive order directly.
+cleanup_definition=$(
+  awk '
+    /^cleanup\(\) \{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^}/ { exit }
+  ' "$harness"
+)
+cleanup_root=$(mktemp -d)
+cleanup_environment="$cleanup_root/rm-owned"
+mkdir "$cleanup_environment"
+printf '%s\n' '{"environment_id":"rm-owned","host_id":"host-1","attempt_id":"attempt-1","generation":"generation-1"}' \
+  >"$cleanup_environment/metadata.json"
+cleanup_actions=$(mktemp)
+CLEANUP_DEFINITION=$cleanup_definition ENV_DIR=$cleanup_environment \
+  CLEANUP_ACTIONS=$cleanup_actions bash -u <<'BASH'
+set -e
+eval "$CLEANUP_DEFINITION"
+allow_cleanup=true
+assert_state_identity() { :; }
+require_opt_in() { :; }
+remove_trigger_label() { :; }
+cancel_recorded_runs() { :; }
+environment_dirs() { [[ ! -d $ENV_DIR ]] || printf '%s\n' "$ENV_DIR"; }
+helper_command() {
+  [[ $1 == destroy && $2 == --environment && $3 == rm-owned ]]
+  printf 'destroy\n' >>"$CLEANUP_ACTIONS"
+  rm -rf "$ENV_DIR"
+}
+wait_no_environments() { [[ ! -d $ENV_DIR ]]; }
+remove_profile() { [[ $1 == d3-owned ]]; printf 'profile\n' >>"$CLEANUP_ACTIONS"; }
+state_get() {
+  case "$1" in
+    profile_name) printf 'd3-owned\n' ;;
+    normal_environment_id) printf 'rm-owned\n' ;;
+    reboot_environment_id) printf '\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+state_set() { :; }
+cleanup >/dev/null
+expected=$(printf 'destroy\nprofile')
+[[ $(cat "$CLEANUP_ACTIONS") == "$expected" ]]
+BASH
+rm -rf "$cleanup_root" "$cleanup_actions"
 
 for required in \
   'audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback' \
