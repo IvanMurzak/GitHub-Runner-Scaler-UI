@@ -394,6 +394,15 @@ Forensics were retained and guarded cleanup plus rollback again removed the
 temporary profile, disposable service, receipt and environments. A subsequent
 retry must grant Full Disk Access to the actual runtime executable after audit
 has recreated it.
-Audit has now recreated that runtime executable and its receipt is deliberately
-retained while the owner selects it in Full Disk Access. No temporary profile,
-disposable service or VM environment is active.
+Audit recreated the protected runtime executable, and the owner selected that
+exact file from Finder in Full Disk Access. Workflow run 35958165629 again
+resolved the exact profile selector, but its production job remained queued
+and no provider-owned VM appeared before timeout. Read-only recovery forensics
+were retained at
+`/var/db/runner-manager-d3-acceptance/evidence/forensics-20260924051222`.
+Guarded cleanup and rollback succeeded: the test daemon and receipt are absent,
+the workflow is cancelled, and owned profiles and helper environments are
+clean. The remaining native blocker is to inspect the root-owned forensic
+snapshot and determine whether the visible duplicate Full Disk Access entry
+represents a stale code identity or whether macOS requires a different TCC
+registration/restart sequence for the protected launchd runtime.
