@@ -1,0 +1,21 @@
+scripts/macos-vm-acceptance.sh
+  s_7da33c11c5bbcc::t_65d06ac8285a3e 299,301-305,314,319-322,339,341-356,358,489,491-494,496-498,503-507,582-585,618-636,638-639,724,763,812-814,816-819,821-824,828-830
+tests/macos-vm-acceptance-contract.sh
+  s_7da33c11c5bbcc::t_d2af74f41eefe8 269-297,327-359,409-436,469-488,520,531-573,608,614-648
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1bcc7bdd95d0c725d0940980cc50b8b1a7b3eb2e",
+  "prompts": {},
+  "sessions": {
+    "s_7da33c11c5bbcc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d0e3-ba90-7a52-9066-64832bbc7001",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
