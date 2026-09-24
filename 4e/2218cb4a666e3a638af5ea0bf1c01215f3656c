@@ -1,0 +1,41 @@
+README.md
+  s_5801a853f78e8a::t_b8182233e52654 130-134
+  s_5801a853f78e8a::t_a70a0e95f71958 135
+crates/app/tests/cli_command_surface.rs
+  s_5801a853f78e8a::t_25ae47bed1836c 164,174,176-180
+crates/app/tests/release_workflow.rs
+  s_5801a853f78e8a::t_9d2fe2b9e4054d 1944-1952,1961,1988-2049,2051-2078
+  s_5801a853f78e8a::t_d6a842025014cc 2050
+  s_5801a853f78e8a::t_6793eee753fda7 2079
+crates/app/build.rs
+  s_5801a853f78e8a::t_3b45f60a17c5f1 31-33
+  s_5801a853f78e8a::t_25ae47bed1836c 1-4,6-23,30,34-35
+  s_5801a853f78e8a::t_b8182233e52654 5,24-29
+.github/workflows/release.yml
+  s_5801a853f78e8a::t_d75cd8f6b5c309 567-570,669-706,794,1407-1415
+  s_5801a853f78e8a::t_cac8b27973421c 1416
+crates/app/src/cli/status.rs
+  s_5801a853f78e8a::t_6aba55008e48a9 811
+  s_5801a853f78e8a::t_25ae47bed1836c 133-134,462,699
+crates/app/src/cli/mod.rs
+  s_5801a853f78e8a::t_25ae47bed1836c 465
+.github/scripts/schema_compat.py
+  s_5801a853f78e8a::t_25ae47bed1836c 1-51,66-153,155-161,163-167,170,175-176,178-182,184-188,191-195
+  s_5801a853f78e8a::t_d75cd8f6b5c309 52-65,154,162,168-169,171-174,177,183,189-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4e2218cb4a666e3a638af5ea0bf1c01215f3656c",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
