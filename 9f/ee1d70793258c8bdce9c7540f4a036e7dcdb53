@@ -1,0 +1,27 @@
+.github/workflows/macos-vm-native-acceptance.yml
+  s_0db95d6a4d8a19::t_48351bb0f68633 44-47
+crates/agent/src/lifecycle.rs
+  s_0db95d6a4d8a19::t_2268fe5af69cf6 2850,2860,2862-2863,2866,5865-5951
+crates/github/src/jit.rs
+  s_0db95d6a4d8a19::t_5847e7e92d528e 905,1121-1122,1124-1125,1130-1132,1135-1144
+scripts/macos-vm-acceptance.sh
+  s_0db95d6a4d8a19::t_d02946012c125c 63-67,261-321,339-389,493,496-515,518,521-522,524-527,529-530,533-572,574-609,646,648,681-683,691,699,708-709,774,776-782
+tests/macos-vm-acceptance-contract.sh
+  s_0db95d6a4d8a19::t_ece6d2f19561a2 74,269-272,274,280,282,289,292,298-382,392,398-401,404-406,415,420-504,511,515-517,538,548-553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9fee1d70793258c8bdce9c7540f4a036e7dcdb53",
+  "prompts": {},
+  "sessions": {
+    "s_0db95d6a4d8a19": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d499-8c9f-7ed0-b3d9-70f8cce78664",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
