@@ -124,8 +124,9 @@ def max_schema(database: Path) -> int:
 
 
 def assert_migrated(database: Path, expected: int) -> None:
-    if max_schema(database) != expected:
-        reject(f"candidate migrated database to {max_schema(database)}, source expects {expected}")
+    actual = max_schema(database)
+    if actual != expected:
+        reject(f"candidate migrated database to {actual}, source expects {expected}")
     with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
         host = connection.execute(
             "SELECT host_capacity, runner_root_override FROM hosts WHERE id = ?", (HOST_ID,)
@@ -187,7 +188,7 @@ def main() -> None:
 
     print(
         f"schema compatibility OK: schema 3 -> {expected_schema}; "
-        f"fresh -> {expected_schema}; build {document['product']['build_version']}"
+        f"fresh -> {expected_schema}; build {build_version}"
     )
 
 

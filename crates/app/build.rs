@@ -63,21 +63,15 @@ fn git_stdout(args: &[&str]) -> Option<String> {
 }
 
 fn source_identity(package: &str) -> String {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let dirty = Command::new("git")
-                .args(["status", "--porcelain", "--untracked-files=no"])
-                .output()
-                .is_ok_and(|status| status.status.success() && !status.stdout.is_empty());
-            let suffix = if dirty { ".dirty" } else { "" };
-            format!("{package}+git.{sha}{suffix}")
-        }
-        // A crates.io package has no .git directory. It is published source,
-        // so a `cargo install` build keeps the package's released identity.
-        _ => package.to_string(),
-    }
+    // A crates.io package has no .git directory. It is published source, so a
+    // `cargo install` build keeps the package's released identity.
+    let Some(sha) = git_stdout(&["rev-parse", "--short=12", "HEAD"]) else {
+        return package.to_string();
+    };
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .is_ok_and(|status| status.status.success() && !status.stdout.is_empty());
+    let suffix = if dirty { ".dirty" } else { "" };
+    format!("{package}+git.{sha}{suffix}")
 }
