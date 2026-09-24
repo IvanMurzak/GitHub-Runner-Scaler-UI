@@ -2847,6 +2847,39 @@ impl LifecycleLauncher {
             self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
+        // Provider absence is stronger than a stale GitHub registration. In
+        // particular, a crash after JIT was journalled can leave the attempt at
+        // `jit_received` while GitHub already knows the runner. The generic
+        // recovery decision then asks us to observe `starting`, but isolated
+        // recovery may only take that edge after observing a live provider
+        // environment. Retire the missing environment instead: this is legal
+        // from every live attempt state and lets a draining profile release its
+        // capacity without inventing a native or provider process.
+        if provider_state == EnvironmentState::Missing {
+            if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
+                self.deregister_runner(policy, &attempt).await;
+            }
+            let outcome = if attempt.state() == AttemptState::Busy
+                || matches!(
+                    github.status,
+                    GithubRunnerObservation::Registered { busy: true }
+                ) {
+                AttemptOutcome::Orphaned
+            } else {
+                AttemptOutcome::failed(FailureReason::ProcessExitedUnexpectedly)
+            };
+            let replacement = replacement_operation(&outcome);
+            self.conclude(&mut attempt, outcome)?;
+            self.clean_or_quarantine(&mut attempt)?;
+            return Ok(
+                replacement.map_or(ReconcileProgress::Reconciled, |operation| {
+                    ReconcileProgress::Replacement {
+                        attempt: attempt.id,
+                        operation,
+                    }
+                }),
+            );
+        }
         match recovery_decision(
             &attempt,
             RecoveryObservation {
@@ -5672,6 +5705,82 @@ mod tests {
             AttemptState::CleanupDeferred
         );
         assert_eq!(provider.native_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_isolated_environment_retires_a_jit_received_attempt() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let id = AttemptId::from_u128(0xd300);
+        let runtime = harness.host_root().join("missing-after-jit");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "missing-generation".into(),
+            })
+            .unwrap();
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        attempt
+            .prepared_environment("environment-missing".into())
+            .unwrap();
+        attempt.mark_prepared(harness.clock.now()).unwrap();
+        attempt.jit_received(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+
+        // This is the native d3 recovery race: the JIT registration exists,
+        // but the helper environment was already destroyed during cleanup.
+        // Advancing to `starting` would assert a provider effect that no longer
+        // exists and used to abort startup with LifecycleError::Transition.
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        let replacements = launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("provider absence reaches a legal terminal state");
+
+        let cleaned = harness.store.attempt(id).unwrap().unwrap();
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+        assert_eq!(
+            cleaned.outcome(),
+            Some(&AttemptOutcome::failed(
+                FailureReason::ProcessExitedUnexpectedly
+            ))
+        );
+        assert!(!cleaned.counts_against_capacity());
+        assert!(!runtime.exists());
+        assert_eq!(*harness.github.deregistrations.lock().unwrap(), vec![73]);
+        assert_eq!(provider.resource_count(), 0);
+        assert_eq!(
+            provider
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|action| **action == "destroy")
+                .count(),
+            0,
+            "an already absent environment is not destroyed again"
+        );
+        assert_eq!(
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "exit_before_acceptance_replacement",
+            }]
+        );
     }
 
     #[tokio::test]
