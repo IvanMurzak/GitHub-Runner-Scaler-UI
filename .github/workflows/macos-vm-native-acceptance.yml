@@ -41,7 +41,10 @@ jobs:
 
   production-provider:
     needs: route
-    runs-on: [self-hosted, macos, arm64, "${{ needs.route.outputs.selector }}"]
+    # generate-jitconfig stores exactly the requested policy labels. The
+    # immutable profile selector is therefore the complete routing contract;
+    # guest OS and architecture are attested inside the job below.
+    runs-on: "${{ needs.route.outputs.selector }}"
     timeout-minutes: 20
     steps:
       - name: Attest the disposable native macOS guest

@@ -2847,7 +2847,7 @@ impl LifecycleLauncher {
             self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
-        if provider_state == EnvironmentState::Missing {
+        if !live {
             // The local half is terminal, but an unreachable GitHub API cannot
             // prove whether a registration still needs removing. Keep the
             // attempt live until a later pass can observe and deregister it;
@@ -2857,12 +2857,13 @@ impl LifecycleLauncher {
                 return Ok(ReconcileProgress::Deferred);
             }
 
-            // Provider absence is stronger than a stale GitHub registration.
+            // Provider termination is stronger than a stale GitHub registration.
             // In particular, a crash after JIT was journalled can leave the
-            // attempt at `jit_received` while GitHub already knows the runner.
+            // attempt at `jit_received` while GitHub already knows the runner,
+            // with the owned environment either absent or durably stopped.
             // The generic recovery decision then asks us to observe `starting`,
             // but isolated recovery may only take that edge after observing a
-            // live provider environment. Retire the missing environment
+            // live provider environment. Retire the terminal environment
             // instead: this is legal from every live attempt state and lets a
             // draining profile release its capacity without inventing a native
             // or provider process.
@@ -5859,6 +5860,93 @@ mod tests {
                 operation: "exit_before_acceptance_replacement",
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_isolated_environment_retires_jit_received_with_or_without_registration() {
+        for (case, github, expected_deregistrations) in [
+            (
+                "registered",
+                GithubRunnerObservation::Registered { busy: false },
+                vec![73],
+            ),
+            ("absent", GithubRunnerObservation::NotRegistered, Vec::new()),
+        ] {
+            let harness = isolated_harness();
+            let provider = Arc::new(FakeIsolatedProvider::default());
+            let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+            let id = AttemptId::new_random();
+            let runtime = harness
+                .host_root()
+                .join(format!("stopped-after-jit-{case}"));
+            fs::create_dir_all(&runtime).unwrap();
+            let mut attempt =
+                RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+            let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+                harness.policy.execution_policy()
+            else {
+                unreachable!()
+            };
+            attempt
+                .allocate_execution(AttemptExecution::Isolated {
+                    provider_kind: Backend::Oci,
+                    environment_id: None,
+                    resolved_image: image.clone(),
+                    generation: format!("stopped-generation-{case}"),
+                })
+                .unwrap();
+            attempt.begin_prepare(harness.clock.now()).unwrap();
+            let identity = FakeIsolatedProvider::identity(&attempt, harness.policy.host_id);
+            let EnvironmentIdentity::Isolated { environment_id, .. } = &identity else {
+                unreachable!()
+            };
+            attempt
+                .prepared_environment(environment_id.clone())
+                .unwrap();
+            attempt.mark_prepared(harness.clock.now()).unwrap();
+            attempt.jit_received(harness.clock.now()).unwrap();
+            harness.store.record_attempt(&attempt).unwrap();
+            provider
+                .resources
+                .lock()
+                .unwrap()
+                .insert(id, (identity, EnvironmentState::Exited));
+            harness.github.observe(github);
+
+            let replacements = launcher
+                .recover_startup(std::slice::from_ref(&harness.policy))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{case}: a terminal provider state must retire without an illegal starting observation: {error}")
+                });
+
+            let cleaned = harness.store.attempt(id).unwrap().unwrap();
+            assert_eq!(cleaned.state(), AttemptState::Cleaned, "{case}");
+            assert_eq!(
+                cleaned.outcome(),
+                Some(&AttemptOutcome::failed(
+                    FailureReason::ProcessExitedUnexpectedly
+                )),
+                "{case}"
+            );
+            assert!(!cleaned.counts_against_capacity(), "{case}");
+            assert!(!runtime.exists(), "{case}");
+            assert_eq!(provider.resource_count(), 0, "{case}");
+            assert_eq!(
+                *harness.github.deregistrations.lock().unwrap(),
+                expected_deregistrations,
+                "{case}"
+            );
+            assert_eq!(
+                replacements,
+                vec![ReplacementIntent {
+                    policy: harness.policy.id,
+                    previous_attempt: id,
+                    operation: "exit_before_acceptance_replacement",
+                }],
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
