@@ -1,0 +1,26 @@
+crates/app/tests/release_workflow.rs
+  s_5801a853f78e8a::t_cecdbee3c9106c 2075-2078
+crates/app/src/cli/daemon.rs
+  s_5801a853f78e8a::t_cecdbee3c9106c 795-798,801,2061-2073
+  s_5801a853f78e8a::t_0b229a68b2e6c1 2074
+crates/app/build.rs
+  s_5801a853f78e8a::t_67736ad0f00301 37-40,43-47,49-52
+  s_5801a853f78e8a::t_cecdbee3c9106c 1,5,17-36,41-42,48,53-63
+  s_5801a853f78e8a::t_5d2065a02c5b0c 64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8de2a67c448baa465aa368491bb614917dfb7c78",
+  "prompts": {},
+  "sessions": {
+    "s_5801a853f78e8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a4e9-83c5-7213-9989-30fded927707",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
