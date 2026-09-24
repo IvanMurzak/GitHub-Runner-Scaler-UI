@@ -385,6 +385,12 @@ Read-only recovery forensics were exported, the run was cancelled, and guarded
 cleanup plus rollback removed the temporary profile, service and receipt.
 Native acceptance remains blocked only on granting Full Disk Access to the
 actual runner and helper executables before a fresh retry.
-Audit was then rerun only to recreate the protected runner executable for the
-owner's Full Disk Access selection. Its receipt is intentionally retained;
-there is no temporary profile, disposable service or VM environment.
+Audit was then rerun to recreate the protected runner executable for the
+owner's Full Disk Access selection. Granting access to the staging copy at
+`/usr/local/libexec/runner-manager-d3-acceptance` did not cover the runtime
+copy executed from the protected data directory. Workflow run 35956444006
+therefore remained queued with no VM environment and timed out fail-closed.
+Forensics were retained and guarded cleanup plus rollback again removed the
+temporary profile, disposable service, receipt and environments. A subsequent
+retry must grant Full Disk Access to the actual runtime executable after audit
+has recreated it.
