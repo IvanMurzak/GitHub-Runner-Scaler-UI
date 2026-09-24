@@ -3,9 +3,10 @@
 **Design status:** reviewed 2026-09-13; no open finding or owner decision.
 **Task status:** derived 2026-09-13.
 **Implementation status:** a1, a2, b1, b2, c1, c2, d1 and d2 merged into the
-integration ref; d3 is held at a green PR for native acceptance.
+integration ref; d3 is held at a green PR for native acceptance. Release schema
+compatibility safeguards are also merged into the integration ref.
 **Repository:** `.` / `main`.
-**Last updated:** 2026-09-18.
+**Last updated:** 2026-09-23.
 
 This file is the only live task-state record.
 
@@ -55,7 +56,7 @@ This file is the only live task-state record.
 | c2-profile-tui | `tasks/c2-profile-tui.md` | C | 2 | c1-profile-cli | . | main | 8/8 | top | ✅ | [PR #76](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/76) / 0c60d9a | 2026-09-16 |
 | d1-linux-wsl-oci | `tasks/d1-linux-wsl-oci.md` | D | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #74](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/74) / b8b8f92 | 2026-09-17 |
 | d2-windows-hyperv | `tasks/d2-windows-hyperv.md` | E | 1 | b2-isolated-lifecycle | . | main | 10/10 | top | ✅ | [PR #77](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/77) / 69b2da3 | 2026-09-18 |
-| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / a65f749; bare-metal Apple Silicon gate pending | 2026-09-18 |
+| d3-macos-vm | `tasks/d3-macos-vm.md` | F | 1 | b2-isolated-lifecycle | . | main | 9/10 | top | 🟣 | [PR #79](https://github.com/IvanMurzak/GitHub-Runner-Scaler-UI/pull/79) / f0f6d5a; bare-metal gate blocked on macOS Full Disk Access | 2026-09-23 |
 | g1-acceptance-docs | `tasks/g1-acceptance-docs.md` | G | 1 | c2-profile-tui, d1-linux-wsl-oci, d2-windows-hyperv, d3-macos-vm | . | main | 10/9 | top | pending | — | 2026-09-13 |
 
 ## Integration landing
@@ -354,3 +355,33 @@ remains open because CI cannot replace the immutable native gate. Completion
 still requires an operator-controlled bare-metal Apple Silicon Mac with APFS,
 the signed entitled helper, and a digest-pinned Apple-authorized macOS template
 containing the RMV1 bootstrap.
+
+**2026-09-23 — d3 service-context diagnostics corrected.** Native acceptance
+on the operator-controlled Apple Silicon Mac reached the production launchd
+context but the provider failed before JIT. A full `implement-task` correction
+preserved typed, redacted helper failures and removed the stderr wait hazard;
+PR #83 landed into PR #79 at head f0f6d5a and all ten checks passed. The exact
+signed helper, virtualization entitlement, digest-pinned template and manual
+helper inspection pass. The corrected service log now reports
+`isolation_provider_permission_denied`: the boot LaunchDaemon lacks Full Disk
+Access to the helper store backed by `/Volumes/NVME`. Failed runs were fully
+rolled back with no profile, disposable service, receipt or VM environment
+left behind.
+
+**2026-09-23 — release schema compatibility safeguarded.** The installed npm
+release exposed schema 3 while the unreleased integration build had already
+opened the production database as schema 5 under a reused release version.
+PR #84 adds a database-aware pre-publication Windows artifact gate, verifies
+schema 3-to-5 migration and preserved rows, isolates release-test databases,
+and gives unreleased source builds commit-qualified identities. Independent
+implementation, review and simplification completed; all eight remote checks
+passed. PR #84 was squash-merged into `runner-sandbox-isolation` at 77ae12b.
+
+**2026-09-23 — d3 Full Disk Access retry remained fail-closed.** Audit passed
+at exact PR #79 head f0f6d5a and workflow run 35940872105 resolved the exact
+profile selector. The production job remained queued because launchd again
+reported `isolation_provider_permission_denied`; no VM environment appeared.
+Read-only recovery forensics were exported, the run was cancelled, and guarded
+cleanup plus rollback removed the temporary profile, service and receipt.
+Native acceptance remains blocked only on granting Full Disk Access to the
+actual runner and helper executables before a fresh retry.
