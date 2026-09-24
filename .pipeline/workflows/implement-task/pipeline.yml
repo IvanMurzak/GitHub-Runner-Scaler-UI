@@ -8,28 +8,35 @@ runner: session
 isolation: run
 base_branch: runner-sandbox-isolation
 
+vars:
+  PP_TASK: ""
+
 steps:
   - name: implement
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/implement.md
     self_improve: false
 
   - name: code-review
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/code-review.md
     self_improve: false
 
   - name: simplify
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/simplify.md
     self_improve: false
 
   - name: land
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/land.md
     model: sonnet
     self_improve: false
