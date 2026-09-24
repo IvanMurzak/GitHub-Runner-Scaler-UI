@@ -2847,6 +2847,16 @@ impl LifecycleLauncher {
             self.clean_or_quarantine(&mut attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
+        // A missing provider resource makes the local half terminal, but an
+        // unreachable GitHub API cannot prove whether a registration still
+        // needs removing. Keep the attempt live until a later pass can observe
+        // and deregister it; cleaning it here would discard the only durable
+        // runner identity and leave a stale registration behind permanently.
+        if provider_state == EnvironmentState::Missing
+            && github.status == GithubRunnerObservation::Unreachable
+        {
+            return Ok(ReconcileProgress::Deferred);
+        }
         // Provider absence is stronger than a stale GitHub registration. In
         // particular, a crash after JIT was journalled can leave the attempt at
         // `jit_received` while GitHub already knows the runner. The generic
@@ -5773,6 +5783,74 @@ mod tests {
             0,
             "an already absent environment is not destroyed again"
         );
+        assert_eq!(
+            replacements,
+            vec![ReplacementIntent {
+                policy: harness.policy.id,
+                previous_attempt: id,
+                operation: "exit_before_acceptance_replacement",
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_isolated_environment_waits_for_github_before_retiring() {
+        let harness = isolated_harness();
+        let provider = Arc::new(FakeIsolatedProvider::default());
+        let launcher = launcher_with_isolated(&harness, Arc::clone(&provider));
+        let id = AttemptId::from_u128(0xd301);
+        let runtime = harness.host_root().join("missing-while-github-unreachable");
+        fs::create_dir_all(&runtime).unwrap();
+        let mut attempt =
+            RunnerAttempt::allocate(id, harness.policy.id, &runtime, harness.clock.now());
+        let runner_manager_domain::execution::ExecutionPolicy::Isolated { image, .. } =
+            harness.policy.execution_policy()
+        else {
+            unreachable!()
+        };
+        attempt
+            .allocate_execution(AttemptExecution::Isolated {
+                provider_kind: Backend::Oci,
+                environment_id: None,
+                resolved_image: image.clone(),
+                generation: "missing-generation".into(),
+            })
+            .unwrap();
+        attempt.begin_prepare(harness.clock.now()).unwrap();
+        attempt
+            .prepared_environment("environment-missing".into())
+            .unwrap();
+        attempt.mark_prepared(harness.clock.now()).unwrap();
+        attempt.jit_received(harness.clock.now()).unwrap();
+        harness.store.record_attempt(&attempt).unwrap();
+
+        harness.github.observe(GithubRunnerObservation::Unreachable);
+        let replacements = launcher
+            .recover_startup(std::slice::from_ref(&harness.policy))
+            .await
+            .expect("an unreachable GitHub API does not abort isolated startup recovery");
+
+        let deferred = harness.store.attempt(id).unwrap().unwrap();
+        assert_eq!(deferred.state(), AttemptState::JitReceived);
+        assert!(deferred.counts_against_capacity());
+        assert!(runtime.exists());
+        assert!(replacements.is_empty());
+        assert!(harness.github.deregistrations.lock().unwrap().is_empty());
+
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        let replacements = launcher
+            .supervise(&harness.policy)
+            .await
+            .expect("a later reachable pass retires the missing environment");
+
+        assert_eq!(
+            harness.store.attempt(id).unwrap().unwrap().state(),
+            AttemptState::Cleaned
+        );
+        assert!(!runtime.exists());
+        assert_eq!(*harness.github.deregistrations.lock().unwrap(), vec![73]);
         assert_eq!(
             replacements,
             vec![ReplacementIntent {
