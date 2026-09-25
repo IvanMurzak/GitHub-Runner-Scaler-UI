@@ -1,0 +1,33 @@
+crates/agent/src/lifecycle/macos_vm.rs
+  s_e8c62402ba9043::t_c72621303d1c41 1056-1082,1256-1257,1262-1263,1268,1270,1275,1856-1889
+docs/macos-vm-helper.md
+  s_e8c62402ba9043::t_6abb02ca43e149 124-144,322-328,354-356
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/CLI.swift
+  s_e8c62402ba9043::t_08bb9425734a8f 68,129-153
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/Store.swift
+  s_e8c62402ba9043::t_4b3b94d7df6539 48-54,77-79,85-106,145,159-161
+native/macos-vm-helper/Tests/RunnerManagerMacOSVMTests/ProtocolTests.swift
+  s_e8c62402ba9043::t_8746024f5c3b63 1,123-166,227-233
+scripts/macos-vm-acceptance.sh
+  s_e8c62402ba9043::t_e971c7992efbc8 112-116,177,180-183,185,190,193-194,668
+tests/macos-vm-acceptance-contract.sh
+  s_e8c62402ba9043::t_3c2051e59b372e 50,56,59,63-72
+tests/macos-vm-helper-cli-json-contract.sh
+  s_e8c62402ba9043::t_dee5807acf152b 60-61,63,69-71,82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "67170cdfca11618bfaecea0a0f60be72ad236796",
+  "prompts": {},
+  "sessions": {
+    "s_e8c62402ba9043": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d621-5fbe-73d1-9e11-4676177173f7",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
