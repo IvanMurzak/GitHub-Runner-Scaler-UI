@@ -64,7 +64,11 @@ BASH
 # LaunchDaemon deliberately reads the standard machine-scoped credential store.
 # Audit must not validate the rooted test keychain selected by --data-dir.
 grep -F 'service_runner() { "$runner_manager" "$@"; }' "$harness" >/dev/null
-grep -F 'service_runner auth status >"$evidence/runner-auth.txt"' "$harness" >/dev/null
+grep -F 'service_runner auth status --start-at boot >"$evidence/runner-auth.txt"' "$harness" >/dev/null
+if grep -F 'service_runner auth status >"$evidence/runner-auth.txt"' "$harness" >/dev/null; then
+  printf 'audit does not explicitly select the boot credential scope\n' >&2
+  exit 1
+fi
 if grep -E '^[[:space:]]+runner auth status >"\$evidence/runner-auth.txt"' "$harness" >/dev/null; then
   printf 'audit still validates the rooted --data-dir credential store\n' >&2
   exit 1

@@ -786,6 +786,15 @@ pub struct AuthReceiveArgs {
 
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {
+    /// Which start mode's credential store to inspect.
+    ///
+    /// An explicit value selects that scope without consulting or changing the
+    /// start mode recorded for this host. This is useful when auditing the
+    /// credential a boot service will read while the production host record
+    /// names a login service. Without this flag, the recorded mode is used.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: Option<StartAt>,
+
     /// Name every repository the credential reaches, instead of counting them.
     ///
     /// An installation on a large account reaches hundreds, and printing them
@@ -2397,6 +2406,7 @@ mod tests {
                 "auth status" => auth::status(
                     &context,
                     &AuthStatusArgs {
+                        start_at: None,
                         list: false,
                         permissions: false,
                     },

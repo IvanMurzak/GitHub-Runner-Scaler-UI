@@ -28,12 +28,21 @@ use support::{
 /// Signs in for real, so the following command reads a credential this suite
 /// did not plant by hand.
 fn signed_in(data_dir: &std::path::Path, github: &FakeGithub) {
+    signed_in_at(data_dir, github, None);
+}
+
+/// Signs in to one explicit start mode so a test can populate both stores
+/// without reaching into their platform-specific implementations.
+fn signed_in_at(data_dir: &std::path::Path, github: &FakeGithub, start_at: Option<&str>) {
     github.with_device_code();
     github.with_approval();
     github.with_no_installations();
     let outcome = run({
         let mut command = runner_manager_against(data_dir, github);
         command.args(["auth", "login"]);
+        if let Some(start_at) = start_at {
+            command.args(["--start-at", start_at]);
+        }
         command
     });
     assert_eq!(
@@ -41,6 +50,71 @@ fn signed_in(data_dir: &std::path::Path, github: &FakeGithub) {
         "the fixture login must succeed, or every assertion after it is about the wrong \
          thing. stdout:\n{}\nstderr:\n{}",
         outcome.stdout, outcome.stderr
+    );
+}
+
+/// An audit can ask about the boot credential even when the production host
+/// currently records login mode. The selector is read-only: after the audit,
+/// an unqualified status must still follow the host record.
+#[test]
+fn an_explicit_start_mode_selects_that_store_without_changing_the_host_record() {
+    let data_dir = tempfile::tempdir().expect("a temporary directory");
+
+    let boot_login = FakeGithub::start();
+    signed_in_at(data_dir.path(), &boot_login, Some("boot"));
+
+    let login_login = FakeGithub::start();
+    signed_in_at(data_dir.path(), &login_login, Some("login"));
+
+    let logout = run({
+        let mut command = runner_manager(data_dir.path());
+        command.args(["auth", "logout"]);
+        command
+    });
+    assert_eq!(logout.code, 0, "stderr: {}", logout.stderr);
+
+    let github = FakeGithub::start();
+    github.with_installation(42, "operator", "User", "selected", &["operator/one"]);
+    let boot_status = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status", "--start-at", "boot"]);
+        command
+    });
+    assert_eq!(
+        boot_status.code,
+        0,
+        "the explicit boot audit must read the boot credential even though the host records \
+         login mode:\n{}",
+        boot_status.both()
+    );
+    assert!(
+        boot_status.stdout.contains("Credential: authenticated"),
+        "{}",
+        boot_status.stdout
+    );
+    assert!(
+        !boot_status.both().contains(&fixture_token()),
+        "auth status must never print the credential it validates:\n{}",
+        boot_status.both()
+    );
+
+    let recorded_status = run({
+        let mut command = runner_manager_against(data_dir.path(), &github);
+        command.args(["auth", "status"]);
+        command
+    });
+    assert_eq!(
+        recorded_status.code,
+        3,
+        "the explicit audit must not change the recorded login mode:\n{}",
+        recorded_status.both()
+    );
+    assert!(
+        recorded_status
+            .stdout
+            .contains("Credential: not_authenticated"),
+        "{}",
+        recorded_status.stdout
     );
 }
 

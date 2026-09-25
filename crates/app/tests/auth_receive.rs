@@ -177,9 +177,10 @@ fn a_received_credential_is_one_auth_status_reports_as_authenticated() {
 
 /// `--start-at` names the store to write *and* the store this host will read.
 ///
-/// Every reader — `auth status`, `repo add`, the daemon — resolves the secret
-/// store from the start mode recorded in the local database, not from the flag
-/// this command was given. A handoff that wrote the user-scoped store and left
+/// Every ordinary reader — unqualified `auth status`, `repo add`, the daemon —
+/// resolves the secret store from the start mode recorded in the local
+/// database, not from the flag this command was given. A handoff that wrote
+/// the user-scoped store and left
 /// the record saying `boot` would put a perfectly good credential somewhere
 /// nothing ever looks, and `auth status` would answer `not_authenticated` on a
 /// host that had just been provisioned successfully.
