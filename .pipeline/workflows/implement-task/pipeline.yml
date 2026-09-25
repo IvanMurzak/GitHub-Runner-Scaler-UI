@@ -4,32 +4,39 @@ name: implement-task
 description: Implement one runner-manager task in an isolated worktree, review and simplify the complete branch diff, then publish a PR after the full PR check rollup is green.
 
 execution: sequential
-runner: session
+runner: manager
 isolation: run
 base_branch: runner-sandbox-isolation
+
+vars:
+  PP_TASK: ""
 
 steps:
   - name: implement
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/implement.md
     self_improve: false
 
   - name: code-review
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/code-review.md
     self_improve: false
 
   - name: simplify
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/simplify.md
     self_improve: false
 
   - name: land
     body:
       - _shared/worktree-preamble.md
+      - _shared/task-input.md
       - steps/land.md
     model: sonnet
     self_improve: false
