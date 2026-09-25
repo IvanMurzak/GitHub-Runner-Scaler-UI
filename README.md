@@ -284,7 +284,8 @@ Organizations use the same commands with `org` in place of `repo`.
 
 ```bash
 runner-manager auth login                                      # Sign in with GitHub's device flow
-runner-manager auth status [--list] [--permissions]            # Inspect access and App permissions
+runner-manager auth status [--start-at boot|login] [--list] [--permissions]
+                                                               # Inspect a start mode's access and App permissions
 runner-manager auth logout                                     # Purge the local credential
 
 runner-manager host show                                       # Show capacity, secret store and REST budget

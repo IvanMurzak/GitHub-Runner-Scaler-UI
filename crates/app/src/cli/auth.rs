@@ -565,9 +565,9 @@ pub fn login(
     let start_mode = requested_mode.unwrap_or(recorded);
     let secrets = context.secret_store(start_mode)?;
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
-    // An explicit choice is recorded, so that `repo add`, `auth status` and the
-    // daemon all agree with the sign-in that just happened rather than with a
-    // default nobody chose.
+    // An explicit choice is recorded, so that `repo add`, an unqualified
+    // `auth status` and the daemon all agree with the sign-in that just
+    // happened rather than with a default nobody chose.
     if let Some(mode) = requested_mode {
         record_start_mode(context, &store, recorded, mode)?;
     }
@@ -689,11 +689,12 @@ pub fn login(
 /// # Why writing the credential is not the whole of the job
 ///
 /// The store a credential lands in is a total function of the *recorded* start
-/// mode -- `auth status`, `repo add` and the daemon all resolve it through
-/// [`Context::recorded_start_mode`]. So a command that writes into the store
-/// for one mode and leaves the record naming the other has stored a valid
-/// credential that nothing on this host will ever look at, and `auth status`
-/// answers `not_authenticated` on a machine that just succeeded.
+/// mode -- an unqualified `auth status`, `repo add` and the daemon all resolve
+/// it through [`Context::recorded_start_mode`]. So a command that writes into
+/// the store for one mode and leaves the record naming the other has stored a
+/// valid credential that the ordinary host flows will never look at, and an
+/// unqualified `auth status` answers `not_authenticated` on a machine that just
+/// succeeded.
 ///
 /// # Errors
 /// [`Failure::LocalState`] when the host record cannot be read or written.
@@ -1432,8 +1433,13 @@ pub fn status(
         writeln!(out).map_err(failed)?;
     }
 
-    let store = context.store()?;
-    let start_mode = context.recorded_start_mode(&store)?;
+    let start_mode = match args.start_at {
+        Some(start_at) => start_at.into(),
+        None => {
+            let store = context.store()?;
+            context.recorded_start_mode(&store)?
+        }
+    };
     let secrets = context.secret_store(start_mode)?;
     let state = credential_state(context, secrets.as_ref())?;
 
@@ -2140,6 +2146,40 @@ mod tests {
 {sentence}"
             );
         }
+    }
+
+    /// An explicit scope is sufficient input for an audit. In particular, the
+    /// boot-store check used by native acceptance must not open the production
+    /// host database merely to discover a mode the operator already supplied.
+    #[test]
+    fn an_explicit_status_start_mode_does_not_open_the_host_database() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let context = context_against_nothing(root.path());
+        let config_dir = context.paths.config_dir().to_path_buf();
+        std::fs::remove_dir(&config_dir).expect("the unused config directory is empty");
+        std::fs::write(&config_dir, b"not a directory")
+            .expect("a file can make the database path unusable");
+
+        let args = AuthStatusArgs {
+            start_at: Some(super::super::StartAt::Boot),
+            list: false,
+            permissions: false,
+        };
+        let mut transcript = Vec::new();
+        let error = status(&context, &args, Styling::plain(), &mut transcript)
+            .expect_err("an empty boot store is not authenticated");
+
+        assert_eq!(
+            error.class(),
+            Failure::NotAuthenticated,
+            "reaching the credential answer proves the unusable host database was not opened: \
+             {error:?}"
+        );
+        assert!(
+            String::from_utf8(transcript)
+                .expect("status output is UTF-8")
+                .contains("Credential: not_authenticated")
+        );
     }
 
     // -- the three-action budget -------------------------------------------

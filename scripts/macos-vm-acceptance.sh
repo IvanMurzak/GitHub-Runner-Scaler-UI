@@ -665,7 +665,7 @@ run_audit() {
   assert_probe_and_image "$evidence"
   [[ -n ${GH_TOKEN:-} ]] || die 'GH_TOKEN is required so sudo never depends on another account home and the exact token can be scanned from evidence'
   gh auth status --hostname github.com >/dev/null
-  service_runner auth status >"$evidence/runner-auth.txt"
+  service_runner auth status --start-at boot >"$evidence/runner-auth.txt"
   [[ $(environment_count) -eq 0 ]] || die 'helper store already contains environments; resolve them before acceptance'
   [[ -z $(service_pid) ]] || die "disposable service '$service_label' already exists"
   local pr_json pr_ref pr_owner repo_owner
