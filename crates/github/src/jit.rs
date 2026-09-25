@@ -902,7 +902,7 @@ mod tests {
     use super::*;
     use crate::testing::{FIXTURE_TOKEN, TestClock};
     use crate::{Endpoints, UserAccessToken};
-    use runner_manager_domain::model::{Arch, HostLabel, Os};
+    use runner_manager_domain::model::{Arch, HostLabel, Label, Os};
     use serde_json::{Value, json};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1118,22 +1118,30 @@ mod tests {
         );
     }
 
-    /// The labels sent are the policy's, verbatim and lower-cased, with nothing
-    /// added.
+    /// Every label a matching job requires is sent when it is part of the
+    /// policy, verbatim and lower-cased, with nothing added implicitly.
     #[test]
-    fn a_policy_registers_exactly_its_own_routing_labels() {
-        let labels = RoutingLabels::derive(
+    fn a_policy_registers_every_workflow_required_label() {
+        let mut labels = RoutingLabels::derive(
             &HostLabel::new("home").expect("a valid host label"),
             Os::Windows,
             Arch::X64,
         );
+        for label in ["self-hosted", "windows", "x64"] {
+            assert!(labels.add(Label::new(label).unwrap()));
+        }
         let request = JitRunnerRequest::for_policy("runner-1", 1, &labels);
 
-        assert_eq!(request.labels(), &["rm-home-win-x64".to_string()]);
-        assert!(
-            !request.labels().iter().any(|label| label == "self-hosted"),
-            "`v1` established that no labels are added implicitly; adding one here would \
-             make a runner answer a `runs-on` the operator never asked it to"
+        assert_eq!(
+            request.labels(),
+            &[
+                "rm-home-win-x64".to_string(),
+                "self-hosted".to_string(),
+                "windows".to_string(),
+                "x64".to_string(),
+            ],
+            "generate-jitconfig stores exactly this request, so omitting any workflow-required \
+             label leaves a registered runner that can never take the matching job"
         );
         assert!(
             request

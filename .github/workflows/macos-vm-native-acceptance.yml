@@ -1,0 +1,82 @@
+name: macOS VM native acceptance
+run-name: macos-vm-${{ github.event.label.name }}
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-vm-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    if: >-
+      github.event.pull_request.number == 79 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.label.name, 'rm-d3-')
+    runs-on: ubuntu-latest
+    outputs:
+      acceptance_id: ${{ steps.selector.outputs.acceptance_id }}
+      reboot: ${{ steps.selector.outputs.reboot }}
+      selector: ${{ steps.selector.outputs.selector }}
+    steps:
+      - name: Resolve the exact profile selector
+        id: selector
+        shell: bash
+        env:
+          TRIGGER_LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGER_LABEL" =~ ^rm-d3-(reboot-)?([0-9]{14}-[0-9a-f]{8})$ ]]
+          reboot=${BASH_REMATCH[1]}
+          acceptance_id=${BASH_REMATCH[2]}
+          selector="rm-d3-acceptance-osx-arm64-d3-${reboot}${acceptance_id}"
+          printf 'acceptance_id=%s\nreboot=%s\nselector=%s\n' \
+            "$acceptance_id" "$([[ -n $reboot ]] && printf true || printf false)" "$selector" \
+            >>"$GITHUB_OUTPUT"
+
+  production-provider:
+    needs: route
+    # generate-jitconfig stores exactly the requested policy labels. The
+    # immutable profile selector is therefore the complete routing contract;
+    # guest OS and architecture are attested inside the job below.
+    runs-on: "${{ needs.route.outputs.selector }}"
+    timeout-minutes: 20
+    steps:
+      - name: Attest the disposable native macOS guest
+        shell: bash
+        env:
+          ACCEPTANCE_ID: ${{ needs.route.outputs.acceptance_id }}
+          ACCEPTANCE_SELECTOR: ${{ needs.route.outputs.selector }}
+          HOLD_SECONDS: ${{ needs.route.outputs.reboot == 'true' && '900' || '180' }}
+        run: |
+          set -euo pipefail
+          [[ "$ACCEPTANCE_ID" =~ ^[0-9]{14}-[0-9a-f]{8}$ ]]
+          [[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?${ACCEPTANCE_ID}$ ]]
+          [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS >= 60 && HOLD_SECONDS <= 900 ))
+          [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]]
+          cpu=$(sysctl -n hw.ncpu)
+          memory_mib=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+          process_limit=$(ulimit -u)
+          [[ $cpu -eq 2 && $memory_mib -eq 4096 && $process_limit -eq 512 ]]
+          [[ -z ${ACTIONS_RUNNER_INPUT_JITCONFIG:-} ]]
+          host_shares=$(mount | awk 'tolower($0) ~ /(virtiofs|shared.*host|host.*shared)/ { count++ } END { print count+0 }')
+          [[ $host_shares -eq 0 ]]
+          if ps eww -axo command | grep -E '[A]CTIONS_RUNNER_INPUT_JITCONFIG=|gh[pousr]_[A-Za-z0-9_]{20,}' >/dev/null; then
+            echo 'credential-shaped content survived in the guest process table' >&2
+            exit 1
+          fi
+          for root in "$RUNNER_TEMP" "$GITHUB_WORKSPACE"; do
+            if grep -RIE --binary-files=without-match --exclude='.credentials*' \
+              'ACTIONS_RUNNER_INPUT_JITCONFIG[[:space:]]*=|gh[pousr]_[A-Za-z0-9_]{20,}' "$root" >/dev/null 2>&1; then
+              echo "credential-shaped content survived under $root" >&2
+              exit 1
+            fi
+          done
+          echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"
+          sleep "$HOLD_SECONDS"
+          echo "RM_ACCEPTANCE completed id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"

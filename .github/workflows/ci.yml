@@ -62,6 +62,103 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  macos-vm-helper:
+    name: macOS VM helper (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64
+            os: macos-latest
+            uname: arm64
+          - name: x86_64
+            os: macos-15-intel
+            uname: x86_64
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Assert native architecture
+        run: |
+          test "$(uname -m)" = "${{ matrix.uname }}"
+          swift --version
+
+      - name: Compile the Virtualization.framework helper
+        run: swift build --package-path native/macos-vm-helper
+
+      - name: Run Swift helper tests
+        run: swift test --package-path native/macos-vm-helper
+
+      - name: Verify helper CLI JSON protocol
+        run: bash tests/macos-vm-helper-cli-json-contract.sh
+
+      - name: Verify the native acceptance harness contract
+        run: bash tests/macos-vm-acceptance-contract.sh
+
+      - name: Sign and execute the native host capability probe
+        run: |
+          set -euo pipefail
+          package=native/macos-vm-helper
+          swift build --package-path "$package" -c release
+          binary=$(swift build --package-path "$package" -c release --show-bin-path)/runner-manager-macos-vm
+          entitlements="$package/runner-manager-macos-vm.entitlements"
+          actual_entitlements="$RUNNER_TEMP/runner-manager-entitlements.plist"
+          probe_json="$RUNNER_TEMP/runner-manager-native-probe.json"
+          probe_root="$RUNNER_TEMP/runner-manager-native-probe-store"
+          trap 'rm -rf "$probe_root"' EXIT
+
+          # The hosted runner has no operator identity. Ad-hoc signing proves
+          # that the built executable carries and observes the committed
+          # entitlement; it is deliberately not production-signing evidence.
+          codesign --force --options runtime --entitlements "$entitlements" --sign - "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          # `:-` requests an XML plist. The newer `-` form emits a diagnostic
+          # dictionary that plist tools cannot inspect on current runner images.
+          codesign --display --entitlements :- "$binary" > "$actual_entitlements"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.virtualization' "$actual_entitlements")" = true
+
+          RUNNER_MANAGER_MACOS_VM_ROOT="$probe_root" \
+            "$binary" --protocol-version 1 probe --json > "$probe_json"
+          python3 -m json.tool "$probe_json" > /dev/null
+
+          read_probe() {
+            python3 -c 'import json, sys; value=json.load(open(sys.argv[1]))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' \
+              "$probe_json" "$1"
+          }
+          test "$(read_probe protocol_version)" = 1
+          test "$(read_probe architecture)" = "${{ matrix.uname }}"
+          test "$(read_probe macos_guest_entitlement)" = true
+          test "$(read_probe fresh_writable_disks)" = true
+
+          framework=$(read_probe virtualization_framework)
+          test "$(read_probe private_jit_channel)" = "$framework"
+          test "$(read_probe resource_limits)" = "$framework"
+          test "$(read_probe process_limits)" = "$framework"
+
+          if [ "${{ matrix.uname }}" = x86_64 ]; then
+            # The shipped macOS guest path is Apple-silicon-only. Compilation,
+            # signing, APFS, or an Intel host must never make it ready.
+            test "$framework" = false
+            result='unsupported by the helper (fail closed)'
+          elif [ "$framework" = true ]; then
+            result='runtime available; real macOS boot still requires an operator template'
+          else
+            result='runtime unavailable on this hosted runner; real VM boot is blocked'
+          fi
+
+          cat "$probe_json"
+          {
+            echo "### macOS VM native capability probe (${{ matrix.uname }})"
+            echo
+            echo '| Gate | Result |'
+            echo '| --- | --- |'
+            echo "| Signed executable observes virtualization entitlement | $(read_probe macos_guest_entitlement) (ad-hoc identity) |"
+            echo "| Real APFS clonefile and cleanup | $(read_probe fresh_writable_disks) |"
+            echo "| VZVirtualMachine.isSupported | $framework |"
+            echo "| Product readiness | $result |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # d1's secret-free native Linux acceptance. The hosted Ubuntu VM uses
   # passwordless sudo only to mount a disposable 1 GiB ext4 loop filesystem and
   # install its immutable helper; Podman and the provider remain rootless. The

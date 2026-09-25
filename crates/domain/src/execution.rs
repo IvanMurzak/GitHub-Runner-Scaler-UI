@@ -53,14 +53,20 @@ impl ImageReference {
         });
         let version = reference
             .strip_prefix("vm-version:")
-            .is_some_and(|version| {
+            .and_then(|value| value.rsplit_once("@sha256:"))
+            .is_some_and(|(version, template_digest)| {
                 !version.is_empty()
                     && version.len() <= 128
+                    && !version.eq_ignore_ascii_case("latest")
                     && version
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                    && template_digest.len() == 64
+                    && template_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || b"abcdef".contains(&byte))
             });
-        if !(oci || (valid && (digest || version))) {
+        if !(oci || (valid && digest) || version) {
             return Err(ExecutionError::InvalidImage);
         }
         Ok(Self { reference })
@@ -69,6 +75,19 @@ impl ImageReference {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.reference
+    }
+
+    /// The independently stable identity embedded in a macOS VM template
+    /// reference. A human-readable version alone can be rebound to different
+    /// bytes, so VM references always carry this digest in the durable policy
+    /// and attempt journal.
+    #[must_use]
+    pub fn vm_template_digest(&self) -> Option<&str> {
+        let (_, digest) = self
+            .reference
+            .strip_prefix("vm-version:")?
+            .rsplit_once("@sha256:")?;
+        Some(digest)
     }
 }
 
@@ -178,8 +197,9 @@ impl ExecutionPolicy {
             }
             resources.validate()?;
             ImageReference::new(image.as_str())?;
-            if matches!(backend, Backend::Oci | Backend::WindowsHyperVContainer)
-                && !image.as_str().contains("sha256:")
+            if (matches!(backend, Backend::Oci | Backend::WindowsHyperVContainer)
+                && image.vm_template_digest().is_some())
+                || (*backend == Backend::VirtualMachine && image.vm_template_digest().is_none())
             {
                 return Err(ExecutionError::BackendImageMismatch);
             }
@@ -294,10 +314,12 @@ impl AttemptExecution {
                 return Err(ExecutionError::UnresolvedProvider);
             }
             ImageReference::new(resolved_image.as_str())?;
-            if matches!(
+            if (matches!(
                 provider_kind,
                 Backend::Oci | Backend::WindowsHyperVContainer
-            ) && !resolved_image.as_str().contains("sha256:")
+            ) && resolved_image.vm_template_digest().is_some())
+                || (*provider_kind == Backend::VirtualMachine
+                    && resolved_image.vm_template_digest().is_none())
             {
                 return Err(ExecutionError::BackendImageMismatch);
             }
@@ -369,6 +391,10 @@ mod tests {
     fn mutable_credentials_and_unknown_provider_shapes_fail_closed() {
         for reference in [
             "runner:latest",
+            "vm-version:latest",
+            "vm-version:LATEST",
+            "vm-version:macos-15.1-arm64-v3",
+            "vm-version:macos-15.1-arm64-v3@sha256:short",
             "https://user:token@registry.example/runner",
             "registry.example/runner@sha256:short",
             "registry.example/runner @sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -391,6 +417,16 @@ mod tests {
         }
         assert!(
             ImageReference::new(format!("registry.example:5000/runner@sha256:{digest}")).is_ok()
+        );
+        let vm = ImageReference::new(format!("vm-version:macos-15.1-arm64-v3@sha256:{digest}"))
+            .expect("digest-pinned VM template");
+        assert_eq!(vm.vm_template_digest(), Some(digest.as_str()));
+        assert_eq!(
+            ImageReference::new(format!(
+                "vm-version:macos-15.1-arm64-v3@sha256:{}",
+                "A".repeat(64)
+            )),
+            Err(ExecutionError::InvalidImage)
         );
         assert!(serde_json::from_str::<ExecutionPolicy>(
             r#"{"mode":"isolated","backend":"unknown","image":{"reference":"x"},"resources":{"cpu_millis":1000,"memory_mib":1024,"disk_mib":4096}}"#
@@ -428,7 +464,9 @@ mod tests {
 
     #[test]
     fn container_backends_require_digest_images_for_policy_and_journal() {
-        let version = ImageReference::new("vm-version:macos-15.0").expect("pinned VM version");
+        let version =
+            ImageReference::new(format!("vm-version:macos-15.0@sha256:{}", "b".repeat(64)))
+                .expect("pinned VM version and template digest");
         for backend in [Backend::Oci, Backend::WindowsHyperVContainer] {
             let policy = ExecutionPolicy::Isolated {
                 backend,
