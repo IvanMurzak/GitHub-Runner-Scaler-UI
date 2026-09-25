@@ -65,7 +65,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 
 use super::{
     AuthCommand, AuthReceiveArgs, AuthStatusArgs, CliError, Context, Failure, NO_OPERATOR_REMEDY,
-    Styling, open_in_browser, write_failed,
+    StartAt, Styling, open_in_browser, write_failed,
 };
 
 // ---------------------------------------------------------------------------
@@ -1339,17 +1339,28 @@ impl CredentialState {
     }
 
     /// The command that clears this state, or the one that re-checks it.
+    ///
+    /// A status query that selected one store explicitly must keep selecting it
+    /// in its remedy. Falling back to an unqualified command would consult the
+    /// host record again and could act on the other credential store.
     #[must_use]
-    pub const fn remedy(&self) -> &'static str {
+    pub fn remedy(&self, start_at: Option<StartAt>) -> String {
+        let selector = match start_at {
+            Some(StartAt::Boot) => " --start-at boot",
+            Some(StartAt::Login) => " --start-at login",
+            None => "",
+        };
         match self {
-            Self::NotAuthenticated | Self::Revoked => "runner-manager auth login",
+            Self::NotAuthenticated | Self::Revoked => {
+                format!("runner-manager auth login{selector}")
+            }
             Self::LockedOut { .. } => {
-                "wait for the lockout to elapse, then runner-manager auth status"
+                format!("wait for the lockout to elapse, then runner-manager auth status{selector}")
             }
             Self::Unreachable { .. } => {
-                "check this host's network, then runner-manager auth status"
+                format!("check this host's network, then runner-manager auth status{selector}")
             }
-            Self::Authenticated(_) => "runner-manager auth status",
+            Self::Authenticated(_) => format!("runner-manager auth status{selector}"),
         }
     }
 }
@@ -1452,7 +1463,7 @@ pub fn status(
         Some(class) => Err(CliError::with_remedy(
             class,
             format!("the stored credential is {}", state.as_str()),
-            state.remedy(),
+            state.remedy(args.start_at),
         )),
     }
 }
@@ -2175,6 +2186,11 @@ mod tests {
             "reaching the credential answer proves the unusable host database was not opened: \
              {error:?}"
         );
+        assert_eq!(
+            error.remedy(),
+            Some("runner-manager auth login --start-at boot"),
+            "the remedy must not fall back to the unusable host record or the other store"
+        );
         assert!(
             String::from_utf8(transcript)
                 .expect("status output is UTF-8")
@@ -2373,7 +2389,7 @@ mod tests {
         let state = CredentialState::LockedOut {
             retry_after_secs: 90,
         };
-        let remedy = state.remedy();
+        let remedy = state.remedy(None);
         assert!(
             !remedy.contains("auth login"),
             "`03-control-flows.md` flow 4.3: a lockout is not a permissions change and not a \
