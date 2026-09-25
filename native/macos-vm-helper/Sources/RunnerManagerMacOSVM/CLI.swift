@@ -55,15 +55,7 @@ struct RunnerManagerMacOSVM {
             let options = try Options(arguments, values: ["--image"], flags: ["--json"])
             let image = try options.required("--image")
             let (manifest, _) = try store.loadTemplate(image: image)
-            try writeJSON(ImageResponse(
-                protocolVersion: protocolVersion,
-                image: manifest.image,
-                templateDigest: manifest.templateDigest,
-                guestOs: manifest.identity.guestOs,
-                architecture: manifest.identity.architecture,
-                immutable: manifest.immutable,
-                bootstrapReady: manifest.bootstrapReady
-            ))
+            try writeImageResponse(manifest)
         case "template":
             try templateCommand(store: store, arguments: arguments)
         case "prepare":
@@ -137,15 +129,7 @@ struct RunnerManagerMacOSVM {
                 flags: ["--json"]
             )
             let manifest = try store.verifyTemplate(image: options.required("--image"))
-            try writeJSON(ImageResponse(
-                protocolVersion: protocolVersion,
-                image: manifest.image,
-                templateDigest: manifest.templateDigest,
-                guestOs: manifest.identity.guestOs,
-                architecture: manifest.identity.architecture,
-                immutable: manifest.immutable,
-                bootstrapReady: manifest.bootstrapReady
-            ))
+            try writeImageResponse(manifest)
             return
         }
         guard command == "register" else {
@@ -169,6 +153,18 @@ struct RunnerManagerMacOSVM {
             hardwareModel: absoluteURL(options.required("--hardware-model"))
         )
         try writeJSON(manifest)
+    }
+
+    private static func writeImageResponse(_ manifest: TemplateManifest) throws {
+        try writeJSON(ImageResponse(
+            protocolVersion: protocolVersion,
+            image: manifest.image,
+            templateDigest: manifest.templateDigest,
+            guestOs: manifest.identity.guestOs,
+            architecture: manifest.identity.architecture,
+            immutable: manifest.immutable,
+            bootstrapReady: manifest.bootstrapReady
+        ))
     }
 
     private static func ownedRecord(store: Store, arguments: [String]) throws -> (EnvironmentRecord, Options) {
