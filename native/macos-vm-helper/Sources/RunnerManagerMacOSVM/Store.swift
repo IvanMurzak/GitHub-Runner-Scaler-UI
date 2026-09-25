@@ -45,7 +45,13 @@ struct Store {
         return environments.appendingPathComponent(environment, isDirectory: true)
     }
 
-    func loadTemplate(image: String, verifyArtifacts: Bool = true) throws -> (TemplateManifest, URL) {
+    /// Loads the immutable inventory used by readiness and reconciliation.
+    ///
+    /// Artifact bytes are verified when they cross into the helper-owned
+    /// template store, and again only through the explicit operator verify
+    /// command. Rehashing a multi-gigabyte disk here would put every readiness,
+    /// prepare, start, and recovery operation on the artifact-size hot path.
+    func loadTemplate(image: String) throws -> (TemplateManifest, URL) {
         let parsed = try parsePinnedImage(image)
         let directory = templateDirectory(parsed.digest)
         let manifestURL = directory.appendingPathComponent(Self.manifestName)
@@ -68,20 +74,34 @@ struct Store {
         else {
             throw HelperFailure.rejected("template is incompatible")
         }
-        if verifyArtifacts {
-            let artifacts = [
-                (Self.diskName, manifest.identity.diskSha256),
-                (Self.auxiliaryName, manifest.identity.auxiliaryStorageSha256),
-                (Self.hardwareModelName, manifest.identity.hardwareModelSha256),
-            ]
-            for (name, expected) in artifacts {
-                let url = directory.appendingPathComponent(name)
-                guard isRegularFile(url), try sha256(url: url) == expected else {
-                    throw HelperFailure.rejected("template artifact identity mismatch")
-                }
+        for name in [Self.diskName, Self.auxiliaryName, Self.hardwareModelName] {
+            guard isRegularFile(directory.appendingPathComponent(name)) else {
+                throw HelperFailure.rejected("template artifact is unavailable")
             }
         }
         return (manifest, directory)
+    }
+
+    /// Performs the authoritative byte-for-byte check at an explicit trust
+    /// boundary rather than on the lifecycle hot path.
+    func verifyTemplate(image: String) throws -> TemplateManifest {
+        let (manifest, directory) = try loadTemplate(image: image)
+        try verifyTemplateArtifacts(manifest, in: directory)
+        return manifest
+    }
+
+    private func verifyTemplateArtifacts(_ manifest: TemplateManifest, in directory: URL) throws {
+        let artifacts = [
+            (Self.diskName, manifest.identity.diskSha256),
+            (Self.auxiliaryName, manifest.identity.auxiliaryStorageSha256),
+            (Self.hardwareModelName, manifest.identity.hardwareModelSha256),
+        ]
+        for (name, expected) in artifacts {
+            let url = directory.appendingPathComponent(name)
+            guard isRegularFile(url), try sha256(url: url) == expected else {
+                throw HelperFailure.rejected("template artifact identity mismatch")
+            }
+        }
     }
 
     func registerTemplate(
@@ -122,7 +142,7 @@ struct Store {
         _ = try parsePinnedImage(manifest.image)
         let destination = templateDirectory(manifest.templateDigest)
         if FileManager.default.fileExists(atPath: destination.path) {
-            let (existing, _) = try loadTemplate(image: manifest.image)
+            let existing = try verifyTemplate(image: manifest.image)
             guard existing == manifest else {
                 throw HelperFailure.rejected("template digest collision")
             }
@@ -136,6 +156,9 @@ struct Store {
             try copyFile(auxiliaryStorage, staging.appendingPathComponent(Self.auxiliaryName))
             try copyFile(hardwareModel, staging.appendingPathComponent(Self.hardwareModelName))
             try writeFile(manifest, to: staging.appendingPathComponent(Self.manifestName))
+            // Hash the copies the helper is about to publish, not only the
+            // operator-owned sources that could change while copying.
+            try verifyTemplateArtifacts(manifest, in: staging)
             for name in [Self.diskName, Self.auxiliaryName, Self.hardwareModelName, Self.manifestName] {
                 try setPermissions(staging.appendingPathComponent(name), mode: 0o400)
             }

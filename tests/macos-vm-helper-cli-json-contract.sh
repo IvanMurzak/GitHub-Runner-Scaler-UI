@@ -57,15 +57,18 @@ PY
 image=$(cat "$fixture/image.txt")
 RUNNER_MANAGER_MACOS_VM_ROOT="$fixture" \
   "$binary" --protocol-version 1 image inspect --image "$image" --json > "$fixture/response.json"
+RUNNER_MANAGER_MACOS_VM_ROOT="$fixture" \
+  "$binary" --protocol-version 1 template verify --image "$image" --json > "$fixture/verified.json"
 
-python3 - "$fixture/response.json" "$image" "$architecture" <<'PY'
+python3 - "$fixture/response.json" "$fixture/verified.json" "$image" "$architecture" <<'PY'
 import json
 import pathlib
 import sys
 
 response = json.loads(pathlib.Path(sys.argv[1]).read_text())
-image = sys.argv[2]
-architecture = sys.argv[3]
+verified = json.loads(pathlib.Path(sys.argv[2]).read_text())
+image = sys.argv[3]
+architecture = sys.argv[4]
 expected = {
     "protocol_version": 1,
     "image": image,
@@ -76,6 +79,7 @@ expected = {
     "bootstrap_ready": True,
 }
 assert response == expected, response
+assert verified == expected, verified
 PY
 
 echo 'macOS VM helper CLI JSON contract passed'

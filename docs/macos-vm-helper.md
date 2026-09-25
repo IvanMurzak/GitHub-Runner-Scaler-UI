@@ -121,13 +121,27 @@ sudo runner-manager-macos-vm --protocol-version 1 template register \
 ```
 
 The command copies the artifacts into the helper's mode-0700 template store,
-makes them read-only, and returns a manifest containing the complete pinned
-image reference. Its SHA-256 identity covers the version, guest OS,
-architecture, exact logical disk size, the SHA-256 of all three artifacts, the
-bootstrap protocol and port, and the process-limit contract. `image inspect`
-rehashes all artifacts before it reports the template ready. The writable disk
-limit must equal the template disk's logical size; the helper never claims that
-Virtualization.framework can shrink an installed macOS disk.
+hashes the stored copies before publishing them, makes them read-only, and
+returns a manifest containing the complete pinned image reference. Its SHA-256
+identity covers the version, guest OS, architecture, exact logical disk size,
+the SHA-256 of all three artifacts, the bootstrap protocol and port, and the
+process-limit contract. Registration is the trust boundary: `image inspect`,
+readiness, preparation, and recovery validate the digest-bound manifest and
+helper-owned read-only layout without repeatedly reading the entire VM disk.
+
+An operator can perform the same authoritative byte-for-byte verification at
+any time, and the native acceptance audit does so before installing its
+profile:
+
+```sh
+sudo runner-manager-macos-vm --protocol-version 1 template verify \
+  --image 'vm-version:macos-15.1-arm64-v3@sha256:<digest>' --json
+```
+
+If an artifact is changed outside the registration command, verification fails
+closed; register the changed template under a new version and digest. The
+writable disk limit must equal the template disk's logical size; the helper
+never claims that Virtualization.framework can shrink an installed macOS disk.
 
 Apple requires each virtual Mac to retain compatible hardware-model and
 auxiliary-storage data, and requires unique machine identity for concurrently
@@ -305,9 +319,13 @@ GitHub-hosted ARM64 macOS runners cannot perform this gate because nested
 virtualization is unavailable. Use a physical Apple-silicon Mac or a dedicated
 bare-metal Apple-silicon host. Install the signed helper and register the
 operator-prepared template first, build the PR's `runner-manager` release
-binary, authenticate its dedicated absolute `--data-dir`, export `GH_TOKEN` for
-the fixture repository (with pull-request and issue-label write plus Actions
-write permissions), then run the guarded phases:
+binary, and authenticate the boot service's standard machine-scoped store with
+`sudo target/release/runner-manager auth login --start-at boot`. The absolute
+`--data-dir` below scopes only the disposable acceptance configuration, state,
+runtime, and logs; it must not root the credential audit because the
+LaunchDaemon does not read that keychain. Export `GH_TOKEN` for the fixture
+repository (with pull-request and issue-label write plus Actions write
+permissions), then run the guarded phases:
 
 ```sh
 common=(
@@ -333,8 +351,9 @@ sudo -E scripts/macos-vm-acceptance.sh rollback "${common[@]}" --allow-rollback
 
 `audit` refuses a non-ARM host, a virtual host where
 `VZVirtualMachine.isSupported` is false, a missing entitlement, non-APFS clone
-support, an incompatible digest-pinned template, an existing helper resource,
-or missing GitHub/product authentication. `run-job` requires exact 2 CPU, 4096
+support, a byte-for-byte verification failure for the digest-pinned template,
+an existing helper resource, or missing GitHub/product authentication in the
+standard boot-service credential store. `run-job` requires exact 2 CPU, 4096
 MiB, template-sized disk and 512-process attestations, no host shares, a fresh
 writable-disk identity, guest secret scans, and launchd restart/adoption while
 the job is live. `prepare-before-reboot` creates a second fresh-disk identity

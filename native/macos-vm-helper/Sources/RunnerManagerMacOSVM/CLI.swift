@@ -65,7 +65,7 @@ struct RunnerManagerMacOSVM {
                 bootstrapReady: manifest.bootstrapReady
             ))
         case "template":
-            try registerTemplate(store: store, arguments: arguments)
+            try templateCommand(store: store, arguments: arguments)
         case "prepare":
             try prepare(store: store, arguments: arguments)
         case "inspect":
@@ -126,8 +126,31 @@ struct RunnerManagerMacOSVM {
         )
     }
 
-    private static func registerTemplate(store: Store, arguments: [String]) throws {
-        guard arguments.first == "register" else { throw HelperFailure.rejected("unsupported template command") }
+    private static func templateCommand(store: Store, arguments: [String]) throws {
+        guard let command = arguments.first else {
+            throw HelperFailure.rejected("unsupported template command")
+        }
+        if command == "verify" {
+            let options = try Options(
+                Array(arguments.dropFirst()),
+                values: ["--image"],
+                flags: ["--json"]
+            )
+            let manifest = try store.verifyTemplate(image: options.required("--image"))
+            try writeJSON(ImageResponse(
+                protocolVersion: protocolVersion,
+                image: manifest.image,
+                templateDigest: manifest.templateDigest,
+                guestOs: manifest.identity.guestOs,
+                architecture: manifest.identity.architecture,
+                immutable: manifest.immutable,
+                bootstrapReady: manifest.bootstrapReady
+            ))
+            return
+        }
+        guard command == "register" else {
+            throw HelperFailure.rejected("unsupported template command")
+        }
         let options = try Options(
             Array(arguments.dropFirst()),
             values: [

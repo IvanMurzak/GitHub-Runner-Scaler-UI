@@ -109,6 +109,11 @@ export RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root"
 export RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag"
 
 runner() { "$runner_manager" --data-dir "$data_dir" "$@"; }
+# The boot LaunchDaemon deliberately uses the standard machine-scoped secret
+# store even when its configuration/state directories were selected with
+# --data-dir. Passing --data-dir here would inspect a rooted test keychain the
+# service never opens.
+service_runner() { "$runner_manager" "$@"; }
 helper_command() { "$helper" --protocol-version 1 "$@"; }
 boot_epoch() {
   sysctl -n kern.boottime |
@@ -169,19 +174,24 @@ assert_probe_and_image() {
   local out=$1
   local probe="$out/probe.json"
   local inspected="$out/image.json"
+  local verified="$out/template-verification.json"
   helper_command probe --json >"$probe"
   helper_command image inspect --image "$image" --json >"$inspected"
-  python3 - "$probe" "$inspected" "$image" "${disk_mib:-}" <<'PY'
+  # Full artifact hashing is an explicit audit/registration trust-boundary
+  # operation, never part of the daemon's readiness/reconciliation hot path.
+  helper_command template verify --image "$image" --json >"$verified"
+  python3 - "$probe" "$inspected" "$verified" "$image" "${disk_mib:-}" <<'PY'
 import json, sys
-probe, image = (json.load(open(p)) for p in sys.argv[1:3])
+probe, image, verified = (json.load(open(p)) for p in sys.argv[1:4])
 required = ('virtualization_framework','macos_guest_entitlement','private_jit_channel',
             'fresh_writable_disks','resource_limits','process_limits')
 assert probe['protocol_version'] == 1 and probe['architecture'] == 'arm64', probe
 assert all(probe.get(k) is True for k in required), probe
-assert image['protocol_version'] == 1 and image['image'] == sys.argv[3], image
+assert image['protocol_version'] == 1 and image['image'] == sys.argv[4], image
 assert image['guest_os'] == 'macos' and image['architecture'] == 'arm64', image
 assert image['immutable'] is True and image['bootstrap_ready'] is True, image
-assert image['template_digest'] == sys.argv[3].split('@sha256:',1)[1], image
+assert image['template_digest'] == sys.argv[4].split('@sha256:',1)[1], image
+assert verified == image, (verified, image)
 PY
   if [[ -z $disk_mib ]]; then
     local manifest="$helper_root/templates/${image##*@sha256:}/manifest.json"
@@ -655,7 +665,7 @@ run_audit() {
   assert_probe_and_image "$evidence"
   [[ -n ${GH_TOKEN:-} ]] || die 'GH_TOKEN is required so sudo never depends on another account home and the exact token can be scanned from evidence'
   gh auth status --hostname github.com >/dev/null
-  runner auth status >"$evidence/runner-auth.txt"
+  service_runner auth status >"$evidence/runner-auth.txt"
   [[ $(environment_count) -eq 0 ]] || die 'helper store already contains environments; resolve them before acceptance'
   [[ -z $(service_pid) ]] || die "disposable service '$service_label' already exists"
   local pr_json pr_ref pr_owner repo_owner
