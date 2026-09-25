@@ -1,0 +1,19 @@
+native/macos-vm-helper/Sources/RunnerManagerMacOSVM/CLI.swift
+  s_4c064b45ac0ee3::t_db3a46292b6c31 58,132,158-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cc24a5a5b5b0e1ddc26091c19bb2f74fcfbc2d9f",
+  "prompts": {},
+  "sessions": {
+    "s_4c064b45ac0ee3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d620-5a47-7a73-ae47-68fed4a6bb3e",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
