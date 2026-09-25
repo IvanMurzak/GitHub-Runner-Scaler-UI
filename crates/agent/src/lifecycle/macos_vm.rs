@@ -1053,6 +1053,33 @@ enum HelperFailure {
     UnexpectedExit,
 }
 
+impl HelperFailure {
+    /// A closed, credential-free class suitable for the redacted service log.
+    const fn log_kind(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "macos_vm_helper_not_installed",
+            Self::PermissionDenied => "macos_vm_helper_permission_denied",
+            Self::StorePermissionDenied => "macos_vm_helper_store_permission_denied",
+            Self::Missing => "macos_vm_helper_resource_missing",
+            Self::Rejected => "macos_vm_helper_operation_rejected",
+            Self::TemplateMismatch => "macos_vm_helper_template_mismatch",
+            Self::TimedOut => "macos_vm_helper_timed_out",
+            Self::IoFailed => "macos_vm_helper_io_failed",
+            Self::UnexpectedExit => "macos_vm_helper_unexpected_exit",
+        }
+    }
+}
+
+fn logged_helper_failure(failure: HelperFailure) -> HelperFailure {
+    // `error_kind` is an allow-listed enumerated field. Do not attach stderr:
+    // alternate helpers and guest failures can put arbitrary secrets there.
+    tracing::warn!(
+        error_kind = failure.log_kind(),
+        "macOS VM helper operation failed"
+    );
+    failure
+}
+
 trait HelperCommand: std::fmt::Debug + Send + Sync {
     fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<Vec<u8>, HelperFailure>;
 }
@@ -1226,26 +1253,26 @@ fn closed_helper_diagnostic(stderr: &[u8]) -> Option<HelperFailure> {
 
 impl HelperCommand for SystemHelper {
     fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<Vec<u8>, HelperFailure> {
-        let output = self
-            .invoke(args, stdin)
-            .map_err(|error| match error.kind() {
+        let output = self.invoke(args, stdin).map_err(|error| {
+            logged_helper_failure(match error.kind() {
                 std::io::ErrorKind::NotFound => HelperFailure::NotInstalled,
                 std::io::ErrorKind::PermissionDenied => HelperFailure::PermissionDenied,
                 std::io::ErrorKind::TimedOut => HelperFailure::TimedOut,
                 _ => HelperFailure::IoFailed,
-            })?;
+            })
+        })?;
         if output.status.success() {
             return Ok(output.stdout);
         }
         if let Some(failure) = closed_helper_diagnostic(&output.stderr) {
-            return Err(failure);
+            return Err(logged_helper_failure(failure));
         }
-        Err(match output.status.code() {
+        Err(logged_helper_failure(match output.status.code() {
             Some(66) => HelperFailure::Missing,
             Some(77) => HelperFailure::PermissionDenied,
             Some(78) => HelperFailure::Rejected,
             _ => HelperFailure::UnexpectedExit,
-        })
+        }))
     }
 }
 
@@ -1824,6 +1851,40 @@ mod tests {
         let captured = read_bounded_stderr(&mut input).unwrap();
         assert_eq!(captured.len(), MAX_HELPER_STDERR);
         assert_eq!(input.position(), (MAX_HELPER_STDERR + 4096) as u64);
+    }
+
+    #[test]
+    fn every_helper_failure_has_a_closed_service_log_class() {
+        let cases = [
+            (HelperFailure::NotInstalled, "macos_vm_helper_not_installed"),
+            (
+                HelperFailure::PermissionDenied,
+                "macos_vm_helper_permission_denied",
+            ),
+            (
+                HelperFailure::StorePermissionDenied,
+                "macos_vm_helper_store_permission_denied",
+            ),
+            (HelperFailure::Missing, "macos_vm_helper_resource_missing"),
+            (
+                HelperFailure::Rejected,
+                "macos_vm_helper_operation_rejected",
+            ),
+            (
+                HelperFailure::TemplateMismatch,
+                "macos_vm_helper_template_mismatch",
+            ),
+            (HelperFailure::TimedOut, "macos_vm_helper_timed_out"),
+            (HelperFailure::IoFailed, "macos_vm_helper_io_failed"),
+            (
+                HelperFailure::UnexpectedExit,
+                "macos_vm_helper_unexpected_exit",
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(failure.log_kind(), expected);
+            assert!(!failure.log_kind().contains("secret"));
+        }
     }
 
     #[cfg(windows)]

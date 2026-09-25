@@ -55,17 +55,9 @@ struct RunnerManagerMacOSVM {
             let options = try Options(arguments, values: ["--image"], flags: ["--json"])
             let image = try options.required("--image")
             let (manifest, _) = try store.loadTemplate(image: image)
-            try writeJSON(ImageResponse(
-                protocolVersion: protocolVersion,
-                image: manifest.image,
-                templateDigest: manifest.templateDigest,
-                guestOs: manifest.identity.guestOs,
-                architecture: manifest.identity.architecture,
-                immutable: manifest.immutable,
-                bootstrapReady: manifest.bootstrapReady
-            ))
+            try writeImageResponse(manifest)
         case "template":
-            try registerTemplate(store: store, arguments: arguments)
+            try templateCommand(store: store, arguments: arguments)
         case "prepare":
             try prepare(store: store, arguments: arguments)
         case "inspect":
@@ -126,8 +118,23 @@ struct RunnerManagerMacOSVM {
         )
     }
 
-    private static func registerTemplate(store: Store, arguments: [String]) throws {
-        guard arguments.first == "register" else { throw HelperFailure.rejected("unsupported template command") }
+    private static func templateCommand(store: Store, arguments: [String]) throws {
+        guard let command = arguments.first else {
+            throw HelperFailure.rejected("unsupported template command")
+        }
+        if command == "verify" {
+            let options = try Options(
+                Array(arguments.dropFirst()),
+                values: ["--image"],
+                flags: ["--json"]
+            )
+            let manifest = try store.verifyTemplate(image: options.required("--image"))
+            try writeImageResponse(manifest)
+            return
+        }
+        guard command == "register" else {
+            throw HelperFailure.rejected("unsupported template command")
+        }
         let options = try Options(
             Array(arguments.dropFirst()),
             values: [
@@ -146,6 +153,18 @@ struct RunnerManagerMacOSVM {
             hardwareModel: absoluteURL(options.required("--hardware-model"))
         )
         try writeJSON(manifest)
+    }
+
+    private static func writeImageResponse(_ manifest: TemplateManifest) throws {
+        try writeJSON(ImageResponse(
+            protocolVersion: protocolVersion,
+            image: manifest.image,
+            templateDigest: manifest.templateDigest,
+            guestOs: manifest.identity.guestOs,
+            architecture: manifest.identity.architecture,
+            immutable: manifest.immutable,
+            bootstrapReady: manifest.bootstrapReady
+        ))
     }
 
     private static func ownedRecord(store: Store, arguments: [String]) throws -> (EnvironmentRecord, Options) {

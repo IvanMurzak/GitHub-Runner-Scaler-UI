@@ -47,18 +47,28 @@ probe_path_declarations=$(
   awk '
     /^assert_probe_and_image\(\) \{/ { in_function = 1; next }
     in_function && /helper_command probe/ { exit }
-    in_function && /^[[:space:]]+local (out|probe|inspected)=/ { print }
+    in_function && /^[[:space:]]+local (out|probe|inspected|verified)=/ { print }
   ' "$harness"
 )
 PROBE_PATH_DECLARATIONS=$probe_path_declarations bash -u <<'BASH'
 eval "probe_paths() {
 $PROBE_PATH_DECLARATIONS
-printf '%s\n%s\n' \"\$probe\" \"\$inspected\"
+printf '%s\n%s\n%s\n' \"\$probe\" \"\$inspected\" \"\$verified\"
 }"
 actual=$(probe_paths '/tmp/runner manager')
-expected=$(printf '%s\n%s\n' '/tmp/runner manager/probe.json' '/tmp/runner manager/image.json')
+expected=$(printf '%s\n%s\n%s\n' '/tmp/runner manager/probe.json' '/tmp/runner manager/image.json' '/tmp/runner manager/template-verification.json')
 [[ $actual == "$expected" ]]
 BASH
+
+# The acceptance data directory roots configuration and state, but the boot
+# LaunchDaemon deliberately reads the standard machine-scoped credential store.
+# Audit must not validate the rooted test keychain selected by --data-dir.
+grep -F 'service_runner() { "$runner_manager" "$@"; }' "$harness" >/dev/null
+grep -F 'service_runner auth status >"$evidence/runner-auth.txt"' "$harness" >/dev/null
+if grep -E '^[[:space:]]+runner auth status >"\$evidence/runner-auth.txt"' "$harness" >/dev/null; then
+  printf 'audit still validates the rooted --data-dir credential store\n' >&2
+  exit 1
+fi
 
 # A failed run-job can install the service and exit before ensure_profile writes
 # profile_name. Exercise the harness's real receipt reader against that durable

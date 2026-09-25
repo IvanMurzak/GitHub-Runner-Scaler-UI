@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import RunnerManagerMacOSVM
@@ -119,6 +120,50 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNotEqual(first.templateDigest, try TemplateManifest.make(identity: changed).templateDigest)
     }
 
+    func testHotTemplateLoadUsesPinnedInventoryAndExplicitVerificationChecksBytes() throws {
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = try Store(environment: ["RUNNER_MANAGER_MACOS_VM_ROOT": temporary.path])
+        let disk = Data("registered disk".utf8)
+        let auxiliary = Data("registered auxiliary storage".utf8)
+        let hardware = Data("registered hardware model".utf8)
+        let identity = TemplateIdentity(
+            schemaVersion: 1,
+            version: "verification-boundary-v1",
+            guestOs: "macos",
+            architecture: hostArchitecture(),
+            diskMib: 1,
+            diskSha256: SHA256.hash(data: disk).hex,
+            auxiliaryStorageSha256: SHA256.hash(data: auxiliary).hex,
+            hardwareModelSha256: SHA256.hash(data: hardware).hex,
+            bootstrapProtocol: 1,
+            bootstrapPort: 22022,
+            processLimit: 512,
+            processLimitMechanism: "rlimit_nproc_dedicated_uid"
+        )
+        let manifest = try TemplateManifest.make(identity: identity)
+        let directory = store.templateDirectory(manifest.templateDigest)
+        try ensureDirectory(directory)
+        try disk.write(to: directory.appendingPathComponent(Store.diskName))
+        try auxiliary.write(to: directory.appendingPathComponent(Store.auxiliaryName))
+        try hardware.write(to: directory.appendingPathComponent(Store.hardwareModelName))
+        try writeFile(manifest, to: directory.appendingPathComponent(Store.manifestName))
+
+        XCTAssertEqual(try store.verifyTemplate(image: manifest.image), manifest)
+        try Data("tampered disk".utf8).write(
+            to: directory.appendingPathComponent(Store.diskName)
+        )
+
+        XCTAssertEqual(
+            try store.loadTemplate(image: manifest.image).0,
+            manifest,
+            "readiness uses the already-verified pinned inventory instead of rehashing artifacts"
+        )
+        XCTAssertThrowsError(try store.verifyTemplate(image: manifest.image)) { error in
+            XCTAssertEqual((error as? HelperFailure)?.message, "template artifact identity mismatch")
+        }
+    }
+
     func testPublicRecordRedactsRecoveryFieldsAndEmitsNullExitCode() throws {
         let record = fixtureRecord()
         let data = try protocolEncoder.encode(record.publicRecord())
@@ -178,5 +223,12 @@ final class ProtocolTests: XCTestCase {
             supervisorPid: 123,
             supervisorToken: "token"
         )
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("runner-manager-macos-vm-protocol-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        return url
     }
 }
