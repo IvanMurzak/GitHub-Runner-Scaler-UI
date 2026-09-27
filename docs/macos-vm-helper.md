@@ -396,7 +396,10 @@ scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
 
 The continuation validates its shell/plist before loading, waits for a changed
 host boot identity, and resolves `gh`/`python3` without relying on LaunchAgent
-shell setup. A failed recovery retains the continuation and evidence for retry;
+shell setup. An internal-plist bootstrap waits up to 600 seconds for an external
+receipt-script volume to mount before opening the script. A mount timeout gives
+an actionable retry message and preserves recovery files. A failed recovery
+retains the continuation and evidence for retry;
 successful recovery removes its files before unloading its own launchd job.
 
 `audit` refuses a non-ARM host, a virtual host where

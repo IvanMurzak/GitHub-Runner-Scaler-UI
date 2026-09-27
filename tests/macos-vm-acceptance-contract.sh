@@ -194,7 +194,9 @@ with tempfile.TemporaryDirectory(prefix='rm-continuation-contract-') as temporar
         subprocess.run(['/bin/sh', '-n', str(script)], check=True)
         document = plistlib.loads(plist.read_bytes())
         assert document['RunAtLoad'] is True
-        assert document['ProgramArguments'] == ['/bin/sh', str(script)]
+        assert document['ProgramArguments'][:2] == ['/bin/sh', '-c']
+        assert 'attempt' in document['ProgramArguments'][2]
+        return document
     generate()
     subprocess.run(['/bin/sh', str(script)], check=True)
     assert not log.exists() and script.exists() and plist.exists(), 'ran before reboot'
@@ -207,6 +209,22 @@ with tempfile.TemporaryDirectory(prefix='rm-continuation-contract-') as temporar
     assert log.read_text().splitlines() == [
         'verify-after-reboot', 'recovery-forensics', 'cleanup', 'rollback', 'bootout']
     assert not script.exists() and not plist.exists()
+
+    # Execute the actual plist bootstrap: an external receipt script can be
+    # absent at login, and a failed mount must preserve the recovery artifacts.
+    document = generate()
+    pending = root / 'pending-script'
+    script.rename(pending)
+    executable(tools / 'sleep', 'exit 0\n')
+    missing = subprocess.run(document['ProgramArguments'], capture_output=True)
+    assert missing.returncode == 78 and b'volume unavailable' in missing.stderr
+    assert pending.exists() and plist.exists()
+    log.unlink()
+    executable(tools / 'sleep', f'mv "{pending}" "{script}"\n')
+    subprocess.run(document['ProgramArguments'], check=True)
+    assert log.read_text().splitlines() == [
+        'verify-after-reboot', 'recovery-forensics', 'cleanup', 'rollback', 'bootout']
+    assert not script.exists() and not plist.exists() and not pending.exists()
 
     # Building/signing must remain in the login user's keychain context.
     # Exercise the installer with inert tools, never touching system paths.

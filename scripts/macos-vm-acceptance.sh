@@ -989,7 +989,20 @@ lines = ['#!/bin/sh', 'set -eu',
          f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true', '']
 pathlib.Path(script).write_text('\n'.join(lines)); os.chmod(script, 0o700)
 pathlib.Path(plist_dir).mkdir(parents=True, exist_ok=True)
-document = {'Label': label, 'ProgramArguments': ['/bin/sh', script], 'RunAtLoad': True,
+# launchd reads this plist from the internal user Library, but the receipt
+# script may live on an external volume. A RunAtLoad shell cannot open that
+# script before mounting completes. Keep the bounded bootstrap in the plist
+# itself, then execute only the exact owned script once it is readable.
+bootstrap = '\n'.join([
+    'set -eu', f'PATH={shlex.quote(search_path)}; export PATH',
+    'attempt=0',
+    f'while [ ! -r {shlex.quote(script)} ]; do',
+    '  if [ "$attempt" -ge 120 ]; then',
+    '    echo "D3 recovery volume unavailable after 600s; mount it and restart the recovery LaunchAgent" >&2',
+    '    exit 78', '  fi',
+    '  sleep 5', '  attempt=$((attempt + 1))', 'done',
+    f'exec /bin/sh {shlex.quote(script)}', ''])
+document = {'Label': label, 'ProgramArguments': ['/bin/sh', '-c', bootstrap], 'RunAtLoad': True,
             'ProcessType': 'Background',
             'StandardOutPath': str(bootstrap_logs / 'stdout.log'),
             'StandardErrorPath': str(bootstrap_logs / 'stderr.log')}
