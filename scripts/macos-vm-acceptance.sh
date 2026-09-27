@@ -119,7 +119,7 @@ export RUNNER_MANAGER_MACOS_VM_HELPER="$helper"
 export RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root"
 export RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag"
 
-runner() { "$runner_manager" --data-dir "$data_dir" "$@"; }
+runner() { "$runner_manager" --data-dir "$data_dir" --use-platform-credential "$@"; }
 login_service() {
   env RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag" \
     RUNNER_MANAGER_MACOS_VM_HELPER="$helper" \

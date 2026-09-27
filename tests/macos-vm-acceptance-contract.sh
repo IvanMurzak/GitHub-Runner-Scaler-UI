@@ -62,6 +62,16 @@ BASH
 
 # The acceptance service is a user-owned LaunchAgent in gui/501. Its login
 # credential and disposable data are deliberately distinct from production.
+runner_definition=$(awk '/^runner\(\) \{/ { print; exit }' "$harness")
+RUNNER_DEFINITION=$runner_definition bash -u <<'BASH'
+eval "$RUNNER_DEFINITION"
+runner_manager=record_cli
+data_dir='/tmp/private acceptance data'
+record_cli() { printf '<%s>\n' "$@"; }
+actual=$(runner repo profile list owner/repo)
+expected=$(printf '<%s>\n' --data-dir "$data_dir" --use-platform-credential repo profile list owner/repo)
+[[ $actual == "$expected" ]]
+BASH
 grep -F 'service_domain=' "$harness" >/dev/null
 grep -F 'auth_runner auth status --start-at login >"$evidence/runner-auth.txt"' "$harness" >/dev/null
 if grep -F 'auth_runner auth status --start-at boot' "$harness" >/dev/null; then

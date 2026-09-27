@@ -395,6 +395,16 @@ workflow from an unmerged PR, so a dispatch-only gate could not validate the PR
 before merge. The workflow is pinned to same-repository PR 79 and rejects every
 other event.
 
+For disposable policy configuration, the harness explicitly uses
+`--data-dir <private-dir> --use-platform-credential`. Config/state and attempt
+history stay disposable, while credential lookup uses the existing platform
+store for the host's recorded start mode, just as the login service does.
+The opt-in is limited to local policy/host/report commands; it cannot alter
+auth, daemon, service, remote-host or TUI credential semantics. Plain
+`--data-dir` continues to select its own rooted secret store. No credential
+is exported, duplicated or logged, and no second OAuth flow is started.
+Overridden GitHub endpoints are refused before platform credential lookup.
+
 The Swift CI jobs establish source compatibility on GitHub-hosted ARM64 and
 Intel machines. Native acceptance still requires an operator-signed helper, a
 real bootstrap-ready pinned image, APFS clone verification, a successful real

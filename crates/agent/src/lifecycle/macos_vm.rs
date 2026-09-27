@@ -1306,7 +1306,9 @@ mod tests {
 
     #[test]
     fn default_helper_uses_the_installer_path_without_shell_path_lookup() {
-        assert!(std::path::Path::new(DEFAULT_HELPER).is_absolute());
+        // This is a macOS/POSIX installer path even when the protocol tests
+        // run on Windows, whose Path requires a drive for absolute paths.
+        assert!(DEFAULT_HELPER.starts_with('/'));
         let installer = include_str!("../../../../native/macos-vm-helper/install.sh");
         assert!(installer.contains(&format!("install -m 0755 \"$binary\" {DEFAULT_HELPER}")));
     }
@@ -1927,13 +1929,18 @@ mod tests {
 
     #[cfg(windows)]
     fn blocking_command(writes_stdout: bool) -> Command {
-        let mut command = Command::new("cmd");
+        // Keep the delay in the process we kill. A cmd/ping pair leaves an
+        // orphan holding the captured pipes after the deadline (nextest LEAK).
+        let mut command = Command::new("powershell.exe");
         command.args([
-            "/C",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
             if writes_stdout {
-                "echo partial & ping -n 4 127.0.0.1 >NUL"
+                "[Console]::Out.Write('partial'); Start-Sleep -Seconds 3"
             } else {
-                "ping -n 4 127.0.0.1 >NUL"
+                "Start-Sleep -Seconds 3"
             },
         ]);
         command
@@ -1945,9 +1952,9 @@ mod tests {
         command.args([
             "-c",
             if writes_stdout {
-                "printf partial; sleep 3"
+                "printf partial; exec sleep 3"
             } else {
-                "sleep 3"
+                "exec sleep 3"
             },
         ]);
         command
