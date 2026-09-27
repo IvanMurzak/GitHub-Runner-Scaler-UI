@@ -42,6 +42,32 @@ fn ci_workflow() -> (PathBuf, String) {
 }
 
 #[test]
+fn privileged_ci_requires_a_disposable_elevated_host_before_checkout() {
+    let (path, source) = ci_workflow();
+    let job = source
+        .split("  service-install:")
+        .nth(1)
+        .expect("the privileged job exists");
+    assert!(
+        job.contains("runs-on: windows-2025"),
+        "{} must use the pinned disposable Windows image",
+        path.display()
+    );
+    let guard = job
+        .find("Require a disposable elevated Windows host")
+        .expect("host guard required");
+    let checkout = job
+        .find("uses: actions/checkout")
+        .expect("checkout required");
+    assert!(
+        guard < checkout,
+        "host guard must precede checkout and mutations"
+    );
+    assert!(job.contains("runner.environment") && job.contains("-ne 'github-hosted'"));
+    assert!(job.contains("WindowsBuiltInRole]::Administrator"));
+}
+
+#[test]
 fn ci_runs_the_privileged_installer_smoke_tests_by_name() {
     let (path, source) = ci_workflow();
 
