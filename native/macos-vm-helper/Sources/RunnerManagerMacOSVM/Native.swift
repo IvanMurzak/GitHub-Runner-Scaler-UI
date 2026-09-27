@@ -332,6 +332,9 @@ final class Supervisor {
         }
         record.state = .exited
         record.runnerExitCode = exitCode
+        if let failure = GuestListenerFailure(rawValue: exitCode) {
+            Self.logger.notice("VM guest listener failure category: \(failure.rawValue, privacy: .public)")
+        }
         record.supervisorPid = nil
         try store.writeRecord(record)
         Self.logStage(.exited)

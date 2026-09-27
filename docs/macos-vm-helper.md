@@ -82,6 +82,20 @@ These diagnostics contain no guest data, error descriptions, paths or JIT;
 they identify the last reached stage even after an unsuccessful attempt is
 cleaned. They are diagnostic checkpoints, not native acceptance evidence.
 
+The disposable archive preserves the upstream listener as
+`bin/.Runner.Listener.rmv1-real` and overlays `bin/Runner.Listener` with the
+signed helper's guest-only launcher. The source package and pinned template
+are not modified. This entry point requires real and effective UID 499 and
+exactly `run`; it performs no VM lifecycle operations. It
+passes JIT only through the child's environment and erases it from the
+wrapper's process environment before spawning. Listener output is drained
+without forwarding or writing files, with at most 64 KiB retained in memory
+for closed failure classification, then erased. Success remains exit 0;
+wrapper failures return 110 (permission), 111 (configuration), 112 (runtime),
+113 (security/keychain), or 114 (unclassified). These are wrapper diagnostic
+exits, not the upstream listener's original failure status. Only these fixed
+numeric categories reach host diagnostics over the existing private reply.
+
 ## Readiness and image contract
 
 `probe --json` returns:

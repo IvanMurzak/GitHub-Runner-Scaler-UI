@@ -372,7 +372,9 @@ func sha256(url: URL) throws -> String {
     defer { stream.close() }
     var hasher = SHA256()
     var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
-    while stream.hasBytesAvailable {
+    // Reading to EOF also checks open failures. hasBytesAvailable is false
+    // for a missing file, which must never look like the digest of empty data.
+    while true {
         let count = stream.read(&buffer, maxLength: buffer.count)
         if count < 0 { throw HelperFailure.degraded("artifact cannot be read") }
         if count == 0 { break }

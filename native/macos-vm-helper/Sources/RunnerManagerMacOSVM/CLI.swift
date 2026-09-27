@@ -6,6 +6,11 @@ struct RunnerManagerMacOSVM {
     static func main() {
         do {
             var arguments = Array(CommandLine.arguments.dropFirst())
+            if let executable = Bundle.main.executableURL,
+               isGuestListenerInvocation(executable: executable, arguments: arguments,
+                                         uid: getuid(), effectiveUID: geteuid()) {
+                Darwin.exit(guestListenerExitCode(executable: executable))
+            }
             if arguments.first == "--internal-supervise" {
                 try runInternalSupervisor(arguments)
             } else {

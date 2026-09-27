@@ -226,7 +226,9 @@ struct Store {
                 staging.appendingPathComponent(Self.hardwareModelName)
             )
             try createMachineIdentifier(at: staging.appendingPathComponent(Self.machineIdentifierName))
-            try archiveRunner(source: runnerSource, destination: staging.appendingPathComponent(Self.runnerArchiveName))
+            try archiveRunner(source: runnerSource, destination: staging.appendingPathComponent(Self.runnerArchiveName),
+                              overlayListener: true)
+            try appendGuestListener(source: runnerSource, archive: staging.appendingPathComponent(Self.runnerArchiveName))
             try setPermissions(staging.appendingPathComponent(Self.diskName), mode: 0o600)
             try setPermissions(staging.appendingPathComponent(Self.auxiliaryName), mode: 0o600)
             try setPermissions(staging.appendingPathComponent(Self.hardwareModelName), mode: 0o600)
@@ -381,10 +383,16 @@ func cloneFile(_ source: URL, _ destination: URL) throws {
     }
 }
 
-func archiveRunner(source: URL, destination: URL) throws {
+func archiveRunner(source: URL, destination: URL, overlayListener: Bool = false) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
     process.arguments = ["-C", source.path, "-cf", destination.path, "."]
+    if overlayListener {
+        // Do not create duplicate pathname members: archive extraction must
+        // never rely on implementation-specific overwrite/hard-link rules.
+        process.arguments = ["--exclude=./bin/Runner.Listener", "--exclude=bin/Runner.Listener"] +
+            (process.arguments ?? [])
+    }
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
@@ -399,6 +407,42 @@ func archiveRunner(source: URL, destination: URL) throws {
         throw HelperFailure.degraded("runner archive creation failed")
     }
     try setPermissions(destination, mode: 0o600)
+}
+
+func appendGuestListener(source: URL, archive: URL) throws {
+    guard let executable = Bundle.main.executableURL else {
+        throw HelperFailure.degraded("guest listener wrapper is unavailable")
+    }
+    let helper = executable.resolvingSymlinksInPath()
+    guard isRegularFile(helper) else { throw HelperFailure.degraded("guest listener wrapper is unavailable") }
+    let original = source.appendingPathComponent("bin/Runner.Listener")
+    guard isRegularFile(original), FileManager.default.isExecutableFile(atPath: original.path) else {
+        throw HelperFailure.rejected("runner listener is unavailable")
+    }
+    let overlay = archive.deletingLastPathComponent().appendingPathComponent(".listener-overlay")
+    try ensureDirectory(overlay)
+    defer { try? FileManager.default.removeItem(at: overlay) }
+    let bin = overlay.appendingPathComponent("bin")
+    try ensureDirectory(bin)
+    try copyFile(original, bin.appendingPathComponent(guestRealListenerName))
+    try copyFile(helper, bin.appendingPathComponent("Runner.Listener"))
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+    process.arguments = ["-C", overlay.path, "-rf", archive.path,
+                         "bin/" + guestRealListenerName, "bin/Runner.Listener"]
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in done.signal() }
+    do { try process.run() } catch { throw HelperFailure.degraded("guest listener wrapper archive failed") }
+    guard done.wait(timeout: .now() + 30) == .success else {
+        process.terminate()
+        throw HelperFailure.degraded("guest listener wrapper archive timed out")
+    }
+    guard process.terminationStatus == 0 else {
+        throw HelperFailure.degraded("guest listener wrapper archive failed")
+    }
 }
 
 func sanitized(_ error: Error, _ fallback: String) -> HelperFailure {
