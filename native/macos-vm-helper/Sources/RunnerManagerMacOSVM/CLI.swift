@@ -220,6 +220,7 @@ struct RunnerManagerMacOSVM {
         do {
             return try Supervisor(store: store, record: record).run(jit: &jit)
         } catch {
+            Supervisor.logStage(.failed)
             var failed = record
             failed.state = .stopped
             failed.supervisorPid = nil

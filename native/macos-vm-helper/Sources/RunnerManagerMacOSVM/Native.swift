@@ -2,6 +2,7 @@ import CryptoKit
 import CoreGraphics
 import Darwin
 import Foundation
+import OSLog
 import Security
 import Virtualization
 
@@ -272,6 +273,9 @@ final class VirtualMachineDelegate: NSObject, VZVirtualMachineDelegate {
 }
 
 final class Supervisor {
+    // Log only closed stage names: never error descriptions, guest frames,
+    // paths, process environments or JIT. These survive environment cleanup.
+    static let logger = Logger(subsystem: "io.github.IvanMurzak.runner-manager.macos-vm", category: "supervisor")
     let store: Store
     var record: EnvironmentRecord
     let directory: URL
@@ -287,6 +291,7 @@ final class Supervisor {
     }
 
     func run(jit: inout Data) throws -> Never {
+        Self.logStage(.configuration)
         let deadline = Date().addingTimeInterval(operationTimeout)
         let (manifest, _) = try store.loadTemplate(image: record.image)
         guard manifest.templateDigest == record.templateDigest else {
@@ -303,14 +308,18 @@ final class Supervisor {
         try store.writeRecord(record)
         installStopHandler()
         try requireTime(deadline)
+        Self.logStage(.boot)
         try start(vm, deadline: deadline)
+        Self.logStage(.connect)
         let connection = try connect(vm: vm, port: manifest.identity.bootstrapPort, deadline: deadline)
+        Self.logStage(.handoff)
         try sendStart(connection: connection, manifest: manifest, jit: &jit, deadline: deadline)
 
         record.state = .running
         try store.writeRecord(record)
         try FileHandle.standardOutput.write(contentsOf: Data("READY\n".utf8))
         try FileHandle.standardOutput.close()
+        Self.logStage(.running)
 
         let finalReply = try readReply(connection.fileDescriptor, deadline: nil)
         guard finalReply.protocolVersion == protocolVersion,
@@ -325,8 +334,13 @@ final class Supervisor {
         record.runnerExitCode = exitCode
         record.supervisorPid = nil
         try store.writeRecord(record)
+        Self.logStage(.exited)
         connection.close()
         stopVMAndExit()
+    }
+
+    static func logStage(_ stage: SupervisorStage) {
+        logger.notice("VM supervisor stage: \(stage.rawValue, privacy: .public)")
     }
 
     private func start(_ vm: VZVirtualMachine, deadline: Date) throws {

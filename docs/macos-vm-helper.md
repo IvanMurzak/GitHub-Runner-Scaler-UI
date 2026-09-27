@@ -75,6 +75,13 @@ arbitrary stderr, guest output, environment values, paths, or credentials into
 provider failures. A store permission failure is reported as a typed
 service-account permission problem instead of the generic degraded state.
 
+The native supervisor records fixed lifecycle stage names in macOS unified
+logging under subsystem `io.github.IvanMurzak.runner-manager.macos-vm`, category
+`supervisor`: configuration, boot, connect, handoff, running, exited, failed.
+These diagnostics contain no guest data, error descriptions, paths or JIT;
+they identify the last reached stage even after an unsuccessful attempt is
+cleaned. They are diagnostic checkpoints, not native acceptance evidence.
+
 ## Readiness and image contract
 
 `probe --json` returns:

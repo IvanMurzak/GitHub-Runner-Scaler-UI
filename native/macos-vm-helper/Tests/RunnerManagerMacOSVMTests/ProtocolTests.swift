@@ -4,6 +4,12 @@ import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class ProtocolTests: XCTestCase {
+    func testSupervisorDiagnosticsHaveOnlyClosedStageNames() {
+        XCTAssertEqual(SupervisorStage.allCases.map { $0.rawValue }, [
+            "configuration", "boot", "connect", "handoff", "running", "exited", "failed",
+        ])
+    }
+
     func testColdArchiveBudgetDoesNotExtendGuestOperations() {
         XCTAssertEqual(operationTimeout, 240)
         XCTAssertEqual(runnerArchiveTimeout, 900)

@@ -10,6 +10,10 @@ let operationTimeout: TimeInterval = 240
 // not guest boot or a secret-channel operation. Keep its own finite budget.
 let runnerArchiveTimeout: TimeInterval = 15 * 60
 
+enum SupervisorStage: String, CaseIterable {
+    case configuration, boot, connect, handoff, running, exited, failed
+}
+
 enum Exit: Int32 {
     case failure = 1
     case missing = 66
