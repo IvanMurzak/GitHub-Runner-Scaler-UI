@@ -327,17 +327,24 @@ eval "$ENVIRONMENT_DEFINITIONS"
 helper_root=$HELPER_ROOT
 image='vm-version:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 disk_mib=47684
+scenario=normal
 helper_command() {
   count=$(cat "$INSPECT_COUNT")
   count=$((count + 1))
   printf '%s\n' "$count" >"$INSPECT_COUNT"
   case "$count" in 1) state=prepared;; 2) state=booting;; *) state=running;; esac
-  printf '{"protocol_version":1,"guest_os":"macos","architecture":"arm64","image":"%s","template_digest":"%s","state":"%s","fresh_writable_disk":true,"shared_host_paths":[],"jit_channel":"private","applied_cpu_millis":2000,"applied_memory_mib":4096,"applied_disk_mib":47684,"applied_process_limit":512,"writable_disk_id":"disk-1","environment_id":"rm-prepared"}\n' \
-    "$image" "${image##*@sha256:}" "$state"
+  disk=disk-1
+  if [[ $scenario == stall ]]; then state=booting; fi
+  if [[ $scenario == replacement && $count -gt 1 ]]; then disk=disk-2; fi
+  printf '{"protocol_version":1,"guest_os":"macos","architecture":"arm64","image":"%s","template_digest":"%s","state":"%s","fresh_writable_disk":true,"shared_host_paths":[],"jit_channel":"private","applied_cpu_millis":2000,"applied_memory_mib":4096,"applied_disk_mib":47684,"applied_process_limit":512,"writable_disk_id":"%s","environment_id":"rm-prepared"}\n' \
+    "$image" "${image##*@sha256:}" "$state" "$disk"
 }
 die() { printf '%s\n' "$*" >&2; exit 42; }
-sleep() { printf 'waited\n' >>"$WAIT_MARKER"; SECONDS=$((SECONDS + 2)); }
-environment=$(capture_single_environment "$CAPTURE_OUTPUT" 10)
+sleep() {
+  printf 'waited\n' >>"$WAIT_MARKER"
+  if [[ $scenario == stall ]]; then SECONDS=$((SECONDS + 300)); else SECONDS=$((SECONDS + 2)); fi
+}
+environment=$(capture_single_environment "$CAPTURE_OUTPUT" 1)
 [[ $environment == rm-prepared ]]
 [[ $(cat "$INSPECT_COUNT") -eq 3 ]]
 [[ -s $WAIT_MARKER ]]
@@ -345,6 +352,13 @@ python3 - "$CAPTURE_OUTPUT" <<'PY'
 import json, sys
 assert json.load(open(sys.argv[1]))['state'] == 'running'
 PY
+for scenario in replacement stall; do
+  printf '0\n' >"$INSPECT_COUNT"
+  if (capture_single_environment "$CAPTURE_OUTPUT" 1) >/dev/null 2>&1; then
+    printf 'readiness accepted %s\n' "$scenario" >&2
+    exit 1
+  fi
+done
 BASH
 rm -rf "$prepared_helper_root" "$prepared_capture" "$prepared_count" "$prepared_wait_marker"
 

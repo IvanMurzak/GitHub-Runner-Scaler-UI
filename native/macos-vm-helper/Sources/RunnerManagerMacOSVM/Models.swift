@@ -6,6 +6,9 @@ let requiredProcessLimit = 512
 let maximumJITBytes = 1024 * 1024
 let maximumGuestReplyBytes = 64 * 1024
 let operationTimeout: TimeInterval = 240
+// Measured cold boot can consume almost the entire connection budget.
+// Archive transfer and guest extraction get their own bounded phase.
+let guestHandoffTimeout: TimeInterval = 240
 // Archiving thousands of runner files on an external APFS volume is cold I/O,
 // not guest boot or a secret-channel operation. Keep its own finite budget.
 let runnerArchiveTimeout: TimeInterval = 15 * 60

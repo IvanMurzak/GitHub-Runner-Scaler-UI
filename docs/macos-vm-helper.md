@@ -62,10 +62,16 @@ limited to 64 KiB. Exit code 66 means a named image or environment is absent,
 77 means permission was denied, and 78 means the request or protocol is not
 supported. Other nonzero exits report a degraded helper.
 Runner Manager gives helper operations a five-minute deadline covering JIT
-stdin, bounded stdout, and process completion. Only `prepare`, which runs before
+stdin, bounded stdout, and process completion. `prepare`, which runs before
 JIT issuance and performs cold file I/O, has a separate 20-minute deadline; its
-runner archive is bounded to 15 minutes inside the helper. Guest boot and
-private-channel operations retain their 240-second deadlines. On expiry Runner
+runner archive is bounded to 15 minutes inside the helper. `start` has a
+10-minute controller envelope: boot/connection and private handoff each have
+their own 240-second deadline. A late but valid connection cannot consume the
+archive-transfer budget, and an expired boot cannot restart its budget.
+Private-channel descriptors are nonblocking so backpressure cannot hide inside
+a blocking write past its deadline. Acceptance similarly separates preparation
+from one 660-second readiness window for one immutable environment/disk identity.
+On expiry Runner
 Manager terminates the helper and reports a typed timeout diagnostic; no
 operation retries a JIT handoff.
 

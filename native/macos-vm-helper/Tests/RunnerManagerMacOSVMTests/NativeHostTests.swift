@@ -101,6 +101,54 @@ final class NativeHostTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 1)
     }
 
+    func testHandoffHasItsOwnBudgetButCannotReviveAnExpiredBoot() throws {
+        let boot = Date(timeIntervalSince1970: 1000)
+        let connection = boot.addingTimeInterval(operationTimeout - 1)
+        XCTAssertEqual(
+            try guestHandoffDeadline(bootDeadline: boot.addingTimeInterval(operationTimeout), now: connection),
+            connection.addingTimeInterval(guestHandoffTimeout)
+        )
+        XCTAssertThrowsError(try guestHandoffDeadline(bootDeadline: boot, now: boot))
+        XCTAssertThrowsError(try guestHandoffDeadline(bootDeadline: boot, now: boot.addingTimeInterval(1)))
+    }
+
+    func testLatePrivateConnectionIsClosedInsteadOfLeaked() {
+        var closed = [Int]()
+        let pending = PendingGuestConnection<Int> { closed.append($0) }
+        XCTAssertNil(pending.wait(timeout: .now()))
+        pending.complete(42)
+        XCTAssertEqual(closed, [42])
+    }
+
+    func testTimelyPrivateConnectionIsAdoptedWithoutClosingIt() {
+        var closed = [Int]()
+        let pending = PendingGuestConnection<Int> { closed.append($0) }
+        pending.complete(42)
+        XCTAssertEqual(pending.wait(timeout: .now() + 1), 42)
+        XCTAssertTrue(closed.isEmpty)
+    }
+
+    func testBackpressuredPrivateChannelWriteHonorsItsDeadline() throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { sockets.forEach { Darwin.close($0) } }
+        // Verify the real API sets nonblocking mode before testing a full
+        // socket. This guard keeps a regression from hanging the test suite.
+        try writeAll(sockets[0], data: Data([1]), deadline: Date().addingTimeInterval(1))
+        guard fcntl(sockets[0], F_GETFL) & O_NONBLOCK != 0 else {
+            XCTFail("private writer left a blocking descriptor")
+            return
+        }
+        let started = Date()
+        XCTAssertThrowsError(try writeAll(
+            sockets[0], data: Data(repeating: 1, count: 1024 * 1024),
+            deadline: started.addingTimeInterval(0.05)
+        )) { error in
+            XCTAssertEqual((error as? HelperFailure)?.message, "private guest channel timed out")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+    }
+
     private func temporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("runner-manager-native-tests-\(UUID().uuidString)", isDirectory: true)

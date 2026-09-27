@@ -272,6 +272,44 @@ final class VirtualMachineDelegate: NSObject, VZVirtualMachineDelegate {
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) { onStop() }
 }
 
+// A connection callback can arrive after its bounded wait. Never read a
+// concurrently mutated captured variable or abandon an unclaimed channel.
+final class PendingGuestConnection<Connection> {
+    private let lock = NSLock()
+    private let done = DispatchSemaphore(value: 0)
+    private let dispose: (Connection) -> Void
+    private var expired = false
+    private var connection: Connection?
+
+    init(dispose: @escaping (Connection) -> Void) { self.dispose = dispose }
+
+    func complete(_ value: Connection?) {
+        lock.lock()
+        if expired {
+            lock.unlock()
+            if let value { dispose(value) }
+            return
+        }
+        connection = value
+        lock.unlock()
+        done.signal()
+    }
+
+    func wait(timeout: DispatchTime) -> Connection? {
+        let result = done.wait(timeout: timeout)
+        lock.lock()
+        let value = connection
+        connection = nil
+        if result == .timedOut { expired = true }
+        lock.unlock()
+        if result == .timedOut {
+            if let value { dispose(value) }
+            return nil
+        }
+        return value
+    }
+}
+
 final class Supervisor {
     // Log only closed stage names: never error descriptions, guest frames,
     // paths, process environments or JIT. These survive environment cleanup.
@@ -312,8 +350,9 @@ final class Supervisor {
         try start(vm, deadline: deadline)
         Self.logStage(.connect)
         let connection = try connect(vm: vm, port: manifest.identity.bootstrapPort, deadline: deadline)
+        let handoffDeadline = try guestHandoffDeadline(bootDeadline: deadline)
         Self.logStage(.handoff)
-        try sendStart(connection: connection, manifest: manifest, jit: &jit, deadline: deadline)
+        try sendStart(connection: connection, manifest: manifest, jit: &jit, deadline: handoffDeadline)
 
         record.state = .running
         try store.writeRecord(record)
@@ -365,16 +404,19 @@ final class Supervisor {
             throw HelperFailure.degraded("private guest channel is unavailable")
         }
         while Date() < deadline {
-            let done = DispatchSemaphore(value: 0)
-            var connected: VZVirtioSocketConnection?
+            let pending = PendingGuestConnection<VZVirtioSocketConnection> { $0.close() }
             vmQueue.async {
                 socket.connect(toPort: port) { result in
-                    if case let .success(connection) = result { connected = connection }
-                    done.signal()
+                    if case let .success(connection) = result {
+                        pending.complete(connection)
+                    } else {
+                        pending.complete(nil)
+                    }
                 }
             }
-            _ = done.wait(timeout: .now() + 5)
-            if let connected { return connected }
+            if let connected = pending.wait(timeout: .now() + min(5, max(0, deadline.timeIntervalSinceNow))) {
+                return connected
+            }
             sleep(1)
         }
         throw HelperFailure.degraded("guest bootstrap did not open its private channel")
@@ -469,13 +511,18 @@ func writeAll(_ fd: Int32, data: Data, deadline: Date) throws {
 }
 
 func writeRaw(_ fd: Int32, bytes: UnsafeRawBufferPointer, deadline: Date) throws {
+    if bytes.isEmpty { return }
+    try makeChannelNonblocking(fd)
     var offset = 0
     while offset < bytes.count {
         var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-        guard poll(&descriptor, 1, try pollTimeout(deadline)) > 0 else {
+        let ready = poll(&descriptor, 1, try pollTimeout(deadline))
+        if ready < 0 && errno == EINTR { continue }
+        guard ready > 0 else {
             throw HelperFailure.degraded("private guest channel timed out")
         }
         let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        if count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
         guard count > 0 else { throw HelperFailure.degraded("private guest channel closed") }
         offset += count
     }
@@ -504,16 +551,20 @@ func readReply(_ fd: Int32, deadline: Date?) throws -> GuestReply {
 }
 
 func readExact(_ fd: Int32, count: Int, deadline: Date?) throws -> Data {
+    if count > 0 { try makeChannelNonblocking(fd) }
     var result = Data(count: count)
     var offset = 0
     try result.withUnsafeMutableBytes { bytes in
         while offset < count {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let timeout = try deadline.map(pollTimeout) ?? -1
-            guard poll(&descriptor, 1, timeout) > 0 else {
+            let ready = poll(&descriptor, 1, timeout)
+            if ready < 0 && errno == EINTR { continue }
+            guard ready > 0 else {
                 throw HelperFailure.degraded("private guest channel timed out")
             }
             let amount = Darwin.read(fd, bytes.baseAddress!.advanced(by: offset), count - offset)
+            if amount < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
             guard amount > 0 else { throw HelperFailure.degraded("private guest channel closed") }
             offset += amount
         }
@@ -525,6 +576,18 @@ func requireTime(_ deadline: Date) throws {
     guard deadline.timeIntervalSinceNow > 0 else {
         throw HelperFailure.degraded("VM start operation timed out")
     }
+}
+
+func makeChannelNonblocking(_ fd: Int32) throws {
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+        throw HelperFailure.degraded("private guest channel is unavailable")
+    }
+}
+
+func guestHandoffDeadline(bootDeadline: Date, now: Date = Date()) throws -> Date {
+    guard now < bootDeadline else { throw HelperFailure.degraded("VM start operation timed out") }
+    return now.addingTimeInterval(guestHandoffTimeout)
 }
 
 func pollTimeout(_ deadline: Date) throws -> Int32 {

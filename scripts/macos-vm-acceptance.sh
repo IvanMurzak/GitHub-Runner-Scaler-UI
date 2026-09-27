@@ -272,14 +272,15 @@ environment_dirs() {
 environment_count() { environment_dirs | awk 'END { print NR+0 }'; }
 
 capture_single_environment() {
-  local output=$1 deadline=$((SECONDS + ${2:-300})) listing count envdir state
+  local output=$1 deadline=$((SECONDS + ${2:-300})) listing count envdir state observation
+  local current_identity owned_identity=''
   while (( SECONDS < deadline )); do
     listing=$(environment_dirs)
     count=$(printf '%s\n' "$listing" | awk 'NF { count++ } END { print count+0 }')
     if [[ $count -eq 1 ]]; then
       envdir=$listing
       helper_command inspect --environment "$(basename "$envdir")" --json >"$output"
-      state=$(python3 - "$output" "$image" "$disk_mib" <<'PY'
+      observation=$(python3 - "$output" "$image" "$disk_mib" <<'PY'
 import json, sys
 r=json.load(open(sys.argv[1]))
 assert r['protocol_version']==1 and r['guest_os']=='macos' and r['architecture']=='arm64', r
@@ -289,9 +290,20 @@ assert r['shared_host_paths']==[] and r['jit_channel']=='private', r
 assert r['applied_cpu_millis']==2000 and r['applied_memory_mib']==4096, r
 assert r['applied_disk_mib']==int(sys.argv[3]) and r['applied_process_limit']==512, r
 assert r['writable_disk_id'] and r['environment_id'].startswith('rm-'), r
-print(r['state'])
+print('|'.join((r['state'],r['environment_id'],r['writable_disk_id'])))
 PY
 )
+      state=${observation%%|*}
+      current_identity=${observation#*|}
+      if [[ -z $owned_identity ]]; then
+        owned_identity=$current_identity
+        # Cold package installation/preparation must not consume boot/channel
+        # time. One resource gets one finite start window, never reset by a
+        # retry or a replaced writable disk. Helper start itself is bounded600s.
+        deadline=$((SECONDS + 660))
+      else
+        [[ $current_identity == "$owned_identity" ]] || die 'VM identity changed before private handoff acknowledgement'
+      fi
       # Booting proves allocation, not a completed private JIT handoff. Killing
       # the service here races start acknowledgement and offline-runner recovery.
       if [[ $state != running ]]; then
@@ -301,6 +313,7 @@ PY
       python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_id"])' "$output"
       return
     fi
+    [[ -z $owned_identity ]] || die 'VM disappeared before private handoff acknowledgement'
     [[ $count -eq 0 ]] || die 'more than one helper environment exists; refusing ambiguous ownership'
     sleep 2
   done

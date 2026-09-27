@@ -39,8 +39,11 @@ const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_HELPER_STDERR: usize = 4 * 1024;
 const MAX_DIAGNOSTICS: usize = 32;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// Two separately bounded 240s guest phases plus process/cleanup margin.
+// This does not increase the deadlines for probe, inspection or cleanup.
+const HELPER_START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // Disk cloning and cold runner archiving happen before JIT issuance. Do not
-// extend start/guest-channel/cleanup deadlines to accommodate that file I/O.
+// use guest start or cleanup deadlines to accommodate that file I/O.
 const HELPER_PREPARE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const PROCESS_LIMIT: u32 = 512;
 
@@ -1122,10 +1125,10 @@ impl SystemHelper {
 }
 
 fn helper_operation_timeout(args: &[String]) -> Duration {
-    if args.first().is_some_and(|operation| operation == "prepare") {
-        HELPER_PREPARE_TIMEOUT
-    } else {
-        HELPER_TIMEOUT
+    match args.first().map(String::as_str) {
+        Some("prepare") => HELPER_PREPARE_TIMEOUT,
+        Some("start") => HELPER_START_TIMEOUT,
+        _ => HELPER_TIMEOUT,
     }
 }
 
@@ -1850,19 +1853,16 @@ mod tests {
     }
 
     #[test]
-    fn only_pre_jit_preparation_has_a_cold_file_io_budget() {
+    fn preparation_and_guest_start_have_distinct_bounded_budgets() {
         assert_eq!(
             helper_operation_timeout(&strings(["prepare", "--json"])),
             HELPER_PREPARE_TIMEOUT
         );
-        for operation in [
-            "probe",
-            "inspect",
-            "start",
-            "stop",
-            "destroy",
-            "internal-supervise",
-        ] {
+        assert_eq!(
+            helper_operation_timeout(&strings(["start", "--jit-stdin"])),
+            HELPER_START_TIMEOUT
+        );
+        for operation in ["probe", "inspect", "stop", "destroy", "internal-supervise"] {
             assert_eq!(
                 helper_operation_timeout(&strings([operation, "prepare"])),
                 HELPER_TIMEOUT
