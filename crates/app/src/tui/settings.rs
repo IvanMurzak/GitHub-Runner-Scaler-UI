@@ -73,7 +73,7 @@ use crate::cli::{
 
 pub const MAX_FOCUSED_FORM_ACTIONS: u8 = 5;
 pub const FORK_TRUST_WARNING: &str = "warning: fork and untrusted pull-request workflows must not run on a personal host until you explicitly accept that trust boundary.";
-pub const STATIC_SELECTOR_WARNING: &str = "Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors start no runner.";
+pub const STATIC_SELECTOR_WARNING: &str = "Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix expressions are not resolved.";
 
 /// What Organization Settings says instead of offering a mode control.
 ///
@@ -5342,8 +5342,8 @@ mod tests {
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
-        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
-        start no runner.
+        Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix
+        expressions are not resolved.
         warning: fork and untrusted pull-request workflows must not run on a personal host until you
         explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
@@ -5385,8 +5385,8 @@ mod tests {
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
-        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
-        start no runner.
+        Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix
+        expressions are not resolved.
         warning: fork and untrusted pull-request workflows must not run on a personal host until you
         explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
@@ -5440,8 +5440,8 @@ mod tests {
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
-        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
-        start no runner.
+        Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix
+        expressions are not resolved.
         warning: fork and untrusted pull-request workflows must not run on a personal host until you
         explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
@@ -5503,9 +5503,9 @@ mod tests {
         --- repository/create-isolated-compact ---
         Target: octo/repo
         Profile: default
-        Static runs-on required: matrix expressions are not
-        resolved; missing or multiple profile selectors start no
-        runner.
+        Static runs-on labels required; selector optional.
+        Overlapping profiles start no runner; matrix expressions
+        are not resolved.
         warning: fork and untrusted pull-request workflows must
         not run on a personal host until you explicitly accept
         that trust boundary.
@@ -5562,8 +5562,8 @@ mod tests {
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
-        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
-        start no runner.
+        Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix
+        expressions are not resolved.
         warning: fork and untrusted pull-request workflows must not run on a personal host until you
         explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]
@@ -5614,8 +5614,8 @@ mod tests {
         Local host: local-home
         Current max_capacity: 2
         runs-on: rm-home-linux-x64  [click to copy]
-        Static runs-on required: matrix expressions are not resolved; missing or multiple profile selectors
-        start no runner.
+        Static runs-on labels required; selector optional. Overlapping profiles start no runner; matrix
+        expressions are not resolved.
         warning: fork and untrusted pull-request workflows must not run on a personal host until you
         explicitly accept that trust boundary.
         Scaling enabled: false  [toggle]

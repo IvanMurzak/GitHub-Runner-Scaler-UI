@@ -210,9 +210,13 @@ runner-manager repo profile list OWNER/REPO
 runner-manager host isolation status --json
 ```
 
-Each named profile prints its immutable selector and a copyable `runs-on` label. Put that
-literal selector in each job's `runs-on`; a matrix expression such as `${{ matrix.runner }}`
-cannot be resolved for automatic scaling. Commands that change a repository policy need
+Each named profile prints its immutable selector and a copyable `runs-on` label. A profile
+matches when it carries every static label required by the job, ignoring case; extra profile
+labels are allowed and the selector is optional. If several local profiles match, scaling
+is refused: require a unique selector or adjust their labels. Inactive autoscaling profiles
+also participate in this ambiguity check, so disabling an isolated profile cannot redirect
+its demand to a native sibling. A matrix expression such as `${{ matrix.runner }}` cannot
+be resolved for automatic scaling. Commands that change a repository policy need
 `--profile NAME` once the repository has several profiles. An isolated profile cannot be
 enabled until its execution provider reports ready; provider failure never starts it as a
 native runner. Keep fork and untrusted pull-request workflows off a personal host unless
@@ -670,9 +674,9 @@ row before pressing `s`; Repository Settings never guesses among siblings. The s
 profile's immutable selector and copyable `runs-on`, and exposes its capacity, scaling, optional
 labels, workspace, native/isolated execution mode, backend, pinned image and resource limits. It
 also creates sibling profiles, drains or removes only the selected profile, and reports provider
-readiness with a concrete remedy. Static `runs-on` selectors are required; matrix expressions are
-not resolved. The selector stays fixed because it is the routing identity that prevents sibling
-profiles or different hosts from answering the same job.
+readiness with a concrete remedy. Static `runs-on` labels are required; matrix expressions are
+not resolved. The selector stays fixed and can be required to select one sibling
+profile or a particular host for a job.
 
 Every status is also written in words, so the dashboard remains usable without colour or
 box-drawing characters.

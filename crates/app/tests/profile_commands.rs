@@ -72,7 +72,12 @@ fn named_profiles_select_one_policy_and_legacy_ambiguity_is_closed() {
     assert_eq!(add_named.code, 0, "{}", add_named.both());
     assert!(add_named.stdout.contains("rm-home-"));
     assert!(add_named.stdout.contains("py-isolated"));
-    assert!(add_named.stdout.contains("static selector"));
+    assert!(add_named.stdout.contains("selector optional"));
+    assert!(
+        add_named
+            .stdout
+            .contains("Overlapping profiles start no runner")
+    );
 
     let policies = store(data_dir.path()).policies().unwrap();
     assert_eq!(policies.len(), 2);
