@@ -4,6 +4,12 @@ import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class ProtocolTests: XCTestCase {
+    func testColdArchiveBudgetDoesNotExtendGuestOperations() {
+        XCTAssertEqual(operationTimeout, 240)
+        XCTAssertEqual(runnerArchiveTimeout, 900)
+        XCTAssertGreaterThan(runnerArchiveTimeout, operationTimeout)
+    }
+
     func testStorePermissionErrorsRemainTypedAndRedacted() {
         let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [
             NSLocalizedDescriptionKey: "token=secret path=/private/guest-output",

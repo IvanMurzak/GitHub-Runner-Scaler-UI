@@ -39,6 +39,9 @@ const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_HELPER_STDERR: usize = 4 * 1024;
 const MAX_DIAGNOSTICS: usize = 32;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// Disk cloning and cold runner archiving happen before JIT issuance. Do not
+// extend start/guest-channel/cleanup deadlines to accommodate that file I/O.
+const HELPER_PREPARE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const PROCESS_LIMIT: u32 = 512;
 
 /// A closed, non-secret summary of macOS VM readiness.
@@ -101,7 +104,7 @@ impl MacOsVmHostState {
                 "move the macOS VM helper store to a volume the background service can access, or grant the signed helper access to that volume",
             ),
             Self::HelperTimedOut => {
-                Some("repair the macOS VM helper operation that exceeded the five-minute timeout")
+                Some("repair the macOS VM helper operation that exceeded its bounded timeout")
             }
             Self::HelperIoFailed => {
                 Some("repair the macOS VM helper process I/O channel and retry the operation")
@@ -1114,7 +1117,15 @@ impl SystemHelper {
             .arg("--protocol-version")
             .arg(PROTOCOL_VERSION.to_string())
             .args(args);
-        invoke_command(command, stdin, HELPER_TIMEOUT)
+        invoke_command(command, stdin, helper_operation_timeout(args))
+    }
+}
+
+fn helper_operation_timeout(args: &[String]) -> Duration {
+    if args.first().is_some_and(|operation| operation == "prepare") {
+        HELPER_PREPARE_TIMEOUT
+    } else {
+        HELPER_TIMEOUT
     }
 }
 
@@ -1217,7 +1228,7 @@ fn receive_until<T>(
 fn helper_timeout() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        "macOS VM helper exceeded its five-minute operation timeout",
+        "macOS VM helper exceeded its bounded operation timeout",
     )
 }
 
@@ -1836,6 +1847,28 @@ mod tests {
             provider.diagnostics(&attempt),
             vec![ProviderDiagnostic::TemplateIdentityMismatch]
         );
+    }
+
+    #[test]
+    fn only_pre_jit_preparation_has_a_cold_file_io_budget() {
+        assert_eq!(
+            helper_operation_timeout(&strings(["prepare", "--json"])),
+            HELPER_PREPARE_TIMEOUT
+        );
+        for operation in [
+            "probe",
+            "inspect",
+            "start",
+            "stop",
+            "destroy",
+            "internal-supervise",
+        ] {
+            assert_eq!(
+                helper_operation_timeout(&strings([operation, "prepare"])),
+                HELPER_TIMEOUT
+            );
+        }
+        assert_eq!(helper_operation_timeout(&[]), HELPER_TIMEOUT);
     }
 
     #[test]

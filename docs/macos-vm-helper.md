@@ -61,10 +61,13 @@ write one JSON value to stdout and nothing sensitive to stderr. Responses are
 limited to 64 KiB. Exit code 66 means a named image or environment is absent,
 77 means permission was denied, and 78 means the request or protocol is not
 supported. Other nonzero exits report a degraded helper.
-Runner Manager gives every helper operation one five-minute deadline covering
-JIT stdin, bounded stdout, and process completion. On expiry it terminates the
-helper and reports a typed timeout diagnostic; no operation retries a JIT
-handoff.
+Runner Manager gives helper operations a five-minute deadline covering JIT
+stdin, bounded stdout, and process completion. Only `prepare`, which runs before
+JIT issuance and performs cold file I/O, has a separate 20-minute deadline; its
+runner archive is bounded to 15 minutes inside the helper. Guest boot and
+private-channel operations retain their 240-second deadlines. On expiry Runner
+Manager terminates the helper and reports a typed timeout diagnostic; no
+operation retries a JIT handoff.
 
 Runner Manager captures at most 4 KiB of helper stderr, but accepts only exact,
 closed diagnostics emitted by this repository's helper. It never copies

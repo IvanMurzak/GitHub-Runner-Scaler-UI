@@ -65,6 +65,7 @@ allow_service_restart=false
 allow_cleanup=false
 allow_rollback=false
 run_wait_timeout_seconds=3600
+environment_wait_timeout_seconds=1800
 run_poll_seconds=30
 run_job_cleanup_armed=false
 run_job_cleanup_running=false
@@ -424,6 +425,38 @@ cancel_recorded_runs() {
     fi
   done
   return "$failures"
+}
+
+wait_for_route() {
+  local run_id=$1 evidence=$2 deadline=$((SECONDS + run_wait_timeout_seconds)) route_state
+  # The route job creates VM demand. Its queue/materialization time must not
+  # consume the separate cold-package/VM preparation budget.
+  while (( SECONDS < deadline )); do
+    gh run view "$run_id" --repo "$repository" --json status,conclusion,jobs >"$evidence/route-state.json"
+    route_state=$(python3 - "$evidence/route-state.json" <<'PY'
+import json,sys
+run=json.load(open(sys.argv[1]))
+routes=[j for j in run.get('jobs',[]) if j.get('name')=='route']
+assert len(routes)<=1, 'ambiguous route jobs'
+if routes and routes[0].get('status')=='completed':
+    assert routes[0].get('conclusion')=='success', 'route did not succeed'
+    guests=[j for j in run.get('jobs',[]) if j.get('name')=='production-provider']
+    assert len(guests)<=1, 'ambiguous VM jobs'
+    if guests:
+        assert guests[0].get('status')!='completed' or guests[0].get('conclusion')=='success', 'VM job already failed'
+        print('ready')
+    else:
+        assert run.get('status')!='completed', 'route produced no VM job'
+        print('waiting')
+else:
+    assert run.get('status')!='completed', 'workflow ended before successful route'
+    print('waiting')
+PY
+) || die "workflow run $run_id route failed; state is preserved at $evidence/route-state.json"
+    [[ $route_state == ready ]] && return
+    sleep "$run_poll_seconds"
+  done
+  die "workflow run $run_id route timed out after $run_wait_timeout_seconds seconds; state is preserved at $evidence/route-state.json"
 }
 
 wait_for_run() {
@@ -822,8 +855,9 @@ run_job() {
   trap 'run_job_failure_cleanup "$?"' EXIT
   install_service_and_profile "$profile" "$selector" "$evidence"
   run_id=$(dispatch_job "$trigger" normal_run_id)
+  wait_for_route "$run_id" "$evidence"
   env_json="$evidence/environment-live.json"
-  capture_single_environment "$env_json" 600 >/dev/null
+  capture_single_environment "$env_json" "$environment_wait_timeout_seconds" >/dev/null
   state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set normal_writable_disk_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")"
   state_set normal_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
@@ -864,7 +898,8 @@ prepare_reboot() {
   require_opt_in "$allow_profile" --allow-profile 'creating the reboot-recovery profile'
   ensure_profile "$profile" "$selector" "$evidence"
   run_id=$(dispatch_job "$trigger" reboot_run_id)
-  env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" 600 >/dev/null
+  wait_for_route "$run_id" "$evidence"
+  env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" "$environment_wait_timeout_seconds" >/dev/null
   disk_id=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")
   [[ $disk_id != "$(state_get normal_writable_disk_id)" ]] || die 'two attempts reused one writable guest disk identity'
   state_set reboot_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"

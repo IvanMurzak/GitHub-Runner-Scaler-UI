@@ -391,7 +391,7 @@ func archiveRunner(source: URL, destination: URL) throws {
     let done = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in done.signal() }
     do { try process.run() } catch { throw HelperFailure.degraded("runner archive creation failed") }
-    if done.wait(timeout: .now() + operationTimeout) == .timedOut {
+    if done.wait(timeout: .now() + runnerArchiveTimeout) == .timedOut {
         process.terminate()
         throw HelperFailure.degraded("runner archive creation timed out")
     }

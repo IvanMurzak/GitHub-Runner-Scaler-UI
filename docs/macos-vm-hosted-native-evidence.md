@@ -53,6 +53,17 @@ and guest surfaces for credential-shaped content, and removes only resources
 whose ownership it can prove. The harness never reboots the host or downloads a
 restore image.
 
+The harness bounds the upstream route job separately (one hour) from cold
+runner-package materialization and VM preparation (30 minutes). It retains the
+route job state and requires a successful route producing the VM job before
+starting the latter deadline. These waits do not replace any guest attestation
+or relax ownership, resource, crash/reboot, or secret-forensics checks.
+Within preparation, the helper's runner archive has a separate 15-minute
+deadline and the adapter bounds the whole pre-JIT helper prepare call to 20
+minutes. Guest boot and private-channel operations retain their shorter
+deadlines; start, stop, destroy and other adapter calls remain bounded to five
+minutes.
+
 Primary references:
 
 - [Apple: `VZVirtualMachine.isSupported`](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/issupported)

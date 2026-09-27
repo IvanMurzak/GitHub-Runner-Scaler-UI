@@ -35,6 +35,50 @@ with tempfile.TemporaryDirectory(prefix='rm-route-contract-') as temporary:
 PY
 grep -F 'run: bash tests/macos-vm-helper-cli-json-contract.sh' "$ci_workflow" >/dev/null
 
+# Execute the actual bounded route wait independently of VM preparation. A
+# completed/failed or ambiguous route must never advance to guest acceptance.
+route_wait_definition=$(awk '/^wait_for_route\(\) \{/ { active=1 } active { print } active && /^}/ { exit }' "$harness")
+route_wait_temp=$(mktemp -d)
+ROUTE_WAIT_DEFINITION=$route_wait_definition ROUTE_WAIT_TEMP=$route_wait_temp bash -eu <<'BASH'
+eval "$ROUTE_WAIT_DEFINITION"
+repository=owner/repo
+run_poll_seconds=30
+run_wait_timeout_seconds=60
+calls=0
+die() { printf '%s\n' "$*" >&2; exit 1; }
+sleep() { SECONDS=$((SECONDS + $1)); }
+gh() {
+  calls=$((calls + 1))
+  case "$scenario" in
+    delayed)
+      if [[ $calls == 1 ]]; then
+        printf '%s\n' '{"status":"queued","jobs":[{"name":"route","status":"queued"}]}'
+      else
+        printf '%s\n' '{"status":"in_progress","jobs":[{"name":"route","status":"completed","conclusion":"success"},{"name":"production-provider","status":"queued"}]}'
+      fi ;;
+    failed) printf '%s\n' '{"status":"completed","jobs":[{"name":"route","status":"completed","conclusion":"failure"}]}' ;;
+    missing_guest) printf '%s\n' '{"status":"completed","jobs":[{"name":"route","status":"completed","conclusion":"success"}]}' ;;
+    skipped) printf '%s\n' '{"status":"completed","jobs":[{"name":"route","status":"completed","conclusion":"skipped"}]}' ;;
+    failed_guest) printf '%s\n' '{"status":"completed","jobs":[{"name":"route","status":"completed","conclusion":"success"},{"name":"production-provider","status":"completed","conclusion":"failure"}]}' ;;
+    ambiguous) printf '%s\n' '{"status":"in_progress","jobs":[{"name":"route"},{"name":"route"}]}' ;;
+    timeout) printf '%s\n' '{"status":"queued","jobs":[]}' ;;
+  esac
+}
+scenario=delayed
+wait_for_route 123 "$ROUTE_WAIT_TEMP"
+[[ $calls == 2 && -s $ROUTE_WAIT_TEMP/route-state.json ]]
+for scenario in failed missing_guest skipped failed_guest ambiguous timeout; do
+  if (wait_for_route 123 "$ROUTE_WAIT_TEMP") >"$ROUTE_WAIT_TEMP/$scenario.log" 2>&1; then
+    printf 'route wait unexpectedly accepted %s\n' "$scenario" >&2
+    exit 1
+  fi
+done
+BASH
+rm "$route_wait_temp/route-state.json" "$route_wait_temp/failed.log" "$route_wait_temp/missing_guest.log" "$route_wait_temp/skipped.log" "$route_wait_temp/failed_guest.log" "$route_wait_temp/ambiguous.log" "$route_wait_temp/timeout.log"
+rmdir "$route_wait_temp"
+[[ $(grep -Fc 'wait_for_route "$run_id" "$evidence"' "$harness") == 2 ]]
+[[ $(grep -Fc '"$environment_wait_timeout_seconds"' "$harness") == 2 ]]
+
 # macOS reports kern.boottime as a struct containing both `sec` and `usec`.
 # Execute the harness's real parser so the `sec` suffix in `usec` can never be
 # mistaken for the boot epoch, including on the system Bash 3.2 used by macOS.
