@@ -52,6 +52,8 @@ jobs:
         env:
           ACCEPTANCE_ID: ${{ needs.route.outputs.acceptance_id }}
           ACCEPTANCE_SELECTOR: ${{ needs.route.outputs.selector }}
+          # PR79's reviewed operator-pinned template has this exact raw disk size.
+          ACCEPTANCE_DISK_MIB: '47684'
           HOLD_SECONDS: ${{ needs.route.outputs.reboot == 'true' && '900' || '180' }}
         run: |
           set -euo pipefail
@@ -63,6 +65,13 @@ jobs:
           memory_mib=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
           process_limit=$(ulimit -u)
           [[ $cpu -eq 2 && $memory_mib -eq 4096 && $process_limit -eq 512 ]]
+          # Attest the actual boot disk, not merely helper-declared metadata.
+          container=$(diskutil info -plist / | plutil -extract APFSContainerReference raw -)
+          physical_store=$(diskutil apfs list -plist "$container" | plutil -extract Containers.0.PhysicalStores.0.DeviceIdentifier raw -)
+          whole_disk=$(diskutil info -plist "$physical_store" | plutil -extract ParentWholeDisk raw -)
+          disk_bytes=$(diskutil info -plist "$whole_disk" | plutil -extract TotalSize raw -)
+          [[ "$disk_bytes" =~ ^[0-9]+$ ]]
+          [[ $disk_bytes -eq $(( ACCEPTANCE_DISK_MIB * 1024 * 1024 )) ]]
           [[ -z ${ACTIONS_RUNNER_INPUT_JITCONFIG:-} ]]
           host_shares=$(mount | awk 'tolower($0) ~ /(virtiofs|shared.*host|host.*shared)/ { count++ } END { print count+0 }')
           [[ $host_shares -eq 0 ]]
@@ -78,5 +87,6 @@ jobs:
             fi
           done
           echo "RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=$cpu memory_mib=$memory_mib process_limit=$process_limit host_shares=$host_shares jit_env=absent id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"
+          echo "RM_ACCEPTANCE disk_bytes=$disk_bytes disk_mib=$ACCEPTANCE_DISK_MIB"
           sleep "$HOLD_SECONDS"
           echo "RM_ACCEPTANCE completed id=$ACCEPTANCE_ID selector=$ACCEPTANCE_SELECTOR"

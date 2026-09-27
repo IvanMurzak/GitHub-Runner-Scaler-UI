@@ -813,6 +813,8 @@ for required in 'pull_request:' 'types: [labeled]' 'github.event.pull_request.nu
   '[[ "$ACCEPTANCE_ID" =~ ^[0-9]{14}-[0-9a-f]{8}$ ]]' \
   '[[ "$ACCEPTANCE_SELECTOR" =~ ^rm-d3-acceptance-osx-arm64-d3-(reboot-)?${ACCEPTANCE_ID}$ ]]' \
   'cpu=$(sysctl -n hw.ncpu)' 'process_limit=$(ulimit -u)' 'host_shares=$(mount' \
+  'APFSContainerReference' 'PhysicalStores.0.DeviceIdentifier' 'ParentWholeDisk' \
+  'RM_ACCEPTANCE disk_bytes=$disk_bytes disk_mib=$ACCEPTANCE_DISK_MIB' \
   'ACTIONS_RUNNER_INPUT_JITCONFIG' 'gh[pousr]_' 'jit_env=absent' \
   'permissions:' 'contents: read'; do
   grep -F -- "$required" "$workflow" >/dev/null || { echo "missing workflow contract: $required" >&2; exit 1; }

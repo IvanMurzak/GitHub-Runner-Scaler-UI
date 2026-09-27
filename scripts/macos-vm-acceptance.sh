@@ -804,6 +804,7 @@ run_job() {
   wait_for_run "$run_id" "$evidence"
   gh run view "$run_id" --repo "$repository" --log >"$evidence/workflow.log"
   grep -F 'RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=2 memory_mib=4096 process_limit=512 host_shares=0 jit_env=absent' "$evidence/workflow.log" >/dev/null || die 'workflow omitted exact guest attestation'
+  grep -F "RM_ACCEPTANCE disk_bytes=$(( disk_mib * 1024 * 1024 )) disk_mib=$disk_mib" "$evidence/workflow.log" >/dev/null || die 'workflow omitted exact boot disk attestation'
   wait_no_environments 300
   assert_status_clean "$evidence/status-clean.json"
   scan_no_secrets "$evidence/host-secret-scan.txt"
@@ -835,6 +836,7 @@ prepare_reboot() {
   [[ $disk_id != "$(state_get normal_writable_disk_id)" ]] || die 'two attempts reused one writable guest disk identity'
   state_set reboot_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set reboot_writable_disk_id "$disk_id"
+  state_set reboot_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
   state_set prepared_boot_epoch "$(boot_epoch)" int
   state_set phase reboot-prepared
   install_reboot_continuation
