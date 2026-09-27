@@ -183,7 +183,7 @@ assert_probe_and_image() {
   python3 - "$probe" "$inspected" "$verified" "$image" "${disk_mib:-}" <<'PY'
 import json, sys
 probe, image, verified = (json.load(open(p)) for p in sys.argv[1:4])
-required = ('virtualization_framework','macos_guest_entitlement','private_jit_channel',
+required = ('user_session','virtualization_framework','macos_guest_entitlement','private_jit_channel',
             'fresh_writable_disks','resource_limits','process_limits')
 assert probe['protocol_version'] == 1 and probe['architecture'] == 'arm64', probe
 assert all(probe.get(k) is True for k in required), probe

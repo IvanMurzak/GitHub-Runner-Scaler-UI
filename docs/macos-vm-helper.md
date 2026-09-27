@@ -17,6 +17,15 @@ The executable defaults to `runner-manager-macos-vm`. Set
 is installed elsewhere. The daemon service account must be able to execute the
 helper and access its template and VM store.
 
+Virtualization.framework VM lifecycle operations are supported only from a
+logged-in GUI user session. On macOS, install the Runner Manager service as a
+login LaunchAgent with `runner-manager service install --start-at login` when
+the service uses this provider. A boot LaunchDaemon is intentionally rejected
+by the helper before preparation or JIT handoff; it cannot be repaired by Full
+Disk Access. This is an Apple platform constraint documented by [Apple DTS on
+launch daemons](https://developer.apple.com/forums/thread/841688) and [Apple
+DTS on launch agents](https://developer.apple.com/forums/thread/786363).
+
 This repository ships the native helper as a Swift package in
 `native/macos-vm-helper`. Install it on the VM host with a signing identity:
 
@@ -66,6 +75,7 @@ service-account permission problem instead of the generic degraded state.
 {
   "protocol_version": 1,
   "architecture": "arm64",
+  "user_session": true,
   "virtualization_framework": true,
   "macos_guest_entitlement": true,
   "private_jit_channel": true,
@@ -74,6 +84,10 @@ service-account permission problem instead of the generic degraded state.
   "process_limits": true
 }
 ```
+
+`user_session` is true only when the helper is a non-root process belonging to
+the current logged-in console user. A false value is a degraded readiness
+state with the remedy `runner-manager service install --start-at login`.
 
 `architecture` is `arm64` or `x86_64` and must equal the host architecture.
 Runner Manager refuses the provider before asking GitHub for JIT configuration

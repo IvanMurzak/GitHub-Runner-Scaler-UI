@@ -53,6 +53,7 @@ pub enum MacOsVmHostState {
     HelperExitedUnexpectedly,
     HelperIncompatible,
     EntitlementMissing,
+    UserSessionUnavailable,
     PrivateChannelUnavailable,
     ResourceLimitsUnavailable,
     RuntimeDegraded,
@@ -70,6 +71,7 @@ impl MacOsVmHostState {
             Self::HelperPermissionDenied
             | Self::HelperStorePermissionDenied
             | Self::EntitlementMissing => ProviderCapability::PermissionDenied,
+            Self::UserSessionUnavailable => ProviderCapability::Degraded,
             Self::PrivateChannelUnavailable
             | Self::ResourceLimitsUnavailable
             | Self::HelperTimedOut
@@ -108,6 +110,9 @@ impl MacOsVmHostState {
             Self::HelperIncompatible => Some("install a helper that implements protocol version 1"),
             Self::EntitlementMissing => Some(
                 "install and sign the helper with the required Virtualization.framework entitlement",
+            ),
+            Self::UserSessionUnavailable => Some(
+                "install the runner-manager service with --start-at login so the macOS VM helper runs in the logged-in GUI user session",
             ),
             Self::PrivateChannelUnavailable => {
                 Some("configure the helper's private virtio/vsock guest control channel")
@@ -226,6 +231,9 @@ impl MacOsVmProcesses {
         }
         if probe.architecture != self.architecture {
             return MacOsVmHostState::UnsupportedArchitecture;
+        }
+        if !probe.user_session {
+            return MacOsVmHostState::UserSessionUnavailable;
         }
         if !probe.virtualization_framework {
             return MacOsVmHostState::RuntimeDegraded;
@@ -821,6 +829,7 @@ impl ExecutionProvider for MacOsVmProcesses {
 struct ProbeResponse {
     protocol_version: u16,
     architecture: String,
+    user_session: bool,
     virtualization_framework: bool,
     macos_guest_entitlement: bool,
     private_jit_channel: bool,
@@ -1436,6 +1445,7 @@ mod tests {
         json!({
             "protocol_version": PROTOCOL_VERSION,
             "architecture": host_architecture(),
+            "user_session": true,
             "virtualization_framework": true,
             "macos_guest_entitlement": true,
             "private_jit_channel": true,
@@ -1590,6 +1600,25 @@ mod tests {
             helper.set_probe(Ok(probe));
             assert_eq!(provider.probe_host(), expected, "field {field}");
         }
+    }
+
+    #[test]
+    fn host_probe_refuses_without_a_logged_in_user_session() {
+        let helper = FakeHelper::ready();
+        let mut probe = ready_probe();
+        probe["user_session"] = json!(false);
+        helper.set_probe(Ok(probe));
+        let provider = provider(HostId::from_u128(1), Arc::clone(&helper));
+        assert_eq!(
+            provider.probe_host(),
+            MacOsVmHostState::UserSessionUnavailable
+        );
+        assert_eq!(
+            provider.probe_host().remedy(),
+            Some(
+                "install the runner-manager service with --start-at login so the macOS VM helper runs in the logged-in GUI user session"
+            )
+        );
     }
 
     #[test]

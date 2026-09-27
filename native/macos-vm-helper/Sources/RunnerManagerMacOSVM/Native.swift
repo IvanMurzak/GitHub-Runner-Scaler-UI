@@ -1,4 +1,5 @@
 import CryptoKit
+import CoreGraphics
 import Darwin
 import Foundation
 import Security
@@ -25,6 +26,21 @@ func hasVirtualizationEntitlement() -> Bool {
 
 func virtualizationIsReady() -> Bool {
     hostArchitecture() == "arm64" && VZVirtualMachine.isSupported
+}
+
+/// Virtualization.framework is supported from a logged-in user session, not
+/// from a boot LaunchDaemon.  In particular, a root daemon can reach the
+/// framework and still fail later when it asks securityd for the VM identity.
+/// Keep this gate in the signed helper so an alternate controller cannot
+/// accidentally turn that unsupported launch context back on.
+func hasLoggedInUserSession() -> Bool {
+    guard geteuid() != 0,
+          let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+          session[kCGSessionOnConsoleKey as String] as? Bool == true,
+          let sessionUser = session[kCGSessionUserIDKey as String] as? Int,
+          sessionUser == Int(getuid())
+    else { return false }
+    return true
 }
 
 func validateTemplateHardwareModel(_ url: URL) throws {

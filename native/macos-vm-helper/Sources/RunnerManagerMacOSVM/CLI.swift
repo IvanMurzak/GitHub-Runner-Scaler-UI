@@ -32,8 +32,9 @@ struct RunnerManagerMacOSVM {
         switch command {
         case "probe":
             try expectOnly(arguments, ["--json"])
+            let userSession = hasLoggedInUserSession()
             let entitlement = hasVirtualizationEntitlement()
-            let framework = virtualizationIsReady()
+            let framework = userSession && virtualizationIsReady()
             // APFS clone readiness is an independent host prerequisite. Probe
             // it even when Virtualization.framework is unavailable so the
             // response identifies the actual blocked layer instead of hiding
@@ -42,6 +43,7 @@ struct RunnerManagerMacOSVM {
             try writeJSON(ProbeResponse(
                 protocolVersion: protocolVersion,
                 architecture: hostArchitecture(),
+                userSession: userSession,
                 virtualizationFramework: framework,
                 macosGuestEntitlement: entitlement,
                 privateJitChannel: framework && entitlement,
@@ -59,6 +61,7 @@ struct RunnerManagerMacOSVM {
         case "template":
             try templateCommand(store: store, arguments: arguments)
         case "prepare":
+            try requireLoggedInUserSession()
             try prepare(store: store, arguments: arguments)
         case "inspect":
             let options = try Options(arguments, values: ["--environment"], flags: ["--json"])
@@ -68,15 +71,18 @@ struct RunnerManagerMacOSVM {
             let options = try Options(arguments, values: ["--host"], flags: ["--json"])
             try writeJSON(try store.list(host: options.required("--host")).map { $0.publicRecord() })
         case "start":
+            try requireLoggedInUserSession()
             let options = try Options(arguments, values: ["--environment"], flags: ["--jit-stdin"])
             let record = try store.loadRecord(options.required("--environment"))
             var jit = try readBoundedStandardInput()
             defer { jit.resetBytes(in: 0..<jit.count) }
             try launchSupervisor(store: store, record: record, jit: &jit)
         case "stop":
+            try requireLoggedInUserSession()
             let (record, _) = try ownedRecord(store: store, arguments: arguments)
             try stopEnvironment(store: store, record: record)
         case "destroy":
+            try requireLoggedInUserSession()
             var (record, _) = try ownedRecord(store: store, arguments: arguments)
             if supervisorMatches(record) || record.state == .running || record.state == .booting {
                 try stopEnvironment(store: store, record: record)
@@ -85,6 +91,14 @@ struct RunnerManagerMacOSVM {
             try store.destroy(record)
         default:
             throw HelperFailure.rejected("unsupported helper command")
+        }
+    }
+
+    private static func requireLoggedInUserSession() throws {
+        guard hasLoggedInUserSession() else {
+            throw HelperFailure.degraded(
+                "Virtualization.framework requires a logged-in user LaunchAgent; install the service with --start-at login"
+            )
         }
     }
 

@@ -30,6 +30,7 @@ struct HelperFailure: Error {
 struct ProbeResponse: Codable, Equatable {
     let protocolVersion: Int
     let architecture: String
+    let userSession: Bool
     let virtualizationFramework: Bool
     let macosGuestEntitlement: Bool
     let privateJitChannel: Bool
@@ -40,6 +41,7 @@ struct ProbeResponse: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case architecture
+        case userSession = "user_session"
         case virtualizationFramework = "virtualization_framework"
         case macosGuestEntitlement = "macos_guest_entitlement"
         case privateJitChannel = "private_jit_channel"

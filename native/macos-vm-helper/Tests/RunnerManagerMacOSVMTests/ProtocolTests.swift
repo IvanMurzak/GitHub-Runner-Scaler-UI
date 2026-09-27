@@ -40,6 +40,7 @@ final class ProtocolTests: XCTestCase {
         let response = ProbeResponse(
             protocolVersion: 1,
             architecture: "arm64",
+            userSession: true,
             virtualizationFramework: false,
             macosGuestEntitlement: true,
             privateJitChannel: false,
@@ -53,6 +54,7 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(Set(json.keys), Set([
             "protocol_version",
             "architecture",
+            "user_session",
             "virtualization_framework",
             "macos_guest_entitlement",
             "private_jit_channel",

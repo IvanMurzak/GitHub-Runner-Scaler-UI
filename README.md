@@ -230,6 +230,11 @@ exact template. Native VM acceptance remains held until signed-helper, real-VM,
 reboot, resource, and secret-forensic gates pass independently on Apple Silicon
 and Intel. See [the macOS VM helper protocol](docs/macos-vm-helper.md).
 
+The macOS VM provider must run in the logged-in operator's GUI session. Use
+`runner-manager service install --start-at login`; a boot LaunchDaemon is
+rejected before VM preparation and JIT handoff because Virtualization.framework
+is not daemon-safe on macOS.
+
 The helper source, signing entitlement, and installer live in
 [`native/macos-vm-helper`](native/macos-vm-helper). Its Swift package is built
 on ARM64 and Intel CI hosts. Apple exposes the macOS guest platform used here
