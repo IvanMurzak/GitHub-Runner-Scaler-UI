@@ -482,9 +482,9 @@ fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point
     );
 
     for (name, runner) in [
-        ("windows-x86_64", "windows-latest"),
+        ("windows-x86_64", "windows-2025"),
         ("macos-arm64", "macos-latest"),
-        ("linux-x86_64", "ubuntu-latest"),
+        ("linux-x86_64", "ubuntu-24.04"),
     ] {
         assert!(
             check.block.windows(2).any(|pair| {
@@ -498,6 +498,18 @@ fn ordinary_workspace_tests_gate_all_three_platforms_and_the_release_entry_point
             "ci.yml's ordinary matrix is missing the {name} / {runner} entry"
         );
     }
+
+    let host_guard = check
+        .block
+        .iter()
+        .position(|(_, line)| line == "run: test \"$RM_CI_RUNNER_ENVIRONMENT\" = github-hosted")
+        .expect("ordinary CI must verify its disposable hosted image");
+    let checkout = check
+        .block
+        .iter()
+        .position(|(_, line)| line.starts_with("uses: actions/checkout"))
+        .expect("ordinary CI checks out the repository");
+    assert!(host_guard < checkout, "host guard precedes checkout");
 
     for command in [
         "cargo metadata --locked --format-version 1 > /dev/null",

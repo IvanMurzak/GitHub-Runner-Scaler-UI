@@ -107,20 +107,27 @@ jobs:
       matrix:
         include:
           - name: windows-x86_64
-            os: windows-latest
+            os: windows-2025
           # macos-latest is Apple Silicon, so the platform the persona actually
           # uses is the platform that is tested. The `uname` assertion below
           # keeps that true if GitHub ever repoints the label.
           - name: macos-arm64
             os: macos-latest
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
     defaults:
       run:
         # bash exists on all three runner images, so every step below is one
         # script rather than one script per OS.
         shell: bash
     steps:
+      # Custom *-latest aliases on persistent hosts must not silently replace
+      # these disposable native OS images (WSL can even resolve Windows pwsh).
+      - name: Require the disposable hosted check image
+        env:
+          RM_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: test "$RM_CI_RUNNER_ENVIRONMENT" = github-hosted
+
       - name: Check out the repository
         uses: actions/checkout@v7
 
@@ -218,11 +225,27 @@ jobs:
   # report success for having verified nothing.
   service-install:
     name: privileged installer smoke tests (windows-x86_64)
-    runs-on: windows-latest
+    runs-on: windows-2025
     defaults:
       run:
         shell: bash
     steps:
+      # These tests deliberately register SCM services and touch the real
+      # default runner root. Refuse persistent hosts BEFORE checkout/mutation.
+      - name: Require a disposable elevated Windows host
+        shell: pwsh
+        env:
+          RM_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          if ($env:RM_CI_RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Privileged installer tests require a disposable GitHub-hosted Windows image; do not relabel a persistent runner as windows-2025.'
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The disposable Windows image must be elevated before privileged installer tests.'
+          }
+
       - name: Check out the repository
         uses: actions/checkout@v7
 
