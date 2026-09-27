@@ -452,7 +452,7 @@ fn record_named_policy(
     store.insert_policy(&policy).map_err(store_failure)?;
     write_add_result(out, &policy, host)?;
     if let Some(labels) = policy.routing_labels() {
-        writeln!(out, "Profile: {} selector={}\nCopy runs-on: {}\nwarning: automatic demand needs a static selector; matrix expressions are not resolved.",
+        writeln!(out, "Profile: {} selector={}\nCopy runs-on: {}\nStatic runs-on labels required; selector optional. Overlapping profiles start no runner; matrix expressions are not resolved.",
             policy.profile_name(), labels.host_label(), labels.host_label())
             .map_err(write_failed("this profile result"))?;
     }
@@ -977,7 +977,7 @@ fn list(context: &Context, scope: TargetScope, out: &mut dyn Write) -> Result<()
         )
         .map_err(failed)?;
         if let Some(labels) = policy.routing_labels() {
-            writeln!(out, "selector: {} (copy runs-on); warning: automatic scaling needs a static selector, not a matrix expression",
+            writeln!(out, "selector: {} (copy runs-on); selector optional; static labels required; overlapping profiles start no runner; matrix expressions are not resolved",
                 labels.host_label()).map_err(failed)?;
         }
 
@@ -1344,7 +1344,7 @@ pub fn apply_policy_mutation_selected(
             writeln!(out, "Scaling enabled for {}.", policy.target).map_err(failed)?;
             writeln!(out, "{TRUST_WARNING}").map_err(failed)?;
             if let Some(labels) = policy.routing_labels() {
-                writeln!(out, "Copy runs-on: {}\nwarning: automatic scaling requires this static selector; matrix expressions are not resolved.",
+                writeln!(out, "Copy runs-on: {}\nStatic runs-on labels required; selector optional. Overlapping profiles start no runner; matrix expressions are not resolved.",
                     labels.host_label()).map_err(failed)?;
             }
         } else {

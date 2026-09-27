@@ -7,6 +7,15 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.29
+
+### Fixes
+
+- Runner profiles accept jobs requiring a case-insensitive subset of their labels,
+  including jobs that omit the immutable selector. Extra profile labels are allowed.
+  Jobs matching multiple local profiles are visibly refused, including overlaps with
+  inactive isolated profiles, rather than scaling twice or falling back to native execution.
+
 ## 0.4.28
 
 ### Fixes
@@ -45,7 +54,6 @@ the version being prepared rather than the version in `Cargo.toml`.
   request or process start is a warning, and a launch that takes longer than a
   minute logs a warning naming how long the package copy, the JIT request and
   the process start each took.
-
 ## 0.4.26
 
 ### Fixes
@@ -428,6 +436,3 @@ prints the explicit Linux commands to run if you want to undo that half too.
 Every existing local command, file, service registration and `status --json`
 document is unchanged. `--host local` is the default, so nothing you have
 scripted needs editing.
-
-
-
