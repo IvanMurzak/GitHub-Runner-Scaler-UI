@@ -1196,6 +1196,22 @@ impl SqliteStore {
     /// which `b1` owns; it is reported rather than worked around silently, and
     /// this is the defensive measure in the meantime.
     fn normalise(&self, mut fields: PersistedAttempt) -> PersistedAttempt {
+        // Historical native rows can retain the execution column's migration
+        // default while the legacy process_id records the former child. A
+        // cleaned row owns no process or capacity, so decode that missing
+        // duplicate identity from the original column without rewriting the
+        // journal. Active rows and conflicting non-null identities must still
+        // fail closed rather than authorizing process adoption or termination.
+        if fields.state == AttemptState::Cleaned
+            && matches!(
+                fields.execution,
+                AttemptExecution::Native { process_id: None }
+            )
+        {
+            fields.execution = AttemptExecution::Native {
+                process_id: fields.process_id,
+            };
+        }
         if fields.last_state_change_at < fields.created_at {
             tracing::warn!(
                 attempt = %fields.id,
@@ -5210,6 +5226,62 @@ mod tests {
         store
             .record_attempt(&other_policy)
             .expect("another policy's s1 is a different slot");
+    }
+
+    #[test]
+    fn cleaned_native_history_with_default_execution_pid_loads_without_rewriting() {
+        let store = store();
+        RawAttempt {
+            process_id: Some(4242),
+            state: "cleaned".into(),
+            outcome: Some(COMPLETED_JOB.into()),
+            terminal_at: Some(timestamp_to_text(ts(2000))),
+            last_state_change_at: timestamp_to_text(ts(3000)),
+            ..RawAttempt::default()
+        }
+        .insert(&store);
+        let default_execution = r#"{"kind":"native","process_id":null}"#;
+        store
+            .lock()
+            .execute(
+                "UPDATE attempts SET execution = ?1 WHERE id = ?2",
+                rusqlite::params![default_execution, ATTEMPT_UUID],
+            )
+            .expect("historical default identity");
+        let loaded = store
+            .attempt(attempt_id())
+            .expect("history loads")
+            .expect("present");
+        assert_eq!(loaded.process_id(), Some(4242));
+        assert!(!loaded.counts_against_capacity());
+        let execution: String = store
+            .lock()
+            .query_row(
+                "SELECT execution FROM attempts WHERE id = ?1",
+                [ATTEMPT_UUID],
+                |row| row.get(0),
+            )
+            .expect("raw history preserved");
+        assert_eq!(execution, default_execution);
+
+        store
+            .lock()
+            .execute(
+                "UPDATE attempts SET state = 'finished' WHERE id = ?1",
+                [ATTEMPT_UUID],
+            )
+            .expect("uncleaned fixture");
+        assert!(matches!(
+            store.attempt(attempt_id()),
+            Err(StoreError::CorruptAttempt { .. })
+        ));
+        store.lock().execute(
+            "UPDATE attempts SET state = 'cleaned', execution = '{\"kind\":\"native\",\"process_id\":7}' WHERE id = ?1", [ATTEMPT_UUID],
+        ).expect("conflicting identity fixture");
+        assert!(matches!(
+            store.attempt(attempt_id()),
+            Err(StoreError::CorruptAttempt { .. })
+        ));
     }
 
     #[test]
