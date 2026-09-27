@@ -333,47 +333,51 @@ GitHub-hosted ARM64 macOS runners cannot perform this gate because nested
 virtualization is unavailable. Use a physical Apple-silicon Mac or a dedicated
 bare-metal Apple-silicon host. Install the signed helper and register the
 operator-prepared template first, build the PR's `runner-manager` release
-binary, and authenticate the boot service's standard machine-scoped store with
-`sudo target/release/runner-manager auth login --start-at boot`. The absolute
-`--data-dir` below scopes only the disposable acceptance configuration, state,
-runtime, and logs; it must not root the credential audit because the
-LaunchDaemon does not read that keychain. Export `GH_TOKEN` for the fixture
-repository (with pull-request and issue-label write plus Actions write
-permissions), then run the guarded phases:
+binary, and authenticate the logged-in operator's existing user-scoped store
+with `target/release/runner-manager auth status --start-at login`. If it is not
+already authenticated, perform the normal interactive login once as the
+operator; the harness never starts a second OAuth flow. The disposable data
+and helper roots below are user-owned. The harness runs as `ivanmurzak`,
+registers only a `gui/501` LaunchAgent with `--start-at login`, and separately
+proves that root probe/prepare fail before resource creation with the login
+remedy. GitHub CLI authentication comes from the operator's existing safe
+store; no token is placed in argv, files, logs, or the service environment.
 
 ```sh
 common=(
   --repository OWNER/REPO
   --image 'vm-version:macos-15.1-arm64-v3@sha256:<digest>'
-  --data-dir /var/db/runner-manager-d3-acceptance/data
+  --data-dir /Volumes/NVME/runner-manager-d3/data
   --runner-manager "$PWD/target/release/runner-manager"
+  --helper /usr/local/libexec/runner-manager-macos-vm
+  --helper-root /Volumes/NVME/runner-manager-d3/helper-store
+  --disk-mib 47684
   --pull-request 79
   --workflow-ref worktree-01a0ac40-2810-7021-8119-413dbbb9884a
 )
 
-sudo -E scripts/macos-vm-acceptance.sh audit "${common[@]}"
-sudo -E scripts/macos-vm-acceptance.sh run-job "${common[@]}" \
+scripts/macos-vm-acceptance.sh audit "${common[@]}"
+scripts/macos-vm-acceptance.sh run-job "${common[@]}" \
   --allow-service-install --allow-profile --allow-service-restart
-sudo -E scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
+scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
   --allow-profile
-# Reboot macOS manually. The harness never invokes a reboot command.
-sudo -E scripts/macos-vm-acceptance.sh verify-after-reboot "${common[@]}"
-sudo -E scripts/macos-vm-acceptance.sh recovery-forensics "${common[@]}"
-sudo -E scripts/macos-vm-acceptance.sh cleanup "${common[@]}" --allow-cleanup
-sudo -E scripts/macos-vm-acceptance.sh rollback "${common[@]}" --allow-rollback
+# Reboot macOS manually. The disposable login continuation resumes after the
+# next console login, runs verify/forensics/cleanup/rollback, and removes itself.
 ```
 
 `audit` refuses a non-ARM host, a virtual host where
 `VZVirtualMachine.isSupported` is false, a missing entitlement, non-APFS clone
 support, a byte-for-byte verification failure for the digest-pinned template,
 an existing helper resource, or missing GitHub/product authentication in the
-standard boot-service credential store. `run-job` requires exact 2 CPU, 4096
+standard login-service credential store. `run-job` requires exact 2 CPU, 4096
 MiB, template-sized disk and 512-process attestations, no host shares, a fresh
 writable-disk identity, guest secret scans, and launchd restart/adoption while
 the job is live. `prepare-before-reboot` creates a second fresh-disk identity
 and durable receipt. `verify-after-reboot` requires the boot epoch to advance,
-the boot LaunchDaemon to return, provider resources and capacity to reach zero,
-and host secret scans to pass. Cleanup and rollback require separate flags and
+the login LaunchAgent to return, provider resources and capacity to reach zero,
+and host secret scans to pass. After host reboot the helper and VM are gone;
+owned orphan/capacity cleanup resumes at the next console login when the
+LaunchAgent starts. Cleanup and rollback require separate flags and
 act only on identities stored in the receipt. The harness creates, applies, and
 deletes a unique repository label for each job. That `pull_request:labeled`
 trigger is deliberate: GitHub does not register a new `workflow_dispatch`

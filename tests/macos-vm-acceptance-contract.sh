@@ -60,17 +60,18 @@ expected=$(printf '%s\n%s\n%s\n' '/tmp/runner manager/probe.json' '/tmp/runner m
 [[ $actual == "$expected" ]]
 BASH
 
-# The acceptance data directory roots configuration and state, but the boot
-# LaunchDaemon deliberately reads the standard machine-scoped credential store.
-# Audit must not validate the rooted test keychain selected by --data-dir.
-grep -F 'service_runner() { "$runner_manager" "$@"; }' "$harness" >/dev/null
-grep -F 'service_runner auth status --start-at boot >"$evidence/runner-auth.txt"' "$harness" >/dev/null
-if grep -F 'service_runner auth status >"$evidence/runner-auth.txt"' "$harness" >/dev/null; then
-  printf 'audit does not explicitly select the boot credential scope\n' >&2
+# The acceptance service is a user-owned LaunchAgent in gui/501. Its login
+# credential and disposable data are deliberately distinct from production.
+grep -F 'service_domain=' "$harness" >/dev/null
+grep -F 'auth_runner auth status --start-at login >"$evidence/runner-auth.txt"' "$harness" >/dev/null
+if grep -F 'auth_runner auth status --start-at boot' "$harness" >/dev/null; then
+  printf 'audit still selects the boot credential scope\n' >&2
   exit 1
 fi
-if grep -E '^[[:space:]]+runner auth status >"\$evidence/runner-auth.txt"' "$harness" >/dev/null; then
-  printf 'audit still validates the rooted --data-dir credential store\n' >&2
+grep -F 'login_service service install --start-at login' "$harness" >/dev/null
+grep -F 'sudo -n env' "$harness" >/dev/null
+if grep -F 'runner service install --start-at boot' "$harness" >/dev/null; then
+  printf 'harness still installs a boot service\n' >&2
   exit 1
 fi
 
@@ -719,7 +720,7 @@ for required in \
   'wait_for_registered_runner' 'run_job_failure_cleanup' 'owned_environment_dirs' \
   'wait_profile_inactive' \
   'scan_service_process_no_secrets' 'ps eww -p' \
-  'gh[pousr]_' 'runner service install --start-at boot' \
+  'gh[pousr]_' 'login_service service install --start-at login' \
   'kill -9' 'runner status --json' 'helper_command destroy' \
   'wait_service_absent 30'; do
   grep -F -- "$required" "$harness" >/dev/null || { echo "missing harness contract: $required" >&2; exit 1; }

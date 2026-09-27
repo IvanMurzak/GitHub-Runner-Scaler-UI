@@ -47,7 +47,7 @@ The reproducible operator procedure is
 [`scripts/macos-vm-acceptance.sh`](../scripts/macos-vm-acceptance.sh). Its
 workflow uses the production provider and a one-time JIT runner, while the
 harness records exact helper metadata, kills and observes restart of a
-disposable boot LaunchDaemon, prepares a durable pre-reboot receipt, verifies a
+disposable user-owned login LaunchAgent in `gui/501`, prepares a durable pre-reboot receipt, verifies a
 different host boot, checks orphan cleanup and capacity accounting, scans host
 and guest surfaces for credential-shaped content, and removes only resources
 whose ownership it can prove. The harness never reboots the host or downloads a

@@ -21,15 +21,19 @@ Options:
   --workflow-ref REF        ref containing the native acceptance workflow
   --pull-request N          same-repository PR carrying the workflow (default 79)
   --disk-mib N              exact registered template disk size
-  --allow-service-install   install the disposable boot LaunchDaemon
+  --helper PATH             signed macOS VM helper (default: /usr/local/libexec/runner-manager-macos-vm)
+  --helper-root PATH        disposable user-owned helper store
+  --allow-service-install   install the disposable login LaunchAgent
   --allow-profile           create/remove the temporary repository profile
-  --allow-service-restart   SIGKILL the disposable LaunchDaemon once
+  --allow-service-restart   SIGKILL the disposable login LaunchAgent once
   --allow-cleanup           destroy owned leftovers and remove the profile
-  --allow-rollback          uninstall the disposable LaunchDaemon and receipt
+  --allow-rollback          uninstall the disposable login LaunchAgent and receipt
 
-Run as root on a physical Apple-silicon Mac. The harness never initiates a
-reboot. prepare-before-reboot writes a receipt, then the operator reboots the
-host manually and runs verify-after-reboot.
+Run as the logged-in acceptance user on a physical Apple-silicon Mac. The
+harness also runs explicit root negative probes, but never installs a root
+LaunchDaemon. The harness never initiates a reboot. prepare-before-reboot
+writes a receipt and a one-shot login continuation; the operator reboots the
+host manually and the continuation resumes after the next login.
 EOF
 }
 
@@ -49,9 +53,9 @@ repository=
 image=
 data_dir=
 runner_manager=
-helper=/usr/local/bin/runner-manager-macos-vm
-helper_root='/Library/Application Support/io.github.IvanMurzak.runner-manager/macos-vm-helper'
-state_path='/var/db/runner-manager-d3-acceptance/state.json'
+helper=/usr/local/libexec/runner-manager-macos-vm
+helper_root='/Volumes/NVME/runner-manager-d3/helper-store'
+state_path='/Volumes/NVME/runner-manager-d3/receipt/state.json'
 workflow_ref=
 pull_request=79
 disk_mib=
@@ -71,6 +75,8 @@ while [[ $# -gt 0 ]]; do
     --image) image=${2-}; shift 2 ;;
     --data-dir) data_dir=${2-}; shift 2 ;;
     --runner-manager) runner_manager=${2-}; shift 2 ;;
+    --helper) helper=${2-}; shift 2 ;;
+    --helper-root) helper_root=${2-}; shift 2 ;;
     --state) state_path=${2-}; shift 2 ;;
     --workflow-ref) workflow_ref=${2-}; shift 2 ;;
     --pull-request) pull_request=${2-}; shift 2 ;;
@@ -87,7 +93,8 @@ done
 
 [[ $(uname -s) == Darwin ]] || die 'this harness requires macOS'
 [[ $(uname -m) == arm64 ]] || die 'native macOS guests are declared only on Apple silicon (arm64)'
-[[ $(id -u) -eq 0 ]] || die 'run this harness as root (sudo -E preserves GH_TOKEN for gh)'
+[[ $(id -u) -eq 501 ]] || die 'run this harness as the logged-in console user ivanmurzak (not root)'
+[[ $(id -un) == ivanmurzak ]] || die 'the acceptance user must be ivanmurzak'
 [[ $repository =~ ^[^/]+/[^/]+$ ]] || die '--repository must be OWNER/REPO'
 [[ $image =~ ^vm-version:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die '--image must be an immutable vm-version reference with a lowercase sha256 digest'
 [[ $data_dir == /* ]] || die '--data-dir must be absolute'
@@ -95,25 +102,37 @@ done
 [[ $helper == /* && -x $helper ]] || die '--helper must name an executable absolute path'
 [[ $helper_root == /* && $state_path == /* ]] || die 'helper root and state path must be absolute'
 [[ $pull_request =~ ^[0-9]+$ && $pull_request -eq 79 ]] || die 'this reviewed one-time acceptance workflow is pinned to PR 79'
-for command in gh git launchctl plutil python3 shasum sysctl; do need "$command"; done
+for command in gh git launchctl plutil python3 shasum sysctl sudo; do need "$command"; done
 
 workflow='macos-vm-native-acceptance.yml'
 service_tag='d3-native-acceptance'
 service_label='io.github.IvanMurzak.runner-manager-selftest-d3-native-acceptance'
+service_domain='gui/501'
 state_dir=$(dirname "$state_path")
 evidence_root="$state_dir/evidence"
 mkdir -p "$state_dir" "$evidence_root"
 chmod 700 "$state_dir" "$evidence_root"
+finisher_log='/Volumes/NVME/runner-manager-d3/login-acceptance-finisher.log'
+milestone() { printf '%s phase=%s %s\n' "$(date -u +%FT%TZ)" "$phase" "$*" >>"$finisher_log"; }
+milestone "harness-start user=$(id -un) uid=$(id -u) service_domain=$service_domain"
 export RUNNER_MANAGER_MACOS_VM_HELPER="$helper"
 export RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root"
 export RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag"
 
 runner() { "$runner_manager" --data-dir "$data_dir" "$@"; }
-# The boot LaunchDaemon deliberately uses the standard machine-scoped secret
-# store even when its configuration/state directories were selected with
-# --data-dir. Passing --data-dir here would inspect a rooted test keychain the
-# service never opens.
-service_runner() { "$runner_manager" "$@"; }
+login_service() {
+  env RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag" \
+    RUNNER_MANAGER_MACOS_VM_HELPER="$helper" \
+    RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" \
+    "$runner_manager" --data-dir "$data_dir" "$@"
+}
+service_runner() { login_service "$@"; }
+auth_runner() {
+  env RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag" \
+    RUNNER_MANAGER_MACOS_VM_HELPER="$helper" \
+    RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" \
+    "$runner_manager" "$@"
+}
 helper_command() { "$helper" --protocol-version 1 "$@"; }
 boot_epoch() {
   sysctl -n kern.boottime |
@@ -121,7 +140,32 @@ boot_epoch() {
     grep -E '^[0-9]+$'
 }
 service_pid() {
-  launchctl print "system/$service_label" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+  launchctl print "$service_domain/$service_label" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+}
+
+root_negative_probes() {
+  local out=$1 before after probe_status prepare_status
+  before=$(environment_count)
+  set +e
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 probe --json >"$out/root-probe.json" 2>"$out/root-probe.err"
+  probe_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 prepare \
+    --environment rm-root-negative --host root-negative --attempt root-negative --generation 1 \
+    --image "$image" --template-digest "${image##*@sha256:}" --architecture arm64 \
+    --cpu-millis 2000 --memory-mib 4096 --disk-mib "${disk_mib:-47684}" --process-limit 512 \
+    --runner-source /tmp --fresh-writable-disk --no-host-shares --private-jit-channel \
+    >"$out/root-prepare.json" 2>"$out/root-prepare.err"
+  prepare_status=$?
+  set -e
+  after=$(environment_count)
+  [[ $prepare_status -ne 0 ]] || die 'root prepare unexpectedly succeeded'
+  [[ $before == "$after" ]] || die 'root negative probe created a helper environment'
+  grep -Eiq 'logged-in user|LaunchAgent|--start-at login' "$out/root-probe.err" "$out/root-prepare.err" ||
+    die 'root negative probe omitted the --start-at login remedy'
+  python3 - "$out/root-probe.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); assert r['user_session'] is False, r
+PY
 }
 
 state_get() {
@@ -342,7 +386,7 @@ wait_service_absent() {
     [[ -z $(service_pid) ]] && return
     sleep 1
   done
-  die 'disposable LaunchDaemon still exists after uninstall'
+  die 'disposable login LaunchAgent still exists after uninstall'
 }
 
 cancel_recorded_runs() {
@@ -600,8 +644,8 @@ preserve_failure_evidence() {
   local evidence=$1 run_id directory
   mkdir -p "$evidence"
   runner status --json >"$evidence/failure-status.json" 2>&1 || true
-  runner service status >"$evidence/failure-service-status.txt" 2>&1 || true
-  launchctl print "system/$service_label" >"$evidence/failure-launchd.txt" 2>&1 || true
+  login_service service status >"$evidence/failure-service-status.txt" 2>&1 || true
+  launchctl print "$service_domain/$service_label" >"$evidence/failure-launchd.txt" 2>&1 || true
   run_id=$(state_get normal_run_id 2>/dev/null || true)
   if [[ -n $run_id ]]; then
     gh run view "$run_id" --repo "$repository" --json status,conclusion,jobs \
@@ -659,13 +703,14 @@ run_job_failure_cleanup() {
 }
 
 run_audit() {
+  milestone 'audit-start login credential and root negative probe pending'
   [[ ! -e $state_path ]] || die "state '$state_path' already exists; finish cleanup/rollback first"
   local evidence="$evidence_root/audit-$(date -u +%Y%m%d%H%M%S)"
   mkdir -m 700 "$evidence"
   assert_probe_and_image "$evidence"
-  [[ -n ${GH_TOKEN:-} ]] || die 'GH_TOKEN is required so sudo never depends on another account home and the exact token can be scanned from evidence'
   gh auth status --hostname github.com >/dev/null
-  service_runner auth status --start-at boot >"$evidence/runner-auth.txt"
+  auth_runner auth status --start-at login >"$evidence/runner-auth.txt"
+  root_negative_probes "$evidence"
   [[ $(environment_count) -eq 0 ]] || die 'helper store already contains environments; resolve them before acceptance'
   [[ -z $(service_pid) ]] || die "disposable service '$service_label' already exists"
   local pr_json pr_ref pr_owner repo_owner
@@ -700,24 +745,26 @@ doc={'schema_version':1,'phase':'audited','repository':sys.argv[2],'image':sys.a
 p.write_text(json.dumps(doc,sort_keys=True,indent=2)+'\n'); os.chmod(p,0o600)
 PY
   printf 'Audit passed. Receipt: %s\n' "$state_path"
+  milestone "audit-passed receipt=$state_path"
 }
 
 install_service_and_profile() {
   local profile=$1 label=$2 evidence=$3
-  require_opt_in "$allow_service_install" --allow-service-install 'installing the disposable boot LaunchDaemon'
+  require_opt_in "$allow_service_install" --allow-service-install 'installing the disposable login LaunchAgent'
   require_opt_in "$allow_profile" --allow-profile 'creating the temporary isolated profile'
   if [[ $(state_get service_installed) != true ]]; then
-    runner service install --start-at boot >"$evidence/service-install.txt"
+    login_service service install --start-at login >"$evidence/service-install.txt"
     state_set service_installed true bool
   fi
   local pid
   for _ in {1..30}; do pid=$(service_pid); [[ -z $pid ]] || break; sleep 2; done
-  [[ -n $pid ]] || die 'disposable LaunchDaemon did not start'
+  [[ -n $pid ]] || die 'disposable login LaunchAgent did not start'
   if [[ $(state_get profile_created) == true ]]; then die 'receipt already owns a temporary profile; clean it first'; fi
   ensure_profile "$profile" "$label" "$evidence"
 }
 
 run_job() {
+  milestone 'normal-job-start disposable login LaunchAgent pending'
   assert_state_identity
   [[ $(state_get phase) == audited ]] || die 'run-job requires an audited receipt'
   [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before run-job'
@@ -737,11 +784,11 @@ run_job() {
   state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set normal_writable_disk_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")"
   state_set normal_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
-  require_opt_in "$allow_service_restart" --allow-service-restart 'forcing a disposable LaunchDaemon crash/restart'
-  before_pid=$(service_pid); [[ -n $before_pid ]] || die 'LaunchDaemon PID is unavailable'
+  require_opt_in "$allow_service_restart" --allow-service-restart 'forcing a disposable login LaunchAgent crash/restart'
+  before_pid=$(service_pid); [[ -n $before_pid ]] || die 'LaunchAgent PID is unavailable'
   kill -9 "$before_pid"
   for _ in {1..60}; do after_pid=$(service_pid); [[ -n $after_pid && $after_pid != "$before_pid" ]] && break; sleep 1; done
-  [[ -n ${after_pid:-} && $after_pid != "$before_pid" ]] || die 'launchd did not restart the service with a new PID'
+  [[ -n ${after_pid:-} && $after_pid != "$before_pid" ]] || die 'launchd did not restart the login service with a new PID'
   helper_command inspect --environment "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")" --json >"$evidence/environment-after-service-crash.json"
   printf '{"old_pid":%s,"new_pid":%s}\n' "$before_pid" "$after_pid" >"$evidence/service-restart.json"
   wait_for_run "$run_id" "$evidence"
@@ -756,9 +803,11 @@ run_job() {
   run_job_cleanup_armed=false
   trap - EXIT
   printf 'Live JIT job and service-crash recovery passed. Evidence: %s\n' "$evidence"
+  milestone "normal-job-passed evidence=$evidence"
 }
 
 prepare_reboot() {
+  milestone 'reboot-preparation-start'
   assert_state_identity
   [[ $(state_get phase) == normal-job-verified ]] || die 'prepare-before-reboot requires a verified normal job'
   [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before reboot preparation'
@@ -778,7 +827,51 @@ prepare_reboot() {
   state_set reboot_writable_disk_id "$disk_id"
   state_set prepared_boot_epoch "$(boot_epoch)" int
   state_set phase reboot-prepared
+  install_reboot_continuation
   printf 'Reboot receipt prepared at %s. Reboot macOS manually; this harness never initiates a reboot.\n' "$state_path"
+  milestone "reboot-prepared continuation=$state_path"
+}
+
+install_reboot_continuation() {
+  local continuation_label='io.github.IvanMurzak.runner-manager-selftest-d3-native-acceptance-recovery'
+  local continuation_dir="$HOME/Library/LaunchAgents"
+  local continuation_plist="$continuation_dir/$continuation_label.plist"
+  local continuation_script="$state_dir/reboot-continuation.sh"
+  [[ ! -e $continuation_plist && ! -e $continuation_script ]] ||
+    die 'a disposable reboot continuation is already present'
+  python3 - "$continuation_script" "$continuation_plist" "$continuation_label" \
+    "$(cd "$(dirname "$0")/.." && pwd)/scripts/macos-vm-acceptance.sh" \
+    "$repository" "$image" "$data_dir" "$runner_manager" "$helper" "$helper_root" \
+    "$state_path" "$workflow_ref" "$pull_request" "$disk_mib" "$continuation_dir" <<'PY'
+import os, pathlib, plistlib, shlex, sys
+(script, plist, label, harness, repository, image, data_dir, runner_manager,
+ helper, helper_root, state, workflow_ref, pull_request, disk_mib, plist_dir) = sys.argv[1:]
+common = [harness, '--repository', repository, '--image', image, '--data-dir', data_dir,
+          '--runner-manager', runner_manager, '--helper', helper, '--helper-root', helper_root,
+          '--state', state, '--workflow-ref', workflow_ref, '--pull-request', pull_request,
+          '--disk-mib', disk_mib]
+def command(phase, *extra):
+    return ' '.join(shlex.quote(x) for x in [harness, phase] + common[1:] + list(extra))
+lines = ['#!/bin/sh', 'set -eu', command('verify-after-reboot'),
+         command('recovery-forensics'), command('cleanup', '--allow-cleanup'),
+         command('rollback', '--allow-rollback'),
+         f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true',
+         f'rm -f {shlex.quote(plist)} {shlex.quote(script)}', '']
+pathlib.Path(script).write_text('\n'.join(lines)); os.chmod(script, 0o700)
+pathlib.Path(plist_dir).mkdir(parents=True, exist_ok=True)
+document = {'Label': label, 'ProgramArguments': ['/bin/sh', script], 'RunAtLoad': True,
+            'ProcessType': 'Background',
+            'StandardOutPath': str(pathlib.Path(state).parent / 'reboot-continuation.out.log'),
+            'StandardErrorPath': str(pathlib.Path(state).parent / 'reboot-continuation.err.log')}
+with open(plist, 'wb') as stream: plistlib.dump(document, stream, sort_keys=False)
+os.chmod(plist, 0o600)
+PY
+  launchctl bootstrap gui/501 "$continuation_plist"
+  launchctl print "gui/501/$continuation_label" >/dev/null ||
+    die 'reboot continuation LaunchAgent did not load into gui/501'
+  state_set continuation_label "$continuation_label"
+  state_set continuation_plist "$continuation_plist"
+  state_set continuation_script "$continuation_script"
 }
 
 verify_reboot() {
@@ -788,12 +881,12 @@ verify_reboot() {
   before=$(state_get prepared_boot_epoch); now=$(boot_epoch)
   (( now > before )) || die 'host boot identity did not advance; perform a real macOS reboot first'
   evidence="$evidence_root/reboot-verified-$(date -u +%Y%m%d%H%M%S)"; mkdir -m 700 "$evidence"
-  [[ -n $(service_pid) ]] || die 'disposable boot LaunchDaemon did not recover without an interactive start'
+  [[ -n $(service_pid) ]] || die 'disposable login LaunchAgent did not recover after login'
   run_id=$(state_get reboot_run_id)
   gh run cancel "$run_id" --repo "$repository" >/dev/null 2>&1 || true
   wait_no_environments 600
   assert_status_clean "$evidence/status-clean.json"
-  runner service status >"$evidence/service-status.txt"
+  login_service service status >"$evidence/service-status.txt"
   scan_no_secrets "$evidence/host-secret-scan.txt"
   scan_service_process_no_secrets "$evidence/service-process-secret-scan.txt"
   profile=$(state_get profile_name); remove_profile "$profile"
@@ -807,9 +900,9 @@ forensics() {
   local evidence="$evidence_root/forensics-$(date -u +%Y%m%d%H%M%S)"
   mkdir -m 700 "$evidence"
   helper_command probe --json >"$evidence/probe.json" || true
-  runner service status >"$evidence/service-status.txt" 2>&1 || true
+  login_service service status >"$evidence/service-status.txt" 2>&1 || true
   runner status --json >"$evidence/status.json" 2>&1 || true
-  launchctl print "system/$service_label" >"$evidence/launchd.txt" 2>&1 || true
+  launchctl print "$service_domain/$service_label" >"$evidence/launchd.txt" 2>&1 || true
   while IFS= read -r directory; do
     helper_command inspect --environment "$(basename "$directory")" --json >>"$evidence/environments.jsonl" || true
   done < <(environment_dirs)
@@ -843,11 +936,11 @@ cleanup() {
 }
 
 rollback() {
-  assert_state_identity; require_opt_in "$allow_rollback" --allow-rollback 'uninstalling the disposable LaunchDaemon and deleting its receipt'
+  assert_state_identity; require_opt_in "$allow_rollback" --allow-rollback 'uninstalling the disposable login LaunchAgent and deleting its receipt'
   [[ $(state_get cleanup_complete) == true ]] || die 'run cleanup successfully before rollback'
   [[ $(state_get profile_created) == false ]] || die 'cleanup the temporary profile before rollback'
   [[ $(environment_count) -eq 0 ]] || die 'cleanup helper environments before rollback'
-  if [[ $(state_get service_installed) == true ]]; then runner service uninstall >/dev/null; fi
+  if [[ $(state_get service_installed) == true ]]; then login_service service uninstall >/dev/null; fi
   wait_service_absent 30
   rm -f "$state_path"
   printf 'Disposable service and receipt rolled back. Evidence remains at %s\n' "$evidence_root"
