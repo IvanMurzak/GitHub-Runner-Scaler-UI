@@ -292,7 +292,9 @@ assert r['writable_disk_id'] and r['environment_id'].startswith('rm-'), r
 print(r['state'])
 PY
 )
-      if [[ $state == prepared ]]; then
+      # Booting proves allocation, not a completed private JIT handoff. Killing
+      # the service here races start acknowledgement and offline-runner recovery.
+      if [[ $state != running ]]; then
         sleep 2
         continue
       fi
@@ -480,6 +482,30 @@ PY
     sleep "$run_poll_seconds"
   done
   die "workflow run $run_id did not complete within $run_wait_timeout_seconds seconds; last state is preserved at $evidence/run-state.json"
+}
+
+wait_for_guest_job() {
+  local run_id=$1 expected_runner=$2 evidence=$3 deadline=$((SECONDS + 180)) ready
+  while (( SECONDS < deadline )); do
+    gh api "repos/$repository/actions/runs/$run_id/jobs?per_page=100" >"$evidence/guest-job.json"
+    ready=$(python3 - "$evidence/guest-job.json" "$expected_runner" <<'PY'
+import json, sys
+jobs=[job for job in json.load(open(sys.argv[1])).get('jobs', []) if job.get('name')=='production-provider']
+assert len(jobs)==1, 'expected exactly one native guest job'
+job=jobs[0]
+assert job.get('status')!='completed', 'guest job ended before the recovery test'
+assert job.get('status') in ('queued','in_progress'), 'unexpected guest job state'
+if job['status']=='in_progress':
+    assert job.get('runner_id')==int(sys.argv[2]), 'guest job belongs to another runner/attempt'
+    print('ready')
+else:
+    print('waiting')
+PY
+) || die 'guest job identity/readiness failed; see the retained guest-job.json'
+    [[ $ready == ready ]] && return
+    sleep 10
+  done
+  die 'the exact registered guest runner did not start its job within 180 seconds'
 }
 
 wait_for_registered_runner() {
@@ -861,6 +887,7 @@ run_job() {
   state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set normal_writable_disk_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")"
   state_set normal_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
+  wait_for_guest_job "$run_id" "$(state_get normal_runner_id)" "$evidence"
   require_opt_in "$allow_service_restart" --allow-service-restart 'forcing a disposable login LaunchAgent crash/restart'
   before_pid=$(service_pid); [[ -n $before_pid ]] || die 'LaunchAgent PID is unavailable'
   kill -9 "$before_pid"
@@ -905,6 +932,7 @@ prepare_reboot() {
   state_set reboot_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
   state_set reboot_writable_disk_id "$disk_id"
   state_set reboot_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
+  wait_for_guest_job "$run_id" "$(state_get reboot_runner_id)" "$evidence"
   state_set prepared_boot_epoch "$(boot_epoch)" int
   state_set phase reboot-prepared
   install_reboot_continuation

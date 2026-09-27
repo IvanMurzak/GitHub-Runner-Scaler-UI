@@ -1,5 +1,11 @@
 # macOS VM hosted-native evidence
 
+Physical acceptance must observe `running`, not merely `booting`, before its
+service-crash or manual-reboot recovery test. `running` follows the private JIT
+acknowledgement; the harness additionally requires the real guest job to be
+`in_progress` on that exact registered runner ID. Offline registration, a
+replacement attempt, or an already-completed job cannot supply recovery evidence.
+
 The CI `macOS VM helper` matrix executes the compiled Swift helper on GitHub's
 official `macos-latest` ARM64 and `macos-15-intel` runners. It provides real-host
 evidence for a limited set of prerequisites:

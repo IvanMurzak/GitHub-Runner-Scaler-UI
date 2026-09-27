@@ -293,7 +293,7 @@ rm -rf "$empty_helper_root" "$empty_capture" "$empty_wait_marker"
 # A newly-created production environment is legitimately `prepared` before the
 # helper consumes the private JIT handoff and begins booting. Exercise the real
 # capture loop across that transition: all immutable properties are checked on
-# both observations, but only booting/running completes the capture.
+# all observations, but only running (private JIT acknowledged) completes it.
 prepared_helper_root=$(mktemp -d)
 mkdir -p "$prepared_helper_root/environments/rm-prepared"
 prepared_capture=$(mktemp)
@@ -313,7 +313,7 @@ helper_command() {
   count=$(cat "$INSPECT_COUNT")
   count=$((count + 1))
   printf '%s\n' "$count" >"$INSPECT_COUNT"
-  if [[ $count -eq 1 ]]; then state=prepared; else state=booting; fi
+  case "$count" in 1) state=prepared;; 2) state=booting;; *) state=running;; esac
   printf '{"protocol_version":1,"guest_os":"macos","architecture":"arm64","image":"%s","template_digest":"%s","state":"%s","fresh_writable_disk":true,"shared_host_paths":[],"jit_channel":"private","applied_cpu_millis":2000,"applied_memory_mib":4096,"applied_disk_mib":47684,"applied_process_limit":512,"writable_disk_id":"disk-1","environment_id":"rm-prepared"}\n' \
     "$image" "${image##*@sha256:}" "$state"
 }
@@ -321,14 +321,45 @@ die() { printf '%s\n' "$*" >&2; exit 42; }
 sleep() { printf 'waited\n' >>"$WAIT_MARKER"; SECONDS=$((SECONDS + 2)); }
 environment=$(capture_single_environment "$CAPTURE_OUTPUT" 10)
 [[ $environment == rm-prepared ]]
-[[ $(cat "$INSPECT_COUNT") -eq 2 ]]
+[[ $(cat "$INSPECT_COUNT") -eq 3 ]]
 [[ -s $WAIT_MARKER ]]
 python3 - "$CAPTURE_OUTPUT" <<'PY'
 import json, sys
-assert json.load(open(sys.argv[1]))['state'] == 'booting'
+assert json.load(open(sys.argv[1]))['state'] == 'running'
 PY
 BASH
 rm -rf "$prepared_helper_root" "$prepared_capture" "$prepared_count" "$prepared_wait_marker"
+
+# Registration alone can be offline, and a retry can use a new runner ID.
+# Exercise the exact pre-crash/reboot job gate, including fail-closed identity.
+guest_definition=$(awk '/^wait_for_guest_job\(\) \{/ { capture=1 } capture {print} capture && /^}/ {exit}' "$harness")
+guest_evidence=$(mktemp -d)
+GUEST_DEFINITION=$guest_definition GUEST_EVIDENCE=$guest_evidence bash -u <<'BASH'
+set -e
+eval "$GUEST_DEFINITION"
+repository=octo/repo
+die() { printf '%s\n' "$*" >&2; exit 42; }
+sleep() { SECONDS=$((SECONDS + $1)); }
+gh() {
+  case "$scenario" in
+    ready) printf '%s\n' '{"jobs":[{"name":"production-provider","status":"in_progress","runner_id":123}]}' ;;
+    foreign) printf '%s\n' '{"jobs":[{"name":"production-provider","status":"in_progress","runner_id":999}]}' ;;
+    ended) printf '%s\n' '{"jobs":[{"name":"production-provider","status":"completed","runner_id":123}]}' ;;
+    queued) printf '%s\n' '{"jobs":[{"name":"production-provider","status":"queued","runner_id":null}]}' ;;
+    ambiguous) printf '%s\n' '{"jobs":[{"name":"production-provider"},{"name":"production-provider"}]}' ;;
+  esac
+}
+scenario=ready
+wait_for_guest_job 1 123 "$GUEST_EVIDENCE"
+for scenario in foreign ended queued ambiguous; do
+  if (wait_for_guest_job 1 123 "$GUEST_EVIDENCE") >"$GUEST_EVIDENCE/$scenario.log" 2>&1; then
+    printf 'guest readiness accepted %s\n' "$scenario" >&2
+    exit 1
+  fi
+done
+BASH
+rm -rf "$guest_evidence"
+[[ $(grep -Fc 'wait_for_guest_job "$run_id"' "$harness") == 2 ]]
 
 # launchd teardown is asynchronous. Exercise the real bounded wait through one
 # retry, then prove the timeout remains fail closed when the PID never leaves.
