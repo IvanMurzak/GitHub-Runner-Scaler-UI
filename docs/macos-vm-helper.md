@@ -12,7 +12,8 @@ protocol requires the helper's guest bootstrap to enforce it inside the guest:
 [VM configuration](https://developer.apple.com/documentation/virtualization/vzvirtualmachineconfiguration),
 [virtio socket configuration](https://developer.apple.com/documentation/virtualization/vzvirtiosocketdeviceconfiguration).
 
-The executable defaults to `runner-manager-macos-vm`. Set
+The executable defaults to `/usr/local/libexec/runner-manager-macos-vm`, the
+installer's absolute path, so a LaunchAgent's minimal `PATH` can resolve it. Set
 `RUNNER_MANAGER_MACOS_VM_HELPER` to an absolute executable path when the helper
 is installed elsewhere. The daemon service account must be able to execute the
 helper and access its template and VM store.

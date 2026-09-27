@@ -32,7 +32,9 @@ use super::{
 };
 
 const PROTOCOL_VERSION: u16 = 1;
-const DEFAULT_HELPER: &str = "runner-manager-macos-vm";
+// LaunchAgents inherit a minimal PATH without /usr/local/bin. Resolve the
+// product-installed helper directly rather than depending on the owner's shell.
+const DEFAULT_HELPER: &str = "/usr/local/libexec/runner-manager-macos-vm";
 const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_HELPER_STDERR: usize = 4 * 1024;
 const MAX_DIAGNOSTICS: usize = 32;
@@ -1301,6 +1303,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn default_helper_uses_the_installer_path_without_shell_path_lookup() {
+        assert!(std::path::Path::new(DEFAULT_HELPER).is_absolute());
+        let installer = include_str!("../../../../native/macos-vm-helper/install.sh");
+        assert!(installer.contains(&format!("install -m 0755 \"$binary\" {DEFAULT_HELPER}")));
+    }
 
     const TEMPLATE_DIGEST: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
