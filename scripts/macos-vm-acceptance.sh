@@ -140,7 +140,11 @@ boot_epoch() {
     grep -E '^[0-9]+$'
 }
 service_pid() {
-  launchctl print "$service_domain/$service_label" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+  launchctl print "$service_domain/$service_label" 2>/dev/null | awk '
+    /^[[:space:]]*state = running$/ { running = 1 }
+    /^[[:space:]]*pid = / { pid = $3 }
+    END { if (running && pid != "") print pid }
+  '
 }
 
 root_negative_probes() {
@@ -486,8 +490,11 @@ PY
 }
 
 scan_no_secrets() {
-  local output=$1
-  python3 - "$output" "$data_dir" "$helper_root" "$evidence_root" <<'PY'
+  local output=$1 bootstrap_logs
+  bootstrap_logs=$(state_get bootstrap_log_root)
+  set -- "$data_dir" "$helper_root"
+  [[ -z $bootstrap_logs ]] || set -- "$@" "$bootstrap_logs"
+  python3 - "$output" "$@" "$evidence_root" <<'PY'
 import os, pathlib, re, sys
 report=pathlib.Path(sys.argv[1]); roots=[pathlib.Path(p) for p in sys.argv[2:]]
 token_shape=re.compile(rb'gh[pousr]_[A-Za-z0-9_]{20,}')
@@ -723,6 +730,7 @@ run_audit() {
   root_negative_probes "$evidence"
   [[ $(environment_count) -eq 0 ]] || die 'helper store already contains environments; resolve them before acceptance'
   [[ -z $(service_pid) ]] || die "disposable service '$service_label' already exists"
+  [[ ! -e $HOME/Library/Logs/$service_label ]] || die 'disposable bootstrap logs already exist; prove ownership and retain/clean them before audit'
   local pr_json pr_ref pr_owner repo_owner
   pr_json=$(gh pr view "$pull_request" --repo "$repository" --json headRefName,headRepositoryOwner,headRefOid)
   pr_ref=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["headRefName"])' <<<"$pr_json")
@@ -746,6 +754,7 @@ doc={'schema_version':1,'phase':'audited','repository':sys.argv[2],'image':sys.a
  'helper_root':sys.argv[7],'workflow_ref':sys.argv[8],
  'disk_mib':int(sys.argv[9]),'git_commit':sys.argv[10],
  'audit_boot_epoch':int(sys.argv[11]),'service_installed':False,'profile_created':False,
+ 'bootstrap_log_root':'',
  'profile_name':'',
  'profile_id':'',
  'pull_request':79,'trigger_label':'','trigger_label_created':False,
@@ -763,8 +772,32 @@ install_service_and_profile() {
   require_opt_in "$allow_service_install" --allow-service-install 'installing the disposable login LaunchAgent'
   require_opt_in "$allow_profile" --allow-profile 'creating the temporary isolated profile'
   if [[ $(state_get service_installed) != true ]]; then
+    # Audit proved this exact bootstrap directory absent. Record our creation
+    # intent before install, so even a failed install's empty logs are owned.
+    if [[ $data_dir == /Volumes/* ]]; then
+      state_set bootstrap_log_root "$HOME/Library/Logs/$service_label"
+    fi
     login_service service install --start-at login >"$evidence/service-install.txt"
     state_set service_installed true bool
+    local bootstrap_logs
+    bootstrap_logs=$(python3 - "$HOME/Library/LaunchAgents/$service_label.plist" "$service_label" "$data_dir" <<'PY'
+import os,pathlib,plistlib,sys
+with open(sys.argv[1], 'rb') as stream: p=plistlib.load(stream)
+assert p['Label']==sys.argv[2], p
+stdout=pathlib.Path(p['StandardOutPath']); stderr=pathlib.Path(p['StandardErrorPath'])
+assert stdout.parent==stderr.parent
+assert stdout.name=='runner-manager.launchd.out.log' and stderr.name=='runner-manager.launchd.err.log'
+internal=pathlib.Path.home()/'Library/Logs'/sys.argv[2]
+private=pathlib.Path(sys.argv[3])/'logs'
+assert stdout.parent in (internal,private), stdout.parent
+if stdout.parent==internal:
+    metadata=internal.lstat()
+    assert not internal.is_symlink() and internal.is_dir()
+    assert metadata.st_uid==os.getuid() and metadata.st_mode & 0o077 == 0
+    print(internal)
+PY
+)
+    state_set bootstrap_log_root "$bootstrap_logs"
   fi
   local pid
   for _ in {1..30}; do pid=$(service_pid); [[ -z $pid ]] || break; sleep 2; done
@@ -849,8 +882,10 @@ install_reboot_continuation() {
   local continuation_dir="$HOME/Library/LaunchAgents"
   local continuation_plist="$continuation_dir/$continuation_label.plist"
   local continuation_script="$state_dir/reboot-continuation.sh"
+  local continuation_logs="$HOME/Library/Logs/$continuation_label"
   [[ ! -e $continuation_plist && ! -e $continuation_script ]] ||
     die 'a disposable reboot continuation is already present'
+  [[ ! -e $continuation_logs ]] || die 'disposable reboot bootstrap logs already exist'
   python3 - "$continuation_script" "$continuation_plist" "$continuation_label" \
     "$(cd "$(dirname "$0")/.." && pwd)/scripts/macos-vm-acceptance.sh" \
     "$repository" "$image" "$data_dir" "$runner_manager" "$helper" "$helper_root" \
@@ -867,6 +902,9 @@ common = [harness, '--repository', repository, '--image', image, '--data-dir', d
 def command(phase, *extra):
     return ' '.join(shlex.quote(x) for x in [harness, phase] + common[1:] + list(extra))
 search_path = ':'.join(dict.fromkeys([gh_dir, python_dir, '/usr/bin', '/bin', '/usr/sbin', '/sbin']))
+bootstrap_logs = pathlib.Path(plist_dir).parent / 'Logs' / label
+bootstrap_logs.mkdir(parents=True, mode=0o700)
+evidence = pathlib.Path(state).parent / 'evidence' / 'reboot-continuation-bootstrap'
 lines = ['#!/bin/sh', 'set -eu',
          f'PATH={shlex.quote(search_path)}; export PATH',
          'current_boot=$(sysctl -n kern.boottime | sed -E -n ' +
@@ -876,6 +914,13 @@ lines = ['#!/bin/sh', 'set -eu',
          command('verify-after-reboot'),
          command('recovery-forensics'), command('cleanup', '--allow-cleanup'),
          command('rollback', '--allow-rollback'),
+         f'mkdir -p {shlex.quote(str(evidence))}',
+         f'chmod 700 {shlex.quote(str(evidence))}',
+         # Retain these exact owned streams before self-removal. Missing
+         # streams are normal in contract tests, whose launchctl is mocked.
+         *[f'if [ -f {shlex.quote(str(bootstrap_logs / name))} ]; then cp -p {shlex.quote(str(bootstrap_logs / name))} {shlex.quote(str(evidence / name))}; rm -f {shlex.quote(str(bootstrap_logs / name))}; fi'
+           for name in ('stdout.log', 'stderr.log')],
+         f'rmdir {shlex.quote(str(bootstrap_logs))}',
          # bootout may terminate this process: remove our exact generated files first.
          f'rm -f {shlex.quote(plist)} {shlex.quote(script)}',
          f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true', '']
@@ -883,14 +928,15 @@ pathlib.Path(script).write_text('\n'.join(lines)); os.chmod(script, 0o700)
 pathlib.Path(plist_dir).mkdir(parents=True, exist_ok=True)
 document = {'Label': label, 'ProgramArguments': ['/bin/sh', script], 'RunAtLoad': True,
             'ProcessType': 'Background',
-            'StandardOutPath': str(pathlib.Path(state).parent / 'reboot-continuation.out.log'),
-            'StandardErrorPath': str(pathlib.Path(state).parent / 'reboot-continuation.err.log')}
+            'StandardOutPath': str(bootstrap_logs / 'stdout.log'),
+            'StandardErrorPath': str(bootstrap_logs / 'stderr.log')}
 with open(plist, 'wb') as stream: plistlib.dump(document, stream, sort_keys=False)
 os.chmod(plist, 0o600)
 PY
   state_set continuation_label "$continuation_label"
   state_set continuation_plist "$continuation_plist"
   state_set continuation_script "$continuation_script"
+  state_set continuation_log_root "$continuation_logs"
   plutil -lint "$continuation_plist" >/dev/null
   /bin/sh -n "$continuation_script"
   launchctl bootstrap gui/501 "$continuation_plist"
@@ -970,6 +1016,30 @@ rollback() {
   [[ $(environment_count) -eq 0 ]] || die 'cleanup helper environments before rollback'
   if [[ $(state_get service_installed) == true ]]; then login_service service uninstall >/dev/null; fi
   wait_service_absent 30
+  local bootstrap_logs
+  bootstrap_logs=$(state_get bootstrap_log_root)
+  if [[ -n $bootstrap_logs ]]; then
+    python3 - "$bootstrap_logs" "$service_label" "$evidence_root" <<'PY'
+import os,pathlib,shutil,stat,sys
+root=pathlib.Path(sys.argv[1]); expected=pathlib.Path.home()/'Library/Logs'/sys.argv[2]
+assert root==expected and not root.is_symlink(), root
+if not root.exists(): raise SystemExit(0)
+metadata=root.lstat()
+assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid==os.getuid()
+allowed={'runner-manager.launchd.out.log','runner-manager.launchd.err.log'}
+files=list(root.iterdir()); assert all(p.name in allowed for p in files), files
+out=pathlib.Path(sys.argv[3])/'launchd-bootstrap'; out.mkdir(mode=0o700,exist_ok=True)
+assert not out.is_symlink() and out.lstat().st_uid==os.getuid()
+for source in files:
+    m=source.lstat(); assert stat.S_ISREG(m.st_mode) and m.st_uid==os.getuid(), source
+    shutil.copy2(source,out/source.name)
+for source in files: source.unlink()
+root.rmdir()
+PY
+  fi
+  local archived_receipt="$evidence_root/rollback-receipt-$(date -u +%Y%m%d%H%M%S)-$$.json"
+  [[ ! -e $archived_receipt ]] || die 'rollback evidence receipt already exists'
+  cp -p "$state_path" "$archived_receipt"
   rm -f "$state_path"
   printf 'Disposable service and receipt rolled back. Evidence remains at %s\n' "$evidence_root"
 }

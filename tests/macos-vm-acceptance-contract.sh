@@ -73,6 +73,19 @@ expected=$(printf '<%s>\n' --data-dir "$data_dir" --use-platform-credential repo
 [[ $actual == "$expected" ]]
 BASH
 grep -F 'service_domain=' "$harness" >/dev/null
+service_pid_definition=$(awk '/^service_pid\(\) \{/ { active=1 } active { print } active && /^}/ { exit }' "$harness")
+SERVICE_PID_DEFINITION=$service_pid_definition bash -u <<'BASH'
+eval "$SERVICE_PID_DEFINITION"
+service_domain=gui/501
+service_label=owned-test
+launchctl() { printf '%s\n' "$LAUNCHCTL_OUTPUT"; }
+LAUNCHCTL_OUTPUT=$'state = spawn scheduled\npid = 101\nlast exit code = 78'
+[[ -z $(service_pid) ]]
+LAUNCHCTL_OUTPUT=$'state = running\npid = 202\nresource coalition = {\nstate = active\n}'
+[[ $(service_pid) == 202 ]]
+LAUNCHCTL_OUTPUT=$'state = running'
+[[ -z $(service_pid) ]]
+BASH
 grep -F 'auth_runner auth status --start-at login >"$evidence/runner-auth.txt"' "$harness" >/dev/null
 if grep -F 'auth_runner auth status --start-at boot' "$harness" >/dev/null; then
   printf 'audit still selects the boot credential scope\n' >&2

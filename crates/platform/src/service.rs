@@ -1476,7 +1476,7 @@ impl ServiceDefinition {
         };
         Self {
             kind: DefinitionKind::LaunchdPlist,
-            text: launchd_plist(plan),
+            text: launchd_plist_with_home(plan, home),
             install_path,
         }
     }
@@ -1651,8 +1651,31 @@ pub const SYSTEMD_HARDENING: [&str; 13] = [
 /// fight with launchd.
 #[must_use]
 pub fn launchd_plist(plan: &InstallPlan) -> String {
+    launchd_plist_with_home(plan, host_home().as_deref())
+}
+
+// launchd opens these streams before executing the user's daemon. On macOS
+// its GUI-domain bootstrap cannot open files on a privacy-protected external
+// volume, even when the signed daemon can read/write that volume after exec.
+// Keep only these bootstrap streams in the user's internal Library. The four
+// captured data directories (including structured logs) stay unchanged.
+fn launchd_bootstrap_logs(plan: &InstallPlan, home: Option<&Path>) -> PathBuf {
+    let logs = &plan.directories().logs;
+    if plan.start_mode() == StartMode::Login
+        && logs.starts_with("/Volumes")
+        && let Some(home) = home
+    {
+        return home
+            .join("Library/Logs")
+            .join(plan.identity().launchd_label());
+    }
+    logs.clone()
+}
+
+fn launchd_plist_with_home(plan: &InstallPlan, home: Option<&Path>) -> String {
     let identity = plan.identity();
     let directories = plan.directories();
+    let bootstrap_logs = launchd_bootstrap_logs(plan, home);
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str(
@@ -1704,15 +1727,13 @@ pub fn launchd_plist(plan: &InstallPlan) -> String {
     ));
     out.push_str(&plist_string(
         "StandardOutPath",
-        &directories
-            .logs
+        &bootstrap_logs
             .join("runner-manager.launchd.out.log")
             .to_string_lossy(),
     ));
     out.push_str(&plist_string(
         "StandardErrorPath",
-        &directories
-            .logs
+        &bootstrap_logs
             .join("runner-manager.launchd.err.log")
             .to_string_lossy(),
     ));
@@ -6279,8 +6300,8 @@ mod sys {
     use super::{
         DefinitionKind, InstallPlan, LAUNCH_AGENTS_SUBDIR, LAUNCH_DAEMONS_DIR, Registration,
         SUDO_REMEDY, ServiceControl, ServiceDefinition, ServiceError, ServiceIdentity,
-        enable_launchd_registration, home_directory, plist_string_value, quote_argument, run,
-        write_definition, xml_value,
+        enable_launchd_registration, home_directory, launchd_bootstrap_logs, plist_string_value,
+        quote_argument, run, write_definition, xml_value,
     };
 
     pub(super) fn control(mode: StartMode) -> Result<Box<dyn ServiceControl>, ServiceError> {
@@ -6343,7 +6364,8 @@ mod sys {
 
         fn install(&self, plan: &InstallPlan) -> Result<ServiceDefinition, ServiceError> {
             let name = plan.identity().name().to_string();
-            let definition = ServiceDefinition::launchd(plan, home_directory().as_deref());
+            let home = home_directory();
+            let definition = ServiceDefinition::launchd(plan, home.as_deref());
             let Some(path) = definition.install_path().map(std::path::Path::to_path_buf) else {
                 return Err(self.failed(
                     "install",
@@ -6354,6 +6376,38 @@ mod sys {
                         .to_string(),
                 ));
             };
+            let bootstrap_logs = launchd_bootstrap_logs(plan, home.as_deref());
+            if bootstrap_logs != plan.directories().logs {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                // SAFETY: getuid reads this process's real UID without touching memory.
+                let caller_uid = unsafe { libc::getuid() };
+                if let Ok(metadata) = std::fs::symlink_metadata(&bootstrap_logs)
+                    && (!metadata.is_dir() || metadata.uid() != caller_uid)
+                {
+                    return Err(self.failed(
+                        "install",
+                        &name,
+                        format!("bootstrap log directory {} is not a real directory owned by this user; refusing to alter it", bootstrap_logs.display()),
+                    ));
+                }
+                std::fs::create_dir_all(&bootstrap_logs)
+                    .and_then(|()| {
+                        std::fs::set_permissions(
+                            &bootstrap_logs,
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                    })
+                    .map_err(|error| {
+                        self.failed(
+                            "install",
+                            &name,
+                            format!(
+                                "cannot prepare private launchd bootstrap logs at {}: {error}",
+                                bootstrap_logs.display()
+                            ),
+                        )
+                    })?;
+            }
             write_definition("install", &name, &path, definition.text(), SUDO_REMEDY)?;
             let target = self.domain();
             let (ok, message) = self.launchctl(&[
@@ -7139,6 +7193,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // The launchd property list
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_login_data_keeps_only_launchd_bootstrap_streams_in_internal_library() {
+        let mut plan = linux_plan(StartMode::Login);
+        plan.directories.logs = PathBuf::from("/Volumes/NVME/private acceptance/logs");
+        let original = plan.directories.clone();
+        let home = Path::new("/Users/operator");
+        let definition = ServiceDefinition::launchd(&plan, Some(home));
+        let expected = home
+            .join("Library/Logs")
+            .join(plan.identity().launchd_label());
+        for (key, name) in [
+            ("StandardOutPath", "runner-manager.launchd.out.log"),
+            ("StandardErrorPath", "runner-manager.launchd.err.log"),
+        ] {
+            assert_eq!(
+                plist_string_value(definition.text(), key).map(PathBuf::from),
+                Some(expected.join(name))
+            );
+        }
+        assert_eq!(
+            plan.directories, original,
+            "private data paths must not move"
+        );
+        assert_eq!(
+            plist_string_value(definition.text(), "WorkingDirectory").map(PathBuf::from),
+            Some(plan.directories.state.clone())
+        );
+        assert_eq!(plist_string_value(definition.text(), "UserName"), None);
+    }
+
+    #[test]
+    fn internal_logs_and_boot_mode_keep_their_original_launchd_stream_paths() {
+        for mode in [StartMode::Login, StartMode::Boot] {
+            let mut plan = linux_plan(mode);
+            for root in ["/var/private/logs", "/Volumes/NVME/private/logs"] {
+                plan.directories.logs = PathBuf::from(root);
+                if mode == StartMode::Login && root.starts_with("/Volumes/") {
+                    continue;
+                }
+                assert_eq!(
+                    launchd_bootstrap_logs(&plan, Some(Path::new("/Users/operator"))),
+                    PathBuf::from(root)
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_daemon_restarts_only_after_an_unsuccessful_exit() {

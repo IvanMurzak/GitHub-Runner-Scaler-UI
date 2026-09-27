@@ -405,6 +405,16 @@ auth, daemon, service, remote-host or TUI credential semantics. Plain
 is exported, duplicated or logged, and no second OAuth flow is started.
 Overridden GitHub endpoints are refused before platform credential lookup.
 
+When disposable data lives on an external volume, launchd's pre-exec stdout
+and stderr are kept in the user-owned internal
+`~/Library/Logs/<disposable-service-label>/` (mode0700). The daemon's captured
+config, state, runtime and structured logs remain under the private data root.
+macOS can deny launchd opening an external-volume stdout even while the
+signed GUI daemon itself can access that volume. This is distinct from the
+unsupported root/boot Virtualization.framework context. The harness records
+these bootstrap logs, includes them in secret forensics, and preserves them
+in evidence before removing their exact owned directory during rollback.
+
 The Swift CI jobs establish source compatibility on GitHub-hosted ARM64 and
 Intel machines. Native acceptance still requires an operator-signed helper, a
 real bootstrap-ready pinned image, APFS clone verification, a successful real
