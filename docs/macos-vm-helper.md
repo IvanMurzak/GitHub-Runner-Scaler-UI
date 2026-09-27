@@ -415,6 +415,13 @@ unsupported root/boot Virtualization.framework context. The harness records
 these bootstrap logs, includes them in secret forensics, and preserves them
 in evidence before removing their exact owned directory during rollback.
 
+The PR79-only route gate performs fixed label validation on the existing
+`rm-macmini-osx-arm64` production login profile, not on a GitHub-hosted queue.
+It checks same-repository PR79 and exports only the reviewed disposable
+selector; it does not check out or execute repository scripts. The actual attestation job
+still requires the separate immutable VM profile selector. This also avoids
+mistaking a delayed hosted route gate for a native VM startup failure.
+
 The Swift CI jobs establish source compatibility on GitHub-hosted ARM64 and
 Intel machines. Native acceptance still requires an operator-signed helper, a
 real bootstrap-ready pinned image, APFS clone verification, a successful real

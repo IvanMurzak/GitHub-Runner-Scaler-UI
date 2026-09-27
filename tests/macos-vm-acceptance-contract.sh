@@ -10,6 +10,29 @@ cli_json_contract="$root/tests/macos-vm-helper-cli-json-contract.sh"
 bash -n "$harness"
 bash -n "$cli_json_contract"
 test -f "$workflow"
+python3 - "$workflow" <<'PY'
+import os,pathlib,subprocess,sys,tempfile,textwrap
+source=pathlib.Path(sys.argv[1]).read_text()
+route=source.split('\n  route:\n',1)[1].split('\n  production-provider:\n',1)[0]
+assert 'runs-on: rm-macmini-osx-arm64' in route
+assert 'github.event.pull_request.number == 79' in route
+assert 'github.event.pull_request.head.repo.full_name == github.repository' in route
+script=textwrap.dedent(route.split('        run: |\n',1)[1])
+with tempfile.TemporaryDirectory(prefix='rm-route-contract-') as temporary:
+    output=pathlib.Path(temporary)/'output'
+    for prefix,reboot in [('', 'false'),('reboot-', 'true')]:
+        output.unlink(missing_ok=True)
+        label=f'rm-d3-{prefix}20260927000000-aabbccdd'
+        environment=dict(os.environ,TRIGGER_LABEL=label,GITHUB_OUTPUT=str(output))
+        subprocess.run(['/bin/bash','-c',script],env=environment,check=True)
+        fields=dict(line.split('=',1) for line in output.read_text().splitlines())
+        assert fields=={'acceptance_id':'20260927000000-aabbccdd','reboot':reboot,
+                        'selector':f'rm-d3-acceptance-osx-arm64-d3-{prefix}20260927000000-aabbccdd'}
+    output.unlink()
+    invalid=dict(os.environ,TRIGGER_LABEL='rm-d3-unowned',GITHUB_OUTPUT=str(output))
+    assert subprocess.run(['/bin/bash','-c',script],env=invalid,capture_output=True).returncode != 0
+    assert not output.exists()
+PY
 grep -F 'run: bash tests/macos-vm-helper-cli-json-contract.sh' "$ci_workflow" >/dev/null
 
 # macOS reports kern.boottime as a struct containing both `sec` and `usec`.

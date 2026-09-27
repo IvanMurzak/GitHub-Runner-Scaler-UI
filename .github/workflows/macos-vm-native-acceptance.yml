@@ -38,7 +38,11 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.label.name, 'rm-d3-') &&
       github.event.label.name != 'rm-d3-production-health'
-    runs-on: ubuntu-latest
+    # This fixed metadata-only gate runs on the already verified production
+    # login profile. Physical acceptance must not depend on hosted-runner
+    # queue availability before it can create its disposable guest demand.
+    # The guest job below still requires its distinct immutable VM selector.
+    runs-on: rm-macmini-osx-arm64
     outputs:
       acceptance_id: ${{ steps.selector.outputs.acceptance_id }}
       reboot: ${{ steps.selector.outputs.reboot }}
