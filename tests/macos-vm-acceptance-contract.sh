@@ -75,6 +75,75 @@ if grep -F 'runner service install --start-at boot' "$harness" >/dev/null; then
   exit 1
 fi
 
+# Execute the real continuation generator without installing any service.
+# The first RunAtLoad must do nothing before reboot; after reboot it must
+# preserve failed evidence or complete all phases and remove files before
+# bootout (which may terminate its own process).
+python3 - "$harness" <<'PY'
+import os, pathlib, plistlib, subprocess, sys, tempfile
+source = pathlib.Path(sys.argv[1]).read_text()
+function = source.split('install_reboot_continuation() {', 1)[1].split('\nverify_reboot() {', 1)[0]
+generator = function.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+with tempfile.TemporaryDirectory(prefix='rm-continuation-contract-') as temporary:
+    root = pathlib.Path(temporary)
+    tools = root / 'tools'; tools.mkdir()
+    script = root / 'continuation.sh'; plist = root / 'agent.plist'
+    harness = root / 'mock harness.sh'; log = root / 'phases'
+    def executable(path, text):
+        path.write_text('#!/bin/sh\nset -eu\n' + text); path.chmod(0o700)
+    executable(tools / 'sysctl', 'echo "{ sec = 200, usec = 400 }"\n')
+    executable(tools / 'launchctl',
+               f'[ ! -e "{script}" ] && [ ! -e "{plist}" ]\necho bootout >>"{log}"\n')
+    executable(harness, f'echo "$1" >>"{log}"\n')
+    args = [str(script), str(plist), 'disposable-recovery', str(harness),
+            'owner/repo', 'image', str(root / 'data'), '/binary', '/helper',
+            '/store', str(root / 'state.json'), 'ref', '79', '47684',
+            str(root), '200', str(tools), str(tools)]
+    def generate():
+        subprocess.run([sys.executable, '-c', generator, *args], check=True)
+        subprocess.run(['/bin/sh', '-n', str(script)], check=True)
+        document = plistlib.loads(plist.read_bytes())
+        assert document['RunAtLoad'] is True
+        assert document['ProgramArguments'] == ['/bin/sh', str(script)]
+    generate()
+    subprocess.run(['/bin/sh', str(script)], check=True)
+    assert not log.exists() and script.exists() and plist.exists(), 'ran before reboot'
+    executable(tools / 'sysctl', 'echo "{ sec = 201, usec = 400 }"\n')
+    executable(harness, 'exit 46\n')
+    failed = subprocess.run(['/bin/sh', str(script)])
+    assert failed.returncode == 46 and script.exists() and plist.exists()
+    executable(harness, f'echo "$1" >>"{log}"\n')
+    subprocess.run(['/bin/sh', str(script)], check=True)
+    assert log.read_text().splitlines() == [
+        'verify-after-reboot', 'recovery-forensics', 'cleanup', 'rollback', 'bootout']
+    assert not script.exists() and not plist.exists()
+
+    # Building/signing must remain in the login user's keychain context.
+    # Exercise the installer with inert tools, never touching system paths.
+    installer = pathlib.Path(sys.argv[1]).parent.parent / 'native/macos-vm-helper/install.sh'
+    executable(tools / 'uname', 'echo Darwin\n')
+    executable(tools / 'id', 'echo 0\n')
+    environment = dict(os.environ, PATH=str(tools) + ':/usr/bin:/bin')
+    root_install = subprocess.run(['/bin/sh', str(installer), '--signing-identity', 'test'],
+                                  env=environment, capture_output=True)
+    assert root_install.returncode == 78
+    assert b'without sudo' in root_install.stderr
+    operations = root / 'install-operations'
+    executable(tools / 'id', 'echo 501\n')
+    executable(tools / 'swift',
+               f'echo swift >>"{operations}"\ncase "$*" in *--show-bin-path*) echo "{root}";; esac\n')
+    executable(tools / 'codesign', f'echo "codesign $*" >>"{operations}"\n')
+    executable(tools / 'sudo', f'echo "sudo $*" >>"{operations}"\n')
+    subprocess.run(['/bin/sh', str(installer), '--signing-identity', 'test'],
+                   env=environment, check=True, capture_output=True)
+    steps = operations.read_text().splitlines()
+    assert steps[:2] == ['swift', 'swift']
+    assert steps[2].startswith('codesign --force')
+    assert steps[3].startswith('codesign --verify')
+    assert len(steps[4:]) == 4 and all(x.startswith('sudo ') for x in steps[4:])
+    assert steps[-1].startswith('sudo install -d -m 0700 -o 501 -g 501 ')
+PY
+
 # A failed run-job can install the service and exit before ensure_profile writes
 # profile_name. Exercise the harness's real receipt reader against that durable
 # partial state: cleanup must see an empty optional name instead of crashing.

@@ -842,21 +842,31 @@ install_reboot_continuation() {
   python3 - "$continuation_script" "$continuation_plist" "$continuation_label" \
     "$(cd "$(dirname "$0")/.." && pwd)/scripts/macos-vm-acceptance.sh" \
     "$repository" "$image" "$data_dir" "$runner_manager" "$helper" "$helper_root" \
-    "$state_path" "$workflow_ref" "$pull_request" "$disk_mib" "$continuation_dir" <<'PY'
+    "$state_path" "$workflow_ref" "$pull_request" "$disk_mib" "$continuation_dir" \
+    "$(boot_epoch)" "$(dirname "$(command -v gh)")" "$(dirname "$(command -v python3)")" <<'PY'
 import os, pathlib, plistlib, shlex, sys
 (script, plist, label, harness, repository, image, data_dir, runner_manager,
- helper, helper_root, state, workflow_ref, pull_request, disk_mib, plist_dir) = sys.argv[1:]
+ helper, helper_root, state, workflow_ref, pull_request, disk_mib, plist_dir,
+ prepared_boot, gh_dir, python_dir) = sys.argv[1:]
 common = [harness, '--repository', repository, '--image', image, '--data-dir', data_dir,
           '--runner-manager', runner_manager, '--helper', helper, '--helper-root', helper_root,
           '--state', state, '--workflow-ref', workflow_ref, '--pull-request', pull_request,
           '--disk-mib', disk_mib]
 def command(phase, *extra):
     return ' '.join(shlex.quote(x) for x in [harness, phase] + common[1:] + list(extra))
-lines = ['#!/bin/sh', 'set -eu', command('verify-after-reboot'),
+search_path = ':'.join(dict.fromkeys([gh_dir, python_dir, '/usr/bin', '/bin', '/usr/sbin', '/sbin']))
+lines = ['#!/bin/sh', 'set -eu',
+         f'PATH={shlex.quote(search_path)}; export PATH',
+         'current_boot=$(sysctl -n kern.boottime | sed -E -n ' +
+         shlex.quote(r's/^[[:space:]]*\{[[:space:]]*sec[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*,.*/\1/p') + ')',
+         'case "$current_boot" in ""|*[!0-9]*) echo "invalid host boot identity" >&2; exit 1;; esac',
+         f'[ "$current_boot" -gt {int(prepared_boot)} ] || exit 0',
+         command('verify-after-reboot'),
          command('recovery-forensics'), command('cleanup', '--allow-cleanup'),
          command('rollback', '--allow-rollback'),
-         f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true',
-         f'rm -f {shlex.quote(plist)} {shlex.quote(script)}', '']
+         # bootout may terminate this process: remove our exact generated files first.
+         f'rm -f {shlex.quote(plist)} {shlex.quote(script)}',
+         f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true', '']
 pathlib.Path(script).write_text('\n'.join(lines)); os.chmod(script, 0o700)
 pathlib.Path(plist_dir).mkdir(parents=True, exist_ok=True)
 document = {'Label': label, 'ProgramArguments': ['/bin/sh', script], 'RunAtLoad': True,
@@ -866,12 +876,14 @@ document = {'Label': label, 'ProgramArguments': ['/bin/sh', script], 'RunAtLoad'
 with open(plist, 'wb') as stream: plistlib.dump(document, stream, sort_keys=False)
 os.chmod(plist, 0o600)
 PY
-  launchctl bootstrap gui/501 "$continuation_plist"
-  launchctl print "gui/501/$continuation_label" >/dev/null ||
-    die 'reboot continuation LaunchAgent did not load into gui/501'
   state_set continuation_label "$continuation_label"
   state_set continuation_plist "$continuation_plist"
   state_set continuation_script "$continuation_script"
+  plutil -lint "$continuation_plist" >/dev/null
+  /bin/sh -n "$continuation_script"
+  launchctl bootstrap gui/501 "$continuation_plist"
+  launchctl print "gui/501/$continuation_label" >/dev/null ||
+    die 'reboot continuation LaunchAgent did not load into gui/501'
 }
 
 verify_reboot() {
@@ -881,7 +893,11 @@ verify_reboot() {
   before=$(state_get prepared_boot_epoch); now=$(boot_epoch)
   (( now > before )) || die 'host boot identity did not advance; perform a real macOS reboot first'
   evidence="$evidence_root/reboot-verified-$(date -u +%Y%m%d%H%M%S)"; mkdir -m 700 "$evidence"
-  [[ -n $(service_pid) ]] || die 'disposable login LaunchAgent did not recover after login'
+  # Login LaunchAgents have no relative startup order. Give the disposable
+  # service a bounded window to start before collecting recovery evidence.
+  local recovered_pid=''
+  for _ in {1..60}; do recovered_pid=$(service_pid); [[ -z $recovered_pid ]] || break; sleep 2; done
+  [[ -n $recovered_pid ]] || die 'disposable login LaunchAgent did not recover after login'
   run_id=$(state_get reboot_run_id)
   gh run cancel "$run_id" --repo "$repository" >/dev/null 2>&1 || true
   wait_no_environments 600

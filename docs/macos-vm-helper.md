@@ -31,8 +31,12 @@ This repository ships the native helper as a Swift package in
 `native/macos-vm-helper`. Install it on the VM host with a signing identity:
 
 ```sh
-sudo native/macos-vm-helper/install.sh --signing-identity 'Developer ID Application: Example (TEAMID)'
+native/macos-vm-helper/install.sh --signing-identity 'Developer ID Application: Example (TEAMID)'
 ```
+
+Run the installer as the logged-in owner, without a leading `sudo`. Building
+and signing use the existing login keychain; only the final system-path
+installation requests normal interactive `sudo`.
 
 The installer builds the helper, signs it with
 `com.apple.security.virtualization`, verifies the resulting signature, and
@@ -365,6 +369,11 @@ scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
 # Reboot macOS manually. The disposable login continuation resumes after the
 # next console login, runs verify/forensics/cleanup/rollback, and removes itself.
 ```
+
+The continuation validates its shell/plist before loading, waits for a changed
+host boot identity, and resolves `gh`/`python3` without relying on LaunchAgent
+shell setup. A failed recovery retains the continuation and evidence for retry;
+successful recovery removes its files before unloading its own launchd job.
 
 `audit` refuses a non-ARM host, a virtual host where
 `VZVirtualMachine.isSupported` is false, a missing entitlement, non-APFS clone

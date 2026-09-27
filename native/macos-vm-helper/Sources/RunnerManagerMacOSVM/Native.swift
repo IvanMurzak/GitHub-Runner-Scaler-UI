@@ -34,11 +34,19 @@ func virtualizationIsReady() -> Bool {
 /// Keep this gate in the signed helper so an alternate controller cannot
 /// accidentally turn that unsupported launch context back on.
 func hasLoggedInUserSession() -> Bool {
-    guard geteuid() != 0,
-          let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+    isLoggedInUserSession(
+        CGSessionCopyCurrentDictionary() as? [String: Any],
+        realUID: getuid(), effectiveUID: geteuid()
+    )
+}
+
+func isLoggedInUserSession(_ session: [String: Any]?, realUID: uid_t, effectiveUID: uid_t) -> Bool {
+    guard realUID != 0, effectiveUID == realUID,
+          let session,
           session[kCGSessionOnConsoleKey as String] as? Bool == true,
+          session[kCGSessionLoginDoneKey as String] as? Bool == true,
           let sessionUser = session[kCGSessionUserIDKey as String] as? Int,
-          sessionUser == Int(getuid())
+          sessionUser == Int(realUID)
     else { return false }
     return true
 }

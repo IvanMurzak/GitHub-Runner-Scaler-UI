@@ -1,9 +1,30 @@
 import Darwin
+import CoreGraphics
 import Foundation
 import XCTest
 @testable import RunnerManagerMacOSVM
 
 final class NativeHostTests: XCTestCase {
+    func testUserSessionRequiresCompletedConsoleLoginAndMatchingNonRootIdentity() {
+        let session: [String: Any] = [
+            kCGSessionOnConsoleKey as String: true,
+            kCGSessionLoginDoneKey as String: true,
+            kCGSessionUserIDKey as String: 501,
+        ]
+        XCTAssertTrue(isLoggedInUserSession(session, realUID: 501, effectiveUID: 501))
+        XCTAssertFalse(isLoggedInUserSession(nil, realUID: 501, effectiveUID: 501))
+        XCTAssertFalse(isLoggedInUserSession(session, realUID: 0, effectiveUID: 0))
+        XCTAssertFalse(isLoggedInUserSession(session, realUID: 501, effectiveUID: 0))
+        XCTAssertFalse(isLoggedInUserSession(session, realUID: 502, effectiveUID: 502))
+        for key in [kCGSessionOnConsoleKey, kCGSessionLoginDoneKey] {
+            var incomplete = session
+            incomplete[key as String] = false
+            XCTAssertFalse(isLoggedInUserSession(incomplete, realUID: 501, effectiveUID: 501))
+            incomplete.removeValue(forKey: key as String)
+            XCTAssertFalse(isLoggedInUserSession(incomplete, realUID: 501, effectiveUID: 501))
+        }
+    }
+
     func testAPFSCloneCreatesIndependentWritableFile() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
