@@ -262,7 +262,16 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Verify unprivileged nextest installation contract
+        if: runner.os != 'Windows'
+        run: bash tests/ci-nextest-install-contract.sh
+
+      - name: Install cargo-nextest (Linux, no sudo)
+        if: runner.os == 'Linux'
+        run: bash scripts/install-ci-nextest.sh
+
       - name: Install cargo-nextest
+        if: runner.os != 'Linux'
         uses: taiki-e/install-action@nextest
         # install-action uses ~/.install-action/tmp for downloads. Multiple
         # ephemeral runners on one physical Windows host share the account's
@@ -414,5 +423,3 @@ jobs:
             exit 1
           }
           Write-Output "$root does not exist, as it did not before"
-
-
