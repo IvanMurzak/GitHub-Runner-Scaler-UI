@@ -354,7 +354,7 @@ fn show_policy(
     )
     .map_err(write_failed("this profile status"))?;
     if let Some(selector) = selector {
-        writeln!(out, "Copy runs-on: {selector}\nwarning: automatic scaling needs this static selector; matrix runs-on expressions are not resolved.")
+        writeln!(out, "Copy runs-on: {selector}\nStatic runs-on labels required; selector optional. Overlapping profiles start no runner; matrix expressions are not resolved.")
             .map_err(write_failed("this profile status"))?;
     }
     writeln!(

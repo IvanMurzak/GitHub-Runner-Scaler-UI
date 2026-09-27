@@ -392,20 +392,14 @@ impl RoutingLabels {
     ///
     /// GitHub assigns a job to a runner whose label set is a **superset** of the
     /// job's required labels, so the predicate is subset-in-the-other-direction:
-    /// the job's required labels must all be present here.
+    /// the job's required labels must all be present here. The immutable selector
+    /// is not mandatory. Reconciliation separately refuses overlapping profiles.
     #[must_use]
     pub fn matches(&self, runs_on: &RunsOn) -> RunsOnMatch {
         let required = match runs_on.required_labels() {
             Ok(required) => required,
             Err(unresolvable) => return RunsOnMatch::Unresolvable(unresolvable),
         };
-
-        // A broad optional label must never claim a job for this profile.
-        if !required.contains(&self.host_label) {
-            return RunsOnMatch::NoMatch {
-                missing: vec![self.host_label.clone()],
-            };
-        }
 
         let missing: Vec<Label> = required
             .iter()
@@ -2076,7 +2070,7 @@ mod tests {
             Row {
                 name: "string: an optional label alone",
                 runs_on: RunsOn::Single("gpu".into()),
-                expect: Expect::NoMatch,
+                expect: Expect::Match,
             },
             Row {
                 name: "string: another host's label",
@@ -2197,6 +2191,42 @@ mod tests {
     }
 
     #[test]
+    fn github_job_labels_are_a_case_insensitive_subset_without_a_selector() {
+        let labels = RoutingLabels::from_parts(
+            label("rm-macmini-osx-arm64"),
+            [
+                label("arm64"),
+                label("macos"),
+                label("self-hosted"),
+                label("extra"),
+            ],
+        );
+        assert!(
+            labels
+                .matches(&RunsOn::Many(vec![
+                    "self-hosted".into(),
+                    "macOS".into(),
+                    "ARM64".into(),
+                ]))
+                .is_match()
+        );
+        for missing in ["X64", "Windows", "Linux", "gpu", "rm-other-osx-arm64"] {
+            let result = labels.matches(&RunsOn::Many(vec![
+                "self-hosted".into(),
+                "macOS".into(),
+                "ARM64".into(),
+                missing.into(),
+            ]));
+            assert_eq!(
+                result,
+                RunsOnMatch::NoMatch {
+                    missing: vec![label(missing)]
+                }
+            );
+        }
+    }
+
+    #[test]
     fn self_hosted_is_not_implicit_and_must_be_carried_to_be_matched() {
         // `docs/spikes/d18-org-jit-verification.md`, Point 3, finding 1: "A
         // workflow written as `runs-on: self-hosted` will not match a runner
@@ -2212,8 +2242,7 @@ mod tests {
         let mut with = host_labels("home");
         with.add(label("self-hosted"));
         assert!(
-            !with
-                .matches(&RunsOn::Single("self-hosted".into()))
+            with.matches(&RunsOn::Single("self-hosted".into()))
                 .is_match()
         );
         assert!(
