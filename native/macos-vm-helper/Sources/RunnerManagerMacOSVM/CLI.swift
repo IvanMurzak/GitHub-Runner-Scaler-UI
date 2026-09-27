@@ -27,8 +27,13 @@ struct RunnerManagerMacOSVM {
         else {
             throw HelperFailure.rejected("unsupported protocol version")
         }
-        let store = try Store()
         let command = arguments.removeFirst()
+        // Reject unsupported callers before even touching the store. This also
+        // preserves the actionable login remedy when a daemon cannot access it.
+        if ["prepare", "start", "stop", "destroy"].contains(command) {
+            try requireLoggedInUserSession()
+        }
+        let store = try Store()
         switch command {
         case "probe":
             try expectOnly(arguments, ["--json"])
@@ -201,6 +206,9 @@ struct RunnerManagerMacOSVM {
     }
 
     private static func runInternalSupervisor(_ arguments: [String]) throws -> Never {
+        // The internal entry point is callable directly, not only by `start`.
+        // Do not read a record, stdin/JIT or construct a VM outside the GUI.
+        try requireLoggedInUserSession()
         guard arguments.count == 3 else { throw HelperFailure.rejected("invalid supervisor invocation") }
         let environment = arguments[1]
         let token = arguments[2]

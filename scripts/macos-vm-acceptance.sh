@@ -156,12 +156,22 @@ root_negative_probes() {
     --runner-source /tmp --fresh-writable-disk --no-host-shares --private-jit-channel \
     >"$out/root-prepare.json" 2>"$out/root-prepare.err"
   prepare_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 start \
+    --environment rm-root-negative --jit-stdin </dev/null \
+    >"$out/root-start.json" 2>"$out/root-start.err"
+  local start_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --internal-supervise \
+    rm-root-negative invalid-nonsecret-ownership </dev/null \
+    >"$out/root-supervisor.json" 2>"$out/root-supervisor.err"
+  local supervisor_status=$?
   set -e
   after=$(environment_count)
   [[ $prepare_status -ne 0 ]] || die 'root prepare unexpectedly succeeded'
+  [[ $start_status -ne 0 && $supervisor_status -ne 0 ]] || die 'root VM start or supervisor unexpectedly succeeded'
   [[ $before == "$after" ]] || die 'root negative probe created a helper environment'
-  grep -Eiq 'logged-in user|LaunchAgent|--start-at login' "$out/root-probe.err" "$out/root-prepare.err" ||
-    die 'root negative probe omitted the --start-at login remedy'
+  for rejection in "$out/root-prepare.err" "$out/root-start.err" "$out/root-supervisor.err"; do
+    grep -Fq -- '--start-at login' "$rejection" || die 'root negative probe omitted the --start-at login remedy'
+  done
   python3 - "$out/root-probe.json" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1])); assert r['user_session'] is False, r
