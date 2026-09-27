@@ -820,6 +820,12 @@ for required in 'pull_request:' 'types: [labeled]' 'github.event.pull_request.nu
   grep -F -- "$required" "$workflow" >/dev/null || { echo "missing workflow contract: $required" >&2; exit 1; }
 done
 
+# The optional production smoke job must not enter the disposable VM route.
+grep -F "github.event.label.name == 'rm-d3-production-health'" "$workflow" >/dev/null
+grep -F "github.event.label.name != 'rm-d3-production-health'" "$workflow" >/dev/null
+grep -F 'runs-on: rm-macmini-osx-arm64' "$workflow" >/dev/null
+grep -F 'RM_PRODUCTION_ACCEPTANCE os=macos arch=arm64 uid=501 jit_env=absent' "$workflow" >/dev/null
+
 if grep -F -- '--label self-hosted' "$harness" >/dev/null || \
    grep -F -- 'gh run watch' "$harness" >/dev/null; then
   echo 'harness restored mismatched registration labels or an unbounded run watcher' >&2

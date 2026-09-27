@@ -13,11 +13,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  production-login-service:
+    # A separate, explicit owner trigger proves the existing production host
+    # profile before disposable VM acceptance. Never change production scaling.
+    if: >-
+      github.event.pull_request.number == 79 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.label.name == 'rm-d3-production-health'
+    runs-on: rm-macmini-osx-arm64
+    timeout-minutes: 5
+    steps:
+      - name: Attest the restored production login runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]]
+          [[ $(id -u) == 501 ]]
+          [[ -z ${ACTIONS_RUNNER_INPUT_JITCONFIG:-} ]]
+          echo 'RM_PRODUCTION_ACCEPTANCE os=macos arch=arm64 uid=501 jit_env=absent'
+
   route:
     if: >-
       github.event.pull_request.number == 79 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      startsWith(github.event.label.name, 'rm-d3-')
+      startsWith(github.event.label.name, 'rm-d3-') &&
+      github.event.label.name != 'rm-d3-production-health'
     runs-on: ubuntu-latest
     outputs:
       acceptance_id: ${{ steps.selector.outputs.acceptance_id }}
