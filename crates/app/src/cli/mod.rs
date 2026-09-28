@@ -462,7 +462,7 @@ pub fn write_failed(what: &str) -> impl Fn(io::Error) -> CliError + Copy + '_ {
 #[derive(Debug, Parser)]
 #[command(
     name = "runner-manager",
-    version,
+    version = env!("RUNNER_MANAGER_BUILD_VERSION"),
     about = "Local-first autoscaling manager for ephemeral GitHub Actions self-hosted runners.",
     long_about = None,
     propagate_version = true,

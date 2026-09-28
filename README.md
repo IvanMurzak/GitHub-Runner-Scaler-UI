@@ -127,6 +127,12 @@ tagged:
 cargo build --release -p runner-manager
 ```
 
+An unreleased checkout reports `X.Y.Z+git.<commit>` from `runner-manager --version`
+(`.dirty` is appended when tracked files differ). Release artifacts built by the release
+workflow report the published `X.Y.Z`. This makes a schema-changing integration build
+distinguishable from the last published binary even while `Cargo.toml` still carries the
+same package version.
+
 The binary lands in `target/release/`. Both need the Rust toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml). Put it somewhere permanent before
 `service install` records its absolute path.

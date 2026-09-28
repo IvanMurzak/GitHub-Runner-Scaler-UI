@@ -564,6 +564,10 @@ jobs:
       - name: Step 5 - build the release binary
         env:
           TARGET: ${{ matrix.target }}
+          # Exact release builds keep the published X.Y.Z. Every other source
+          # build reports X.Y.Z+git.<sha>, so an integration binary cannot be
+          # mistaken for an already-published release with an older DB schema.
+          RUNNER_MANAGER_RELEASE_BUILD: "1"
         run: |
           # `--locked` proves the build used the lock file exactly as the `tag`
           # job committed it. Without it a resolver change here would ship a
@@ -662,6 +666,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Runs the packaged Windows executable, not target/ output. This is the last
+  # reversible artifact gate before `publish` creates the GitHub Release.
+  schema-compat:
+    name: verify release database compatibility
+    needs: [validate, tag, build]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tag.outputs.sha }}
+
+      - name: Download the Windows release candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: release-x86_64-pc-windows-msvc
+          path: candidate
+
+      - name: Exercise schema 3 and a fresh database with the candidate
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $archive = Get-ChildItem candidate -Filter '*.zip' -File -Recurse -ErrorAction Stop
+          if ($archive.Count -ne 1) { throw "expected one Windows candidate zip, found $($archive.Count)" }
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath candidate/unpacked
+          $binary = Get-ChildItem candidate/unpacked -Filter 'runner-manager.exe' -File -Recurse -ErrorAction Stop
+          if ($binary.Count -ne 1) { throw "expected one candidate executable, found $($binary.Count)" }
+          $work = Join-Path $env:RUNNER_TEMP "schema-compat-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python .github/scripts/schema_compat.py `
+            --binary $binary.FullName `
+            --source-root . `
+            --work-root $work `
+            --expected-version $env:VERSION
+
   # --------------------------------------------------------------------------
   # Step 6, continued. One SBOM for the release, covering the locked graph,
   # with what actually reaches a binary marked as such.
@@ -749,7 +791,7 @@ jobs:
   # --------------------------------------------------------------------------
   publish:
     name: publish the release (step 7)
-    needs: [validate, tag, build, sbom]
+    needs: [validate, tag, build, sbom, schema-compat]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1361,6 +1403,16 @@ jobs:
           npm install --global --prefix "$smoke_prefix" \
             "${root_package}@${VERSION}" --include=optional --prefer-online
           "$smoke_prefix/bin/runner-manager" --version
+
+          # Installation alone does not open the database. Drive the installed
+          # binary through the same old/fresh DB contract as the staged Windows
+          # artifact, always under RUNNER_TEMP so validation cannot migrate the
+          # runner's or an operator's production configuration.
+          python .github/scripts/schema_compat.py \
+            --binary "$smoke_prefix/bin/runner-manager" \
+            --source-root . \
+            --work-root "$RUNNER_TEMP/npm-schema-compat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --expected-version "$VERSION"
 
           echo "npm channel is installable at ${VERSION}"
 
