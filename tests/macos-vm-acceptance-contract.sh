@@ -13,8 +13,12 @@ test -f "$workflow"
 python3 - "$workflow" <<'PY'
 import os,pathlib,subprocess,sys,tempfile,textwrap
 source=pathlib.Path(sys.argv[1]).read_text()
+production=source.split('\n  production-login-service:\n',1)[1].split('\n  route:\n',1)[0]
 route=source.split('\n  route:\n',1)[1].split('\n  production-provider:\n',1)[0]
-assert 'runs-on: rm-macmini-osx-arm64' in route
+guest=source.split('\n  production-provider:\n',1)[1]
+assert 'runs-on: rm-macmini-osx-arm64' in production
+assert 'runs-on: ubuntu-24.04' in route
+assert 'runs-on: "${{ needs.route.outputs.selector }}"' in guest
 assert 'github.event.pull_request.number == 79' in route
 assert 'github.event.pull_request.head.repo.full_name == github.repository' in route
 script=textwrap.dedent(route.split('        run: |\n',1)[1])
