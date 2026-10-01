@@ -163,12 +163,24 @@ To see what it would do without changing anything:
 runner-manager update --check
 ```
 
-If the agent is installed as a service, you do not need to do anything else.
-`service install` registers a copy of the binary rather than the file a package
-manager owns, so the running daemon notices the new version, finishes every job
-it is holding, swaps its copy and is restarted by the operating system. Until it
-does, `runner-manager service status` still reports the old version. That is the
-hand-over in progress, not a failed update.
+If the service was installed from the binary this command updated, no further
+action is needed. Its daemon notices that source change, stops starting runners,
+waits without a deadline for every job it owns, swaps its private copy, and is
+restarted by the operating system. Until then, `runner-manager service status`
+still reports the old version.
+
+If `service install` recorded a **different** source binary, ordinary `update`
+leaves that service alone and names the separate path. To request the same
+job-safe handover from the currently installed binary regardless of that path,
+run `runner-manager update --force` (or inspect it first with `update --check
+--force`). This retains a recoverable backup beside the old service source and
+replaces only that source; it does not stop the service or cancel a job. The
+command can return while a long job is still running. On macOS, the new binary
+may need a new login-Keychain grant: **do not run `auth login` until `service
+status` reports the new version**. If prompted, run the exact `auth login`
+command printed by `update --force`, which names the new service binary and its
+existing data directory. Authentication replaces the credential, not the
+database, runner profiles or settings.
 
 `update` refuses two things rather than overwriting them: a `cargo build` inside
 a checkout of this repository, and the private copy the service runs. Both name

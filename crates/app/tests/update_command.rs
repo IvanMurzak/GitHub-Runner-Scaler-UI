@@ -447,6 +447,25 @@ fn check_says_when_this_copy_could_not_be_updated() {
     );
 }
 
+#[test]
+fn force_check_does_not_recommend_overwriting_a_checkout_build() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let data = tempfile::tempdir().expect("a temporary directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_runner-manager"))
+        .env_remove("RUNNER_MANAGER_DATA_DIR")
+        .env("RUNNER_MANAGER_UPDATE_BASE_URL", &release.assets)
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(["update", "--check", "--force"])
+        .output()
+        .expect("the binary must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("would refuse here"), "{stdout}");
+    assert!(!stdout.contains("would back up and stage"), "{stdout}");
+}
+
 /// The override that redirects where a replacement executable comes from
 /// accepts only this machine.
 ///
@@ -642,6 +661,74 @@ fn a_service_installed_from_another_binary_is_named_rather_than_assumed() {
         "the report must name the other binary; output was:\n{}",
         outcome.both()
     );
+}
+
+/// A forced dry run must not promise an unbounded drain when its service record
+/// does not belong to a live registration. Neither binary may change.
+#[test]
+fn force_check_refuses_an_unmatched_service_and_preserves_both_files() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let installed = Installed::new();
+    let source = installed.data.join("another").join("runner-manager");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"operator source").unwrap();
+    write_install_record(&installed.data, Some(&source));
+    let before = installed.bytes();
+
+    let outcome = installed.update(&release.assets, &["--check", "--force"]);
+    assert_eq!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stdout.contains("would refuse here"),
+        "{}",
+        outcome.both()
+    );
+    assert!(
+        !outcome.stdout.contains("Install it with:"),
+        "{}",
+        outcome.both()
+    );
+    assert_eq!(installed.bytes(), before);
+    assert_eq!(std::fs::read(source).unwrap(), b"operator source");
+}
+
+/// A forged record in a data-dir cannot borrow the real machine's service
+/// registration to overwrite its own arbitrary source path.
+#[test]
+fn force_refuses_a_record_without_its_matching_live_service() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), RUNNING);
+    let installed = Installed::new();
+    let source = installed.data.join("another").join("runner-manager");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"unrelated source").unwrap();
+    write_install_record(&installed.data, Some(&source));
+
+    let outcome = installed.update(&release.assets, &["--force"]);
+    assert_ne!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert!(
+        outcome.stderr.contains("registration") || outcome.stderr.contains("service"),
+        "output was:\n{}",
+        outcome.both()
+    );
+    assert_eq!(std::fs::read(source).unwrap(), b"unrelated source");
+}
+
+#[test]
+fn force_refuses_before_updating_cli_when_service_cannot_be_drained() {
+    let fixtures = tempfile::tempdir().expect("a temporary directory");
+    let release = build_release(fixtures.path(), &one_release_newer());
+    let installed = Installed::new();
+    let source = installed.data.join("another").join("runner-manager");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"unrelated source").unwrap();
+    write_install_record(&installed.data, Some(&source));
+    let before = installed.bytes();
+
+    let outcome = installed.update(&release.assets, &["--force"]);
+    assert_ne!(outcome.code, 0, "output was:\n{}", outcome.both());
+    assert_eq!(installed.bytes(), before, "CLI must not be half-updated");
+    assert_eq!(std::fs::read(source).unwrap(), b"unrelated source");
 }
 
 /// A host with no service at all gets no paragraph about one.

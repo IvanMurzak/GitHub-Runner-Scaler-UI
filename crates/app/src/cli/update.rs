@@ -60,6 +60,10 @@ use sha2::{Digest, Sha256};
 use super::{CliError, Context, Failure, UpdateArgs, write_failed};
 use runner_manager_platform::service::InstallRecord;
 
+#[path = "update_force.rs"]
+mod force;
+use force::{force_service_handover, preflight_force, report_force_check};
+
 // ---------------------------------------------------------------------------
 // Where the assets come from
 // ---------------------------------------------------------------------------
@@ -622,9 +626,36 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
     let document = runtime.block_on(fetch_text(&source, "SHA256SUMS"))?;
     let published = read_published_archive(&document, target, &source)?;
     writeln!(out, "  published                 {}", published.version).map_err(failed)?;
+    let refusal = installation.refusal();
 
     let ordering = compare_versions(&published.version, running_version());
     if ordering != std::cmp::Ordering::Greater {
+        if ordering == std::cmp::Ordering::Equal && args.force {
+            if let Some(problem) = refusal {
+                if args.check {
+                    writeln!(
+                        out,
+                        "`runner-manager update --force` would refuse here: {problem}"
+                    )
+                    .map_err(failed)?;
+                    return Ok(());
+                }
+                return Err(problem);
+            }
+            if args.check {
+                match preflight_force(context) {
+                    Ok(()) => report_force_check(context, &installation, &published.version, out)?,
+                    Err(problem) => writeln!(
+                        out,
+                        "`runner-manager update --force` would refuse here: {problem}"
+                    )
+                    .map_err(failed)?,
+                }
+            } else {
+                force_service_handover(context, &installation, &published.version, out)?;
+            }
+            return Ok(());
+        }
         writeln!(out).map_err(failed)?;
         let sentence = if ordering == std::cmp::Ordering::Equal {
             format!(
@@ -651,8 +682,6 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
     // copy, where the command it just recommended refuses. A dry run that
     // predicts the wrong outcome is worse than no dry run: it is the one thing
     // an operator uses it to avoid.
-    let refusal = installation.refusal();
-
     if args.check {
         writeln!(out).map_err(failed)?;
         writeln!(
@@ -662,7 +691,27 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
         )
         .map_err(failed)?;
         match &refusal {
-            None => writeln!(out, "Install it with: runner-manager update").map_err(failed)?,
+            None => {
+                if args.force
+                    && let Err(problem) = preflight_force(context)
+                {
+                    writeln!(
+                        out,
+                        "`runner-manager update --force` would refuse here: {problem}"
+                    )
+                    .map_err(failed)?;
+                    return Ok(());
+                }
+                let command = if args.force {
+                    "runner-manager update --force"
+                } else {
+                    "runner-manager update"
+                };
+                writeln!(out, "Install it with: {command}").map_err(failed)?;
+                if args.force {
+                    report_force_check(context, &installation, &published.version, out)?;
+                }
+            }
             Some(problem) => {
                 writeln!(out, "`runner-manager update` would refuse here: {problem}")
                     .map_err(failed)?;
@@ -676,6 +725,12 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
 
     if let Some(problem) = refusal {
         return Err(problem);
+    }
+
+    if args.force {
+        // A newer CLI is useful only if the service can receive the handover.
+        // Detect a stale or unobserved registration before changing that CLI.
+        preflight_force(context)?;
     }
 
     writeln!(out).map_err(failed)?;
@@ -770,7 +825,11 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
         }
     }
 
-    report_service_consequence(context, &installation, &published.version, out)?;
+    if args.force {
+        force_service_handover(context, &installation, &published.version, out)?;
+    } else {
+        report_service_consequence(context, &installation, &published.version, out)?;
+    }
     Ok(())
 }
 

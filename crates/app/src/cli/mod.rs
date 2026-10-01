@@ -869,6 +869,11 @@ pub struct UpdateArgs {
     /// exit would put it in a taxonomy whose every other member is one.
     #[arg(long)]
     pub check: bool,
+
+    /// Reconcile an installed service even when it was installed from another binary.
+    /// Its daemon drains running jobs before replacing its private copy.
+    #[arg(long)]
+    pub force: bool,
 }
 
 // -- f2's surface, declared here so `f2` attaches to a shape that exists ------
