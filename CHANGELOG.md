@@ -9,13 +9,66 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ## 0.4.29
 
+### Features
+
+- Named runner profiles can route different jobs from one repository to native
+  or isolated execution. The CLI and TUI expose profile, capacity, workspace,
+  backend and readiness controls; provider failure never falls back to native.
+- Linux and managed WSL support rootless OCI isolation with pinned images and
+  fail-closed resource limits. Windows has a Hyper-V-isolated backend, still
+  preview-held where its native host acceptance is outstanding. The macOS VM
+  backend is **not** part of this release.
+
 ### Fixes
 
+- Upgrading from 0.4.28 migrates the local database from schema 3 to schema 5,
+  preserving existing runner policies as native default profiles. Older binaries
+  cannot read the upgraded database; keep a recoverable backup before upgrading.
+- Cleaned native attempt history with a legacy process identity is readable
+  without rewriting its journal or relaxing checks on active attempts.
 - Runner profiles accept jobs requiring a case-insensitive subset of their labels,
   including jobs that omit the immutable selector. Extra profile labels are allowed.
   Jobs matching multiple local profiles are visibly refused, including overlaps with
   inactive isolated profiles, rather than scaling twice or falling back to native execution.
 
+## 0.4.28
+
+### Fixes
+
+- A launch's timings now include how long it waited for the host allocation
+  lock while another runner was being launched, and that wait counts toward the
+  one-minute slow-launch warning. A launch that fails now logs
+  `attempt_launch_failed` with the same step timings, including the step it
+  failed in.
+- The macOS package copy in `.runner-package/` is removed from a runner root the
+  host no longer uses, such as after the host root override changes or a
+  persistent repository is removed or moves its workspace.
+- A job runs as the account that owns the runner package cache under `state/`
+  and the macOS copy in `.runner-package/`, so it could replace the runner
+  binaries every later runner on the host was copied from. The daemon now
+  records a fingerprint of each package tree it installs or builds, from every
+  file's inode, size, mode, owner and change time, and uses a tree only while
+  its fingerprint still matches. A cache entry it did not install in this run,
+  or one that has changed, is downloaded again and verified against GitHub's
+  published checksum, so a restarted daemon downloads the runner package once
+  before its first launch. Not on Windows.
+
+## 0.4.27
+
+### Fixes
+
+- A runner took minutes to come online when the runner root was on a different
+  volume from the package cache and that disk was busy: every launch copied the
+  whole runner package (about 9,000 files) byte for byte, while holding the
+  host allocation lock that every other launch waits for. On one macOS host a
+  queued job waited four minutes for that copy. On macOS the daemon now keeps
+  one copy of the package in `.runner-package/` under the runner root and makes
+  each runner an APFS clone of it, so a launch copies no package data after the
+  first. On Linux the copy is a reflink where the filesystem supports one.
+- Launch retries and step timings are logged. A retried package copy, JIT
+  request or process start is a warning, and a launch that takes longer than a
+  minute logs a warning naming how long the package copy, the JIT request and
+  the process start each took.
 ## 0.4.26
 
 ### Fixes
@@ -404,4 +457,3 @@ prints the explicit Linux commands to run if you want to undo that half too.
 Every existing local command, file, service registration and `status --json`
 document is unchanged. `--host local` is the default, so nothing you have
 scripted needs editing.
-

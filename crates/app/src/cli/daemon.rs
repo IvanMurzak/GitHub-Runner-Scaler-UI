@@ -15,8 +15,8 @@ use std::time::Duration;
 use runner_manager_agent::lifecycle::NativeProcesses;
 use runner_manager_agent::lifecycle::{
     CachedRuntimePackages, LifecycleGithub, LifecycleGithubObservation, LifecycleLauncher,
-    LifecyclePorts, NoAttemptEvents, PersistentDemand, PlatformExecutionProvider, RetryPolicy,
-    TokioRetryDelay,
+    LifecyclePorts, PersistentDemand, PlatformExecutionProvider, RetryPolicy, TokioRetryDelay,
+    TracingAttemptEvents,
 };
 use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
@@ -291,7 +291,7 @@ async fn run_generation(
                 clock: Arc::clone(&clock),
                 demand: Arc::new(PersistentDemand),
                 delay: Arc::new(TokioRetryDelay),
-                events: Arc::new(NoAttemptEvents),
+                events: Arc::new(TracingAttemptEvents),
                 reconcile_events: Arc::clone(&events),
             },
         ));
@@ -1695,7 +1695,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use runner_manager_agent::lifecycle::{JitRequestFailure, PruneAuthority, RuntimePackages};
+    use runner_manager_agent::lifecycle::{
+        JitRequestFailure, NoAttemptEvents, PruneAuthority, RuntimePackages,
+    };
     use runner_manager_agent::package::RunnerVersion;
     use runner_manager_domain::attempt::RunnerAttempt;
     use runner_manager_domain::model::PolicyId;
