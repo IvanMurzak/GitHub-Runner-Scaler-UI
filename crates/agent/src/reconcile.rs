@@ -833,6 +833,8 @@ pub struct LaunchRequest<'a> {
     // package pruning. A caller holding an unrelated public AllocationLock can
     // no longer assemble a LaunchRequest and present that guard as authority.
     pub(crate) allocation_guard: &'a AllocationGuard,
+    /// How long this loop waited for that lock, for the launch's timings.
+    pub lock_wait: Duration,
 }
 
 /// Why one runner could not be started.
@@ -1275,8 +1277,6 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
 /// Fixed, credential-free reasons a queued job cannot route to one profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RoutingRefusal {
-    MissingSelector,
-    MultipleSelectors,
     OverlappingProfiles,
 }
 
@@ -1284,8 +1284,6 @@ impl RoutingRefusal {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::MissingSelector => "missing_profile_selector",
-            Self::MultipleSelectors => "multiple_profile_selectors",
             Self::OverlappingProfiles => "overlapping_profile_matches",
         }
     }
@@ -1294,9 +1292,9 @@ impl RoutingRefusal {
 impl fmt::Display for RoutingRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::MissingSelector => "add exactly one profile selector to a static `runs-on`",
-            Self::MultipleSelectors => "remove the extra profile selectors from `runs-on`",
-            Self::OverlappingProfiles => "repair overlapping profile selectors or optional labels",
+            Self::OverlappingProfiles => {
+                "repair overlapping profile labels or require a unique profile selector"
+            }
         })
     }
 }
@@ -2303,6 +2301,7 @@ impl Reconciler {
         let mut budget = intent.to_start;
 
         while budget > 0 {
+            let waiting_since = std::time::Instant::now();
             let guard = match self.lock.acquire().await {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -2316,6 +2315,7 @@ impl Reconciler {
                     break;
                 }
             };
+            let lock_wait = waiting_since.elapsed();
 
             // The read and the decision are both inside the hold, and so is the
             // creation below. Two concurrent passes therefore serialise on the
@@ -2354,6 +2354,7 @@ impl Reconciler {
                     host: &self.host,
                     policy,
                     allocation_guard: &guard,
+                    lock_wait,
                 })
                 .await;
             drop(guard);
@@ -2629,9 +2630,9 @@ fn demand_for(policy: &ScalePolicy, reading: &QueuedDemand) -> DemandTally {
     }
 }
 
-/// Tally one shared target reading while refusing jobs whose selector cannot
-/// identify exactly one profile. The individual label predicate remains the
-/// authority for optional labels and unresolvable expressions.
+/// Tally one shared target reading using GitHub's required-label subset rule.
+/// Refuse ambiguous ownership, including inactive local profiles: disabling an
+/// isolated profile must not redirect its broad-label demand to a native sibling.
 fn route_demand(
     all_policies: &[ScalePolicy],
     profiles: &[&ScalePolicy],
@@ -2648,26 +2649,21 @@ fn route_demand(
     let Some(first) = profiles.first() else {
         return (tallies, refusals);
     };
-    let selectors: BTreeSet<_> = all_policies
+    let owners: Vec<_> = all_policies
         .iter()
-        .filter(|policy| policy.target == first.target)
-        .filter_map(ScalePolicy::routing_labels)
-        .map(|labels| labels.host_label())
+        .filter(|policy| policy.target == first.target && policy.host_id == first.host_id)
+        .filter(|policy| policy.owns_runners())
         .collect();
     let jobs: Vec<&runner_manager_domain::policy::RunsOn> = match &first.target {
         ScaleTarget::Repository(repository) => reading.jobs_for(repository).iter().collect(),
         ScaleTarget::Organization(_) => reading.jobs().collect(),
     };
     for job in jobs {
-        let Ok(required) = job.required_labels() else {
+        let Ok(_) = job.required_labels() else {
             // `demand_for` already preserves this as unresolvable for each profile.
             continue;
         };
-        let selector_count = selectors
-            .iter()
-            .filter(|selector| required.contains(selector))
-            .count();
-        let matched: Vec<PolicyId> = profiles
+        let matched: Vec<PolicyId> = owners
             .iter()
             .filter(|policy| {
                 policy
@@ -2676,18 +2672,15 @@ fn route_demand(
             })
             .map(|policy| policy.id)
             .collect();
-        let refusal = match (selector_count, matched.len()) {
-            (0, _) => Some(RoutingRefusal::MissingSelector),
-            (2.., _) => Some(RoutingRefusal::MultipleSelectors),
-            (_, 2..) => Some(RoutingRefusal::OverlappingProfiles),
-            _ => None,
-        };
-        if let Some(reason) = refusal {
-            *refusals.entry(reason).or_default() += 1;
+        if matched.len() > 1 {
+            *refusals
+                .entry(RoutingRefusal::OverlappingProfiles)
+                .or_default() += 1;
             for id in matched {
-                let tally = tallies.get_mut(&id).expect("matched profile was tallied");
-                tally.matched -= 1;
-                tally.not_matched += 1;
+                if let Some(tally) = tallies.get_mut(&id) {
+                    tally.matched -= 1;
+                    tally.not_matched += 1;
+                }
             }
         }
     }
@@ -4702,6 +4695,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subset_labels_without_selector_scale_only_the_compatible_local_profile() {
+        use runner_manager_domain::model::{Arch, HostLabel, Os};
+        use runner_manager_domain::policy::RoutingLabels;
+        let mut harness = Harness::build(
+            fixtures::host()
+                .os(Os::MacOs)
+                .architecture(Arch::Arm64)
+                .capacity(10)
+                .build(),
+            Arc::new(FakeLauncher::new()),
+            Arc::new(FakeDemand::ready(0, &repo("o/r"))),
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [
+                fixtures::queued_job(&["self-hosted", "macOS", "ARM64"]),
+                fixtures::queued_job(&["SELF-HOSTED", "MACOS", "arm64"]),
+                fixtures::queued_job(&["self-hosted", "macOS", "X64"]),
+                fixtures::queued_job(&["self-hosted", "Windows", "ARM64"]),
+                fixtures::queued_job(&["self-hosted", "macOS", "ARM64", "gpu"]),
+                fixtures::queued_job(&["rm-other-osx-arm64", "macOS", "ARM64"]),
+            ],
+        )));
+        let mut local = fixtures::policy()
+            .id(PolicyId::from_u128(1))
+            .repository("o/r")
+            .autoscale("macmini", 10)
+            .routing_labels(RoutingLabels::derive(
+                &HostLabel::new("macmini").unwrap(),
+                Os::MacOs,
+                Arch::Arm64,
+            ))
+            .active()
+            .build();
+        for label in ["self-hosted", "macos", "arm64", "extra"] {
+            local.add_routing_label(fixtures::label(label)).unwrap();
+        }
+        let mut foreign = local.to_persisted();
+        foreign.id = PolicyId::from_u128(2);
+        foreign.host_id = HostId::from_u128(0xdead);
+        let foreign = ScalePolicy::from_persisted(foreign).unwrap();
+        let report = harness.reconciler.reconcile(&[local, foreign]).await;
+        assert_eq!(report.started, 2);
+        assert_eq!(report.targets_read, 1);
+        assert!(harness.events.events().iter().any(|event| matches!(
+            event,
+            LifecycleEvent::DemandObserved {
+                demand: 2,
+                not_matched: 4,
+                ..
+            }
+        )));
+        assert!(
+            !harness
+                .events
+                .events()
+                .iter()
+                .any(|event| matches!(event, LifecycleEvent::RoutingRefused { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_overlap_never_falls_back_to_native_in_either_state_or_order() {
+        use runner_manager_domain::execution::{
+            Backend, ExecutionPolicy, ImageReference, ResourceLimits,
+        };
+        let mut native = policy(1, "o/r", 2);
+        native
+            .add_routing_label(fixtures::label("self-hosted"))
+            .unwrap();
+        let mut isolated = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        isolated
+            .add_routing_label(fixtures::label("self-hosted"))
+            .unwrap();
+        isolated
+            .set_execution_policy(ExecutionPolicy::Isolated {
+                backend: Backend::Oci,
+                image: ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .unwrap(),
+                resources: ResourceLimits {
+                    cpu_millis: 1000,
+                    memory_mib: 512,
+                    disk_mib: 1024,
+                },
+            })
+            .unwrap();
+        assert!(!isolated.may_start_runners());
+        let mut active_isolated = isolated.clone();
+        active_isolated.activate().unwrap();
+        for profiles in [
+            [native.clone(), isolated.clone()],
+            [isolated.clone(), native.clone()],
+            [native.clone(), active_isolated.clone()],
+            [active_isolated, native.clone()],
+        ] {
+            let mut harness = Harness::simple(4, 0, "o/r");
+            harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+                repo("o/r"),
+                [fixtures::queued_job(&["SELF-HOSTED"])],
+            )));
+            let report = harness.reconciler.reconcile(&profiles).await;
+            assert_eq!(report.started, 0);
+            assert!(harness.events.events().iter().any(|event| matches!(
+                event,
+                LifecycleEvent::RoutingRefused {
+                    reason: RoutingRefusal::OverlappingProfiles,
+                    count: 1,
+                    ..
+                }
+            )));
+        }
+        // A job explicitly requiring the unavailable isolated selector cannot
+        // be served by the native sibling either.
+        let mut harness = Harness::simple(4, 0, "o/r");
+        harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [fixtures::queued_job(&["rm-home-win-x64-py-isolated"])],
+        )));
+        assert_eq!(
+            harness
+                .reconciler
+                .reconcile(&[native, isolated])
+                .await
+                .started,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn shared_optional_labels_do_not_duplicate_native_and_isolated_demand() {
         let mut harness = Harness::simple(2, 0, "o/r");
         harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
@@ -4733,7 +4859,7 @@ mod tests {
         assert!(harness.events.events().iter().any(|event| matches!(
             event,
             LifecycleEvent::RoutingRefused {
-                reason: RoutingRefusal::MissingSelector,
+                reason: RoutingRefusal::OverlappingProfiles,
                 count: 1,
                 ..
             }
@@ -4757,7 +4883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_and_overlapping_selectors_start_no_runner_and_show_remedies() {
+    async fn missing_required_selector_labels_do_not_match_and_overlaps_show_remedies() {
         let mut harness = Harness::simple(4, 0, "o/r");
         harness.demand.set(PollOutcome::Ready(QueuedDemand::of(
             repo("o/r"),
@@ -4773,14 +4899,60 @@ mod tests {
             .reconcile(&[policy(1, "o/r", 2), isolated])
             .await;
         assert_eq!(report.started, 0);
-        assert!(harness.events.events().iter().any(|event| matches!(
-            event,
-            LifecycleEvent::RoutingRefused {
-                reason: RoutingRefusal::MultipleSelectors,
-                count: 1,
-                ..
-            }
+        assert_eq!(
+            harness
+                .events
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    LifecycleEvent::DemandObserved {
+                        demand: 0,
+                        not_matched: 1,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+
+        // Domain constructors permit extra selector-shaped labels. Routing
+        // depends on all required labels and unique ownership, not their shape.
+        // The store separately rejects sibling selector reuse on write/load.
+        let mut superset = policy(1, "o/r", 2);
+        assert!(
+            superset
+                .add_routing_label(fixtures::label("rm-home-win-x64-py-isolated"))
+                .unwrap()
+        );
+        let mut sibling = fixtures::named_policy("py-isolated", PolicyId::from_u128(2));
+        sibling.activate().unwrap();
+        let mut unique = Harness::simple(4, 0, "o/r");
+        unique.demand.set(PollOutcome::Ready(QueuedDemand::of(
+            repo("o/r"),
+            [fixtures::queued_job(&[
+                HOST_LABEL,
+                "rm-home-win-x64-py-isolated",
+            ])],
         )));
+        let report = unique.reconciler.reconcile(&[superset, sibling]).await;
+        assert_eq!(report.started, 1);
+        assert_eq!(
+            report
+                .allocations
+                .iter()
+                .find(|allocation| allocation.to_start == 1)
+                .unwrap()
+                .policy_id,
+            PolicyId::from_u128(1)
+        );
+        assert!(
+            !unique
+                .events
+                .events()
+                .iter()
+                .any(|event| matches!(event, LifecycleEvent::RoutingRefused { .. }))
+        );
 
         let mut overlap = Harness::simple(4, 1, "o/r");
         let report = overlap

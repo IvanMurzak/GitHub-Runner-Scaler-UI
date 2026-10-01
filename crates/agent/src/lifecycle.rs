@@ -29,7 +29,7 @@ use runner_manager_domain::attempt::{
 use runner_manager_domain::execution::{AttemptExecution, Backend, ImageReference};
 use runner_manager_domain::model::{AttemptId, Clock, HostId, PolicyId, ScaleTarget};
 use runner_manager_domain::path::LocalAbsolutePath;
-use runner_manager_domain::policy::ScalePolicy;
+use runner_manager_domain::policy::{RoutingLabels, ScalePolicy};
 use runner_manager_domain::store::{Store, StoreError};
 use runner_manager_domain::workspace::{AttemptWorkspace, WorkspacePolicy};
 use runner_manager_github::jit::{
@@ -153,6 +153,14 @@ pub enum AttemptEvent {
         operation: &'static str,
         delay: Duration,
     },
+    /// How long each step of a launch took, whether or not it started a
+    /// runner, so a slow or failed start can be attributed to the wait for the
+    /// allocation lock, the package copy, the JIT request, or the process start.
+    Launched {
+        attempt: AttemptId,
+        started: bool,
+        timings: LaunchTimings,
+    },
     Adopted {
         attempt: AttemptId,
     },
@@ -216,6 +224,130 @@ pub struct NoAttemptEvents;
 
 impl AttemptEventSink for NoAttemptEvents {
     fn emit(&self, _event: AttemptEvent) {}
+}
+
+/// Where one launch spent its time. A step the launch never reached is zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchTimings {
+    /// Waiting for the host allocation lock, which another launch may hold.
+    pub lock_wait: Duration,
+    pub materialize: Duration,
+    pub register: Duration,
+    pub spawn: Duration,
+}
+
+impl LaunchTimings {
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.lock_wait + self.materialize + self.register + self.spawn
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaunchStep {
+    Materialize,
+    Register,
+    Spawn,
+}
+
+/// Times a launch's steps; beginning one ends the one before, so an early
+/// return still leaves the step it failed in measured once [`Self::finish`]
+/// runs.
+#[derive(Debug)]
+struct LaunchStopwatch {
+    timings: LaunchTimings,
+    running: Option<(LaunchStep, std::time::Instant)>,
+}
+
+impl LaunchStopwatch {
+    fn new(lock_wait: Duration) -> Self {
+        Self {
+            timings: LaunchTimings {
+                lock_wait,
+                ..LaunchTimings::default()
+            },
+            running: None,
+        }
+    }
+
+    fn begin(&mut self, step: LaunchStep) {
+        self.finish();
+        self.running = Some((step, std::time::Instant::now()));
+    }
+
+    fn finish(&mut self) {
+        if let Some((step, since)) = self.running.take() {
+            let slot = match step {
+                LaunchStep::Materialize => &mut self.timings.materialize,
+                LaunchStep::Register => &mut self.timings.register,
+                LaunchStep::Spawn => &mut self.timings.spawn,
+            };
+            *slot = since.elapsed();
+        }
+    }
+}
+
+/// A launch slower than this is logged as a warning, with its steps.
+///
+/// A healthy launch is a few seconds; a queued job waits for all of it, and
+/// the daemon's default filter drops the `info` line that times every launch.
+const SLOW_LAUNCH: Duration = Duration::from_secs(60);
+
+/// The daemon's sink for retries and launch timings; the other attempt events
+/// already reach the log through the reconcile sink.
+///
+/// Every field name is on `d1`'s allow-list, or the redacting layer would log
+/// `[redacted]` in its place; `tests::every_field_name_the_attempt_sink_emits_is_allowed`
+/// keeps that true.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TracingAttemptEvents;
+
+impl AttemptEventSink for TracingAttemptEvents {
+    fn emit(&self, event: AttemptEvent) {
+        match event {
+            AttemptEvent::Retry {
+                attempt,
+                operation,
+                delay,
+            } => tracing::warn!(
+                event = "attempt_retry",
+                attempt_id = %attempt,
+                reason = operation,
+                retry_in_ms = millis(delay),
+            ),
+            AttemptEvent::Launched {
+                attempt,
+                started,
+                timings,
+            } => {
+                macro_rules! launched {
+                    ($level:ident, $name:literal) => {
+                        tracing::$level!(
+                            event = $name,
+                            attempt_id = %attempt,
+                            duration_ms = millis(timings.total()),
+                            lock_wait_ms = millis(timings.lock_wait),
+                            materialize_ms = millis(timings.materialize),
+                            register_ms = millis(timings.register),
+                            spawn_ms = millis(timings.spawn),
+                        )
+                    };
+                }
+                if !started {
+                    launched!(warn, "attempt_launch_failed");
+                } else if timings.total() >= SLOW_LAUNCH {
+                    launched!(warn, "attempt_launch_slow");
+                } else {
+                    launched!(info, "attempt_launched");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether the demand that justified a retry still exists.
@@ -412,25 +544,81 @@ impl<'a> PruneAuthority<'a> {
 #[derive(Debug)]
 pub struct CachedRuntimePackages {
     cache: Arc<PackageCache>,
+    trusted: Arc<TrustedTrees>,
 }
 
 impl CachedRuntimePackages {
+    /// Run `work` against a package tree on the blocking pool: a fingerprint
+    /// walks ~9,000 entries and a copy can take minutes.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        root: &Path,
+        work: impl FnOnce(&TrustedTrees, &Path) -> T + Send + 'static,
+    ) -> Result<T, FailureReason> {
+        let trusted = Arc::clone(&self.trusted);
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || work(&trusted, &root))
+            .await
+            .map_err(|_| FailureReason::ProcessStartFailed)
+    }
+
     #[must_use]
     pub fn new(cache: Arc<PackageCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            trusted: Arc::default(),
+        }
     }
 }
 
 #[async_trait]
 impl RuntimePackages for CachedRuntimePackages {
     async fn materialize(&self, attempt: &RunnerAttempt) -> Result<RunnerVersion, FailureReason> {
-        let installed = self
+        let (mut installed, downloaded) = self
             .cache
-            .ensure_installed()
+            .ensure_installed_reporting()
             .await
             .map_err(package_failure)?;
-        copy_package_tree(installed.root(), attempt.runtime_path())
-            .map_err(|_| FailureReason::ProcessStartFailed)?;
+        // A cache entry this process did not install, or one that has changed
+        // since, may hold a job's edits; replace it with one downloaded and
+        // verified now. One this call just downloaded is trusted as it lands.
+        // See `TrustedTrees`.
+        let fresh = if downloaded {
+            true
+        } else if self.blocking(installed.root(), TrustedTrees::holds).await? {
+            false
+        } else {
+            installed = self.cache.reinstall().await.map_err(package_failure)?;
+            true
+        };
+        if fresh {
+            self.blocking(installed.root(), TrustedTrees::record)
+                .await?
+                .map_err(|_| FailureReason::ProcessStartFailed)?;
+        }
+        // Off the async thread: the daemon runs a current-thread runtime, and a
+        // copy (or a seed rebuild) can take minutes on a busy disk.
+        let destination = attempt.runtime_path().to_path_buf();
+        let copied = self
+            .blocking(installed.root(), move |trusted, source| {
+                copy_package_tree(source, &destination, trusted)?;
+                // Checked again after the copy: an edit a job made while it ran
+                // moved the entry's print, and the runtime may hold it.
+                if trusted.holds(source) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        "the runner package changed while copied",
+                    ))
+                }
+            })
+            .await?;
+        if copied.is_err() {
+            // Nothing a failed or tainted copy left may reach a retry's copy,
+            // which lays out over the same runtime.
+            let _ = remove_materialized_package(attempt);
+            return Err(FailureReason::ProcessStartFailed);
+        }
         if let Err(error) = self.cache.lease(attempt, installed.version()) {
             // Undoing the copy must not undo the *job* workspace: a persistent
             // slot's `_work` is retained across attempts, and this rollback
@@ -1165,7 +1353,46 @@ fn replacement_operation(outcome: &AttemptOutcome) -> Option<&'static str> {
 ///   job workspace of the attempt before it. The refusal is top-level only,
 ///   because the retained directory is a direct child of the slot; a `_work`
 ///   nested inside the package's own tree is an ordinary name.
-fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+///
+/// On Unix the copy is a copy-on-write clone where the filesystem offers one,
+/// taken from a [`package_seed`] on the destination's own volume. A plain
+/// byte copy of the ~9,000-file package across volumes took four minutes on a
+/// host whose runner root shared a busy disk with a build, and a queued job
+/// waits for every second of it.
+fn copy_package_tree(
+    source: &Path,
+    destination: &Path,
+    seeds: &TrustedTrees,
+) -> std::io::Result<()> {
+    refuse_work_folder(source)?;
+
+    #[cfg(unix)]
+    {
+        // A seed that cannot be made is a slower launch, not a failed one.
+        // The seed sits under the runner root, beside job runtimes, so the
+        // refusal is re-checked on it; a seed that fails it is bypassed.
+        let origin = package_seed(source, destination, seeds)
+            .ok()
+            .filter(|seed| refuse_work_folder(seed).is_ok())
+            .unwrap_or_else(|| source.to_path_buf());
+        clone_tree(&origin, destination)?;
+        // A seed a job edited during the clone no longer holds; the caller
+        // re-checks the cache entry itself.
+        if origin != source && !seeds.holds(&origin) {
+            return Err(std::io::Error::other(
+                "the package seed changed while cloned",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = seeds;
+        copy_package_entries(source, destination, true)
+    }
+}
+
+fn refuse_work_folder(source: &Path) -> std::io::Result<()> {
     if source.join(DEFAULT_WORK_FOLDER).exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1174,22 +1401,214 @@ fn copy_package_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
              extracts to prevent data leakage",
         ));
     }
+    Ok(())
+}
 
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("cp")
-            .arg("-a")
-            .arg(format!("{}/.", source.display()))
-            .arg(destination)
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("cp failed"))
+/// Where runtime copies of the package are cloned from, beside the runtimes.
+#[cfg(unix)]
+const PACKAGE_SEED_DIR: &str = ".runner-package";
+
+/// A copy of the cache entry on the destination's volume, so that every
+/// runtime after the first is a same-volume clone rather than a cross-volume
+/// byte copy. Returns `source` itself when it already shares the volume.
+///
+/// The seed lives at `<runner root>/.runner-package/<version>` and is replaced
+/// whenever its manifest stops matching the cache entry's, which covers both a
+/// new version and a reinstalled one. Superseded versions and interrupted
+/// stagings are removed on that same pass. Launches hold the host allocation
+/// lock for the whole materialization, so no other launch is cloning from a
+/// seed while it is replaced.
+///
+/// The seed sits one `..` from every job's runtime and is owned by the account
+/// jobs run as, so it is only reused while it is provably the tree this
+/// process built: see [`TrustedTrees`].
+///
+/// Only on macOS, where the runner root is all but certainly APFS and a clone
+/// is free. On a Linux filesystem without reflinks a seed would only move every
+/// copy's reads onto the runner root's own, possibly busy, disk.
+#[cfg(unix)]
+fn package_seed(
+    source: &Path,
+    destination: &Path,
+    seeds: &TrustedTrees,
+) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !cfg!(target_os = "macos") {
+        return Ok(source.to_path_buf());
+    }
+    let root = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a runtime directory has no parent"))?;
+    if fs::metadata(source)?.dev() == fs::metadata(root)?.dev() {
+        return Ok(source.to_path_buf());
+    }
+    refresh_package_seed(source, &root.join(PACKAGE_SEED_DIR), seeds)
+}
+
+/// The package trees this process built or installed, and what each looked
+/// like right after: the cache entry runtimes are copied from and the seeds
+/// they are cloned from.
+///
+/// Both are owned by the account jobs run as, so a job can edit any file in
+/// them, and nothing on disk can say what they should hold: the published
+/// digest covers the archive, not the extracted tree, and a record kept on disk
+/// could be rewritten by the same account. So a tree is trusted only while its
+/// [`tree_fingerprint`] matches the one recorded here. Every edit, replacement
+/// or rename moves the change time (`ctime`) of the entry or of its directory,
+/// and only the superuser can set a change time. A tree without a record, as
+/// every tree has after a restart, is rebuilt before it is used.
+///
+/// Unix only. On Windows every tree is trusted, as before.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedTrees {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    prints: Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
+}
+
+impl TrustedTrees {
+    /// Whether `root` is a tree recorded here and still looks as it did.
+    fn holds(&self, root: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let recorded = self
+                .prints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(root)
+                .copied();
+            recorded.is_some_and(|recorded| {
+                tree_fingerprint(root).is_ok_and(|current| current == recorded)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            true
         }
     }
-    #[cfg(not(unix))]
-    copy_package_entries(source, destination, true)
+
+    /// Trust `root` as it is now; called right after this process made it.
+    fn record(&self, root: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let print = tree_fingerprint(root)?;
+            self.prints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(root.to_path_buf(), print);
+        }
+        #[cfg(not(unix))]
+        let _ = root;
+        Ok(())
+    }
+}
+
+/// A digest of every entry under `root`: its relative path, inode, size, mode,
+/// owner and change time.
+#[cfg(unix)]
+fn tree_fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    fn walk(root: &Path, path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        for field in [
+            metadata.ino(),
+            metadata.size(),
+            u64::from(metadata.mode()),
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+        ] {
+            hasher.update(field.to_le_bytes());
+        }
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+        if metadata.is_dir() {
+            let mut children = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            children.sort();
+            for child in children {
+                walk(root, &child, hasher)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    walk(root, root, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+/// The seed of `source` under `seeds`, rebuilt unless its manifest matches the
+/// cache entry's and its fingerprint the one this process recorded.
+#[cfg(unix)]
+fn refresh_package_seed(
+    source: &Path,
+    seeds: &Path,
+    trusted: &TrustedTrees,
+) -> std::io::Result<PathBuf> {
+    use crate::package::MANIFEST_FILE;
+
+    let version = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("a cache entry has no name"))?;
+    let seed = seeds.join(version);
+    let manifest = fs::read(source.join(MANIFEST_FILE))?;
+    if fs::read(seed.join(MANIFEST_FILE)).is_ok_and(|held| held == manifest) && trusted.holds(&seed)
+    {
+        return Ok(seed);
+    }
+
+    // Superseded versions, a stale seed and interrupted stagings all go.
+    match remove_runtime_tree(seeds) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::create_dir_all(seeds)?;
+    let staging = seeds.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+    // A half-made staging would hold the disk space the fallback copy needs.
+    if let Err(error) = clone_tree(source, &staging).and_then(|()| fs::rename(&staging, &seed)) {
+        let _ = remove_runtime_tree(&staging);
+        return Err(error);
+    }
+    // After the rename, which itself moves the seed directory's change time.
+    trusted.record(&seed)?;
+    Ok(seed)
+}
+
+/// `cp -a`, asking for a copy-on-write clone where the platform's `cp` can.
+///
+/// macOS `cp -c` and GNU `--reflink=auto` both fall back to a byte copy across
+/// volumes; a `cp` that does not know the flag at all gets a plain `cp -a`.
+#[cfg(unix)]
+fn clone_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    const CLONE: &[&str] = &["-c"];
+    #[cfg(target_os = "linux")]
+    const CLONE: &[&str] = &["--reflink=auto"];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const CLONE: &[&str] = &[];
+
+    let from = format!("{}/.", source.display());
+    let cp = |extra: &[&str]| {
+        std::process::Command::new("cp")
+            .arg("-a")
+            .args(extra)
+            .arg(&from)
+            .arg(destination)
+            .status()
+    };
+    if cp(CLONE)?.success() || cp(&[])?.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("cp failed"))
+    }
 }
 
 #[cfg(not(unix))]
@@ -3431,6 +3850,15 @@ impl LifecycleLauncher {
         Ok(host.runner_root_override.clone())
     }
 
+    /// `Host.runner_root_override`, or the platform default when that resolves;
+    /// `None` when neither does. Unlike [`Self::effective_host_root`] it records
+    /// no refusal, for callers to whom an unresolvable root is not a failure.
+    fn resolvable_host_root(&self) -> Result<Option<LocalAbsolutePath>, LifecycleError> {
+        Ok(self
+            .configured_host_root()?
+            .or_else(|| default_runner_root(&self.app_paths).ok()))
+    }
+
     /// `Host.runner_root_override`, or the platform default standing in for it.
     ///
     /// Takes the policy because an unresolvable default is a refusal like any
@@ -3574,9 +4002,7 @@ impl LifecycleLauncher {
         // failure and propagates, because silently continuing would drop the
         // overlap check entirely and accept a repository root that sits inside
         // the host root — the pair `RootPreflight` exists to refuse.
-        let host_root = self
-            .configured_host_root()?
-            .or_else(|| default_runner_root(&self.app_paths).ok());
+        let host_root = self.resolvable_host_root()?;
         let mut preflight = RootPreflight::new(&self.app_paths);
         if let Some(host_root) = host_root {
             preflight = preflight.against(RootOwner::Host, host_root);
@@ -3639,7 +4065,29 @@ impl LifecycleLauncher {
         &self,
         policy: &ScalePolicy,
         allocation_guard: &AllocationGuard,
+        lock_wait: Duration,
     ) -> Result<RunnerAttempt, LifecycleError> {
+        let (attempt, labels) = self.allocate_attempt(policy)?;
+        let id = attempt.id;
+        let mut stopwatch = LaunchStopwatch::new(lock_wait);
+        let result = self
+            .launch_steps(policy, allocation_guard, attempt, labels, &mut stopwatch)
+            .await;
+        stopwatch.finish();
+        self.ports.events.emit(AttemptEvent::Launched {
+            attempt: id,
+            started: result.is_ok(),
+            timings: stopwatch.timings,
+        });
+        result
+    }
+
+    /// Place and journal a new attempt: everything before its first external
+    /// effect, and so before there is anything to time.
+    fn allocate_attempt<'p>(
+        &self,
+        policy: &'p ScalePolicy,
+    ) -> Result<(RunnerAttempt, &'p RoutingLabels), LifecycleError> {
         if !*self
             .recovery_complete
             .lock()
@@ -3709,7 +4157,20 @@ impl LifecycleLauncher {
         // before any package or GitHub effect
         // (`02-target-architecture.md`, "Slot allocation", step 7).
         self.record_allocation(&attempt)?;
+        Ok((attempt, labels))
+    }
 
+    async fn launch_steps(
+        &self,
+        policy: &ScalePolicy,
+        allocation_guard: &AllocationGuard,
+        mut attempt: RunnerAttempt,
+        labels: &RoutingLabels,
+        stopwatch: &mut LaunchStopwatch,
+    ) -> Result<RunnerAttempt, LifecycleError> {
+        let id = attempt.id;
+        let isolated = !attempt.execution().is_native();
+        stopwatch.begin(LaunchStep::Materialize);
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
             Err(reason) => return self.fail_launch(&mut attempt, reason),
@@ -3720,7 +4181,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
 
-        if resolved.is_some() {
+        if isolated {
             attempt
                 .begin_prepare(self.ports.clock.now())
                 .map_err(|_| LifecycleError::Transition)?;
@@ -3729,7 +4190,7 @@ impl LifecycleLauncher {
         let prepared = match self.ports.processes.prepare(&attempt, policy) {
             Ok(prepared) => prepared,
             Err(reason) => {
-                let safe_reason = if resolved.is_some() {
+                let safe_reason = if isolated {
                     safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
                 } else {
                     reason
@@ -3737,7 +4198,7 @@ impl LifecycleLauncher {
                 return self.fail_launch(&mut attempt, safe_reason);
             }
         };
-        if resolved.is_some() {
+        if isolated {
             let Some(identity) = prepared.identity() else {
                 return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
                     IsolationProviderFailure::OwnershipMismatch,
@@ -3760,12 +4221,14 @@ impl LifecycleLauncher {
             self.record(&attempt)?;
         }
 
+        stopwatch.begin(LaunchStep::Register);
         let jit_request =
             JitRunnerRequest::for_policy(runner_name(id), self.runner_group_id, labels);
         let registration = match self.register_with_retry(policy, id, &jit_request).await {
             Ok(registration) => registration,
             Err(error) => return self.fail_launch(&mut attempt, error.reason()),
         };
+        stopwatch.begin(LaunchStep::Spawn);
         let runner_id = registration.runner().id;
         write_runner_id(attempt.runtime_path(), runner_id)?;
         attempt
@@ -3773,7 +4236,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
         let config = registration.into_config();
-        if resolved.is_some() {
+        if isolated {
             let started = self
                 .ports
                 .processes
@@ -3874,8 +4337,55 @@ impl LifecycleLauncher {
                 version,
                 &attempts,
             )
-            .map_err(LifecycleError::Failed)
+            .map_err(LifecycleError::Failed)?;
+        #[cfg(target_os = "macos")]
+        self.prune_abandoned_seeds(&attempts);
+        Ok(())
     }
+
+    /// Remove the package seed from every runner root this host once placed a
+    /// runtime in and no longer does: a changed host root override, a removed
+    /// persistent policy, or one that moved its workspace.
+    ///
+    /// The roots ever used are the parents of the journal's runtime paths; the
+    /// roots in use are the effective host root and every persistent policy's
+    /// root. When the effective host root cannot be resolved nothing is
+    /// removed, because a seed still in use cannot then be told apart. Runs
+    /// under the allocation lock, so no launch is cloning from a seed it
+    /// removes, and it is best-effort: a seed left behind costs disk, never a
+    /// launch.
+    #[cfg(target_os = "macos")]
+    fn prune_abandoned_seeds(&self, attempts: &[RunnerAttempt]) {
+        let Ok(policies) = self.ports.store.policies() else {
+            return;
+        };
+        let Ok(Some(host_root)) = self.resolvable_host_root() else {
+            return;
+        };
+        let in_use: BTreeSet<PathBuf> = policies
+            .iter()
+            .filter_map(|policy| match policy.workspace_policy() {
+                WorkspacePolicy::Persistent { root } => Some(canonical_or_raw(root.as_path())),
+                WorkspacePolicy::Ephemeral => None,
+            })
+            .chain(std::iter::once(canonical_or_raw(host_root.as_path())))
+            .collect();
+        // Distinct parents first: the journal keeps every attempt ever made.
+        let used: BTreeSet<&Path> = attempts
+            .iter()
+            .filter_map(|attempt| attempt.runtime_path().parent())
+            .collect();
+        for root in used.into_iter().map(canonical_or_raw) {
+            if !in_use.contains(&root) {
+                let _ = remove_runtime_tree(&root.join(PACKAGE_SEED_DIR));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_or_raw(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[async_trait]
@@ -3898,7 +4408,7 @@ impl RunnerLauncher for LifecycleLauncher {
     }
 
     async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
-        self.launch_attempt(request.policy, request.allocation_guard)
+        self.launch_attempt(request.policy, request.allocation_guard, request.lock_wait)
             .await
             .map_err(|error| LaunchFailure::new(error.reason()))
     }
@@ -4986,12 +5496,20 @@ mod tests {
         }
 
         async fn launch_result(&self) -> Result<RunnerAttempt, LaunchFailure> {
+            self.launch_after_waiting(Duration::ZERO).await
+        }
+
+        async fn launch_after_waiting(
+            &self,
+            lock_wait: Duration,
+        ) -> Result<RunnerAttempt, LaunchFailure> {
             let guard = self.allocation_lock.acquire().await.unwrap();
             self.launcher
                 .launch(LaunchRequest {
                     host: &self.host,
                     policy: &self.policy,
                     allocation_guard: &guard,
+                    lock_wait,
                 })
                 .await
         }
@@ -5163,6 +5681,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("isolated launch");
@@ -5257,6 +5776,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .unwrap();
@@ -5299,6 +5819,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect_err("prepare failed after creating resource");
@@ -5421,6 +5942,7 @@ mod tests {
                     host: &harness.host,
                     policy: &harness.policy,
                     allocation_guard: &guard,
+                    lock_wait: Duration::ZERO,
                 })
                 .await
                 .expect_err("pre-JIT refusal");
@@ -5456,6 +5978,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect_err("unsupported host must be refused before JIT");
@@ -5538,6 +6061,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("launch");
@@ -6048,6 +6572,82 @@ mod tests {
 
         clear_runner_root_refusal(&harness.app_paths, &harness.policy.id.to_string())
             .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_launch_reports_how_long_each_step_took() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        let events = harness.events.events();
+        let launched = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::Launched { attempt, .. } if *attempt == started.id))
+            .expect("a successful launch reports its step timings");
+        let starting = events
+            .iter()
+            .position(|event| matches!(event, AttemptEvent::State { attempt, state: AttemptState::Starting } if *attempt == started.id))
+            .unwrap();
+        assert!(starting < launched, "timings follow the start: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_still_reports_its_step_timings() {
+        let harness = Harness::new(
+            FakeGithubLifecycle::default().fail(true),
+            Arc::new(PersistentDemand),
+        );
+        harness.ready().await;
+        let failed = harness.launch_after_waiting(Duration::from_secs(90)).await;
+        assert!(failed.is_err());
+
+        let timings = harness
+            .events
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                AttemptEvent::Launched {
+                    started: false,
+                    timings,
+                    ..
+                } => Some(timings),
+                _ => None,
+            })
+            .expect("a launch that failed at registration reports its timings");
+        assert_eq!(timings.lock_wait, Duration::from_secs(90));
+        assert_eq!(timings.spawn, Duration::ZERO, "spawn was never reached");
+        assert!(timings.total() >= Duration::from_secs(90));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_launch_removes_the_seed_of_a_root_no_longer_in_use() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+
+        // A runtime this host once placed under a root it no longer uses.
+        let old_root = harness._root.path().join("old-root");
+        let old_runtime = old_root.join("abandoned");
+        fs::create_dir_all(old_root.join(PACKAGE_SEED_DIR).join("2.335.0")).unwrap();
+        fs::create_dir_all(&old_runtime).unwrap();
+        let old = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            harness.policy.id,
+            &old_runtime,
+            harness.clock.now(),
+        );
+        harness.store.record_attempt(&old).unwrap();
+        let kept = harness.host_root().join(PACKAGE_SEED_DIR);
+        fs::create_dir_all(kept.join("2.336.0")).unwrap();
+
+        harness.launch().await;
+
+        assert!(
+            !old_root.join(PACKAGE_SEED_DIR).exists(),
+            "the abandoned root's seed is removed"
+        );
+        assert!(old_runtime.exists(), "only the seed is touched");
+        assert!(kept.exists(), "the host root's own seed is kept");
     }
 
     #[tokio::test]
@@ -8089,7 +8689,8 @@ mod tests {
         fs::create_dir_all(&retained).unwrap();
         fs::write(retained.join("checkout.txt"), b"from the first job").unwrap();
 
-        copy_package_tree(&package, &slot).expect("the package lays out around `_work`");
+        copy_package_tree(&package, &slot, &TrustedTrees::default())
+            .expect("the package lays out around `_work`");
         assert!(slot.join("bin").join("Runner.Listener").exists());
         assert!(
             slot.join("externals").join(DEFAULT_WORK_FOLDER).is_dir(),
@@ -8102,7 +8703,7 @@ mod tests {
 
         // A package that ever grew a top-level `_work` is refused, not merged.
         fs::create_dir(package.join(DEFAULT_WORK_FOLDER)).unwrap();
-        let error = copy_package_tree(&package, &slot).unwrap_err();
+        let error = copy_package_tree(&package, &slot, &TrustedTrees::default()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
             fs::read_to_string(retained.join("checkout.txt")).unwrap(),
@@ -8478,6 +9079,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("the host can still launch");
@@ -9142,7 +9744,7 @@ mod tests {
         fs::create_dir_all(&nested_work).unwrap();
         fs::write(nested_work.join("allowed.txt"), b"allowed").unwrap();
 
-        copy_package_tree(&source, &dest).unwrap();
+        copy_package_tree(&source, &dest, &TrustedTrees::default()).unwrap();
 
         assert_eq!(fs::read_to_string(dest.join("file1.txt")).unwrap(), "hello");
         assert_eq!(
@@ -9161,6 +9763,145 @@ mod tests {
     }
 
     #[test]
+    fn every_field_name_the_attempt_sink_emits_is_allowed() {
+        use runner_manager_platform::logging::is_field_allowed;
+
+        // Kept beside the sink rather than derived from it, as in `reconcile`.
+        for field in [
+            "event",
+            "attempt_id",
+            "reason",
+            "retry_in_ms",
+            "duration_ms",
+            "lock_wait_ms",
+            "materialize_ms",
+            "register_ms",
+            "spawn_ms",
+        ] {
+            assert!(
+                is_field_allowed(field),
+                "`{field}` would be logged as `[redacted]`"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn package_entry(root: &Path, version: &str, manifest: &str) -> PathBuf {
+        let entry = root.join("packages").join(version);
+        fs::create_dir_all(entry.join("bin")).unwrap();
+        fs::write(entry.join(crate::package::MANIFEST_FILE), manifest).unwrap();
+        fs::write(entry.join("bin").join("Runner.Listener"), version).unwrap();
+        entry
+    }
+
+    /// The seed's binary's inode: a rebuilt seed holds a new file.
+    #[cfg(unix)]
+    fn listener_inode(seed: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(seed.join("bin").join("Runner.Listener"))
+            .unwrap()
+            .ino()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_seed_is_built_once_and_reused_while_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = TrustedTrees::default();
+
+        let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
+        assert_eq!(seed, seeds.join("2.336.0"));
+        assert_eq!(
+            fs::read_to_string(seed.join("bin").join("Runner.Listener")).unwrap(),
+            "2.336.0"
+        );
+
+        let built = listener_inode(&seed);
+        assert_eq!(
+            refresh_package_seed(&source, &seeds, &trusted).unwrap(),
+            seed
+        );
+        assert_eq!(listener_inode(&seed), built, "an untouched seed is reused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tampered_or_unrecorded_seed_is_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{\"digest\":\"a\"}");
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = TrustedTrees::default();
+        let seed = refresh_package_seed(&source, &seeds, &trusted).unwrap();
+
+        // A job rewrites the binary in place and leaves the manifest alone.
+        fs::write(seed.join("bin").join("Runner.Listener"), b"planted").unwrap();
+        refresh_package_seed(&source, &seeds, &trusted).unwrap();
+        assert_eq!(
+            fs::read_to_string(seed.join("bin").join("Runner.Listener")).unwrap(),
+            "2.336.0",
+            "a seed whose print moved is rebuilt from the cache entry"
+        );
+
+        // A restarted daemon has no print of a seed it did not build.
+        let built = listener_inode(&seed);
+        refresh_package_seed(&source, &seeds, &TrustedTrees::default()).unwrap();
+        assert_ne!(
+            listener_inode(&seed),
+            built,
+            "an unrecorded seed is rebuilt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_seed_is_rebuilt_for_a_new_entry_and_drops_every_other() {
+        let root = tempfile::tempdir().unwrap();
+        let seeds = root.path().join("runners").join(PACKAGE_SEED_DIR);
+        let trusted = TrustedTrees::default();
+        let old = package_entry(root.path(), "2.335.0", "{\"digest\":\"old\"}");
+        refresh_package_seed(&old, &seeds, &trusted).unwrap();
+        fs::create_dir_all(seeds.join(".staging-interrupted")).unwrap();
+        fs::write(seeds.join("stray"), b"").unwrap();
+
+        let new = package_entry(root.path(), "2.336.0", "{\"digest\":\"new\"}");
+        let seed = refresh_package_seed(&new, &seeds, &trusted).unwrap();
+
+        let mut left: Vec<_> = fs::read_dir(&seeds)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["2.336.0"]);
+
+        // A reinstalled entry of the same version has a different manifest.
+        fs::write(
+            new.join(crate::package::MANIFEST_FILE),
+            "{\"digest\":\"again\"}",
+        )
+        .unwrap();
+        let built = listener_inode(&seed);
+        refresh_package_seed(&new, &seeds, &trusted).unwrap();
+        assert_ne!(listener_inode(&seed), built, "a stale seed is rebuilt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_on_the_runtime_volume_is_its_own_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = package_entry(root.path(), "2.336.0", "{}");
+        let runtime = root.path().join("runners").join("attempt");
+        fs::create_dir_all(&runtime).unwrap();
+
+        let trusted = TrustedTrees::default();
+        assert_eq!(package_seed(&source, &runtime, &trusted).unwrap(), source);
+        copy_package_tree(&source, &runtime, &trusted).unwrap();
+        assert!(runtime.join("bin").join("Runner.Listener").exists());
+        assert!(!root.path().join("runners").join(PACKAGE_SEED_DIR).exists());
+    }
+
+    #[test]
     fn copy_package_tree_refuses_top_level_work_folder() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
@@ -9173,7 +9914,7 @@ mod tests {
         let top_work = source.join(DEFAULT_WORK_FOLDER);
         fs::create_dir_all(&top_work).unwrap();
 
-        let err = copy_package_tree(&source, &dest).unwrap_err();
+        let err = copy_package_tree(&source, &dest, &TrustedTrees::default()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

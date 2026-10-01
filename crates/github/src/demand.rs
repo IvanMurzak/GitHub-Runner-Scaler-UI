@@ -1622,12 +1622,11 @@ mod tests {
             "the completed job is dropped and the two queued ones keep their labels"
         );
 
-        // This captured payload lacks the profile selector on its Windows job.
-        // It is still parsed faithfully, but explicit profile routing must not
-        // guess that the job belongs to this policy.
+        // The Windows job requires a subset of this policy's labels, even
+        // without its selector. The macOS job still requires missing labels.
         let tally = host_labels().tally(&queued);
-        assert_eq!(tally.demand(), 0);
-        assert_eq!(tally.not_matched, 2);
+        assert_eq!(tally.demand(), 1);
+        assert_eq!(tally.not_matched, 1);
 
         // GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, as an idle
         // repository answers it. `total_count` and an empty array, which is the
