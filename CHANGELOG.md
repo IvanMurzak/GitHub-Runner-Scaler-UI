@@ -7,6 +7,24 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.30
+
+### Features
+
+- `runner-manager update --force` can reconcile a running service installed
+  from a different source binary. It keeps a recoverable backup of that source,
+  then lets the existing daemon finish every running job before switching its
+  private binary; the command does not forcibly stop the service or cancel a job.
+  `update --check --force` previews the action without changing files.
+
+### Operator notes
+
+- On macOS a new binary may need a fresh login-Keychain grant. The command
+  warns about this and prints the exact `auth login` command for the service
+  binary and existing data directory. Wait until `service status` reports the
+  new version before signing in again. Authentication does not remove runner
+  profiles, settings or the database.
+
 ## 0.4.29
 
 ### Features
