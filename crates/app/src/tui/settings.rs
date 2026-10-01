@@ -3001,9 +3001,11 @@ mod tests {
     }
 
     fn answer_profile_github(mut stream: TcpStream) {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request = String::new();
-        reader.read_line(&mut request).unwrap();
+        {
+            let mut reader = BufReader::new(&mut stream);
+            reader.read_line(&mut request).unwrap();
+        }
         let path = request.split_whitespace().nth(1).unwrap_or("/");
         let body = if path.starts_with("/user/installations/7/repositories") {
             r#"{"total_count":1,"repositories":[{"full_name":"octo/repo"}]}"#
