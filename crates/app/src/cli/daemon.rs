@@ -15,8 +15,8 @@ use std::time::Duration;
 use runner_manager_agent::lifecycle::NativeProcesses;
 use runner_manager_agent::lifecycle::{
     CachedRuntimePackages, LifecycleGithub, LifecycleGithubObservation, LifecycleLauncher,
-    LifecyclePorts, NoAttemptEvents, PersistentDemand, PlatformExecutionProvider, RetryPolicy,
-    TokioRetryDelay, TracingAttemptEvents,
+    LifecyclePorts, PersistentDemand, PlatformExecutionProvider, RetryPolicy, TokioRetryDelay,
+    TracingAttemptEvents,
 };
 use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,

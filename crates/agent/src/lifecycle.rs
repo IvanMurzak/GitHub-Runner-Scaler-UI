@@ -4135,7 +4135,7 @@ impl LifecycleLauncher {
             .ok_or(LifecycleError::Failed(FailureReason::JitRequestFailed))?;
         let id = AttemptId::new_random();
         let placement = self.allocate_workspace(policy, id)?;
-        let attempt = RunnerAttempt::allocate_in(
+        let mut attempt = RunnerAttempt::allocate_in(
             id,
             policy.id,
             placement.runtime,
@@ -4169,6 +4169,7 @@ impl LifecycleLauncher {
         stopwatch: &mut LaunchStopwatch,
     ) -> Result<RunnerAttempt, LifecycleError> {
         let id = attempt.id;
+        let isolated = !attempt.execution().is_native();
         stopwatch.begin(LaunchStep::Materialize);
         let version = match self.materialize_with_retry(policy, &attempt).await {
             Ok(version) => version,
@@ -4180,7 +4181,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Journal)?
             .insert(id, version);
 
-        if resolved.is_some() {
+        if isolated {
             attempt
                 .begin_prepare(self.ports.clock.now())
                 .map_err(|_| LifecycleError::Transition)?;
@@ -4189,7 +4190,7 @@ impl LifecycleLauncher {
         let prepared = match self.ports.processes.prepare(&attempt, policy) {
             Ok(prepared) => prepared,
             Err(reason) => {
-                let safe_reason = if resolved.is_some() {
+                let safe_reason = if isolated {
                     safe_isolation_reason(reason, IsolationProviderFailure::RuntimeOperationFailed)
                 } else {
                     reason
@@ -4197,7 +4198,7 @@ impl LifecycleLauncher {
                 return self.fail_launch(&mut attempt, safe_reason);
             }
         };
-        if resolved.is_some() {
+        if isolated {
             let Some(identity) = prepared.identity() else {
                 return Err(LifecycleError::Failed(FailureReason::IsolationProvider(
                     IsolationProviderFailure::OwnershipMismatch,
@@ -4235,7 +4236,7 @@ impl LifecycleLauncher {
             .map_err(|_| LifecycleError::Transition)?;
         self.record(&attempt)?;
         let config = registration.into_config();
-        if resolved.is_some() {
+        if isolated {
             let started = self
                 .ports
                 .processes
@@ -5680,6 +5681,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("isolated launch");
@@ -5774,6 +5776,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .unwrap();
@@ -5816,6 +5819,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect_err("prepare failed after creating resource");
@@ -5938,6 +5942,7 @@ mod tests {
                     host: &harness.host,
                     policy: &harness.policy,
                     allocation_guard: &guard,
+                    lock_wait: Duration::ZERO,
                 })
                 .await
                 .expect_err("pre-JIT refusal");
@@ -5973,6 +5978,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect_err("unsupported host must be refused before JIT");
@@ -6055,6 +6061,7 @@ mod tests {
                 host: &harness.host,
                 policy: &harness.policy,
                 allocation_guard: &guard,
+                lock_wait: Duration::ZERO,
             })
             .await
             .expect("launch");

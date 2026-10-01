@@ -118,7 +118,10 @@ def status(binary: Path, data_dir: Path) -> dict:
 
 
 def max_schema(database: Path) -> int:
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+    # The candidate has exited, so its disposable database is quiescent.
+    # Immutable readback avoids a macOS read-only WAL open trying to create a
+    # sibling -shm file on protected or external storage.
+    with sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True) as connection:
         value = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     return int(value or 0)
 
@@ -127,7 +130,7 @@ def assert_migrated(database: Path, expected: int) -> None:
     actual = max_schema(database)
     if actual != expected:
         reject(f"candidate migrated database to {actual}, source expects {expected}")
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+    with sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True) as connection:
         host = connection.execute(
             "SELECT host_capacity, runner_root_override FROM hosts WHERE id = ?", (HOST_ID,)
         ).fetchone()
