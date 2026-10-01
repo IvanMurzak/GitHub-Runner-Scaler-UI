@@ -63,6 +63,22 @@ pub(super) fn preflight_force(context: &Context) -> Result<(), CliError> {
             ),
         ));
     }
+    if same_file(&source, &record.binary) {
+        return Err(CliError::new(
+            Failure::UpdateUnsupported,
+            "the recorded source is the live service copy; --force cannot safely replace it",
+        ));
+    }
+    if executable_version(&source).is_none() {
+        return Err(CliError::with_remedy(
+            Failure::UpdateUnsupported,
+            format!(
+                "recorded service source {} does not answer runner-manager --version; --force will not replace an unrecognized file",
+                display_path(&source)
+            ),
+            "inspect runner-manager service status and reinstall from a valid source if needed",
+        ));
+    }
     Ok(())
 }
 
