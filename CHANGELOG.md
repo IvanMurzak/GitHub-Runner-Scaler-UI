@@ -7,6 +7,30 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.29
+
+### Features
+
+- Named runner profiles can route different jobs from one repository to native
+  or isolated execution. The CLI and TUI expose profile, capacity, workspace,
+  backend and readiness controls; provider failure never falls back to native.
+- Linux and managed WSL support rootless OCI isolation with pinned images and
+  fail-closed resource limits. Windows has a Hyper-V-isolated backend, still
+  preview-held where its native host acceptance is outstanding. The macOS VM
+  backend is **not** part of this release.
+
+### Fixes
+
+- Upgrading from 0.4.28 migrates the local database from schema 3 to schema 5,
+  preserving existing runner policies as native default profiles. Older binaries
+  cannot read the upgraded database; keep a recoverable backup before upgrading.
+- Cleaned native attempt history with a legacy process identity is readable
+  without rewriting its journal or relaxing checks on active attempts.
+- Runner profiles accept jobs requiring a case-insensitive subset of their labels,
+  including jobs that omit the immutable selector. Extra profile labels are allowed.
+  Jobs matching multiple local profiles are visibly refused, including overlaps with
+  inactive isolated profiles, rather than scaling twice or falling back to native execution.
+
 ## 0.4.28
 
 ### Fixes
@@ -45,7 +69,6 @@ the version being prepared rather than the version in `Cargo.toml`.
   request or process start is a warning, and a launch that takes longer than a
   minute logs a warning naming how long the package copy, the JIT request and
   the process start each took.
-
 ## 0.4.26
 
 ### Fixes
@@ -74,6 +97,13 @@ the version being prepared rather than the version in `Cargo.toml`.
 - The TUI header shows every service version it can see: the local service,
   each managed WSL host's service, and the app. A TUI started with
   `--host wsl:NAME` labels its service as that WSL host's.
+- Managed WSL isolated runners can use an operator-provisioned, root-owned OCI
+  storage helper backed by finite Linux filesystems. The provider requires the
+  helper's bounded-store attestation and keeps returning
+  `DiskQuotaUnavailable` for ordinary rootless Podman storage that cannot
+  enforce the requested disk cap. The same helper and its provider resources
+  now have a terminate/restart acceptance that verifies generation-fenced
+  adoption, cleanup accounting, and no duplicate JIT registration.
 
 ## 0.4.25
 
@@ -421,6 +451,3 @@ prints the explicit Linux commands to run if you want to undo that half too.
 Every existing local command, file, service registration and `status --json`
 document is unchanged. `--host local` is the default, so nothing you have
 scripted needs editing.
-
-
-

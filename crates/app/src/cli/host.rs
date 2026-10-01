@@ -74,9 +74,15 @@
 //! models has somewhere to go — and this file states the assumption where the
 //! number is read.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
 
+use runner_manager_agent::lifecycle::ProviderCapability;
+#[cfg(not(test))]
+use runner_manager_agent::lifecycle::WindowsHyperVContainers;
+#[cfg(test)]
+use runner_manager_agent::lifecycle::WindowsHyperVHostState;
 use runner_manager_domain::capacity::HostAllocator;
 use runner_manager_domain::model::{Host, RefreshInterval, ScaleTarget, StartMode};
 use runner_manager_domain::store::{Store, StoreError};
@@ -85,6 +91,7 @@ use runner_manager_github::rest::{
     BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
 };
 use runner_manager_platform::runner_root::RootOwner;
+use serde::Serialize;
 
 use super::workspace;
 use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, Styling, write_failed};
@@ -152,14 +159,14 @@ pub struct HostBudget {
     /// Organization targets in the set. Non-zero makes the projection a
     /// **floor** rather than an estimate; see [`HostBudget::is_floor`].
     organization_targets: usize,
-    /// Policies priced, whatever their state.
-    priced_policies: usize,
+    /// Distinct targets priced, whatever their policies' states.
+    priced_targets: usize,
 }
 
 impl HostBudget {
-    /// Prices every persisted policy, at this host's refresh interval.
+    /// Prices every distinct persisted target, at this host's refresh interval.
     ///
-    /// # Every policy is priced, including the ones not polling
+    /// # Every target is priced, including the ones not polling
     ///
     /// A `pending`, `disabled` or `monitor_only` policy costs less than this
     /// says — a monitor-only policy never polls demand at all, and a disabled
@@ -180,9 +187,10 @@ impl HostBudget {
     /// shortfall sayable instead of silent.
     #[must_use]
     pub fn of(interval: RefreshInterval, targets: &[ScaleTarget]) -> Self {
-        let mut costs = Vec::with_capacity(targets.len());
+        let unique: BTreeSet<&ScaleTarget> = targets.iter().collect();
+        let mut costs = Vec::with_capacity(unique.len());
         let mut organization_targets = 0;
-        for target in targets {
+        for target in unique {
             costs.push(measured(match target {
                 ScaleTarget::Repository(_) => TargetCost::repository(),
                 ScaleTarget::Organization(_) => {
@@ -191,11 +199,12 @@ impl HostBudget {
                 }
             }));
         }
+        let priced_targets = costs.len();
         Self {
             interval,
             projection: BudgetProjection::new(interval, costs),
             organization_targets,
-            priced_policies: targets.len(),
+            priced_targets,
         }
     }
 
@@ -261,7 +270,7 @@ impl HostBudget {
             self.ceiling()
         )?;
         writeln!(out, "  headroom                  {}", self.headroom())?;
-        writeln!(out, "  policies priced           {}", self.priced_policies)?;
+        writeln!(out, "  targets priced            {}", self.priced_targets)?;
         writeln!(
             out,
             "  repository targets that fit at this interval: about {}",
@@ -283,11 +292,11 @@ impl HostBudget {
 
         writeln!(
             out,
-            "  About: every configured policy is priced as if it were polling, whatever its"
+            "  About: every configured target is priced as if it were polling, whatever its"
         )?;
         writeln!(
             out,
-            "  state, so this total is never an under-estimate of the set you have."
+            "  policies' states; profiles sharing a target use one poll and one charge."
         )?;
         if self.is_floor() {
             writeln!(
@@ -419,7 +428,227 @@ pub fn dispatch(
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
+        HostCommand::Isolation(super::HostIsolationCommand::Status(args)) => {
+            isolation_status(args.json, out)
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationBackend {
+    Auto,
+    Native,
+    Oci,
+    WindowsHyperVContainer,
+    VirtualMachine,
+}
+
+impl IsolationBackend {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Native => "Native",
+            Self::Oci => "OCI",
+            Self::WindowsHyperVContainer => "Hyper-V container",
+            Self::VirtualMachine => "Virtual machine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationReadiness {
+    Ready,
+    NotInstalled,
+    Unsupported,
+    PermissionDenied,
+    ImageUnavailableOrIncompatible,
+    DiskQuotaUnavailable,
+    Degraded,
+}
+
+impl IsolationReadiness {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotInstalled => "not installed",
+            Self::Unsupported => "unsupported",
+            Self::PermissionDenied => "permission denied",
+            Self::ImageUnavailableOrIncompatible => "image unavailable or incompatible",
+            Self::DiskQuotaUnavailable => "disk quota unavailable",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// A presentation-safe provider capability. Provider process output is never
+/// stored here, so TUI and JSON consumers can render only the typed state and
+/// the product-owned remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct IsolationCapability {
+    pub backend: IsolationBackend,
+    pub state: IsolationReadiness,
+    pub remedy: Option<&'static str>,
+    pub support_notice: Option<&'static str>,
+    pub unsupported_workflow_capabilities: &'static [&'static str],
+}
+
+/// Untrusted probe input. `raw_output` exists only at the conversion boundary
+/// and is intentionally discarded by [`sanitize_isolation_observation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IsolationObservation<'a> {
+    pub backend: IsolationBackend,
+    pub state: IsolationReadiness,
+    pub raw_output: Option<&'a str>,
+}
+
+#[must_use]
+pub(crate) const fn sanitize_isolation_observation(
+    observation: IsolationObservation<'_>,
+) -> IsolationCapability {
+    let _ = observation.raw_output;
+    let remedy = match (observation.backend, observation.state) {
+        (_, IsolationReadiness::Ready) => None,
+        (IsolationBackend::Oci, IsolationReadiness::NotInstalled) => {
+            Some("install and configure an OCI execution provider")
+        }
+        (IsolationBackend::Oci, IsolationReadiness::DiskQuotaUnavailable) => {
+            Some("configure the required bounded OCI storage quota")
+        }
+        (IsolationBackend::WindowsHyperVContainer, IsolationReadiness::Unsupported) => {
+            Some("use a supported host and provider")
+        }
+        (IsolationBackend::VirtualMachine, IsolationReadiness::NotInstalled) => {
+            Some("install and configure a virtual machine execution provider")
+        }
+        _ => Some("install and configure an integrated isolation provider"),
+    };
+    IsolationCapability {
+        backend: observation.backend,
+        state: observation.state,
+        remedy,
+        support_notice: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            Some(
+                "preview: native acceptance is pending for Windows 11 Pro/Enterprise with Docker Desktop and Windows Server Standard/Datacenter with a supported server runtime, including job, restart, reboot, and resource-exhaustion cases",
+            )
+        } else {
+            None
+        },
+        unsupported_workflow_capabilities: if matches!(
+            observation.backend,
+            IsolationBackend::WindowsHyperVContainer
+        ) {
+            &[
+                "desktop",
+                "devices",
+                "container_actions",
+                "service_containers",
+            ]
+        } else {
+            &[]
+        },
+    }
+}
+
+fn windows_hyper_v_capability() -> IsolationCapability {
+    #[cfg(test)]
+    let host = WindowsHyperVHostState::UnsupportedHost;
+    #[cfg(not(test))]
+    let host = WindowsHyperVContainers::host_state();
+    let state = readiness_from_provider_capability(host.capability());
+    let mut capability = sanitize_isolation_observation(IsolationObservation {
+        backend: IsolationBackend::WindowsHyperVContainer,
+        state,
+        raw_output: None,
+    });
+    capability.remedy = host.remedy();
+    capability
+}
+
+const fn readiness_from_provider_capability(capability: ProviderCapability) -> IsolationReadiness {
+    match capability {
+        ProviderCapability::Ready => IsolationReadiness::Ready,
+        ProviderCapability::Unsupported => IsolationReadiness::Unsupported,
+        ProviderCapability::NotInstalled => IsolationReadiness::NotInstalled,
+        ProviderCapability::PermissionDenied => IsolationReadiness::PermissionDenied,
+        ProviderCapability::ImageUnavailableOrIncompatible => {
+            IsolationReadiness::ImageUnavailableOrIncompatible
+        }
+        ProviderCapability::DiskQuotaUnavailable => IsolationReadiness::DiskQuotaUnavailable,
+        ProviderCapability::Degraded => IsolationReadiness::Degraded,
+    }
+}
+
+#[must_use]
+pub fn isolation_capabilities() -> Vec<IsolationCapability> {
+    let capability = |backend, state| {
+        sanitize_isolation_observation(IsolationObservation {
+            backend,
+            state,
+            raw_output: None,
+        })
+    };
+    vec![
+        capability(IsolationBackend::Native, IsolationReadiness::Ready),
+        capability(IsolationBackend::Oci, IsolationReadiness::NotInstalled),
+        windows_hyper_v_capability(),
+        capability(
+            IsolationBackend::VirtualMachine,
+            IsolationReadiness::NotInstalled,
+        ),
+    ]
+}
+
+pub fn isolation_status(json: bool, out: &mut dyn Write) -> Result<(), CliError> {
+    let providers = isolation_capabilities();
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "providers": providers,
+    });
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&document)
+                .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?
+        )
+        .map_err(write_failed("this provider status"))?;
+    } else {
+        for provider in providers {
+            writeln!(
+                out,
+                "{} provider: {}",
+                provider.backend.display_name(),
+                provider.state.display_name()
+            )
+            .map_err(write_failed("this provider status"))?;
+            if let Some(remedy) = provider.remedy {
+                writeln!(out, "  remedy: {remedy}")
+                    .map_err(write_failed("this provider status"))?;
+            }
+            if let Some(notice) = provider.support_notice {
+                writeln!(out, "  support: {notice}")
+                    .map_err(write_failed("this provider status"))?;
+            }
+            if !provider.unsupported_workflow_capabilities.is_empty() {
+                writeln!(
+                    out,
+                    "  unsupported workflow capabilities: {}",
+                    provider.unsupported_workflow_capabilities.join(", ")
+                )
+                .map_err(write_failed("this provider status"))?;
+            }
+        }
+        writeln!(out, "Provider readiness is checked again, including the pinned image, before JIT registration.")
+        .map_err(write_failed("this provider status"))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +901,63 @@ mod tests {
         ScaleTarget::Organization(Org::new(name).expect("a valid organization"))
     }
 
+    #[test]
+    fn isolation_status_keeps_windows_client_and_server_requirements_distinct() {
+        let mut text = Vec::new();
+        isolation_status(false, &mut text).expect("text status");
+        let text = String::from_utf8(text).expect("UTF-8 status");
+        assert!(
+            text.contains(
+                "use Windows 11 Pro or Enterprise with Docker Desktop in Windows-container mode"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Windows Server Standard or Datacenter with Moby or Mirantis Container Runtime"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Education"), "{text}");
+
+        let mut json = Vec::new();
+        isolation_status(true, &mut json).expect("JSON status");
+        let document: serde_json::Value =
+            serde_json::from_slice(&json).expect("parseable JSON status");
+        let windows = document["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["backend"] == "windows_hyper_v_container")
+            .expect("Windows provider");
+        assert_eq!(windows["state"], "unsupported");
+        assert!(
+            windows["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("use Windows 11 Pro or Enterprise")
+        );
+        assert!(!windows.to_string().contains("Education"));
+    }
+
+    #[test]
+    fn oci_disk_quota_refusal_remains_distinct_in_operator_status() {
+        assert_eq!(
+            readiness_from_provider_capability(ProviderCapability::DiskQuotaUnavailable),
+            IsolationReadiness::DiskQuotaUnavailable
+        );
+        let capability = sanitize_isolation_observation(IsolationObservation {
+            backend: IsolationBackend::Oci,
+            state: IsolationReadiness::DiskQuotaUnavailable,
+            raw_output: Some("untrusted runtime output"),
+        });
+        assert_eq!(capability.state.display_name(), "disk quota unavailable");
+        assert_eq!(
+            capability.remedy,
+            Some("configure the required bounded OCI storage quota")
+        );
+    }
+
     fn budget_text(budget: &HostBudget) -> String {
         let mut rendered = Vec::new();
         budget.write(&mut rendered).expect("writing to a Vec");
@@ -891,9 +1177,33 @@ mod tests {
         assert_eq!(one.requests_per_hour(), 360);
         assert_eq!(three.requests_per_hour(), 1_080);
         assert!(
-            budget_text(&three).contains("policies priced           3"),
-            "the output must say how many policies the total covers, or an operator              cannot tell an under-count from a cheap set"
+            budget_text(&three).contains("targets priced            3"),
+            "the output must say how many targets the total covers, or an operator              cannot tell an under-count from a cheap set"
         );
+    }
+
+    #[test]
+    fn equal_profile_targets_are_charged_once_even_with_case_variants() {
+        let interval = RefreshInterval::default();
+        let targets = [
+            repository("o/one"),
+            repository("O/ONE"),
+            repository("o/two"),
+            organization("acme"),
+            organization("ACME"),
+        ];
+        let budget = HostBudget::of(interval, &targets);
+        let unique = HostBudget::of(
+            interval,
+            &[
+                repository("o/one"),
+                repository("o/two"),
+                organization("acme"),
+            ],
+        );
+        assert_eq!(budget.requests_per_hour(), unique.requests_per_hour());
+        assert_eq!(budget.headroom(), unique.headroom());
+        assert!(budget_text(&budget).contains("targets priced            3"));
     }
 
     /// An organization's real cost is unknown locally, so the total must be

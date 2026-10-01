@@ -39,6 +39,7 @@
 
 pub mod attempt;
 pub mod capacity;
+pub mod execution;
 pub mod model;
 pub mod path;
 pub mod policy;

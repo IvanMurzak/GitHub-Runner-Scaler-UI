@@ -1941,7 +1941,15 @@ fn nothing_is_published_without_the_full_test_matrix() {
 
     // Positive first: an unreadable `jobs:` block would make every reachability
     // assertion below pass over an empty graph.
-    for required in ["validate", "test", "tag", "build", "sbom", "publish"] {
+    for required in [
+        "validate",
+        "test",
+        "tag",
+        "build",
+        "schema-compat",
+        "sbom",
+        "publish",
+    ] {
         assert!(
             graph.contains_key(required),
             "release.yml must declare a `{required}` job. Parsed jobs: {:?}",
@@ -1950,7 +1958,7 @@ fn nothing_is_published_without_the_full_test_matrix() {
     }
 
     let upstream = upstream_of(&graph, "publish");
-    for required in ["validate", "test", "tag", "build", "sbom"] {
+    for required in ["validate", "test", "tag", "build", "schema-compat", "sbom"] {
         assert!(
             upstream.contains(required),
             "`publish` must wait, directly or transitively, on `{required}`. \
@@ -1974,6 +1982,100 @@ fn nothing_is_published_without_the_full_test_matrix() {
         above_build.contains("tag"),
         "`build` must wait on `tag` so the artifacts carry the version that was \
          written. Resolved upstream of build: {above_build:?}"
+    );
+}
+
+#[test]
+fn database_compatibility_is_proved_before_release_publication() {
+    let source = read_workflow("release.yml");
+    let graph = job_dependencies(&source);
+    let upstream = upstream_of(&graph, "publish");
+    assert!(
+        upstream.contains("schema-compat"),
+        "the staged-artifact database gate must be upstream of GitHub Release publication: \
+         {upstream:?}"
+    );
+
+    let steps = workflow_steps(&source);
+    let candidate_gate: Vec<&WorkflowStep> = steps
+        .iter()
+        .filter(|step| step.job == "schema-compat" && step.run.contains("schema_compat.py"))
+        .collect();
+    assert_eq!(
+        candidate_gate.len(),
+        1,
+        "one schema gate must execute the staged Windows candidate, found: {:?}",
+        candidate_gate
+            .iter()
+            .map(|step| &step.name)
+            .collect::<Vec<_>>()
+    );
+    let gate = candidate_gate[0];
+    for contract in [
+        "--binary",
+        "--source-root",
+        "--work-root",
+        "--expected-version",
+        "RUNNER_TEMP",
+    ] {
+        assert!(
+            gate.run.contains(contract),
+            "candidate schema gate must name {contract}; body was:\n{}",
+            gate.run
+        );
+    }
+
+    let npm_gate = steps.iter().find(|step| {
+        step.job == "channels"
+            && step.run.contains("npm install --global")
+            && step.run.contains("schema_compat.py")
+    });
+    assert!(
+        npm_gate.is_some(),
+        "the clean npm install smoke must open old and fresh isolated databases, not stop at --version"
+    );
+
+    let script = std::fs::read_to_string(
+        repository_root()
+            .join(".github")
+            .join("scripts")
+            .join("schema_compat.py"),
+    )
+    .expect("schema compatibility script must exist");
+    for contract in [
+        "RUNNER_TEMP is required",
+        "schema_migrations",
+        "migrations(source_root, 3)",
+        "status",
+        "--json",
+        "source_schema_version",
+        "profile_name",
+        "execution_policy",
+        "product.build_version",
+    ] {
+        assert!(
+            script.contains(contract),
+            "schema compatibility script must pin contract {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn release_and_source_build_identities_cannot_be_confused() {
+    let source = read_workflow("release.yml");
+    assert!(
+        source.contains("RUNNER_MANAGER_RELEASE_BUILD: \"1\""),
+        "the release build must explicitly opt into the bare published semver"
+    );
+
+    let build_script = std::fs::read_to_string(repository_root().join("crates/app/build.rs"))
+        .expect("the build identity script must exist");
+    assert!(
+        build_script.contains("+git.{sha}")
+            && build_script.contains("RUNNER_MANAGER_RELEASE_BUILD")
+            && build_script.contains("symbolic-ref")
+            && build_script.contains("ls-files"),
+        "source builds need a current commit-qualified identity and releases need an explicit opt-in"
     );
 }
 

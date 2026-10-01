@@ -27,10 +27,12 @@ use runner_manager_domain::attempt::{
     AttemptOutcome, AttemptState, FailureReason, PersistedAttempt, RunnerAttempt,
 };
 use runner_manager_domain::model::{
-    Arch, AttemptId, CachePolicy, Host, HostId, HostLabel, Label, Os, PolicyId, RefreshInterval,
-    ScaleTarget, StartMode, Timestamp,
+    Arch, AttemptId, CachePolicy, Host, HostId, HostLabel, Label, Os, PolicyId, ProfileName,
+    RefreshInterval, ScaleTarget, StartMode, Timestamp,
 };
-use runner_manager_domain::policy::{PolicyMode, RoutingLabels, RunsOn, ScalePolicy};
+use runner_manager_domain::policy::{
+    NamedProfileSpec, PolicyMode, RoutingLabels, RunsOn, ScalePolicy,
+};
 use runner_manager_domain::workspace::AttemptWorkspace;
 
 use crate::clock::{DEFAULT_EPOCH_SECS, timestamp};
@@ -250,6 +252,31 @@ pub fn active_policy() -> ScalePolicy {
 #[must_use]
 pub fn monitor_only_policy() -> ScalePolicy {
     policy().monitor_only().active().build()
+}
+
+/// A named repository profile sharing the default fixture's host and target.
+/// Its selector is derived by the domain, never supplied by the fixture.
+///
+/// # Panics
+/// On an invalid profile name.
+#[must_use]
+pub fn named_policy(name: &str, id: PolicyId) -> ScalePolicy {
+    ScalePolicy::new_named(
+        id,
+        ScaleTarget::repository("o/r").expect("fixture target"),
+        1,
+        HOST_ID,
+        NamedProfileSpec {
+            requested_host_label: HostLabel::new("home").expect("fixture host label"),
+            os: Os::Windows,
+            arch: Arch::X64,
+            profile_name: ProfileName::new(name).expect("fixture profile name"),
+            min_capacity: 0,
+            max_capacity: NonZeroU16::new(2).expect("non-zero"),
+        },
+        CachePolicy::default(),
+    )
+    .expect("named fixture is valid")
 }
 
 impl PolicyBuilder {
@@ -545,6 +572,33 @@ impl AttemptBuilder {
         };
         let entered_state_at = self.entered_state_at.unwrap_or(self.created_at);
         let terminal_at = self.state.is_terminal().then_some(entered_state_at);
+        let isolated_stage = matches!(
+            self.state,
+            AttemptState::Preparing
+                | AttemptState::Prepared
+                | AttemptState::Destroying
+                | AttemptState::CleanupDeferred
+        );
+        let process_id = if isolated_stage {
+            None
+        } else {
+            self.process_id
+        };
+        let execution = if isolated_stage {
+            runner_manager_domain::execution::AttemptExecution::Isolated {
+                provider_kind: runner_manager_domain::execution::Backend::Oci,
+                environment_id: (self.state != AttemptState::Preparing)
+                    .then(|| "fixture-environment".into()),
+                resolved_image: runner_manager_domain::execution::ImageReference::new(format!(
+                    "registry.example/runner@sha256:{}",
+                    "a".repeat(64)
+                ))
+                .expect("pinned fixture"),
+                generation: "fixture-generation".into(),
+            }
+        } else {
+            runner_manager_domain::execution::AttemptExecution::Native { process_id }
+        };
 
         RunnerAttempt::from_persisted(PersistedAttempt {
             id: self.id,
@@ -552,7 +606,8 @@ impl AttemptBuilder {
             github_runner_id: self.github_runner_id,
             state: self.state,
             outcome,
-            process_id: self.process_id,
+            process_id,
+            execution,
             runtime_path: self.runtime_path.into(),
             workspace_kind: self.workspace.kind(),
             workspace_slot: self.workspace.slot_number(),
@@ -621,9 +676,32 @@ mod tests {
             "rm-home-win-x64"
         );
         assert_eq!(policy.max_capacity().unwrap().get(), 2);
+        assert_eq!(policy.profile_name().as_str(), "default");
 
         // And `active()` is the explicit `set-scale`.
         assert!(active_policy().may_start_runners());
+    }
+
+    #[test]
+    fn named_fixture_derives_a_distinct_selector_and_preserves_casefolding() {
+        let py = named_policy("Py-Isolated", OTHER_POLICY_ID);
+        assert_eq!(py.profile_name().as_str(), "py-isolated");
+        assert_eq!(
+            py.routing_labels().unwrap().host_label().as_str(),
+            "rm-home-win-x64-py-isolated"
+        );
+        assert!(
+            !py.routing_labels()
+                .unwrap()
+                .matches(&queued_job(&["gpu"]))
+                .is_match()
+        );
+        assert!(
+            py.routing_labels()
+                .unwrap()
+                .matches(&queued_job(&["rm-home-win-x64-py-isolated"]))
+                .is_match()
+        );
     }
 
     #[test]

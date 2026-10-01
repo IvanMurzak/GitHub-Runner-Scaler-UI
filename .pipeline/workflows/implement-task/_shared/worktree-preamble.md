@@ -45,7 +45,7 @@ Rules for every step:
 
    `--no-fail-fast` keeps one failing test target from hiding the rest. The gate
    passes when every failure is fixed or shown not to be caused by this branch:
-   it fails the same way on `origin/main` (locally or in `main`'s latest CI
+   it fails the same way on `origin/$BASE_BRANCH` (locally or in `$BASE_BRANCH`'s latest CI
    run), or it is purely environmental (for example, it passes once an
    unwritable `TEMP` is redirected). Record each such failure and its evidence
    in the step report instead of blocking; fix every failure the branch

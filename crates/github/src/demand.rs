@@ -1295,7 +1295,7 @@ mod tests {
             &server,
             &repo(),
             100,
-            jobs_body(&["self-hosted", "windows"], 2, 0),
+            jobs_body(&["rm-home-win-x64", "self-hosted", "windows"], 2, 0),
         )
         .await;
         mount_jobs(&server, &repo(), 101, jobs_body(&["ubuntu-latest"], 4, 0)).await;
@@ -1622,8 +1622,8 @@ mod tests {
             "the completed job is dropped and the two queued ones keep their labels"
         );
 
-        // And the demand a Windows policy on that host would clamp: one, not
-        // two, because the macOS job belongs to another machine.
+        // The Windows job requires a subset of this policy's labels, even
+        // without its selector. The macOS job still requires missing labels.
         let tally = host_labels().tally(&queued);
         assert_eq!(tally.demand(), 1);
         assert_eq!(tally.not_matched, 1);

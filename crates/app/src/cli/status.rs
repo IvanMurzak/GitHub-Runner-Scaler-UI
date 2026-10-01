@@ -130,6 +130,8 @@ pub struct StatusDocument {
 pub struct Product {
     pub name: &'static str,
     pub version: &'static str,
+    /// The package version plus a commit identity for an unreleased source build.
+    pub build_version: &'static str,
     /// The version reported by the product-owned binary registered for the
     /// local service, or `null` when no readable service installation exists.
     pub service_binary_version: Option<String>,
@@ -287,6 +289,8 @@ pub struct BudgetSnapshot {
 pub struct PolicySnapshot {
     pub id: String,
     pub target: String,
+    /// Immutable runner-profile identity within `target`.
+    pub profile_name: String,
     pub scope: String,
     pub mode: String,
     pub state: String,
@@ -350,6 +354,7 @@ impl PolicySnapshot {
         Self {
             id: policy.id.to_string(),
             target: policy.target.slug(),
+            profile_name: policy.profile_name().to_string(),
             scope: workspace::scope_token(policy.target.scope()).to_string(),
             mode: match policy.mode() {
                 PolicyMode::MonitorOnly => "monitor_only",
@@ -454,6 +459,7 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         product: Product {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
+            build_version: env!("RUNNER_MANAGER_BUILD_VERSION"),
             service_binary_version: installed_service_version(context),
             service_credential_rejected_since: github_credential_rejected_since(context.paths())
                 .ok()
@@ -690,6 +696,7 @@ mod tests {
             product: Product {
                 name: "runner-manager",
                 version: "0.1.0",
+                build_version: "0.1.0+git.0123456789ab",
                 service_binary_version: None,
                 service_credential_rejected_since: None,
                 service_definition_outdated_since_version: None,
@@ -734,6 +741,7 @@ mod tests {
             policies: vec![PolicySnapshot {
                 id: "00000000-0000-0000-0000-000000000010".to_string(),
                 target: "owner/repo".to_string(),
+                profile_name: "default".to_string(),
                 scope: "repository".to_string(),
                 mode: "autoscale".to_string(),
                 state: "active".to_string(),
@@ -800,6 +808,7 @@ mod tests {
         assert_eq!(
             keys(&emitted, "/product"),
             [
+                "build_version",
                 "name",
                 "service_binary_version",
                 "service_credential_rejected_since",
@@ -857,6 +866,7 @@ mod tests {
                 "max_capacity",
                 "min_capacity",
                 "mode",
+                "profile_name",
                 "routing_labels",
                 "scope",
                 "state",

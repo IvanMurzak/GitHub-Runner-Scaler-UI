@@ -78,6 +78,7 @@ pub enum Boundary {
     TerminalOwnership,
     WslPlatform,
     LivePermissionProbe,
+    ProfileStateSpace,
 }
 
 impl Boundary {
@@ -102,6 +103,9 @@ impl Boundary {
             }
             Self::LivePermissionProbe => {
                 "queries live GitHub permission state rather than only local persisted state"
+            }
+            Self::ProfileStateSpace => {
+                "creates and selects multiple PolicyIds for one repository, including execution and selector state absent from the single-policy chain oracle"
             }
         }
     }
@@ -149,6 +153,7 @@ const PRIVILEGED_WSL: &str = "crates/platform/tests/privileged_wsl_lifecycle.rs"
 const TUI_SHELL: &str = "crates/app/src/tui/shell.rs";
 const UPDATE: &str = "crates/app/tests/update_command.rs";
 const WSL_ACCEPTANCE: &str = "crates/app/src/cli/wsl_acceptance.rs";
+const PROFILE_COMMANDS: &str = "crates/app/tests/profile_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -206,6 +211,20 @@ const WSL_REASON: &str = "Every `wsl` leaf drives `wsl.exe` on the host (and `in
      distribution, so these run only through the scripted `Workstation` seam, never as \
      real processes in a local chain.";
 
+macro_rules! profile_row {
+    ($leaf:literal, $test:literal) => {
+        Classification {
+            leaf: $leaf,
+            coverage: Coverage::Dedicated,
+            evidence: &[at(PROFILE_COMMANDS, $test)],
+            exclusion: Some(Exclusion {
+                boundary: Boundary::ProfileStateSpace,
+                reason: "This command addresses one of several repository PolicyIds; dedicated real-process tests check selected mutations and sibling preservation while the existing generated oracle models single-policy repositories.",
+            }),
+        }
+    };
+}
+
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
     // -- auth: sign-in state is modelled as credential presence -------------
@@ -236,6 +255,18 @@ pub const MANIFEST: &[Classification] = &[
     generated("host set-runtime-root"),
     generated("host reset-runtime-root"),
     generated("host show"),
+    Classification {
+        leaf: "host isolation status",
+        coverage: Coverage::Dedicated,
+        evidence: &[at(
+            PROFILE_COMMANDS,
+            "isolated_configuration_is_pinned_and_cannot_arm_without_provider",
+        )],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::ProfileStateSpace,
+            reason: "Reports the execution providers for profiles; a dedicated JSON-schema test covers this new capability document outside the single-policy generated oracle.",
+        }),
+    },
     // -- repo ----------------------------------------------------------------
     generated("repo add"),
     generated("repo list"),
@@ -245,6 +276,46 @@ pub const MANIFEST: &[Classification] = &[
     generated("repo remove-label"),
     generated("repo set-workspace"),
     generated("repo remove"),
+    profile_row!(
+        "repo profile add",
+        "named_profiles_select_one_policy_and_legacy_ambiguity_is_closed"
+    ),
+    profile_row!(
+        "repo profile list",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile show",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile set-capacity",
+        "named_profiles_select_one_policy_and_legacy_ambiguity_is_closed"
+    ),
+    profile_row!(
+        "repo profile set-scale",
+        "isolated_configuration_is_pinned_and_cannot_arm_without_provider"
+    ),
+    profile_row!(
+        "repo profile add-label",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile remove-label",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile set-workspace",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile set-execution",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
+    profile_row!(
+        "repo profile remove",
+        "profile_commands_mutate_and_remove_only_the_selected_sibling"
+    ),
     // -- org -----------------------------------------------------------------
     generated("org add"),
     generated("org list"),

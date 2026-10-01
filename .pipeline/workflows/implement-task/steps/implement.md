@@ -9,7 +9,7 @@ its acceptance criteria, and commit the result locally in the run worktree.
 
 - The task text supplied to the run. It may be free-form text, a GitHub issue,
   or a path to an immutable task spec under `.taskflow/`.
-- A clean run worktree based on `origin/main`.
+- A clean run worktree based on `origin/$BASE_BRANCH`.
 
 If there is no task text, stop and report that the pipeline cannot invent its
 own scope.
@@ -49,7 +49,7 @@ own scope.
 - The task's acceptance criteria are satisfied with appropriate automated tests.
 - The full local gate and every runnable task-specific gate pass.
 - `git status --porcelain` is empty and
-  `git log --oneline origin/main..HEAD` is non-empty.
+  `git log --oneline origin/$BASE_BRANCH..HEAD` is non-empty.
 - The run branch has not been pushed and no PR was created.
 - The report lists commands run and any explicitly deferred environment-only
   checks.

@@ -7,16 +7,16 @@ quality improvements that preserve behavior, and commit them locally.
 
 ## Inputs
 
-- `git log --oneline origin/main..HEAD` is non-empty.
+- `git log --oneline origin/$BASE_BRANCH..HEAD` is non-empty.
 - `git status --porcelain` is empty.
 
 ## Steps
 
 1. Enter and verify the worktree. Stop if either input precondition fails.
-2. Review the changed code in `origin/main...HEAD`. If a `simplify` skill is
+2. Review the changed code in `origin/$BASE_BRANCH...HEAD`. If a `simplify` skill is
    available, invoke it with `$worktree_path` as its explicit target and wait
    for its final result; its edits must stay in this worktree and within the
-   files `git diff --name-only origin/main...HEAD` lists. Otherwise, inspect
+   files `git diff --name-only origin/$BASE_BRANCH...HEAD` lists. Otherwise, inspect
    that diff directly.
 3. Inspect every edit. Keep changes that make the implementation materially
    clearer, smaller, less repetitive, or more efficient without changing the

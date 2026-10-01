@@ -55,6 +55,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "set-runtime-root",
             "reset-runtime-root",
             "show",
+            "isolation",
         ],
     ),
     (
@@ -68,6 +69,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "remove-label",
             "set-workspace",
             "remove",
+            "profile",
         ],
     ),
     (
@@ -88,6 +90,26 @@ const SURFACE: [(&str, &[&str]); 10] = [
     ("status", &[]),
     ("update", &[]),
     ("wsl", &["list", "install", "status", "detach"]),
+];
+
+/// Profile and provider leaves added by the runner-sandbox architecture.
+const NESTED_SURFACE: [(&str, &[&str]); 2] = [
+    ("host isolation", &["status"]),
+    (
+        "repo profile",
+        &[
+            "add",
+            "list",
+            "show",
+            "set-capacity",
+            "set-scale",
+            "add-label",
+            "remove-label",
+            "set-workspace",
+            "set-execution",
+            "remove",
+        ],
+    ),
 ];
 
 /// The command names clap lists under `Commands:` in a help page.
@@ -139,7 +161,7 @@ fn help_for(path: &[&str]) -> String {
 }
 
 #[test]
-fn version_reports_the_package_version() {
+fn version_reports_a_distinguishable_build_version() {
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let outcome = run({
         let mut command = runner_manager(temporary.path());
@@ -149,9 +171,13 @@ fn version_reports_the_package_version() {
     assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
     assert_eq!(
         outcome.stdout.trim(),
-        format!("runner-manager {}", env!("CARGO_PKG_VERSION")),
+        format!("runner-manager {}", env!("RUNNER_MANAGER_BUILD_VERSION")),
         "Journey 0 step 2 is `runner-manager --version` to confirm the install, so the \
-         output has to name the product and its version and nothing else"
+         output has to name the product and its build version and nothing else"
+    );
+    assert!(
+        env!("RUNNER_MANAGER_BUILD_VERSION").starts_with(env!("CARGO_PKG_VERSION")),
+        "the build identity must retain the package version"
     );
 }
 
@@ -796,7 +822,7 @@ fn the_readme_documents_exactly_the_commands_the_help_text_lists() {
 
 /// `SURFACE` as leaves, spelled `family` or `family subcommand`.
 fn published_leaves() -> Vec<String> {
-    SURFACE
+    let mut leaves: Vec<String> = SURFACE
         .iter()
         .flat_map(|(family, subcommands)| {
             if subcommands.is_empty() {
@@ -804,11 +830,31 @@ fn published_leaves() -> Vec<String> {
             } else {
                 subcommands
                     .iter()
+                    .filter(|subcommand| {
+                        !NESTED_SURFACE
+                            .iter()
+                            .any(|(nested, _)| *nested == format!("{family} {subcommand}"))
+                    })
                     .map(|subcommand| format!("{family} {subcommand}"))
                     .collect()
             }
         })
-        .collect()
+        .collect();
+    for (parent, children) in NESTED_SURFACE {
+        leaves.extend(children.iter().map(|child| format!("{parent} {child}")));
+    }
+    leaves
+}
+
+#[test]
+fn new_profile_and_provider_families_list_their_documented_leaves() {
+    for (path, children) in NESTED_SURFACE {
+        let mut listed = commands_in(&help_for(&path.split_whitespace().collect::<Vec<_>>()));
+        listed.sort();
+        let mut expected: Vec<String> = children.iter().map(|child| (*child).to_string()).collect();
+        expected.sort();
+        assert_eq!(listed, expected, "{path} command inventory");
+    }
 }
 
 /// `HIDDEN_BRIDGES` as leaves, in the same spelling.

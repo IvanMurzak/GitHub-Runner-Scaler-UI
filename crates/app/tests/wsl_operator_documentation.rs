@@ -92,6 +92,125 @@ fn wsl_procedure() -> String {
     wsl_section(&source).to_string()
 }
 
+#[test]
+fn managed_wsl_restart_acceptance_keeps_the_distribution_boundary_and_cleanup_explicit() {
+    let root = repository_root();
+    let orchestrator =
+        std::fs::read_to_string(root.join("tests/managed-wsl-oci-restart-acceptance.ps1"))
+            .expect("managed WSL restart orchestrator exists");
+    for required in [
+        "wsl.exe --terminate $Distribution",
+        "finally",
+        "cleanup $repoLinux $managedUser",
+    ] {
+        assert!(
+            orchestrator.contains(required),
+            "managed WSL restart orchestration no longer contains `{required}`"
+        );
+    }
+
+    let harness = std::fs::read_to_string(root.join("tests/managed-wsl-oci-restart-acceptance.sh"))
+        .expect("managed WSL restart harness exists");
+    for required in [
+        "live_rootless_managed_wsl_restart_seed",
+        "live_rootless_managed_wsl_restart_recover",
+        "isolated_restart_at_each_transition_adopts_or_destroys_one_resource",
+        "/run/user/$managed_uid",
+        "pid1-start-before",
+        "windows-session-boot-id",
+    ] {
+        assert!(
+            harness.contains(required),
+            "managed WSL restart harness no longer contains `{required}`"
+        );
+    }
+
+    let provider = std::fs::read_to_string(root.join("crates/agent/src/oci.rs"))
+        .expect("OCI restart fixture exists");
+    for required in [
+        "a different generation adopted the crash-gap resource",
+        "registration-count",
+        "uncleaned_ephemeral_attempts",
+    ] {
+        assert!(
+            provider.contains(required),
+            "managed WSL restart provider evidence no longer contains `{required}`"
+        );
+    }
+}
+
+#[test]
+fn managed_wsl_host_reboot_acceptance_is_phase_split_and_cannot_reboot_the_host() {
+    let root = repository_root();
+    let harness = std::fs::read_to_string(root.join("tests/managed-wsl-oci-reboot-acceptance.ps1"))
+        .expect("managed WSL host-reboot orchestrator exists");
+    for required in [
+        "[ValidateSet('prepare', 'verify-after-reboot', 'cleanup')]",
+        "Assert-Elevated",
+        "Get-WindowsBootEvidence",
+        "Assert-BootChanged",
+        "'remount-after-host-reboot'",
+        "githubRegistrations=0",
+        "capacity=0",
+        "nonceAbsentFromProviderDurableSurfaces=true",
+    ] {
+        assert!(
+            harness.contains(required),
+            "managed WSL host-reboot harness no longer contains `{required}`"
+        );
+    }
+    for forbidden in [
+        "Restart-Computer",
+        "shutdown.exe",
+        "wsl.exe --terminate",
+        "encoded_jit_config",
+    ] {
+        assert!(
+            !harness.contains(forbidden),
+            "managed WSL host-reboot harness contains forbidden action `{forbidden}`"
+        );
+    }
+
+    let guest = std::fs::read_to_string(root.join("tests/managed-wsl-oci-restart-acceptance.sh"))
+        .expect("managed WSL restart guest harness exists");
+    for required in [
+        "remount-after-host-reboot",
+        "the WSL VM boot identity did not change",
+        "seed did not leave five provider resources",
+        "security-scan-complete",
+    ] {
+        assert!(
+            guest.contains(required),
+            "managed WSL host-reboot guest evidence no longer contains `{required}`"
+        );
+    }
+
+    let contract = std::fs::read_to_string(root.join("tests/managed-wsl-oci-reboot-contract.ps1"))
+        .expect("managed WSL host-reboot syntax test exists");
+    assert!(contract.contains("Language.Parser]::ParseFile"));
+
+    #[cfg(windows)]
+    {
+        let outcome = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "tests/managed-wsl-oci-reboot-contract.ps1",
+            ])
+            .current_dir(&root)
+            .output()
+            .expect("Windows PowerShell runs the host-reboot syntax test");
+        assert!(
+            outcome.status.success(),
+            "host-reboot PowerShell syntax/contract test failed:\n{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Definition of Done 1: nothing is left to the operator to invent
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 /runtime/
 /state/
 /logs/
+/scripts/.windows-hyperv-acceptance/
 
 # Editors and OS cruft
 .DS_Store
