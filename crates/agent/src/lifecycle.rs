@@ -9845,6 +9845,9 @@ mod tests {
         );
 
         // A restarted daemon has no print of a seed it did not build.
+        // Keep the old inode allocated until the replacement is complete;
+        // otherwise the filesystem may immediately reuse its number.
+        let old_listener = fs::File::open(seed.join("bin").join("Runner.Listener")).unwrap();
         let built = listener_inode(&seed);
         refresh_package_seed(&source, &seeds, &TrustedTrees::default()).unwrap();
         assert_ne!(
@@ -9852,6 +9855,7 @@ mod tests {
             built,
             "an unrecorded seed is rebuilt"
         );
+        drop(old_listener);
     }
 
     #[cfg(unix)]
@@ -9881,9 +9885,12 @@ mod tests {
             "{\"digest\":\"again\"}",
         )
         .unwrap();
-        let built = listener_inode(&seed);
         refresh_package_seed(&new, &seeds, &trusted).unwrap();
-        assert_ne!(listener_inode(&seed), built, "a stale seed is rebuilt");
+        assert_eq!(
+            fs::read_to_string(seed.join(crate::package::MANIFEST_FILE)).unwrap(),
+            "{\"digest\":\"again\"}",
+            "a stale seed is rebuilt from the changed entry"
+        );
     }
 
     #[cfg(unix)]
