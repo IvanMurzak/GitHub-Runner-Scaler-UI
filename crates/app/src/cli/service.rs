@@ -2,6 +2,7 @@
 
 //! Noninteractive wrappers around the platform service transaction.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
@@ -37,6 +38,8 @@ pub fn dispatch(
 ///
 /// See [`identity`].
 pub(super) const SERVICE_TAG_VARIABLE: &str = "RUNNER_MANAGER_SERVICE_NAME_TAG";
+const MACOS_VM_HELPER_VARIABLE: &str = "RUNNER_MANAGER_MACOS_VM_HELPER";
+const MACOS_VM_ROOT_VARIABLE: &str = "RUNNER_MANAGER_MACOS_VM_ROOT";
 #[cfg(windows)]
 pub(super) const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
 
@@ -93,6 +96,37 @@ pub(super) fn identity() -> ServiceIdentity {
         Ok(tag) if !tag.trim().is_empty() => ServiceIdentity::fixture(tag.trim()),
         _ => ServiceIdentity::product(),
     }
+}
+
+/// Captures only the disposable macOS acceptance fixture's non-secret provider
+/// configuration. A production identity, another platform, or an absent value
+/// always produces the default empty service environment.
+fn fixture_service_environment_with(
+    identity: &ServiceIdentity,
+    is_macos: bool,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    if !is_macos || !identity.is_fixture() {
+        return BTreeMap::new();
+    }
+    [
+        SERVICE_TAG_VARIABLE,
+        MACOS_VM_HELPER_VARIABLE,
+        MACOS_VM_ROOT_VARIABLE,
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        lookup(name)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (name.to_string(), value))
+    })
+    .collect()
+}
+
+fn fixture_service_environment(identity: &ServiceIdentity) -> BTreeMap<String, String> {
+    fixture_service_environment_with(identity, cfg!(target_os = "macos"), |name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// Says out loud that this command is pointed at a test registration.
@@ -319,7 +353,8 @@ fn install_from(
     let request = InstallRequest::new(mode)
         .for_binary(&service_binary)
         .copied_from(source)
-        .with_arguments(service_arguments);
+        .with_arguments(service_arguments)
+        .with_environment(fixture_service_environment(operations.identity()));
     // The swap above is undone on every failure below it. See `OwnedCopy`: a
     // refused install that left the new copy in place is what put a running
     // daemon on a binary nobody registered.
@@ -647,6 +682,33 @@ mod tests {
     use crate::cli::{Cli, Command, DaemonCommand};
     use runner_manager_domain::path::LocalAbsolutePath;
     use runner_manager_platform::service::{RecordingControls, ServiceIdentity, ServiceOperations};
+
+    #[test]
+    fn only_the_macos_fixture_captures_the_provider_environment_allowlist() {
+        let value = |name: &str| match name {
+            SERVICE_TAG_VARIABLE => Some("d3-native-acceptance".to_string()),
+            MACOS_VM_HELPER_VARIABLE => Some("/usr/local/bin/helper".to_string()),
+            MACOS_VM_ROOT_VARIABLE => Some("/Library/Application Support/helper".to_string()),
+            _ => Some("must-not-be-captured".to_string()),
+        };
+        let fixture = ServiceIdentity::fixture("d3-native-acceptance");
+        let environment = fixture_service_environment_with(&fixture, true, value);
+        assert_eq!(environment.len(), 3, "{environment:?}");
+        assert_eq!(
+            environment
+                .get(MACOS_VM_HELPER_VARIABLE)
+                .map(String::as_str),
+            Some("/usr/local/bin/helper")
+        );
+        assert!(
+            fixture_service_environment_with(&ServiceIdentity::product(), true, value).is_empty(),
+            "production registrations must not inherit fixture configuration"
+        );
+        assert!(
+            fixture_service_environment_with(&fixture, false, value).is_empty(),
+            "fixture configuration belongs only in a macOS launchd registration"
+        );
+    }
 
     #[test]
     fn only_the_running_pre_supervisor_login_action_needs_migration() {

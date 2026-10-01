@@ -1,0 +1,1144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Native Apple-silicon acceptance for the production macOS VM provider.
+# The harness is deliberately phase-oriented. It never reboots the host and it
+# never downloads or installs a macOS image. Destructive phases require an
+# explicit --allow-* switch and act only on the profile/service names recorded
+# in the receipt.
+
+usage() {
+  cat <<'EOF'
+usage: macos-vm-acceptance.sh PHASE --repository OWNER/REPO --image PINNED_IMAGE \
+       --data-dir ABSOLUTE_DIR --runner-manager ABSOLUTE_BINARY [options]
+
+PHASE is one of:
+  audit, run-job, prepare-before-reboot, verify-after-reboot,
+  recovery-forensics, cleanup, rollback
+
+Options:
+  --state PATH              durable receipt path
+  --workflow-ref REF        ref containing the native acceptance workflow
+  --pull-request N          same-repository PR carrying the workflow (default 79)
+  --disk-mib N              exact registered template disk size
+  --helper PATH             signed macOS VM helper (default: /usr/local/libexec/runner-manager-macos-vm)
+  --helper-root PATH        disposable user-owned helper store
+  --allow-service-install   install the disposable login LaunchAgent
+  --allow-profile           create/remove the temporary repository profile
+  --allow-service-restart   SIGKILL the disposable login LaunchAgent once
+  --allow-cleanup           destroy owned leftovers and remove the profile
+  --allow-rollback          uninstall the disposable login LaunchAgent and receipt
+
+Run as the logged-in acceptance user on a physical Apple-silicon Mac. The
+harness also runs explicit root negative probes, but never installs a root
+LaunchDaemon. The harness never initiates a reboot. prepare-before-reboot
+writes a receipt and a one-shot login continuation; the operator reboots the
+host manually and the continuation resumes after the next login.
+EOF
+}
+
+die() { printf 'macOS VM acceptance: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command '$1' was not found"; }
+require_opt_in() { [[ "$1" == true ]] || die "$3 was refused; re-run this phase with $2 after reviewing audit state"; }
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+phase=$1
+shift
+case "$phase" in
+  audit|run-job|prepare-before-reboot|verify-after-reboot|recovery-forensics|cleanup|rollback) ;;
+  *) usage; die "unknown phase '$phase'" ;;
+esac
+
+repository=
+image=
+data_dir=
+runner_manager=
+helper=/usr/local/libexec/runner-manager-macos-vm
+helper_root='/Volumes/NVME/runner-manager-d3/helper-store'
+state_path='/Volumes/NVME/runner-manager-d3/receipt/state.json'
+workflow_ref=
+pull_request=79
+disk_mib=
+allow_service_install=false
+allow_profile=false
+allow_service_restart=false
+allow_cleanup=false
+allow_rollback=false
+run_wait_timeout_seconds=3600
+environment_wait_timeout_seconds=1800
+run_poll_seconds=30
+run_job_cleanup_armed=false
+run_job_cleanup_running=false
+run_job_cleanup_evidence=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repository) repository=${2-}; shift 2 ;;
+    --image) image=${2-}; shift 2 ;;
+    --data-dir) data_dir=${2-}; shift 2 ;;
+    --runner-manager) runner_manager=${2-}; shift 2 ;;
+    --helper) helper=${2-}; shift 2 ;;
+    --helper-root) helper_root=${2-}; shift 2 ;;
+    --state) state_path=${2-}; shift 2 ;;
+    --workflow-ref) workflow_ref=${2-}; shift 2 ;;
+    --pull-request) pull_request=${2-}; shift 2 ;;
+    --disk-mib) disk_mib=${2-}; shift 2 ;;
+    --allow-service-install) allow_service_install=true; shift ;;
+    --allow-profile) allow_profile=true; shift ;;
+    --allow-service-restart) allow_service_restart=true; shift ;;
+    --allow-cleanup) allow_cleanup=true; shift ;;
+    --allow-rollback) allow_rollback=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option '$1'" ;;
+  esac
+done
+
+[[ $(uname -s) == Darwin ]] || die 'this harness requires macOS'
+[[ $(uname -m) == arm64 ]] || die 'native macOS guests are declared only on Apple silicon (arm64)'
+[[ $(id -u) -eq 501 ]] || die 'run this harness as the logged-in console user ivanmurzak (not root)'
+[[ $(id -un) == ivanmurzak ]] || die 'the acceptance user must be ivanmurzak'
+[[ $repository =~ ^[^/]+/[^/]+$ ]] || die '--repository must be OWNER/REPO'
+[[ $image =~ ^vm-version:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die '--image must be an immutable vm-version reference with a lowercase sha256 digest'
+[[ $data_dir == /* ]] || die '--data-dir must be absolute'
+[[ $runner_manager == /* && -x $runner_manager ]] || die '--runner-manager must name an executable absolute path'
+[[ $helper == /* && -x $helper ]] || die '--helper must name an executable absolute path'
+[[ $helper_root == /* && $state_path == /* ]] || die 'helper root and state path must be absolute'
+[[ $pull_request =~ ^[0-9]+$ && $pull_request -eq 79 ]] || die 'this reviewed one-time acceptance workflow is pinned to PR 79'
+for command in gh git launchctl plutil python3 shasum sysctl sudo; do need "$command"; done
+
+workflow='macos-vm-native-acceptance.yml'
+service_tag='d3-native-acceptance'
+service_label='io.github.IvanMurzak.runner-manager-selftest-d3-native-acceptance'
+service_domain='gui/501'
+state_dir=$(dirname "$state_path")
+evidence_root="$state_dir/evidence"
+mkdir -p "$state_dir" "$evidence_root"
+chmod 700 "$state_dir" "$evidence_root"
+finisher_log='/Volumes/NVME/runner-manager-d3/login-acceptance-finisher.log'
+milestone() { printf '%s phase=%s %s\n' "$(date -u +%FT%TZ)" "$phase" "$*" >>"$finisher_log"; }
+milestone "harness-start user=$(id -un) uid=$(id -u) service_domain=$service_domain"
+export RUNNER_MANAGER_MACOS_VM_HELPER="$helper"
+export RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root"
+export RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag"
+
+runner() { "$runner_manager" --data-dir "$data_dir" --use-platform-credential "$@"; }
+login_service() {
+  env RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag" \
+    RUNNER_MANAGER_MACOS_VM_HELPER="$helper" \
+    RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" \
+    "$runner_manager" --data-dir "$data_dir" "$@"
+}
+service_runner() { login_service "$@"; }
+auth_runner() {
+  env RUNNER_MANAGER_SERVICE_NAME_TAG="$service_tag" \
+    RUNNER_MANAGER_MACOS_VM_HELPER="$helper" \
+    RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" \
+    "$runner_manager" "$@"
+}
+helper_command() { "$helper" --protocol-version 1 "$@"; }
+boot_epoch() {
+  sysctl -n kern.boottime |
+    sed -E -n 's/^[[:space:]]*\{[[:space:]]*sec[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*,.*/\1/p' |
+    grep -E '^[0-9]+$'
+}
+service_pid() {
+  launchctl print "$service_domain/$service_label" 2>/dev/null | awk '
+    /^[[:space:]]*state = running$/ { running = 1 }
+    /^[[:space:]]*pid = / { pid = $3 }
+    END { if (running && pid != "") print pid }
+  '
+}
+
+root_negative_probes() {
+  local out=$1 before after probe_status prepare_status
+  before=$(environment_count)
+  set +e
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 probe --json >"$out/root-probe.json" 2>"$out/root-probe.err"
+  probe_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 prepare \
+    --environment rm-root-negative --host root-negative --attempt root-negative --generation 1 \
+    --image "$image" --template-digest "${image##*@sha256:}" --architecture arm64 \
+    --cpu-millis 2000 --memory-mib 4096 --disk-mib "${disk_mib:-47684}" --process-limit 512 \
+    --runner-source /tmp --fresh-writable-disk --no-host-shares --private-jit-channel \
+    >"$out/root-prepare.json" 2>"$out/root-prepare.err"
+  prepare_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --protocol-version 1 start \
+    --environment rm-root-negative --jit-stdin </dev/null \
+    >"$out/root-start.json" 2>"$out/root-start.err"
+  local start_status=$?
+  sudo -n env RUNNER_MANAGER_MACOS_VM_ROOT="$helper_root" "$helper" --internal-supervise \
+    rm-root-negative invalid-nonsecret-ownership </dev/null \
+    >"$out/root-supervisor.json" 2>"$out/root-supervisor.err"
+  local supervisor_status=$?
+  set -e
+  after=$(environment_count)
+  [[ $prepare_status -ne 0 ]] || die 'root prepare unexpectedly succeeded'
+  [[ $start_status -ne 0 && $supervisor_status -ne 0 ]] || die 'root VM start or supervisor unexpectedly succeeded'
+  [[ $before == "$after" ]] || die 'root negative probe created a helper environment'
+  for rejection in "$out/root-prepare.err" "$out/root-start.err" "$out/root-supervisor.err"; do
+    grep -Fq -- '--start-at login' "$rejection" || die 'root negative probe omitted the --start-at login remedy'
+  done
+  python3 - "$out/root-probe.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); assert r['user_session'] is False, r
+PY
+}
+
+state_get() {
+  local key=$1
+  python3 - "$state_path" "$key" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_file(): raise SystemExit(3)
+v = json.loads(p.read_text())
+for part in sys.argv[2].split('.'):
+    if not isinstance(v, dict) or part not in v:
+        v = None
+        break
+    v = v[part]
+if v is None: print('')
+elif isinstance(v, bool): print(str(v).lower())
+else: print(v)
+PY
+}
+
+state_set() {
+  local key=$1 value=$2 kind=${3:-string}
+  python3 - "$state_path" "$key" "$value" "$kind" <<'PY'
+import json, os, pathlib, sys, tempfile
+p = pathlib.Path(sys.argv[1]); doc = json.loads(p.read_text())
+value = sys.argv[3]
+if sys.argv[4] == 'bool': value = value == 'true'
+elif sys.argv[4] == 'int': value = int(value)
+target = doc
+parts = sys.argv[2].split('.')
+for part in parts[:-1]: target = target.setdefault(part, {})
+target[parts[-1]] = value
+fd, tmp = tempfile.mkstemp(dir=p.parent, prefix='.state-', text=True)
+with os.fdopen(fd, 'w') as f: json.dump(doc, f, sort_keys=True, indent=2); f.write('\n')
+os.chmod(tmp, 0o600); os.replace(tmp, p)
+PY
+}
+
+assert_state_identity() {
+  [[ -f $state_path ]] || die "state '$state_path' is absent; run audit first"
+  [[ $(state_get schema_version) == 1 ]] || die 'unrecognized state schema'
+  [[ $(state_get repository) == "$repository" ]] || die 'state belongs to another repository'
+  [[ $(state_get image) == "$image" ]] || die 'state belongs to another template image'
+  [[ $(state_get data_dir) == "$data_dir" ]] || die 'state belongs to another data directory'
+  [[ $(state_get runner_manager_sha256) == "$(shasum -a 256 "$runner_manager" | awk '{print $1}')" ]] || die 'runner-manager binary changed after audit'
+  [[ $(state_get helper_sha256) == "$(shasum -a 256 "$helper" | awk '{print $1}')" ]] || die 'signed macOS VM helper changed after audit'
+}
+
+assert_probe_and_image() {
+  local out=$1
+  local probe="$out/probe.json"
+  local inspected="$out/image.json"
+  local verified="$out/template-verification.json"
+  helper_command probe --json >"$probe"
+  helper_command image inspect --image "$image" --json >"$inspected"
+  # Full artifact hashing is an explicit audit/registration trust-boundary
+  # operation, never part of the daemon's readiness/reconciliation hot path.
+  helper_command template verify --image "$image" --json >"$verified"
+  python3 - "$probe" "$inspected" "$verified" "$image" "${disk_mib:-}" <<'PY'
+import json, sys
+probe, image, verified = (json.load(open(p)) for p in sys.argv[1:4])
+required = ('user_session','virtualization_framework','macos_guest_entitlement','private_jit_channel',
+            'fresh_writable_disks','resource_limits','process_limits')
+assert probe['protocol_version'] == 1 and probe['architecture'] == 'arm64', probe
+assert all(probe.get(k) is True for k in required), probe
+assert image['protocol_version'] == 1 and image['image'] == sys.argv[4], image
+assert image['guest_os'] == 'macos' and image['architecture'] == 'arm64', image
+assert image['immutable'] is True and image['bootstrap_ready'] is True, image
+assert image['template_digest'] == sys.argv[4].split('@sha256:',1)[1], image
+assert verified == image, (verified, image)
+PY
+  if [[ -z $disk_mib ]]; then
+    local manifest="$helper_root/templates/${image##*@sha256:}/manifest.json"
+    [[ -r $manifest ]] || die "registered manifest '$manifest' is unreadable"
+    disk_mib=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["identity"]["disk_mib"])' "$manifest")
+  fi
+  [[ $disk_mib =~ ^[0-9]+$ && $disk_mib -gt 0 ]] || die 'template disk size is invalid'
+}
+
+environment_dirs() {
+  [[ -d "$helper_root/environments" ]] || return 0
+  local directory
+  for directory in "$helper_root"/environments/*; do
+    [[ -d $directory && ! -L $directory ]] && printf '%s\n' "$directory"
+  done
+  return 0
+}
+
+environment_count() { environment_dirs | awk 'END { print NR+0 }'; }
+
+capture_single_environment() {
+  local output=$1 deadline=$((SECONDS + ${2:-300})) listing count envdir state observation
+  local current_identity owned_identity=''
+  while (( SECONDS < deadline )); do
+    listing=$(environment_dirs)
+    count=$(printf '%s\n' "$listing" | awk 'NF { count++ } END { print count+0 }')
+    if [[ $count -eq 1 ]]; then
+      envdir=$listing
+      helper_command inspect --environment "$(basename "$envdir")" --json >"$output"
+      observation=$(python3 - "$output" "$image" "$disk_mib" <<'PY'
+import json, sys
+r=json.load(open(sys.argv[1]))
+assert r['protocol_version']==1 and r['guest_os']=='macos' and r['architecture']=='arm64', r
+assert r['image']==sys.argv[2] and r['template_digest']==sys.argv[2].split('@sha256:',1)[1], r
+assert r['state'] in ('prepared','booting','running') and r['fresh_writable_disk'] is True, r
+assert r['shared_host_paths']==[] and r['jit_channel']=='private', r
+assert r['applied_cpu_millis']==2000 and r['applied_memory_mib']==4096, r
+assert r['applied_disk_mib']==int(sys.argv[3]) and r['applied_process_limit']==512, r
+assert r['writable_disk_id'] and r['environment_id'].startswith('rm-'), r
+print('|'.join((r['state'],r['environment_id'],r['writable_disk_id'])))
+PY
+)
+      state=${observation%%|*}
+      current_identity=${observation#*|}
+      if [[ -z $owned_identity ]]; then
+        owned_identity=$current_identity
+        # Cold package installation/preparation must not consume boot/channel
+        # time. One resource gets one finite start window, never reset by a
+        # retry or a replaced writable disk. Helper start itself is bounded600s.
+        deadline=$((SECONDS + 660))
+      else
+        [[ $current_identity == "$owned_identity" ]] || die 'VM identity changed before private handoff acknowledgement'
+      fi
+      # Booting proves allocation, not a completed private JIT handoff. Killing
+      # the service here races start acknowledgement and offline-runner recovery.
+      if [[ $state != running ]]; then
+        sleep 2
+        continue
+      fi
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_id"])' "$output"
+      return
+    fi
+    [[ -z $owned_identity ]] || die 'VM disappeared before private handoff acknowledgement'
+    [[ $count -eq 0 ]] || die 'more than one helper environment exists; refusing ambiguous ownership'
+    sleep 2
+  done
+  die 'no production provider-owned macOS VM appeared before timeout'
+}
+
+find_run() {
+  local trigger_label=$1 deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    local id
+    id=$(gh run list --repo "$repository" --event pull_request --branch "$workflow_ref" --limit 50 \
+      --json databaseId,displayTitle,workflowName \
+      --jq ".[] | select(.workflowName == \"macOS VM native acceptance\" and .displayTitle == \"macos-vm-$trigger_label\") | .databaseId" | head -1)
+    [[ -z $id ]] || { printf '%s\n' "$id"; return; }
+    sleep 3
+  done
+  die "could not find pull-request workflow run for one-time label '$trigger_label'"
+}
+
+wait_no_environments() {
+  local deadline=$((SECONDS + ${1:-300}))
+  while (( SECONDS < deadline )); do
+    [[ $(environment_count) -eq 0 ]] && return
+    sleep 2
+  done
+  die 'provider-owned VM remained after the cleanup deadline'
+}
+
+owned_environment_dirs() {
+  local profile_id database
+  profile_id=$(state_get profile_id)
+  [[ -n $profile_id ]] || die 'receipt has no profile id, so environment ownership cannot be proved'
+  database="$data_dir/config/runner-manager.sqlite3"
+  [[ -r $database ]] || die "runner-manager database '$database' is unreadable, so environment ownership cannot be proved"
+  python3 - "$database" "$helper_root" "$profile_id" "$image" <<'PY'
+import json, pathlib, sqlite3, sys
+database, helper_root, profile_id, image = sys.argv[1:]
+with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as connection:
+    attempts = {
+        str(row[0]).lower()
+        for row in connection.execute('SELECT id FROM attempts WHERE policy_id = ?', (profile_id,))
+    }
+root = pathlib.Path(helper_root) / 'environments'
+if not root.is_dir():
+    raise SystemExit(0)
+for directory in sorted(root.iterdir()):
+    if not directory.is_dir() or directory.is_symlink():
+        continue
+    metadata = directory / 'metadata.json'
+    try:
+        record = json.loads(metadata.read_text())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot verify environment ownership at {directory}: {error}")
+    if str(record.get('attempt_id', '')).lower() not in attempts:
+        continue
+    if record.get('environment_id') != directory.name:
+        raise SystemExit(f"owned environment metadata/path mismatch at {directory}")
+    if record.get('image') != image or record.get('template_digest') != image.split('@sha256:', 1)[1]:
+        raise SystemExit(f"owned environment image identity mismatch at {directory}")
+    print(directory)
+PY
+}
+
+owned_environment_count() { owned_environment_dirs | awk 'END { print NR+0 }'; }
+
+wait_no_owned_environments() {
+  local deadline=$((SECONDS + ${1:-300})) count
+  while (( SECONDS < deadline )); do
+    if ! count=$(owned_environment_count); then
+      die 'could not verify whether receipt-owned provider VMs remain'
+    fi
+    [[ $count =~ ^[0-9]+$ ]] || die 'receipt-owned environment count was not numeric'
+    [[ $count -eq 0 ]] && return
+    sleep 2
+  done
+  die 'receipt-owned provider VM remained after the cleanup deadline'
+}
+
+wait_profile_inactive() {
+  local profile=$1 deadline=$((SECONDS + ${2:-90})) remaining
+  while (( SECONDS < deadline )); do
+    if ! remaining=$(runner status --json | python3 -c '
+import json, sys
+document=json.load(sys.stdin)
+profiles=[p for p in document["policies"] if p["target"]==sys.argv[1] and p["profile_name"]==sys.argv[2]]
+print(0 if not profiles else profiles[0]["active_attempts"] + profiles[0]["cleanup_blocked_attempts"])
+' "$repository" "$profile"); then
+      die "could not verify whether receipt-owned profile '$profile' still holds attempts"
+    fi
+    [[ $remaining =~ ^[0-9]+$ ]] || die "receipt-owned profile '$profile' reported a non-numeric attempt count"
+    [[ $remaining -eq 0 ]] && return
+    sleep 2
+  done
+  die "receipt-owned profile '$profile' still holds attempts after the cleanup deadline"
+}
+
+wait_service_absent() {
+  local deadline=$((SECONDS + ${1:-30}))
+  while (( SECONDS < deadline )); do
+    [[ -z $(service_pid) ]] && return
+    sleep 1
+  done
+  die 'disposable login LaunchAgent still exists after uninstall'
+}
+
+cancel_recorded_runs() {
+  local key run_id status failures=0
+  for key in normal_run_id reboot_run_id; do
+    if ! run_id=$(state_get "$key"); then
+      printf "could not read recorded workflow run field '%s'\n" "$key" >&2
+      failures=1
+      continue
+    fi
+    [[ -z $run_id ]] && continue
+    if ! status=$(gh run view "$run_id" --repo "$repository" --json status --jq .status); then
+      printf "could not inspect recorded workflow run '%s' before cancellation\n" "$run_id" >&2
+      failures=1
+      continue
+    fi
+    [[ $status == completed ]] && continue
+    if ! gh run cancel "$run_id" --repo "$repository" >/dev/null; then
+      printf "could not cancel recorded workflow run '%s'\n" "$run_id" >&2
+      failures=1
+    fi
+  done
+  return "$failures"
+}
+
+wait_for_route() {
+  local run_id=$1 evidence=$2 deadline=$((SECONDS + run_wait_timeout_seconds)) route_state
+  # The route job creates VM demand. Its queue/materialization time must not
+  # consume the separate cold-package/VM preparation budget.
+  while (( SECONDS < deadline )); do
+    gh run view "$run_id" --repo "$repository" --json status,conclusion,jobs >"$evidence/route-state.json"
+    route_state=$(python3 - "$evidence/route-state.json" <<'PY'
+import json,sys
+run=json.load(open(sys.argv[1]))
+routes=[j for j in run.get('jobs',[]) if j.get('name')=='route']
+assert len(routes)<=1, 'ambiguous route jobs'
+if routes and routes[0].get('status')=='completed':
+    assert routes[0].get('conclusion')=='success', 'route did not succeed'
+    guests=[j for j in run.get('jobs',[]) if j.get('name')=='production-provider']
+    assert len(guests)<=1, 'ambiguous VM jobs'
+    if guests:
+        assert guests[0].get('status')!='completed' or guests[0].get('conclusion')=='success', 'VM job already failed'
+        print('ready')
+    else:
+        assert run.get('status')!='completed', 'route produced no VM job'
+        print('waiting')
+else:
+    assert run.get('status')!='completed', 'workflow ended before successful route'
+    print('waiting')
+PY
+) || die "workflow run $run_id route failed; state is preserved at $evidence/route-state.json"
+    [[ $route_state == ready ]] && return
+    sleep "$run_poll_seconds"
+  done
+  die "workflow run $run_id route timed out after $run_wait_timeout_seconds seconds; state is preserved at $evidence/route-state.json"
+}
+
+wait_for_run() {
+  local run_id=$1 evidence=$2 deadline=$((SECONDS + run_wait_timeout_seconds)) status conclusion
+  while (( SECONDS < deadline )); do
+    gh run view "$run_id" --repo "$repository" --json status,conclusion >"$evidence/run-state.json"
+    read -r status conclusion < <(python3 - "$evidence/run-state.json" <<'PY' | tr -d '\r'
+import json, sys
+run=json.load(open(sys.argv[1]))
+print(run.get('status') or '', run.get('conclusion') or '')
+PY
+)
+    if [[ $status == completed ]]; then
+      [[ $conclusion == success ]] || die "workflow run $run_id completed with conclusion '$conclusion'; state is preserved at $evidence/run-state.json"
+      return
+    fi
+    case "$status" in
+      queued|in_progress|pending|requested|waiting) ;;
+      *) die "workflow run $run_id reported unexpected status '$status'; state is preserved at $evidence/run-state.json" ;;
+    esac
+    sleep "$run_poll_seconds"
+  done
+  die "workflow run $run_id did not complete within $run_wait_timeout_seconds seconds; last state is preserved at $evidence/run-state.json"
+}
+
+wait_for_guest_job() {
+  local run_id=$1 expected_runner=$2 evidence=$3 deadline=$((SECONDS + 180)) ready
+  while (( SECONDS < deadline )); do
+    gh api "repos/$repository/actions/runs/$run_id/jobs?per_page=100" >"$evidence/guest-job.json"
+    ready=$(python3 - "$evidence/guest-job.json" "$expected_runner" <<'PY'
+import json, sys
+jobs=[job for job in json.load(open(sys.argv[1])).get('jobs', []) if job.get('name')=='production-provider']
+assert len(jobs)==1, 'expected exactly one native guest job'
+job=jobs[0]
+assert job.get('status')!='completed', 'guest job ended before the recovery test'
+assert job.get('status') in ('queued','in_progress'), 'unexpected guest job state'
+if job['status']=='in_progress':
+    assert job.get('runner_id')==int(sys.argv[2]), 'guest job belongs to another runner/attempt'
+    print('ready')
+else:
+    print('waiting')
+PY
+) || die 'guest job identity/readiness failed; see the retained guest-job.json'
+    [[ $ready == ready ]] && return
+    sleep 10
+  done
+  die 'the exact registered guest runner did not start its job within 180 seconds'
+}
+
+wait_for_registered_runner() {
+  local selector=$1 evidence=$2 deadline=$((SECONDS + 180)) runner_id
+  while (( SECONDS < deadline )); do
+    gh api "repos/$repository/actions/runners?per_page=100" >"$evidence/github-runners.json"
+    runner_id=$(python3 - "$evidence/github-runners.json" "$selector" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1])); required={sys.argv[2].lower()}
+matches=[]
+for runner in document.get('runners', []):
+    labels={str(label.get('name', '')).lower() for label in runner.get('labels', [])}
+    if sys.argv[2].lower() in labels:
+        matches.append((runner, labels))
+if len(matches) > 1:
+    raise SystemExit(f'more than one runner carries acceptance selector {sys.argv[2]}')
+if matches:
+    runner, labels=matches[0]
+    missing=sorted(required-labels)
+    if missing:
+        raise SystemExit(f"runner {runner.get('id')} is missing required labels: {missing}")
+    print(runner['id'])
+PY
+)
+    [[ -z $runner_id ]] || { printf '%s\n' "$runner_id"; return; }
+    sleep 10
+  done
+  die "no GitHub runner registered with every workflow-required label before the 180-second deadline; last inventory is preserved at $evidence/github-runners.json"
+}
+
+assert_status_clean() {
+  local output=$1
+  runner status --json >"$output"
+  python3 - "$output" <<'PY'
+import json, sys
+s=json.load(open(sys.argv[1]))
+h=s['host']
+assert h['active_ephemeral_attempts']==0, s
+assert h['cleanup_blocked_ephemeral_attempts']==0, s
+PY
+}
+
+scan_no_secrets() {
+  local output=$1 bootstrap_logs
+  bootstrap_logs=$(state_get bootstrap_log_root)
+  set -- "$data_dir" "$helper_root"
+  [[ -z $bootstrap_logs ]] || set -- "$@" "$bootstrap_logs"
+  python3 - "$output" "$@" "$evidence_root" <<'PY'
+import os, pathlib, re, sys
+report=pathlib.Path(sys.argv[1]); roots=[pathlib.Path(p) for p in sys.argv[2:]]
+token_shape=re.compile(rb'gh[pousr]_[A-Za-z0-9_]{20,}')
+jit_shape=re.compile(rb'ACTIONS_RUNNER_INPUT_JITCONFIG\s*=')
+token=os.environ.get('GH_TOKEN','').encode()
+scanned=0
+with report.open('w') as out:
+  for root in roots:
+    if not root.exists(): continue
+    for base, dirs, files in os.walk(root):
+      dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base,d))]
+      for name in files:
+        p=pathlib.Path(base,name)
+        try:
+          if p.is_symlink() or p.stat().st_size > 16*1024*1024: continue
+          data=p.read_bytes(); scanned += 1
+        except (OSError, PermissionError): continue
+        checks_jit = root != roots[-1]
+        if token_shape.search(data) or (checks_jit and jit_shape.search(data)) or (token and token in data):
+          raise SystemExit(f'credential-shaped content found in {p}')
+  out.write(f'scanned_files={scanned}\nresult=no-jit-or-token-shaped-content\n')
+assert scanned > 0
+PY
+}
+
+scan_service_process_no_secrets() {
+  local output=$1 pid
+  pid=$(service_pid); [[ -n $pid ]] || die 'cannot scan secrets because the disposable service has no PID'
+  ps eww -p "$pid" -o command= | python3 -c '
+import os, pathlib, re, sys
+data=sys.stdin.buffer.read(); token=os.environ.get("GH_TOKEN","").encode()
+if re.search(rb"ACTIONS_RUNNER_INPUT_JITCONFIG\s*=", data) or re.search(rb"gh[pousr]_[A-Za-z0-9_]{20,}", data) or (token and token in data):
+    raise SystemExit("credential-shaped content found in the disposable service process")
+pathlib.Path(sys.argv[1]).write_text("result=no-jit-or-token-shaped-content\\n")
+' "$output"
+}
+
+new_acceptance_id() { date -u '+%Y%m%d%H%M%S-'; python3 - <<'PY'
+import secrets
+print(secrets.token_hex(4))
+PY
+}
+
+profile_selector() {
+  local profile=$1
+  if [[ ! $profile =~ ^d3-(reboot-)?[0-9]{14}-[0-9a-f]{8}$ ]]; then
+    die "cannot derive a profile selector from invalid acceptance profile '$profile'"
+    return 1
+  fi
+  printf 'rm-d3-acceptance-osx-arm64-%s\n' "$profile"
+}
+
+trigger_label() {
+  local profile=$1
+  if [[ ! $profile =~ ^d3-(reboot-)?[0-9]{14}-[0-9a-f]{8}$ ]]; then
+    die "cannot derive a trigger label from invalid acceptance profile '$profile'"
+    return 1
+  fi
+  printf 'rm-%s\n' "$profile"
+}
+
+dispatch_job() {
+  local label=$1 run_key=$2
+  gh label create "$label" --repo "$repository" --color 8250df \
+    --description "One-time d3 native acceptance trigger for PR $pull_request" || return 1
+  state_set trigger_label "$label" || return 1
+  state_set trigger_label_created true bool || return 1
+  gh pr edit "$pull_request" --repo "$repository" --add-label "$label" >/dev/null || return 1
+  local run_id
+  run_id=$(find_run "$label") || return 1
+  state_set "$run_key" "$run_id" || return 1
+  remove_trigger_label || return 1
+  printf '%s\n' "$run_id"
+}
+
+remove_trigger_label() {
+  local created label
+  created=$(state_get trigger_label_created) || die 'could not read trigger-label ownership from the receipt'
+  [[ $created == true ]] || return 0
+  label=$(state_get trigger_label) || die 'could not read the owned trigger label from the receipt'
+  [[ -n $label ]] || die 'receipt says it owns a trigger label but records no label name'
+  gh pr edit "$pull_request" --repo "$repository" --remove-label "$label" >/dev/null || \
+    die "could not remove one-time label '$label' from PR $pull_request"
+  gh label delete "$label" --repo "$repository" --yes >/dev/null || \
+    die "could not delete one-time repository label '$label'"
+  state_set trigger_label_created false bool
+}
+
+ensure_profile() {
+  local profile=$1 label=$2 evidence=$3
+  runner repo profile add "$repository" --name "$profile" --host-label d3-acceptance \
+    --max-capacity 1 \
+    --execution isolated --backend virtual-machine --image "$image" \
+    --cpu 2000 --memory 4096 --disk "$disk_mib" --enable >"$evidence/profile-add.txt"
+  state_set profile_created true bool
+  state_set profile_name "$profile"
+  state_set unique_label "$label"
+  runner status --json >"$evidence/profile-status.json"
+  local profile_id
+  profile_id=$(python3 - "$evidence/profile-status.json" "$repository" "$profile" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1]))
+matches=[p for p in document['policies'] if p['target']==sys.argv[2] and p['profile_name']==sys.argv[3]]
+assert len(matches)==1, matches
+print(matches[0]['id'])
+PY
+)
+  state_set profile_id "$profile_id"
+  python3 - "$evidence/profile-status.json" "$repository" "$profile" "$label" <<'PY'
+import json, sys
+document=json.load(open(sys.argv[1]))
+matches=[p for p in document['policies'] if p['target']==sys.argv[2] and p['profile_name']==sys.argv[3]]
+assert len(matches)==1 and matches[0]['routing_labels']==[sys.argv[4]], matches
+PY
+}
+
+disable_profile() {
+  local profile=$1
+  if ! printf 'yes\n' | runner repo profile set-scale "$repository" --profile "$profile" --enabled false; then
+    printf "could not disable temporary profile '%s'; resolve the runner-manager error above before retrying cleanup\n" "$profile" >&2
+    return 1
+  fi
+}
+
+purge_profile() {
+  local profile=$1
+  if ! printf 'yes\n' | runner repo profile remove "$repository" --profile "$profile" --purge; then
+    printf "could not remove temporary profile '%s'; resolve the runner-manager error above before retrying cleanup\n" "$profile" >&2
+    return 1
+  fi
+  if runner repo profile show "$repository" --profile "$profile" >/dev/null 2>&1; then
+    printf "temporary profile '%s' still exists after removal\n" "$profile" >&2
+    return 1
+  fi
+}
+
+remove_profile() {
+  local profile=$1
+  disable_profile "$profile" || die "could not disable receipt-owned profile '$profile'"
+  purge_profile "$profile" || die "could not purge receipt-owned profile '$profile'"
+}
+
+destroy_receipt_owned_environments() {
+  local listing directory metadata environment host attempt generation
+  listing=$(owned_environment_dirs) || die 'could not enumerate receipt-owned environments'
+  while IFS= read -r directory; do
+    [[ -n $directory ]] || continue
+    metadata="$directory/metadata.json"
+    [[ -r $metadata ]] || die "cannot prove ownership for '$directory'"
+    read -r environment host attempt generation < <(python3 - "$metadata" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); print(r['environment_id'],r['host_id'],r['attempt_id'],r['generation'])
+PY
+)
+    [[ $environment == rm-* ]] || die 'refusing to destroy an unrecognized environment'
+    if ! helper_command destroy --environment "$environment" --host "$host" --attempt "$attempt" --generation "$generation"; then
+      printf "could not destroy receipt-owned environment '%s'\n" "$environment" >&2
+      return 1
+    fi
+  done <<<"$listing"
+}
+
+preserve_failure_evidence() {
+  local evidence=$1 run_id directory
+  mkdir -p "$evidence"
+  runner status --json >"$evidence/failure-status.json" 2>&1 || true
+  login_service service status >"$evidence/failure-service-status.txt" 2>&1 || true
+  launchctl print "$service_domain/$service_label" >"$evidence/failure-launchd.txt" 2>&1 || true
+  run_id=$(state_get normal_run_id 2>/dev/null || true)
+  if [[ -n $run_id ]]; then
+    gh run view "$run_id" --repo "$repository" --json status,conclusion,jobs \
+      >"$evidence/failure-run.json" 2>&1 || true
+    gh run view "$run_id" --repo "$repository" --log \
+      >"$evidence/failure-workflow.log" 2>&1 || true
+  fi
+  while IFS= read -r directory; do
+    helper_command inspect --environment "$(basename "$directory")" --json \
+      >>"$evidence/failure-environments.jsonl" 2>&1 || true
+  done < <(environment_dirs)
+}
+
+run_job_failure_cleanup() {
+  local original_status=$1 profile failures=0 evidence=$run_job_cleanup_evidence
+  [[ $run_job_cleanup_armed == true && $run_job_cleanup_running == false ]] || return 0
+  run_job_cleanup_armed=false
+  run_job_cleanup_running=true
+  set +e
+  cancel_recorded_runs || failures=1
+  (remove_trigger_label) || failures=1
+  profile=$(state_get profile_name 2>/dev/null || true)
+  if [[ $(state_get profile_created 2>/dev/null || true) == true && -n $profile ]]; then
+    if ! disable_profile "$profile"; then
+      failures=1
+      preserve_failure_evidence "$evidence"
+    else
+      preserve_failure_evidence "$evidence"
+      if ! (destroy_receipt_owned_environments); then
+        failures=1
+      elif ! (wait_no_owned_environments 60); then
+        failures=1
+      elif ! (wait_profile_inactive "$profile" 90); then
+        failures=1
+      elif ! purge_profile "$profile"; then
+        failures=1
+      elif ! state_set profile_created false bool ||
+           ! state_set profile_name '' ||
+           ! state_set cleanup_complete true bool; then
+          printf 'receipt-owned resources were removed, but the cleanup result could not be persisted\n' >&2
+          failures=1
+      fi
+    fi
+  else
+    preserve_failure_evidence "$evidence"
+  fi
+  if [[ $failures -eq 0 ]]; then
+    printf 'run-job failed with status %s; receipt-owned run, profile, and environments were cleaned. Evidence: %s\n' \
+      "$original_status" "$evidence" >&2
+  else
+    printf 'run-job failed with status %s and automatic cleanup was incomplete. Evidence: %s. Re-run cleanup with --allow-cleanup.\n' \
+      "$original_status" "$evidence" >&2
+  fi
+  return 0
+}
+
+run_audit() {
+  milestone 'audit-start login credential and root negative probe pending'
+  [[ ! -e $state_path ]] || die "state '$state_path' already exists; finish cleanup/rollback first"
+  local evidence="$evidence_root/audit-$(date -u +%Y%m%d%H%M%S)"
+  mkdir -m 700 "$evidence"
+  assert_probe_and_image "$evidence"
+  gh auth status --hostname github.com >/dev/null
+  auth_runner auth status --start-at login >"$evidence/runner-auth.txt"
+  root_negative_probes "$evidence"
+  [[ $(environment_count) -eq 0 ]] || die 'helper store already contains environments; resolve them before acceptance'
+  [[ -z $(service_pid) ]] || die "disposable service '$service_label' already exists"
+  [[ ! -e $HOME/Library/Logs/$service_label ]] || die 'disposable bootstrap logs already exist; prove ownership and retain/clean them before audit'
+  local pr_json pr_ref pr_owner repo_owner
+  pr_json=$(gh pr view "$pull_request" --repo "$repository" --json headRefName,headRepositoryOwner,headRefOid)
+  pr_ref=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["headRefName"])' <<<"$pr_json")
+  pr_owner=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["headRepositoryOwner"]["login"])' <<<"$pr_json")
+  local pr_oid
+  pr_oid=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["headRefOid"])' <<<"$pr_json")
+  repo_owner=${repository%%/*}
+  [[ $pr_owner == "$repo_owner" ]] || die "PR $pull_request is not a same-repository pull request"
+  [[ -z $workflow_ref || $workflow_ref == "$pr_ref" ]] || die "--workflow-ref '$workflow_ref' is not PR $pull_request head '$pr_ref'"
+  workflow_ref=$pr_ref
+  local commit
+  commit=$(git -C "$(cd "$(dirname "$0")/.." && pwd)" rev-parse HEAD)
+  [[ $commit == "$pr_oid" ]] || die "local HEAD '$commit' is not PR $pull_request head '$pr_oid'"
+  python3 - "$state_path" "$repository" "$image" "$data_dir" "$runner_manager" "$helper" "$helper_root" "$workflow_ref" "$disk_mib" "$commit" "$(boot_epoch)" <<'PY'
+import hashlib,json,os,pathlib,sys,tempfile
+p=pathlib.Path(sys.argv[1]); binary=pathlib.Path(sys.argv[5])
+doc={'schema_version':1,'phase':'audited','repository':sys.argv[2],'image':sys.argv[3],
+ 'data_dir':sys.argv[4],'runner_manager':sys.argv[5],
+ 'runner_manager_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
+ 'helper':sys.argv[6],'helper_sha256':hashlib.sha256(pathlib.Path(sys.argv[6]).read_bytes()).hexdigest(),
+ 'helper_root':sys.argv[7],'workflow_ref':sys.argv[8],
+ 'disk_mib':int(sys.argv[9]),'git_commit':sys.argv[10],
+ 'audit_boot_epoch':int(sys.argv[11]),'service_installed':False,'profile_created':False,
+ 'bootstrap_log_root':'',
+ 'profile_name':'',
+ 'profile_id':'',
+ 'pull_request':79,'trigger_label':'','trigger_label_created':False,
+ 'normal_run_id':'','normal_runner_id':'','normal_environment_id':'','normal_writable_disk_id':'','reboot_run_id':'',
+ 'reboot_environment_id':'','reboot_writable_disk_id':'',
+ 'prepared_boot_epoch':0,'cleanup_complete':False,'rollback_complete':False}
+p.write_text(json.dumps(doc,sort_keys=True,indent=2)+'\n'); os.chmod(p,0o600)
+PY
+  printf 'Audit passed. Receipt: %s\n' "$state_path"
+  milestone "audit-passed receipt=$state_path"
+}
+
+install_service_and_profile() {
+  local profile=$1 label=$2 evidence=$3
+  require_opt_in "$allow_service_install" --allow-service-install 'installing the disposable login LaunchAgent'
+  require_opt_in "$allow_profile" --allow-profile 'creating the temporary isolated profile'
+  if [[ $(state_get service_installed) != true ]]; then
+    # Audit proved this exact bootstrap directory absent. Record our creation
+    # intent before install, so even a failed install's empty logs are owned.
+    if [[ $data_dir == /Volumes/* ]]; then
+      state_set bootstrap_log_root "$HOME/Library/Logs/$service_label"
+    fi
+    login_service service install --start-at login >"$evidence/service-install.txt"
+    state_set service_installed true bool
+    local bootstrap_logs
+    bootstrap_logs=$(python3 - "$HOME/Library/LaunchAgents/$service_label.plist" "$service_label" "$data_dir" <<'PY'
+import os,pathlib,plistlib,sys
+with open(sys.argv[1], 'rb') as stream: p=plistlib.load(stream)
+assert p['Label']==sys.argv[2], p
+stdout=pathlib.Path(p['StandardOutPath']); stderr=pathlib.Path(p['StandardErrorPath'])
+assert stdout.parent==stderr.parent
+assert stdout.name=='runner-manager.launchd.out.log' and stderr.name=='runner-manager.launchd.err.log'
+internal=pathlib.Path.home()/'Library/Logs'/sys.argv[2]
+private=pathlib.Path(sys.argv[3])/'logs'
+assert stdout.parent in (internal,private), stdout.parent
+if stdout.parent==internal:
+    metadata=internal.lstat()
+    assert not internal.is_symlink() and internal.is_dir()
+    assert metadata.st_uid==os.getuid() and metadata.st_mode & 0o077 == 0
+    print(internal)
+PY
+)
+    state_set bootstrap_log_root "$bootstrap_logs"
+  fi
+  local pid
+  for _ in {1..30}; do pid=$(service_pid); [[ -z $pid ]] || break; sleep 2; done
+  [[ -n $pid ]] || die 'disposable login LaunchAgent did not start'
+  if [[ $(state_get profile_created) == true ]]; then die 'receipt already owns a temporary profile; clean it first'; fi
+  ensure_profile "$profile" "$label" "$evidence"
+}
+
+run_job() {
+  milestone 'normal-job-start disposable login LaunchAgent pending'
+  assert_state_identity
+  [[ $(state_get phase) == audited ]] || die 'run-job requires an audited receipt'
+  [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before run-job'
+  workflow_ref=$(state_get workflow_ref); disk_mib=$(state_get disk_mib)
+  local acceptance_id profile selector trigger evidence run_id env_json before_pid after_pid
+  acceptance_id=$(new_acceptance_id | tr -d '\n')
+  profile="d3-$acceptance_id"
+  selector=$(profile_selector "$profile"); trigger=$(trigger_label "$profile")
+  evidence="$evidence_root/run-$acceptance_id"; mkdir -m 700 "$evidence"
+  run_job_cleanup_evidence="$evidence"
+  run_job_cleanup_armed=true
+  trap 'run_job_failure_cleanup "$?"' EXIT
+  install_service_and_profile "$profile" "$selector" "$evidence"
+  run_id=$(dispatch_job "$trigger" normal_run_id)
+  wait_for_route "$run_id" "$evidence"
+  env_json="$evidence/environment-live.json"
+  capture_single_environment "$env_json" "$environment_wait_timeout_seconds" >/dev/null
+  state_set normal_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
+  state_set normal_writable_disk_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")"
+  state_set normal_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
+  wait_for_guest_job "$run_id" "$(state_get normal_runner_id)" "$evidence"
+  require_opt_in "$allow_service_restart" --allow-service-restart 'forcing a disposable login LaunchAgent crash/restart'
+  before_pid=$(service_pid); [[ -n $before_pid ]] || die 'LaunchAgent PID is unavailable'
+  kill -9 "$before_pid"
+  for _ in {1..60}; do after_pid=$(service_pid); [[ -n $after_pid && $after_pid != "$before_pid" ]] && break; sleep 1; done
+  [[ -n ${after_pid:-} && $after_pid != "$before_pid" ]] || die 'launchd did not restart the login service with a new PID'
+  helper_command inspect --environment "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")" --json >"$evidence/environment-after-service-crash.json"
+  printf '{"old_pid":%s,"new_pid":%s}\n' "$before_pid" "$after_pid" >"$evidence/service-restart.json"
+  wait_for_run "$run_id" "$evidence"
+  gh run view "$run_id" --repo "$repository" --log >"$evidence/workflow.log"
+  grep -F 'RM_ACCEPTANCE guest_os=macos arch=arm64 cpu=2 memory_mib=4096 process_limit=512 host_shares=0 jit_env=absent' "$evidence/workflow.log" >/dev/null || die 'workflow omitted exact guest attestation'
+  grep -F "RM_ACCEPTANCE disk_bytes=$(( disk_mib * 1024 * 1024 )) disk_mib=$disk_mib" "$evidence/workflow.log" >/dev/null || die 'workflow omitted exact boot disk attestation'
+  wait_no_environments 300
+  assert_status_clean "$evidence/status-clean.json"
+  scan_no_secrets "$evidence/host-secret-scan.txt"
+  scan_service_process_no_secrets "$evidence/service-process-secret-scan.txt"
+  remove_profile "$profile"; state_set profile_created false bool; state_set profile_name ''
+  state_set phase normal-job-verified
+  run_job_cleanup_armed=false
+  trap - EXIT
+  printf 'Live JIT job and service-crash recovery passed. Evidence: %s\n' "$evidence"
+  milestone "normal-job-passed evidence=$evidence"
+}
+
+prepare_reboot() {
+  milestone 'reboot-preparation-start'
+  assert_state_identity
+  [[ $(state_get phase) == normal-job-verified ]] || die 'prepare-before-reboot requires a verified normal job'
+  [[ $(environment_count) -eq 0 ]] || die 'helper store is not empty before reboot preparation'
+  workflow_ref=$(state_get workflow_ref); disk_mib=$(state_get disk_mib)
+  local acceptance_id profile selector trigger evidence run_id env_json disk_id
+  acceptance_id=$(new_acceptance_id | tr -d '\n')
+  profile="d3-reboot-$acceptance_id"
+  selector=$(profile_selector "$profile"); trigger=$(trigger_label "$profile")
+  evidence="$evidence_root/reboot-$acceptance_id"; mkdir -m 700 "$evidence"
+  require_opt_in "$allow_profile" --allow-profile 'creating the reboot-recovery profile'
+  ensure_profile "$profile" "$selector" "$evidence"
+  run_id=$(dispatch_job "$trigger" reboot_run_id)
+  wait_for_route "$run_id" "$evidence"
+  env_json="$evidence/environment-before-reboot.json"; capture_single_environment "$env_json" "$environment_wait_timeout_seconds" >/dev/null
+  disk_id=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["writable_disk_id"])' "$env_json")
+  [[ $disk_id != "$(state_get normal_writable_disk_id)" ]] || die 'two attempts reused one writable guest disk identity'
+  state_set reboot_environment_id "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["environment_id"])' "$env_json")"
+  state_set reboot_writable_disk_id "$disk_id"
+  state_set reboot_runner_id "$(wait_for_registered_runner "$selector" "$evidence")"
+  wait_for_guest_job "$run_id" "$(state_get reboot_runner_id)" "$evidence"
+  state_set prepared_boot_epoch "$(boot_epoch)" int
+  state_set phase reboot-prepared
+  install_reboot_continuation
+  printf 'Reboot receipt prepared at %s. Reboot macOS manually; this harness never initiates a reboot.\n' "$state_path"
+  milestone "reboot-prepared continuation=$state_path"
+}
+
+install_reboot_continuation() {
+  local continuation_label='io.github.IvanMurzak.runner-manager-selftest-d3-native-acceptance-recovery'
+  local continuation_dir="$HOME/Library/LaunchAgents"
+  local continuation_plist="$continuation_dir/$continuation_label.plist"
+  local continuation_script="$state_dir/reboot-continuation.sh"
+  local continuation_logs="$HOME/Library/Logs/$continuation_label"
+  [[ ! -e $continuation_plist && ! -e $continuation_script ]] ||
+    die 'a disposable reboot continuation is already present'
+  [[ ! -e $continuation_logs ]] || die 'disposable reboot bootstrap logs already exist'
+  python3 - "$continuation_script" "$continuation_plist" "$continuation_label" \
+    "$(cd "$(dirname "$0")/.." && pwd)/scripts/macos-vm-acceptance.sh" \
+    "$repository" "$image" "$data_dir" "$runner_manager" "$helper" "$helper_root" \
+    "$state_path" "$workflow_ref" "$pull_request" "$disk_mib" "$continuation_dir" \
+    "$(boot_epoch)" "$(dirname "$(command -v gh)")" "$(dirname "$(command -v python3)")" <<'PY'
+import os, pathlib, plistlib, shlex, sys
+(script, plist, label, harness, repository, image, data_dir, runner_manager,
+ helper, helper_root, state, workflow_ref, pull_request, disk_mib, plist_dir,
+ prepared_boot, gh_dir, python_dir) = sys.argv[1:]
+common = [harness, '--repository', repository, '--image', image, '--data-dir', data_dir,
+          '--runner-manager', runner_manager, '--helper', helper, '--helper-root', helper_root,
+          '--state', state, '--workflow-ref', workflow_ref, '--pull-request', pull_request,
+          '--disk-mib', disk_mib]
+def command(phase, *extra):
+    return ' '.join(shlex.quote(x) for x in [harness, phase] + common[1:] + list(extra))
+search_path = ':'.join(dict.fromkeys([gh_dir, python_dir, '/usr/bin', '/bin', '/usr/sbin', '/sbin']))
+bootstrap_logs = pathlib.Path(plist_dir).parent / 'Logs' / label
+bootstrap_logs.mkdir(parents=True, mode=0o700)
+evidence = pathlib.Path(state).parent / 'evidence' / 'reboot-continuation-bootstrap'
+lines = ['#!/bin/sh', 'set -eu',
+         f'PATH={shlex.quote(search_path)}; export PATH',
+         'current_boot=$(sysctl -n kern.boottime | sed -E -n ' +
+         shlex.quote(r's/^[[:space:]]*\{[[:space:]]*sec[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*,.*/\1/p') + ')',
+         'case "$current_boot" in ""|*[!0-9]*) echo "invalid host boot identity" >&2; exit 1;; esac',
+         f'[ "$current_boot" -gt {int(prepared_boot)} ] || exit 0',
+         command('verify-after-reboot'),
+         command('recovery-forensics'), command('cleanup', '--allow-cleanup'),
+         command('rollback', '--allow-rollback'),
+         f'mkdir -p {shlex.quote(str(evidence))}',
+         f'chmod 700 {shlex.quote(str(evidence))}',
+         # Retain these exact owned streams before self-removal. Missing
+         # streams are normal in contract tests, whose launchctl is mocked.
+         *[f'if [ -f {shlex.quote(str(bootstrap_logs / name))} ]; then cp -p {shlex.quote(str(bootstrap_logs / name))} {shlex.quote(str(evidence / name))}; rm -f {shlex.quote(str(bootstrap_logs / name))}; fi'
+           for name in ('stdout.log', 'stderr.log')],
+         f'rmdir {shlex.quote(str(bootstrap_logs))}',
+         # bootout may terminate this process: remove our exact generated files first.
+         f'rm -f {shlex.quote(plist)} {shlex.quote(script)}',
+         f'launchctl bootout gui/501/{label} >/dev/null 2>&1 || true', '']
+pathlib.Path(script).write_text('\n'.join(lines)); os.chmod(script, 0o700)
+pathlib.Path(plist_dir).mkdir(parents=True, exist_ok=True)
+# launchd reads this plist from the internal user Library, but the receipt
+# script may live on an external volume. A RunAtLoad shell cannot open that
+# script before mounting completes. Keep the bounded bootstrap in the plist
+# itself, then execute only the exact owned script once it is readable.
+bootstrap = '\n'.join([
+    'set -eu', f'PATH={shlex.quote(search_path)}; export PATH',
+    'attempt=0',
+    f'while [ ! -r {shlex.quote(script)} ]; do',
+    '  if [ "$attempt" -ge 120 ]; then',
+    '    echo "D3 recovery volume unavailable after 600s; mount it and restart the recovery LaunchAgent" >&2',
+    '    exit 78', '  fi',
+    '  sleep 5', '  attempt=$((attempt + 1))', 'done',
+    f'exec /bin/sh {shlex.quote(script)}', ''])
+document = {'Label': label, 'ProgramArguments': ['/bin/sh', '-c', bootstrap], 'RunAtLoad': True,
+            'ProcessType': 'Background',
+            'StandardOutPath': str(bootstrap_logs / 'stdout.log'),
+            'StandardErrorPath': str(bootstrap_logs / 'stderr.log')}
+with open(plist, 'wb') as stream: plistlib.dump(document, stream, sort_keys=False)
+os.chmod(plist, 0o600)
+PY
+  state_set continuation_label "$continuation_label"
+  state_set continuation_plist "$continuation_plist"
+  state_set continuation_script "$continuation_script"
+  state_set continuation_log_root "$continuation_logs"
+  plutil -lint "$continuation_plist" >/dev/null
+  /bin/sh -n "$continuation_script"
+  launchctl bootstrap gui/501 "$continuation_plist"
+  launchctl print "gui/501/$continuation_label" >/dev/null ||
+    die 'reboot continuation LaunchAgent did not load into gui/501'
+}
+
+verify_reboot() {
+  assert_state_identity
+  [[ $(state_get phase) == reboot-prepared ]] || die 'verify-after-reboot requires a reboot-prepared receipt'
+  local before now evidence run_id profile
+  before=$(state_get prepared_boot_epoch); now=$(boot_epoch)
+  (( now > before )) || die 'host boot identity did not advance; perform a real macOS reboot first'
+  evidence="$evidence_root/reboot-verified-$(date -u +%Y%m%d%H%M%S)"; mkdir -m 700 "$evidence"
+  # Login LaunchAgents have no relative startup order. Give the disposable
+  # service a bounded window to start before collecting recovery evidence.
+  local recovered_pid=''
+  for _ in {1..60}; do recovered_pid=$(service_pid); [[ -z $recovered_pid ]] || break; sleep 2; done
+  [[ -n $recovered_pid ]] || die 'disposable login LaunchAgent did not recover after login'
+  run_id=$(state_get reboot_run_id)
+  gh run cancel "$run_id" --repo "$repository" >/dev/null 2>&1 || true
+  wait_no_environments 600
+  assert_status_clean "$evidence/status-clean.json"
+  login_service service status >"$evidence/service-status.txt"
+  scan_no_secrets "$evidence/host-secret-scan.txt"
+  scan_service_process_no_secrets "$evidence/service-process-secret-scan.txt"
+  profile=$(state_get profile_name); remove_profile "$profile"
+  state_set profile_created false bool; state_set profile_name ''
+  state_set verified_boot_epoch "$now" int; state_set phase reboot-verified
+  printf 'Full host-reboot recovery passed. Evidence: %s\n' "$evidence"
+}
+
+forensics() {
+  assert_state_identity
+  local evidence="$evidence_root/forensics-$(date -u +%Y%m%d%H%M%S)"
+  mkdir -m 700 "$evidence"
+  helper_command probe --json >"$evidence/probe.json" || true
+  login_service service status >"$evidence/service-status.txt" 2>&1 || true
+  runner status --json >"$evidence/status.json" 2>&1 || true
+  launchctl print "$service_domain/$service_label" >"$evidence/launchd.txt" 2>&1 || true
+  while IFS= read -r directory; do
+    helper_command inspect --environment "$(basename "$directory")" --json >>"$evidence/environments.jsonl" || true
+  done < <(environment_dirs)
+  scan_no_secrets "$evidence/host-secret-scan.txt"
+  printf 'Read-only recovery forensics: %s\n' "$evidence"
+}
+
+cleanup() {
+  assert_state_identity; require_opt_in "$allow_cleanup" --allow-cleanup 'acceptance cleanup'
+  local profile profile_id github_failures=0
+  cancel_recorded_runs || github_failures=1
+  (remove_trigger_label) || github_failures=1
+  profile=$(state_get profile_name)
+  profile_id=$(state_get profile_id)
+  if [[ -n $profile && -z $profile_id ]]; then
+    die "receipt-owned profile '$profile' has no durable profile id; refusing unprovable environment cleanup"
+  fi
+  [[ -z $profile ]] || disable_profile "$profile" || die "could not disable receipt-owned profile '$profile'"
+  if [[ -n $profile_id ]]; then
+    destroy_receipt_owned_environments
+    wait_no_owned_environments 60
+  fi
+  [[ -z $profile ]] || wait_profile_inactive "$profile" 90
+  [[ -z $profile ]] || purge_profile "$profile" || die "could not purge receipt-owned profile '$profile'"
+  state_set profile_created false bool; state_set profile_name ''
+  if [[ $github_failures -ne 0 ]]; then
+    die 'local receipt-owned profile and environments were cleaned, but recorded GitHub run or label cleanup was incomplete; retry cleanup'
+  fi
+  state_set cleanup_complete true bool
+  printf 'Owned profiles and helper environments are clean.\n'
+}
+
+rollback() {
+  assert_state_identity; require_opt_in "$allow_rollback" --allow-rollback 'uninstalling the disposable login LaunchAgent and deleting its receipt'
+  [[ $(state_get cleanup_complete) == true ]] || die 'run cleanup successfully before rollback'
+  [[ $(state_get profile_created) == false ]] || die 'cleanup the temporary profile before rollback'
+  [[ $(environment_count) -eq 0 ]] || die 'cleanup helper environments before rollback'
+  if [[ $(state_get service_installed) == true ]]; then login_service service uninstall >/dev/null; fi
+  wait_service_absent 30
+  local bootstrap_logs
+  bootstrap_logs=$(state_get bootstrap_log_root)
+  if [[ -n $bootstrap_logs ]]; then
+    python3 - "$bootstrap_logs" "$service_label" "$evidence_root" <<'PY'
+import os,pathlib,shutil,stat,sys
+root=pathlib.Path(sys.argv[1]); expected=pathlib.Path.home()/'Library/Logs'/sys.argv[2]
+assert root==expected and not root.is_symlink(), root
+if not root.exists(): raise SystemExit(0)
+metadata=root.lstat()
+assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid==os.getuid()
+allowed={'runner-manager.launchd.out.log','runner-manager.launchd.err.log'}
+files=list(root.iterdir()); assert all(p.name in allowed for p in files), files
+out=pathlib.Path(sys.argv[3])/'launchd-bootstrap'; out.mkdir(mode=0o700,exist_ok=True)
+assert not out.is_symlink() and out.lstat().st_uid==os.getuid()
+for source in files:
+    m=source.lstat(); assert stat.S_ISREG(m.st_mode) and m.st_uid==os.getuid(), source
+    shutil.copy2(source,out/source.name)
+for source in files: source.unlink()
+root.rmdir()
+PY
+  fi
+  local archived_receipt="$evidence_root/rollback-receipt-$(date -u +%Y%m%d%H%M%S)-$$.json"
+  [[ ! -e $archived_receipt ]] || die 'rollback evidence receipt already exists'
+  cp -p "$state_path" "$archived_receipt"
+  rm -f "$state_path"
+  printf 'Disposable service and receipt rolled back. Evidence remains at %s\n' "$evidence_root"
+}
+
+case "$phase" in
+  audit) run_audit ;;
+  run-job) run_job ;;
+  prepare-before-reboot) prepare_reboot ;;
+  verify-after-reboot) verify_reboot ;;
+  recovery-forensics) forensics ;;
+  cleanup) cleanup ;;
+  rollback) rollback ;;
+esac

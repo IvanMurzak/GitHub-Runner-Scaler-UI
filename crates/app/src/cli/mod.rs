@@ -476,6 +476,15 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true, env = DATA_DIR_VARIABLE)]
     pub data_dir: Option<PathBuf>,
 
+    /// Reuse the existing platform credential for local policy/report commands.
+    ///
+    /// Requires --data-dir. Config/state remain private under that directory;
+    /// only credential lookup matches the installed service's recorded start
+    /// mode. This never exports or copies a credential and cannot be used for
+    /// auth, daemon, service, TUI or remote-host commands.
+    #[arg(long, global = true, requires = "data_dir")]
+    pub use_platform_credential: bool,
+
     /// Which host this command is addressed to: `local`, or `wsl:NAME`.
     ///
     /// `local` is the default and is this machine, exactly as before. With
@@ -786,6 +795,15 @@ pub struct AuthReceiveArgs {
 
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {
+    /// Which start mode's credential store to inspect.
+    ///
+    /// An explicit value selects that scope without consulting or changing the
+    /// start mode recorded for this host. This is useful when auditing the
+    /// credential a boot service will read while the production host record
+    /// names a login service. Without this flag, the recorded mode is used.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: Option<StartAt>,
+
     /// Name every repository the credential reaches, instead of counting them.
     ///
     /// An installation on a large account reaches hundreds, and printing them
@@ -964,6 +982,8 @@ pub enum BackendMode {
 pub struct IsolationArgs {
     #[arg(long, value_enum)]
     pub backend: Option<BackendMode>,
+    /// Immutable image identity. Virtual-machine references use
+    /// vm-version:<version>@sha256:<template-digest>.
     #[arg(long)]
     pub image: Option<String>,
     #[arg(long)]
@@ -1472,6 +1492,20 @@ impl Context {
         &self.endpoints
     }
 
+    fn reuse_platform_credential(&mut self) -> Result<(), CliError> {
+        let production = Endpoints::production();
+        if self.endpoints.api_base() != production.api_base()
+            || self.endpoints.web_base() != production.web_base()
+        {
+            return Err(CliError::new(
+                Failure::InvalidArgument,
+                "platform credentials cannot be reused with overridden GitHub endpoints",
+            ));
+        }
+        self.data_root = None;
+        Ok(())
+    }
+
     #[must_use]
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::clone(&self.clock)
@@ -1681,6 +1715,10 @@ pub fn dispatch() -> ExitCode {
     // command line the operator did not write.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = Cli::parse_from(&argv);
+    if let Err(failure) = validate_platform_credential_reuse(&cli) {
+        let _ = failure.render(&mut io::stderr());
+        return ExitCode::from(failure.class().code());
+    }
 
     // A Windows service process is not an ordinary console process. SCM
     // requires its main thread to enter StartServiceCtrlDispatcher, and kills
@@ -1750,12 +1788,39 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Cl
     run_with_shutdown(cli, out, err, None)
 }
 
+fn validate_platform_credential_reuse(cli: &Cli) -> Result<(), CliError> {
+    if cli.use_platform_credential
+        && (cli.data_dir.is_none()
+            || cli.host.distribution().is_some()
+            || !matches!(
+                cli.command,
+                Command::Repo(_) | Command::Org(_) | Command::Host(_) | Command::Status(_)
+            ))
+    {
+        return Err(CliError::new(
+            Failure::InvalidArgument,
+            "--use-platform-credential requires --data-dir and a local repo, org, host or status command; authentication and services retain their own credential-store rules",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_operator_context(cli: &Cli, err: &mut dyn Write) -> Result<Context, CliError> {
+    validate_platform_credential_reuse(cli)?;
+    let mut context = Context::resolve(cli.data_dir.as_deref(), err)?;
+    if cli.use_platform_credential {
+        context.reuse_platform_credential()?;
+    }
+    Ok(context)
+}
+
 fn run_with_shutdown(
     cli: &Cli,
     out: &mut dyn Write,
     err: &mut dyn Write,
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
+    validate_platform_credential_reuse(cli)?;
     let service_paths = match &cli.command {
         Command::Daemon(DaemonCommand::Run(args)) => args.service_paths(),
         _ => None,
@@ -1777,7 +1842,7 @@ fn run_with_shutdown(
     };
     let context = match service_paths {
         Some(paths) => Context::resolve_service(paths, err)?,
-        None => Context::resolve(cli.data_dir.as_deref(), err)?,
+        None => resolve_operator_context(cli, err)?,
     };
 
     // Diagnostics go to `logs/`, redacted by `d1`'s allowlist sink. A CLI that
@@ -2270,6 +2335,87 @@ fn local_display_name() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn platform_credential_reuse_preserves_private_paths_and_is_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let private_root = root.path().to_str().unwrap();
+        let ordinary =
+            Cli::try_parse_from(["runner-manager", "--data-dir", private_root, "status"]).unwrap();
+        let reused = Cli::try_parse_from([
+            "runner-manager",
+            "--data-dir",
+            private_root,
+            "--use-platform-credential",
+            "status",
+        ])
+        .unwrap();
+        let mut warnings = Vec::new();
+        let ordinary_context = resolve_operator_context(&ordinary, &mut warnings).unwrap();
+        let reused_context = resolve_operator_context(&reused, &mut warnings).unwrap();
+        assert_eq!(ordinary_context.data_root.as_deref(), Some(root.path()));
+        assert!(reused_context.data_root.is_none());
+        assert_eq!(
+            ordinary_context.paths.config_dir(),
+            reused_context.paths.config_dir()
+        );
+        assert_eq!(
+            ordinary_context.paths.state_dir(),
+            reused_context.paths.state_dir()
+        );
+        assert_eq!(
+            ordinary_context.paths.config_dir(),
+            root.path().join("config")
+        );
+        assert!(
+            !root.path().join("secrets").exists(),
+            "no credential was copied or exported"
+        );
+        assert!(
+            Cli::try_parse_from(["runner-manager", "--use-platform-credential", "status",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn platform_credential_reuse_rejects_auth_services_tui_and_remote_before_io() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("never-created");
+        for command in [
+            vec!["auth", "login"],
+            vec!["auth", "logout"],
+            vec!["daemon", "run"],
+            vec!["service", "install"],
+            vec!["tui"],
+            vec!["--host", "wsl:Ubuntu", "status"],
+        ] {
+            let mut argv = vec![
+                "runner-manager",
+                "--data-dir",
+                absent.to_str().unwrap(),
+                "--use-platform-credential",
+            ];
+            argv.extend(command);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let error = resolve_operator_context(&cli, &mut Vec::new()).unwrap_err();
+            assert_eq!(error.class(), Failure::InvalidArgument);
+            assert!(!absent.exists());
+        }
+    }
+
+    #[test]
+    fn platform_credential_reuse_cannot_send_a_live_credential_to_fixture_endpoints() {
+        let root = tempfile::tempdir().unwrap();
+        let mut context = Context::rooted_against(
+            root.path(),
+            Endpoints::for_test_server("http://127.0.0.1:1").unwrap(),
+        )
+        .unwrap();
+        let error = context.reuse_platform_credential().unwrap_err();
+        assert_eq!(error.class(), Failure::InvalidArgument);
+        assert_eq!(context.data_root.as_deref(), Some(root.path()));
+        assert!(!root.path().join("secrets").exists());
+    }
+
     use clap::CommandFactory as _;
 
     /// The whole point of the taxonomy: two classes must never share a number,
@@ -2395,6 +2541,7 @@ mod tests {
                 "auth status" => auth::status(
                     &context,
                     &AuthStatusArgs {
+                        start_at: None,
                         list: false,
                         permissions: false,
                     },

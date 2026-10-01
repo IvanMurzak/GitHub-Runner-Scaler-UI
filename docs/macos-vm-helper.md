@@ -1,0 +1,465 @@
+# macOS VM helper protocol
+
+Runner Manager can execute an isolated macOS profile through an
+operator-installed helper backed by Apple's Virtualization.framework. Runner
+Manager does not download, install, patch, or select macOS restore images. The
+operator owns the helper and a compatible, pinned VM template.
+
+Apple documents CPU and memory as `VZVirtualMachineConfiguration` properties,
+and virtio sockets as the host/guest port-based communication device. Process
+count is not a Virtualization.framework VM configuration property, so this
+protocol requires the helper's guest bootstrap to enforce it inside the guest:
+[VM configuration](https://developer.apple.com/documentation/virtualization/vzvirtualmachineconfiguration),
+[virtio socket configuration](https://developer.apple.com/documentation/virtualization/vzvirtiosocketdeviceconfiguration).
+
+The executable defaults to `/usr/local/libexec/runner-manager-macos-vm`, the
+installer's absolute path, so a LaunchAgent's minimal `PATH` can resolve it. Set
+`RUNNER_MANAGER_MACOS_VM_HELPER` to an absolute executable path when the helper
+is installed elsewhere. The daemon service account must be able to execute the
+helper and access its template and VM store.
+
+Virtualization.framework VM lifecycle operations are supported only from a
+logged-in GUI user session. On macOS, install the Runner Manager service as a
+login LaunchAgent with `runner-manager service install --start-at login` when
+the service uses this provider. A boot LaunchDaemon is intentionally rejected
+by the helper before preparation or JIT handoff; it cannot be repaired by Full
+Disk Access. This is an Apple platform constraint documented by [Apple DTS on
+launch daemons](https://developer.apple.com/forums/thread/841688) and [Apple
+DTS on launch agents](https://developer.apple.com/forums/thread/786363).
+
+This repository ships the native helper as a Swift package in
+`native/macos-vm-helper`. Install it on the VM host with a signing identity:
+
+```sh
+native/macos-vm-helper/install.sh --signing-identity 'Developer ID Application: Example (TEAMID)'
+```
+
+Run the installer as the logged-in owner, without a leading `sudo`. Building
+and signing use the existing login keychain; only the final system-path
+installation requests normal interactive `sudo`.
+
+The installer builds the helper, signs it with
+`com.apple.security.virtualization`, verifies the resulting signature, and
+installs it at `/usr/local/libexec/runner-manager-macos-vm` with a command link
+in `/usr/local/bin`. `--signing-identity -` is useful for a local development
+build, but is not production signing evidence. `probe` verifies the running
+executable's signature and entitlement with Security.framework rather than
+assuming that the entitlement file used at build time survived installation.
+
+The helper targets macOS 13 or later. Apple documents
+[`VZMacPlatformConfiguration`](https://developer.apple.com/documentation/virtualization/vzmacplatformconfiguration)
+as the platform configuration for macOS guests on Apple silicon. The package
+is compiled and unit-tested on both GitHub-hosted ARM64 and Intel Macs, but the
+Intel binary reports the macOS VM capability unavailable. An Intel compile is
+not evidence that an Intel host can boot this macOS guest configuration.
+The exact native operations exercised on hosted runners, and the remaining
+operator-hardware acceptance boundary, are recorded in
+[macOS VM hosted-native evidence](macos-vm-hosted-native-evidence.md).
+
+Every invocation begins with `--protocol-version 1`. Successful read commands
+write one JSON value to stdout and nothing sensitive to stderr. Responses are
+limited to 64 KiB. Exit code 66 means a named image or environment is absent,
+77 means permission was denied, and 78 means the request or protocol is not
+supported. Other nonzero exits report a degraded helper.
+Runner Manager gives helper operations a five-minute deadline covering JIT
+stdin, bounded stdout, and process completion. `prepare`, which runs before
+JIT issuance and performs cold file I/O, has a separate 20-minute deadline; its
+runner archive is bounded to 15 minutes inside the helper. `start` has a
+10-minute controller envelope: boot/connection and private handoff each have
+their own 240-second deadline. A late but valid connection cannot consume the
+archive-transfer budget, and an expired boot cannot restart its budget.
+Private-channel descriptors are nonblocking so backpressure cannot hide inside
+a blocking write past its deadline. Acceptance similarly separates preparation
+from one 660-second readiness window for one immutable environment/disk identity.
+On expiry Runner
+Manager terminates the helper and reports a typed timeout diagnostic; no
+operation retries a JIT handoff.
+
+Runner Manager captures at most 4 KiB of helper stderr, but accepts only exact,
+closed diagnostics emitted by this repository's helper. It never copies
+arbitrary stderr, guest output, environment values, paths, or credentials into
+provider failures. A store permission failure is reported as a typed
+service-account permission problem instead of the generic degraded state.
+
+The native supervisor records fixed lifecycle stage names in macOS unified
+logging under subsystem `io.github.IvanMurzak.runner-manager.macos-vm`, category
+`supervisor`: configuration, boot, connect, handoff, running, exited, failed.
+These diagnostics contain no guest data, error descriptions, paths or JIT;
+they identify the last reached stage even after an unsuccessful attempt is
+cleaned. They are diagnostic checkpoints, not native acceptance evidence.
+
+The disposable archive preserves the upstream listener as
+`bin/.Runner.Listener.rmv1-real` and overlays `bin/Runner.Listener` with the
+signed helper's guest-only launcher. The source package and pinned template
+are not modified. This entry point requires real and effective UID 499 and
+exactly `run`; it performs no VM lifecycle operations. It
+passes JIT only through the child's environment and erases it from the
+wrapper's process environment before spawning. Listener output is drained
+without forwarding or writing files, with at most 64 KiB retained in memory
+for closed failure classification, then erased. Success remains exit 0;
+wrapper failures return 110 (permission), 111 (configuration), 112 (runtime),
+113 (security/keychain), or 114 (unclassified). These are wrapper diagnostic
+exits, not the upstream listener's original failure status. Only these fixed
+numeric categories reach host diagnostics over the existing private reply.
+
+## Readiness and image contract
+
+`probe --json` returns:
+
+```json
+{
+  "protocol_version": 1,
+  "architecture": "arm64",
+  "user_session": true,
+  "virtualization_framework": true,
+  "macos_guest_entitlement": true,
+  "private_jit_channel": true,
+  "fresh_writable_disks": true,
+  "resource_limits": true,
+  "process_limits": true
+}
+```
+
+`user_session` is true only when the helper is a non-root process belonging to
+the current logged-in console user. A false value is a degraded readiness
+state with the remedy `runner-manager service install --start-at login`.
+
+`architecture` is `arm64` or `x86_64` and must equal the host architecture.
+Runner Manager refuses the provider before asking GitHub for JIT configuration
+unless every boolean is true.
+
+`image inspect --image vm-version:<version>@sha256:<template-digest> --json`
+returns:
+
+```json
+{
+  "protocol_version": 1,
+  "image": "vm-version:macos-15.1-arm64-v3@sha256:<64 lowercase hex characters>",
+  "template_digest": "<the same 64 hex characters>",
+  "guest_os": "macos",
+  "architecture": "arm64",
+  "immutable": true,
+  "bootstrap_ready": true
+}
+```
+
+The response must repeat the requested image exactly and independently report
+the same template digest. A version label without a digest, a digest mismatch,
+a Linux guest, a mutable template, an architecture mismatch, or a template
+without the runner bootstrap is rejected before JIT. Mutable aliases such as
+`latest` cannot be expressed by the `vm-version:` image grammar. The digest is
+the immutable identity of the installed bootable template, not merely the
+restore-image download; changing any template content requires a new digest.
+
+### Registering a template
+
+Start with a macOS VM installed using Apple's
+[installation procedure](https://developer.apple.com/documentation/virtualization/installing-macos-on-a-virtual-machine).
+Install the guest bootstrap described below as a boot LaunchDaemon, shut the VM
+down, and register its disk, auxiliary storage, and serialized hardware model:
+
+```sh
+sudo runner-manager-macos-vm --protocol-version 1 template register \
+  --version macos-15.1-arm64-v3 \
+  --architecture arm64 \
+  --disk-mib 32768 \
+  --bootstrap-port 22022 \
+  --disk /path/to/VM.bundle/Disk.img \
+  --auxiliary-storage /path/to/VM.bundle/AuxiliaryStorage \
+  --hardware-model /path/to/VM.bundle/HardwareModel
+```
+
+The command copies the artifacts into the helper's mode-0700 template store,
+hashes the stored copies before publishing them, makes them read-only, and
+returns a manifest containing the complete pinned image reference. Its SHA-256
+identity covers the version, guest OS, architecture, exact logical disk size,
+the SHA-256 of all three artifacts, the bootstrap protocol and port, and the
+process-limit contract. Registration is the trust boundary: `image inspect`,
+readiness, preparation, and recovery validate the digest-bound manifest and
+helper-owned read-only layout without repeatedly reading the entire VM disk.
+
+An operator can perform the same authoritative byte-for-byte verification at
+any time, and the native acceptance audit does so before installing its
+profile:
+
+```sh
+sudo runner-manager-macos-vm --protocol-version 1 template verify \
+  --image 'vm-version:macos-15.1-arm64-v3@sha256:<digest>' --json
+```
+
+If an artifact is changed outside the registration command, verification fails
+closed; register the changed template under a new version and digest. The
+writable disk limit must equal the template disk's logical size; the helper
+never claims that Virtualization.framework can shrink an installed macOS disk.
+
+Apple requires each virtual Mac to retain compatible hardware-model and
+auxiliary-storage data, and requires unique machine identity for concurrently
+running VMs. The helper therefore creates a fresh machine identifier and a
+fresh APFS clone of both the disk and auxiliary storage for every attempt. If
+the store volume cannot perform a real `clonefile(2)` copy-on-write clone, probe
+or prepare fails closed.
+
+## Environment lifecycle
+
+`prepare` receives an environment name, host ID, attempt ID, random generation,
+pinned image and template digest, host architecture, CPU/memory/disk limits, a
+locked `--process-limit 512`, and the extracted runner source directory. It also
+always receives:
+
+```text
+--fresh-writable-disk --no-host-shares --private-jit-channel
+```
+
+The helper clones a new writable disk, copies the runner into the guest, and
+prepares the private guest-control channel. It must not mount the source path or
+any host home, application-data directory, credential store, runtime socket,
+device, or prior attempt disk into the VM.
+
+The native helper archives the already-extracted runner into the private
+environment bundle during `prepare`. On boot it transmits that archive over the
+virtio socket before transmitting JIT. It never configures a directory-sharing
+device, so neither the runner source path nor any other host path is visible to
+the guest. The guest must finish copying and verifying the archive before it
+accepts JIT.
+
+`inspect --environment <id> --json` and `list --host <host-id> --json` return one
+record or an array of records with this shape:
+
+```json
+{
+  "protocol_version": 1,
+  "environment_id": "rm-<attempt>-<generation>",
+  "state": "prepared",
+  "host_id": "<uuid>",
+  "attempt_id": "<uuid>",
+  "generation": "<random generation>",
+  "image": "vm-version:macos-15.1-arm64-v3@sha256:<digest>",
+  "template_digest": "<digest>",
+  "guest_os": "macos",
+  "architecture": "arm64",
+  "writable_disk_id": "<unique nonempty id>",
+  "fresh_writable_disk": true,
+  "shared_host_paths": [],
+  "jit_channel": "private",
+  "applied_cpu_millis": 2000,
+  "applied_memory_mib": 4096,
+  "applied_disk_mib": 32768,
+  "applied_process_limit": 512,
+  "runner_exit_code": null
+}
+```
+
+States are `prepared`, `booting`, `running`, `exited`, or `stopped`. The helper
+sets `runner_exit_code` only after the runner exits. Runner Manager trusts no
+resource for destructive work unless host, attempt, generation, image, guest
+OS, architecture, fresh-disk, share, and channel metadata all match the durable
+attempt journal. Before JIT, all four applied limits must exactly equal the
+policy request and locked process baseline. A helper that cannot enforce or
+report the guest process limit must return readiness with
+`process_limits: false`; Runner Manager then fails closed.
+
+`start --environment <id> --jit-stdin` reads the complete encoded JIT document
+from stdin. The helper sends it through the private guest channel, places it
+only in `Runner.Listener`'s initial environment, erases the handoff, and returns
+success only after the guest accepted it. The JIT document must never enter VM
+configuration, command arguments, files, disks, logs, or resource metadata.
+
+The helper process that answers `start` launches a detached, per-environment
+supervisor. That supervisor owns the `VZVirtualMachine` for its lifetime and
+writes its PID plus a random generation token to private durable metadata. A
+later invocation regards that PID as live only if `KERN_PROCARGS2` still shows
+the exact supervisor mode and token; this prevents PID reuse from turning
+`stop` into a signal to an unrelated process. The public `inspect` and `list`
+documents never include those recovery fields.
+
+### Required guest bootstrap protocol
+
+The repository does **not** ship this guest program. The operator who prepares
+the pinned image must install a boot LaunchDaemon implementing the contract
+below and validate that image with the native acceptance harness. The shipped
+Swift executable is the host helper: it configures Virtualization.framework,
+owns VM resources and speaks RMV1 to the operator-provided guest component.
+Template registration records the operator's assertion that the bootstrap is
+present; only a real boot and acknowledgement can establish acceptance
+evidence.
+
+Virtualization.framework has CPU-count and memory-size configuration and a
+fixed-size disk attachment, but it has no process-tree limit. A template may
+set `bootstrap_ready: true` only when it contains a boot LaunchDaemon that
+implements all of this protocol:
+
+1. Listen only on the manifest's virtio-socket port. Do not listen on TCP, a
+   shared directory, a serial port, or a host-mounted filesystem.
+2. Read the four bytes `RMV1`, then an unsigned big-endian 32-bit JSON-header
+   length, the JSON header, exactly `runner_archive_bytes` archive bytes, and
+   exactly `jit_bytes` JIT bytes. Reject extra, short, oversized, duplicate, or
+   wrong-generation requests. The header names only lengths, identities,
+   SHA-256, and controls; it never contains JIT.
+3. Verify the runner archive SHA-256, extract it into a new attempt directory
+   without permitting absolute paths, `..`, or links that escape that
+   directory, then erase the received archive. Never write JIT to a file,
+   disk-backed log, command argument, VM metadata, or crash report.
+4. Use a dedicated, non-admin runner UID that has no other processes and cannot
+   call `setuid`. In the runner child, drop supplementary groups and switch to
+   that UID, call `setrlimit(RLIMIT_NPROC)` with both soft and hard values equal
+   to 512, and confirm both values with `getrlimit`. The child must acknowledge
+   those values to the bootstrap over an inherited pipe immediately before
+   `exec`, so the bootstrap is attesting the process that will become
+   `Runner.Listener`, not its own limit.
+5. Put the received value only in
+   `ACTIONS_RUNNER_INPUT_JITCONFIG` for the initial environment of
+   `bin/Runner.Listener run`. Erase every bootstrap copy before returning an
+   `accepted` reply. The reply is a big-endian 32-bit length followed by JSON
+   containing protocol version, `status: "accepted"`, environment, generation,
+   runner PID, `applied_process_limit: 512`,
+   `process_limit_mechanism: "rlimit_nproc_dedicated_uid"`, and
+   `runner_uid_exclusive: true`.
+6. Keep the socket open. After the runner exits, send one more framed JSON reply
+   with `status: "exited"` and `runner_exit_code`, then close it. Do not include
+   JIT, environment values, runner output, or file paths in either reply.
+
+The host helper rejects the start unless the acknowledgement matches every
+field exactly. A template without this bootstrap cannot be registered as
+native acceptance evidence, and a future bootstrap using a different process
+control needs a new template schema and helper implementation. Compilation,
+mock replies, or a manifest assertion do not satisfy this gate.
+
+`stop` and `destroy` receive the environment, host, attempt, and generation.
+They are idempotent. `destroy` removes the writable disk and VM configuration;
+`inspect` must then report absence with exit code 66. `list` remains discovery
+only: Runner Manager quarantines unmatched resources and never deletes from
+enumeration alone.
+
+CPU requests must be an exact multiple of 1000 millis because
+`VZVirtualMachineConfiguration.cpuCount` is an integer. Memory MiB is converted
+exactly to bytes and checked against the framework's allowed range. The helper
+calls `validate()` on the final configuration and reports the requested values
+only after validation. Disk enforcement is the exact logical size of the
+verified template and its fresh writable clone. Unsupported fractional CPU,
+memory, disk, bootstrap, signing, or host-architecture combinations fail
+before JIT is requested or consumed.
+
+## Operator validation
+
+The interactive operator and a boot LaunchDaemon can have different macOS
+volume access. The helper store must be reachable by the service context as
+well as by the account that registered the template. This is especially
+relevant when the default path under `/Library/Application Support` is a
+symlink to `/Volumes`: a successful interactive `probe` or `image inspect`
+does not prove that the background service can open the target volume. Move the
+store to a service-accessible volume or grant the signed helper the required
+volume access before enabling the profile.
+
+Run `runner-manager host isolation status` as the daemon service account. This
+reports host prerequisites only because it has no policy image. A ready helper
+still does not make an incompatible profile ready: enabling or starting a
+profile checks that policy's exact version and template digest before JIT and
+names the failing image in its remedy.
+
+Native support is a platform gate. Protocol unit tests cover ownership,
+recovery behavior, fresh disks, resource arguments, and secret transport on
+every development host, but release acceptance must exercise real Apple-silicon
+hardware, the only architecture on which this provider currently declares
+native macOS guests available. Intel CI remains a required fail-closed probe.
+
+### Reproducible native acceptance
+
+GitHub-hosted ARM64 macOS runners cannot perform this gate because nested
+virtualization is unavailable. Use a physical Apple-silicon Mac or a dedicated
+bare-metal Apple-silicon host. Install the signed helper and register the
+operator-prepared template first, build the PR's `runner-manager` release
+binary, and authenticate the logged-in operator's existing user-scoped store
+with `target/release/runner-manager auth status --start-at login`. If it is not
+already authenticated, perform the normal interactive login once as the
+operator; the harness never starts a second OAuth flow. The disposable data
+and helper roots below are user-owned. The harness runs as `ivanmurzak`,
+registers only a `gui/501` LaunchAgent with `--start-at login`, and separately
+proves that root probe/prepare fail before resource creation with the login
+remedy. GitHub CLI authentication comes from the operator's existing safe
+store; no token is placed in argv, files, logs, or the service environment.
+
+```sh
+common=(
+  --repository OWNER/REPO
+  --image 'vm-version:macos-15.1-arm64-v3@sha256:<digest>'
+  --data-dir /Volumes/NVME/runner-manager-d3/data
+  --runner-manager "$PWD/target/release/runner-manager"
+  --helper /usr/local/libexec/runner-manager-macos-vm
+  --helper-root /Volumes/NVME/runner-manager-d3/helper-store
+  --disk-mib 47684
+  --pull-request 79
+  --workflow-ref worktree-01a0ac40-2810-7021-8119-413dbbb9884a
+)
+
+scripts/macos-vm-acceptance.sh audit "${common[@]}"
+scripts/macos-vm-acceptance.sh run-job "${common[@]}" \
+  --allow-service-install --allow-profile --allow-service-restart
+scripts/macos-vm-acceptance.sh prepare-before-reboot "${common[@]}" \
+  --allow-profile
+# Reboot macOS manually. The disposable login continuation resumes after the
+# next console login, runs verify/forensics/cleanup/rollback, and removes itself.
+```
+
+The continuation validates its shell/plist before loading, waits for a changed
+host boot identity, and resolves `gh`/`python3` without relying on LaunchAgent
+shell setup. An internal-plist bootstrap waits up to 600 seconds for an external
+receipt-script volume to mount before opening the script. A mount timeout gives
+an actionable retry message and preserves recovery files. A failed recovery
+retains the continuation and evidence for retry;
+successful recovery removes its files before unloading its own launchd job.
+
+`audit` refuses a non-ARM host, a virtual host where
+`VZVirtualMachine.isSupported` is false, a missing entitlement, non-APFS clone
+support, a byte-for-byte verification failure for the digest-pinned template,
+an existing helper resource, or missing GitHub/product authentication in the
+standard login-service credential store. `run-job` requires exact 2 CPU, 4096
+MiB, template-sized disk and 512-process attestations, no host shares, a fresh
+writable-disk identity, guest secret scans, and launchd restart/adoption while
+the job is live. `prepare-before-reboot` creates a second fresh-disk identity
+and durable receipt. `verify-after-reboot` requires the boot epoch to advance,
+the login LaunchAgent to return, provider resources and capacity to reach zero,
+and host secret scans to pass. After host reboot the helper and VM are gone;
+owned orphan/capacity cleanup resumes at the next console login when the
+LaunchAgent starts. Cleanup and rollback require separate flags and
+act only on identities stored in the receipt. The harness creates, applies, and
+deletes a unique repository label for each job. That `pull_request:labeled`
+trigger is deliberate: GitHub does not register a new `workflow_dispatch`
+workflow from an unmerged PR, so a dispatch-only gate could not validate the PR
+before merge. The workflow is pinned to same-repository PR 79 and rejects every
+other event.
+
+For disposable policy configuration, the harness explicitly uses
+`--data-dir <private-dir> --use-platform-credential`. Config/state and attempt
+history stay disposable, while credential lookup uses the existing platform
+store for the host's recorded start mode, just as the login service does.
+The opt-in is limited to local policy/host/report commands; it cannot alter
+auth, daemon, service, remote-host or TUI credential semantics. Plain
+`--data-dir` continues to select its own rooted secret store. No credential
+is exported, duplicated or logged, and no second OAuth flow is started.
+Overridden GitHub endpoints are refused before platform credential lookup.
+
+When disposable data lives on an external volume, launchd's pre-exec stdout
+and stderr are kept in the user-owned internal
+`~/Library/Logs/<disposable-service-label>/` (mode0700). The daemon's captured
+config, state, runtime and structured logs remain under the private data root.
+macOS can deny launchd opening an external-volume stdout even while the
+signed GUI daemon itself can access that volume. This is distinct from the
+unsupported root/boot Virtualization.framework context. The harness records
+these bootstrap logs, includes them in secret forensics, and preserves them
+in evidence before removing their exact owned directory during rollback.
+
+The PR79-only route gate performs fixed label validation on a GitHub-hosted
+Ubuntu runner, independently of the production Mac runner queue. It checks
+same-repository PR79 and exports only the reviewed disposable selector; it
+does not check out or execute repository scripts. The actual attestation job
+still requires the separate immutable VM profile selector on the Mac. The
+harness times out route scheduling separately from native VM preparation, so
+a delayed metadata gate cannot be mistaken for a VM startup failure.
+
+The Swift CI jobs establish source compatibility on GitHub-hosted ARM64 and
+Intel machines. Native acceptance still requires an operator-signed helper, a
+real bootstrap-ready pinned image, APFS clone verification, a successful real
+VM boot and JIT job, limit observation inside the guest, cleanup/recovery after
+host-process failure, and the applicable Apple hardware/OS combinations. The
+current helper deliberately reports unavailable for an Intel macOS guest; an
+Intel package build is not a substitute for that missing platform capability.

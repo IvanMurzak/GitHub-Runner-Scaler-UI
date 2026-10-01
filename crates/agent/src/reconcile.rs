@@ -5421,6 +5421,10 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             (
+                "lifecycle/macos_vm.rs",
+                include_str!("lifecycle/macos_vm.rs"),
+            ),
+            (
                 "lifecycle/windows_hyperv.rs",
                 include_str!("lifecycle/windows_hyperv.rs"),
             ),

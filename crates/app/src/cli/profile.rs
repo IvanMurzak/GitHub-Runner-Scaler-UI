@@ -204,22 +204,23 @@ pub fn dispatch(
             policy
                 .set_execution_policy(execution)
                 .map_err(|error| CliError::new(Failure::InvalidArgument, error.to_string()))?;
-            if policy.enabled()
-                && !policy.execution_policy().is_native()
-                && PlatformExecutionProvider::new(policy.host_id).probe(&policy)
-                    != ProviderCapability::Ready
-            {
-                return Err(CliError::with_remedy(
-                    Failure::Conflict,
-                    format!(
-                        "profile {} is enabled and the selected isolation provider is not ready; execution was not changed",
-                        policy.profile_name()
-                    ),
-                    format!(
-                        "runner-manager repo profile set-scale {target} --profile {} --enabled false",
-                        policy.profile_name()
-                    ),
-                ));
+            if policy.enabled() && !policy.execution_policy().is_native() {
+                let provider = PlatformExecutionProvider::new(policy.host_id);
+                let capability = provider.probe(&policy);
+                if capability != ProviderCapability::Ready {
+                    return Err(CliError::with_remedy(
+                        Failure::Conflict,
+                        format!(
+                            "profile {} is enabled and the selected isolation provider is not ready; execution was not changed",
+                            policy.profile_name()
+                        ),
+                        format!(
+                            "{}; or disable the profile first with runner-manager repo profile set-scale {target} --profile {} --enabled false",
+                            provider.policy_remedy(&policy, capability),
+                            policy.profile_name()
+                        ),
+                    ));
+                }
             }
             if policy.revision() != expected {
                 store
