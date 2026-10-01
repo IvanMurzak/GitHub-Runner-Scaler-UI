@@ -9,8 +9,23 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ## 0.4.29
 
+### Features
+
+- Named runner profiles can route different jobs from one repository to native
+  or isolated execution. The CLI and TUI expose profile, capacity, workspace,
+  backend and readiness controls; provider failure never falls back to native.
+- Linux and managed WSL support rootless OCI isolation with pinned images and
+  fail-closed resource limits. Windows has a Hyper-V-isolated backend, still
+  preview-held where its native host acceptance is outstanding. The macOS VM
+  backend is **not** part of this release.
+
 ### Fixes
 
+- Upgrading from 0.4.28 migrates the local database from schema 3 to schema 5,
+  preserving existing runner policies as native default profiles. Older binaries
+  cannot read the upgraded database; keep a recoverable backup before upgrading.
+- Cleaned native attempt history with a legacy process identity is readable
+  without rewriting its journal or relaxing checks on active attempts.
 - Runner profiles accept jobs requiring a case-insensitive subset of their labels,
   including jobs that omit the immutable selector. Extra profile labels are allowed.
   Jobs matching multiple local profiles are visibly refused, including overlaps with
