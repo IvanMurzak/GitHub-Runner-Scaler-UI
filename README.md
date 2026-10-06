@@ -621,8 +621,10 @@ Each platform also adds a few variables unless `runner.env` sets the same name:
   priority.
 - **Windows:** `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point at a profile inside
   each runner's own attempt directory, so concurrent jobs no longer share the service account's
-  caches. .NET known-folder APIs ignore these variables and still report the service account's
-  profile.
+  caches. That profile goes with the attempt, so tool caches under it (npm, pnpm, NuGet, bun)
+  start empty for every job; point them at a shared directory with `runner.env`, for example
+  `npm_config_cache` or `NUGET_PACKAGES`, if you want them kept. .NET known-folder APIs ignore
+  these variables and still report the service account's profile.
 
 `TMPDIR`, `TEMP` and `TMP` are always the attempt's own and cannot be changed. Isolated runners
 do not get any of this; their environment is the image's.

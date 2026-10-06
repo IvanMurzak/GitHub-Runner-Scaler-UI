@@ -54,6 +54,10 @@ pub const RESERVED_PREFIX: &str = "ACTIONS_RUNNER_INPUT_";
 pub const MACOS_TOOL_DIRECTORIES: [&str; 3] =
     ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
 
+/// The `PATH` launchd gives a service, kept behind Homebrew's directories when
+/// the daemon has no `PATH` of its own.
+pub const MACOS_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /// The `LANG` a macOS runner gets when the daemon has none. It is what
 /// `config.sh` would have recorded from a default macOS terminal, and without a
 /// UTF-8 locale Ruby, CocoaPods and Python mis-handle non-ASCII text.
@@ -84,8 +88,12 @@ pub enum RunnerEnvError {
     Reserved { line: Option<usize>, name: String },
     #[error("line {line} sets `{name}` a second time")]
     Duplicate { line: usize, name: String },
-    #[error("the value of `{name}` contains a line break, which runner.env cannot hold")]
-    LineBreak { name: String },
+    #[error(
+        "{}the value of `{name}` contains a line break or a NUL character, which runner.env \
+         cannot hold",
+        at(*.line)
+    )]
+    LineBreak { line: Option<usize>, name: String },
     #[error("cannot {action} {}: {source}", path.display())]
     Io {
         action: &'static str,
@@ -136,6 +144,14 @@ impl RunnerEnv {
                 .ok_or(RunnerEnvError::NotAnAssignment { line: Some(line) })?;
             let name = name.trim_end();
             validate_name(name, Some(line))?;
+            // A NUL cannot reach a process environment: the launch would fail
+            // with nothing naming this file as the cause.
+            if value.contains('\0') {
+                return Err(RunnerEnvError::LineBreak {
+                    line: Some(line),
+                    name: name.to_owned(),
+                });
+            }
             if env.get(name).is_some() {
                 return Err(RunnerEnvError::Duplicate {
                     line,
@@ -171,6 +187,11 @@ impl RunnerEnv {
     /// never a partial one. Created owner-only where the platform has modes,
     /// since an operator may put something sensitive here regardless.
     ///
+    /// On Unix the replacement keeps the existing file's owner and mode, and a
+    /// new file takes its directory's owner, best effort: the daemon may run as
+    /// another account than this command (a `sudo` edit of a user agent's
+    /// file), and a file it cannot read stops every native launch.
+    ///
     /// # Errors
     /// [`RunnerEnvError::Io`].
     pub fn save(&self, path: &Path) -> Result<(), RunnerEnvError> {
@@ -187,6 +208,27 @@ impl RunnerEnv {
             .write_all(self.render().as_bytes())
             .and_then(|()| temporary.as_file().sync_all())
             .map_err(|source| failed("write", source))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let existing = fs::metadata(path).ok();
+            if let Some(owner) = existing.clone().or_else(|| fs::metadata(parent).ok()) {
+                // Fails without privilege unless the owner is already this
+                // account, which is the case this exists for.
+                let _ = std::os::unix::fs::chown(
+                    temporary.path(),
+                    Some(owner.uid()),
+                    Some(owner.gid()),
+                );
+            }
+            if let Some(existing) = existing {
+                let mode = existing.permissions().mode() & 0o777;
+                temporary
+                    .as_file()
+                    .set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(|source| failed("write", source))?;
+            }
+        }
         temporary
             .persist(path)
             .map(|_| ())
@@ -219,6 +261,7 @@ impl RunnerEnv {
         validate_name(name, None)?;
         if value.contains(['\n', '\r', '\0']) {
             return Err(RunnerEnvError::LineBreak {
+                line: None,
                 name: name.to_owned(),
             });
         }
@@ -372,6 +415,10 @@ impl Inherited {
 /// The directory inside an attempt that is its runner's profile on Windows.
 pub const RUNNER_HOME_DIR: &str = "home";
 
+/// The variables [`platform_defaults`] sets on Windows, in order: the profile
+/// directory twice, then its roaming and local application data.
+pub const WINDOWS_PROFILE_VARIABLES: [&str; 4] = ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"];
+
 /// The [`platform_defaults`] that name a directory the caller must create.
 /// Creating them creates the profile directory above them too.
 pub const DIRECTORY_VARIABLES: [&str; 2] = ["APPDATA", "LOCALAPPDATA"];
@@ -402,11 +449,12 @@ pub fn platform_defaults(
         RunnerPlatform::Windows => {
             let home = runtime.join(RUNNER_HOME_DIR);
             let app_data = home.join("AppData");
+            let [user_profile, home_name, roaming, local] = WINDOWS_PROFILE_VARIABLES;
             vec![
-                ("USERPROFILE", home.clone().into_os_string()),
-                ("HOME", home.into_os_string()),
-                ("APPDATA", app_data.join("Roaming").into_os_string()),
-                ("LOCALAPPDATA", app_data.join("Local").into_os_string()),
+                (user_profile, home.clone().into_os_string()),
+                (home_name, home.into_os_string()),
+                (roaming, app_data.join("Roaming").into_os_string()),
+                (local, app_data.join("Local").into_os_string()),
             ]
         }
         RunnerPlatform::MacOs => {
@@ -422,9 +470,13 @@ pub fn platform_defaults(
                 .collect();
             if !missing.is_empty() {
                 let mut path = OsString::from(missing.join(":"));
-                if let Some(inherited) = inherited.path.as_deref().filter(|p| !p.is_empty()) {
-                    path.push(":");
-                    path.push(inherited);
+                path.push(":");
+                // With no `PATH` at all a program search falls back to the
+                // system's own directories; a `PATH` naming only Homebrew would
+                // take those away, so they are spelled out instead.
+                match inherited.path.as_deref().filter(|p| !p.is_empty()) {
+                    Some(inherited) => path.push(inherited),
+                    None => path.push(MACOS_SYSTEM_PATH),
                 }
                 defaults.push(("PATH", path));
             }
@@ -517,6 +569,10 @@ mod tests {
                 format!("A=1\nA={secret}\n"),
                 "line 2 sets `A` a second time",
             ),
+            (
+                format!("A=1\nB={secret}\0\n"),
+                "line 2: the value of `B` contains a line break or a NUL",
+            ),
         ] {
             let error = RunnerEnv::parse(&text).unwrap_err().to_string();
             assert!(error.contains(expected), "{error:?} lacks {expected:?}");
@@ -561,6 +617,24 @@ mod tests {
             env.set("NOT-A-NAME", "x"),
             Err(RunnerEnvError::InvalidName { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(directory.path());
+        let mut env = RunnerEnv::default();
+        env.set("A", "1").unwrap();
+        env.save(&path).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "a new file is owner-only");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        env.set("B", "2").unwrap();
+        env.save(&path).unwrap();
+        assert_eq!(mode(&path), 0o644, "the replacement reset the file's mode");
     }
 
     #[test]
@@ -611,6 +685,21 @@ mod tests {
             has_locale: true,
         };
         assert!(defaults(RunnerPlatform::MacOs, &login).is_empty());
+
+        // A daemon with no PATH keeps the system directories behind Homebrew's.
+        let bare = Inherited {
+            path: None,
+            has_locale: true,
+        };
+        assert_eq!(
+            defaults(RunnerPlatform::MacOs, &bare),
+            [(
+                "PATH",
+                OsString::from(format!(
+                    "/opt/homebrew/bin:/opt/homebrew/sbin:{MACOS_SYSTEM_PATH}"
+                ))
+            )]
+        );
     }
 
     #[test]

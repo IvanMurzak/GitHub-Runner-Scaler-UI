@@ -16,8 +16,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   with, such as cache locations. They reach the next runner without a restart. `host show`
   names the file and how many variables it sets. `TMPDIR`, `TEMP`, `TMP` and
   `ACTIONS_RUNNER_INPUT_*` cannot be set, and errors never print a value. A `runner.env` that
-  does not parse stops native launches until it is fixed, rather than starting runners without
-  it.
+  does not parse stops native launches until it is fixed, before any runner is registered with
+  GitHub, rather than starting runners without it.
 
 ### Fixes
 
@@ -31,13 +31,15 @@ the version being prepared rather than the version in `Cargo.toml`.
   to gzip and never hit. `runner.env` overrides either.
 - Windows runners get a profile of their own (`USERPROFILE`, `HOME`, `APPDATA`,
   `LOCALAPPDATA`) inside the attempt directory instead of sharing the service account's, where
-  concurrent jobs collided on `~/.bun`, the npm cache and the pnpm store. .NET known-folder APIs
-  still report the service account's profile.
+  concurrent jobs collided on `~/.bun`, the npm cache and the pnpm store. Caches under that
+  profile start empty for every job; share one deliberately with `runner.env`. .NET known-folder
+  APIs still report the service account's profile.
 - Windows attempt workspaces holding a junction that denies listing to everyone, such as the
   `INetCache\Content.IE5` junction WinINet creates, are now removed. Cleanup unlinks every
   junction and symbolic link before removing the tree.
 - A cleanup that keeps failing is retried with per-attempt backoff, from 30 seconds up to 30
-  minutes, instead of every poll, and its warning names the reason
+  minutes, instead of on every poll, both by the reconciler and by runner supervision, and is
+  logged once per retry instead of twice. Its warning names the reason
   (`ephemeral_workspace_could_not_be_removed`) rather than `other`.
 - The log no longer redacts `kind`, `delay_secs` and `remaining` on rate-limit warnings, or long
   `snake_case` reasons such as `late_ephemeral_workspace_could_not_be_removed`.

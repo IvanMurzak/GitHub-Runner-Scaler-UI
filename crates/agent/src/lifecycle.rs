@@ -48,8 +48,8 @@ use secrecy::SecretString;
 use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
-    AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    ReplacementIntent, RunnerLauncher, failure_reason_kind,
+    AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
+    OutcomeKind, ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
 
 mod windows_hyperv;
@@ -2316,8 +2316,10 @@ impl NativeProcesses {
     ///
     /// A file that cannot be read or parsed fails the launch rather than
     /// starting a runner without the environment the operator configured.
-    /// The warning names the line and variable, never a value.
-    fn host_env(&self) -> Result<RunnerEnv, ProcessStartFailure> {
+    /// [`ExecutionProvider::prepare`] asks first, before a JIT runner is
+    /// registered, so a broken file costs no registration. The reason names
+    /// the file and the line or variable, never a value.
+    fn host_env(&self) -> Result<RunnerEnv, FailureReason> {
         let Some(path) = &self.runner_env_file else {
             return Ok(RunnerEnv::default());
         };
@@ -2326,7 +2328,9 @@ impl NativeProcesses {
                 reason = "runner_env_file_invalid",
                 "runner.env could not be applied, so no runner starts until it is fixed: {error}"
             );
-            ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
+            FailureReason::Other(format!(
+                "runner.env cannot be applied ({error}); fix it with `runner-manager host env`"
+            ))
         })
     }
 
@@ -2523,6 +2527,23 @@ impl NativeProcesses {
 }
 
 impl ProcessSupervisor for NativeProcesses {
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        if !attempt.execution().is_native() || !policy.execution_policy().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.host_env()?;
+        Ok(PreparedEnvironment {
+            attempt: attempt.id,
+            identity: None,
+        })
+    }
+
     fn spawn(
         &self,
         attempt: &RunnerAttempt,
@@ -2547,7 +2568,7 @@ impl ProcessSupervisor for NativeProcesses {
                 FailureReason::ProcessStartFailed,
             ));
         }
-        let host_env = self.host_env()?;
+        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -2781,6 +2802,10 @@ pub struct LifecycleLauncher {
     recovery_complete: Mutex<bool>,
     versions: Mutex<BTreeMap<AttemptId, RunnerVersion>>,
     pending_replacements: Mutex<BTreeMap<AttemptId, ReplacementIntent>>,
+    /// Backoff for cleanups [`Self::supervise`] tolerates and retries, so a
+    /// workspace that cannot be removed is not retried and reported on every
+    /// pass.
+    cleanup_retries: Mutex<CleanBackoff>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2816,6 +2841,7 @@ impl LifecycleLauncher {
             recovery_complete: Mutex::new(false),
             versions: Mutex::new(BTreeMap::new()),
             pending_replacements: Mutex::new(BTreeMap::new()),
+            cleanup_retries: Mutex::new(CleanBackoff::default()),
         }
     }
 
@@ -2994,9 +3020,16 @@ impl LifecycleLauncher {
                 // one of its recreated files open on Windows, so failure here
                 // is residue to retry, not a reason to abort startup recovery
                 // and take every unrelated repository offline.
+                // Retried with backoff; the event is the one report, which the
+                // event sink logs as a warning.
+                let now = self.ports.clock.now();
+                if !self.cleanup_retries().is_due(attempt.id, now) {
+                    return Ok(ReconcileProgress::Reconciled);
+                }
                 match self.scrub_workspace(&attempt) {
-                    Ok(()) => {}
+                    Ok(()) => self.cleanup_retries().succeeded(attempt.id),
                     Err(LifecycleError::WorkspaceCleanupDeferred) => {
+                        self.cleanup_retries().failed(attempt.id, now);
                         self.ports
                             .reconcile_events
                             .emit(LifecycleEvent::AttemptCleanFailed {
@@ -3004,12 +3037,6 @@ impl LifecycleLauncher {
                                 attempt: attempt.id,
                                 reason: "late_ephemeral_workspace_could_not_be_removed",
                             });
-                        tracing::warn!(
-                            policy_id = %attempt.policy_id,
-                            attempt_id = %attempt.id,
-                            reason = "late_ephemeral_workspace_could_not_be_removed",
-                            "a cleaned ephemeral attempt left late workspace residue; cleanup will retry without blocking the daemon"
-                        );
                     }
                     Err(error) => return Err(error),
                 }
@@ -3482,40 +3509,45 @@ impl LifecycleLauncher {
     /// late process are tolerated. A journal failure or a package lease that
     /// cannot be released still propagates: those are not one workspace's
     /// problem.
+    ///
+    /// A tolerated failure is retried with per-attempt backoff: until it is
+    /// due again the attempt is skipped silently rather than re-tried and
+    /// re-reported on every pass.
     fn clean_or_quarantine(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
-        match self.clean_attempt(attempt) {
-            Err(LifecycleError::SlotQuarantined { class, .. }) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: class,
-                    });
-                Ok(())
-            }
+        let now = self.ports.clock.now();
+        if !self.cleanup_retries().is_due(attempt.id, now) {
+            return Ok(());
+        }
+        let reason = match self.clean_attempt(attempt) {
+            Err(LifecycleError::SlotQuarantined { class, .. }) => class,
             Err(LifecycleError::WorkspaceCleanupDeferred) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: failure_reason_kind(&FailureReason::WorkspaceCleanupDeferred),
-                    });
-                Ok(())
+                failure_reason_kind(&FailureReason::WorkspaceCleanupDeferred)
             }
             Err(LifecycleError::EnvironmentCleanupDeferred) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: "isolated_environment_cleanup_deferred",
-                    });
-                Ok(())
+                "isolated_environment_cleanup_deferred"
             }
-            other => other,
-        }
+            other => {
+                if other.is_ok() {
+                    self.cleanup_retries().succeeded(attempt.id);
+                }
+                return other;
+            }
+        };
+        self.cleanup_retries().failed(attempt.id, now);
+        self.ports
+            .reconcile_events
+            .emit(LifecycleEvent::AttemptCleanFailed {
+                policy: attempt.policy_id,
+                attempt: attempt.id,
+                reason,
+            });
+        Ok(())
+    }
+
+    fn cleanup_retries(&self) -> std::sync::MutexGuard<'_, CleanBackoff> {
+        self.cleanup_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn clean_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
@@ -4534,7 +4566,9 @@ impl RunnerLauncher for LifecycleLauncher {
                 ))
             })?;
         self.clean_attempt(&mut attempt)
-            .map_err(|error| LaunchFailure::new(error.reason()))
+            .map_err(|error| LaunchFailure::new(error.reason()))?;
+        self.cleanup_retries().succeeded(id);
+        Ok(())
     }
 }
 
@@ -6508,6 +6542,8 @@ mod tests {
             0
         );
         provider.extra_resources.lock().unwrap().clear();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         launcher
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
@@ -6900,6 +6936,8 @@ mod tests {
         );
 
         block.release();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         restarted
             .supervise(&harness.policy)
             .await
@@ -6976,6 +7014,8 @@ mod tests {
 
         terminal_block.release();
         cleaned_block.release();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         restarted
             .supervise(&harness.policy)
             .await
@@ -8402,10 +8442,33 @@ mod tests {
         let path = runner_env::path_in(root.path());
         fs::write(&path, "GOOD=1\nghp_notarealtokenbutshapedlikeone\n").unwrap();
         let processes = NativeProcesses::new().with_runner_env_file(path.clone());
-        let failure = processes.host_env().unwrap_err();
-        assert_eq!(failure.reason, FailureReason::ProcessStartFailed);
+        let failure = processes.host_env().unwrap_err().to_string();
+        assert!(
+            failure.contains("runner.env") && failure.contains("line 2"),
+            "{failure}"
+        );
+        assert!(
+            !failure.contains("ghp_"),
+            "the failure echoed a value: {failure}"
+        );
+
+        // `prepare` runs before the JIT registration, so a broken file is
+        // refused there, before GitHub is asked for anything.
+        let policy = fixtures::policy()
+            .repository("octo/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            root.path(),
+            FakeClock::default().now(),
+        );
+        assert!(processes.prepare(&attempt, &policy).is_err());
 
         fs::write(&path, "GOOD=1\n").unwrap();
+        assert!(processes.prepare(&attempt, &policy).is_ok());
         assert_eq!(processes.host_env().unwrap().get("GOOD"), Some("1"));
         assert!(NativeProcesses::new().host_env().unwrap().is_empty());
     }
@@ -9388,6 +9451,70 @@ mod tests {
             .await
             .expect("the retried cleanup completes");
         assert!(!runtime.exists(), "the whole attempt directory goes");
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+    }
+
+    /// Supervision retries a workspace it cannot remove with per-attempt
+    /// backoff, so a stuck workspace is reported once per delay rather than on
+    /// every pass.
+    #[tokio::test]
+    async fn supervision_backs_off_a_workspace_it_cannot_remove() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let runtime = attempt.runtime_path().to_path_buf();
+        harness.conclude(attempt.id);
+        let Some(block) = BlockedDeletion::inject(&runtime.join("held-open-subdirectory")) else {
+            eprintln!(
+                "skipped: this account cannot be refused a deletion, so no partial deletion can be injected"
+            );
+            return;
+        };
+        let failures = || {
+            harness
+                .reconcile_events
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        LifecycleEvent::AttemptCleanFailed { attempt: failed, .. }
+                            if *failed == attempt.id
+                    )
+                })
+                .count()
+        };
+        let supervise = async || {
+            harness
+                .launcher
+                .supervise(&harness.policy)
+                .await
+                .expect("a stuck workspace does not fail supervision");
+        };
+
+        supervise().await;
+        assert_eq!(failures(), 1);
+        supervise().await;
+        assert_eq!(
+            failures(),
+            1,
+            "the failed cleanup was retried on the very next pass"
+        );
+        harness.clock.advance_secs(31);
+        supervise().await;
+        assert_eq!(
+            failures(),
+            2,
+            "the cleanup was not retried once its delay passed"
+        );
+
+        block.release();
+        harness.clock.advance_secs(61);
+        supervise().await;
+        assert!(
+            !runtime.exists(),
+            "the retry removes the workspace once it can"
+        );
         assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
     }
 

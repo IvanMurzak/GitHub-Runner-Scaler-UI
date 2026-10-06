@@ -465,7 +465,16 @@ pub fn runner_env_command(
 ) -> Result<(), CliError> {
     let failed = write_failed("the runner environment");
     let path = runner_env::path_in(context.paths().config_dir());
-    let mut env = RunnerEnv::load(&path).map_err(runner_env_failure)?;
+    let mut env = RunnerEnv::load(&path).map_err(|error| match error {
+        RunnerEnvError::Io { .. } => runner_env_failure(error),
+        // `host env` cannot rewrite a file it cannot parse without losing
+        // what it did not understand, so it says where the file is.
+        _ => CliError::with_remedy(
+            Failure::InvalidArgument,
+            format!("{} cannot be used: {error}", path.display()),
+            format!("edit or delete that line in {}", path.display()),
+        ),
+    })?;
     match command {
         HostEnvCommand::Show => {
             write_runner_env(out, &path, &env).map_err(failed)?;
@@ -530,19 +539,10 @@ fn write_runner_env(out: &mut dyn Write, path: &Path, env: &RunnerEnv) -> io::Re
             )?;
         }
         RunnerPlatform::Windows => {
-            let names: Vec<&str> = runner_env::platform_defaults(
-                RunnerPlatform::Windows,
-                Path::new(""),
-                &runner_env::Inherited::default(),
-                |_| false,
-            )
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
             writeln!(
                 out,
                 "  {}   a profile inside each runner's attempt, removed with it",
-                names.join(", ")
+                runner_env::WINDOWS_PROFILE_VARIABLES.join(", ")
             )?;
             writeln!(
                 out,

@@ -1950,9 +1950,11 @@ struct CleanRetry {
     not_before: Timestamp,
 }
 
-/// Per-attempt cleanup backoff.
+/// Per-attempt cleanup backoff. One each in the [`Reconciler`]'s sweep of
+/// concluded attempts and in the lifecycle launcher's own supervision pass,
+/// the two places a failed cleanup is retried.
 #[derive(Debug, Default)]
-struct CleanBackoff {
+pub(crate) struct CleanBackoff {
     retries: BTreeMap<AttemptId, CleanRetry>,
 }
 
@@ -1962,14 +1964,14 @@ impl CleanBackoff {
         crate::lifecycle::RetryPolicy::bounded(u32::MAX, CLEAN_RETRY_INITIAL, CLEAN_RETRY_MAXIMUM);
 
     /// Whether `attempt`'s cleanup should be tried at `now`.
-    fn is_due(&self, attempt: AttemptId, now: Timestamp) -> bool {
+    pub(crate) fn is_due(&self, attempt: AttemptId, now: Timestamp) -> bool {
         self.retries
             .get(&attempt)
             .is_none_or(|retry| now >= retry.not_before)
     }
 
     /// Records a failed cleanup and schedules the next try.
-    fn failed(&mut self, attempt: AttemptId, now: Timestamp) {
+    pub(crate) fn failed(&mut self, attempt: AttemptId, now: Timestamp) {
         let failures = self
             .retries
             .get(&attempt)
@@ -1986,7 +1988,7 @@ impl CleanBackoff {
     }
 
     /// Forgets `attempt`: it was cleaned.
-    fn succeeded(&mut self, attempt: AttemptId) {
+    pub(crate) fn succeeded(&mut self, attempt: AttemptId) {
         self.retries.remove(&attempt);
     }
 
