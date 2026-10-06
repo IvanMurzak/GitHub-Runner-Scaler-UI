@@ -1,0 +1,88 @@
+crates/app/tests/runner_env_commands.rs
+  s_468234d3364cc1::t_0cb04c46fff3d9 1-127
+  s_468234d3364cc1::t_112c060f579167 128-131
+crates/platform/src/process.rs
+  s_468234d3364cc1::t_923f661a489f9c 2966
+  s_468234d3364cc1::t_d912d0e1e221aa 556,560,569-592,1866,1894,1901,2968,3008,3051
+  s_468234d3364cc1::t_f50f191fe48a29 477,489,535-555,557-559,561,632-635,643-650,1841-1865,1867-1893,1895-1900,2960-2965,2967,2969-3007,3009-3050,3052
+CHANGELOG.md
+  s_468234d3364cc1::t_784f1d8e94ba33 10-44
+README.md
+  s_468234d3364cc1::t_7c1f1c162ae944 601-629
+  s_468234d3364cc1::t_419d91be4978a7 299-301
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_296c48a357bccf 290-294
+crates/agent/src/lifecycle.rs
+  s_468234d3364cc1::t_c63f04019e16b9 42
+  s_468234d3364cc1::t_fdaa89b78152ac 2560,2563
+  s_468234d3364cc1::t_5a5c2327ea8ca7 2107-2114
+  s_468234d3364cc1::t_b4b796f5f7dca6 2541
+  s_468234d3364cc1::t_6af86134ee5705 8327-8331,8367,9044
+  s_468234d3364cc1::t_fda552c963a4b0 987,993,2299-2323,8386,8400,9045
+  s_468234d3364cc1::t_b76ed2c7536ece 107-113,116-131,134-138,965,974
+  s_468234d3364cc1::t_b29752571aa1f7 2074-2076
+  s_468234d3364cc1::t_95ac8615bd9d51 8347-8353,8388,8390,9002
+  s_468234d3364cc1::t_236e9d4ab04154 949-950,954,963-964,966-973,975-986,988-992,994-995,2755,8354-8366,8368-8385,8387,8389,8391-8399,8401-8403,9001,9003-9043,9046-9048
+crates/app/src/cli/host.rs
+  s_468234d3364cc1::t_1ae4b7cdaac08a 447,498,511-512,514,542-555,965,968
+  s_468234d3364cc1::t_3211ba0939cc50 444-446
+  s_468234d3364cc1::t_e4702efc42658c 448-450
+  s_468234d3364cc1::t_c775ce1650b699 495-497
+  s_468234d3364cc1::t_5ae511730c580e 499-501,508-510
+  s_468234d3364cc1::t_dcbf9a458d6ca4 513
+  s_468234d3364cc1::t_defdf089383bb5 515-517,539-541
+  s_468234d3364cc1::t_a6f400fbf6ad41 966-967
+  s_468234d3364cc1::t_c9987fed8e6ec7 969-971
+  s_307055ee7a037e::t_57b2e78f001be2 80,94,99-102,439-443,454-494,502-507,518-538
+crates/platform/src/runner_env.rs
+  s_468234d3364cc1::t_c9ec6120592b53 1-640
+  s_255cd70270e405::t_ca0ace0d945cfc 641-662
+crates/app/src/cli/mod.rs
+  s_468234d3364cc1::t_9c28b5c972b106 816-844
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_2f9f9ec94520a7 1273,1934-2003,2020,2043,2542-2544,2552-2556,2560,2584-2585,2587,3303,3315,3323,3332,3651-3706
+crates/app/src/tui/shell.rs
+  s_468234d3364cc1::t_400c1f55341d08 1460-1462
+crates/app/tests/cli_command_surface.rs
+  s_468234d3364cc1::t_436cdcd0e57489 59,96-98,100
+crates/app/tests/command_accountability/mod.rs
+  s_468234d3364cc1::t_7dc2925ff01471 82,111-113,161,233-246,289-300
+crates/domain/src/attempt.rs
+  s_468234d3364cc1::t_c89316674c3503 417-426,509,519,557-559,2300-2302,2320,2351
+crates/platform/src/lib.rs
+  s_468234d3364cc1::t_eb320940473d9e 56
+crates/platform/src/logging.rs
+  s_468234d3364cc1::t_7bf71a673eba42 171-172,185-186,200-201,1189-1192,1199-1215,2385-2432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e2cd5b9a004b78159d91ca638148bdbad49bb6b7",
+  "prompts": {},
+  "sessions": {
+    "s_255cd70270e405": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e97b7695-dd04-4653-a79a-976610d39f73",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_307055ee7a037e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a853583017bfc18b1",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
