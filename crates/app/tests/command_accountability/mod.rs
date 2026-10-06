@@ -109,7 +109,8 @@ impl Boundary {
                 "creates and selects multiple PolicyIds for one repository, including execution and selector state absent from the single-policy chain oracle"
             }
             Self::RunnerEnvironmentFile => {
-                "reads or rewrites the host's runner.env, a file outside the chain oracle's                  modelled state whose only effect is on a native runner's environment at launch"
+                "reads or rewrites the host's runner.env, a file outside the chain oracle's \
+                 modelled state whose only effect is on a native runner's environment at launch"
             }
         }
     }

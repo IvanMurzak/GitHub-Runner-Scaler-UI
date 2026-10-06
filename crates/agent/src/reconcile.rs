@@ -1938,10 +1938,10 @@ impl ScaleDownReport {
 /// every six seconds, and each failure logs a warning: one stuck Windows
 /// workspace wrote some 15,000 of them a day. The retry is still real; it is
 /// just no longer a log flood.
-pub const CLEAN_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const CLEAN_RETRY_INITIAL: Duration = Duration::from_secs(30);
 
 /// The longest a failing cleanup waits between tries.
-pub const CLEAN_RETRY_MAXIMUM: Duration = Duration::from_secs(30 * 60);
+const CLEAN_RETRY_MAXIMUM: Duration = Duration::from_secs(30 * 60);
 
 /// One attempt's consecutive cleanup failures, and when it may be tried again.
 #[derive(Debug, Clone, Copy)]
@@ -1953,51 +1953,47 @@ struct CleanRetry {
 /// Per-attempt cleanup backoff.
 #[derive(Debug, Default)]
 struct CleanBackoff {
-    retries: Mutex<BTreeMap<AttemptId, CleanRetry>>,
+    retries: BTreeMap<AttemptId, CleanRetry>,
 }
 
 impl CleanBackoff {
+    /// The doubling-with-a-ceiling schedule; the attempt bound is unused.
+    const SCHEDULE: crate::lifecycle::RetryPolicy =
+        crate::lifecycle::RetryPolicy::bounded(u32::MAX, CLEAN_RETRY_INITIAL, CLEAN_RETRY_MAXIMUM);
+
     /// Whether `attempt`'s cleanup should be tried at `now`.
     fn is_due(&self, attempt: AttemptId, now: Timestamp) -> bool {
-        self.lock()
+        self.retries
             .get(&attempt)
             .is_none_or(|retry| now >= retry.not_before)
     }
 
     /// Records a failed cleanup and schedules the next try.
-    fn failed(&self, attempt: AttemptId, now: Timestamp) {
-        let mut retries = self.lock();
-        let failures = retries
+    fn failed(&mut self, attempt: AttemptId, now: Timestamp) {
+        let failures = self
+            .retries
             .get(&attempt)
             .map_or(1, |retry| retry.failures.saturating_add(1));
-        let delay = CLEAN_RETRY_INITIAL
-            .saturating_mul(1_u32 << (failures - 1).min(16))
-            .min(CLEAN_RETRY_MAXIMUM);
-        let delay = chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
-        retries.insert(
+        let delay = Self::SCHEDULE.delay(failures);
+        self.retries.insert(
             attempt,
             CleanRetry {
                 failures,
-                not_before: now.checked_add_signed(delay).unwrap_or(now),
+                // At most `CLEAN_RETRY_MAXIMUM`, so always representable.
+                not_before: now + chrono::Duration::from_std(delay).unwrap_or_default(),
             },
         );
     }
 
     /// Forgets `attempt`: it was cleaned.
-    fn succeeded(&self, attempt: AttemptId) {
-        self.lock().remove(&attempt);
+    fn succeeded(&mut self, attempt: AttemptId) {
+        self.retries.remove(&attempt);
     }
 
     /// Forgets every attempt not in `present`, so the map cannot outgrow the
     /// journal.
-    fn retain(&self, present: &BTreeSet<AttemptId>) {
-        self.lock().retain(|attempt, _| present.contains(attempt));
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<AttemptId, CleanRetry>> {
-        self.retries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn retain(&mut self, present: &BTreeSet<AttemptId>) {
+        self.retries.retain(|attempt, _| present.contains(attempt));
     }
 }
 
@@ -2531,7 +2527,7 @@ impl Reconciler {
     /// `is_concluded` and not `is_terminal`: `cleaned` is terminal and already
     /// done, and `busy` is not terminal at all. That is what makes it impossible
     /// for this path to reach a runner executing a job.
-    async fn clean_terminal_attempts(&self, report: &mut ReconcileReport) {
+    async fn clean_terminal_attempts(&mut self, report: &mut ReconcileReport) {
         let attempts = match self.launcher.attempts().await {
             Ok(attempts) => attempts,
             Err(failure) => {
@@ -3690,7 +3686,7 @@ mod tests {
         assert_eq!(harness.events.count_of("attempt_clean_failed"), 3);
 
         // The delay never exceeds the ceiling, however many failures accrue.
-        let backoff = CleanBackoff::default();
+        let mut backoff = CleanBackoff::default();
         let id = AttemptId::from_u128(9);
         for _ in 0..40 {
             backoff.failed(id, start);

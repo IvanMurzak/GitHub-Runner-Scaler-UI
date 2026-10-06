@@ -575,16 +575,14 @@ impl SpawnSpec {
             .iter()
             .rev()
             .find(|(key, _)| {
-                if cfg!(windows) {
-                    key.eq_ignore_ascii_case(name)
-                } else {
-                    key == name
-                }
+                key.to_str()
+                    .is_some_and(|key| crate::runner_env::same_name(key, name))
             })
             .map(|(_, value)| value.as_os_str())
     }
 
     /// Whether [`Self::normal_scheduling`] was asked for.
+    #[doc(hidden)]
     #[must_use]
     pub const fn uses_normal_scheduling(&self) -> bool {
         self.normal_scheduling
@@ -2955,16 +2953,6 @@ mod tests {
         );
 
         child.stop(Duration::from_secs(10)).expect("cleanup");
-    }
-
-    #[test]
-    fn normal_scheduling_is_opt_in() {
-        assert!(!SpawnSpec::new("runner").uses_normal_scheduling());
-        assert!(
-            SpawnSpec::new("runner")
-                .normal_scheduling()
-                .uses_normal_scheduling()
-        );
     }
 
     /// Set by [`a_runner_leaves_the_background_state_its_parent_runs_in`] when

@@ -113,21 +113,20 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
-    let platform = RunnerPlatform::current();
-    if platform == RunnerPlatform::Windows {
-        // The profile `platform_defaults` points at. Created even when
-        // `runner.env` overrides part of it: it is inside the attempt, so it
-        // costs nothing and goes with the attempt.
-        let app_data = runtime.join(runner_env::RUNNER_HOME_DIR).join("AppData");
-        let _ = std::fs::create_dir_all(app_data.join("Roaming"));
-        let _ = std::fs::create_dir_all(app_data.join("Local"));
-    }
     let defaults = runner_env::platform_defaults(
-        platform,
+        RunnerPlatform::current(),
         runtime,
         &runner_env::Inherited::current(),
         Path::exists,
     );
+    // The Windows profile the defaults point at. Created even when
+    // `runner.env` overrides part of it: it is inside the attempt, so it costs
+    // nothing and goes with the attempt.
+    for (name, dir) in &defaults {
+        if runner_env::DIRECTORY_VARIABLES.contains(name) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
     let mut spec = SpawnSpec::new(program)
         .arg("run")
         .working_dir(runtime)
@@ -156,7 +155,7 @@ impl RetryPolicy {
         }
     }
 
-    fn delay(self, failure_index: u32) -> Duration {
+    pub(crate) fn delay(self, failure_index: u32) -> Duration {
         let shift = failure_index.saturating_sub(1).min(31);
         self.initial
             .saturating_mul(1_u32 << shift)
@@ -946,13 +945,19 @@ fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
 /// wait forever for its peer. The .NET runner routinely leaves diagnostic FIFOs
 /// in its private `tmp`, so use the standard library's fd-relative Unix remover,
 /// which unlinks non-directories without opening them. Keep the external remover
-/// on Windows for its existing read-only and long-path handling, after
-/// [`unlink_reparse_points`] has taken every link out of its way.
+/// on Windows for its existing read-only and long-path handling; when it is
+/// refused, [`unlink_reparse_points`] takes every link out of its way and it
+/// runs once more.
 fn remove_runtime_tree(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        unlink_reparse_points(path);
-        remove_dir_all::remove_dir_all(path)
+        match remove_dir_all::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                unlink_reparse_points(path);
+                remove_dir_all::remove_dir_all(path)
+            }
+            other => other,
+        }
     }
     #[cfg(not(windows))]
     {
@@ -972,9 +977,13 @@ fn remove_runtime_tree(path: &Path) -> std::io::Result<()> {
 /// point) that the deny entry does not cover, and once the links are gone the
 /// tree is ordinary.
 ///
+/// Only walked after a refusal, so an ordinary tree is traversed once. The
+/// metadata comes from the directory listing itself, which on Windows
+/// describes a reparse point without opening it.
+///
 /// Best effort: a failure here is not reported, because
-/// [`remove_runtime_tree`]'s `remove_dir_all` runs next and its result is the
-/// authority on whether the tree went.
+/// [`remove_runtime_tree`]'s second `remove_dir_all` runs next and its result
+/// is the authority on whether the tree went.
 #[cfg(windows)]
 fn unlink_reparse_points(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -982,7 +991,7 @@ fn unlink_reparse_points(dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
         if is_link_like(&metadata) {
@@ -2733,7 +2742,7 @@ pub enum LifecycleError {
     /// An ephemeral runtime is still held by a late process. Its journal state
     /// remains unchanged and ordinary supervision retries it, but startup
     /// recovery must not take unrelated repositories offline because of it.
-    #[error("attempt workspace could not be removed")]
+    #[error("{}", FailureReason::WorkspaceCleanupDeferred)]
     WorkspaceCleanupDeferred,
     #[error("isolated environment cleanup is deferred")]
     EnvironmentCleanupDeferred,
@@ -3491,7 +3500,7 @@ impl LifecycleLauncher {
                     .emit(LifecycleEvent::AttemptCleanFailed {
                         policy: attempt.policy_id,
                         attempt: attempt.id,
-                        reason: "ephemeral_workspace_could_not_be_removed",
+                        reason: failure_reason_kind(&FailureReason::WorkspaceCleanupDeferred),
                     });
                 Ok(())
             }

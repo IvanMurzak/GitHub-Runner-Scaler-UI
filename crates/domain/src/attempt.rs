@@ -2297,10 +2297,10 @@ mod tests {
             // registered.
             FailureReason::TerminatedAfterRegistrationTimeout => AttemptState::Starting,
             FailureReason::IsolationProvider(_) => AttemptState::Allocated,
-            // Never recorded as an outcome (see the variant), so the only claim
-            // made here is the one `Other` makes: the type would accept it.
-            FailureReason::WorkspaceCleanupDeferred => AttemptState::Busy,
-            FailureReason::Other(_) => AttemptState::Busy,
+            // `WorkspaceCleanupDeferred` is never recorded as an outcome (see
+            // the variant), so the only claim made for it is the one `Other`
+            // makes: the type would accept it.
+            FailureReason::WorkspaceCleanupDeferred | FailureReason::Other(_) => AttemptState::Busy,
         }
     }
 

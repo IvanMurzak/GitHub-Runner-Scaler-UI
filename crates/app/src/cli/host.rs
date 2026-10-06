@@ -530,10 +530,19 @@ fn write_runner_env(out: &mut dyn Write, path: &Path, env: &RunnerEnv) -> io::Re
             )?;
         }
         RunnerPlatform::Windows => {
+            let names: Vec<&str> = runner_env::platform_defaults(
+                RunnerPlatform::Windows,
+                Path::new(""),
+                &runner_env::Inherited::default(),
+                |_| false,
+            )
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
             writeln!(
                 out,
-                "  USERPROFILE, HOME, APPDATA, LOCALAPPDATA   a profile inside each runner's \
-                 attempt, removed with it"
+                "  {}   a profile inside each runner's attempt, removed with it",
+                names.join(", ")
             )?;
             writeln!(
                 out,
@@ -545,7 +554,9 @@ fn write_runner_env(out: &mut dyn Write, path: &Path, env: &RunnerEnv) -> io::Re
     writeln!(out)?;
     writeln!(
         out,
-        "Always per attempt and not changeable: TMPDIR, TEMP, TMP, ACTIONS_RUNNER_INPUT_*"
+        "Always per attempt and not changeable: {}, {}*",
+        runner_env::RESERVED_NAMES.join(", "),
+        runner_env::RESERVED_PREFIX
     )?;
     writeln!(
         out,

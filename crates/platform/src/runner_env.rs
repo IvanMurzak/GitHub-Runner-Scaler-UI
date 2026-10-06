@@ -23,7 +23,7 @@
 //! The per-attempt temporary directory (`TMPDIR`, `TEMP`, `TMP`) is applied
 //! last and cannot be overridden, and neither can GitHub's
 //! `ACTIONS_RUNNER_INPUT_*` inputs, one of which carries the JIT
-//! configuration: [`RESERVED_NAMES`].
+//! configuration: [`RESERVED_NAMES`] and [`RESERVED_PREFIX`].
 //!
 //! # Not a secret store
 //!
@@ -40,15 +40,14 @@ use std::path::{Path, PathBuf};
 /// The file's name inside the configuration directory.
 pub const RUNNER_ENV_FILE: &str = "runner.env";
 
-/// Names `runner.env` may not set, compared without regard to case.
-///
-/// The temporary directory is per attempt, and cleanup and isolation rely on
-/// it; `ACTIONS_RUNNER_INPUT_` is a prefix ([`is_reserved`]), because the
-/// listener reads every such variable as a command-line input, including the
-/// JIT configuration that registers it.
-pub const RESERVED_NAMES: [&str; 4] = ["TMPDIR", "TEMP", "TMP", "ACTIONS_RUNNER_INPUT_*"];
+/// Names `runner.env` may not set, compared without regard to case: the
+/// temporary directory is per attempt, and cleanup and isolation rely on it.
+pub const RESERVED_NAMES: [&str; 3] = ["TMPDIR", "TEMP", "TMP"];
 
-const RUNNER_INPUT_PREFIX: &str = "ACTIONS_RUNNER_INPUT_";
+/// The prefix of every name `runner.env` may not set: the listener reads each
+/// such variable as a command-line input, including the JIT configuration
+/// that registers it.
+pub const RESERVED_PREFIX: &str = "ACTIONS_RUNNER_INPUT_";
 
 /// macOS directories put ahead of the inherited `PATH`, when they exist and
 /// are not on it already: Apple Silicon Homebrew, then Intel Homebrew.
@@ -195,8 +194,7 @@ impl RunnerEnv {
     }
 
     /// The file's text.
-    #[must_use]
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         let mut text = String::new();
         for line in &self.lines {
             match line {
@@ -291,10 +289,7 @@ pub fn split_assignment(raw: &str) -> Result<(&str, &str), RunnerEnvError> {
 
 /// Whether `name` is one this file may set: a portable environment variable
 /// name that is not [reserved](RESERVED_NAMES).
-///
-/// # Errors
-/// [`RunnerEnvError::InvalidName`] or [`RunnerEnvError::Reserved`].
-pub fn validate_name(name: &str, line: Option<usize>) -> Result<(), RunnerEnvError> {
+fn validate_name(name: &str, line: Option<usize>) -> Result<(), RunnerEnvError> {
     let mut chars = name.chars();
     let valid = chars
         .next()
@@ -314,17 +309,13 @@ pub fn validate_name(name: &str, line: Option<usize>) -> Result<(), RunnerEnvErr
 
 /// Whether `name` is reserved, without regard to case: Windows treats `Tmp`
 /// and `TMP` as one variable.
-#[must_use]
-pub fn is_reserved(name: &str) -> bool {
+fn is_reserved(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with(RUNNER_INPUT_PREFIX)
-        || RESERVED_NAMES
-            .iter()
-            .any(|reserved| !reserved.ends_with('*') && upper == *reserved)
+    upper.starts_with(RESERVED_PREFIX) || RESERVED_NAMES.contains(&upper.as_str())
 }
 
 /// Whether two names are the same variable on this platform.
-fn same_name(a: &str, b: &str) -> bool {
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
     if cfg!(windows) {
         a.eq_ignore_ascii_case(b)
     } else {
@@ -380,6 +371,10 @@ impl Inherited {
 
 /// The directory inside an attempt that is its runner's profile on Windows.
 pub const RUNNER_HOME_DIR: &str = "home";
+
+/// The [`platform_defaults`] that name a directory the caller must create.
+/// Creating them creates the profile directory above them too.
+pub const DIRECTORY_VARIABLES: [&str; 2] = ["APPDATA", "LOCALAPPDATA"];
 
 /// The variables `platform` sets for a runner whose attempt directory is
 /// `runtime`, before `runner.env` is applied.
@@ -461,8 +456,9 @@ fn split_colon_path(path: &OsStr) -> Vec<&OsStr> {
 }
 
 /// The variables a native runner starts with on top of the daemon's
-/// environment, in the order they must be applied: the platform defaults that
-/// `file` does not replace, then `file` itself.
+/// environment, in the order they must be applied: the platform defaults, then
+/// `file`. Applied in order the last value for a name wins, as it does for
+/// `Command::env`, so `file` overrides a default of the same name.
 #[must_use]
 pub fn runner_environment(
     defaults: Vec<(&'static str, OsString)>,
@@ -470,7 +466,6 @@ pub fn runner_environment(
 ) -> Vec<(OsString, OsString)> {
     defaults
         .into_iter()
-        .filter(|(name, _)| file.get(name).is_none())
         .map(|(name, value)| (OsString::from(name), value))
         .chain(
             file.entries()
@@ -650,6 +645,10 @@ mod tests {
         assert_eq!(
             runner_environment(defaults, &file),
             [
+                (
+                    OsString::from("PATH"),
+                    OsString::from("/opt/homebrew/bin:/usr/bin")
+                ),
                 (OsString::from("LANG"), OsString::from(MACOS_DEFAULT_LANG)),
                 (OsString::from("PATH"), OsString::from("/custom/bin")),
                 (

@@ -1186,26 +1186,34 @@ fn redact_value(value: &str) -> String {
         return REDACTION.to_string();
     }
 
-    if value.len() >= OPAQUE_RUN_THRESHOLD
-        && value.chars().all(is_opaque_char)
-        && !is_snake_case_identifier(value)
-    {
+    if value.len() >= OPAQUE_RUN_THRESHOLD && value.chars().all(is_opaque_char) {
         return REDACTION.to_string();
     }
 
     value.to_string()
 }
 
-/// Whether a value is a `snake_case` identifier: lowercase words joined by
-/// single underscores, such as `late_ephemeral_workspace_could_not_be_removed`.
+/// Fields whose values are this product's own closed vocabulary: `snake_case`
+/// constants such as `late_ephemeral_workspace_could_not_be_removed`.
+const CLOSED_VOCABULARY_FIELDS: &[&str] = &["kind", "reason"];
+
+/// Whether a closed-vocabulary field's value is emitted as it is.
 ///
-/// This product's closed-vocabulary `reason` fields are exactly that shape, and
-/// the long ones are over [`OPAQUE_RUN_THRESHOLD`], so the opaque-run rule used
-/// to redact the very field that says what went wrong. No credential format
-/// this module knows has that shape: GitHub's start with a prefix caught above,
-/// and base64 or hex output of 40 or more characters with no digit and no
-/// capital, split into words by single underscores, is not something a key
-/// generator produces.
+/// The long `reason` constants are over [`OPAQUE_RUN_THRESHOLD`], so the
+/// opaque-run rule redacted the very field that says what went wrong. Exempt
+/// only in these fields, never in a message or any other field: there a long
+/// run is still treated as a secret. Within them, a lowercase `snake_case`
+/// identifier that does not start with a token prefix is not something a
+/// credential or a key generator produces.
+fn is_closed_vocabulary(name: &str, value: &str) -> bool {
+    CLOSED_VOCABULARY_FIELDS.contains(&name)
+        && !TOKEN_PREFIXES
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        && is_snake_case_identifier(value)
+}
+
+/// Whether a value is lowercase words joined by single underscores.
 fn is_snake_case_identifier(value: &str) -> bool {
     value.contains('_')
         && value
@@ -1329,10 +1337,12 @@ struct RedactingVisitor {
 
 impl RedactingVisitor {
     fn put_str(&mut self, name: &str, value: &str) {
-        let rendered = if is_field_allowed(name) {
-            redact(value)
-        } else {
+        let rendered = if !is_field_allowed(name) {
             REDACTION.to_string()
+        } else if is_closed_vocabulary(name, value) {
+            value.to_string()
+        } else {
+            redact(value)
         };
         self.fields
             .insert(name.to_string(), Value::String(rendered));
@@ -2410,12 +2420,14 @@ mod tests {
         }
     }
 
-    /// The carve-out above is for identifiers, not for anything long with an
-    /// underscore in it.
+    /// The carve-out is for identifiers in closed-vocabulary fields, not for
+    /// anything long with an underscore in it, and not for message text.
     #[test]
-    fn only_a_lowercase_snake_case_run_escapes_the_opaque_rule() {
+    fn only_a_snake_case_reason_field_escapes_the_opaque_rule() {
         let reason = "late_ephemeral_workspace_could_not_be_removed";
-        assert_eq!(redact(reason), reason);
+        assert!(is_closed_vocabulary("reason", reason));
+        assert!(!is_closed_vocabulary("message", reason));
+        assert_eq!(redact(reason), REDACTION, "free text kept a long run");
         for opaque in [
             // A capital, a digit, a doubled or trailing underscore, and no
             // underscore at all: each is a shape a secret can take.
@@ -2426,7 +2438,7 @@ mod tests {
             "lateephemeralworkspacecouldnotberemovedquite",
             "ghs_ephemeral_workspace_could_not_be_removed",
         ] {
-            assert_eq!(redact(opaque), REDACTION, "{opaque} was not redacted");
+            assert!(!is_closed_vocabulary("reason", opaque), "{opaque}");
         }
     }
 
