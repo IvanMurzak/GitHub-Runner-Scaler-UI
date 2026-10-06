@@ -1,0 +1,57 @@
+crates/agent/src/lifecycle.rs
+  s_468234d3364cc1::t_a291aa251a70bb 8449-8465
+  s_468234d3364cc1::t_0909db5230446d 2545,3535,3545,9457-9503
+  s_468234d3364cc1::t_e86f03e9067db1 51-52,2319-2322,2331-2333,2530-2544,2546,2571,2805-2808,2844,3023-3028,3030,3032,3512-3515,3517-3522,3524,3527,3529-3534,3536-3544,3546-3550,4569-4571,6545-6546,6939-6940,7017-7018,8445-8448,8466-8468,8471,9504-9520
+crates/platform/src/runner_env.rs
+  s_468234d3364cc1::t_be2c7489a51b95 91-96
+  s_468234d3364cc1::t_a176365c8086aa 222-223,452,454-457
+  s_468234d3364cc1::t_e4cc91124d7caa 147-154
+  s_468234d3364cc1::t_f34497eeb45b4a 264
+  s_468234d3364cc1::t_7a073e73e3b27e 227,572-575
+  s_468234d3364cc1::t_f84d73f7c9b49b 57-60
+  s_468234d3364cc1::t_6acf4dc5b35908 624,626-627,632,688-702
+  s_468234d3364cc1::t_e0335d59ecd806 418-421
+  s_468234d3364cc1::t_b72cf295b8be2f 473-479
+  s_255cd70270e405::t_0b1a0dd7e8cf68 190-194,211-221,224-226,228-231,622-623,625,628-631,633-639
+crates/app/src/cli/host.rs
+  s_468234d3364cc1::t_b19f3e126d3e41 545
+  s_307055ee7a037e::t_804a379b6ae8e7 468-477
+CHANGELOG.md
+  s_468234d3364cc1::t_954b1f01d8b694 19-20,34-36,41-42
+README.md
+  s_468234d3364cc1::t_c43be74d2e911c 624-627
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_5c4a15837b1cae 1953-1955,1957,1967,1974,1991
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "669e20913539057e1c1f3809f30aedeed4465224",
+  "prompts": {},
+  "sessions": {
+    "s_255cd70270e405": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e97b7695-dd04-4653-a79a-976610d39f73",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_307055ee7a037e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a853583017bfc18b1",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
