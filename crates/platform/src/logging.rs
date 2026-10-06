@@ -168,6 +168,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "attempt_state",
     "capacity",
     "count",
+    // Seconds a rate-limited client waits before its next request.
+    "delay_secs",
     "demand",
     "desired",
     "duration_ms",
@@ -180,6 +182,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "http_status",
     "installation_id",
     "job_id",
+    // A closed enum's `Display`, such as a rate limit's primary/secondary kind.
+    "kind",
     "label",
     "lock",
     "lock_wait_ms",
@@ -193,6 +197,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "policy_state",
     "reason",
     "register_ms",
+    // GitHub's `x-ratelimit-remaining`: a request count.
+    "remaining",
     "retry_in_ms",
     "runner_id",
     "scope",
@@ -1180,11 +1186,31 @@ fn redact_value(value: &str) -> String {
         return REDACTION.to_string();
     }
 
-    if value.len() >= OPAQUE_RUN_THRESHOLD && value.chars().all(is_opaque_char) {
+    if value.len() >= OPAQUE_RUN_THRESHOLD
+        && value.chars().all(is_opaque_char)
+        && !is_snake_case_identifier(value)
+    {
         return REDACTION.to_string();
     }
 
     value.to_string()
+}
+
+/// Whether a value is a `snake_case` identifier: lowercase words joined by
+/// single underscores, such as `late_ephemeral_workspace_could_not_be_removed`.
+///
+/// This product's closed-vocabulary `reason` fields are exactly that shape, and
+/// the long ones are over [`OPAQUE_RUN_THRESHOLD`], so the opaque-run rule used
+/// to redact the very field that says what went wrong. No credential format
+/// this module knows has that shape: GitHub's start with a prefix caught above,
+/// and base64 or hex output of 40 or more characters with no digit and no
+/// capital, split into words by single underscores, is not something a key
+/// generator produces.
+fn is_snake_case_identifier(value: &str) -> bool {
+    value.contains('_')
+        && value
+            .split('_')
+            .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()))
 }
 
 /// The length of a SHA-256 digest written as lowercase hex.
@@ -2354,6 +2380,54 @@ mod tests {
             );
         }
         assert!(output.contains("\"count\":3"), "{output}");
+    }
+
+    /// The rate-limit warning's fields and a long closed-vocabulary reason
+    /// reach the log, rather than `[redacted]` in place of the diagnosis.
+    #[test]
+    fn non_secret_diagnostic_fields_survive() {
+        let capture = Capture::default();
+        let output = emit(&capture, || {
+            tracing::warn!(
+                kind = "secondary",
+                delay_secs = 61_u64,
+                remaining = 0_u64,
+                reason = "late_ephemeral_workspace_could_not_be_removed",
+                "rate limited"
+            );
+        });
+        for expected in [
+            "\"kind\":\"secondary\"",
+            "\"delay_secs\":61",
+            "\"remaining\":0",
+            "\"reason\":\"late_ephemeral_workspace_could_not_be_removed\"",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from:
+{output}"
+            );
+        }
+    }
+
+    /// The carve-out above is for identifiers, not for anything long with an
+    /// underscore in it.
+    #[test]
+    fn only_a_lowercase_snake_case_run_escapes_the_opaque_rule() {
+        let reason = "late_ephemeral_workspace_could_not_be_removed";
+        assert_eq!(redact(reason), reason);
+        for opaque in [
+            // A capital, a digit, a doubled or trailing underscore, and no
+            // underscore at all: each is a shape a secret can take.
+            "late_ephemeral_workspace_could_not_be_Removed",
+            "late_ephemeral_workspace_could_not_be_removed2",
+            "late_ephemeral__workspace_could_not_be_removed",
+            "late_ephemeral_workspace_could_not_be_removed_",
+            "lateephemeralworkspacecouldnotberemovedquite",
+            "ghs_ephemeral_workspace_could_not_be_removed",
+        ] {
+            assert_eq!(redact(opaque), REDACTION, "{opaque} was not redacted");
+        }
     }
 
     #[test]

@@ -39,6 +39,7 @@ use runner_manager_github::rest::{CancelToken, InventoryGateway};
 use runner_manager_platform::process::{
     Adoption, ChildProcess, ProcessIdentity, RestrictiveHandoff, SpawnSpec, Termination,
 };
+use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerPlatform};
 use runner_manager_platform::runner_root::{
     self, RootOwner, RootPreflight, RunnerRootError, default_runner_root,
 };
@@ -103,15 +104,38 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// secret `ACTIONS_RUNNER_INPUT_JITCONFIG` input. The platform spawn boundary
 /// supplies that input from the restrictive handoff; the listener command line
 /// must contain only the supported `run` command.
-fn runner_listener_spec(program: PathBuf, runtime: &Path) -> SpawnSpec {
+///
+/// The environment is the daemon's plus [`runner_env::platform_defaults`] and
+/// then the host's `runner.env`, which wins over a default of the same name.
+/// The per-attempt temporary directory goes last and `runner.env` cannot name
+/// it. On macOS the runner also leaves the daemon's background scheduling
+/// ([`SpawnSpec::normal_scheduling`]).
+fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
-    SpawnSpec::new(program)
+    let platform = RunnerPlatform::current();
+    if platform == RunnerPlatform::Windows {
+        // The profile `platform_defaults` points at. Created even when
+        // `runner.env` overrides part of it: it is inside the attempt, so it
+        // costs nothing and goes with the attempt.
+        let app_data = runtime.join(runner_env::RUNNER_HOME_DIR).join("AppData");
+        let _ = std::fs::create_dir_all(app_data.join("Roaming"));
+        let _ = std::fs::create_dir_all(app_data.join("Local"));
+    }
+    let defaults = runner_env::platform_defaults(
+        platform,
+        runtime,
+        &runner_env::Inherited::current(),
+        Path::exists,
+    );
+    let mut spec = SpawnSpec::new(program)
         .arg("run")
         .working_dir(runtime)
-        .env("TMPDIR", &tmp)
-        .env("TEMP", &tmp)
-        .env("TMP", &tmp)
+        .normal_scheduling();
+    for (name, value) in runner_env::runner_environment(defaults, host_env) {
+        spec = spec.env(name, value);
+    }
+    spec.env("TMPDIR", &tmp).env("TEMP", &tmp).env("TMP", &tmp)
 }
 
 /// Retry bounds for failures that can resolve without operator action.
@@ -922,15 +946,50 @@ fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
 /// wait forever for its peer. The .NET runner routinely leaves diagnostic FIFOs
 /// in its private `tmp`, so use the standard library's fd-relative Unix remover,
 /// which unlinks non-directories without opening them. Keep the external remover
-/// on Windows for its existing read-only and junction handling.
+/// on Windows for its existing read-only and long-path handling, after
+/// [`unlink_reparse_points`] has taken every link out of its way.
 fn remove_runtime_tree(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        unlink_reparse_points(path);
         remove_dir_all::remove_dir_all(path)
     }
     #[cfg(not(windows))]
     {
         fs::remove_dir_all(path)
+    }
+}
+
+/// Remove every symlink, junction and other reparse point under `dir` as a
+/// link, without ever descending into one.
+///
+/// WinINet creates `…\INetCache\Content.IE5` as a junction whose own DACL denies
+/// `Everyone` the right to list it, and a job that points `USERPROFILE` or
+/// `LOCALAPPDATA` into its workspace gets one there. Both `remove_dir_all` 1.0
+/// and `std::fs::remove_dir_all` then fail on the whole tree with
+/// `ERROR_ACCESS_DENIED`, so the attempt could never be cleaned. Removing the
+/// link itself is a different operation (`RemoveDirectoryW` on the reparse
+/// point) that the deny entry does not cover, and once the links are gone the
+/// tree is ordinary.
+///
+/// Best effort: a failure here is not reported, because
+/// [`remove_runtime_tree`]'s `remove_dir_all` runs next and its result is the
+/// authority on whether the tree went.
+#[cfg(windows)]
+fn unlink_reparse_points(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if is_link_like(&metadata) {
+            let _ = fs::remove_dir(&path).or_else(|_| fs::remove_file(&path));
+        } else if metadata.is_dir() {
+            unlink_reparse_points(&path);
+        }
     }
 }
 
@@ -2012,6 +2071,9 @@ pub use ExecutionProvider as ProcessSupervisor;
 pub struct NativeProcesses {
     children: Mutex<BTreeMap<AttemptId, ChildProcess>>,
     successful_exits: Mutex<BTreeMap<AttemptId, bool>>,
+    /// The host's `runner.env`, read at every launch so that `host env set`
+    /// reaches the next runner without a daemon restart. `None` applies none.
+    runner_env_file: Option<PathBuf>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2040,6 +2102,14 @@ impl PlatformExecutionProvider {
             oci: OciProcesses::new(host_id),
             windows_hyper_v: WindowsHyperVContainers::new(host_id),
         }
+    }
+
+    /// Applies the host's `runner.env` at `path` to every native runner.
+    /// Isolated runners do not get it: their environment is the image's.
+    #[must_use]
+    pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
+        self.native = self.native.with_runner_env_file(path);
+        self
     }
 
     fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
@@ -2224,6 +2294,31 @@ impl NativeProcesses {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Applies the host's `runner.env` at `path` to every runner launched.
+    #[must_use]
+    pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
+        self.runner_env_file = Some(path);
+        self
+    }
+
+    /// The host's `runner.env`, read now.
+    ///
+    /// A file that cannot be read or parsed fails the launch rather than
+    /// starting a runner without the environment the operator configured.
+    /// The warning names the line and variable, never a value.
+    fn host_env(&self) -> Result<RunnerEnv, ProcessStartFailure> {
+        let Some(path) = &self.runner_env_file else {
+            return Ok(RunnerEnv::default());
+        };
+        RunnerEnv::load(path).map_err(|error| {
+            tracing::warn!(
+                reason = "runner_env_file_invalid",
+                "runner.env could not be applied, so no runner starts until it is fixed: {error}"
+            );
+            ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed)
+        })
     }
 
     #[cfg(test)]
@@ -2443,6 +2538,7 @@ impl ProcessSupervisor for NativeProcesses {
                 FailureReason::ProcessStartFailed,
             ));
         }
+        let host_env = self.host_env()?;
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -2461,10 +2557,10 @@ impl ProcessSupervisor for NativeProcesses {
                 )
                 .working_dir(attempt.runtime_path())
         } else {
-            runner_listener_spec(program, attempt.runtime_path())
+            runner_listener_spec(program, attempt.runtime_path(), &host_env)
         };
         #[cfg(not(test))]
-        let spec = runner_listener_spec(program, attempt.runtime_path());
+        let spec = runner_listener_spec(program, attempt.runtime_path(), &host_env);
         let child = spec
             .spawn_runner_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
@@ -2656,7 +2752,7 @@ impl LifecycleError {
             // Rendered through `Display` rather than a second copy of the same
             // sentence, so the two cannot drift apart.
             Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
-            Self::WorkspaceCleanupDeferred => FailureReason::Other(self.to_string()),
+            Self::WorkspaceCleanupDeferred => FailureReason::WorkspaceCleanupDeferred,
             Self::EnvironmentCleanupDeferred => FailureReason::Other(self.to_string()),
         }
     }
@@ -8228,7 +8324,11 @@ mod tests {
     #[test]
     fn production_listener_command_uses_the_supported_jit_contract() {
         let runtime = Path::new("runtime");
-        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), runtime);
+        let spec = runner_listener_spec(
+            PathBuf::from("Runner.Listener"),
+            runtime,
+            &RunnerEnv::default(),
+        );
         let arguments: Vec<_> = spec
             .arguments()
             .iter()
@@ -8242,6 +8342,63 @@ mod tests {
                 .any(|argument| argument == "--jit-config-file"),
             "the obsolete file option would be rejected by Runner.Listener 2.336.0"
         );
+    }
+
+    /// What a production runner starts with: the platform defaults, the host's
+    /// `runner.env` over them, the attempt's own temporary directory, and
+    /// normal scheduling.
+    #[test]
+    fn production_listener_layers_runner_env_over_the_platform_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("attempt");
+        let host_env =
+            RunnerEnv::parse("ELECTRON_CACHE=/cache/electron\nHOME=/operator/chose/this\n")
+                .unwrap();
+        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), &runtime, &host_env);
+        let env = |name: &str| spec.configured_env(name).map(PathBuf::from);
+
+        assert!(spec.uses_normal_scheduling());
+        assert_eq!(
+            env("ELECTRON_CACHE"),
+            Some(PathBuf::from("/cache/electron"))
+        );
+        assert_eq!(
+            env("HOME"),
+            Some(PathBuf::from("/operator/chose/this")),
+            "runner.env must win over a platform default of the same name"
+        );
+        for tmp in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(env(tmp), Some(runtime.join("tmp")), "{tmp}");
+        }
+
+        let home = runtime.join(runner_env::RUNNER_HOME_DIR);
+        if cfg!(windows) {
+            // Each runner's own profile, created inside its attempt, so that
+            // concurrent jobs stop sharing the service account's.
+            assert_eq!(env("USERPROFILE"), Some(home.clone()));
+            assert_eq!(env("APPDATA"), Some(home.join(r"AppData\Roaming")));
+            assert_eq!(env("LOCALAPPDATA"), Some(home.join(r"AppData\Local")));
+            assert!(home.join(r"AppData\Roaming").is_dir());
+            assert!(home.join(r"AppData\Local").is_dir());
+        } else {
+            // Unix keeps the account's own profile.
+            assert_eq!(env("USERPROFILE"), None);
+            assert!(!home.exists());
+        }
+    }
+
+    #[test]
+    fn an_invalid_runner_env_fails_the_launch_without_echoing_a_value() {
+        let root = tempfile::tempdir().unwrap();
+        let path = runner_env::path_in(root.path());
+        fs::write(&path, "GOOD=1\nghp_notarealtokenbutshapedlikeone\n").unwrap();
+        let processes = NativeProcesses::new().with_runner_env_file(path.clone());
+        let failure = processes.host_env().unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ProcessStartFailed);
+
+        fs::write(&path, "GOOD=1\n").unwrap();
+        assert_eq!(processes.host_env().unwrap().get("GOOD"), Some("1"));
+        assert!(NativeProcesses::new().host_env().unwrap().is_empty());
     }
 
     #[cfg(windows)]
@@ -8839,6 +8996,54 @@ mod tests {
             .expect("runtime deletion must not wait for a FIFO peer")
             .unwrap();
         assert!(!diagnostic.exists());
+    }
+
+    /// The junction WinINet leaves in a job's profile, reproduced: its own DACL
+    /// denies `Everyone` the right to list it.
+    #[cfg(windows)]
+    #[test]
+    fn disposable_tree_removal_unlinks_a_junction_nobody_may_list() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tree = temporary.path().join("attempt");
+        let cache = tree.join(r"tmp\home\AppData\Local\Microsoft\Windows\INetCache");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"not the attempt's").unwrap();
+        fs::write(tree.join("tmp").join("job.log"), b"job output").unwrap();
+        let junction = cache.join("Content.IE5");
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        // `/L` puts the entry on the junction itself, as WinINet does, rather
+        // than on the directory it points at. `*S-1-1-0` is `Everyone` in every
+        // display language.
+        let denied = std::process::Command::new("icacls")
+            .arg(&junction)
+            .args(["/L", "/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{denied:?}");
+
+        // The control: without the fix the tree cannot be removed at all.
+        let unfixed = remove_dir_all::remove_dir_all(&tree)
+            .expect_err("the fixture no longer reproduces the WinINet junction");
+        assert_eq!(unfixed.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(junction.symlink_metadata().is_ok());
+
+        remove_runtime_tree(&tree).expect("a tree holding a deny-list junction is removed");
+        assert!(!tree.exists(), "the attempt tree survived");
+        assert_eq!(
+            fs::read(outside.join("keep.txt")).unwrap(),
+            b"not the attempt's",
+            "removing the junction followed it into the directory it points at"
+        );
     }
 
     /// One slot entry that refuses to be removed, and the undo that lets the

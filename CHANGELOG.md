@@ -7,6 +7,41 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.31
+
+### Features
+
+- `runner-manager host env set NAME=VALUE`, `host env unset NAME` and `host env show` manage
+  `runner.env` in the configuration directory: variables every native runner on the host starts
+  with, such as cache locations. They reach the next runner without a restart. `host show`
+  names the file and how many variables it sets. `TMPDIR`, `TEMP`, `TMP` and
+  `ACTIONS_RUNNER_INPUT_*` cannot be set, and errors never print a value. A `runner.env` that
+  does not parse stops native launches until it is fixed, rather than starting runners without
+  it.
+
+### Fixes
+
+- macOS runners no longer inherit the service's background priority. The LaunchAgent runs the
+  daemon as a background process, and every runner it started ran on efficiency cores with
+  throttled I/O, 4 to 20 times slower than a classic runner. The daemon stays in the background;
+  each runner leaves it as it starts, and a warning is logged if that ever fails.
+- macOS runners find Homebrew tools: `/opt/homebrew/bin`, `/opt/homebrew/sbin` and
+  `/usr/local/bin` go ahead of the service's minimal `PATH` when they exist, and `LANG` defaults
+  to `en_US.UTF-8` when the service has none. Without `zstd` on the path `actions/cache` fell back
+  to gzip and never hit. `runner.env` overrides either.
+- Windows runners get a profile of their own (`USERPROFILE`, `HOME`, `APPDATA`,
+  `LOCALAPPDATA`) inside the attempt directory instead of sharing the service account's, where
+  concurrent jobs collided on `~/.bun`, the npm cache and the pnpm store. .NET known-folder APIs
+  still report the service account's profile.
+- Windows attempt workspaces holding a junction that denies listing to everyone, such as the
+  `INetCache\Content.IE5` junction WinINet creates, are now removed. Cleanup unlinks every
+  junction and symbolic link before removing the tree.
+- A cleanup that keeps failing is retried with per-attempt backoff, from 30 seconds up to 30
+  minutes, instead of every poll, and its warning names the reason
+  (`ephemeral_workspace_could_not_be_removed`) rather than `other`.
+- The log no longer redacts `kind`, `delay_secs` and `remaining` on rate-limit warnings, or long
+  `snake_case` reasons such as `late_ephemeral_workspace_could_not_be_removed`.
+
 ## 0.4.30
 
 ### Features

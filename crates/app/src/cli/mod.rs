@@ -813,6 +813,35 @@ pub enum HostCommand {
     /// Inspect this host's execution provider capabilities.
     #[command(subcommand)]
     Isolation(HostIsolationCommand),
+    /// View or change the environment every native runner starts with.
+    #[command(subcommand)]
+    Env(HostEnvCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostEnvCommand {
+    /// Print runner.env and the defaults this platform adds.
+    Show,
+    /// Set one variable for every native runner started from now on.
+    Set(HostEnvSetArgs),
+    /// Remove one variable from runner.env.
+    Unset(HostEnvUnsetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HostEnvSetArgs {
+    /// The variable and its value. The value is taken literally, with no
+    /// quoting or expansion; quote it for your shell. Not for secrets: every
+    /// job on this host can read it.
+    #[arg(value_name = "NAME=VALUE", allow_hyphen_values = true)]
+    pub assignment: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HostEnvUnsetArgs {
+    /// The variable to remove.
+    #[arg(value_name = "NAME")]
+    pub name: String,
 }
 
 #[derive(Debug, Subcommand)]

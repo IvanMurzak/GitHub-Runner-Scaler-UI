@@ -53,6 +53,7 @@ pub mod logging;
 pub mod os;
 pub mod paths;
 pub mod process;
+pub mod runner_env;
 pub mod runner_root;
 pub mod runner_root_access;
 pub mod secrets;

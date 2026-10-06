@@ -414,6 +414,16 @@ pub enum FailureReason {
     /// preserved in the attempt journal and operator activity rather than
     /// flattened into free-form subprocess or adapter text.
     IsolationProvider(IsolationProviderFailure),
+    /// An ephemeral attempt's workspace could not be removed yet, typically
+    /// because a late child still holds a file open or a directory refuses to
+    /// be listed; the reconciler retries it with backoff.
+    ///
+    /// **A cleanup report, never an attempt outcome.** It names why the
+    /// reconciler's cleanup of an already concluded attempt failed, so the
+    /// event and the log say *which* failure it was instead of `other`. No code
+    /// path concludes an attempt with it, which also keeps it out of the
+    /// journal that an older binary might read.
+    WorkspaceCleanupDeferred,
     /// Anything else. Must carry no credential.
     Other(String),
 }
@@ -496,7 +506,7 @@ impl FailureReason {
     /// invocation are markedly worse to read and to `rustdoc`. That is a
     /// legibility trade, deliberately taken — not an impossibility. If the
     /// documentation ever thins out, the macro is the better answer.
-    pub const ALL: [FailureReason; 10] = [
+    pub const ALL: [FailureReason; 11] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
         FailureReason::RunnerPackageUnverified,
@@ -506,6 +516,7 @@ impl FailureReason {
         FailureReason::RegistrationTimedOut,
         FailureReason::TerminatedAfterRegistrationTimeout,
         FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed),
+        FailureReason::WorkspaceCleanupDeferred,
         FailureReason::Other(String::new()),
     ];
 }
@@ -543,6 +554,9 @@ impl fmt::Display for FailureReason {
                  register with GitHub before its startup deadline",
             ),
             FailureReason::IsolationProvider(category) => category.fmt(f),
+            FailureReason::WorkspaceCleanupDeferred => {
+                f.write_str("the attempt workspace could not be removed yet; cleanup will retry")
+            }
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
     }
@@ -2283,6 +2297,9 @@ mod tests {
             // registered.
             FailureReason::TerminatedAfterRegistrationTimeout => AttemptState::Starting,
             FailureReason::IsolationProvider(_) => AttemptState::Allocated,
+            // Never recorded as an outcome (see the variant), so the only claim
+            // made here is the one `Other` makes: the type would accept it.
+            FailureReason::WorkspaceCleanupDeferred => AttemptState::Busy,
             FailureReason::Other(_) => AttemptState::Busy,
         }
     }
@@ -2300,7 +2317,7 @@ mod tests {
         // The table is written out rather than derived so each pairing carries
         // its reason; `earliest_state_producing` above is what makes a new
         // variant a compile error, and the two are cross-checked below.
-        let cases: [(FailureReason, AttemptState); 10] = [
+        let cases: [(FailureReason, AttemptState); 11] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -2331,6 +2348,7 @@ mod tests {
                 FailureReason::IsolationProvider(IsolationProviderFailure::NotInstalled),
                 AttemptState::Allocated,
             ),
+            (FailureReason::WorkspaceCleanupDeferred, AttemptState::Busy),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
                 AttemptState::Busy,
