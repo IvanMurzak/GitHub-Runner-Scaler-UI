@@ -77,6 +77,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
+use std::path::Path;
 
 use runner_manager_agent::lifecycle::ProviderCapability;
 #[cfg(not(test))]
@@ -90,11 +91,15 @@ use runner_manager_github::demand::DEMAND_REQUESTS_PER_REPOSITORY_PER_POLL;
 use runner_manager_github::rest::{
     BudgetProjection, TargetCost, budget_allowance, refreshes_per_hour,
 };
+use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerEnvError, RunnerPlatform};
 use runner_manager_platform::runner_root::RootOwner;
 use serde::Serialize;
 
 use super::workspace;
-use super::{CliError, Context, Failure, HostCommand, HostSetCapacityArgs, Styling, write_failed};
+use super::{
+    CliError, Context, Failure, HostCommand, HostEnvCommand, HostSetCapacityArgs, Styling,
+    write_failed,
+};
 
 // ---------------------------------------------------------------------------
 // The one place a target is priced
@@ -431,7 +436,132 @@ pub fn dispatch(
         HostCommand::Isolation(super::HostIsolationCommand::Status(args)) => {
             isolation_status(args.json, out)
         }
+        HostCommand::Env(command) => runner_env_command(context, command, out),
     }
+}
+
+// ---------------------------------------------------------------------------
+// host env
+// ---------------------------------------------------------------------------
+
+fn runner_env_failure(error: RunnerEnvError) -> CliError {
+    match error {
+        RunnerEnvError::Io { .. } => CliError::new(Failure::LocalState, error.to_string()),
+        _ => CliError::new(Failure::InvalidArgument, error.to_string()),
+    }
+}
+
+/// `host env show|set|unset`. `set` and `unset` rewrite `runner.env` in place,
+/// keeping its comments, and take effect for the next runner started: the
+/// daemon reads the file at every launch.
+///
+/// # Errors
+/// [`Failure::InvalidArgument`] for a refused name or value, or a file that no
+/// longer parses; [`Failure::LocalState`] when it cannot be read or written.
+pub fn runner_env_command(
+    context: &Context,
+    command: &HostEnvCommand,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let failed = write_failed("the runner environment");
+    let path = runner_env::path_in(context.paths().config_dir());
+    let mut env = RunnerEnv::load(&path).map_err(|error| match error {
+        RunnerEnvError::Io { .. } => runner_env_failure(error),
+        // `host env` cannot rewrite a file it cannot parse without losing
+        // what it did not understand, so it says where the file is.
+        _ => CliError::with_remedy(
+            Failure::InvalidArgument,
+            format!("{} cannot be used: {error}", path.display()),
+            format!("edit or delete that line in {}", path.display()),
+        ),
+    })?;
+    match command {
+        HostEnvCommand::Show => {
+            write_runner_env(out, &path, &env).map_err(failed)?;
+        }
+        HostEnvCommand::Set(args) => {
+            let (name, value) =
+                runner_env::split_assignment(&args.assignment).map_err(runner_env_failure)?;
+            let replaced = env.set(name, value).map_err(runner_env_failure)?;
+            env.save(&path).map_err(runner_env_failure)?;
+            let verb = if replaced { "replaced" } else { "set" };
+            writeln!(
+                out,
+                "{name} {verb} in {}; native runners started from now on get it.",
+                path.display()
+            )
+            .map_err(failed)?;
+        }
+        HostEnvCommand::Unset(args) => {
+            if env.unset(&args.name) {
+                env.save(&path).map_err(runner_env_failure)?;
+                writeln!(
+                    out,
+                    "{} removed from {}; native runners started from now on do not get it.",
+                    args.name,
+                    path.display()
+                )
+                .map_err(failed)?;
+            } else {
+                writeln!(out, "{} is not set in {}.", args.name, path.display()).map_err(failed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The file's variables, then what the platform adds and what is fixed, so
+/// that the whole of a runner's extra environment is on one screen.
+fn write_runner_env(out: &mut dyn Write, path: &Path, env: &RunnerEnv) -> io::Result<()> {
+    writeln!(out, "runner.env: {}", path.display())?;
+    if env.is_empty() {
+        writeln!(out, "  (no variables set)")?;
+    }
+    for (name, value) in env.entries() {
+        writeln!(out, "  {name}={value}")?;
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Added by this platform unless runner.env sets the same name:"
+    )?;
+    match RunnerPlatform::current() {
+        RunnerPlatform::MacOs => {
+            writeln!(
+                out,
+                "  PATH   {} ahead of the service's PATH, those that exist",
+                runner_env::MACOS_TOOL_DIRECTORIES.join(", ")
+            )?;
+            writeln!(
+                out,
+                "  LANG   {} when the service has no locale",
+                runner_env::MACOS_DEFAULT_LANG
+            )?;
+        }
+        RunnerPlatform::Windows => {
+            writeln!(
+                out,
+                "  {}   a profile inside each runner's attempt, removed with it",
+                runner_env::WINDOWS_PROFILE_VARIABLES.join(", ")
+            )?;
+            writeln!(
+                out,
+                "  (.NET known-folder APIs still report the service account's profile)"
+            )?;
+        }
+        RunnerPlatform::Linux => writeln!(out, "  nothing")?,
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Always per attempt and not changeable: {}, {}*",
+        runner_env::RESERVED_NAMES.join(", "),
+        runner_env::RESERVED_PREFIX
+    )?;
+    writeln!(
+        out,
+        "Isolated runners do not get these; their environment is the image's."
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -843,6 +973,13 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         affected.cleanup_blocked
     )
     .map_err(failed)?;
+    let env_path = runner_env::path_in(context.paths().config_dir());
+    let env_state = match RunnerEnv::load(&env_path) {
+        Ok(env) => format!("{} variable(s); `host env show` lists them", env.len()),
+        Err(error) => format!("unusable, so no runner starts: {error}"),
+    };
+    writeln!(out, "  runner env file           {}", env_path.display()).map_err(failed)?;
+    writeln!(out, "  runner env                {env_state}").map_err(failed)?;
 
     // -- the secret store ------------------------------------------------
     let secrets = context.secret_store(start_mode)?;

@@ -56,6 +56,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "reset-runtime-root",
             "show",
             "isolation",
+            "env",
         ],
     ),
     (
@@ -92,9 +93,11 @@ const SURFACE: [(&str, &[&str]); 10] = [
     ("wsl", &["list", "install", "status", "detach"]),
 ];
 
-/// Profile and provider leaves added by the runner-sandbox architecture.
-const NESTED_SURFACE: [(&str, &[&str]); 2] = [
+/// Profile and provider leaves added by the runner-sandbox architecture, and
+/// the host runner environment (`runner.env`).
+const NESTED_SURFACE: [(&str, &[&str]); 3] = [
     ("host isolation", &["status"]),
+    ("host env", &["show", "set", "unset"]),
     (
         "repo profile",
         &[

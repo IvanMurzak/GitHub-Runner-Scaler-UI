@@ -168,6 +168,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "attempt_state",
     "capacity",
     "count",
+    // Seconds a rate-limited client waits before its next request.
+    "delay_secs",
     "demand",
     "desired",
     "duration_ms",
@@ -180,6 +182,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "http_status",
     "installation_id",
     "job_id",
+    // A closed enum's `Display`, such as a rate limit's primary/secondary kind.
+    "kind",
     "label",
     "lock",
     "lock_wait_ms",
@@ -193,6 +197,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "policy_state",
     "reason",
     "register_ms",
+    // GitHub's `x-ratelimit-remaining`: a request count.
+    "remaining",
     "retry_in_ms",
     "runner_id",
     "scope",
@@ -1187,6 +1193,34 @@ fn redact_value(value: &str) -> String {
     value.to_string()
 }
 
+/// Fields whose values are this product's own closed vocabulary: `snake_case`
+/// constants such as `late_ephemeral_workspace_could_not_be_removed`.
+const CLOSED_VOCABULARY_FIELDS: &[&str] = &["kind", "reason"];
+
+/// Whether a closed-vocabulary field's value is emitted as it is.
+///
+/// The long `reason` constants are over [`OPAQUE_RUN_THRESHOLD`], so the
+/// opaque-run rule redacted the very field that says what went wrong. Exempt
+/// only in these fields, never in a message or any other field: there a long
+/// run is still treated as a secret. Within them, a lowercase `snake_case`
+/// identifier that does not start with a token prefix is not something a
+/// credential or a key generator produces.
+fn is_closed_vocabulary(name: &str, value: &str) -> bool {
+    CLOSED_VOCABULARY_FIELDS.contains(&name)
+        && !TOKEN_PREFIXES
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        && is_snake_case_identifier(value)
+}
+
+/// Whether a value is lowercase words joined by single underscores.
+fn is_snake_case_identifier(value: &str) -> bool {
+    value.contains('_')
+        && value
+            .split('_')
+            .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()))
+}
+
 /// The length of a SHA-256 digest written as lowercase hex.
 const SHA256_HEX_LEN: usize = 64;
 
@@ -1303,10 +1337,12 @@ struct RedactingVisitor {
 
 impl RedactingVisitor {
     fn put_str(&mut self, name: &str, value: &str) {
-        let rendered = if is_field_allowed(name) {
-            redact(value)
-        } else {
+        let rendered = if !is_field_allowed(name) {
             REDACTION.to_string()
+        } else if is_closed_vocabulary(name, value) {
+            value.to_string()
+        } else {
+            redact(value)
         };
         self.fields
             .insert(name.to_string(), Value::String(rendered));
@@ -2354,6 +2390,56 @@ mod tests {
             );
         }
         assert!(output.contains("\"count\":3"), "{output}");
+    }
+
+    /// The rate-limit warning's fields and a long closed-vocabulary reason
+    /// reach the log, rather than `[redacted]` in place of the diagnosis.
+    #[test]
+    fn non_secret_diagnostic_fields_survive() {
+        let capture = Capture::default();
+        let output = emit(&capture, || {
+            tracing::warn!(
+                kind = "secondary",
+                delay_secs = 61_u64,
+                remaining = 0_u64,
+                reason = "late_ephemeral_workspace_could_not_be_removed",
+                "rate limited"
+            );
+        });
+        for expected in [
+            "\"kind\":\"secondary\"",
+            "\"delay_secs\":61",
+            "\"remaining\":0",
+            "\"reason\":\"late_ephemeral_workspace_could_not_be_removed\"",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from:
+{output}"
+            );
+        }
+    }
+
+    /// The carve-out is for identifiers in closed-vocabulary fields, not for
+    /// anything long with an underscore in it, and not for message text.
+    #[test]
+    fn only_a_snake_case_reason_field_escapes_the_opaque_rule() {
+        let reason = "late_ephemeral_workspace_could_not_be_removed";
+        assert!(is_closed_vocabulary("reason", reason));
+        assert!(!is_closed_vocabulary("message", reason));
+        assert_eq!(redact(reason), REDACTION, "free text kept a long run");
+        for opaque in [
+            // A capital, a digit, a doubled or trailing underscore, and no
+            // underscore at all: each is a shape a secret can take.
+            "late_ephemeral_workspace_could_not_be_Removed",
+            "late_ephemeral_workspace_could_not_be_removed2",
+            "late_ephemeral__workspace_could_not_be_removed",
+            "late_ephemeral_workspace_could_not_be_removed_",
+            "lateephemeralworkspacecouldnotberemovedquite",
+            "ghs_ephemeral_workspace_could_not_be_removed",
+        ] {
+            assert!(!is_closed_vocabulary("reason", opaque), "{opaque}");
+        }
     }
 
     #[test]

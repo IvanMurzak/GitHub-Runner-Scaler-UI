@@ -1457,6 +1457,9 @@ fn failure_remediation(reason: &FailureReason) -> &'static str {
                 "Inspect the provider bootstrap; do not retry the one-time JIT handoff."
             }
         },
+        FailureReason::WorkspaceCleanupDeferred => {
+            "Stop whatever still holds files in the attempt workspace; cleanup retries."
+        }
         FailureReason::Other(_) => "Inspect the local runner log and the copy-safe diagnostic.",
     }
 }

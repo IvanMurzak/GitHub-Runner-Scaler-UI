@@ -296,6 +296,9 @@ runner-manager host set-capacity N                             # Limit concurren
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 runner-manager host isolation status [--json]                  # Report execution provider readiness
+runner-manager host env show                                   # Show what native runners add to their environment
+runner-manager host env set NAME=VALUE                         # Give every native runner a variable
+runner-manager host env unset NAME                             # Remove a runner variable
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
@@ -594,6 +597,37 @@ Both take effect for the next runner and never relocate a running one. Both are 
 while this host still has runner attempts it has not cleaned up, naming how many are active and
 how many are awaiting cleanup, so run them once the host is idle. No existing directory is moved
 or deleted.
+
+### Give runners an environment
+
+A runner started by the service inherits the service's environment, which is not your login
+shell's. Set extra variables, such as cache locations, for every native runner on this machine:
+
+```sh
+runner-manager host env set npm_config_cache=/Volumes/Data/ci-cache/npm
+runner-manager host env set ELECTRON_CACHE=/Volumes/Data/ci-cache/electron
+runner-manager host env show
+```
+
+They live in `runner.env` in the configuration directory, one `NAME=VALUE` per line, and reach
+the next runner started without a restart. Every job on the machine can read them, so do not put
+secrets there; use repository or organization secrets instead.
+
+Each platform also adds a few variables unless `runner.env` sets the same name:
+
+- **macOS:** Homebrew's `/opt/homebrew/bin`, `/opt/homebrew/sbin` and `/usr/local/bin`, when
+  they exist, ahead of the service's minimal `PATH`, and `LANG=en_US.UTF-8` when the service
+  has no locale. Runners also run at normal priority rather than the service's background
+  priority.
+- **Windows:** `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point at a profile inside
+  each runner's own attempt directory, so concurrent jobs no longer share the service account's
+  caches. That profile goes with the attempt, so tool caches under it (npm, pnpm, NuGet, bun)
+  start empty for every job; point them at a shared directory with `runner.env`, for example
+  `npm_config_cache` or `NUGET_PACKAGES`, if you want them kept. .NET known-folder APIs ignore
+  these variables and still report the service account's profile.
+
+`TMPDIR`, `TEMP` and `TMP` are always the attempt's own and cannot be changed. Isolated runners
+do not get any of this; their environment is the image's.
 
 ### Keep a build cache between jobs
 

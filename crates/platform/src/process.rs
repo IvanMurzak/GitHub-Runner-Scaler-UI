@@ -474,6 +474,7 @@ pub struct SpawnSpec {
     envs: Vec<(OsString, OsString)>,
     working_dir: Option<PathBuf>,
     output: OutputMode,
+    normal_scheduling: bool,
 }
 
 impl SpawnSpec {
@@ -485,6 +486,7 @@ impl SpawnSpec {
             envs: Vec::new(),
             working_dir: None,
             output: OutputMode::Discard,
+            normal_scheduling: false,
         }
     }
 
@@ -530,11 +532,60 @@ impl SpawnSpec {
         self
     }
 
+    /// Starts the child at normal scheduling priority even when this process
+    /// runs throttled.
+    ///
+    /// On macOS a launchd agent declared `ProcessType = Background` runs
+    /// "darwinbg": priority 4, efficiency cores only, throttled I/O. That is
+    /// right for the daemon, which mostly waits, and wrong for the runners it
+    /// starts, which inherit it and then run every build step 4 to 20 times
+    /// slower than a classic runner does. With this set, the child clears the
+    /// inherited background state for itself (`setpriority(PRIO_DARWIN_PROCESS,
+    /// 0, 0)`) between `fork` and `exec`, so the daemon stays in the background
+    /// and only the runner and its descendants leave it.
+    ///
+    /// Best effort, on purpose. A throttled runner still runs its job
+    /// correctly; a runner that fails to start runs nothing. So a failed call
+    /// does not abort the launch: the parent reads the child's priority back
+    /// after the spawn and logs a warning when it is still at the background
+    /// ceiling, which is the one report a post-`fork` hook cannot make itself.
+    /// Leaving the background state needs no privilege for one's own process,
+    /// so that warning is not expected to fire.
+    ///
+    /// No effect on other platforms, which have no such inherited state.
+    #[must_use]
+    pub fn normal_scheduling(mut self) -> Self {
+        self.normal_scheduling = true;
+        self
+    }
+
     /// The arguments as configured. Exposed so a security test can assert what
     /// a process listing would show.
     #[must_use]
     pub fn arguments(&self) -> &[OsString] {
         &self.args
+    }
+
+    /// The variable the child gets for `name`, as configured on top of the
+    /// inherited environment: the last [`Self::env`] for it wins, as it does in
+    /// the child. Names compare without case on Windows, as Windows does.
+    #[must_use]
+    pub fn configured_env(&self, name: &str) -> Option<&OsStr> {
+        self.envs
+            .iter()
+            .rev()
+            .find(|(key, _)| {
+                key.to_str()
+                    .is_some_and(|key| crate::runner_env::same_name(key, name))
+            })
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    /// Whether [`Self::normal_scheduling`] was asked for.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn uses_normal_scheduling(&self) -> bool {
+        self.normal_scheduling
     }
 
     /// Launches the child.
@@ -576,6 +627,10 @@ impl SpawnSpec {
             OutputMode::Capture => (Stdio::piped(), Stdio::piped()),
         };
         command.stdout(stdout).stderr(stderr);
+        #[cfg(target_os = "macos")]
+        if self.normal_scheduling {
+            sys::clear_inherited_background(&mut command);
+        }
 
         let child = command.spawn().map_err(|source| ProcessError::Spawn {
             program: self.program.clone(),
@@ -583,6 +638,14 @@ impl SpawnSpec {
         })?;
 
         let pid = child.id();
+        #[cfg(target_os = "macos")]
+        if self.normal_scheduling && sys::runs_throttled(pid) {
+            tracing::warn!(
+                pid,
+                reason = "runner_started_at_background_priority",
+                "the runner process still runs at background priority, so its jobs will be slow"
+            );
+        }
         match ProcessIdentity::of_child(pid) {
             Ok(identity) => Ok(ChildProcess {
                 child,
@@ -1773,6 +1836,67 @@ mod sys {
             info.pbi_start_tvsec, info.pbi_start_tvusec
         )))
     }
+
+    /// The highest base priority XNU gives a "darwinbg" task
+    /// (`MAXPRI_THROTTLE`). A normal user task runs at 31.
+    #[cfg(target_os = "macos")]
+    pub(super) const BACKGROUND_PRIORITY_CEILING: i32 = 4;
+
+    /// Makes the child leave the background state it inherited from this
+    /// process before it executes the program.
+    ///
+    /// The hook runs after `fork`, in a copy of a multi-threaded process, so it
+    /// must be async-signal-safe: one system call, no allocation, no lock. Its
+    /// result is deliberately ignored; [`super::SpawnSpec::normal_scheduling`]
+    /// says why a failure must not abort the launch and how it is reported.
+    #[cfg(target_os = "macos")]
+    pub(super) fn clear_inherited_background(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure makes one system call on the calling process
+        // (`who == 0`) and touches no memory, allocator or lock, so it is safe
+        // to run between `fork` and `exec`.
+        unsafe {
+            command.pre_exec(|| {
+                let _ = libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, 0);
+                Ok(())
+            });
+        }
+    }
+
+    /// The task's base scheduling priority: the number `ps -o pri` shows.
+    ///
+    /// The effective answer, which is the one that has to be asked.
+    /// `getpriority(PRIO_DARWIN_PROCESS, pid)` looks like the obvious query and
+    /// is not: asked about another process it reads only what was requested
+    /// for it from outside, and for a launchd `Background` agent running at
+    /// priority 4 it answers 0, "not background" (measured on macOS 26).
+    #[cfg(target_os = "macos")]
+    pub(super) fn base_priority(pid: u32) -> io::Result<i32> {
+        // SAFETY: as `start_token`: a zeroed, correctly sized `proc_taskinfo`
+        // and its exact size, so the kernel writes only within it.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap_or(i32::MAX);
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.pti_priority)
+    }
+
+    /// Whether `pid` runs at or under the background priority ceiling. A
+    /// process that can no longer be read is not reported as throttled.
+    #[cfg(target_os = "macos")]
+    pub(super) fn runs_throttled(pid: u32) -> bool {
+        base_priority(pid).is_ok_and(|priority| priority <= BACKGROUND_PRIORITY_CEILING)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2829,6 +2953,89 @@ mod tests {
         );
 
         child.stop(Duration::from_secs(10)).expect("cleanup");
+    }
+
+    /// Set by [`a_runner_leaves_the_background_state_its_parent_runs_in`] when
+    /// it re-runs this test binary as the throttled parent.
+    #[cfg(target_os = "macos")]
+    const DARWIN_BACKGROUND_PARENT: &str = "RUNNER_MANAGER_TEST_DARWIN_BACKGROUND_PARENT";
+
+    /// The throttled parent, in a process of its own so that moving it into
+    /// the background slows nothing else in the suite.
+    ///
+    /// It starts two identical children, one without and one with
+    /// [`SpawnSpec::normal_scheduling`], and prints each child's priority. The
+    /// first child is the control: it proves the background state really is
+    /// inherited here, without which the second child's normal priority would
+    /// prove nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "spawned only as the throttled parent of the darwinbg test"]
+    fn darwin_background_parent_helper() {
+        assert!(
+            std::env::var_os(DARWIN_BACKGROUND_PARENT).is_some(),
+            "run only by a_runner_leaves_the_background_state_its_parent_runs_in"
+        );
+        // SAFETY: a plain system call on this process.
+        let moved =
+            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
+        assert_eq!(moved, 0, "{}", std::io::Error::last_os_error());
+        println!(
+            "parent_priority={}",
+            sys::base_priority(std::process::id()).expect("own priority")
+        );
+        for (label, spec) in [
+            ("control", long_running()),
+            ("runner", long_running().normal_scheduling()),
+        ] {
+            let mut child = spec.spawn().expect("child starts");
+            let priority = sys::base_priority(child.pid()).expect("child priority");
+            println!("{label}_priority={priority}");
+            child.stop(Duration::from_secs(5)).expect("child stops");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runner_leaves_the_background_state_its_parent_runs_in() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::darwin_background_parent_helper",
+                "--nocapture",
+            ])
+            .env(DARWIN_BACKGROUND_PARENT, "1")
+            .output()
+            .expect("the throttled parent runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the throttled parent failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let priority = |label: &str| -> i32 {
+            let prefix = format!("{label}_priority=");
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {label} priority in: {stdout}"))
+        };
+        let ceiling = sys::BACKGROUND_PRIORITY_CEILING;
+        assert!(
+            priority("parent") <= ceiling,
+            "the helper never entered the background state, so nothing below is tested"
+        );
+        assert!(
+            priority("control") <= ceiling,
+            "a child without the flag did not inherit the background state, so the flag's \
+             child proves nothing: {stdout}"
+        );
+        assert!(
+            priority("runner") > ceiling,
+            "a child started with normal_scheduling still runs throttled: {stdout}"
+        );
     }
 
     #[test]

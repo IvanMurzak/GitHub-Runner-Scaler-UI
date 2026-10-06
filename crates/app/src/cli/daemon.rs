@@ -287,7 +287,11 @@ async fn run_generation(
                 store: Arc::clone(&lifecycle_store) as Arc<dyn Store>,
                 github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
                 packages: Arc::new(CachedRuntimePackages::new(cache)),
-                processes: Arc::new(PlatformExecutionProvider::new(host.id)),
+                processes: Arc::new(
+                    PlatformExecutionProvider::new(host.id).with_runner_env_file(
+                        runner_manager_platform::runner_env::path_in(context.paths().config_dir()),
+                    ),
+                ),
                 clock: Arc::clone(&clock),
                 demand: Arc::new(PersistentDemand),
                 delay: Arc::new(TokioRetryDelay),

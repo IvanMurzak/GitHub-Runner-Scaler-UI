@@ -1270,6 +1270,7 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
             IsolationProviderFailure::UnsafeRuntimePath => "isolation_unsafe_runtime_path",
             IsolationProviderFailure::JitHandoffRejected => "isolation_jit_handoff_rejected",
         },
+        FailureReason::WorkspaceCleanupDeferred => "ephemeral_workspace_could_not_be_removed",
         FailureReason::Other(_) => "other",
     }
 }
@@ -1930,6 +1931,74 @@ impl ScaleDownReport {
     }
 }
 
+/// How long a failed cleanup of one attempt waits before it is tried again,
+/// doubling per consecutive failure up to [`CLEAN_RETRY_MAXIMUM`].
+///
+/// A runtime that cannot be removed used to be retried on every pass, about
+/// every six seconds, and each failure logs a warning: one stuck Windows
+/// workspace wrote some 15,000 of them a day. The retry is still real; it is
+/// just no longer a log flood.
+const CLEAN_RETRY_INITIAL: Duration = Duration::from_secs(30);
+
+/// The longest a failing cleanup waits between tries.
+const CLEAN_RETRY_MAXIMUM: Duration = Duration::from_secs(30 * 60);
+
+/// One attempt's consecutive cleanup failures, and when it may be tried again.
+#[derive(Debug, Clone, Copy)]
+struct CleanRetry {
+    failures: u32,
+    not_before: Timestamp,
+}
+
+/// Per-attempt cleanup backoff. One each in the [`Reconciler`]'s sweep of
+/// concluded attempts and in the lifecycle launcher's own supervision pass,
+/// the two places a failed cleanup is retried.
+#[derive(Debug, Default)]
+pub(crate) struct CleanBackoff {
+    retries: BTreeMap<AttemptId, CleanRetry>,
+}
+
+impl CleanBackoff {
+    /// The doubling-with-a-ceiling schedule; the attempt bound is unused.
+    const SCHEDULE: crate::lifecycle::RetryPolicy =
+        crate::lifecycle::RetryPolicy::bounded(u32::MAX, CLEAN_RETRY_INITIAL, CLEAN_RETRY_MAXIMUM);
+
+    /// Whether `attempt`'s cleanup should be tried at `now`.
+    pub(crate) fn is_due(&self, attempt: AttemptId, now: Timestamp) -> bool {
+        self.retries
+            .get(&attempt)
+            .is_none_or(|retry| now >= retry.not_before)
+    }
+
+    /// Records a failed cleanup and schedules the next try.
+    pub(crate) fn failed(&mut self, attempt: AttemptId, now: Timestamp) {
+        let failures = self
+            .retries
+            .get(&attempt)
+            .map_or(1, |retry| retry.failures.saturating_add(1));
+        let delay = Self::SCHEDULE.delay(failures);
+        self.retries.insert(
+            attempt,
+            CleanRetry {
+                failures,
+                // At most `CLEAN_RETRY_MAXIMUM`, so always representable.
+                not_before: now + chrono::Duration::from_std(delay).unwrap_or_default(),
+            },
+        );
+    }
+
+    /// Forgets `attempt`: it was cleaned.
+    pub(crate) fn succeeded(&mut self, attempt: AttemptId) {
+        self.retries.remove(&attempt);
+    }
+
+    /// Forgets every attempt not in `present`, so the map cannot outgrow the
+    /// journal.
+    fn retain(&mut self, present: &BTreeSet<AttemptId>) {
+        self.retries.retain(|attempt, _| present.contains(attempt));
+    }
+}
+
 /// The reconciliation loop.
 ///
 /// One per target, as `f3` runs them; they share a [`RunnerLauncher`] and an
@@ -1946,6 +2015,7 @@ pub struct Reconciler {
     jitter: Arc<dyn Jitter>,
     events: Arc<dyn EventSink>,
     schedule: PollSchedule,
+    clean_backoff: CleanBackoff,
 }
 
 impl Reconciler {
@@ -1968,6 +2038,7 @@ impl Reconciler {
             jitter: ports.jitter,
             events: ports.events,
             schedule: PollSchedule::new(interval),
+            clean_backoff: CleanBackoff::default(),
         }
     }
 
@@ -2458,7 +2529,7 @@ impl Reconciler {
     /// `is_concluded` and not `is_terminal`: `cleaned` is terminal and already
     /// done, and `busy` is not terminal at all. That is what makes it impossible
     /// for this path to reach a runner executing a job.
-    async fn clean_terminal_attempts(&self, report: &mut ReconcileReport) {
+    async fn clean_terminal_attempts(&mut self, report: &mut ReconcileReport) {
         let attempts = match self.launcher.attempts().await {
             Ok(attempts) => attempts,
             Err(failure) => {
@@ -2466,6 +2537,9 @@ impl Reconciler {
                 return;
             }
         };
+        self.clean_backoff
+            .retain(&attempts.iter().map(|attempt| attempt.id).collect());
+        let now = self.clock.now();
         for attempt in attempts {
             if !attempt.state().is_concluded() {
                 continue;
@@ -2473,9 +2547,15 @@ impl Reconciler {
             let Some(outcome) = attempt.outcome() else {
                 continue;
             };
+            // Backed off after failing: not tried, so neither cleaned nor a
+            // fresh failure to report.
+            if !self.clean_backoff.is_due(attempt.id, now) {
+                continue;
+            }
             let kind = OutcomeKind::of(outcome);
             match self.launcher.clean(attempt.id).await {
                 Ok(()) => {
+                    self.clean_backoff.succeeded(attempt.id);
                     report.cleaned = report.cleaned.saturating_add(1);
                     if kind.is_failure() {
                         report.failures = report.failures.saturating_add(1);
@@ -2499,8 +2579,10 @@ impl Reconciler {
                 // attempt already stopped counting -- but this module's
                 // organising principle is the things that go wrong silently, and
                 // `clean` returns a `Result` precisely so the caller can say
-                // something.
+                // something. It is retried with per-attempt backoff
+                // ([`CLEAN_RETRY_INITIAL`]) so the saying is not a flood.
                 Err(failure) => {
+                    self.clean_backoff.failed(attempt.id, now);
                     report.clean_failures = report.clean_failures.saturating_add(1);
                     self.events.emit(LifecycleEvent::AttemptCleanFailed {
                         policy: attempt.policy_id,
@@ -3216,6 +3298,7 @@ mod tests {
         launcher: Arc<FakeLauncher>,
         demand: Arc<FakeDemand>,
         events: Arc<EventLog>,
+        clock: Arc<FakeClock>,
         reconciler: Reconciler,
     }
 
@@ -3227,6 +3310,7 @@ mod tests {
             lock: Arc<dyn AllocationLock>,
         ) -> Self {
             let events = Arc::new(EventLog::new());
+            let clock = Arc::new(FakeClock::default());
             let reconciler = Reconciler::new(
                 host,
                 ReconcilerPorts {
@@ -3234,7 +3318,7 @@ mod tests {
                     launcher: Arc::clone(&launcher) as Arc<dyn RunnerLauncher>,
                     lock,
                     directory: Arc::new(FakeDirectory::default()),
-                    clock: Arc::new(FakeClock::default()),
+                    clock: Arc::clone(&clock) as Arc<dyn Clock>,
                     jitter: Arc::new(NoJitter) as Arc<dyn Jitter>,
                     events: Arc::clone(&events) as Arc<dyn EventSink>,
                 },
@@ -3243,6 +3327,7 @@ mod tests {
                 launcher,
                 demand,
                 events,
+                clock,
                 reconciler,
             }
         }
@@ -3559,6 +3644,62 @@ mod tests {
             })
             .collect();
         assert_eq!(reasons, vec!["other"]);
+    }
+
+    /// A cleanup that keeps failing is retried with per-attempt exponential
+    /// backoff rather than on every pass, and a success forgets the backoff.
+    #[tokio::test]
+    async fn a_failing_cleanup_backs_off_exponentially_per_attempt() {
+        let launcher = Arc::new(FakeLauncher::refusing_cleanup(vec![concluded(
+            1,
+            1,
+            AttemptOutcome::ExitedIdleWithoutWork,
+        )]));
+        let mut harness = Harness::build(
+            host_with(4),
+            Arc::clone(&launcher),
+            Arc::new(FakeDemand::ready(0, &repo("acme/app"))),
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        let policies = [policy(1, "acme/app", 4)];
+        let start = harness.clock.now();
+        let at = |offset: Duration| start + chrono::Duration::from_std(offset).unwrap();
+        let mut failures_at = async |offset: Duration| {
+            harness.clock.set(at(offset));
+            harness.reconciler.reconcile(&policies).await.clean_failures
+        };
+
+        assert_eq!(failures_at(Duration::ZERO).await, 1);
+        // Inside the first delay: not tried, so nothing new to report.
+        assert_eq!(
+            failures_at(CLEAN_RETRY_INITIAL - Duration::from_secs(1)).await,
+            0,
+            "a failed cleanup was retried on the very next pass"
+        );
+        assert_eq!(failures_at(CLEAN_RETRY_INITIAL).await, 1);
+        // The second delay is twice the first.
+        let second = CLEAN_RETRY_INITIAL + CLEAN_RETRY_INITIAL * 2;
+        assert_eq!(
+            failures_at(second - Duration::from_secs(1)).await,
+            0,
+            "the delay did not double after a second failure"
+        );
+        assert_eq!(failures_at(second).await, 1);
+        assert_eq!(harness.events.count_of("attempt_clean_failed"), 3);
+
+        // The delay never exceeds the ceiling, however many failures accrue.
+        let mut backoff = CleanBackoff::default();
+        let id = AttemptId::from_u128(9);
+        for _ in 0..40 {
+            backoff.failed(id, start);
+        }
+        assert!(!backoff.is_due(id, at(CLEAN_RETRY_MAXIMUM - Duration::from_secs(1))));
+        assert!(backoff.is_due(id, at(CLEAN_RETRY_MAXIMUM)));
+        backoff.succeeded(id);
+        assert!(
+            backoff.is_due(id, start),
+            "a cleaned attempt kept its backoff"
+        );
     }
 
     /// N2: an unreadable attempt set makes a scale-down inconclusive, not empty.

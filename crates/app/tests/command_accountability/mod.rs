@@ -79,6 +79,7 @@ pub enum Boundary {
     WslPlatform,
     LivePermissionProbe,
     ProfileStateSpace,
+    RunnerEnvironmentFile,
 }
 
 impl Boundary {
@@ -106,6 +107,10 @@ impl Boundary {
             }
             Self::ProfileStateSpace => {
                 "creates and selects multiple PolicyIds for one repository, including execution and selector state absent from the single-policy chain oracle"
+            }
+            Self::RunnerEnvironmentFile => {
+                "reads or rewrites the host's runner.env, a file outside the chain oracle's \
+                 modelled state whose only effect is on a native runner's environment at launch"
             }
         }
     }
@@ -154,6 +159,7 @@ const TUI_SHELL: &str = "crates/app/src/tui/shell.rs";
 const UPDATE: &str = "crates/app/tests/update_command.rs";
 const WSL_ACCEPTANCE: &str = "crates/app/src/cli/wsl_acceptance.rs";
 const PROFILE_COMMANDS: &str = "crates/app/tests/profile_commands.rs";
+const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -225,6 +231,20 @@ macro_rules! profile_row {
     };
 }
 
+macro_rules! runner_env_row {
+    ($leaf:literal, $test:literal) => {
+        Classification {
+            leaf: $leaf,
+            coverage: Coverage::Dedicated,
+            evidence: &[at(RUNNER_ENV_COMMANDS, $test)],
+            exclusion: Some(Exclusion {
+                boundary: Boundary::RunnerEnvironmentFile,
+                reason: "runner.env changes nothing the generated oracle observes: no policy, attempt, root or credential, only what a launched native runner inherits. Dedicated real-process tests drive set, unset and show against the file under --data-dir and pin the refusals.",
+            }),
+        }
+    };
+}
+
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
     // -- auth: sign-in state is modelled as credential presence -------------
@@ -267,6 +287,18 @@ pub const MANIFEST: &[Classification] = &[
             reason: "Reports the execution providers for profiles; a dedicated JSON-schema test covers this new capability document outside the single-policy generated oracle.",
         }),
     },
+    runner_env_row!(
+        "host env show",
+        "host_env_set_show_and_unset_round_trip_through_runner_env"
+    ),
+    runner_env_row!(
+        "host env set",
+        "host_env_refuses_what_the_daemon_would_refuse_and_writes_nothing"
+    ),
+    runner_env_row!(
+        "host env unset",
+        "host_env_set_show_and_unset_round_trip_through_runner_env"
+    ),
     // -- repo ----------------------------------------------------------------
     generated("repo add"),
     generated("repo list"),

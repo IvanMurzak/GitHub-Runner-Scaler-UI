@@ -39,6 +39,7 @@ use runner_manager_github::rest::{CancelToken, InventoryGateway};
 use runner_manager_platform::process::{
     Adoption, ChildProcess, ProcessIdentity, RestrictiveHandoff, SpawnSpec, Termination,
 };
+use runner_manager_platform::runner_env::{self, RunnerEnv, RunnerPlatform};
 use runner_manager_platform::runner_root::{
     self, RootOwner, RootPreflight, RunnerRootError, default_runner_root,
 };
@@ -47,8 +48,8 @@ use secrecy::SecretString;
 use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
-    AllocationGuard, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent, OutcomeKind,
-    ReplacementIntent, RunnerLauncher, failure_reason_kind,
+    AllocationGuard, CleanBackoff, EventSink, LaunchFailure, LaunchRequest, LifecycleEvent,
+    OutcomeKind, ReplacementIntent, RunnerLauncher, failure_reason_kind,
 };
 
 mod windows_hyperv;
@@ -103,15 +104,37 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// secret `ACTIONS_RUNNER_INPUT_JITCONFIG` input. The platform spawn boundary
 /// supplies that input from the restrictive handoff; the listener command line
 /// must contain only the supported `run` command.
-fn runner_listener_spec(program: PathBuf, runtime: &Path) -> SpawnSpec {
+///
+/// The environment is the daemon's plus [`runner_env::platform_defaults`] and
+/// then the host's `runner.env`, which wins over a default of the same name.
+/// The per-attempt temporary directory goes last and `runner.env` cannot name
+/// it. On macOS the runner also leaves the daemon's background scheduling
+/// ([`SpawnSpec::normal_scheduling`]).
+fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
-    SpawnSpec::new(program)
+    let defaults = runner_env::platform_defaults(
+        RunnerPlatform::current(),
+        runtime,
+        &runner_env::Inherited::current(),
+        Path::exists,
+    );
+    // The Windows profile the defaults point at. Created even when
+    // `runner.env` overrides part of it: it is inside the attempt, so it costs
+    // nothing and goes with the attempt.
+    for (name, dir) in &defaults {
+        if runner_env::DIRECTORY_VARIABLES.contains(name) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    let mut spec = SpawnSpec::new(program)
         .arg("run")
         .working_dir(runtime)
-        .env("TMPDIR", &tmp)
-        .env("TEMP", &tmp)
-        .env("TMP", &tmp)
+        .normal_scheduling();
+    for (name, value) in runner_env::runner_environment(defaults, host_env) {
+        spec = spec.env(name, value);
+    }
+    spec.env("TMPDIR", &tmp).env("TEMP", &tmp).env("TMP", &tmp)
 }
 
 /// Retry bounds for failures that can resolve without operator action.
@@ -132,7 +155,7 @@ impl RetryPolicy {
         }
     }
 
-    fn delay(self, failure_index: u32) -> Duration {
+    pub(crate) fn delay(self, failure_index: u32) -> Duration {
         let shift = failure_index.saturating_sub(1).min(31);
         self.initial
             .saturating_mul(1_u32 << shift)
@@ -922,15 +945,60 @@ fn remove_materialized_package(attempt: &RunnerAttempt) -> std::io::Result<()> {
 /// wait forever for its peer. The .NET runner routinely leaves diagnostic FIFOs
 /// in its private `tmp`, so use the standard library's fd-relative Unix remover,
 /// which unlinks non-directories without opening them. Keep the external remover
-/// on Windows for its existing read-only and junction handling.
+/// on Windows for its existing read-only and long-path handling; when it is
+/// refused, [`unlink_reparse_points`] takes every link out of its way and it
+/// runs once more.
 fn remove_runtime_tree(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        remove_dir_all::remove_dir_all(path)
+        match remove_dir_all::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                unlink_reparse_points(path);
+                remove_dir_all::remove_dir_all(path)
+            }
+            other => other,
+        }
     }
     #[cfg(not(windows))]
     {
         fs::remove_dir_all(path)
+    }
+}
+
+/// Remove every symlink, junction and other reparse point under `dir` as a
+/// link, without ever descending into one.
+///
+/// WinINet creates `…\INetCache\Content.IE5` as a junction whose own DACL denies
+/// `Everyone` the right to list it, and a job that points `USERPROFILE` or
+/// `LOCALAPPDATA` into its workspace gets one there. Both `remove_dir_all` 1.0
+/// and `std::fs::remove_dir_all` then fail on the whole tree with
+/// `ERROR_ACCESS_DENIED`, so the attempt could never be cleaned. Removing the
+/// link itself is a different operation (`RemoveDirectoryW` on the reparse
+/// point) that the deny entry does not cover, and once the links are gone the
+/// tree is ordinary.
+///
+/// Only walked after a refusal, so an ordinary tree is traversed once. The
+/// metadata comes from the directory listing itself, which on Windows
+/// describes a reparse point without opening it.
+///
+/// Best effort: a failure here is not reported, because
+/// [`remove_runtime_tree`]'s second `remove_dir_all` runs next and its result
+/// is the authority on whether the tree went.
+#[cfg(windows)]
+fn unlink_reparse_points(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if is_link_like(&metadata) {
+            let _ = fs::remove_dir(&path).or_else(|_| fs::remove_file(&path));
+        } else if metadata.is_dir() {
+            unlink_reparse_points(&path);
+        }
     }
 }
 
@@ -2012,6 +2080,9 @@ pub use ExecutionProvider as ProcessSupervisor;
 pub struct NativeProcesses {
     children: Mutex<BTreeMap<AttemptId, ChildProcess>>,
     successful_exits: Mutex<BTreeMap<AttemptId, bool>>,
+    /// The host's `runner.env`, read at every launch so that `host env set`
+    /// reaches the next runner without a daemon restart. `None` applies none.
+    runner_env_file: Option<PathBuf>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2040,6 +2111,14 @@ impl PlatformExecutionProvider {
             oci: OciProcesses::new(host_id),
             windows_hyper_v: WindowsHyperVContainers::new(host_id),
         }
+    }
+
+    /// Applies the host's `runner.env` at `path` to every native runner.
+    /// Isolated runners do not get it: their environment is the image's.
+    #[must_use]
+    pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
+        self.native = self.native.with_runner_env_file(path);
+        self
     }
 
     fn isolated_provider(&self, backend: Backend) -> Option<&dyn ExecutionProvider> {
@@ -2224,6 +2303,35 @@ impl NativeProcesses {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Applies the host's `runner.env` at `path` to every runner launched.
+    #[must_use]
+    pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
+        self.runner_env_file = Some(path);
+        self
+    }
+
+    /// The host's `runner.env`, read now.
+    ///
+    /// A file that cannot be read or parsed fails the launch rather than
+    /// starting a runner without the environment the operator configured.
+    /// [`ExecutionProvider::prepare`] asks first, before a JIT runner is
+    /// registered, so a broken file costs no registration. The reason names
+    /// the file and the line or variable, never a value.
+    fn host_env(&self) -> Result<RunnerEnv, FailureReason> {
+        let Some(path) = &self.runner_env_file else {
+            return Ok(RunnerEnv::default());
+        };
+        RunnerEnv::load(path).map_err(|error| {
+            tracing::warn!(
+                reason = "runner_env_file_invalid",
+                "runner.env could not be applied, so no runner starts until it is fixed: {error}"
+            );
+            FailureReason::Other(format!(
+                "runner.env cannot be applied ({error}); fix it with `runner-manager host env`"
+            ))
+        })
     }
 
     #[cfg(test)]
@@ -2419,6 +2527,23 @@ impl NativeProcesses {
 }
 
 impl ProcessSupervisor for NativeProcesses {
+    fn prepare(
+        &self,
+        attempt: &RunnerAttempt,
+        policy: &ScalePolicy,
+    ) -> Result<PreparedEnvironment, FailureReason> {
+        if !attempt.execution().is_native() || !policy.execution_policy().is_native() {
+            return Err(FailureReason::Other(
+                "execution provider unavailable".into(),
+            ));
+        }
+        self.host_env()?;
+        Ok(PreparedEnvironment {
+            attempt: attempt.id,
+            identity: None,
+        })
+    }
+
     fn spawn(
         &self,
         attempt: &RunnerAttempt,
@@ -2443,6 +2568,7 @@ impl ProcessSupervisor for NativeProcesses {
                 FailureReason::ProcessStartFailed,
             ));
         }
+        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -2461,10 +2587,10 @@ impl ProcessSupervisor for NativeProcesses {
                 )
                 .working_dir(attempt.runtime_path())
         } else {
-            runner_listener_spec(program, attempt.runtime_path())
+            runner_listener_spec(program, attempt.runtime_path(), &host_env)
         };
         #[cfg(not(test))]
-        let spec = runner_listener_spec(program, attempt.runtime_path());
+        let spec = runner_listener_spec(program, attempt.runtime_path(), &host_env);
         let child = spec
             .spawn_runner_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
@@ -2637,7 +2763,7 @@ pub enum LifecycleError {
     /// An ephemeral runtime is still held by a late process. Its journal state
     /// remains unchanged and ordinary supervision retries it, but startup
     /// recovery must not take unrelated repositories offline because of it.
-    #[error("attempt workspace could not be removed")]
+    #[error("{}", FailureReason::WorkspaceCleanupDeferred)]
     WorkspaceCleanupDeferred,
     #[error("isolated environment cleanup is deferred")]
     EnvironmentCleanupDeferred,
@@ -2656,7 +2782,7 @@ impl LifecycleError {
             // Rendered through `Display` rather than a second copy of the same
             // sentence, so the two cannot drift apart.
             Self::SlotQuarantined { .. } => FailureReason::Other(self.to_string()),
-            Self::WorkspaceCleanupDeferred => FailureReason::Other(self.to_string()),
+            Self::WorkspaceCleanupDeferred => FailureReason::WorkspaceCleanupDeferred,
             Self::EnvironmentCleanupDeferred => FailureReason::Other(self.to_string()),
         }
     }
@@ -2676,6 +2802,10 @@ pub struct LifecycleLauncher {
     recovery_complete: Mutex<bool>,
     versions: Mutex<BTreeMap<AttemptId, RunnerVersion>>,
     pending_replacements: Mutex<BTreeMap<AttemptId, ReplacementIntent>>,
+    /// Backoff for cleanups [`Self::supervise`] tolerates and retries, so a
+    /// workspace that cannot be removed is not retried and reported on every
+    /// pass.
+    cleanup_retries: Mutex<CleanBackoff>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2711,6 +2841,7 @@ impl LifecycleLauncher {
             recovery_complete: Mutex::new(false),
             versions: Mutex::new(BTreeMap::new()),
             pending_replacements: Mutex::new(BTreeMap::new()),
+            cleanup_retries: Mutex::new(CleanBackoff::default()),
         }
     }
 
@@ -2889,9 +3020,16 @@ impl LifecycleLauncher {
                 // one of its recreated files open on Windows, so failure here
                 // is residue to retry, not a reason to abort startup recovery
                 // and take every unrelated repository offline.
+                // Retried with backoff; the event is the one report, which the
+                // event sink logs as a warning.
+                let now = self.ports.clock.now();
+                if !self.cleanup_retries().is_due(attempt.id, now) {
+                    return Ok(ReconcileProgress::Reconciled);
+                }
                 match self.scrub_workspace(&attempt) {
-                    Ok(()) => {}
+                    Ok(()) => self.cleanup_retries().succeeded(attempt.id),
                     Err(LifecycleError::WorkspaceCleanupDeferred) => {
+                        self.cleanup_retries().failed(attempt.id, now);
                         self.ports
                             .reconcile_events
                             .emit(LifecycleEvent::AttemptCleanFailed {
@@ -2899,12 +3037,6 @@ impl LifecycleLauncher {
                                 attempt: attempt.id,
                                 reason: "late_ephemeral_workspace_could_not_be_removed",
                             });
-                        tracing::warn!(
-                            policy_id = %attempt.policy_id,
-                            attempt_id = %attempt.id,
-                            reason = "late_ephemeral_workspace_could_not_be_removed",
-                            "a cleaned ephemeral attempt left late workspace residue; cleanup will retry without blocking the daemon"
-                        );
                     }
                     Err(error) => return Err(error),
                 }
@@ -3377,40 +3509,45 @@ impl LifecycleLauncher {
     /// late process are tolerated. A journal failure or a package lease that
     /// cannot be released still propagates: those are not one workspace's
     /// problem.
+    ///
+    /// A tolerated failure is retried with per-attempt backoff: until it is
+    /// due again the attempt is skipped silently rather than re-tried and
+    /// re-reported on every pass.
     fn clean_or_quarantine(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
-        match self.clean_attempt(attempt) {
-            Err(LifecycleError::SlotQuarantined { class, .. }) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: class,
-                    });
-                Ok(())
-            }
+        let now = self.ports.clock.now();
+        if !self.cleanup_retries().is_due(attempt.id, now) {
+            return Ok(());
+        }
+        let reason = match self.clean_attempt(attempt) {
+            Err(LifecycleError::SlotQuarantined { class, .. }) => class,
             Err(LifecycleError::WorkspaceCleanupDeferred) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: "ephemeral_workspace_could_not_be_removed",
-                    });
-                Ok(())
+                failure_reason_kind(&FailureReason::WorkspaceCleanupDeferred)
             }
             Err(LifecycleError::EnvironmentCleanupDeferred) => {
-                self.ports
-                    .reconcile_events
-                    .emit(LifecycleEvent::AttemptCleanFailed {
-                        policy: attempt.policy_id,
-                        attempt: attempt.id,
-                        reason: "isolated_environment_cleanup_deferred",
-                    });
-                Ok(())
+                "isolated_environment_cleanup_deferred"
             }
-            other => other,
-        }
+            other => {
+                if other.is_ok() {
+                    self.cleanup_retries().succeeded(attempt.id);
+                }
+                return other;
+            }
+        };
+        self.cleanup_retries().failed(attempt.id, now);
+        self.ports
+            .reconcile_events
+            .emit(LifecycleEvent::AttemptCleanFailed {
+                policy: attempt.policy_id,
+                attempt: attempt.id,
+                reason,
+            });
+        Ok(())
+    }
+
+    fn cleanup_retries(&self) -> std::sync::MutexGuard<'_, CleanBackoff> {
+        self.cleanup_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn clean_attempt(&self, attempt: &mut RunnerAttempt) -> Result<(), LifecycleError> {
@@ -4429,7 +4566,9 @@ impl RunnerLauncher for LifecycleLauncher {
                 ))
             })?;
         self.clean_attempt(&mut attempt)
-            .map_err(|error| LaunchFailure::new(error.reason()))
+            .map_err(|error| LaunchFailure::new(error.reason()))?;
+        self.cleanup_retries().succeeded(id);
+        Ok(())
     }
 }
 
@@ -6403,6 +6542,8 @@ mod tests {
             0
         );
         provider.extra_resources.lock().unwrap().clear();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         launcher
             .recover_startup(std::slice::from_ref(&harness.policy))
             .await
@@ -6795,6 +6936,8 @@ mod tests {
         );
 
         block.release();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         restarted
             .supervise(&harness.policy)
             .await
@@ -6871,6 +7014,8 @@ mod tests {
 
         terminal_block.release();
         cleaned_block.release();
+        // A tolerated cleanup failure is retried after its backoff delay.
+        harness.clock.advance_secs(31);
         restarted
             .supervise(&harness.policy)
             .await
@@ -8228,7 +8373,11 @@ mod tests {
     #[test]
     fn production_listener_command_uses_the_supported_jit_contract() {
         let runtime = Path::new("runtime");
-        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), runtime);
+        let spec = runner_listener_spec(
+            PathBuf::from("Runner.Listener"),
+            runtime,
+            &RunnerEnv::default(),
+        );
         let arguments: Vec<_> = spec
             .arguments()
             .iter()
@@ -8242,6 +8391,86 @@ mod tests {
                 .any(|argument| argument == "--jit-config-file"),
             "the obsolete file option would be rejected by Runner.Listener 2.336.0"
         );
+    }
+
+    /// What a production runner starts with: the platform defaults, the host's
+    /// `runner.env` over them, the attempt's own temporary directory, and
+    /// normal scheduling.
+    #[test]
+    fn production_listener_layers_runner_env_over_the_platform_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("attempt");
+        let host_env =
+            RunnerEnv::parse("ELECTRON_CACHE=/cache/electron\nHOME=/operator/chose/this\n")
+                .unwrap();
+        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), &runtime, &host_env);
+        let env = |name: &str| spec.configured_env(name).map(PathBuf::from);
+
+        assert!(spec.uses_normal_scheduling());
+        assert_eq!(
+            env("ELECTRON_CACHE"),
+            Some(PathBuf::from("/cache/electron"))
+        );
+        assert_eq!(
+            env("HOME"),
+            Some(PathBuf::from("/operator/chose/this")),
+            "runner.env must win over a platform default of the same name"
+        );
+        for tmp in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(env(tmp), Some(runtime.join("tmp")), "{tmp}");
+        }
+
+        let home = runtime.join(runner_env::RUNNER_HOME_DIR);
+        if cfg!(windows) {
+            // Each runner's own profile, created inside its attempt, so that
+            // concurrent jobs stop sharing the service account's.
+            assert_eq!(env("USERPROFILE"), Some(home.clone()));
+            assert_eq!(env("APPDATA"), Some(home.join(r"AppData\Roaming")));
+            assert_eq!(env("LOCALAPPDATA"), Some(home.join(r"AppData\Local")));
+            assert!(home.join(r"AppData\Roaming").is_dir());
+            assert!(home.join(r"AppData\Local").is_dir());
+        } else {
+            // Unix keeps the account's own profile.
+            assert_eq!(env("USERPROFILE"), None);
+            assert!(!home.exists());
+        }
+    }
+
+    #[test]
+    fn an_invalid_runner_env_fails_the_launch_without_echoing_a_value() {
+        let root = tempfile::tempdir().unwrap();
+        let path = runner_env::path_in(root.path());
+        fs::write(&path, "GOOD=1\nghp_notarealtokenbutshapedlikeone\n").unwrap();
+        let processes = NativeProcesses::new().with_runner_env_file(path.clone());
+        let failure = processes.host_env().unwrap_err().to_string();
+        assert!(
+            failure.contains("runner.env") && failure.contains("line 2"),
+            "{failure}"
+        );
+        assert!(
+            !failure.contains("ghp_"),
+            "the failure echoed a value: {failure}"
+        );
+
+        // `prepare` runs before the JIT registration, so a broken file is
+        // refused there, before GitHub is asked for anything.
+        let policy = fixtures::policy()
+            .repository("octo/repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            root.path(),
+            FakeClock::default().now(),
+        );
+        assert!(processes.prepare(&attempt, &policy).is_err());
+
+        fs::write(&path, "GOOD=1\n").unwrap();
+        assert!(processes.prepare(&attempt, &policy).is_ok());
+        assert_eq!(processes.host_env().unwrap().get("GOOD"), Some("1"));
+        assert!(NativeProcesses::new().host_env().unwrap().is_empty());
     }
 
     #[cfg(windows)]
@@ -8841,6 +9070,54 @@ mod tests {
         assert!(!diagnostic.exists());
     }
 
+    /// The junction WinINet leaves in a job's profile, reproduced: its own DACL
+    /// denies `Everyone` the right to list it.
+    #[cfg(windows)]
+    #[test]
+    fn disposable_tree_removal_unlinks_a_junction_nobody_may_list() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tree = temporary.path().join("attempt");
+        let cache = tree.join(r"tmp\home\AppData\Local\Microsoft\Windows\INetCache");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"not the attempt's").unwrap();
+        fs::write(tree.join("tmp").join("job.log"), b"job output").unwrap();
+        let junction = cache.join("Content.IE5");
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        // `/L` puts the entry on the junction itself, as WinINet does, rather
+        // than on the directory it points at. `*S-1-1-0` is `Everyone` in every
+        // display language.
+        let denied = std::process::Command::new("icacls")
+            .arg(&junction)
+            .args(["/L", "/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{denied:?}");
+
+        // The control: without the fix the tree cannot be removed at all.
+        let unfixed = remove_dir_all::remove_dir_all(&tree)
+            .expect_err("the fixture no longer reproduces the WinINet junction");
+        assert_eq!(unfixed.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(junction.symlink_metadata().is_ok());
+
+        remove_runtime_tree(&tree).expect("a tree holding a deny-list junction is removed");
+        assert!(!tree.exists(), "the attempt tree survived");
+        assert_eq!(
+            fs::read(outside.join("keep.txt")).unwrap(),
+            b"not the attempt's",
+            "removing the junction followed it into the directory it points at"
+        );
+    }
+
     /// One slot entry that refuses to be removed, and the undo that lets the
     /// temporary directory be torn down afterwards.
     ///
@@ -9174,6 +9451,70 @@ mod tests {
             .await
             .expect("the retried cleanup completes");
         assert!(!runtime.exists(), "the whole attempt directory goes");
+        assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
+    }
+
+    /// Supervision retries a workspace it cannot remove with per-attempt
+    /// backoff, so a stuck workspace is reported once per delay rather than on
+    /// every pass.
+    #[tokio::test]
+    async fn supervision_backs_off_a_workspace_it_cannot_remove() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let attempt = harness.launch().await;
+        let runtime = attempt.runtime_path().to_path_buf();
+        harness.conclude(attempt.id);
+        let Some(block) = BlockedDeletion::inject(&runtime.join("held-open-subdirectory")) else {
+            eprintln!(
+                "skipped: this account cannot be refused a deletion, so no partial deletion can be injected"
+            );
+            return;
+        };
+        let failures = || {
+            harness
+                .reconcile_events
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        LifecycleEvent::AttemptCleanFailed { attempt: failed, .. }
+                            if *failed == attempt.id
+                    )
+                })
+                .count()
+        };
+        let supervise = async || {
+            harness
+                .launcher
+                .supervise(&harness.policy)
+                .await
+                .expect("a stuck workspace does not fail supervision");
+        };
+
+        supervise().await;
+        assert_eq!(failures(), 1);
+        supervise().await;
+        assert_eq!(
+            failures(),
+            1,
+            "the failed cleanup was retried on the very next pass"
+        );
+        harness.clock.advance_secs(31);
+        supervise().await;
+        assert_eq!(
+            failures(),
+            2,
+            "the cleanup was not retried once its delay passed"
+        );
+
+        block.release();
+        harness.clock.advance_secs(61);
+        supervise().await;
+        assert!(
+            !runtime.exists(),
+            "the retry removes the workspace once it can"
+        );
         assert_eq!(harness.attempt(attempt.id).state(), AttemptState::Cleaned);
     }
 
