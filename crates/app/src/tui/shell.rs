@@ -3837,6 +3837,61 @@ mod tests {
         assert!(doctor.current().is_some_and(|summary| summary.checked > 0));
     }
 
+    /// The doctor does not open the database before the first snapshot has:
+    /// both creating a fresh SQLite file at once is what failed with
+    /// `database is locked`.
+    #[test]
+    fn the_tui_doctor_waits_for_the_first_snapshot() {
+        let data_root = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        let context = Arc::new(
+            crate::cli::Context::resolve(Some(data_root.path()), &mut warnings)
+                .expect("production TUI context"),
+        );
+        let control = Arc::new((
+            Mutex::new(SourceState {
+                stopped: false,
+                refresh_pending: false,
+                next_generation: 1,
+                active: None,
+            }),
+            Condvar::new(),
+        ));
+        let cache = Arc::new(DoctorCache::default());
+        let runner = {
+            let cache = Arc::clone(&cache);
+            let weak = Arc::downgrade(&control);
+            let context = Arc::clone(&context);
+            thread::spawn(move || cache.run(&context, &weak))
+        };
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            cache.current().is_none(),
+            "the doctor ran before any snapshot"
+        );
+        assert!(
+            !data_root
+                .path()
+                .join("config")
+                .join("runner-manager.sqlite3")
+                .exists(),
+            "the doctor opened the database before the snapshot did"
+        );
+
+        cache.mark(|state| state.snapshot_taken = true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while cache.current().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the doctor never ran");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            control.0.lock().unwrap().refresh_pending,
+            "it asks for a publish"
+        );
+        cache.mark(|state| state.stopped = true);
+        runner.join().unwrap();
+    }
+
     #[tokio::test]
     async fn capture_seam_and_merged_loop_causally_deliver_mouse_and_agent_events() {
         let output = SharedWriter::default();
