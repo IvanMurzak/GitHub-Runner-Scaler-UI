@@ -353,13 +353,12 @@ fn supervise(
         ));
     }
 
-    // Taken first, so that a replacement landing while this starts is still
-    // newer than the start it is compared with.
-    let started = std::time::SystemTime::now();
     // Only under the stable supervisor: it restarts the same path when this
-    // exits with `UpgradePending`, and nothing else would.
+    // exits with `UpgradePending`, and nothing else would. Read first, so the
+    // file this process was started from is the one it remembers.
     let own_image = std::env::var_os(super::service::SUPERVISED_ENVIRONMENT)
-        .and_then(|_| std::env::current_exe().ok());
+        .and_then(|_| std::env::current_exe().ok())
+        .and_then(|image| written_at(&image).map(|written| (image, written)));
 
     let store = context.store()?;
     let mode = context
@@ -418,7 +417,7 @@ fn supervise(
             () = super::wsl_watchdog::maintain_distribution(paths, inventory, distribution) => {
                 unreachable!("the WSL recovery watchdog runs until its task is stopped")
             }
-            () = wait_for_companion_replacement(own_image, started) => {}
+            () = wait_for_companion_replacement(own_image) => {}
         }
     });
     // Only the replacement watch ends. Dropping the holder loop above stopped
@@ -438,21 +437,23 @@ fn supervise(
 /// How often a running companion looks for a replacement of its own file.
 const COMPANION_REPLACEMENT_POLL: Duration = Duration::from_secs(15);
 
-/// Returns once `wsl install` has put a different companion at `image`.
+/// Returns once `wsl install` has put a different companion at the path this
+/// process was started from, given as that path and the modification time it
+/// had then.
 ///
 /// This is how an update reaches a companion that is already running without
 /// touching the lifecycle task: `wsl install` swaps the file in place
-/// ([`replace_in_place`]) and this process, seeing a file newer than itself,
+/// ([`replace_in_place`]) and this process, seeing a different file there,
 /// exits for the supervisor to start the new one. Never returns when there is
 /// nothing to watch -- a companion started outside the supervisor, or under a
 /// versioned path nothing replaces.
-async fn wait_for_companion_replacement(image: Option<PathBuf>, started: std::time::SystemTime) {
-    let Some(image) = image else {
+async fn wait_for_companion_replacement(image: Option<(PathBuf, std::time::SystemTime)>) {
+    let Some((image, written)) = image else {
         return std::future::pending().await;
     };
     loop {
         tokio::time::sleep(COMPANION_REPLACEMENT_POLL).await;
-        if companion_replaced_since(&image, started) {
+        if companion_replaced(&image, written) {
             tracing::info!(
                 image = %image.display(),
                 "a newer WSL lifecycle companion was installed; restarting onto it"
@@ -462,15 +463,22 @@ async fn wait_for_companion_replacement(image: Option<PathBuf>, started: std::ti
     }
 }
 
-/// Whether the file at `image` was put there after `started`.
+/// When the file at `path` was last written.
+fn written_at(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// Whether the file at `image` is no longer the one written at `written`.
 ///
+/// Compared for difference, not against the clock, so that a clock stepped
+/// backwards cannot make every restarted companion believe it was replaced.
 /// A missing file is not a replacement: [`replace_in_place`] renames the old
 /// file aside a moment before the new one arrives, and a look in between must
 /// not exit for a program that is not there yet.
-fn companion_replaced_since(image: &Path, started: std::time::SystemTime) -> bool {
-    std::fs::metadata(image)
-        .and_then(|metadata| metadata.modified())
-        .is_ok_and(|modified| modified > started)
+fn companion_replaced(image: &Path, written: std::time::SystemTime) -> bool {
+    written_at(image).is_some_and(|now| now != written)
 }
 
 /// The guest holder process, stopped when its owner lets go of it.
@@ -2456,12 +2464,31 @@ impl Provisioner<'_> {
                 self.apply_task_request(&request, identity.name(), why, out)?;
             }
         }
-        out.flush().map_err(failed)?;
-        // Only once the task names the version-independent paths: until then
-        // a versioned copy may be the very program it starts.
+        // Only once this task names the version-independent paths: until then
+        // a versioned copy may be the very program it starts. And never a copy
+        // another managed distribution's task still names -- `state/bin` is
+        // shared by every distribution this account manages.
         if let Some(files) = &companion {
-            remove_retired_companion_files(&files.directory);
+            let still_named =
+                companion_paths_named_by_other_tasks(self.host, self.paths, &distribution);
+            let orphaned = remove_retired_companion_files(&files.directory, still_named.as_deref());
+            if request.restart && !orphaned.is_empty() {
+                writeln!(
+                    out,
+                    "warning: {} still in use although no lifecycle task names it: Task \
+                     Scheduler ended the previous companion but not what it started. It stops at \
+                     the next sign-out; end it sooner in Task Manager.",
+                    orphaned
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                        + if orphaned.len() == 1 { " is" } else { " are" }
+                )
+                .map_err(failed)?;
+            }
         }
+        out.flush().map_err(failed)?;
 
         // -- Stage 8: the record, then the read-back -----------------------
         // The record is written before the read-back so that a host which is
@@ -2940,13 +2967,9 @@ struct CompanionFiles {
 /// to a unique name and the new one is moved into the freed name; the old
 /// process keeps running from the renamed file, and the next start of the
 /// path is the new build. A copy whose bytes already match is left alone, so
-/// a rerun of the same version restarts nothing.
-///
-/// The new file's modification time is set *after* it is in place: that is
-/// what a running companion compares against its own start time
-/// ([`companion_replaced_since`]), and setting it any earlier would let a
-/// companion that started between the write and the rename -- from the old
-/// file -- believe it was already the new one.
+/// a rerun of the same version restarts nothing. The new file is written now,
+/// so its modification time differs from the old one's, which is what a
+/// running companion watches for ([`companion_replaced`]).
 fn replace_in_place(source: &Path, destination: &Path) -> io::Result<bool> {
     if destination.is_file() && same_contents(source, destination)? {
         return Ok(false);
@@ -2974,9 +2997,6 @@ fn replace_in_place(source: &Path, destination: &Path) -> io::Result<bool> {
         // Succeeds when nothing is running it; otherwise a later install's
         // sweep removes it once that process has gone.
         let _ = std::fs::remove_file(aside);
-    }
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(destination) {
-        let _ = file.set_modified(std::time::SystemTime::now());
     }
     Ok(true)
 }
@@ -3007,16 +3027,63 @@ fn aside_path(path: &Path) -> PathBuf {
 /// aside copies [`replace_in_place`] leaves while their process runs, and the
 /// versioned copies 0.4.34 and earlier installed. A file that is still
 /// running cannot be deleted and is left for the next install.
-fn remove_retired_companion_files(directory: &Path) {
+///
+/// `still_named` is the text of every other managed distribution's task
+/// action, lower-cased; a versioned copy any of them names is kept, and
+/// `None` -- those tasks could not all be read -- keeps every versioned copy.
+/// Returns the versioned copies nothing names that could not be removed,
+/// because a process that no task accounts for still runs them.
+fn remove_retired_companion_files(
+    directory: &Path,
+    still_named: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let mut orphaned = Vec::new();
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return orphaned;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_retired_companion_file(&name) {
+        if !is_retired_companion_file(&name) {
+            continue;
+        }
+        if name.ends_with(".old") {
+            // Set aside by an update; still running until its process ends.
             let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        let Some(still_named) = still_named else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if still_named.iter().any(|action| action.contains(&lower)) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_err() && entry.path().exists() {
+            orphaned.push(entry.path());
         }
     }
+    orphaned
+}
+
+/// The action text of every other managed distribution's lifecycle task,
+/// lower-cased, or `None` when any of them cannot be read -- in which case
+/// nothing they might name may be removed.
+fn companion_paths_named_by_other_tasks(
+    host: &WslHost,
+    paths: &AppPaths,
+    except: &str,
+) -> Option<Vec<String>> {
+    let mut named = Vec::new();
+    for record in WslProviderRecord::all(paths).ok()? {
+        if record.distribution == except {
+            continue;
+        }
+        let identity = LifecycleTaskIdentity::for_distribution(&record.distribution).ok()?;
+        if let Some(task) = host.tasks().query(&identity).ok()? {
+            named.push(format!("{} {}", task.command(), task.arguments()).to_ascii_lowercase());
+        }
+    }
+    Some(named)
 }
 
 /// `runner-manager-wsl.exe.<id>.old`, `runner-manager-wsl-0.4.34.exe` and
@@ -3119,6 +3186,14 @@ impl LifecycleTaskRequest {
 ///
 /// # Errors
 /// Whatever Task Scheduler refused, [`WslError::NeedsElevation`] among them.
+/// How long [`apply_lifecycle_task_request`] waits for an ended instance to
+/// stop being listed as running: up to ten seconds.
+const TASK_END_ATTEMPTS: u32 = 20;
+#[cfg(not(test))]
+const TASK_END_POLL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const TASK_END_POLL: Duration = Duration::ZERO;
+
 fn apply_lifecycle_task_request(
     host: &WslHost,
     request: &LifecycleTaskRequest,
@@ -3126,8 +3201,19 @@ fn apply_lifecycle_task_request(
     let task = request.task(host.executable())?;
     let tasks = host.tasks();
     tasks.register(&task)?;
-    if request.restart {
-        tasks.stop(task.identity())?;
+    if request.restart && tasks.stop(task.identity())? {
+        // `/Run` on an instance Task Scheduler still lists as running is
+        // ignored (`IgnoreNew`), and an ended task is not a failure that
+        // `RestartOnFailure` would retry -- so wait for the end to land.
+        for _ in 0..TASK_END_ATTEMPTS {
+            if !tasks
+                .query(task.identity())?
+                .is_some_and(|registered| registered.running())
+            {
+                break;
+            }
+            std::thread::sleep(TASK_END_POLL);
+        }
     }
     // Started now as well as at logon: the operator asked for a runner host,
     // and one that only exists after the next sign-out would look broken for
@@ -4164,20 +4250,21 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
 
         // The same build again: nothing changes, so nothing restarts.
-        let started = std::time::SystemTime::now();
+        let written = written_at(&destination).unwrap();
         assert!(!replace_in_place(&source, &destination).unwrap());
-        assert!(!companion_replaced_since(&destination, started));
+        assert!(!companion_replaced(&destination, written));
 
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&source, b"the next build").unwrap();
         assert!(replace_in_place(&source, &destination).unwrap());
         assert_eq!(std::fs::read(&destination).unwrap(), b"the next build");
         assert!(
-            companion_replaced_since(&destination, started),
-            "a companion started before the swap sees a newer file"
+            companion_replaced(&destination, written),
+            "a companion started from the previous file sees a different one"
         );
         assert!(
-            !companion_replaced_since(&destination, std::time::SystemTime::now()),
-            "and the one started after it does not, so it never restarts in a loop"
+            !companion_replaced(&destination, written_at(&destination).unwrap()),
+            "and the one started from the new file does not, so it never restarts in a loop"
         );
         assert_eq!(
             std::fs::read_dir(destination.parent().unwrap())
@@ -4230,7 +4317,7 @@ mod tests {
             1,
             "the running file was set aside: {leftovers:?}"
         );
-        remove_retired_companion_files(root.path());
+        remove_retired_companion_files(root.path(), Some(&[]));
         assert!(
             std::fs::read_dir(root.path())
                 .unwrap()
@@ -4270,7 +4357,7 @@ mod tests {
         ] {
             std::fs::write(root.path().join(name), b"x").unwrap();
         }
-        remove_retired_companion_files(root.path());
+        remove_retired_companion_files(root.path(), Some(&[]));
         let mut left: Vec<String> = std::fs::read_dir(root.path())
             .unwrap()
             .flatten()
@@ -4328,18 +4415,13 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_older_companion_file_is_not_a_replacement() {
+    fn a_missing_or_unchanged_companion_file_is_not_a_replacement() {
         let root = tempfile::tempdir().unwrap();
         let image = root.path().join(COMPANION_CHILD);
-        assert!(!companion_replaced_since(
-            &image,
-            std::time::SystemTime::now()
-        ));
+        assert!(!companion_replaced(&image, std::time::SystemTime::now()));
         std::fs::write(&image, b"x").unwrap();
-        assert!(!companion_replaced_since(
-            &image,
-            std::time::SystemTime::now() + Duration::from_secs(60)
-        ));
+        let written = written_at(&image).unwrap();
+        assert!(!companion_replaced(&image, written));
     }
 
     /// Shaped like a stored credential document and unmistakably not one.
@@ -4648,8 +4730,12 @@ mod tests {
     /// deliberately truncated scripts in the refusal table are still written
     /// out, because each of those omits a rule on purpose.
     fn preflight_script() -> ScriptedRunner {
-        ScriptedRunner::new()
-            .always("--list --verbose", ok("* Ubuntu   Running   2\n"))
+        preflight_on(ScriptedRunner::new())
+    }
+
+    /// [`preflight_script`]'s answers after whatever `base` already answers.
+    fn preflight_on(base: ScriptedRunner) -> ScriptedRunner {
+        base.always("--list --verbose", ok("* Ubuntu   Running   2\n"))
             .always("--exec id -u", ok("0\n"))
             .always("--exec uname -m", ok("x86_64\n"))
             .always("--exec systemctl is-system-running", ok("running\n"))
@@ -5929,7 +6015,17 @@ mod tests {
     /// A healthy managed host whose registered task is `task`, in the state
     /// `status`, where `/Create` answers `create`.
     fn provisioned_with_task(task: &str, status: &str, create: CommandOutput) -> ScriptedRunner {
-        preflight_script()
+        provisioned_with_task_on(ScriptedRunner::new(), task, status, create)
+    }
+
+    /// [`provisioned_with_task`] after whatever `base` already answers.
+    fn provisioned_with_task_on(
+        base: ScriptedRunner,
+        task: &str,
+        status: &str,
+        create: CommandOutput,
+    ) -> ScriptedRunner {
+        preflight_on(base)
             .always("--exec systemctl is-enabled", ok("enabled\n"))
             .always("--exec systemctl is-active", ok("active\n"))
             .always("--exec docker info", ok("27.1.1\n"))
@@ -6087,9 +6183,17 @@ mod tests {
             )
         })
         .with_package(b"the new build");
+        let (old_supervisor, old_child) = versioned_companion(&fixture.paths);
+        std::fs::create_dir_all(old_child.parent().expect("a bin directory")).expect("bin");
+        std::fs::write(&old_child, b"0.4.34").expect("the versioned companion");
+        std::fs::write(&old_supervisor, b"0.4.34").expect("the versioned supervisor");
 
         let refusal = fixture.install(None).expect_err("no prompt can be shown");
 
+        assert!(
+            old_child.exists() && old_supervisor.exists(),
+            "the task still names the versioned copies, so they stay"
+        );
         assert_eq!(refusal.class(), Failure::WslProvisioning);
         let message = refusal.to_string();
         for expected in [
@@ -6106,6 +6210,53 @@ mod tests {
             "{remedy}"
         );
         assert!(remedy.contains("elevated prompt"), "{remedy}");
+    }
+
+    #[test]
+    fn migrating_one_distribution_keeps_the_versioned_copies_another_task_still_names() {
+        // `state/bin` is shared by every distribution an account manages, and
+        // 0.4.34's versioned names do not carry the distribution. Debian's
+        // task is not running right now, so nothing locks its files: only the
+        // check of its action keeps them.
+        let mut fixture = Fixture::over_paths(|paths| {
+            let debian_task = LifecycleTaskRequest {
+                distribution: "Debian".to_string(),
+                principal: "FIXTURE\\ivan".to_string(),
+                linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
+                recovery_root: paths.state_dir().join("wsl-recovery").join("Debian"),
+                companion: Some(versioned_companion(paths)),
+                restart: false,
+            }
+            .task(&WslExecutable::at("wsl.exe"))
+            .expect("a usable name")
+            .xml();
+            provisioned_with_task_on(
+                ScriptedRunner::new().always(
+                    &format!("/TN {} /XML", identity_of("Debian").name()),
+                    ok(&debian_task),
+                ),
+                &desired_task_xml(paths, Some(versioned_companion(paths))),
+                "Running",
+                access_denied(),
+            )
+        })
+        .with_package(b"the new build");
+        fixture.elevation = FakeElevation::granting(fixture.journal.clone());
+        WslProviderRecord::new("Debian", identity_of("Debian").name(), "0.4.34", Utc::now())
+            .write(&fixture.paths)
+            .expect("Debian's record");
+        let (old_supervisor, old_child) = versioned_companion(&fixture.paths);
+        std::fs::create_dir_all(old_child.parent().expect("a bin directory")).expect("bin");
+        std::fs::write(&old_child, b"0.4.34").expect("the versioned companion");
+        std::fs::write(&old_supervisor, b"0.4.34").expect("the versioned supervisor");
+        let aside = old_child.with_file_name("runner-manager-wsl.exe.1-2.old");
+        std::fs::write(&aside, b"set aside").expect("an aside copy");
+
+        fixture.install(None).expect("Ubuntu migrated");
+
+        assert!(old_child.exists(), "Debian's task still starts it");
+        assert!(old_supervisor.exists(), "Debian's task still starts it");
+        assert!(!aside.exists(), "an aside copy no task names is swept");
     }
 
     #[test]

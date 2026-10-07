@@ -86,8 +86,9 @@ pub const PRODUCT_MARKER: &str = "runner-manager-wsl-lifecycle/v1";
 ///
 /// `wsl install` re-registers a task only when the registered document differs
 /// from the one it would write (see [`LifecycleTask::is_registered_as`]), and
-/// that comparison reads the description, the program and its arguments — not
-/// every setting. So a release that changes anything else in the document (a
+/// that comparison reads the program, its arguments and the account (through
+/// [`LifecycleTask::definition_stamp`]), not every setting. So a release that
+/// changes anything else in the document (a
 /// trigger, a setting, the run level) must raise this number, or hosts that
 /// already have the task keep the old document.
 ///
@@ -148,14 +149,14 @@ impl LifecycleTaskIdentity {
         &self.name
     }
 
-    /// The description the document carries, which also carries the marker.
-    #[must_use]
-    pub fn description(&self) -> String {
+    /// The description a document carries: the marker, and the task's
+    /// [`LifecycleTask::definition_stamp`].
+    fn description(&self, stamp: &str) -> String {
         format!(
             "Keeps the WSL distribution \"{}\" running so its runner-manager service can \
              accept jobs after this account logs on. Created and owned by runner-manager \
-             ({PRODUCT_MARKER}, definition {TASK_DEFINITION_REVISION}); remove it with \
-             `runner-manager wsl detach --distribution {}`.",
+             ({PRODUCT_MARKER}, {stamp}); remove it with `runner-manager wsl detach \
+             --distribution {}`.",
             self.distribution, self.distribution
         )
     }
@@ -292,6 +293,43 @@ impl LifecycleTask {
             .join(" ")
     }
 
+    /// `definition N, fingerprint XXXXXXXXXXXXXXXX`: the document revision and
+    /// a digest of the program, its arguments and the account, carried in the
+    /// description.
+    ///
+    /// # Why a digest rather than the values themselves
+    ///
+    /// `schtasks /Query /XML` writes to a pipe in the console's code page, not
+    /// in the UTF-16 its own header declares (measured on Windows 11), so a
+    /// profile path, an account or a distribution name outside that code page
+    /// comes back altered. A comparison of the values would then fail on every
+    /// update and send every update back to the `/Create` that needs
+    /// administrator rights. The stamp is ASCII and survives the trip.
+    #[must_use]
+    pub fn definition_stamp(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for part in [
+            self.command().to_string_lossy().as_ref(),
+            self.rendered_arguments().as_str(),
+            self.principal.user_id(),
+        ] {
+            digest.update(part.as_bytes());
+            digest.update([0]);
+        }
+        let digest = hex::encode(digest.finalize());
+        format!(
+            "definition {TASK_DEFINITION_REVISION}, fingerprint {}",
+            &digest[..16]
+        )
+    }
+
+    /// The description the document carries.
+    #[must_use]
+    pub fn description(&self) -> String {
+        self.identity.description(&self.definition_stamp())
+    }
+
     /// Whether `registered` already is this task, so that registering it again
     /// would change nothing.
     ///
@@ -300,29 +338,23 @@ impl LifecycleTask {
     /// all, and `/Create` is the call Windows refuses an ordinary token for a
     /// task that an elevated prompt created.
     ///
-    /// Compared: ownership, the description (which carries
-    /// [`TASK_DEFINITION_REVISION`]), the program, its argument string, whether
-    /// it is enabled, and the account when Task Scheduler names one. A task an
-    /// operator disabled is not "already this task": re-registering it is how
-    /// `wsl install` has always repaired that.
-    ///
-    /// The account is compared only when the read-back names an account rather
-    /// than a security identifier, because Task Scheduler may export either
-    /// for the same principal and this module cannot resolve one into the
-    /// other.
+    /// Compared: ownership, whether it is enabled, the
+    /// [`definition_stamp`](Self::definition_stamp) in its description, and --
+    /// when they are ASCII and so survive the export unaltered -- the program
+    /// and its argument string as well, which also catches an action edited by
+    /// hand. A task an operator disabled is not "already this task":
+    /// re-registering it is how `wsl install` has always repaired that.
     #[must_use]
     pub fn is_registered_as(&self, registered: &RegisteredTask) -> bool {
-        let account_matches = registered.account().is_none_or(|account| {
-            account.starts_with("S-1-") || account.eq_ignore_ascii_case(self.principal.user_id())
-        });
+        let command = self.command().to_string_lossy();
+        let arguments = self.rendered_arguments();
+        let action_matches = !(command.is_ascii() && arguments.is_ascii())
+            || (registered.command().eq_ignore_ascii_case(&command)
+                && registered.arguments() == arguments);
         registered.is_product_owned()
             && registered.enabled()
-            && account_matches
-            && registered.description() == self.identity.description()
-            && registered
-                .command()
-                .eq_ignore_ascii_case(&self.command().to_string_lossy())
-            && registered.arguments() == self.rendered_arguments()
+            && registered.description().contains(&self.definition_stamp())
+            && action_matches
     }
 
     /// The Task Scheduler document.
@@ -338,7 +370,7 @@ impl LifecycleTask {
         out.push_str("  <RegistrationInfo>\n");
         out.push_str(&format!(
             "    <Description>{}</Description>\n",
-            xml_escape(&self.identity.description())
+            xml_escape(&self.description())
         ));
         out.push_str(&format!(
             "    <URI>\\{}</URI>\n",
@@ -1068,19 +1100,59 @@ mod tests {
         // in whatever case it stored.
         let exported = desired
             .xml()
-            .replace("IVANPC\\IvanD", "S-1-5-21-1-2-3-1001")
+            .replace(r"IVANPC\IvanD", "S-1-5-21-1-2-3-1001")
             .replace(
                 r"<Command>C:\state\bin\runner-manager-wsl-supervisor.exe</Command>",
                 r"<Command>c:\STATE\bin\RUNNER-MANAGER-WSL-SUPERVISOR.EXE</Command>",
             );
-        assert_ne!(exported, desired.xml(), "both substitutions must apply");
+        assert!(!exported.contains("IVANPC") && !exported.contains(r"<Command>C:\state"));
         let registered = RegisteredTask::from_document("whatever", &exported, true);
         assert!(desired.is_registered_as(&registered));
     }
 
     #[test]
+    fn a_profile_outside_the_console_code_page_still_reads_back_as_this_task() {
+        // `schtasks /Query /XML` writes to a pipe in the console code page, so
+        // a character outside it comes back as something else. Every update on
+        // such a host would otherwise look like a new document and need
+        // administrator rights again.
+        let desired = task("Ubuntu")
+            .with_recovery_root(PathBuf::from(r"C:\Users\Иван\state\wsl-recovery\Ubuntu"))
+            .with_windows_supervisor(
+                PathBuf::from(r"C:\Users\Иван\state\bin\runner-manager-wsl-supervisor.exe"),
+                PathBuf::from(r"C:\Users\Иван\state\bin\runner-manager-wsl.exe"),
+            );
+        let lossy: String = desired
+            .xml()
+            .chars()
+            .map(|c| if c.is_ascii() { c } else { '?' })
+            .collect();
+        let registered = RegisteredTask::from_document("whatever", &lossy, true);
+        assert!(desired.is_registered_as(&registered));
+
+        let other_stamp = lossy.replace(
+            &desired.definition_stamp(),
+            "definition 2, fingerprint 0000000000000000",
+        );
+        assert_ne!(other_stamp, lossy);
+        let registered = RegisteredTask::from_document("whatever", &other_stamp, true);
+        assert!(!desired.is_registered_as(&registered));
+    }
+
+    #[test]
     fn a_document_that_differs_in_anything_compared_is_registered_again() {
         let desired = supervised(r"C:\state\bin");
+        let somebody_else = LifecycleTask::new(
+            identity("Ubuntu"),
+            TaskPrincipal::named(r"IVANPC\Somebody"),
+            &WslExecutable::at(r"C:\Windows\System32\wsl.exe"),
+            "/usr/local/bin/runner-manager",
+        )
+        .with_recovery_root(PathBuf::from(r"C:\state\wsl-recovery\Ubuntu"))
+        .with_windows_supervisor(
+            PathBuf::from(r"C:\state\bin\runner-manager-wsl-supervisor.exe"),
+            PathBuf::from(r"C:\state\bin\runner-manager-wsl.exe"),
+        );
         let differing = [
             (
                 "the versioned 0.4.34 companion paths",
@@ -1093,10 +1165,9 @@ mod tests {
             ),
             (
                 "an earlier definition revision",
-                desired.xml().replace(
-                    &format!("{PRODUCT_MARKER}, definition {TASK_DEFINITION_REVISION}"),
-                    PRODUCT_MARKER,
-                ),
+                desired
+                    .xml()
+                    .replace(&desired.definition_stamp(), "definition 1"),
             ),
             (
                 "a task an operator disabled",
@@ -1105,16 +1176,20 @@ mod tests {
                     "\n    <Enabled>false</Enabled>\n",
                 ),
             ),
-            (
-                "another account",
-                desired.xml().replace("IVANPC\\IvanD", "IVANPC\\Somebody"),
-            ),
+            ("another account", somebody_else.xml()),
             (
                 "a different recovery root",
+                supervised(r"C:\state\bin")
+                    .with_recovery_root(PathBuf::from(r"C:\elsewhere\Ubuntu"))
+                    .xml(),
+            ),
+            (
+                "an action edited by hand under the same description",
                 desired.xml().replace("wsl-recovery", "elsewhere"),
             ),
         ];
         for (what, document) in differing {
+            assert_ne!(document, desired.xml(), "{what}: the case must differ");
             let registered = RegisteredTask::from_document("whatever", &document, true);
             assert!(!desired.is_registered_as(&registered), "{what}");
         }
