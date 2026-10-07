@@ -1296,13 +1296,14 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
             service.binary.display()
         ))
         .remedy(format!(
-            "{} in a Terminal on this Mac, not over SSH (sign in again with the service binary; \
-             never switch to --start-at boot for this)",
+            "{}{} (sign in again with the service binary; never switch to --start-at boot for \
+             this)",
             super::update::force::auth_command_line(
                 setup.data_root.as_deref(),
                 StartMode::Login,
                 &service.binary
-            )
+            ),
+            runner_manager_platform::service::MACOS_LOGIN_PLACE
         )),
         Err(error) => unknown(format!("the service binary could not be asked: {error}")),
     }

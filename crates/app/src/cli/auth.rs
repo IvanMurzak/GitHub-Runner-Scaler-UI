@@ -1033,17 +1033,14 @@ pub fn receive(
 
 /// `daemon adopt-credential --start-at boot|login`.
 ///
-/// The receiving half of the upgrade handover: the daemon that is about to
-/// exit read its credential, and this process -- the build that replaces it --
-/// writes the same document back through the ordinary [`SecretStore`]. What
-/// makes that worth a process of its own is who the writer is. A macOS keychain
-/// partitions an item to the code that created it, and an ad-hoc signed binary
-/// is identified by its code hash, so only a store made *by the new binary* is
-/// one the new daemon can read after the restart.
+/// The receiving half of the upgrade handover (`hand_over_credential_to_new_binary`
+/// in `daemon.rs` says why the new binary has to be the writer): the document
+/// the exiting daemon read goes back into the ordinary [`SecretStore`], written
+/// by this process.
 ///
 /// Unlike [`receive`], this records no start mode: the daemon handing over
 /// already runs under the mode it names, and this process opens that daemon's
-/// own directories.
+/// own directories, so a custom data directory never gains a stray database.
 ///
 /// # Errors
 /// As [`receive`], less the start-mode record.

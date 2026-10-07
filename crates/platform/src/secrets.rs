@@ -2007,7 +2007,9 @@ mod sys {
 
     use security_framework::os::macos::keychain::{CreateOptions, KeychainSettings, SecKeychain};
 
-    use super::{DIRECTORY, ITEM, KEYCHAIN_SERVICE, ROOTED_KEYCHAIN_PASSWORD, SecretScope};
+    use super::{
+        DIRECTORY, ITEM, KEYCHAIN_SERVICE, ROOTED_KEYCHAIN_PASSWORD, SecretScope, StartMode,
+    };
 
     /// The composed product identity, as a plain `&str`.
     ///
@@ -2802,8 +2804,8 @@ mod sys {
         error: &security_framework::base::Error,
     ) -> io::Error {
         let code = error.code();
-        if site.kind == Kind::System && !is_root() {
-            return io::Error::new(
+        match site.kind {
+            Kind::System if !is_root() => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
                     "Security.framework returned {code} ({error}). The machine-scoped store is the \
@@ -2814,10 +2816,8 @@ mod sys {
                      you need the value itself, or install with `--start-at login` to keep the \
                      token in your own login keychain instead."
                 ),
-            );
-        }
-        if site.kind == Kind::Login && is_locked(keychain) {
-            return io::Error::new(
+            ),
+            Kind::Login if is_locked(keychain) => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
                     "Security.framework returned {code} ({error}). {} is locked for this \
@@ -2828,28 +2828,29 @@ mod sys {
                      session first with `security unlock-keychain`.",
                     site.path.display()
                 ),
-            );
-        }
-        if site.kind == Kind::Login {
-            return io::Error::other(format!(
+            ),
+            Kind::Login => io::Error::other(format!(
                 "Security.framework returned {code} ({error}). The item is there and this keychain \
                  does not grant it to the program asking. macOS ties a login-keychain item to the \
                  exact build that wrote it -- an ad-hoc signed binary is known by the hash of its \
                  code -- so every release, and every rebuild, is a different program to it. The \
                  service hands its credential to the new build while it upgrades; an item written \
                  by a version that could not, or by a binary the service does not run, needs one \
-                 more sign-in by the build that will read it: run `runner-manager auth login \
-                 --start-at login` in a Terminal in the Mac's desktop session (not over SSH)."
-            ));
+                 more sign-in by the build that will read it: run {}.",
+                crate::service::sign_in_instruction(StartMode::Login)
+            )),
+            // The System Keychain as root, and a rooted keychain: both grant
+            // every application, so only an item from before that can refuse.
+            Kind::System | Kind::Rooted => io::Error::other(format!(
+                "Security.framework returned {code} ({error}). The item is there and this keychain \
+                 does not grant it to the program asking. An earlier version granted the stored \
+                 token to the single binary that wrote it, and an upgrade replaces that binary -- \
+                 so an item written by one of those versions locks out every later copy, the \
+                 daemon's included. Signing in once more rewrites it so that every application \
+                 may read it: run `runner-manager auth login`, with sudo if this is the \
+                 machine-scoped store."
+            )),
         }
-        io::Error::other(format!(
-            "Security.framework returned {code} ({error}). The item is there and this keychain does \
-             not grant it to the program asking. An earlier version granted the stored token to \
-             the single binary that wrote it, and an upgrade replaces that binary -- so an item \
-             written by one of those versions locks out every later copy, the daemon's included. \
-             Signing in once more rewrites it so that every application may read it: run \
-             `runner-manager auth login`, with sudo if this is the machine-scoped store."
-        ))
     }
 
     /// Whether `keychain` is locked as far as this process can tell.

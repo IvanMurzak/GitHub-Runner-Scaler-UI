@@ -43,6 +43,7 @@ use runner_manager_platform::lock::{HostLock, LockError, LockKind};
 use runner_manager_platform::service::{
     InstallRecord, clear_credential_unreadable, clear_github_credential_rejection,
     record_credential_unreadable, record_github_contact, record_github_credential_rejected,
+    sign_in_instruction,
 };
 use runner_manager_platform::wsl::fence::{
     DrainRequest, GuestHeartbeat, GuestRecoveryConfig,
@@ -193,11 +194,7 @@ async fn run_generation(
             CliError::with_remedy(
                 Failure::SecretStore,
                 format!("cannot read the stored GitHub credential: {source}"),
-                format!(
-                    "{}{}",
-                    runner_manager_platform::service::sign_in_command(mode),
-                    runner_manager_platform::service::sign_in_where(mode)
-                ),
+                sign_in_instruction(mode),
             )
         })?
         .ok_or_else(|| {
@@ -829,21 +826,16 @@ fn stop_for_upgrade(
     version: &str,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    if let Some(source) = source {
-        match replace_own_binary(source) {
-            Ok(()) => {
-                if HANDS_OVER_CREDENTIAL {
-                    hand_over_credential_to_new_binary(context, mode);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "the new binary could not be put in place; the service manager will restart the version already there"
-                );
-                writeln!(out, "warning: {error}").map_err(write_failed("the daemon state"))?;
-            }
+    match source.map(replace_own_binary) {
+        Some(Ok(())) if HANDS_OVER_CREDENTIAL => hand_over_credential_to_new_binary(context, mode),
+        Some(Err(error)) => {
+            tracing::warn!(
+                %error,
+                "the new binary could not be put in place; the service manager will restart the version already there"
+            );
+            writeln!(out, "warning: {error}").map_err(write_failed("the daemon state"))?;
         }
+        _ => {}
     }
     writeln!(
         out,
@@ -948,7 +940,8 @@ fn hand_over_credential_to_new_binary(context: &Context, mode: StartMode) {
         Handover::NothingStored => tracing::info!("no credential is stored; nothing to hand over"),
         Handover::Unreadable | Handover::Failed { .. } => tracing::warn!(
             ?outcome,
-            "the credential was not handed over; the new daemon may need `runner-manager auth login --start-at {mode}`"
+            remedy = %sign_in_instruction(mode),
+            "the credential was not handed over; the new daemon may need a sign-in"
         ),
     }
 }
@@ -1010,15 +1003,13 @@ fn adopt_through(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("{} could not be started: {error}", binary.display()))?;
+    // Dropped at the end of the statement, which closes the pipe before the wait.
     let written = child
         .stdin
         .take()
-        .ok_or_else(|| "the new binary's stdin is not a pipe".to_string())
-        .and_then(|mut stdin| {
-            stdin
-                .write_all(document.expose_secret().as_bytes())
-                .map_err(|error| format!("the credential could not be written to it: {error}"))
-        });
+        .expect("stdin was configured as a pipe")
+        .write_all(document.expose_secret().as_bytes())
+        .map_err(|error| format!("the credential could not be written to it: {error}"));
     // Waited for even when the write failed, so the child is never left behind.
     let output = child
         .wait_with_output()

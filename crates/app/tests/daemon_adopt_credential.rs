@@ -5,11 +5,13 @@
 // from the binary that replaces it, so that the new build is the writer of the
 // keychain item it will read after the restart. `crates/app` has no library
 // target, so the command can only be driven from here, as a process: the
-// handover's own decisions are unit-tested beside it in `daemon.rs`.
+// handover's own decisions are unit-tested beside it in `daemon.rs`, and that
+// the command stays hidden yet reachable is `HIDDEN_BRIDGES` in
+// `cli_command_surface.rs`.
 
 mod support;
 
-use support::{FakeGithub, fixture_token, run, runner_manager, runner_manager_against};
+use support::{FakeGithub, fixture_token, run, runner_manager_against};
 
 /// A credential document as `UserAccessToken::to_stored_document` writes one.
 fn document(access: &str) -> String {
@@ -26,38 +28,6 @@ const INVALID_ARGUMENT: i32 = 9;
 
 /// `Failure::NotAuthenticated`: no credential in the store at all.
 const NOT_AUTHENTICATED: i32 = 3;
-
-#[test]
-fn adopt_credential_is_absent_from_help_and_still_runs() {
-    let data_dir = tempfile::tempdir().expect("a temporary directory");
-    let help = run({
-        let mut command = runner_manager(data_dir.path());
-        command.args(["daemon", "--help"]);
-        command
-    });
-    assert_eq!(
-        help.code, 0,
-        "`daemon --help` must succeed: {}",
-        help.stderr
-    );
-    assert!(
-        !help.stdout.contains("adopt-credential"),
-        "a bridge between two daemon builds is not a command to advertise:\n{}",
-        help.stdout
-    );
-
-    let own_help = run({
-        let mut command = runner_manager(data_dir.path());
-        command.args(["daemon", "adopt-credential", "--help"]);
-        command
-    });
-    assert_eq!(own_help.code, 0, "still reachable: {}", own_help.stderr);
-    assert!(
-        own_help.stdout.contains("--start-at"),
-        "{}",
-        own_help.stdout
-    );
-}
 
 /// The credential the old daemon handed over is one the host is signed in
 /// with afterwards.

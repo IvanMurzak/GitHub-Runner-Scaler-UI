@@ -1494,14 +1494,11 @@ pub enum DaemonCommand {
     /// Run the reconciliation loop in the foreground.
     Run(DaemonRunArgs),
     /// Store a credential the previous build of the daemon hands over while it
-    /// upgrades.
+    /// upgrades, read from stdin.
     ///
-    /// The daemon starts this from the binary it has just put in place, with
-    /// the credential document on stdin. On macOS the keychain ties an item to
-    /// the exact build that wrote it, so the new build has to be the writer:
-    /// that is the only way it can read its own credential after the restart
-    /// without somebody signing in at the Mac. Not a command anybody types, so
-    /// it is hidden for the reason `auth receive` is.
+    /// Started by the upgrading daemon from the binary it has just put in
+    /// place; see `hand_over_credential_to_new_binary` for why. Hidden for the
+    /// reason `auth receive` is.
     #[command(hide = true)]
     AdoptCredential(DaemonAdoptCredentialArgs),
 }
@@ -2069,8 +2066,10 @@ fn run_with_shutdown(
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
     let service_paths = match &cli.command {
-        Command::Daemon(DaemonCommand::Run(args)) => args.directories.service_paths(),
-        Command::Daemon(DaemonCommand::AdoptCredential(args)) => args.directories.service_paths(),
+        Command::Daemon(
+            DaemonCommand::Run(DaemonRunArgs { directories, .. })
+            | DaemonCommand::AdoptCredential(DaemonAdoptCredentialArgs { directories, .. }),
+        ) => directories.service_paths(),
         _ => None,
     };
     if service_paths.is_some() && cli.data_dir.is_some() {
