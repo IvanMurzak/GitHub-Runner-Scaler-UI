@@ -17,7 +17,8 @@ the version being prepared rather than the version in `Cargo.toml`.
   scanning of the runner roots, whether the service runs unattended as LocalSystem, the Windows
   PowerShell execution policy and PowerShell 7; on macOS a `Background` LaunchAgent or throttled
   runners, Spotlight indexing the runner root, and whether the service binary can still read its
-  keychain credential; everywhere a capacity larger than memory and cores allow and any tools
+  keychain credential; everywhere a runner root that does not answer within 5 seconds (a hung
+  external disk or network mount), a capacity larger than memory and cores allow, and any tools
   named with `host required-tools`. `--json` prints a versioned document. It exits with the new
   code 25 (`host_unfit`) when a required check fails.
 - `runner-manager host prepare` fixes what the doctor found. It asks before changing anything

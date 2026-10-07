@@ -596,6 +596,7 @@ administrator rights:
 | `macos.launchd_priority` | macOS | recommended | none; `runner-manager update` repairs the plist | - |
 | `macos.spotlight` | macOS | recommended | `mdutil -i off` for a runner root on its own volume | yes |
 | `macos.keychain_credential` | macOS | required | none; prints the exact `auth login --start-at login` | - |
+| `host.runner_root_responsive` | all | required | none; a runner root that does not answer within 5 s (a hung external disk or network mount) | - |
 | `host.capacity` | all | recommended | none; suggests `host set-capacity N` from memory and cores | - |
 | `host.required_tools` | all | required | none; install the tool or extend PATH | - |
 
