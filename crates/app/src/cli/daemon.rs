@@ -638,7 +638,6 @@ const CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// more than one attempt before the access half stops working.
 const CREDENTIAL_RENEWAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// Keep the daemon's credential alive even when no runner request uses it.
 /// Evaluates the required host checks and updates `unfit`, logging only when
 /// the verdict changes so a host that stays unfit does not fill the log. The
 /// first evaluation of a generation also names the missing recommended
@@ -690,6 +689,7 @@ async fn maintain_host_fitness(context: &Context, unfit: Arc<AtomicBool>) {
     }
 }
 
+/// Keep the daemon's credential alive even when no runner request uses it.
 async fn maintain_credential(client: Arc<AuthenticatedClient>) {
     loop {
         client

@@ -91,6 +91,10 @@ pub const SKIP_DOCTOR_VARIABLE: &str = "RUNNER_MANAGER_SKIP_HOST_DOCTOR";
 /// How often the daemon re-evaluates the required checks.
 pub const DAEMON_RECHECK: Duration = Duration::from_secs(5 * 60);
 
+/// How long the daemon's host-unfit record counts as a refusal in force: three
+/// rechecks, so one slow evaluation does not hide it.
+const HOST_UNFIT_RECORD_FRESH: Duration = Duration::from_secs(3 * DAEMON_RECHECK.as_secs());
+
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The memory one concurrent job is assumed to need when a capacity is
 /// recommended. A guide, not a measurement of any particular workload.
@@ -227,6 +231,10 @@ pub struct HostSetup {
     pub runner_roots: Vec<PathBuf>,
     pub capacity: u16,
     pub required_tools: Vec<String>,
+    /// Why the required-tools file could not be read, when it could not: the
+    /// check is then unknown rather than "none configured".
+    #[serde(default)]
+    pub required_tools_error: Option<String>,
     /// The `PATH` a native runner starts with, as well as this process can
     /// tell (exact in the daemon).
     pub runner_path: Option<String>,
@@ -1183,14 +1191,22 @@ fn probe_spotlight(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     let outcome = fail(format!(
         "Spotlight indexes {names}, re-reading every file jobs write there"
     ));
-    let on_startup_volume = indexed.iter().all(|(_, volume)| is_startup_volume(volume));
-    if on_startup_volume {
-        outcome.not_fixable().remedy(format!(
-            "the root is on the startup volume: move it into a folder whose name ends in \
-             `.noindex` (runner-manager host set-runtime-root --path {}.noindex), or add it to \
-             System Settings > Spotlight > Search Privacy",
-            indexed[0].0.display()
-        ))
+    // The fix turns indexing off per volume and never on a startup volume, so
+    // a root there needs the manual remedy even when another root is fixable.
+    let Some((startup_root, _)) = indexed.iter().find(|(_, volume)| is_startup_volume(volume))
+    else {
+        return outcome;
+    };
+    let remedy = format!(
+        "{} is on the startup volume: move it into a folder whose name ends in `.noindex` \
+         (runner-manager host set-runtime-root --path {}.noindex), or add it to System \
+         Settings > Spotlight > Search Privacy",
+        startup_root.display(),
+        startup_root.display()
+    );
+    let outcome = outcome.remedy(remedy);
+    if indexed.iter().all(|(_, volume)| is_startup_volume(volume)) {
+        outcome.not_fixable()
     } else {
         outcome
     }
@@ -1309,6 +1325,10 @@ fn probe_capacity(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
 // -- host.required_tools ------------------------------------------------------
 
 fn probe_required_tools(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    if let Some(error) = &setup.required_tools_error {
+        return unknown(format!("the required tools could not be read: {error}"))
+            .remedy("runner-manager host required-tools --set <TOOLS> (rewrites the file)");
+    }
     if setup.required_tools.is_empty() {
         return not_applicable(
             "no required tools are configured (runner-manager host required-tools --set git,node)",
@@ -1658,12 +1678,17 @@ fn setup_from_parts(
         }
     }
     let mode = service.as_ref().map(|service| service.start_mode);
+    let (required_tools, required_tools_error) = match required_tools(context) {
+        Ok(tools) => (tools, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     HostSetup {
         os: HostOs::current(),
         perspective,
         runner_roots,
         capacity: host.map_or(super::DEFAULT_HOST_CAPACITY, Host::host_capacity),
-        required_tools: required_tools(context).unwrap_or_default(),
+        required_tools,
+        required_tools_error,
         runner_path: runner_path(context, perspective, mode),
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
@@ -2903,6 +2928,15 @@ impl DoctorSummary {
             daemon_host_unfit: host_fitness::host_unfit(context.paths())
                 .ok()
                 .flatten()
+                // A running daemon re-stamps the record every recheck, so one
+                // it has not touched for several is left behind by a daemon
+                // that stopped (or was uninstalled) while refusing, not a
+                // refusal in force.
+                .filter(|record| {
+                    (context.clock().now() - record.checked_at)
+                        .to_std()
+                        .is_ok_and(|age| age <= HOST_UNFIT_RECORD_FRESH)
+                })
                 .map(|record| HostUnfitSummary {
                     since: record.since,
                     checks: record.checks,
@@ -3050,11 +3084,20 @@ pub fn before_service_install(
     writeln!(out).map_err(failed)
 }
 
-/// The TUI's one-key fix: applies every available fix the person consented
-/// to, asking for administrator rights through the system's own dialog, and
-/// returns one line describing what happened.
+/// The TUI's one-key fix: applies the fixes for `checks` -- the ones the
+/// dialog named, never another -- that the person consented to, asking for
+/// administrator rights through the system's own dialog, and returns one line
+/// describing what happened.
 #[must_use]
-pub fn prepare_from_tui(context: &Context, allow_security_tradeoffs: bool) -> String {
+pub fn prepare_from_tui(
+    context: &Context,
+    checks: &[String],
+    allow_security_tradeoffs: bool,
+) -> String {
+    // An empty `only` means every check to `prepare`; here it means none.
+    if checks.is_empty() {
+        return "Host prepare: nothing was chosen to fix.".into();
+    }
     let setup = match setup(context, Perspective::Operator, None) {
         Ok(setup) => setup,
         Err(error) => return format!("host prepare could not start: {error}"),
@@ -3074,7 +3117,7 @@ pub fn prepare_from_tui(context: &Context, allow_security_tradeoffs: bool) -> St
                 allow_developer_mode: allow_security_tradeoffs,
             },
         },
-        &[],
+        checks,
         &mut sink,
     ) {
         Ok(outcome) => tui_summary(&outcome),
@@ -3323,6 +3366,7 @@ mod tests {
             runner_roots: vec![PathBuf::from(r"C:\rman")],
             capacity: 2,
             required_tools: Vec::new(),
+            required_tools_error: None,
             runner_path: Some(r"C:\Windows\System32".into()),
             probe_dir: PathBuf::from(r"C:\state"),
             data_root: None,
@@ -3803,6 +3847,14 @@ mod tests {
             "not on the runners' PATH: pwsh"
         );
         assert_eq!(report.required_failing(), ["host.required_tools"]);
+
+        // A file that cannot be read is not "none configured".
+        setup.required_tools = Vec::new();
+        setup.required_tools_error = Some("required-tools.json is not valid".into());
+        assert_eq!(
+            status_of(&setup, &facts, "host.required_tools"),
+            Status::Unknown
+        );
     }
 
     #[test]

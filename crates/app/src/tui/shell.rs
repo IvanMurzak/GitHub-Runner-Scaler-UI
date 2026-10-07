@@ -599,6 +599,9 @@ fn operational_readiness(
 /// check id, which is what the one-key fix reads back.
 const DOCTOR_ROW_PREFIX: &str = "readiness:doctor:";
 
+/// The activity-row id of the daemon's recorded refusal to start runners.
+const HOST_UNFIT_ROW_ID: &str = "readiness:host:unfit";
+
 /// Folds `host doctor`'s failing checks, and the daemon's refusal to start
 /// runners, into the readiness the dashboard leads with. A failing required
 /// check blocks; a recommended one degrades. The doctor itself ran on this
@@ -612,7 +615,7 @@ fn with_host_doctor(
     if let Some(unfit) = &doctor.daemon_host_unfit {
         assessment.state = assessment.state.worse(OperationalReadiness::Blocked);
         assessment.activity.push(screens::ActivityRow {
-            id: "readiness:host:unfit".into(),
+            id: HOST_UNFIT_ROW_ID.into(),
             occurred_at: now.clone(),
             outcome: screens::ActivityOutcome::Failed,
             summary: format!(
@@ -1664,10 +1667,13 @@ pub enum Effect {
     OpenFullDiskAccess,
     ActivateFocusedControl,
     Settings(SettingsCommand),
-    /// Run `host prepare` for every failing check it can fix, elevating
-    /// through the system's own prompt. `allow_security_tradeoffs` includes
-    /// the fixes that lower security (Defender exclusion, Developer Mode).
+    /// Run `host prepare` for `checks` -- exactly the failing checks the
+    /// dialog named -- elevating through the system's own prompt.
+    /// `allow_security_tradeoffs` includes the fixes among them that lower
+    /// security (Defender exclusion, Developer Mode); a check the dialog did
+    /// not name is never fixed, so a yes cannot reach one nobody was shown.
     PrepareHost {
+        checks: Vec<String>,
         allow_security_tradeoffs: bool,
     },
 }
@@ -1677,9 +1683,13 @@ pub enum Effect {
 pub enum HostPrepareUi {
     #[default]
     Hidden,
-    /// Waiting for the person to choose. `tradeoffs` names the failing checks
-    /// whose fix lowers security; with none, the choice is only yes or no.
-    Confirm { tradeoffs: Vec<String> },
+    /// Waiting for the person to choose. `checks` are the failing checks the
+    /// dashboard shows; `tradeoffs` names those whose fix lowers security, and
+    /// with none the choice is only yes or no.
+    Confirm {
+        checks: Vec<String>,
+        tradeoffs: Vec<String>,
+    },
     /// What the last run did.
     Done(String),
 }
@@ -1703,18 +1713,28 @@ fn reduce_host_prepare_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Ef
             // The key that closes the result is not also a command.
             Some(Vec::new())
         }
-        HostPrepareUi::Confirm { tradeoffs } => {
+        HostPrepareUi::Confirm { checks, tradeoffs } => {
             let choice = match key.code {
-                KeyCode::Char('y' | 'Y') => Some(!tradeoffs.is_empty()),
-                KeyCode::Char('s' | 'S') if !tradeoffs.is_empty() => Some(false),
+                KeyCode::Char('y' | 'Y') => Some((checks.clone(), !tradeoffs.is_empty())),
+                KeyCode::Char('s' | 'S') if !tradeoffs.is_empty() => Some((
+                    checks
+                        .iter()
+                        .filter(|id| !tradeoffs.contains(id))
+                        .cloned()
+                        .collect(),
+                    false,
+                )),
                 _ => None,
             };
             state.host_prepare = HostPrepareUi::Hidden;
-            Some(choice.map_or_else(Vec::new, |allow_security_tradeoffs| {
-                vec![Effect::PrepareHost {
-                    allow_security_tradeoffs,
-                }]
-            }))
+            Some(
+                choice.map_or_else(Vec::new, |(checks, allow_security_tradeoffs)| {
+                    vec![Effect::PrepareHost {
+                        checks,
+                        allow_security_tradeoffs,
+                    }]
+                }),
+            )
         }
     }
 }
@@ -2182,15 +2202,31 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('a') => state.open_screen(Screen::Activity),
         KeyCode::Char('f') => {
             let failing = failing_doctor_checks(state);
-            state.host_prepare = if failing.is_empty() {
+            let refused = state
+                .screen_model
+                .snapshot
+                .activity
+                .iter()
+                .any(|row| row.id == HOST_UNFIT_ROW_ID);
+            state.host_prepare = if failing.is_empty() && refused {
+                // The service measured from its own account; this view did
+                // not reproduce the failure, so there is nothing to apply here.
+                HostPrepareUi::Done(
+                    "The service refuses to start runners, but this view finds no failing check \
+                     to fix: the service measures from its own account. Run `runner-manager \
+                     host doctor` there; the service re-checks within five minutes."
+                        .into(),
+                )
+            } else if failing.is_empty() {
                 HostPrepareUi::Done("Host doctor reports nothing to fix.".into())
             } else {
                 HostPrepareUi::Confirm {
                     tradeoffs: failing
-                        .into_iter()
+                        .iter()
                         .filter(|id| crate::cli::doctor::lowers_security(id))
-                        .map(str::to_owned)
+                        .map(|id| (*id).to_owned())
                         .collect(),
+                    checks: failing.into_iter().map(str::to_owned).collect(),
                 }
             };
         }
@@ -2587,7 +2623,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 fn render_host_prepare(frame: &mut Frame<'_>, area: Rect, dialog: &HostPrepareUi) {
     let lines: Vec<Line<'static>> = match dialog {
         HostPrepareUi::Hidden => return,
-        HostPrepareUi::Confirm { tradeoffs } if tradeoffs.is_empty() => vec![
+        HostPrepareUi::Confirm { tradeoffs, .. } if tradeoffs.is_empty() => vec![
             Line::from("Fix what host doctor found?"),
             Line::from("Changes that need administrator rights are made in one step,"),
             Line::from("after the system's own administrator prompt."),
@@ -2597,7 +2633,7 @@ fn render_host_prepare(frame: &mut Frame<'_>, area: Rect, dialog: &HostPrepareUi
                 Style::default().add_modifier(Modifier::BOLD),
             )),
         ],
-        HostPrepareUi::Confirm { tradeoffs } => vec![
+        HostPrepareUi::Confirm { tradeoffs, .. } => vec![
             Line::from("Fix what host doctor found?"),
             Line::from(Span::styled(
                 format!("These fixes lower security: {}", tradeoffs.join(", ")),
@@ -3015,14 +3051,17 @@ where
                     }
                 }
                 Effect::PrepareHost {
+                    checks,
                     allow_security_tradeoffs,
                 } => {
                     // Synchronous on purpose: while it runs the person is
                     // answering the system's administrator prompt, not this UI.
                     let message = match context {
-                        Some(context) => {
-                            crate::cli::doctor::prepare_from_tui(context, allow_security_tradeoffs)
-                        }
+                        Some(context) => crate::cli::doctor::prepare_from_tui(
+                            context,
+                            &checks,
+                            allow_security_tradeoffs,
+                        ),
                         None => "host prepare needs the local application context".into(),
                     };
                     state.host_prepare = HostPrepareUi::Done(message);
@@ -5908,11 +5947,15 @@ fn f_offers_the_host_fix_and_asks_before_a_security_tradeoff() {
     reduce(&mut safe, press(KeyCode::Char('f')));
     assert_eq!(
         safe.host_prepare,
-        HostPrepareUi::Confirm { tradeoffs: vec![] }
+        HostPrepareUi::Confirm {
+            checks: vec!["windows.long_paths".into()],
+            tradeoffs: vec![]
+        }
     );
     assert_eq!(
         reduce(&mut safe, press(KeyCode::Char('y'))),
         [Effect::PrepareHost {
+            checks: vec!["windows.long_paths".into()],
             allow_security_tradeoffs: false
         }]
     );
@@ -5922,6 +5965,10 @@ fn f_offers_the_host_fix_and_asks_before_a_security_tradeoff() {
     assert_eq!(
         tradeoff.host_prepare,
         HostPrepareUi::Confirm {
+            checks: vec![
+                "windows.long_paths".into(),
+                "windows.defender_exclusion".into()
+            ],
             tradeoffs: vec!["windows.defender_exclusion".into()]
         }
     );
@@ -5932,9 +5979,12 @@ fn f_offers_the_host_fix_and_asks_before_a_security_tradeoff() {
         crate::tui::buffer_text(terminal.backend().buffer())
     };
     assert!(frame.contains("These fixes lower security"), "{frame}");
+    // "Only the others" names only the others, so nothing that lowers
+    // security can be reached even by a check the dialog did not list.
     assert_eq!(
         reduce(&mut tradeoff, press(KeyCode::Char('s'))),
         [Effect::PrepareHost {
+            checks: vec!["windows.long_paths".into()],
             allow_security_tradeoffs: false
         }]
     );
@@ -5942,6 +5992,10 @@ fn f_offers_the_host_fix_and_asks_before_a_security_tradeoff() {
     assert_eq!(
         reduce(&mut tradeoff, press(KeyCode::Char('y'))),
         [Effect::PrepareHost {
+            checks: vec![
+                "windows.long_paths".into(),
+                "windows.defender_exclusion".into()
+            ],
             allow_security_tradeoffs: true
         }]
     );

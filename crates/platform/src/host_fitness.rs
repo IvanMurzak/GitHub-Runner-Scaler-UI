@@ -159,7 +159,13 @@ pub fn find_on_path(tool: &str, path: &OsStr) -> Option<PathBuf> {
     }
     let extensions: Vec<String> = if cfg!(windows) {
         let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        let mut list = vec![String::new()];
+        // A bare name is tried as-is only when it already carries an
+        // extension: `cmd` and `CreateProcess` never run an extensionless file,
+        // and Node.js ships a POSIX `npm` script beside `npm.cmd`.
+        let mut list = Vec::new();
+        if tool.contains('.') {
+            list.push(String::new());
+        }
         list.extend(
             pathext
                 .split(';')
@@ -910,6 +916,21 @@ mod tests {
         assert_eq!(find_on_path("rmtool", &path), Some(tool));
         assert_eq!(find_on_path("absent-tool", &path), None);
         assert_eq!(find_on_path("../rmtool", &path), None);
+    }
+
+    /// Node.js on Windows ships a POSIX `npm` script beside `npm.cmd`; only the
+    /// one Windows can start is an answer.
+    #[cfg(windows)]
+    #[test]
+    fn an_extensionless_file_is_never_the_windows_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("npm"), b"#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        assert_eq!(find_on_path("npm", &path), None);
+        let cmd = directory.path().join("npm.cmd");
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        assert_eq!(find_on_path("npm", &path), Some(cmd.clone()));
+        assert_eq!(find_on_path("npm.cmd", &path), Some(cmd));
     }
 
     #[test]
