@@ -1960,6 +1960,36 @@ mod sys {
 
 // ---------------------------------------------------------------------------
 
+/// `errSecWrPerm`: the keychain refused to be written.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ERR_SEC_WR_PERM: i32 = -61;
+
+/// Whether a keychain error, as this module words them (`… returned <code>`),
+/// carries [`ERR_SEC_WR_PERM`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_keychain_write_refusal(message: &str) -> bool {
+    let needle = format!("returned {ERR_SEC_WR_PERM}");
+    message.match_indices(&needle).any(|(at, found)| {
+        !message[at + found.len()..].starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// The System keychain's refusal of an ordinary account, explained.
+///
+/// `auth login` without `--start-at` on a Mac with no service used to reach
+/// for this store and print only `SecKeychainItemCreateFromContent returned
+/// -61`, after the operator had already approved the device code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn system_keychain_write_refused(source: &str) -> String {
+    format!(
+        "{source}. The machine-scoped store is the System keychain, and only root may write \
+         it. It holds the credential for a service that starts at boot; sign in for that one \
+         with `sudo runner-manager auth login --start-at boot`. For a service that runs as you \
+         (`runner-manager service install --start-at login`), sign in to your own login \
+         keychain instead: `runner-manager auth login --start-at login`"
+    )
+}
+
 #[cfg(target_os = "macos")]
 mod sys {
     //! A generic-password item in a keychain, and which keychain is the whole
@@ -2361,6 +2391,21 @@ mod sys {
     }
 
     pub(super) fn store(site: &Site, _scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
+        write(site, plaintext).map_err(|error| {
+            let message = error.to_string();
+            if site.kind == Kind::System && !is_root() && super::is_keychain_write_refusal(&message)
+            {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    super::system_keychain_write_refused(&message),
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn write(site: &Site, plaintext: &[u8]) -> io::Result<()> {
         let _no_ui = without_user_interaction();
         let keychain = open(site, true)?.ok_or_else(|| {
             io::Error::new(
@@ -3251,6 +3296,35 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn a_system_keychain_write_refusal_says_which_sign_in_to_run() {
+        for refused in [
+            "SecKeychainItemCreateFromContent returned -61",
+            "Security.framework returned -61 (write permissions error)",
+        ] {
+            assert!(is_keychain_write_refusal(refused), "{refused}");
+        }
+        for other in [
+            "SecKeychainItemCreateFromContent returned -610",
+            "Security.framework returned -25293 (auth failed)",
+            "no keychain",
+        ] {
+            assert!(!is_keychain_write_refusal(other), "{other}");
+        }
+        let explained =
+            system_keychain_write_refused("SecKeychainItemCreateFromContent returned -61");
+        assert!(explained.starts_with("SecKeychainItemCreateFromContent returned -61. "));
+        assert!(explained.contains("only root may write it"), "{explained}");
+        assert!(
+            explained.contains("`runner-manager auth login --start-at login`"),
+            "{explained}"
+        );
+        assert!(
+            explained.contains("`sudo runner-manager auth login --start-at boot`"),
+            "{explained}"
+        );
+    }
 
     /// Shaped like a real `ghu_` user access token and unmistakably not one.
     ///
