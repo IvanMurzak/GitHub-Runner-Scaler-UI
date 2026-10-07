@@ -1,0 +1,28 @@
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_89e9cba5cf77cd 700-706
+  s_468234d3364cc1::t_7952fe4541ab33 1307-1345,3346-3347,3350,3998
+  s_468234d3364cc1::t_75107c164ea98a 360-361
+  s_468234d3364cc1::t_7205cbf2dac29e 1165-1168
+  s_468234d3364cc1::t_d0abc92f239b8b 3901-3920
+  s_468234d3364cc1::t_b8368f65bd5787 699,1346-1348,1929-1932,3295-3296,3344-3345,3348-3349,3921-3927,3997,3999
+crates/platform/src/host_fitness.rs
+  s_468234d3364cc1::t_039a7e56d9c972 116-185
+  s_468234d3364cc1::t_c589f64c946053 1042-1043,1045-1049
+  s_468234d3364cc1::t_a7c0a49b71a389 1029-1041,1044,1050-1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e27daf212596fb1e27ebc04ab930ac8bae2a36ba",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
