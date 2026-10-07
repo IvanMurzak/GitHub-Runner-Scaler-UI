@@ -3174,17 +3174,87 @@ impl LifecycleLauncher {
             self.record(&attempt)?;
         }
 
-        // A one-shot child owned by this invocation exited successfully after
-        // GitHub had already reported it busy, and its ephemeral registration
-        // is now gone.  This concludes the *runner attempt*, never the workflow
-        // outcome; GitHub remains authoritative for that outcome.
-        if attempt.state() == AttemptState::Busy
-            && !process_alive
-            && github.status == GithubRunnerObservation::NotRegistered
-            && self.ports.processes.completed_successfully(&attempt)
+        // What the runner's own diagnostics say about whether it ran a job.
+        // Read before anything below can conclude the attempt, because cleanup
+        // deletes `_diag` with the rest of the runtime directory.
+        let evidence = JobEvidence::of(attempt.runtime_path());
+
+        // A one-shot child owned by this invocation exited successfully. This
+        // concludes the *runner attempt*, never the workflow outcome; GitHub
+        // remains authoritative for that.
+        //
+        // GitHub's inventory used to be the only witness, and it is a sampled
+        // one: a job of a few seconds starts and ends between two passes, so
+        // the attempt was last seen `starting` (or `idle`), never `busy`, and
+        // its clean exit was recorded `process_exited_unexpectedly` -- and a
+        // replacement runner was started for it. The reverse error came from
+        // the same sampling: a runner GitHub showed assigned, that never took
+        // the job up, was recorded `completed_job` once it exited 0. The
+        // runner's diagnostics decide both, and GitHub's sample only decides
+        // when the diagnostics say nothing.
+        if !process_alive && self.ports.processes.completed_successfully(&attempt) {
+            let outcome = match (attempt.state(), evidence) {
+                (
+                    AttemptState::Starting | AttemptState::Idle | AttemptState::Busy,
+                    JobEvidence::RanAJob,
+                ) => Some(AttemptOutcome::CompletedJob),
+                (AttemptState::Busy, JobEvidence::NoJob) => {
+                    Some(AttemptOutcome::ExitedIdleWithoutWork)
+                }
+                (AttemptState::Busy, JobEvidence::Unknown)
+                    if github.status == GithubRunnerObservation::NotRegistered =>
+                {
+                    Some(AttemptOutcome::CompletedJob)
+                }
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                let now = self.ports.clock.now();
+                match (&outcome, attempt.state()) {
+                    (AttemptOutcome::CompletedJob, AttemptState::Starting | AttemptState::Idle) => {
+                        let runner_id = attempt
+                            .github_runner_id()
+                            .or(github.runner_id)
+                            .or_else(|| read_runner_id(attempt.runtime_path()))
+                            .ok_or(LifecycleError::Transition)?;
+                        attempt
+                            .assigned_job(runner_id, now)
+                            .map_err(|_| LifecycleError::Transition)?;
+                        self.record(&attempt)?;
+                    }
+                    (AttemptOutcome::ExitedIdleWithoutWork, AttemptState::Busy) => {
+                        attempt
+                            .assignment_not_taken(now)
+                            .map_err(|_| LifecycleError::Transition)?;
+                        self.record(&attempt)?;
+                    }
+                    _ => {}
+                }
+                // An ephemeral runner leaves GitHub's list a little after its
+                // process exits; one still listed is removed here rather than
+                // left for GitHub to time out.
+                if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
+                    self.deregister_runner(policy, &attempt).await;
+                }
+                self.conclude(&mut attempt, outcome)?;
+                self.clean_or_quarantine(&mut attempt)?;
+                return Ok(ReconcileProgress::Reconciled);
+            }
+        }
+
+        // A live runner journalled `busy` that GitHub now shows waiting, and
+        // whose diagnostics show no job: the assignment was never taken up.
+        // Back to `idle`, where the idle timeout applies to it again; the
+        // `busy` arm below would otherwise adopt it for as long as it runs.
+        if process_alive
+            && attempt.state() == AttemptState::Busy
+            && github.status == (GithubRunnerObservation::Registered { busy: false })
+            && evidence == JobEvidence::NoJob
         {
-            self.conclude(&mut attempt, AttemptOutcome::CompletedJob)?;
-            self.clean_or_quarantine(&mut attempt)?;
+            attempt
+                .assignment_not_taken(self.ports.clock.now())
+                .map_err(|_| LifecycleError::Transition)?;
+            self.record(&attempt)?;
             return Ok(ReconcileProgress::Reconciled);
         }
 
@@ -4655,6 +4725,43 @@ impl RunnerLauncher for LifecycleLauncher {
 
 fn runner_name(attempt: AttemptId) -> String {
     format!("runner-manager-{attempt}")
+}
+
+/// What a native runner's own diagnostics say about whether it ran a job.
+///
+/// `Runner.Listener` writes `_diag/Runner_*.log` when it starts, and starts
+/// `Runner.Worker` -- which writes `_diag/Worker_*.log` -- only for a job it has
+/// acquired. So a worker log is proof a job ran, and a listener log without one
+/// is proof none did. With neither, the directory is not where the listener
+/// wrote, and nothing is concluded from it. `_diag` is scrubbed with the rest of
+/// the runtime after every attempt, persistent slots included, so a log found
+/// here belongs to this attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobEvidence {
+    RanAJob,
+    NoJob,
+    Unknown,
+}
+
+impl JobEvidence {
+    fn of(runtime: &Path) -> Self {
+        let Ok(entries) = fs::read_dir(runtime.join("_diag")) else {
+            return Self::Unknown;
+        };
+        let mut listener = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".log") {
+                continue;
+            }
+            if name.starts_with("Worker_") {
+                return Self::RanAJob;
+            }
+            listener |= name.starts_with("Runner_");
+        }
+        if listener { Self::NoJob } else { Self::Unknown }
+    }
 }
 
 fn read_runner_id(runtime: &Path) -> Option<u64> {
@@ -7505,6 +7612,187 @@ mod tests {
         assert_eq!(harness.github.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(harness.processes.spawns.load(Ordering::SeqCst), 1);
         assert!(harness.delay.0.lock().unwrap().is_empty());
+    }
+
+    /// Writes the runner's own diagnostics: always the listener's log, and the
+    /// job worker's when `ran_a_job`. `Runner.Listener` starts `Runner.Worker`
+    /// only for a job it has acquired.
+    fn write_runner_diagnostics(runtime: &Path, ran_a_job: bool) {
+        let diag = runtime.join("_diag");
+        fs::create_dir_all(&diag).unwrap();
+        fs::write(diag.join("Runner_20261007-211941-utc.log"), b"listener").unwrap();
+        if ran_a_job {
+            fs::write(diag.join("Worker_20261007-211950-utc.log"), b"worker").unwrap();
+        }
+    }
+
+    /// The macOS field case: a job of a few seconds starts and ends between two
+    /// passes, so GitHub was never seen reporting the runner busy -- the attempt
+    /// is still `starting` -- and the registration is already gone. It used to be
+    /// recorded `process_exited_unexpectedly`, with a replacement runner.
+    #[tokio::test]
+    async fn a_job_too_short_to_be_seen_busy_is_recorded_as_completed() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        assert_eq!(started.state(), AttemptState::Starting);
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        let cleaned = harness.only_attempt();
+        assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+        assert_eq!(cleaned.github_runner_id(), Some(73));
+        assert!(replacements.is_empty(), "a finished job needs no replacement");
+        let busy_seen = harness.events.events().into_iter().any(|event| {
+            matches!(
+                event,
+                AttemptEvent::State {
+                    state: AttemptState::Busy,
+                    ..
+                }
+            )
+        });
+        assert!(busy_seen, "the journal walks the diagram to `busy` first");
+    }
+
+    /// The same from `idle`: seen registered and waiting once, then gone.
+    #[tokio::test]
+    async fn a_job_taken_between_two_passes_after_idle_is_recorded_as_completed() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Idle);
+
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        let replacements = harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert_eq!(
+            harness.only_attempt().outcome(),
+            Some(&AttemptOutcome::CompletedJob)
+        );
+        assert!(replacements.is_empty());
+    }
+
+    /// The reverse error, from the same sampling: GitHub showed the runner
+    /// assigned, the runner never started the job (no worker log), and it exited
+    /// 0. That is not a completed job.
+    #[tokio::test]
+    async fn an_assignment_the_runner_never_took_up_is_not_a_completed_job() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Busy);
+
+        write_runner_diagnostics(started.runtime_path(), false);
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        let cleaned = harness.only_attempt();
+        assert_eq!(
+            cleaned.outcome(),
+            Some(&AttemptOutcome::ExitedIdleWithoutWork)
+        );
+        assert_eq!(cleaned.state(), AttemptState::Cleaned);
+    }
+
+    /// The mirror case: the runner really ran its job and exited 0 before GitHub
+    /// took it off the list. It used to be recorded `orphaned`.
+    #[tokio::test]
+    async fn a_finished_job_still_listed_at_github_is_completed_and_deregistered() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+
+        assert_eq!(
+            harness.only_attempt().outcome(),
+            Some(&AttemptOutcome::CompletedJob)
+        );
+        assert_eq!(*harness.github.deregistrations.lock().unwrap(), vec![73]);
+    }
+
+    /// A live runner journalled `busy` whose assignment GitHub withdrew goes
+    /// back to `idle`, where the idle timeout holds it again.
+    #[tokio::test]
+    async fn a_live_runner_whose_assignment_was_withdrawn_goes_back_to_idle() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Busy);
+
+        write_runner_diagnostics(started.runtime_path(), false);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Idle);
+
+        // A runner that did start its job keeps `busy` whatever GitHub says.
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: true });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness
+            .github
+            .observe(GithubRunnerObservation::Registered { busy: false });
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Busy);
+    }
+
+    /// Without the runner's diagnostics nothing changes: a clean exit seen only
+    /// at `starting` is still a runner that exited before taking a job.
+    #[tokio::test]
+    async fn without_runner_diagnostics_an_early_exit_is_still_a_failure() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        harness.launch().await;
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert!(matches!(
+            harness.only_attempt().outcome(),
+            Some(AttemptOutcome::Failed {
+                reason: FailureReason::ProcessExitedUnexpectedly
+            })
+        ));
     }
 
     #[tokio::test]
