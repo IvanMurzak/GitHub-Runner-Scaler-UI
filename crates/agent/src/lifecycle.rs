@@ -7648,7 +7648,10 @@ mod tests {
         assert_eq!(cleaned.outcome(), Some(&AttemptOutcome::CompletedJob));
         assert_eq!(cleaned.state(), AttemptState::Cleaned);
         assert_eq!(cleaned.github_runner_id(), Some(73));
-        assert!(replacements.is_empty(), "a finished job needs no replacement");
+        assert!(
+            replacements.is_empty(),
+            "a finished job needs no replacement"
+        );
         let busy_seen = harness.events.events().into_iter().any(|event| {
             matches!(
                 event,

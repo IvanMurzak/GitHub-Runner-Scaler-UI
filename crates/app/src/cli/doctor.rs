@@ -414,7 +414,9 @@ pub trait HostActions {
     fn set_spotlight(&self, volume: &Path, enabled: bool) -> Result<(), String>;
     /// `pmset -a NAME VALUE`, for one of [`POWER_SETTINGS`].
     fn set_power_setting(&self, name: &str, _value: u32) -> Result<(), String> {
-        Err(format!("cannot set {name}: power settings exist only on macOS"))
+        Err(format!(
+            "cannot set {name}: power settings exist only on macOS"
+        ))
     }
 }
 
@@ -1416,7 +1418,10 @@ const MACOS_RUNNER_ROOT: &str = "/Users/Shared/rman.noindex";
 /// and the name is everything before it.
 fn power_settings_in(output: &str) -> BTreeMap<String, u32> {
     let mut settings = BTreeMap::new();
-    for line in output.lines().filter(|line| line.starts_with(char::is_whitespace)) {
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with(char::is_whitespace))
+    {
         let words: Vec<&str> = line.split_whitespace().collect();
         if let Some(at) = words.iter().position(|word| word.parse::<u32>().is_ok())
             && at > 0
@@ -1470,12 +1475,18 @@ fn probe_sleep(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     {
         return pass("sleep is disabled for the whole system");
     }
-    power_probe(facts, "sleep", 0, "the Mac does not sleep on its own", |minutes| {
-        format!(
-            "the Mac sleeps after {minutes} minute(s) nobody uses it, and a sleeping Mac freezes \
+    power_probe(
+        facts,
+        "sleep",
+        0,
+        "the Mac does not sleep on its own",
+        |minutes| {
+            format!(
+                "the Mac sleeps after {minutes} minute(s) nobody uses it, and a sleeping Mac freezes \
              the job it is running; GitHub fails a job whose runner stops answering"
-        )
-    })
+            )
+        },
+    )
 }
 
 fn apply_sleep(
@@ -1610,7 +1621,6 @@ fn probe_runner_root_location(setup: &HostSetup, _: &dyn HostFacts) -> Outcome {
         ))
     }
 }
-
 
 // -- macos.keychain_credential ------------------------------------------------
 
@@ -2603,7 +2613,9 @@ impl HostActions for SystemActions {
 
     fn set_power_setting(&self, name: &str, value: u32) -> Result<(), String> {
         if !POWER_SETTINGS.iter().any(|(known, _)| *known == name) {
-            return Err(format!("{name} is not a power setting `host prepare` changes"));
+            return Err(format!(
+                "{name} is not a power setting `host prepare` changes"
+            ));
         }
         let output = run_capture(
             Path::new("/usr/bin/pmset"),
@@ -4180,8 +4192,15 @@ mod tests {
         let report = evaluate(&setup, &facts);
         let off = finding(&report, id);
         assert_eq!(off.status, Status::Fail);
-        assert!(off.fix.is_none(), "automatic login is never changed for you");
-        assert!(off.detail.contains("waits for me to sign in"), "{}", off.detail);
+        assert!(
+            off.fix.is_none(),
+            "automatic login is never changed for you"
+        );
+        assert!(
+            off.detail.contains("waits for me to sign in"),
+            "{}",
+            off.detail
+        );
         assert!(
             off.remedy
                 .as_deref()
@@ -4226,7 +4245,11 @@ mod tests {
         let found = finding(&report, id);
         assert_eq!(found.status, Status::Fail);
         assert!(found.detail.contains("has a space"), "{}", found.detail);
-        assert!(found.detail.contains("inside /Users/me"), "{}", found.detail);
+        assert!(
+            found.detail.contains("inside /Users/me"),
+            "{}",
+            found.detail
+        );
         let remedy = found.remedy.as_deref().unwrap();
         assert!(remedy.contains(MACOS_RUNNER_ROOT), "{remedy}");
         assert!(!MACOS_RUNNER_ROOT.contains(' '));
@@ -4248,7 +4271,9 @@ mod tests {
         );
         setup.runner_roots = vec![root.clone()];
         let mut facts = Facts::default();
-        facts.mounts.insert(root, PathBuf::from("/System/Volumes/Data"));
+        facts
+            .mounts
+            .insert(root, PathBuf::from("/System/Volumes/Data"));
         facts.indexed = vec![PathBuf::from("/System/Volumes/Data")];
         let report = evaluate(&setup, &facts);
         let remedy = finding(&report, "macos.spotlight").remedy.clone().unwrap();

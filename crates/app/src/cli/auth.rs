@@ -618,9 +618,8 @@ pub fn login(
     // warning that they were signing in to the wrong half. Hence the flag, and
     // hence the line printed below whether or not it was passed.
     let recorded = context.recorded_start_mode(&store)?;
-    let start_mode = requested_mode.unwrap_or_else(|| {
-        assumed_start_mode(AssumptionFacts::of_this_host(context, recorded))
-    });
+    let start_mode = requested_mode
+        .unwrap_or_else(|| assumed_start_mode(AssumptionFacts::of_this_host(context, recorded)));
     let secrets = context.secret_store(start_mode)?;
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
     // The mode used is recorded, so that `repo add`, `auth status` and the
@@ -2139,16 +2138,26 @@ mod tests {
         // No service installed from this account's directories: the store's
         // own failure, as before.
         let alone = through_service(&locked_login_keychain(), || None).unwrap_err();
-        assert!(alone.message().contains("locked for this session"), "{alone:?}");
+        assert!(
+            alone.message().contains("locked for this session"),
+            "{alone:?}"
+        );
 
         // A service that could not answer either: both reasons.
         let neither = through_service(&locked_login_keychain(), || {
-            Some(Err("no running service took the request within 8 seconds".into()))
+            Some(Err(
+                "no running service took the request within 8 seconds".into()
+            ))
         })
         .unwrap_err();
-        assert!(neither.message().contains("locked for this session"), "{neither:?}");
         assert!(
-            neither.message().contains("the service was asked instead, and no running service"),
+            neither.message().contains("locked for this session"),
+            "{neither:?}"
+        );
+        assert!(
+            neither
+                .message()
+                .contains("the service was asked instead, and no running service"),
             "{neither:?}"
         );
         assert_eq!(neither.remedy(), Some("runner-manager service status"));
@@ -2196,7 +2205,10 @@ mod tests {
             let mut out = Vec::new();
             write_store_choice(&mut out, mode, false).unwrap();
             let line = String::from_utf8(out).unwrap();
-            assert!(line.contains(&format!("start mode {mode}, assumed")), "{line}");
+            assert!(
+                line.contains(&format!("start mode {mode}, assumed")),
+                "{line}"
+            );
             assert!(line.contains(flag), "{line}");
         }
     }
@@ -3236,10 +3248,9 @@ mod tests {
             finished: Duration::from_secs(5),
             poll: Duration::from_millis(20),
         };
-        let state = credential_state_or_ask(&context, &store, || {
-            Some(ask_service_at(&state_dir, wait))
-        })
-        .expect("the service's answer");
+        let state =
+            credential_state_or_ask(&context, &store, || Some(ask_service_at(&state_dir, wait)))
+                .expect("the service's answer");
         service.join().unwrap();
         assert!(
             matches!(

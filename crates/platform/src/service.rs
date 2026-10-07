@@ -4722,8 +4722,9 @@ pub struct UnattendedGap {
 /// The name of the account a registration runs as.
 fn service_account_name(account: &ServiceAccount) -> String {
     match account {
-        ServiceAccount::InvokingUser => crate::unattended_login::current_account()
-            .unwrap_or_else(|| "the operator".to_owned()),
+        ServiceAccount::InvokingUser => {
+            crate::unattended_login::current_account().unwrap_or_else(|| "the operator".to_owned())
+        }
         other => other.as_str().to_owned(),
     }
 }
@@ -10056,7 +10057,10 @@ logs = \"/d\"
 
         // Where nothing can be probed, a login registration still says so.
         let gap = unattended_gap(StartMode::Login, "ivan", None).expect("a gap");
-        assert!(gap.reason.contains("does not run until the operator signs in"));
+        assert!(
+            gap.reason
+                .contains("does not run until the operator signs in")
+        );
         assert_eq!(unattended_gap(StartMode::Boot, "root", None), None);
     }
 

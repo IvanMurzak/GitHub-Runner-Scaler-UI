@@ -1969,9 +1969,9 @@ const ERR_SEC_WR_PERM: i32 = -61;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_keychain_write_refusal(message: &str) -> bool {
     let needle = format!("returned {ERR_SEC_WR_PERM}");
-    message.match_indices(&needle).any(|(at, found)| {
-        !message[at + found.len()..].starts_with(|c: char| c.is_ascii_digit())
-    })
+    message
+        .match_indices(&needle)
+        .any(|(at, found)| !message[at + found.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// The System keychain's refusal of an ordinary account, explained.
