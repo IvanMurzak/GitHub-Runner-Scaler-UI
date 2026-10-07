@@ -61,35 +61,66 @@ pub enum Resume {
 }
 
 impl Resume {
+    /// Why the service does not come back by itself, as a clause. `None`
+    /// when it does.
+    #[must_use]
+    pub fn detail(&self, account: &str) -> Option<String> {
+        match self {
+            Self::Resumes => None,
+            Self::FileVaultOn => Some(
+                "FileVault is on, so after a restart the Mac waits at its unlock screen until \
+                 somebody types a password, and the service does not start until then"
+                    .to_owned(),
+            ),
+            Self::NoAutomaticLogin => Some(format!(
+                "automatic login is off, so after a restart this login-mode service waits for \
+                 {account} to sign in"
+            )),
+            Self::AutomaticLoginAsAnother(other) => Some(format!(
+                "automatic login signs in {other}, not {account}, so after a restart this \
+                 login-mode service waits for {account} to sign in"
+            )),
+            Self::Unknown(why) => Some(format!(
+                "whether this Mac signs {account} in after a restart could not be read: {why}"
+            )),
+        }
+    }
+
+    /// What an operator does about it, in System Settings. `None` when there
+    /// is nothing to do or nothing known.
+    #[must_use]
+    pub fn remedy(&self) -> Option<String> {
+        match self {
+            Self::Resumes | Self::Unknown(_) => None,
+            Self::FileVaultOn => Some(FILEVAULT_STEPS.to_owned()),
+            Self::NoAutomaticLogin => Some(format!(
+                "{AUTO_LOGIN_STEPS}; or install the service to start at boot (`sudo \
+                 runner-manager service install --start-at boot`)"
+            )),
+            Self::AutomaticLoginAsAnother(_) => Some(AUTO_LOGIN_STEPS.to_owned()),
+        }
+    }
+
     /// What `service status` says about it, in full sentences, with the steps
     /// that change it. `None` when the service resumes.
     #[must_use]
     pub fn explain(&self, account: &str) -> Option<String> {
-        const GAP: &str = "This host does not resume work after an unattended reboot";
-        match self {
-            Self::Resumes => None,
-            Self::FileVaultOn => Some(format!(
-                "{GAP}: FileVault is on, so after a restart the Mac waits at its unlock screen \
-                 until somebody types a password, and the service does not start until then. To \
-                 have it come back by itself: {FILEVAULT_STEPS}."
-            )),
-            Self::NoAutomaticLogin => Some(format!(
-                "{GAP}: automatic login is off, so after a restart this login-mode service waits \
-                 for {account} to sign in. To have it come back by itself: {AUTO_LOGIN_STEPS}; or \
-                 install the service to start at boot (`sudo runner-manager service install \
-                 --start-at boot`)."
-            )),
-            Self::AutomaticLoginAsAnother(other) => Some(format!(
-                "{GAP}: automatic login signs in {other}, not {account}, so after a restart this \
-                 login-mode service waits for {account} to sign in. To change it: \
-                 {AUTO_LOGIN_STEPS}."
-            )),
-            Self::Unknown(why) => Some(format!(
-                "Whether this host resumes work after an unattended reboot could not be read: \
-                 {why}."
-            )),
-        }
+        let detail = self.detail(account)?;
+        Some(match (self, self.remedy()) {
+            (Self::Unknown(_), _) | (_, None) => format!("{}.", capitalized(&detail)),
+            (_, Some(remedy)) => format!(
+                "This host does not resume work after an unattended reboot: {detail}. To have it \
+                 come back by itself: {remedy}."
+            ),
+        })
     }
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// Judges what was found for a service in `mode` running as `account`.

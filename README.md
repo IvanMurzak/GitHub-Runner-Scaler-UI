@@ -630,6 +630,12 @@ administrator rights:
 | `windows.pwsh` | Windows | info | none; install PowerShell 7 | - |
 | `macos.launchd_priority` | macOS | recommended | none; `runner-manager update` repairs the plist | - |
 | `macos.spotlight` | macOS | recommended | `mdutil -i off` for a runner root on its own volume | yes |
+| `macos.sleep` | macOS | recommended | `pmset -a sleep 0` (a sleeping Mac freezes the job it runs) | yes |
+| `macos.disk_sleep` | macOS | recommended | `pmset -a disksleep 0` | yes |
+| `macos.autorestart` | macOS | recommended | `pmset -a autorestart 1` (start again after a power failure) | yes |
+| `macos.wake_on_lan` | macOS | info | `pmset -a womp 1` | yes |
+| `macos.unattended_login` | macOS | recommended | none; prints the System Settings steps for automatic login or FileVault, which are never changed for you | - |
+| `macos.runner_root_location` | macOS | recommended | none; suggests `host set-runtime-root --path /Users/Shared/rman.noindex` for a root with a space or inside the service account's home | - |
 | `macos.keychain_credential` | macOS | required | none; prints the exact `auth login --start-at login` | - |
 | `host.runner_root_responsive` | all | required | none; a runner root that does not answer within 5 s (a hung external disk or network mount) | - |
 | `host.capacity` | all | recommended | none; suggests `host set-capacity N` from memory and cores | - |
@@ -656,6 +662,12 @@ By default every job runs in a disposable workspace under this machine's runner 
 that root is `%SystemDrive%\rman`, normally `C:\rman`, so build paths stay short. macOS and
 Linux keep using the platform runtime directory, exactly as before. `runner-manager host show`
 prints the effective path and whether it is `platform-default` or `configured`.
+
+On macOS that default is under `~/Library/Application Support`: its path has a space, which
+breaks job scripts that do not quote paths, and it sits inside the service account's home
+folder, and so does every job's `TMPDIR`. `host doctor` reports both
+(`macos.runner_root_location`). A folder with neither, which Spotlight also skips, is
+`runner-manager host set-runtime-root --path /Users/Shared/rman.noindex`.
 
 Put runners somewhere else, such as a faster disk:
 
