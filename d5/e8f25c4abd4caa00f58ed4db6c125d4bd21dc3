@@ -1,0 +1,51 @@
+crates/app/src/cli/cache.rs
+  s_468234d3364cc1::t_b8d7eebeeb00b8 312-313,318,347-359,361-370,372-378,380-417,419-437,439-444,452,454
+  s_468234d3364cc1::t_140f5519c9d019 924-1000,1004-1035
+  s_468234d3364cc1::t_7d50bac49d850c 316-317,319-324,326-344,346
+  s_468234d3364cc1::t_228bae5fb56fbb 447-449
+  s_167cfa87e5f4e0::t_3a0f6149f691f5 13,15,325,345,360,371,379,418,438,1001-1003
+README.md
+  s_468234d3364cc1::t_b6f39cb852a34e 470-472,477-483
+  s_468234d3364cc1::t_1e001290f7863d 172-177
+  s_468234d3364cc1::t_bdd36491c16138 807-810
+crates/agent/src/dependency_caches.rs
+  s_468234d3364cc1::t_6581ff00c009ae 172-183,187,192,194
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_a905cf4783b405 460-464
+  s_468234d3364cc1::t_68ea7b7d0a08e8 166-174
+  s_468234d3364cc1::t_232441b218a62c 596-601,604-605,607-610,612-628
+crates/app/src/cli/update.rs
+  s_468234d3364cc1::t_3c1ffb5b76641f 861-866
+  s_468234d3364cc1::t_e2c31aa4a481ca 875,896,1523,1531,1539-1555
+  s_468234d3364cc1::t_4754e2eb0eea84 674-677,836-860,867-874,876-895,1524-1530,1532-1538,1556-1561
+CHANGELOG.md
+  s_468234d3364cc1::t_53cc95a47a6c84 10-42
+crates/platform/src/dependency_cache.rs
+  s_468234d3364cc1::t_c33f7bf677e6e1 116-147,560-568,1217-1227
+crates/platform/src/dependency_cache/tests.rs
+  s_468234d3364cc1::t_b30df1d4ef454f 775-798
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d5e8f25c4abd4caa00f58ed4db6c125d4bd21dc3",
+  "prompts": {},
+  "sessions": {
+    "s_167cfa87e5f4e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a116ea-8c1b-7623-b5e2-473a1d23da59",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
