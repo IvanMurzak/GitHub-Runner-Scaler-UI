@@ -398,11 +398,25 @@ fn registration_labels(labels: &runner_manager_domain::policy::RoutingLabels) ->
 // Building it
 // ---------------------------------------------------------------------------
 
-/// Reads local state and assembles the snapshot.
+/// Reads local state and assembles the snapshot, `host doctor` included.
 ///
 /// # Errors
 /// [`Failure::LocalState`] and [`Failure::SecretStore`].
 pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
+    snapshot_with(context, true)
+}
+
+/// The same snapshot with the doctor left out (`doctor.checked` is 0), for a
+/// caller that refreshes it on its own cadence: the TUI polls every minute
+/// and must not wait on the doctor's probes for its first frame.
+///
+/// # Errors
+/// As [`snapshot`].
+pub fn snapshot_without_doctor(context: &Context) -> Result<StatusDocument, CliError> {
+    snapshot_with(context, false)
+}
+
+fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument, CliError> {
     let store = context.store()?;
     let host = local_host(&store)?;
     let attempts = store.attempts().map_err(|source| {
@@ -457,7 +471,11 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         .iter()
         .map(|policy| workspace::repository_workspace(&store, &runner_root, policy))
         .collect::<Result<Vec<_>, CliError>>()?;
-    let doctor = super::doctor::status_summary(context, host.as_ref(), &policies, &runner_root);
+    let doctor = if with_doctor {
+        super::doctor::status_summary(context, host.as_ref(), &policies, &runner_root)
+    } else {
+        super::doctor::pending_summary(context)
+    };
 
     Ok(StatusDocument {
         schema_version: SCHEMA_VERSION,

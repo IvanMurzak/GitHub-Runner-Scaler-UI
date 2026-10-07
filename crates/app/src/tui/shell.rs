@@ -243,6 +243,87 @@ pub struct AgentEvent {
 struct LocalAgentEventSource {
     control: Arc<(Mutex<SourceState>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
+    /// The host doctor's latest verdict, kept by its own thread so a frame
+    /// never waits on its probes. `None` for an injected producer.
+    doctor: Option<Arc<DoctorCache>>,
+}
+
+/// `host doctor`'s verdict for the TUI, refreshed off the snapshot path: once
+/// at start, then every [`crate::cli::doctor::DAEMON_RECHECK`], and at once
+/// after the one-key fix ran.
+#[derive(Debug, Default)]
+struct DoctorCache {
+    state: Mutex<DoctorCacheState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DoctorCacheState {
+    summary: Option<crate::cli::doctor::DoctorSummary>,
+    stale: bool,
+    stopped: bool,
+}
+
+impl DoctorCache {
+    fn current(&self) -> Option<crate::cli::doctor::DoctorSummary> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.summary.clone())
+    }
+
+    fn mark(&self, apply: impl FnOnce(&mut DoctorCacheState)) {
+        if let Ok(mut state) = self.state.lock() {
+            apply(&mut state);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Evaluates now and then whenever marked stale or every recheck, asking
+    /// the snapshot source to publish each new verdict. Ends when the source
+    /// is gone.
+    fn run(
+        &self,
+        context: &crate::cli::Context,
+        control: &std::sync::Weak<(Mutex<SourceState>, Condvar)>,
+    ) {
+        loop {
+            let summary = crate::cli::doctor::current_summary(context).ok();
+            if let Ok(mut state) = self.state.lock() {
+                state.summary = summary;
+                state.stale = false;
+            }
+            let Some(control) = control.upgrade() else {
+                return;
+            };
+            {
+                let (state_lock, wake) = &*control;
+                let Ok(mut state) = state_lock.lock() else {
+                    return;
+                };
+                if state.stopped {
+                    return;
+                }
+                state.refresh_pending = true;
+                wake.notify_one();
+            }
+            drop(control);
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            let Ok((state, _)) =
+                self.wake
+                    .wait_timeout_while(state, crate::cli::doctor::DAEMON_RECHECK, |state| {
+                        !state.stale && !state.stopped
+                    })
+            else {
+                return;
+            };
+            if state.stopped {
+                return;
+            }
+        }
+    }
 }
 
 struct SourceState {
@@ -257,7 +338,24 @@ impl LocalAgentEventSource {
         context: Arc<crate::cli::Context>,
         poll_rate: Duration,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
-        Self::start_with(move |cancel| local_agent_event(&context, cancel), poll_rate)
+        let doctor = Arc::new(DoctorCache::default());
+        let (mut source, receiver) = Self::start_with(
+            {
+                let context = Arc::clone(&context);
+                let doctor = Arc::clone(&doctor);
+                move |cancel| local_agent_event(&context, &doctor, cancel)
+            },
+            poll_rate,
+        )?;
+        let control = Arc::downgrade(&source.control);
+        let cache = Arc::clone(&doctor);
+        // Detached: it may be mid-probe when the TUI exits, and nothing it
+        // holds needs an orderly shutdown.
+        thread::Builder::new()
+            .name("runner-manager-tui-doctor".to_owned())
+            .spawn(move || cache.run(&context, &control))?;
+        source.doctor = Some(doctor);
+        Ok((source, receiver))
     }
 
     fn start_with(
@@ -332,6 +430,7 @@ impl LocalAgentEventSource {
             Self {
                 control,
                 worker: Some(worker),
+                doctor: None,
             },
             receiver,
         ))
@@ -354,6 +453,9 @@ impl LocalAgentEventSource {
 
 impl Drop for LocalAgentEventSource {
     fn drop(&mut self) {
+        if let Some(doctor) = &self.doctor {
+            doctor.mark(|state| state.stopped = true);
+        }
         let (state_lock, wake) = &*self.control;
         {
             let mut state = state_lock.lock().unwrap();
@@ -372,11 +474,27 @@ impl Drop for LocalAgentEventSource {
 pub trait RefreshRequester {
     fn request_refresh(&self) -> io::Result<()>;
     fn refresh_in_progress(&self) -> bool;
+    /// Something changed the host's settings (the one-key fix): re-run the
+    /// host doctor as well as the snapshot.
+    fn refresh_host_doctor(&self) -> io::Result<()> {
+        self.request_refresh()
+    }
 }
 
 impl RefreshRequester for LocalAgentEventSource {
     fn request_refresh(&self) -> io::Result<()> {
         LocalAgentEventSource::request_refresh(self)
+    }
+
+    fn refresh_host_doctor(&self) -> io::Result<()> {
+        match &self.doctor {
+            // Its thread publishes a fresh snapshot once the doctor is done.
+            Some(doctor) => {
+                doctor.mark(|state| state.stale = true);
+                Ok(())
+            }
+            None => self.request_refresh(),
+        }
     }
 
     fn refresh_in_progress(&self) -> bool {
@@ -398,7 +516,11 @@ impl RefreshRequester for NoopRefreshRequester {
     }
 }
 
-fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> AgentEvent {
+fn local_agent_event(
+    context: &crate::cli::Context,
+    doctor: &DoctorCache,
+    cancel: &CancelToken,
+) -> AgentEvent {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -416,12 +538,19 @@ fn local_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> Age
             };
         }
     };
-    runtime.block_on(production_agent_event(context, cancel))
+    runtime.block_on(production_agent_event(context, doctor, cancel))
 }
 
-async fn production_agent_event(context: &crate::cli::Context, cancel: &CancelToken) -> AgentEvent {
-    match crate::cli::status::snapshot(context) {
-        Ok(local) => {
+async fn production_agent_event(
+    context: &crate::cli::Context,
+    doctor: &DoctorCache,
+    cancel: &CancelToken,
+) -> AgentEvent {
+    match crate::cli::status::snapshot_without_doctor(context) {
+        Ok(mut local) => {
+            if let Some(summary) = doctor.current() {
+                local.doctor = summary;
+            }
             let privacy_access_denied =
                 match runner_manager_platform::service::runner_root_refusals(context.paths()) {
                     Ok(refusals) => refusals
@@ -3065,7 +3194,7 @@ where
                         None => "host prepare needs the local application context".into(),
                     };
                     state.host_prepare = HostPrepareUi::Done(message);
-                    refresh.request_refresh()?;
+                    refresh.refresh_host_doctor()?;
                 }
             }
         }
@@ -3643,6 +3772,37 @@ mod tests {
             self.0.lock().unwrap().push("mouse:off");
             Ok(())
         }
+    }
+
+    /// The host doctor runs on its own thread: the snapshot source publishes
+    /// without waiting for it, and the verdict arrives in the cache by itself.
+    #[tokio::test]
+    async fn the_tui_doctor_runs_beside_the_snapshot_source() {
+        let data_root = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        let context = Arc::new(
+            crate::cli::Context::resolve(Some(data_root.path()), &mut warnings)
+                .expect("production TUI context"),
+        );
+        let (source, mut events) = LocalAgentEventSource::start(context, Duration::from_secs(3600))
+            .expect("production local-agent source");
+        tokio::time::timeout(Duration::from_secs(60), events.recv())
+            .await
+            .expect("a snapshot without waiting for an hourly poll")
+            .expect("source event");
+        let doctor = source
+            .doctor
+            .as_ref()
+            .expect("the production source keeps a doctor");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while doctor.current().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the doctor thread never filled the cache"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(doctor.current().is_some_and(|summary| summary.checked > 0));
     }
 
     #[tokio::test]

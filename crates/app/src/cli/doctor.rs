@@ -3053,13 +3053,34 @@ pub fn status_summary(
     DoctorSummary::of(Some(&evaluate(&setup, &SystemFacts)), context)
 }
 
+/// A summary with no checks run yet, still carrying the daemon's recorded
+/// refusal.
+#[must_use]
+pub fn pending_summary(context: &Context) -> DoctorSummary {
+    DoctorSummary::of(None, context)
+}
+
+/// The doctor summary read fresh from this host's configuration, for a
+/// caller that has nothing to hand it: `service status`, and the TUI's own
+/// doctor thread. `Err` when the configuration could not be read.
+///
+/// # Errors
+/// The local-state failure of reading the configuration.
+pub fn current_summary(context: &Context) -> Result<DoctorSummary, CliError> {
+    let setup = setup(context, Perspective::Operator, None)?;
+    Ok(DoctorSummary::of(
+        Some(&evaluate(&setup, &SystemFacts)),
+        context,
+    ))
+}
+
 /// The doctor summary for `service status`.
 #[must_use]
 pub fn service_status_line(context: &Context) -> String {
-    match setup(context, Perspective::Operator, None) {
-        Ok(setup) => DoctorSummary::of(Some(&evaluate(&setup, &SystemFacts)), context).line(),
-        Err(error) => format!("not checked ({error})"),
-    }
+    current_summary(context).map_or_else(
+        |error| format!("not checked ({error})"),
+        |summary| summary.line(),
+    )
 }
 
 /// Run by `service install` before it registers anything: reports the
