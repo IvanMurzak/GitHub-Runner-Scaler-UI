@@ -7,6 +7,65 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.36
+
+### Fixes
+
+- `auth login` on a Mac with no service installed, run as an ordinary account, signs in for a
+  login-mode service. It used to assume `boot`, reached for the System keychain only root may
+  write, and failed after the device code with `SecKeychainItemCreateFromContent returned -61`.
+  The assumed mode is printed with the flag that picks the other one, and recorded, so `repo
+  add`, `auth status` and the service look in the same store. A `-61` from the System keychain
+  now says that only root may write it and names `sudo runner-manager auth login --start-at
+  boot` and `runner-manager auth login --start-at login`.
+- A short job is recorded `completed_job`. A job of a few seconds starts and ends between two
+  polls, so GitHub was never seen reporting the runner busy, and its clean exit was recorded
+  `failed / process_exited_unexpectedly`, with a replacement runner started for it (3 of 5
+  attempts on a new Mac). The runner's own diagnostics now decide: a job worker's log in its
+  `_diag` directory means it ran a job. The same evidence settles two related errors. A runner
+  GitHub showed assigned that never started the job, and exited 0, is recorded
+  `exited_idle_without_work` rather than `completed_job`, and a live one goes back to `idle`, so
+  the idle timeout holds it again. A runner that finished its job before GitHub took it off the
+  list is recorded `completed_job` rather than `orphaned`.
+- `service status` no longer tells a Mac that signs its runner account in automatically that it
+  will not resume after an unattended reboot. It reads automatic login and FileVault: it says
+  nothing for a host that comes back by itself, and names the System Settings steps for one that
+  does not. The dashboard's "starts only after this user signs in" warning follows it.
+- On a login-mode Mac reached over SSH, `repo add`, `org add` and `auth status` work. The SSH
+  session cannot unlock the login keychain, so they failed with its error while the service, in
+  the desktop session, used the credential every poll. They now ask the running service what the
+  credential reaches; the answer crosses through the state directory and never holds the
+  credential. `status` says the credential is in use by the service when the service reached
+  GitHub in the last 15 minutes, instead of calling it unreadable.
+- The Spotlight check's remedy names `/Users/Shared/rman.noindex`. It used to suggest
+  `…/Application Support/…/runtime.noindex`, a path with a space that `host set-runtime-root`
+  also refused.
+
+### Features
+
+- `host doctor` checks a Mac's power settings, and `host prepare` fixes them with one
+  administrator prompt (`pmset -a …`), recording the values it replaced so `host prepare
+  --revert` puts them back: `macos.sleep` (`sleep 0`), `macos.disk_sleep` (`disksleep 0`) and
+  `macos.autorestart` (`autorestart 1`) are recommended, `macos.wake_on_lan` (`womp 1`) is
+  informational.
+- `macos.unattended_login` reports whether the service comes back after an unattended restart:
+  automatic login as the service's account for a login-mode service, and FileVault off for
+  either mode. It prints the System Settings steps and never changes automatic login or
+  FileVault itself.
+- `macos.runner_root_location` reports a runner root with a space in its path, or inside the
+  home folder of the account the service runs as, where every job's `TMPDIR` is too (a test
+  that builds a stand-in home folder from `TMPDIR` then nests it inside the real one). The
+  default root is unchanged; the remedy is `host set-runtime-root --path
+  /Users/Shared/rman.noindex`.
+
+### Notes
+
+- Job steps see SIGPIPE ignored, so `yes | head` exits 1 rather than 141. That comes from the
+  GitHub Actions runner, not from runner-manager: .NET ignores SIGPIPE in `Runner.Listener` and
+  `Runner.Worker` and its process start keeps an ignored disposition for every step, on classic
+  runners too (actions/runner#2684). runner-manager starts the listener with the default
+  disposition, and a test now pins that.
+
 ## 0.4.35
 
 ### Fixes
