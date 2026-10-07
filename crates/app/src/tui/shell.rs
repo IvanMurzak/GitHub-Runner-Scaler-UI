@@ -5848,18 +5848,30 @@ fn host_doctor_findings_and_the_daemons_refusal_lead_the_readiness() {
         degraded.summary
     );
 
+    // A failing required check blocks on its own, without the daemon's record.
     let ready = readiness_from_facts(Ok(ready_service()), true, &[], "12:00:00Z".into());
     let blocked = with_host_doctor(
         ready,
-        &doctor_summary(&[("host.required_tools", Severity::Required, false)], true),
+        &doctor_summary(&[("host.required_tools", Severity::Required, false)], false),
         "12:00:00Z".into(),
     );
     assert_eq!(blocked.state, OperationalReadiness::Blocked);
+    assert_eq!(
+        blocked.activity[0].outcome,
+        screens::ActivityOutcome::Failed
+    );
+
+    // And so does the daemon's refusal, on its own.
+    let ready = readiness_from_facts(Ok(ready_service()), true, &[], "12:00:00Z".into());
+    let refused = with_host_doctor(ready, &doctor_summary(&[], true), "12:00:00Z".into());
+    assert_eq!(refused.state, OperationalReadiness::Blocked);
+    assert_eq!(refused.activity.len(), 1);
+    assert_eq!(refused.activity[0].id, "readiness:host:unfit");
     assert!(
-        blocked
-            .activity
-            .iter()
-            .any(|row| row.id == "readiness:host:unfit")
+        refused.activity[0]
+            .summary
+            .contains("windows.symlink_privilege"),
+        "{refused:?}"
     );
     let tools = blocked
         .activity
