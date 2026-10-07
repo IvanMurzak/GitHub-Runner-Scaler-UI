@@ -262,6 +262,11 @@ struct DoctorCacheState {
     summary: Option<crate::cli::doctor::DoctorSummary>,
     stale: bool,
     stopped: bool,
+    /// Set once the first status snapshot has read the database. The doctor
+    /// waits for it: on a first start both would otherwise create and migrate
+    /// the same new SQLite file at once, and one of them fails with
+    /// `database is locked` (measured: 6 of 8 runs of the capture-seam test).
+    snapshot_taken: bool,
 }
 
 impl DoctorCache {
@@ -287,6 +292,20 @@ impl DoctorCache {
         context: &crate::cli::Context,
         control: &std::sync::Weak<(Mutex<SourceState>, Condvar)>,
     ) {
+        {
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            let Ok(state) = self
+                .wake
+                .wait_while(state, |state| !state.snapshot_taken && !state.stopped)
+            else {
+                return;
+            };
+            if state.stopped {
+                return;
+            }
+        }
         loop {
             // The database can be busy for a moment (the snapshot reads it
             // too), so a read failure is retried before it is shown as an
@@ -557,7 +576,9 @@ async fn production_agent_event(
     doctor: &DoctorCache,
     cancel: &CancelToken,
 ) -> AgentEvent {
-    match crate::cli::status::snapshot_without_doctor(context) {
+    let snapshot = crate::cli::status::snapshot_without_doctor(context);
+    doctor.mark(|state| state.snapshot_taken = true);
+    match snapshot {
         Ok(mut local) => {
             if let Some(summary) = doctor.current() {
                 local.doctor = summary;
@@ -3864,12 +3885,7 @@ mod tests {
                     1,
                 ))))
                 .unwrap();
-            // `select!` picks among ready sources at random and draws a frame
-            // after each, so `q` must come late enough that the already-queued
-            // agent event is taken first even on a busy machine. Five
-            // milliseconds was not: under a parallel test run `q` won and the
-            // loop exited still showing Loading.
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
             input_sender
                 .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::Char('q')))))
                 .unwrap();
