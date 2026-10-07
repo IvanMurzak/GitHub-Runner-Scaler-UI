@@ -4273,6 +4273,92 @@ mod tests {
         );
     }
 
+    fn rooted_context(root: &Path) -> Context {
+        let endpoints =
+            runner_manager_github::Endpoints::for_test_server("http://127.0.0.1:9").unwrap();
+        Context::rooted_against(root, endpoints).unwrap()
+    }
+
+    /// The whole prepare path against fakes: nothing is applied without a yes
+    /// and with nobody to ask, and with one the batch goes to one elevated
+    /// run and every change lands in the journal with what it replaced.
+    #[test]
+    fn prepare_needs_a_yes_then_elevates_once_and_journals_what_it_changed() {
+        let root = tempfile::tempdir().unwrap();
+        let context = rooted_context(root.path());
+        let setup = windows_setup();
+        let facts = Facts {
+            exclusions: Some(Vec::new()),
+            ..Facts::default()
+        };
+        let actions = Actions::default();
+        let elevator = FakeElevator {
+            facts: &facts,
+            actions: &actions,
+            refuse: false,
+            requests: RefCell::default(),
+        };
+        let run = |consent: Consent, out: &mut Vec<u8>| {
+            prepare(
+                PrepareRun {
+                    context: &context,
+                    setup: setup.clone(),
+                    facts: &facts,
+                    actions: &actions,
+                    elevator: &elevator,
+                    prompt: &mut NoPrompt,
+                    consent,
+                },
+                &[],
+                out,
+            )
+        };
+
+        let refused = run(Consent::default(), &mut Vec::new()).unwrap_err();
+        assert_eq!(refused.class(), Failure::InvalidArgument);
+        assert!(
+            actions.log.borrow().is_empty(),
+            "nothing may change without a yes"
+        );
+        assert!(elevator.requests.borrow().is_empty());
+        assert!(!journal_path(&context).exists());
+
+        let mut out = Vec::new();
+        let outcome = run(
+            Consent {
+                assume_yes: true,
+                ..Consent::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(elevator.requests.borrow().len(), 1, "{text}");
+        assert!(
+            outcome
+                .held
+                .iter()
+                .any(|(id, _)| *id == "windows.defender_exclusion"),
+            "--yes alone never applies a security trade-off: {text}"
+        );
+        assert!(
+            !actions
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("defender"))
+        );
+        let journal = read_journal(&journal_path(&context)).unwrap();
+        assert_eq!(
+            journal.entries["windows.long_paths"].changes,
+            [Change::RegistryDword {
+                value: RegValue::LongPathsEnabled,
+                previous: None,
+                applied: 1
+            }]
+        );
+    }
+
     #[test]
     fn the_summary_line_counts_by_severity() {
         let failing = |id: &str, severity| FindingSummary {
