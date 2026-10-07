@@ -1,0 +1,23 @@
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_473d55efdba180 612-614
+  s_468234d3364cc1::t_56f1faa68b95a7 607,611,615-616
+crates/agent/src/dependency_caches.rs
+  s_468234d3364cc1::t_325980caba349c 256-289
+  s_468234d3364cc1::t_778133f9e9b310 175-189,255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3f32e1d7980fe77e06e6aee5b491513f3ef3d38e",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
