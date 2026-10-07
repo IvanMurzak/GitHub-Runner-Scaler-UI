@@ -12,6 +12,7 @@ crates/app/tests/cli_command_surface.rs
   s_468234d3364cc1::t_9704ebdcd1ce04 280,295-299
 CHANGELOG.md
   s_468234d3364cc1::t_4bebbc4993190c 11-27,31-36
+  s_468234d3364cc1::t_5ab24ac494c812 28-30
 crates/app/src/cli/auth.rs
   s_468234d3364cc1::t_dbaaa45be675e9 1034-1060
   s_468234d3364cc1::t_c623c950d8b08e 1084
@@ -31,6 +32,9 @@ crates/app/src/cli/update_force.rs
   s_468234d3364cc1::t_81541036e0bbb8 131,287
 crates/platform/src/service.rs
   s_468234d3364cc1::t_6970dabf23b428 158-167,3244-3376,4546,4556-4557,5115-5139,8588-8663
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_846d5536c022fa 1291-1294
+  s_468234d3364cc1::t_bb8044dde0f2c5 1298-1299
 ---
 {
   "schema_version": "authorship/3.0.0",
