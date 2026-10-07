@@ -87,6 +87,10 @@ async fn run(
     windows_service_host: bool,
 ) -> Result<(), CliError> {
     loop {
+        #[cfg(target_os = "macos")]
+        if converge_launchd_definition(context, out, service_shutdown.clone()).await? {
+            return Ok(());
+        }
         match run_generation(context, out, service_shutdown.clone(), windows_service_host).await? {
             DaemonOutcome::Stopped => return Ok(()),
             DaemonOutcome::Reload => {}
@@ -734,6 +738,128 @@ fn stop_for_upgrade(
         ),
         "runner-manager service status",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// A launchd plist written by an older build
+// ---------------------------------------------------------------------------
+
+/// How long the daemon waits for launchd to stop it after asking for a reload.
+/// The helper boots the job out about a second after it starts.
+#[cfg(target_os = "macos")]
+const LAUNCHD_RELOAD_GRACE: Duration = Duration::from_secs(90);
+
+/// Puts the current plist in place of one an older build wrote with the wrong
+/// `ProcessType`, and has launchd load the job again. Returns `true` when this
+/// daemon has stopped for that.
+///
+/// # Why the daemon does it
+///
+/// `runner-manager update` replaces the binary and nothing else: the old daemon
+/// drains, swaps its private copy and exits, and launchd restarts the new
+/// binary from the job it already holds, old `ProcessType` included. So the
+/// first daemon of a fixed version is the earliest code that can repair the
+/// plist, and straight after an upgrade drain it holds no runner, which is the
+/// one moment a reload interrupts nothing. With a runner held it defers to a
+/// later generation rather than stop under a job.
+///
+/// Only the launchd job itself does this: `XPC_SERVICE_NAME` is the job's
+/// label, which launchd sets, and the parent is launchd. A runner the daemon
+/// started inherits the variable but not the parent, so a `daemon run` inside a
+/// job never reloads the service. Every failure leaves the loaded job as it
+/// was and is logged; none stops the daemon.
+#[cfg(target_os = "macos")]
+async fn converge_launchd_definition(
+    context: &Context,
+    out: &mut dyn Write,
+    service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
+) -> Result<bool, CliError> {
+    let operations = super::service::operations(context);
+    let label = super::service::identity().launchd_label();
+    let launchd_job = std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == label)
+        && std::os::unix::process::parent_id() == 1;
+    if !launchd_job {
+        return Ok(false);
+    }
+    let drift = match operations.definition_drift() {
+        Ok(drift) => drift.filter(|drift| {
+            drift.manager == runner_manager_platform::service::DefinitionKind::LaunchdPlist
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "cannot compare the installed launchd plist");
+            return Ok(false);
+        }
+    };
+    let Some(drift) = drift else {
+        // The file can be current while the loaded job is not: a rewrite whose
+        // reload failed, or a hand edit nobody reloaded. Reported, never acted
+        // on: a reload that did not help would repeat on every start.
+        // `kickstart` would not help: it restarts from the job launchd holds.
+        if runner_manager_platform::process::runs_at_background_priority()
+            && let Ok(Some(record)) = InstallRecord::read(context.paths())
+            && let Some(plist) = record.definition_path
+        {
+            let (sudo, domain) = match record.start_mode {
+                StartMode::Boot => ("sudo ", "system".to_string()),
+                StartMode::Login => ("", "gui/$(id -u)".to_string()),
+            };
+            tracing::warn!(
+                reason = "launchd_job_outdated",
+                "launchd runs this daemon at background priority although its plist is current, \
+                 so the plist was never reloaded and every runner is throttled; reload it while no \
+                 job is running: {sudo}launchctl bootout {domain}/{label} && {sudo}launchctl \
+                 bootstrap {domain} '{}'",
+                plist.display()
+            );
+        }
+        return Ok(false);
+    };
+    let active = match context
+        .store()
+        .and_then(|store| store.attempts().map_err(local_store_failure))
+    {
+        Ok(attempts) => active_count(&attempts),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot count this host's runners, so the outdated launchd plist is left for now"
+            );
+            return Ok(false);
+        }
+    };
+    if active > 0 {
+        tracing::warn!(
+            path = %drift.path.display(),
+            active_runners = active,
+            reason = "launchd_plist_outdated",
+            "the launchd plist throttles every runner; it is rewritten when the daemon next starts with no runner, or restarts with none after a policy change"
+        );
+        return Ok(false);
+    }
+    if let Err(error) = operations.reload_launchd_definition(&drift) {
+        tracing::warn!(%error, "the outdated launchd plist could not be replaced");
+        return Ok(false);
+    }
+    tracing::info!(
+        path = %drift.path.display(),
+        process_type = runner_manager_platform::service::LAUNCHD_PROCESS_TYPE,
+        "rewrote the launchd plist written by {}; launchd is loading the job again",
+        drift.installed_by_version
+    );
+    tokio::select! {
+        signal = wait_for_shutdown(service_shutdown) => {
+            signal.map_err(signal_failure)?;
+            writeln!(out, "daemon stopped so launchd can load the rewritten plist; no runner was held")
+                .map_err(write_failed("the daemon state"))?;
+            Ok(true)
+        }
+        () = tokio::time::sleep(LAUNCHD_RELOAD_GRACE) => {
+            tracing::warn!(
+                "launchd did not reload the job after the plist was rewritten; continuing under the old ProcessType"
+            );
+            Ok(false)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

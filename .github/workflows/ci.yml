@@ -194,6 +194,14 @@ jobs:
           USERPROFILE: ${{ runner.temp }}/install-action-home
 
       - name: cargo nextest run --workspace
+        env:
+          # Lets the macOS leg load short-lived launch agents into the runner's
+          # GUI session: a runner's priority under the plist the product
+          # installs, and the plist rewrite plus detached reload an update
+          # performs (`service::launchd_fixture`). Without it those tests skip
+          # themselves; `privileged_tests_are_wired_into_ci.rs` asserts this
+          # stays set.
+          RUNNER_MANAGER_LAUNCHD_ACCEPTANCE: ${{ runner.os == 'macOS' && '1' || '' }}
         run: cargo nextest run --workspace
 
       - name: cargo test --doc

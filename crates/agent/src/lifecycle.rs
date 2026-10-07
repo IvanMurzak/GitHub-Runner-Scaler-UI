@@ -108,8 +108,8 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// The environment is the daemon's plus [`runner_env::platform_defaults`] and
 /// then the host's `runner.env`, which wins over a default of the same name.
 /// The per-attempt temporary directory goes last and `runner.env` cannot name
-/// it. On macOS the runner also leaves the daemon's background scheduling
-/// ([`SpawnSpec::normal_scheduling`]).
+/// it. On macOS a runner that still starts throttled is reported
+/// ([`SpawnSpec::expect_normal_scheduling`]).
 fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
@@ -130,7 +130,7 @@ fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) 
     let mut spec = SpawnSpec::new(program)
         .arg("run")
         .working_dir(runtime)
-        .normal_scheduling();
+        .expect_normal_scheduling();
     for (name, value) in runner_env::runner_environment(defaults, host_env) {
         spec = spec.env(name, value);
     }
@@ -8406,7 +8406,7 @@ mod tests {
         let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), &runtime, &host_env);
         let env = |name: &str| spec.configured_env(name).map(PathBuf::from);
 
-        assert!(spec.uses_normal_scheduling());
+        assert!(spec.expects_normal_scheduling());
         assert_eq!(
             env("ELECTRON_CACHE"),
             Some(PathBuf::from("/cache/electron"))

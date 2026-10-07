@@ -532,29 +532,25 @@ impl SpawnSpec {
         self
     }
 
-    /// Starts the child at normal scheduling priority even when this process
-    /// runs throttled.
+    /// Declares that the child must run at normal scheduling priority, and
+    /// has the launch say so when it does not.
     ///
-    /// On macOS a launchd agent declared `ProcessType = Background` runs
-    /// "darwinbg": priority 4, efficiency cores only, throttled I/O. That is
-    /// right for the daemon, which mostly waits, and wrong for the runners it
-    /// starts, which inherit it and then run every build step 4 to 20 times
-    /// slower than a classic runner does. With this set, the child clears the
-    /// inherited background state for itself (`setpriority(PRIO_DARWIN_PROCESS,
-    /// 0, 0)`) between `fork` and `exec`, so the daemon stays in the background
-    /// and only the runner and its descendants leave it.
+    /// On macOS the parent reads the child's base priority back after the
+    /// spawn and logs a warning when it is at the background ceiling. A
+    /// throttled runner still runs its job correctly, only 4 to 20 times
+    /// slower, so this reports rather than refuses.
     ///
-    /// Best effort, on purpose. A throttled runner still runs its job
-    /// correctly; a runner that fails to start runs nothing. So a failed call
-    /// does not abort the launch: the parent reads the child's priority back
-    /// after the spawn and logs a warning when it is still at the background
-    /// ceiling, which is the one report a post-`fork` hook cannot make itself.
-    /// Leaving the background state needs no privilege for one's own process,
-    /// so that warning is not expected to fire.
+    /// Nothing here changes the child's priority. Under launchd the priority
+    /// comes from the job's `ProcessType`, which every descendant inherits and
+    /// none can leave (`crate::service::LAUNCHD_PROCESS_TYPE` has the
+    /// measurements), so the fix belongs in the plist. 0.4.31 cleared
+    /// `PRIO_DARWIN_PROCESS` between `fork` and `exec` instead; the call
+    /// succeeded and the runner stayed at 4, and this warning is what showed
+    /// it.
     ///
-    /// No effect on other platforms, which have no such inherited state.
+    /// No effect on other platforms.
     #[must_use]
-    pub fn normal_scheduling(mut self) -> Self {
+    pub fn expect_normal_scheduling(mut self) -> Self {
         self.normal_scheduling = true;
         self
     }
@@ -581,10 +577,10 @@ impl SpawnSpec {
             .map(|(_, value)| value.as_os_str())
     }
 
-    /// Whether [`Self::normal_scheduling`] was asked for.
+    /// Whether [`Self::expect_normal_scheduling`] was asked for.
     #[doc(hidden)]
     #[must_use]
-    pub const fn uses_normal_scheduling(&self) -> bool {
+    pub const fn expects_normal_scheduling(&self) -> bool {
         self.normal_scheduling
     }
 
@@ -627,10 +623,6 @@ impl SpawnSpec {
             OutputMode::Capture => (Stdio::piped(), Stdio::piped()),
         };
         command.stdout(stdout).stderr(stderr);
-        #[cfg(target_os = "macos")]
-        if self.normal_scheduling {
-            sys::clear_inherited_background(&mut command);
-        }
 
         let child = command.spawn().map_err(|source| ProcessError::Spawn {
             program: self.program.clone(),
@@ -963,6 +955,14 @@ pub struct PermissionsSummary {
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> std::io::Result<String> {
     sys::current_user_sid()
+}
+
+/// Whether this process runs at the background priority ceiling, by the same
+/// reading the post-spawn runner check uses.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn runs_at_background_priority() -> bool {
+    sys::runs_throttled(std::process::id())
 }
 
 pub fn permissions_summary(path: &Path) -> Result<PermissionsSummary, HandoffError> {
@@ -1842,53 +1842,61 @@ mod sys {
     #[cfg(target_os = "macos")]
     pub(super) const BACKGROUND_PRIORITY_CEILING: i32 = 4;
 
-    /// Makes the child leave the background state it inherited from this
-    /// process before it executes the program.
+    /// The highest base scheduling priority among the process's threads: the
+    /// number `ps -o pri` shows.
     ///
-    /// The hook runs after `fork`, in a copy of a multi-threaded process, so it
-    /// must be async-signal-safe: one system call, no allocation, no lock. Its
-    /// result is deliberately ignored; [`super::SpawnSpec::normal_scheduling`]
-    /// says why a failure must not abort the launch and how it is reported.
-    #[cfg(target_os = "macos")]
-    pub(super) fn clear_inherited_background(command: &mut std::process::Command) {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the closure makes one system call on the calling process
-        // (`who == 0`) and touches no memory, allocator or lock, so it is safe
-        // to run between `fork` and `exec`.
-        unsafe {
-            command.pre_exec(|| {
-                let _ = libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, 0);
-                Ok(())
-            });
-        }
-    }
-
-    /// The task's base scheduling priority: the number `ps -o pri` shows.
-    ///
-    /// The effective answer, which is the one that has to be asked.
-    /// `getpriority(PRIO_DARWIN_PROCESS, pid)` looks like the obvious query and
-    /// is not: asked about another process it reads only what was requested
-    /// for it from outside, and for a launchd `Background` agent running at
-    /// priority 4 it answers 0, "not background" (measured on macOS 26).
+    /// The threads, because that is where the throttle is. Under a launchd
+    /// `Background` job a child's task priority (`proc_taskinfo::pti_priority`)
+    /// reads 31 while every one of its threads has base priority 4, and `ps`
+    /// shows 4 (measured on macOS 27); only the job itself reads 4 there. A
+    /// check of the task priority therefore passes for exactly the runners it
+    /// exists to catch. `getpriority(PRIO_DARWIN_PROCESS, pid)` is no better:
+    /// for a `Background` agent at priority 4 it answers 0, "not background".
     #[cfg(target_os = "macos")]
     pub(super) fn base_priority(pid: u32) -> io::Result<i32> {
-        // SAFETY: as `start_token`: a zeroed, correctly sized `proc_taskinfo`
-        // and its exact size, so the kernel writes only within it.
-        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-        let size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap_or(i32::MAX);
+        /// `PROC_PIDLISTTHREADS` from `<sys/proc_info.h>`, which `libc` lacks.
+        const PROC_PIDLISTTHREADS: libc::c_int = 6;
+        /// Far more than a freshly started runner has; a process with more
+        /// threads is still judged by the first this many.
+        const MAX_THREADS: usize = 256;
+
+        let mut threads = [0u64; MAX_THREADS];
+        let capacity = i32::try_from(size_of_val(&threads)).unwrap_or(i32::MAX);
+        // SAFETY: the buffer and its exact size in bytes, so the kernel writes
+        // only within it.
         let written = unsafe {
             libc::proc_pidinfo(
                 pid as libc::c_int,
-                libc::PROC_PIDTASKINFO,
+                PROC_PIDLISTTHREADS,
                 0,
-                std::ptr::from_mut(&mut info).cast(),
-                size,
+                threads.as_mut_ptr().cast(),
+                capacity,
             )
         };
-        if written != size {
+        if written <= 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(info.pti_priority)
+        let count = usize::try_from(written).unwrap_or(0) / size_of::<u64>();
+        let size = i32::try_from(size_of::<libc::proc_threadinfo>()).unwrap_or(i32::MAX);
+        let mut highest = None;
+        for &thread in &threads[..count.min(MAX_THREADS)] {
+            // SAFETY: as above, a zeroed, correctly sized `proc_threadinfo`.
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    pid as libc::c_int,
+                    libc::PROC_PIDTHREADINFO,
+                    thread,
+                    std::ptr::from_mut(&mut info).cast(),
+                    size,
+                )
+            };
+            // A thread can exit between the listing and this read.
+            if written == size {
+                highest = highest.max(Some(info.pth_priority));
+            }
+        }
+        highest.ok_or_else(io::Error::last_os_error)
     }
 
     /// Whether `pid` runs at or under the background priority ceiling. A
@@ -2955,86 +2963,140 @@ mod tests {
         child.stop(Duration::from_secs(10)).expect("cleanup");
     }
 
-    /// Set by [`a_runner_leaves_the_background_state_its_parent_runs_in`] when
-    /// it re-runs this test binary as the throttled parent.
+    /// What the launchd job below writes into its working directory.
     #[cfg(target_os = "macos")]
-    const DARWIN_BACKGROUND_PARENT: &str = "RUNNER_MANAGER_TEST_DARWIN_BACKGROUND_PARENT";
+    const PRIORITY_REPORT: &str = "priority-report.txt";
 
-    /// The throttled parent, in a process of its own so that moving it into
-    /// the background slows nothing else in the suite.
+    /// The job of a launch agent rendered by `launchd_plist`, run by launchd
+    /// and by nothing else.
     ///
-    /// It starts two identical children, one without and one with
-    /// [`SpawnSpec::normal_scheduling`], and prints each child's priority. The
-    /// first child is the control: it proves the background state really is
-    /// inherited here, without which the second child's normal priority would
-    /// prove nothing.
+    /// It starts one child exactly as the lifecycle starts a runner and writes
+    /// its own base priority and the child's into its working directory, which
+    /// the plist points at a directory the test owns.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "spawned only as the throttled parent of the darwinbg test"]
-    fn darwin_background_parent_helper() {
+    #[ignore = "run only by launchd, as the job of the launch-agent priority test"]
+    fn launch_agent_priority_helper() {
+        let label = std::env::var("XPC_SERVICE_NAME").unwrap_or_default();
         assert!(
-            std::env::var_os(DARWIN_BACKGROUND_PARENT).is_some(),
-            "run only by a_runner_leaves_the_background_state_its_parent_runs_in"
+            label.contains("-selftest-"),
+            "run only by launchd for the launch-agent priority test, not under {label:?}"
         );
-        // SAFETY: a plain system call on this process.
-        let moved =
-            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
-        assert_eq!(moved, 0, "{}", std::io::Error::last_os_error());
-        println!(
-            "parent_priority={}",
-            sys::base_priority(std::process::id()).expect("own priority")
+        let mut child = long_running()
+            .expect_normal_scheduling()
+            .spawn()
+            .expect("child starts");
+        let report = format!(
+            "agent_priority={}\nchild_priority={}\n",
+            sys::base_priority(std::process::id()).expect("own priority"),
+            sys::base_priority(child.pid()).expect("child priority"),
         );
-        for (label, spec) in [
-            ("control", long_running()),
-            ("runner", long_running().normal_scheduling()),
-        ] {
-            let mut child = spec.spawn().expect("child starts");
-            let priority = sys::base_priority(child.pid()).expect("child priority");
-            println!("{label}_priority={priority}");
-            child.stop(Duration::from_secs(5)).expect("child stops");
-        }
+        child.stop(Duration::from_secs(5)).expect("child stops");
+        // Renamed into place so the test never reads half a report.
+        let staged = format!("{PRIORITY_REPORT}.partial");
+        std::fs::write(&staged, report).expect("report staged");
+        std::fs::rename(&staged, PRIORITY_REPORT).expect("report written");
     }
 
+    /// Loads the plist `launchd_plist` renders for a test plan, passed through
+    /// `edit`, as a launch agent; waits for its job's report and boots it out
+    /// again. Returns `(agent priority, child priority)`.
     #[cfg(target_os = "macos")]
-    #[test]
-    fn a_runner_leaves_the_background_state_its_parent_runs_in() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
+    fn priorities_under_launch_agent(tag: &str, edit: impl FnOnce(String) -> String) -> (i32, i32) {
+        use crate::service::launchd_fixture::LoadedAgent;
+        use crate::service::{InstallPlan, ServiceDirectories, ServiceIdentity, launchd_plist};
+        use runner_manager_domain::model::StartMode;
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directories = ServiceDirectories {
+            config: root.path().join("config"),
+            state: root.path().join("state"),
+            runtime: root.path().join("runtime"),
+            logs: root.path().join("logs"),
+        };
+        for directory in directories.all() {
+            std::fs::create_dir_all(directory).expect("directory created");
+        }
+        let binary = crate::service::launchd_fixture::job_binary(root.path());
+        let identity = ServiceIdentity::fixture(&format!("priority-{tag}-{}", std::process::id()));
+        let label = identity.launchd_label();
+        let plan = InstallPlan::unchecked(identity, StartMode::Login, binary, directories.clone())
+            .with_arguments([
                 "--ignored",
                 "--exact",
-                "process::tests::darwin_background_parent_helper",
-                "--nocapture",
-            ])
-            .env(DARWIN_BACKGROUND_PARENT, "1")
-            .output()
-            .expect("the throttled parent runs");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "the throttled parent failed: {stdout}{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let priority = |label: &str| -> i32 {
-            let prefix = format!("{label}_priority=");
-            stdout
-                .lines()
-                .find_map(|line| line.strip_prefix(&prefix))
-                .and_then(|value| value.trim().parse().ok())
-                .unwrap_or_else(|| panic!("no {label} priority in: {stdout}"))
+                "process::tests::launch_agent_priority_helper",
+                "--test-threads=1",
+            ]);
+        let plist = root.path().join(format!("{label}.plist"));
+        std::fs::write(&plist, edit(launchd_plist(&plan))).expect("plist written");
+        let _loaded = LoadedAgent::bootstrap(&label, &plist);
+
+        let report = directories.state.join(PRIORITY_REPORT);
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let text = loop {
+            if let Ok(text) = std::fs::read_to_string(&report) {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the {tag} agent's job wrote no report; its stderr: {}",
+                std::fs::read_to_string(directories.logs.join("runner-manager.launchd.err.log"))
+                    .unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(250));
         };
+        let value = |name: &str| -> i32 {
+            text.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in the {tag} report: {text}"))
+        };
+        (value("agent_priority"), value("child_priority"))
+    }
+
+    /// A runner started by a daemon under the launch agent `launchd_plist`
+    /// renders runs at normal priority.
+    ///
+    /// This is the test 0.4.31 lacked. Its test moved the parent into the
+    /// background with `setpriority`, which a child can undo, so it passed while
+    /// every real runner stayed at 4: launchd's `ProcessType` is a different
+    /// mechanism and a child cannot undo it. Here launchd itself starts the job,
+    /// from the plist the product installs.
+    ///
+    /// The control agent is the same plist with `ProcessType` set back to
+    /// `Background`. Its child has to be throttled, which proves that launchd
+    /// applies the job's class to descendants on this host. Without that, the
+    /// rendered agent's normal-priority child would prove nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runner_under_the_rendered_launch_agent_runs_at_normal_priority() {
+        if !crate::service::launchd_fixture::enabled() {
+            return;
+        }
         let ceiling = sys::BACKGROUND_PRIORITY_CEILING;
+        let process_type =
+            |value: &str| format!("<key>ProcessType</key>\n  <string>{value}</string>");
+        let rendered = process_type(crate::service::LAUNCHD_PROCESS_TYPE);
+
+        let (control_agent, control_child) = priorities_under_launch_agent("control", |plist| {
+            assert!(plist.contains(&rendered), "{plist}");
+            plist.replace(&rendered, &process_type("Background"))
+        });
         assert!(
-            priority("parent") <= ceiling,
-            "the helper never entered the background state, so nothing below is tested"
+            control_agent <= ceiling && control_child <= ceiling,
+            "a Background agent's job ({control_agent}) and its child ({control_child}) were not \
+             throttled, so this host does not show the condition under test"
+        );
+
+        let (agent, child) = priorities_under_launch_agent("rendered", |plist| plist);
+        eprintln!(
+            "Background control: job {control_agent}, runner {control_child}; \
+             rendered plist: job {agent}, runner {child}"
         );
         assert!(
-            priority("control") <= ceiling,
-            "a child without the flag did not inherit the background state, so the flag's \
-             child proves nothing: {stdout}"
-        );
-        assert!(
-            priority("runner") > ceiling,
-            "a child started with normal_scheduling still runs throttled: {stdout}"
+            child > ceiling,
+            "a runner started under the rendered launch agent runs at background priority \
+             {child} (agent {agent}); launchd applies the plist's ProcessType to every runner"
         );
     }
 
