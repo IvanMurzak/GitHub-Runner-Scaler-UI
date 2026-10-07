@@ -281,13 +281,16 @@ fn ci_runs_the_privileged_wsl_lifecycle_tests_and_the_leak_check_can_see_their_f
     );
 }
 
-/// The launch-agent priority test returns early unless its variable is `1`,
-/// so a macOS leg without the variable passes having measured nothing. It is
-/// the only test that runs a runner under the plist the product installs, and
-/// its absence is how 0.4.31 shipped runners stuck at background priority.
+/// The launchd acceptance tests return early unless their variable is `1`, so
+/// a macOS leg without it passes having measured nothing. They are the only
+/// tests that run a runner under the plist the product installs and that
+/// reload a rewritten plist, and the lack of the first is how 0.4.31 shipped
+/// runners stuck at background priority.
 #[test]
 fn ci_measures_runner_priority_under_a_real_launch_agent_on_macos() {
     let (path, source) = ci_workflow();
+    // A Windows checkout has CRLF line endings.
+    let source = source.replace("\r\n", "\n");
     let check = source
         .split("\n  check:\n")
         .nth(1)
@@ -297,8 +300,8 @@ fn ci_measures_runner_priority_under_a_real_launch_agent_on_macos() {
         check.contains(
             "RUNNER_MANAGER_LAUNCHD_ACCEPTANCE: ${{ runner.os == 'macOS' && '1' || '' }}"
         ),
-        "{}'s `check` job must set RUNNER_MANAGER_LAUNCHD_ACCEPTANCE=1 on macOS, or \
-         `a_runner_under_the_rendered_launch_agent_runs_at_normal_priority` skips itself.",
+        "{}'s `check` job must set RUNNER_MANAGER_LAUNCHD_ACCEPTANCE=1 on macOS, or the launchd \
+         acceptance tests skip themselves.",
         path.display()
     );
 }
