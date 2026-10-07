@@ -1601,6 +1601,29 @@ pub const SYSTEMD_HARDENING: [&str; 13] = [
 
 // -- launchd -----------------------------------------------------------------
 
+/// The `ProcessType` every rendered plist carries.
+///
+/// # Why not `Background`
+///
+/// launchd applies a job's `ProcessType` to the whole process tree it starts,
+/// not only to the daemon. Under `Background` every runner the daemon launched
+/// ran at base priority 4, on efficiency cores with throttled I/O, so each job
+/// took 4 to 20 times as long as on a classic runner.
+///
+/// A child cannot leave it. This is the process type launchd chose at spawn
+/// (`spawn type = background (5)` in `launchctl print`), not the
+/// `PRIO_DARWIN_BG` flag `setpriority` controls: measured on macOS 27, a child
+/// of a `Background` agent reads `getpriority(PRIO_DARWIN_PROCESS) == 0`, and
+/// `setpriority(PRIO_DARWIN_PROCESS, 0, 0)` returns success and leaves it at
+/// 4, before `exec` and after it alike. 0.4.31 tried exactly that.
+///
+/// The measured alternatives, as the base priority of a runner the agent
+/// starts: `Background` 4, `Adaptive` 4, `Standard` (the default when the key
+/// is absent) 20, `Interactive` 31 (the same as a classic runner, and the value
+/// GitHub's own runner service template uses). The daemon itself mostly waits,
+/// so it costs nothing to run it at that priority too.
+pub const LAUNCHD_PROCESS_TYPE: &str = "Interactive";
+
 /// Renders the launchd property list for this plan.
 ///
 /// `KeepAlive` is a dictionary rather than `<true/>` on purpose: the
@@ -1641,9 +1664,7 @@ pub fn launchd_plist(plan: &InstallPlan) -> String {
         "  <key>ThrottleInterval</key>\n  <integer>{}</integer>\n",
         plan.restart().delay().as_secs()
     ));
-    // A background job yields CPU and I/O to whatever the operator is doing.
-    // Anything above it asks the scheduler for more than a daemon needs.
-    out.push_str(&plist_string("ProcessType", "Background"));
+    out.push_str(&plist_string("ProcessType", LAUNCHD_PROCESS_TYPE));
     out.push_str(&plist_string(
         "WorkingDirectory",
         &directories.state.to_string_lossy(),
@@ -2385,22 +2406,25 @@ fn review_launchd(
     controls: &mut Vec<String>,
     findings: &mut Vec<PrivilegeFinding>,
 ) {
-    match plist_string_value(text, "ProcessType").as_deref() {
-        Some("Background") => controls.push("ProcessType=Background".to_string()),
-        Some(other) => findings.push(PrivilegeFinding {
-            kind: FindingKind::Excess,
+    // A scheduling class is not an authority, so no value here is an excess.
+    // Anything but `Interactive` is a shortfall: launchd applies it to every
+    // runner the daemon starts. See `LAUNCHD_PROCESS_TYPE`.
+    match plist_string_value(text, "ProcessType") {
+        Some(value) if value == LAUNCHD_PROCESS_TYPE => {
+            controls.push(format!("ProcessType={LAUNCHD_PROCESS_TYPE}"));
+        }
+        found => findings.push(PrivilegeFinding {
+            kind: FindingKind::Shortfall,
             subject: "ProcessType".to_string(),
             detail: format!(
-                "is `{other}`, which asks the scheduler for more CPU and I/O than a background \
-                 daemon needs"
+                "is {}, and launchd applies it to every runner the daemon starts, so their jobs \
+                 run below normal priority. The daemon rewrites it to `{LAUNCHD_PROCESS_TYPE}` \
+                 the next time it holds no runner; `service install` rewrites it now",
+                found.map_or_else(
+                    || "absent (launchd's `Standard`)".to_string(),
+                    |value| format!("`{value}`")
+                )
             ),
-        }),
-        None => findings.push(PrivilegeFinding {
-            kind: FindingKind::Excess,
-            subject: "ProcessType".to_string(),
-            detail: "is absent, so launchd applies its `Standard` default rather than \
-                     `Background`"
-                .to_string(),
         }),
     }
 
@@ -3233,25 +3257,55 @@ pub struct DefinitionDrift {
     pub rendered: String,
     /// The start mode it was installed for.
     pub start_mode: StartMode,
+    /// Which manager reads the definition.
+    pub manager: DefinitionKind,
 }
 
-/// Compares the installed systemd unit against this build's rendering.
+/// Compares the installed definition against this build's rendering.
 ///
-/// Limited to systemd, whose unit is a plain file this module renders byte
-/// for byte; `None` for every other manager, for a definition that cannot be
-/// read, and for one that already matches. The file is read through
-/// `controls`, so a double never compares against a real host's unit.
+/// A systemd unit is compared byte for byte. A launchd plist is compared on
+/// `ProcessType` alone (see [`launchd_definition_drift`]). `None` for every
+/// other manager, for a definition that cannot be read, and for one that
+/// already matches. The file is read through `controls`, so a double never
+/// compares against a real host's definition.
 fn definition_drift(
     controls: &dyn ControlFactory,
     identity: &ServiceIdentity,
     record: &InstallRecord,
 ) -> Option<DefinitionDrift> {
-    if host_definition_kind(record.start_mode) != DefinitionKind::SystemdUnit {
-        return None;
-    }
+    let compare = match host_definition_kind(record.start_mode) {
+        DefinitionKind::SystemdUnit => systemd_definition_drift,
+        DefinitionKind::LaunchdPlist => launchd_definition_drift,
+        DefinitionKind::WindowsService | DefinitionKind::WindowsScheduledTask => return None,
+    };
     let path = record.definition_path.clone()?;
     let installed = controls.installed_definition(&path)?;
-    systemd_definition_drift(identity, record, path, &installed)
+    compare(identity, record, path, &installed)
+}
+
+/// A plist whose `ProcessType` is not [`LAUNCHD_PROCESS_TYPE`], with the plist
+/// this build renders in its place.
+///
+/// Only that one key, unlike the systemd comparison. The daemon repairs this
+/// drift by itself (`daemon.rs`, `converge_launchd_definition`), so a
+/// whole-file comparison would make it rewrite and reload over every edit an
+/// operator made to the plist. A plist that does carry the wrong value is
+/// replaced whole, as `service install` would replace it.
+fn launchd_definition_drift(
+    identity: &ServiceIdentity,
+    record: &InstallRecord,
+    path: PathBuf,
+    installed: &str,
+) -> Option<DefinitionDrift> {
+    (plist_string_value(installed, "ProcessType").as_deref() != Some(LAUNCHD_PROCESS_TYPE)).then(
+        || DefinitionDrift {
+            path,
+            installed_by_version: record.installed_by_version.clone(),
+            rendered: launchd_plist(&record.plan(identity.clone())),
+            start_mode: record.start_mode,
+            manager: DefinitionKind::LaunchdPlist,
+        },
+    )
 }
 
 fn systemd_definition_drift(
@@ -3266,6 +3320,7 @@ fn systemd_definition_drift(
         installed_by_version: record.installed_by_version.clone(),
         rendered,
         start_mode: record.start_mode,
+        manager: DefinitionKind::SystemdUnit,
     })
 }
 
@@ -4368,6 +4423,33 @@ impl ServiceOperations {
             .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, &record)))
     }
 
+    /// Writes the plist this build renders over an outdated one, then has a
+    /// detached helper boot the job out and bootstrap it again from the new
+    /// file.
+    ///
+    /// launchd reads a plist only when the job is bootstrapped. Rewriting the
+    /// file changes nothing for a job that is already loaded, and a `KeepAlive`
+    /// restart reuses the loaded copy. So the job has to be booted out, and
+    /// that terminates the daemon that asked for it. The helper runs in a
+    /// session of its own, which launchd does not kill with the job, and
+    /// retries the bootstrap: launchd refuses it for a few seconds while the
+    /// old job is still exiting (`5: Input/output error`, measured).
+    ///
+    /// Call this only from the daemon the job runs, and only while it holds no
+    /// runner. It is an operation on the registration the daemon itself runs
+    /// under, and it never changes the start mode.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Control`] or [`ServiceError::NeedsElevation`] when the
+    /// plist cannot be written or the helper cannot be started. The loaded job
+    /// is untouched in both cases.
+    #[cfg(target_os = "macos")]
+    pub fn reload_launchd_definition(&self, drift: &DefinitionDrift) -> Result<(), ServiceError> {
+        replace_definition(self.identity.name(), drift)?;
+        sys::reload_detached(&self.identity, drift.start_mode, &drift.path)
+    }
+
     /// Creates or reconciles the runner root this start mode's account needs.
     ///
     /// The account is not an argument: it is [`ServiceAccount::for_start_mode`],
@@ -4778,6 +4860,27 @@ impl ServiceStatus {
     #[must_use]
     pub fn with_definition_drift(mut self, drift: Option<DefinitionDrift>) -> Self {
         if let Some(drift) = drift {
+            if drift.manager == DefinitionKind::LaunchdPlist {
+                let elevation = match drift.start_mode {
+                    StartMode::Boot => "sudo ",
+                    StartMode::Login => "",
+                };
+                self.problems.push(StatusProblem {
+                    subject: "definition",
+                    detail: format!(
+                        "{} was written by runner-manager {} with a `ProcessType` other than \
+                         `{LAUNCHD_PROCESS_TYPE}`, which launchd applies to every runner the \
+                         daemon starts, so their jobs run below normal priority. The daemon \
+                         rewrites it and reloads itself the next time it holds no runner; to do \
+                         it now, run `{elevation}runner-manager service install --start-at {}`. \
+                         Configuration and credentials are kept.",
+                        drift.path.display(),
+                        drift.installed_by_version,
+                        drift.start_mode,
+                    ),
+                });
+                return self;
+            }
             let repair = match drift.start_mode {
                 StartMode::Boot => {
                     "`sudo systemctl stop runner-manager && sudo runner-manager service install \
@@ -6159,6 +6262,38 @@ fn write_definition(
         .map_err(|error| definition_error(operation, name, error, remedy, path))
 }
 
+/// Replaces an installed definition with [`DefinitionDrift::rendered`].
+///
+/// Through a temporary file in the same directory and a rename, so a failure
+/// at any point leaves the old definition in place rather than a truncated
+/// one. The mode is set to `0644` before the rename, as `service install`
+/// leaves it: launchd refuses a plist that others can write.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn replace_definition(name: &str, drift: &DefinitionDrift) -> Result<(), ServiceError> {
+    use std::io::Write as _;
+
+    let path = drift.path.as_path();
+    let directory = path.parent().unwrap_or_else(|| Path::new("/"));
+    let failed = |error: std::io::Error, at: &Path| {
+        definition_error("rewrite", name, error, SUDO_REMEDY, at)
+    };
+    let mut staged =
+        tempfile::NamedTempFile::new_in(directory).map_err(|error| failed(error, directory))?;
+    staged
+        .write_all(drift.rendered.as_bytes())
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|error| failed(error, staged.path()))?;
+    std::fs::set_permissions(
+        staged.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .map_err(|error| failed(error, path))?;
+    staged
+        .persist(path)
+        .map(drop)
+        .map_err(|error| failed(error.error, path))
+}
+
 #[cfg(unix)]
 fn definition_error(
     operation: &'static str,
@@ -6425,6 +6560,71 @@ mod sys {
             } else {
                 Err(self.failed("stop", identity.name(), message))
             }
+        }
+    }
+
+    /// Boots the job out and bootstraps it again from `plist`, from a shell
+    /// that outlives this process.
+    ///
+    /// `setsid` puts the shell in a session and process group of its own, and
+    /// launchd kills only the job's own process group when it boots the job out
+    /// (measured: such a helper survives and its bootstrap succeeds). The work
+    /// runs in a background subshell, so the outer shell exits at once and is
+    /// reaped here rather than left behind. `bootout` blocks until the daemon
+    /// has exited; the bootstrap is retried for a minute because launchd
+    /// refuses it while the old job is still being torn down. When the job is
+    /// still loaded after a failed bootout, every bootstrap fails and the
+    /// running daemon carries on as it was.
+    pub(super) fn reload_detached(
+        identity: &ServiceIdentity,
+        mode: StartMode,
+        plist: &std::path::Path,
+    ) -> Result<(), ServiceError> {
+        use std::os::unix::process::CommandExt;
+
+        const SCRIPT: &str = r#"(
+  sleep 1
+  launchctl bootout "$1"
+  tries=0
+  until launchctl bootstrap "$2" "$3"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 60 ]; then
+      echo "runner-manager: launchd did not load $3 again; run: runner-manager service install" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+) </dev/null &"#;
+
+        let control = LaunchdControl { mode };
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", SCRIPT, "runner-manager-reload"])
+            .arg(control.service_target(identity))
+            .arg(control.domain())
+            .arg(plist)
+            .stdin(std::process::Stdio::null());
+        // SAFETY: one async-signal-safe system call between `fork` and `exec`,
+        // touching no memory, allocator or lock.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let status = command.status().map_err(|error| {
+            control.failed("reload", identity.name(), format!("/bin/sh: {error}"))
+        })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(control.failed(
+                "reload",
+                identity.name(),
+                format!("the reload helper exited with {status}"),
+            ))
         }
     }
 
@@ -7111,6 +7311,262 @@ mod tests {
             None,
             "a LaunchAgent already runs as the operator:\n{agent}"
         );
+    }
+
+    #[test]
+    fn the_plist_runs_the_daemon_and_its_runners_as_an_interactive_job() {
+        for mode in [StartMode::Boot, StartMode::Login] {
+            let plan = linux_plan(mode);
+            let plist = launchd_plist(&plan);
+            assert_eq!(
+                plist_string_value(&plist, "ProcessType").as_deref(),
+                Some("Interactive"),
+                "launchd applies ProcessType to every runner the daemon starts:\n{plist}"
+            );
+            let review = review_least_privilege(
+                &ServiceDefinition::from_text(DefinitionKind::LaunchdPlist, plist),
+                &plan,
+            );
+            assert!(
+                review
+                    .controls()
+                    .iter()
+                    .any(|control| control == "ProcessType=Interactive"),
+                "{review}"
+            );
+            assert!(
+                !review
+                    .findings()
+                    .iter()
+                    .any(|finding| finding.subject == "ProcessType"),
+                "{review}"
+            );
+        }
+    }
+
+    /// The value 0.4.31 and earlier installed, and launchd's default, both
+    /// throttle every runner. That is a shortfall the update repairs, not an
+    /// excess: a scheduling class grants no authority.
+    #[test]
+    fn a_plist_that_throttles_its_runners_is_a_shortfall() {
+        let plan = linux_plan(StartMode::Login);
+        let rendered = launchd_plist(&plan);
+        let interactive = "<key>ProcessType</key>\n  <string>Interactive</string>\n";
+        for (label, throttled) in [
+            (
+                "Background",
+                edited(
+                    &rendered,
+                    interactive,
+                    "<key>ProcessType</key>\n  <string>Background</string>\n",
+                ),
+            ),
+            ("absent", edited(&rendered, interactive, "")),
+        ] {
+            let review = review_least_privilege(
+                &ServiceDefinition::from_text(DefinitionKind::LaunchdPlist, throttled),
+                &plan,
+            );
+            assert!(review.is_least_privilege(), "{label}: {review}");
+            assert!(
+                review.findings().iter().any(|finding| {
+                    finding.kind == FindingKind::Shortfall
+                        && finding.subject == "ProcessType"
+                        && finding.detail.contains(label)
+                }),
+                "{label}: {review}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plist_with_an_old_process_type_is_drift_and_an_operator_edit_is_not() {
+        let host = Host::new();
+        let identity = ServiceIdentity::product();
+        let plan = InstallPlan::resolve(
+            identity.clone(),
+            &host.request(StartMode::Login),
+            ServiceDirectories::of(&host.paths),
+        )
+        .expect("a resolvable plan");
+        let installed = launchd_plist(&plan);
+        let definition =
+            ServiceDefinition::from_text(DefinitionKind::LaunchdPlist, installed.clone());
+        let mut record = InstallRecord::of(&plan, &definition, Utc::now());
+        record.installed_by_version = "0.4.31".into();
+        let path = PathBuf::from("/Users/op/Library/LaunchAgents/runner-manager.plist");
+
+        assert_eq!(
+            launchd_definition_drift(&identity, &record, path.clone(), &installed),
+            None
+        );
+        let edited_by_operator = edited(
+            &installed,
+            "</dict>\n</plist>\n",
+            "  <key>Nice</key>\n  <integer>0</integer>\n</dict>\n</plist>\n",
+        );
+        assert_eq!(
+            launchd_definition_drift(&identity, &record, path.clone(), &edited_by_operator),
+            None,
+            "the daemon repairs this drift itself, so it must not key on edits it did not cause"
+        );
+
+        let written_by_0_4_31 = edited(
+            &installed,
+            "<string>Interactive</string>",
+            "<string>Background</string>",
+        );
+        let drift = launchd_definition_drift(&identity, &record, path, &written_by_0_4_31)
+            .expect("a Background plist is drift");
+        assert_eq!(drift.manager, DefinitionKind::LaunchdPlist);
+        assert_eq!(drift.start_mode, StartMode::Login);
+        assert_eq!(
+            drift.rendered, installed,
+            "the repair must write exactly what `service install` writes"
+        );
+
+        let status = ServiceStatus::compose(identity, None, None, None, None, &host.paths)
+            .with_definition_drift(Some(drift));
+        assert!(!status.is_healthy());
+        let problem = status
+            .problems()
+            .iter()
+            .find(|problem| problem.subject == "definition")
+            .expect("the drift is reported");
+        assert!(
+            problem.detail.contains("0.4.31")
+                && problem
+                    .detail
+                    .contains("runner-manager service install --start-at login")
+                && !problem.detail.contains("systemctl")
+                && !problem.detail.contains("sudo"),
+            "{}",
+            problem.detail
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_definition_is_the_rendering_and_readable_by_launchd() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let path = root
+            .path()
+            .join("io.github.IvanMurzak.runner-manager.plist");
+        std::fs::write(&path, "<string>Background</string>").expect("old plist");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let drift = DefinitionDrift {
+            path: path.clone(),
+            installed_by_version: "0.4.31".into(),
+            rendered: launchd_plist(&linux_plan(StartMode::Login)),
+            start_mode: StartMode::Login,
+            manager: DefinitionKind::LaunchdPlist,
+        };
+
+        replace_definition("runner-manager", &drift).expect("replaced");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), drift.rendered);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no staging file is left beside the plist"
+        );
+    }
+
+    /// The rewrite and the detached reload together, against a real launchd:
+    /// a fixture agent loaded as `Background` is replaced by the same plist
+    /// with [`LAUNCHD_PROCESS_TYPE`], and launchd must end up running it with
+    /// that spawn type. Gated like the runner-priority test in `process.rs`,
+    /// on the same variable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_rewritten_plist_is_loaded_again_by_the_detached_reload() {
+        if std::env::var_os("RUNNER_MANAGER_LAUNCHD_ACCEPTANCE").is_none_or(|value| value != "1") {
+            eprintln!(
+                "skipped: set RUNNER_MANAGER_LAUNCHD_ACCEPTANCE=1 to load test launch agents"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let identity = ServiceIdentity::fixture(&format!("reload-{}", std::process::id()));
+        let label = identity.launchd_label();
+        let path = root.path().join(format!("{label}.plist"));
+        let plist = |process_type: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+                 {}  <key>ProgramArguments</key>\n  <array>\n    <string>/bin/sleep</string>\n\
+                 \x20   <string>600</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n\
+                 {}</dict>\n</plist>\n",
+                plist_string("Label", &label),
+                plist_string("ProcessType", process_type)
+            )
+        };
+        std::fs::write(&path, plist("Background")).expect("plist written");
+        // SAFETY: `getuid` reads the calling process's real user id and cannot
+        // fail.
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        let target = format!("{domain}/{label}");
+        struct BootOut(String);
+        impl Drop for BootOut {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["bootout", &self.0])
+                    .output();
+            }
+        }
+        let _loaded = BootOut(target.clone());
+        let spawn_type = || {
+            let printed = std::process::Command::new("launchctl")
+                .args(["print", &target])
+                .output()
+                .expect("launchctl runs");
+            String::from_utf8_lossy(&printed.stdout)
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix("spawn type = ")
+                        .map(str::to_string)
+                })
+        };
+        let bootstrap = std::process::Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(&path)
+            .output()
+            .expect("launchctl runs");
+        assert!(
+            bootstrap.status.success(),
+            "{}",
+            String::from_utf8_lossy(&bootstrap.stderr)
+        );
+        assert_eq!(spawn_type().as_deref(), Some("background (5)"));
+
+        let drift = DefinitionDrift {
+            path: path.clone(),
+            installed_by_version: "0.4.31".into(),
+            rendered: plist(LAUNCHD_PROCESS_TYPE),
+            start_mode: StartMode::Login,
+            manager: DefinitionKind::LaunchdPlist,
+        };
+        replace_definition(identity.name(), &drift).expect("plist replaced");
+        super::sys::reload_detached(&identity, StartMode::Login, &path).expect("helper started");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if spawn_type().as_deref() == Some("interactive (4)") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launchd still reports {:?} for the rewritten agent",
+                spawn_type()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     #[test]

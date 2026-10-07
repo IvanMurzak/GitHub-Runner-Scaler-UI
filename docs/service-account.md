@@ -129,8 +129,12 @@ What bounds it:
 
 - `SessionCreate` is `false`: a job that runs outside every login session is not
   given a security session it has no use for;
-- `ProcessType` is `Background`, so the daemon yields CPU and I/O to whatever
-  the operator is doing;
+- `ProcessType` is `Interactive`. launchd applies a job's process type to every
+  process it starts, and the runners the daemon starts have to run at normal
+  priority: under `Background` each one ran at priority 4 on efficiency cores,
+  and nothing a runner does can leave it. A scheduling class grants no
+  authority, so `review_least_privilege` reports any other value as a
+  shortfall, not an excess;
 - no `MachServices` and no `Sockets`, which is `07-security.md` rule 2 enforced
   in the definition rather than only in review.
 

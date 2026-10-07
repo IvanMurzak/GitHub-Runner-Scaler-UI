@@ -7,6 +7,25 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.32
+
+### Fixes
+
+- macOS runners now really run at normal priority. The 0.4.31 fix did not work: launchd applies
+  the LaunchAgent's `ProcessType = Background` to every process the daemon starts, and a runner
+  cannot leave it, so runners stayed at priority 4 on efficiency cores. The daemon's own warning
+  (`runner_started_at_background_priority`) reported it. The plist now says
+  `ProcessType = Interactive`, the value GitHub's own runner service uses, and a runner starts
+  at priority 31, the same as a classic runner. The daemon runs at that priority too; it mostly
+  waits.
+- An existing installation is repaired without `service install`. After `runner-manager update`,
+  the new daemon finds the old `ProcessType` in its plist, rewrites the plist and has launchd load
+  the job again. It does this only while it holds no runner, which is always the case right after
+  the upgrade drain, so no job is interrupted. The start mode is kept. `service status` reports a
+  plist that still carries the old value. A plist that has the right `ProcessType` is left alone,
+  including any edits made to it; one with the old value is replaced whole, as `service install`
+  would replace it.
+
 ## 0.4.31
 
 ### Features
