@@ -122,12 +122,20 @@ pub const USAGE_FILE: &str = ".usage.json";
 /// prune` from an ordinary prompt cannot write it -- while `host cache show`,
 /// which only reads, works. The service already reads the state directory it
 /// shares with the account that installed it, so a request left there is the
-/// one channel both sides can use without administrator rights. The service
-/// takes the request by deleting the file, which is also how the asking
-/// command knows somebody is listening.
+/// one channel both sides can use without administrator rights. The file holds
+/// an identifier the asking command chose. The service takes the request by
+/// deleting the file, which is how the command knows somebody is listening,
+/// and answers in [`PRUNE_RESULT_FILE`] under the same identifier, which is
+/// how it knows the answer is to this request and not to a pass that was
+/// already under way.
 pub const PRUNE_REQUEST_FILE: &str = "cache-prune.request";
 
-/// How often the service looks for a [`PRUNE_REQUEST_FILE`].
+/// The service's answer to the last [`PRUNE_REQUEST_FILE`] it took.
+pub const PRUNE_RESULT_FILE: &str = "cache-prune.result";
+
+/// How often the service looks for a [`PRUNE_REQUEST_FILE`]. It looks while a
+/// pass is running too, so a request is taken within this however long the
+/// pass takes.
 pub const PRUNE_REQUEST_POLL: Duration = Duration::from_secs(5);
 
 /// Where a prune request for the service lives.
@@ -136,13 +144,50 @@ pub fn prune_request_path(state_dir: &Path) -> PathBuf {
     state_dir.join(PRUNE_REQUEST_FILE)
 }
 
-/// Takes a pending prune request, if there is one. Returns whether there was.
+/// Takes a pending prune request, if there is one, and returns its identifier.
 ///
 /// Taking it is deleting it, so a request is honoured once however many
 /// times it is looked for.
 #[must_use]
-pub fn take_prune_request(state_dir: &Path) -> bool {
-    fs::remove_file(prune_request_path(state_dir)).is_ok()
+pub fn take_prune_request(state_dir: &Path) -> Option<String> {
+    let path = prune_request_path(state_dir);
+    let request = fs::read_to_string(&path).ok()?;
+    fs::remove_file(&path).ok()?;
+    Some(request.trim().to_owned())
+}
+
+/// The service's answer to one prune request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneResult {
+    /// The identifier the request carried.
+    pub request: String,
+    /// What the pass measured and removed, or why it could not run.
+    pub outcome: Result<CacheUsage, String>,
+}
+
+impl PruneResult {
+    /// Records this answer where the asking command looks for it.
+    ///
+    /// # Errors
+    /// The file could not be written.
+    pub fn write(&self, state_dir: &Path) -> Result<(), CacheError> {
+        let path = state_dir.join(PRUNE_RESULT_FILE);
+        let json = serde_json::to_vec_pretty(self).map_err(|error| CacheError::Io {
+            action: "encode",
+            path: path.clone(),
+            source: io::Error::other(error),
+        })?;
+        write_atomically(&path, &json)
+    }
+
+    /// The answer to the request `request`, once the service has given it.
+    #[must_use]
+    pub fn read_for(state_dir: &Path, request: &str) -> Option<Self> {
+        let bytes = fs::read(state_dir.join(PRUNE_RESULT_FILE)).ok()?;
+        serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|result| result.request == request)
+    }
 }
 
 const TRASH_DIR: &str = ".trash";

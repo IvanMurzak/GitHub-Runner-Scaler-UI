@@ -30,15 +30,16 @@ the version being prepared rather than the version in `Cargo.toml`.
   the change is needed once and prints the exact command to run from an elevated prompt.
   Registering a distribution's task for the first time works the same way. The versioned
   companion copies are removed once nothing runs them.
-- `runner-manager update` names every managed WSL host that runs another version, with the
+- `runner-manager update` names every managed WSL host that runs an older version, with the
   `wsl install --distribution NAME` command that updates it. It does not run that command
   itself: updating a WSL host drains that host's jobs with no deadline, and `update` returns as
   soon as this machine's own binary is replaced.
 - `host cache prune` works from an ordinary prompt on a host whose service runs as another
   account (LocalSystem on Windows, root elsewhere). It used to fail with `cannot write
-  …\_cache\.usage.json: Access is denied`; it now asks the running service to prune, waits for
-  its result and prints it. When no service takes the request it says so and names both remedies:
-  start the service, or run the command from an elevated prompt.
+  …\_cache\.usage.json: Access is denied`; it now asks the service installed from this account's
+  directories to prune, waits for its answer and prints it. The service takes the request within
+  five seconds even while a scheduled pass is running. When no service takes it, or the service
+  cannot prune either, the command says so at once and names the remedy.
 
 ## 0.4.34
 

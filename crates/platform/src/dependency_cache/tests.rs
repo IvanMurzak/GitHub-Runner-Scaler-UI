@@ -776,12 +776,36 @@ fn the_deepest_pnpm_store_file_fits_the_windows_path_limit_under_the_default_roo
 #[test]
 fn a_prune_request_is_taken_exactly_once() {
     let state = tempfile::tempdir().unwrap();
-    assert!(!take_prune_request(state.path()), "nothing was asked");
-    fs::write(prune_request_path(state.path()), b"now").unwrap();
-    assert!(take_prune_request(state.path()));
-    assert!(
-        !take_prune_request(state.path()),
+    assert_eq!(take_prune_request(state.path()), None, "nothing was asked");
+    fs::write(prune_request_path(state.path()), b"request-7\n").unwrap();
+    assert_eq!(
+        take_prune_request(state.path()).as_deref(),
+        Some("request-7")
+    );
+    assert_eq!(
+        take_prune_request(state.path()),
+        None,
         "a request is honoured once however often it is looked for"
+    );
+}
+
+#[test]
+fn a_prune_result_answers_only_the_request_it_names() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(PruneResult::read_for(state.path(), "request-7"), None);
+    let result = PruneResult {
+        request: "request-7".into(),
+        outcome: Err("the root is gone".into()),
+    };
+    result.write(state.path()).unwrap();
+    assert_eq!(
+        PruneResult::read_for(state.path(), "request-7"),
+        Some(result)
+    );
+    assert_eq!(
+        PruneResult::read_for(state.path(), "request-8"),
+        None,
+        "an answer to an earlier request is not this one's"
     );
 }
 

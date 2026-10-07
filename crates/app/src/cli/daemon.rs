@@ -599,28 +599,44 @@ const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// in `state_dir` -- which is how an operator whose account cannot write the
 /// service's cache root still gets a prune. The walk runs on a blocking
 /// thread: a pnpm store holds hundreds of thousands of files.
+///
+/// Requests are taken while a pass is running too -- a walk of a full cache
+/// can outlast the time the asking command waits to hear that somebody is
+/// listening -- and carried out once that pass ends, one pass at a time.
 async fn maintain_dependency_caches(
     caches: runner_manager_agent::dependency_caches::DependencyCaches,
     state_dir: std::path::PathBuf,
     scheduled: bool,
 ) {
     use runner_manager_platform::dependency_cache::{
-        PRUNE_INTERVAL, PRUNE_REQUEST_POLL, prune_request_path,
+        PRUNE_INTERVAL, PRUNE_REQUEST_POLL, prune_request_path, take_prune_request,
     };
-    let request = prune_request_path(&state_dir);
+    let request_file = prune_request_path(&state_dir);
     let mut next_scheduled = scheduled.then(std::time::Instant::now);
+    let mut pending: Option<String> = None;
+    let mut running: Option<tokio::task::JoinHandle<()>> = None;
     loop {
-        let due = next_scheduled.is_some_and(|at| std::time::Instant::now() >= at);
-        // Almost every look finds nothing to do, and a look is one `stat`.
-        if due || request.exists() {
-            let (pass, state) = (caches.clone(), state_dir.clone());
-            let _ =
-                tokio::task::spawn_blocking(move || pass.prune_if_requested_or_due(&state, due))
-                    .await;
+        // Almost every look finds nothing, and a look is one `stat`.
+        if pending.is_none() && request_file.exists() {
+            pending = take_prune_request(&state_dir);
         }
-        // A pass ran either way, so the schedule starts again from now.
-        if due {
-            next_scheduled = Some(std::time::Instant::now() + PRUNE_INTERVAL);
+        if running
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            running = None;
+        }
+        if running.is_none() {
+            let pass = caches.clone();
+            if let Some(request) = pending.take() {
+                let state = state_dir.clone();
+                running = Some(tokio::task::spawn_blocking(move || {
+                    pass.answer_prune_request(&state, request);
+                }));
+            } else if next_scheduled.is_some_and(|at| std::time::Instant::now() >= at) {
+                running = Some(tokio::task::spawn_blocking(move || pass.prune_scheduled()));
+                next_scheduled = Some(std::time::Instant::now() + PRUNE_INTERVAL);
+            }
         }
         tokio::time::sleep(PRUNE_REQUEST_POLL).await;
     }

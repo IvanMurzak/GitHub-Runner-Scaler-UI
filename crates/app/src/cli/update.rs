@@ -840,7 +840,7 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
 // What it means for managed WSL hosts
 // ---------------------------------------------------------------------------
 
-/// Names every managed WSL host that runs a version other than `version`, and
+/// Names every managed WSL host that runs a version older than `version`, and
 /// the command that brings it up to date.
 ///
 /// # Why `update` says this rather than doing it
@@ -852,9 +852,9 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
 /// service copy is replaced, and signs in through the device flow if the
 /// distribution holds no credential. Neither belongs inside `update`, which
 /// returns as soon as this machine's own binary is replaced and lets its
-/// service drain in the background. Since 0.4.35 `wsl install` needs no
-/// administrator rights to update a host, so the command printed here is all
-/// that is left to do.
+/// service drain in the background. Updating a host with `wsl install` needs
+/// no administrator rights, except once for a host whose lifecycle task 0.4.34
+/// or earlier registered from an elevated prompt; it asks for them itself.
 ///
 /// Never a failure: a record this build cannot read is `wsl list`'s business.
 fn report_managed_wsl_hosts(
@@ -868,7 +868,9 @@ fn report_managed_wsl_hosts(
     };
     let behind: Vec<_> = records
         .iter()
-        .filter(|record| record.installed_version != version)
+        .filter(|record| {
+            compare_versions(&record.installed_version, version) == std::cmp::Ordering::Less
+        })
         .collect();
     if behind.is_empty() {
         return Ok(());
@@ -877,7 +879,8 @@ fn report_managed_wsl_hosts(
     writeln!(
         out,
         "Managed WSL hosts are updated separately, because updating one drains its own jobs. \
-         Run, from this prompt (no administrator rights needed):"
+         Run, from this prompt (no administrator rights needed, except once for a host first \
+         set up before 0.4.35 from an elevated prompt, which asks for them itself):"
     )
     .map_err(failed)?;
     for record in behind {
@@ -1530,6 +1533,7 @@ mod tests {
             ("Ubuntu", "0.4.34"),
             ("My Debian", "0.4.30"),
             ("Current", "0.4.35"),
+            ("Newer", "0.4.100"),
         ] {
             WslProviderRecord::new(distribution, "task", version, chrono::Utc::now())
                 .write(&paths)
@@ -1548,8 +1552,8 @@ mod tests {
             "{said}"
         );
         assert!(
-            !said.contains("Current"),
-            "a current host is not named: {said}"
+            !said.contains("Current") && !said.contains("Newer"),
+            "a current or newer host is not named: {said}"
         );
         assert!(said.contains("no administrator rights"), "{said}");
     }
