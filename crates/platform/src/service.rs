@@ -168,6 +168,10 @@ pub const CREDENTIAL_UNREADABLE_SUBJECT: &str = "stored credential";
 /// The `service status` subject blocked runner launches are reported under.
 pub const LAUNCHES_BLOCKED_SUBJECT: &str = "runner launches";
 
+/// The [`StatusProblem::subject`] of a daemon that refuses to start runners
+/// because a required host check fails from its own session.
+pub const HOST_UNFIT_SUBJECT: &str = "host fitness";
+
 /// The agent's last runner-root refusal, for `service status` to report.
 ///
 /// See [`record_runner_root_refusal`] for the contract.
@@ -4508,7 +4512,11 @@ impl ServiceOperations {
             &self.paths,
             Utc::now(),
         ))
-        .with_unattended_gap(unattended))
+        .with_unattended_gap(unattended)
+        .with_host_unfit(crate::host_fitness::host_unfit_in_force(
+            &self.paths,
+            Utc::now(),
+        )))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -5213,6 +5221,26 @@ impl ServiceStatus {
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
+    }
+
+    /// Reports that the daemon starts no runner because a required host check
+    /// fails from its own session. That is the service not doing its job, so
+    /// it is a problem: a host whose daemon refused every runner used to read
+    /// `verdict healthy`.
+    #[must_use]
+    pub fn with_host_unfit(mut self, unfit: Option<crate::host_fitness::HostUnfitRecord>) -> Self {
+        if let Some(unfit) = &unfit {
+            self.problems.push(StatusProblem {
+                subject: HOST_UNFIT_SUBJECT,
+                detail: format!(
+                    "the service has started no runner since {}, because a required host check \
+                     fails from its own session: {}",
+                    unfit.since.to_rfc3339(),
+                    unfit.describe()
+                ),
+            });
+        }
+        self
     }
 
     /// Records whether this registration comes back by itself after an
@@ -10062,6 +10090,57 @@ logs = \"/d\"
                 .contains("does not run until the operator signs in")
         );
         assert_eq!(unattended_gap(StartMode::Boot, "root", None), None);
+    }
+
+    /// A daemon refusing every runner is not a healthy service.
+    #[test]
+    fn a_daemon_that_finds_the_host_unfit_makes_the_service_unhealthy() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Login))
+            .expect("an install at login");
+        let paths = operations.paths.clone();
+        crate::host_fitness::record_host_unfit(
+            &paths,
+            &[crate::host_fitness::UnfitFinding {
+                id: "host.runner_root_responsive".into(),
+                detail: "macOS has not let the service list /Volumes/NVME/runners".into(),
+                remedy: Some("click Allow".into()),
+            }],
+            Utc::now(),
+        )
+        .unwrap();
+        let status = operations.status().expect("a status");
+        assert!(!status.is_healthy(), "{status}");
+        let problem = status
+            .problems()
+            .iter()
+            .find(|problem| problem.subject == HOST_UNFIT_SUBJECT)
+            .expect("the refusal is a problem");
+        assert!(
+            problem.detail.contains("/Volumes/NVME/runners"),
+            "{problem:?}"
+        );
+        assert!(problem.detail.contains("Fix: click Allow"), "{problem:?}");
+
+        // A record nobody has re-stamped for a while is a stopped daemon's,
+        // not a refusal in force.
+        crate::host_fitness::clear_host_unfit(&paths).unwrap();
+        crate::host_fitness::record_host_unfit(
+            &paths,
+            &[],
+            Utc::now() - chrono::Duration::hours(2),
+        )
+        .unwrap();
+        let status = operations.status().expect("a status");
+        assert!(
+            !status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == HOST_UNFIT_SUBJECT),
+            "{status}"
+        );
     }
 
     // -----------------------------------------------------------------------

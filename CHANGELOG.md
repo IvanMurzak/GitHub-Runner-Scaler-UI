@@ -37,6 +37,20 @@ the version being prepared rather than the version in `Cargo.toml`.
   credential reaches; the answer crosses through the state directory and never holds the
   credential. `status` says the credential is in use by the service when the service reached
   GitHub in the last 15 minutes, instead of calling it unreadable.
+- A runner root on an external volume that macOS has not yet let the service read is reported
+  as such. After an update, macOS asks again whether runner-manager "would like to access files
+  on a removable volume", because it ties the answer to the exact build, and until somebody
+  clicks Allow on the Mac's desktop the service's listing of the root waits and it starts no
+  runner. `host.runner_root_responsive` now says that a privacy question is probably waiting and
+  which button answers it, and, when the answer was no, where to turn it on (System Settings >
+  Privacy & Security > Files & Folders). A refusal is a failure; it used to be "unknown", which
+  let runners start on a root they could not use.
+- `service status` is not healthy while the service starts no runner because a required host
+  check fails; it used to say `verdict healthy`. It names what the service found and the fix,
+  and so does `status`, under `host unfit because`.
+- `host doctor` reports a required check the running service finds failing as failing, with the
+  service's finding, even when its own look passes. Over SSH it used to list the runner root
+  itself, from a session macOS was not asking about, and call it passing.
 - The Spotlight check's remedy names `/Users/Shared/rman.noindex`. It used to suggest
   `…/Application Support/…/runtime.noindex`, a path with a space that `host set-runtime-root`
   also refused.

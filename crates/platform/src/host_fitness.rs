@@ -121,6 +121,16 @@ pub enum Responsiveness {
     /// It did not answer within the deadline: a hung volume (a stalled USB or
     /// NVMe enclosure, a dead network mount).
     Hung,
+    /// Its metadata answered, and listing it did not within the deadline. On
+    /// macOS that is what a pending privacy question looks like: reading a
+    /// folder on a removable or network volume waits while "would like to
+    /// access files on a removable volume" is on the desktop, while `stat`
+    /// does not. A stalled disk usually stalls the `stat` too.
+    ListingBlocked,
+    /// The system refused to let this process list it (`EPERM`). On macOS
+    /// that is a privacy setting this process was refused, not file
+    /// permissions, which answer `EACCES`.
+    NotPermitted(String),
     /// It answered with an error.
     Failed(String),
 }
@@ -150,6 +160,10 @@ pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Re
     }
     let (sender, receiver) = std::sync::mpsc::channel();
     let probed = path.clone();
+    // Set once the metadata has answered, so a probe still blocked can say
+    // whether it was the `stat` or the listing that never came back.
+    let listing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listing_started = std::sync::Arc::clone(&listing);
     let spawned = std::thread::Builder::new()
         .name("runner-root-probe".into())
         .spawn(move || {
@@ -157,14 +171,22 @@ pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Re
                 .ancestors()
                 .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
                 .map(Path::to_path_buf);
+            listing_started.store(true, std::sync::atomic::Ordering::Release);
+            let refused = |error: std::io::Error| {
+                if is_not_permitted(&error) {
+                    Responsiveness::NotPermitted(error.to_string())
+                } else {
+                    Responsiveness::Failed(error.to_string())
+                }
+            };
             let answer = match existing {
                 None => Responsiveness::Failed(format!("{} does not exist", probed.display())),
                 Some(existing) => match std::fs::read_dir(&existing) {
                     Ok(mut entries) => match entries.next() {
-                        Some(Err(error)) => Responsiveness::Failed(error.to_string()),
+                        Some(Err(error)) => refused(error),
                         _ => Responsiveness::Responds,
                     },
-                    Err(error) => Responsiveness::Failed(error.to_string()),
+                    Err(error) => refused(error),
                 },
             };
             if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
@@ -178,9 +200,26 @@ pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Re
         }
         return Responsiveness::Failed(error.to_string());
     }
-    receiver
-        .recv_timeout(deadline)
-        .unwrap_or(Responsiveness::Hung)
+    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
+        if listing.load(std::sync::atomic::Ordering::Acquire) {
+            Responsiveness::ListingBlocked
+        } else {
+            Responsiveness::Hung
+        }
+    })
+}
+
+/// `EPERM`, which a privacy refusal answers, as opposed to `EACCES`.
+fn is_not_permitted(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// Whether this process can create a symbolic link inside `directory`.
@@ -342,6 +381,11 @@ pub fn write_registry_string(
 
 /// The file under `state/` the daemon keeps while it refuses to start runners.
 pub const HOST_UNFIT_FILE: &str = "host-unfit.json";
+
+/// How long the record counts as a refusal in force. A running daemon
+/// re-stamps it on every recheck (every five minutes), so one it has not
+/// touched for three is left behind by a daemon that stopped while refusing.
+pub const HOST_UNFIT_RECORD_FRESH: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const HOST_UNFIT_SCHEMA_VERSION: u32 = 1;
 
 /// What the daemon recorded the last time a required host check failed.
@@ -354,6 +398,37 @@ pub struct HostUnfitRecord {
     pub checked_at: DateTime<Utc>,
     /// The ids of the required checks that failed.
     pub checks: Vec<String>,
+    /// What each of them found, from the daemon's own session, and what fixes
+    /// it. Empty in a record an older daemon wrote.
+    #[serde(default)]
+    pub findings: Vec<UnfitFinding>,
+}
+
+/// One failing required check, as the daemon saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfitFinding {
+    pub id: String,
+    pub detail: String,
+    #[serde(default)]
+    pub remedy: Option<String>,
+}
+
+impl HostUnfitRecord {
+    /// One sentence per failing check, with its remedy.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if self.findings.is_empty() {
+            return self.checks.join(", ");
+        }
+        self.findings
+            .iter()
+            .map(|finding| match &finding.remedy {
+                Some(remedy) => format!("{}: {}. Fix: {remedy}", finding.id, finding.detail),
+                None => format!("{}: {}", finding.id, finding.detail),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 fn host_unfit_path(paths: &AppPaths) -> PathBuf {
@@ -367,7 +442,7 @@ fn host_unfit_path(paths: &AppPaths) -> PathBuf {
 /// A description of the write failure.
 pub fn record_host_unfit(
     paths: &AppPaths,
-    checks: &[String],
+    findings: &[UnfitFinding],
     at: DateTime<Utc>,
 ) -> Result<(), String> {
     let since = host_unfit(paths)
@@ -378,7 +453,8 @@ pub fn record_host_unfit(
         schema_version: HOST_UNFIT_SCHEMA_VERSION,
         since,
         checked_at: at,
-        checks: checks.to_vec(),
+        checks: findings.iter().map(|finding| finding.id.clone()).collect(),
+        findings: findings.to_vec(),
     };
     let path = host_unfit_path(paths);
     let text = serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?;
@@ -397,6 +473,17 @@ pub fn clear_host_unfit(paths: &AppPaths) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
     }
+}
+
+/// The daemon's refusal, when one is in force at `now`: recorded, and
+/// re-stamped within [`HOST_UNFIT_RECORD_FRESH`].
+#[must_use]
+pub fn host_unfit_in_force(paths: &AppPaths, now: DateTime<Utc>) -> Option<HostUnfitRecord> {
+    host_unfit(paths).ok().flatten().filter(|record| {
+        (now - record.checked_at)
+            .to_std()
+            .is_ok_and(|age| age <= HOST_UNFIT_RECORD_FRESH)
+    })
 }
 
 /// The daemon's current refusal, if it has one.
@@ -1003,6 +1090,14 @@ mod tests {
         assert_eq!(find_on_path("npm.cmd", &path), Some(cmd));
     }
 
+    fn unfit_finding(id: &str) -> UnfitFinding {
+        UnfitFinding {
+            id: id.into(),
+            detail: "it fails".into(),
+            remedy: None,
+        }
+    }
+
     #[test]
     fn the_unfit_record_keeps_its_first_moment_and_clears() {
         let root = tempfile::tempdir().unwrap();
@@ -1010,9 +1105,9 @@ mod tests {
         paths.create_all().unwrap();
         assert_eq!(host_unfit(&paths).unwrap(), None);
         let first = Utc::now() - chrono::Duration::minutes(10);
-        record_host_unfit(&paths, &["windows.symlink_privilege".into()], first).unwrap();
+        record_host_unfit(&paths, &[unfit_finding("windows.symlink_privilege")], first).unwrap();
         let later = Utc::now();
-        record_host_unfit(&paths, &["host.required_tools".into()], later).unwrap();
+        record_host_unfit(&paths, &[unfit_finding("host.required_tools")], later).unwrap();
         let record = host_unfit(&paths).unwrap().unwrap();
         assert_eq!(record.since, first);
         assert_eq!(record.checked_at, later);

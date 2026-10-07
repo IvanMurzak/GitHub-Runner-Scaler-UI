@@ -92,10 +92,6 @@ pub const SKIP_DOCTOR_VARIABLE: &str = "RUNNER_MANAGER_SKIP_HOST_DOCTOR";
 /// How often the daemon re-evaluates the required checks.
 pub const DAEMON_RECHECK: Duration = Duration::from_secs(5 * 60);
 
-/// How long the daemon's host-unfit record counts as a refusal in force: three
-/// rechecks, so one slow evaluation does not hide it.
-const HOST_UNFIT_RECORD_FRESH: Duration = Duration::from_secs(3 * DAEMON_RECHECK.as_secs());
-
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The memory one concurrent job is assumed to need when a capacity is
 /// recommended. A guide, not a measurement of any particular workload.
@@ -272,6 +268,10 @@ pub struct HostSetup {
     /// That account's home folder, on macOS.
     #[serde(default)]
     pub service_home: Option<PathBuf>,
+    /// The required checks the running daemon finds failing, from its own
+    /// session, when it refuses to start runners. See [`evaluate`].
+    #[serde(default)]
+    pub daemon_unfit: Option<host_fitness::HostUnfitRecord>,
 }
 
 impl HostSetup {
@@ -1706,15 +1706,46 @@ fn probe_runner_root_responsive(setup: &HostSetup, facts: &dyn HostFacts) -> Out
         return not_applicable("no runner root could be resolved");
     }
     let mut hung = Vec::new();
+    let mut asking = Vec::new();
+    let mut refused = Vec::new();
     let mut errors = Vec::new();
     for root in &setup.runner_roots {
+        let privacy_protected = setup.os == HostOs::Macos && is_privacy_protected_volume(root);
         match facts.directory_responds(root) {
             host_fitness::Responsiveness::Responds => {}
-            host_fitness::Responsiveness::Hung => hung.push(root.display().to_string()),
-            host_fitness::Responsiveness::Failed(error) => {
+            host_fitness::Responsiveness::ListingBlocked if privacy_protected => {
+                asking.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::NotPermitted(_) if privacy_protected => {
+                refused.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::Hung | host_fitness::Responsiveness::ListingBlocked => {
+                hung.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::NotPermitted(error)
+            | host_fitness::Responsiveness::Failed(error) => {
                 errors.push(format!("{}: {error}", root.display()));
             }
         }
+    }
+    if !asking.is_empty() {
+        return fail(format!(
+            "macOS has not let the service list {}: listing it waits, which is what a pending \
+             privacy question looks like (\"would like to access files on a removable volume\", \
+             or on a network volume). Nothing starts there until somebody answers it",
+            asking.join(", ")
+        ))
+        .remedy(format!(
+            "{PRIVACY_PROMPT_REMEDY}; if no dialog is showing, check the volume"
+        ));
+    }
+    if !refused.is_empty() {
+        return fail(format!(
+            "macOS refuses to let the service list {} (Operation not permitted): its access to \
+             files on that volume was turned down",
+            refused.join(", ")
+        ))
+        .remedy(PRIVACY_REFUSED_REMEDY);
     }
     if !hung.is_empty() {
         return fail(format!(
@@ -1733,6 +1764,22 @@ fn probe_runner_root_responsive(setup: &HostSetup, facts: &dyn HostFacts) -> Out
     }
     pass("every runner root answers")
 }
+
+/// Folders macOS guards behind a privacy question: every other volume, under
+/// `/Volumes`. The startup volume's own folders are not asked about.
+fn is_privacy_protected_volume(root: &Path) -> bool {
+    root.starts_with("/Volumes")
+}
+
+/// What to click when the question is on the desktop.
+const PRIVACY_PROMPT_REMEDY: &str = "at this Mac's desktop, click Allow on the dialog asking \
+     whether runner-manager may access files on a removable (or network) volume. macOS asks \
+     again after every runner-manager update, because it ties the answer to the exact build";
+
+/// What to turn on when the question was answered no.
+const PRIVACY_REFUSED_REMEDY: &str = "System Settings > Privacy & Security > Files & Folders > \
+     runner-manager: turn on Removable Volumes (or Network Volumes); the service checks again \
+     within five minutes";
 
 // -- host.capacity ------------------------------------------------------------
 
@@ -1896,7 +1943,7 @@ pub fn evaluate(setup: &HostSetup, facts: &dyn HostFacts) -> Report {
         .iter()
         .filter(|check| check.platform.includes(setup.os))
         .map(|check| {
-            let outcome = (check.probe)(setup, facts);
+            let outcome = daemon_view(setup, check.id, (check.probe)(setup, facts));
             Finding {
                 id: check.id,
                 title: check.title,
@@ -1924,6 +1971,40 @@ pub fn evaluate(setup: &HostSetup, facts: &dyn HostFacts) -> Report {
         perspective: setup.perspective,
         elevated: facts.elevated(),
         findings,
+    }
+}
+
+/// A required check the running daemon finds failing fails here too, whatever
+/// this command's own probe says.
+///
+/// The two can disagree, and the daemon is the one that matters: it is the
+/// account and the session runners inherit. Over SSH on a Mac, the daemon in
+/// the desktop session was waiting on a privacy question about the runner
+/// root's volume and starting no runner, while `host doctor` in the SSH
+/// session listed the same root and reported it passing.
+fn daemon_view(setup: &HostSetup, id: &str, outcome: Outcome) -> Outcome {
+    if setup.perspective != Perspective::Operator || outcome.status == Status::Fail {
+        return outcome;
+    }
+    let Some(unfit) = &setup.daemon_unfit else {
+        return outcome;
+    };
+    if !unfit.checks.iter().any(|failing| failing == id) {
+        return outcome;
+    }
+    let found = unfit.findings.iter().find(|finding| finding.id == id);
+    let failed = fail(format!(
+        "the service finds this failing from its own session, and starts no runner until it \
+         passes{}; this command's own look found: {}",
+        found.map_or_else(String::new, |finding| format!(": {}", finding.detail)),
+        outcome.detail
+    ));
+    match found
+        .and_then(|finding| finding.remedy.clone())
+        .or(outcome.remedy)
+    {
+        Some(remedy) => failed.remedy(remedy),
+        None => failed,
     }
 }
 
@@ -2240,6 +2321,9 @@ fn setup_from_parts(
         ),
         service_account,
         service_home,
+        daemon_unfit: (perspective == Perspective::Operator)
+            .then(|| host_fitness::host_unfit_in_force(context.paths(), context.clock().now()))
+            .flatten(),
         service,
     }
 }
@@ -3491,6 +3575,8 @@ pub struct FindingSummary {
 pub struct HostUnfitSummary {
     pub since: Timestamp,
     pub checks: Vec<String>,
+    /// What each check found and what fixes it, as the daemon recorded it.
+    pub detail: String,
 }
 
 /// The `doctor` block of `status --json`.
@@ -3536,22 +3622,16 @@ impl DoctorSummary {
                 })
                 .map(|finding| finding.id.to_owned())
                 .collect(),
-            daemon_host_unfit: host_fitness::host_unfit(context.paths())
-                .ok()
-                .flatten()
-                // A running daemon re-stamps the record every recheck, so one
-                // it has not touched for several is left behind by a daemon
-                // that stopped (or was uninstalled) while refusing, not a
-                // refusal in force.
-                .filter(|record| {
-                    (context.clock().now() - record.checked_at)
-                        .to_std()
-                        .is_ok_and(|age| age <= HOST_UNFIT_RECORD_FRESH)
-                })
-                .map(|record| HostUnfitSummary {
-                    since: record.since,
-                    checks: record.checks,
-                }),
+            // A record a daemon stopped re-stamping is not a refusal in force.
+            daemon_host_unfit: host_fitness::host_unfit_in_force(
+                context.paths(),
+                context.clock().now(),
+            )
+            .map(|record| HostUnfitSummary {
+                since: record.since,
+                detail: record.describe(),
+                checks: record.checks,
+            }),
         }
     }
 
@@ -3826,7 +3906,17 @@ pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String
     let recorded = if verdict.required.is_empty() {
         host_fitness::clear_host_unfit(context.paths())
     } else {
-        host_fitness::record_host_unfit(context.paths(), &verdict.required, context.clock().now())
+        let findings: Vec<host_fitness::UnfitFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| verdict.required.iter().any(|id| id == finding.id))
+            .map(|finding| host_fitness::UnfitFinding {
+                id: finding.id.to_owned(),
+                detail: finding.detail.clone(),
+                remedy: finding.remedy.clone(),
+            })
+            .collect();
+        host_fitness::record_host_unfit(context.paths(), &findings, context.clock().now())
     };
     // The refusal itself does not depend on the record; only what `status`
     // can show does.
@@ -3867,6 +3957,8 @@ mod tests {
         mounts: HashMap<PathBuf, PathBuf>,
         /// Directories that do not answer.
         hung: Vec<PathBuf>,
+        /// Directories that answer something other than "responds" or "hung".
+        answers: HashMap<PathBuf, host_fitness::Responsiveness>,
         process_type: Option<String>,
         throttled: usize,
         credential: Option<CredentialProbe>,
@@ -3917,6 +4009,9 @@ mod tests {
             Ok(Some(self.indexed.iter().any(|v| v == volume)))
         }
         fn directory_responds(&self, directory: &Path) -> host_fitness::Responsiveness {
+            if let Some(answer) = self.answers.get(directory) {
+                return answer.clone();
+            }
             if self.hung.iter().any(|hung| hung == directory) {
                 host_fitness::Responsiveness::Hung
             } else {
@@ -4031,6 +4126,7 @@ mod tests {
             launches_blocked: None,
             service_account: None,
             service_home: None,
+            daemon_unfit: None,
         }
     }
 
@@ -4228,6 +4324,117 @@ mod tests {
 
         setup.service = None;
         assert_eq!(status_of(&setup, &facts, id), Status::NotApplicable);
+    }
+
+    /// The old Mac after an update: the daemon's listing of a runner root on
+    /// an external volume waits on "would like to access files on a removable
+    /// volume", and the report has to say which button that is.
+    #[test]
+    fn a_runner_root_behind_a_privacy_question_names_what_to_click() {
+        let id = "host.runner_root_responsive";
+        let root = PathBuf::from("/Volumes/NVME/runners");
+        let mut setup = macos_setup();
+        setup.runner_roots = vec![root.clone()];
+        let mut facts = Facts::default();
+        facts
+            .answers
+            .insert(root.clone(), host_fitness::Responsiveness::ListingBlocked);
+        let report = evaluate(&setup, &facts);
+        let asking = finding(&report, id);
+        assert_eq!(asking.status, Status::Fail);
+        assert_eq!(asking.severity, Severity::Required);
+        assert!(
+            asking.detail.contains("removable volume"),
+            "{}",
+            asking.detail
+        );
+        assert!(
+            asking.remedy.as_deref().unwrap().contains("click Allow"),
+            "{asking:?}"
+        );
+
+        facts.answers.insert(
+            root.clone(),
+            host_fitness::Responsiveness::NotPermitted("Operation not permitted".into()),
+        );
+        let report = evaluate(&setup, &facts);
+        let refused = finding(&report, id);
+        assert_eq!(refused.status, Status::Fail, "a refusal is not an unknown");
+        assert!(
+            refused
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("Files & Folders > runner-manager"),
+            "{refused:?}"
+        );
+
+        // Off `/Volumes` the startup volume asks nothing: a blocked listing is
+        // a stalled disk there, as before.
+        let local = PathBuf::from("/Users/Shared/rman.noindex");
+        setup.runner_roots = vec![local.clone()];
+        facts
+            .answers
+            .insert(local, host_fitness::Responsiveness::ListingBlocked);
+        let report = evaluate(&setup, &facts);
+        let stalled = finding(&report, id);
+        assert_eq!(stalled.status, Status::Fail);
+        assert!(!stalled.detail.contains("removable"), "{}", stalled.detail);
+    }
+
+    /// `host doctor` over SSH listed a root the daemon, in the desktop
+    /// session, could not, and called it passing. The daemon's own finding
+    /// wins.
+    #[test]
+    fn a_check_the_daemon_finds_failing_fails_here_too() {
+        let id = "host.runner_root_responsive";
+        let mut setup = macos_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+
+        let record = host_fitness::HostUnfitRecord {
+            schema_version: 1,
+            since: chrono::Utc::now(),
+            checked_at: chrono::Utc::now(),
+            checks: vec![id.into()],
+            findings: vec![host_fitness::UnfitFinding {
+                id: id.into(),
+                detail: "macOS has not let the service list /Volumes/NVME/rman".into(),
+                remedy: Some("click Allow".into()),
+            }],
+        };
+        setup.daemon_unfit = Some(record);
+        let report = evaluate(&setup, &facts);
+        let found = finding(&report, id);
+        assert_eq!(found.status, Status::Fail);
+        assert!(
+            found.detail.contains("from its own session"),
+            "{}",
+            found.detail
+        );
+        assert!(
+            found.detail.contains("/Volumes/NVME/rman"),
+            "{}",
+            found.detail
+        );
+        assert_eq!(found.remedy.as_deref(), Some("click Allow"));
+        assert!(!report.required_failing().is_empty());
+        assert_eq!(
+            finding(&report, "macos.spotlight").status,
+            status_of(
+                &HostSetup {
+                    daemon_unfit: None,
+                    ..setup.clone()
+                },
+                &facts,
+                "macos.spotlight"
+            ),
+            "only the checks the daemon names change"
+        );
+
+        // The daemon's own preflight is not overridden by its own record.
+        setup.perspective = Perspective::Daemon;
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
     }
 
     #[test]

@@ -711,6 +711,7 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
             unfit.since,
             unfit.checks.join(", ")
         )?;
+        writeln!(out, "  host unfit because        {}", unfit.detail)?;
     }
     if let Some(blocked) = &document.product.service_launches_blocked {
         writeln!(out, "  daemon starts no runner   {blocked}")?;
@@ -877,6 +878,9 @@ mod tests {
                 daemon_host_unfit: Some(super::super::doctor::HostUnfitSummary {
                     since: chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap(),
                     checks: vec!["windows.symlink_privilege".to_string()],
+                    detail: "windows.symlink_privilege: symbolic links are refused. Fix: turn \
+                             on Developer Mode"
+                        .to_string(),
                 }),
             },
             caches: super::super::cache::CacheSnapshot {
@@ -953,7 +957,7 @@ mod tests {
         );
         assert_eq!(
             keys(&emitted, "/doctor/daemon_host_unfit"),
-            ["checks", "since"]
+            ["checks", "detail", "since"]
         );
         assert_eq!(
             keys(&emitted, "/caches"),
@@ -1298,6 +1302,12 @@ mod tests {
             text.contains("  daemon starts no runner   since ")
                 && text.contains("host unfit (windows.symlink_privilege)"),
             "{text}"
+        );
+        assert!(
+            text.contains(
+                "  host unfit because        windows.symlink_privilege: symbolic links are refused. Fix: turn on Developer Mode"
+            ),
+            "what the daemon found, and what fixes it: {text}"
         );
 
         let mut healthy = document();

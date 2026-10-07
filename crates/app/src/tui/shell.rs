@@ -784,7 +784,7 @@ fn with_host_doctor(
             outcome: screens::ActivityOutcome::Failed,
             summary: format!(
                 "The service starts no runner: required host check(s) fail ({}).",
-                unfit.checks.join(", ")
+                unfit.detail
             ),
             remediation: "Press f to run host prepare, or run `runner-manager host prepare`; the \
                           service re-checks within five minutes."
@@ -6097,6 +6097,7 @@ fn doctor_summary(
         daemon_host_unfit: unfit.then(|| crate::cli::doctor::HostUnfitSummary {
             since: chrono::Utc::now(),
             checks: vec!["windows.symlink_privilege".into()],
+            detail: "windows.symlink_privilege: symbolic links are refused".into(),
         }),
     }
 }

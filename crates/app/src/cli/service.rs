@@ -574,19 +574,26 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
         let only_launches = status.problems().iter().all(|problem| {
             problem.subject == runner_manager_platform::service::LAUNCHES_BLOCKED_SUBJECT
         });
-        let remedy = if status
-            .problems()
-            .iter()
-            .any(|problem| problem.subject == "registration")
-        {
-            let mode = status.start_mode().unwrap_or(StartMode::Boot);
-            format!("runner-manager service install --start-at {mode}")
-        } else if only_launches && let Some(blocked) = status.launches_blocked() {
-            // Reinstalling the service is not what unblocks a launch fence.
-            blocked.remedy.clone()
-        } else {
-            "runner-manager service uninstall && runner-manager service install".into()
-        };
+        let remedy =
+            if status
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == "registration")
+            {
+                let mode = status.start_mode().unwrap_or(StartMode::Boot);
+                format!("runner-manager service install --start-at {mode}")
+            } else if only_launches && let Some(blocked) = status.launches_blocked() {
+                // Reinstalling the service is not what unblocks a launch fence.
+                blocked.remedy.clone()
+            } else if status.problems().iter().all(|problem| {
+                problem.subject == runner_manager_platform::service::HOST_UNFIT_SUBJECT
+            }) {
+                // Nor a host check: the problem line names its fix, and `host
+                // doctor` shows the rest.
+                "runner-manager host doctor".into()
+            } else {
+                "runner-manager service uninstall && runner-manager service install".into()
+            };
         Err(CliError::with_remedy(
             Failure::LocalState,
             "the service status above contains one or more errors",
