@@ -10028,6 +10028,33 @@ mod tests {
         (made.status.success() && link.symlink_metadata().is_ok()).then_some(())
     }
 
+    /// The dependency caches live beside attempts, under `<runner root>/_cache`,
+    /// and jobs link into them (pnpm hard-links from its store; a workflow may
+    /// symlink or junction a cache into its workspace). Removing an ephemeral
+    /// attempt must take the links and never what they point at.
+    #[test]
+    fn removing_an_attempt_never_reaches_into_the_dependency_caches_it_linked() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("_cache").join("o").join("r").join("npm");
+        fs::create_dir_all(&cache).unwrap();
+        let cached = cache.join("package.tgz");
+        fs::write(&cached, b"kept between jobs").unwrap();
+        let attempt = root.path().join("0123456789abcdef");
+        let work = attempt.join("_work").join("repo");
+        fs::create_dir_all(&work).unwrap();
+        fs::hard_link(&cached, work.join("hard-linked.tgz")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cache, work.join("linked-cache")).unwrap();
+        #[cfg(windows)]
+        if plant_junction(&work.join("linked-cache"), &cache).is_none() {
+            eprintln!("this machine would not create a junction; the hard link is still checked");
+        }
+
+        remove_runtime_tree(&attempt).unwrap();
+        assert!(!attempt.exists());
+        assert_eq!(fs::read(&cached).unwrap(), b"kept between jobs");
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_work_directory_replaced_by_a_junction_fails_closed_and_deletes_nothing_beyond_it() {
