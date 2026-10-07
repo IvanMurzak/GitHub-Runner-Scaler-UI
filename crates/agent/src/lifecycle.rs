@@ -2346,10 +2346,13 @@ impl NativeProcesses {
         &self,
         attempt: &RunnerAttempt,
         target: Option<&runner_manager_domain::model::ScaleTarget>,
-    ) -> Result<Vec<(&'static str, std::ffi::OsString)>, FailureReason> {
+        host_env: &RunnerEnv,
+    ) -> Vec<(&'static str, std::ffi::OsString)> {
         match (&self.dependency_caches, target) {
-            (Some(caches), Some(target)) => caches.for_launch(target, attempt.runtime_path()),
-            _ => Ok(Vec::new()),
+            (Some(caches), Some(target)) => {
+                caches.for_launch(target, attempt.runtime_path(), host_env)
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -2381,9 +2384,7 @@ impl NativeProcesses {
             ));
         }
         let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
-        let caches = self
-            .cache_env(attempt, cache_target)
-            .map_err(ProcessStartFailure::before_spawn)?;
+        let caches = self.cache_env(attempt, cache_target, &host_env);
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -8602,13 +8603,17 @@ mod tests {
             FakeClock::default().now(),
         );
         assert!(
-            processes.cache_env(&attempt, None).unwrap().is_empty(),
+            processes
+                .cache_env(&attempt, None, &RunnerEnv::default())
+                .is_empty(),
             "a launch with no prepared target, such as a bare `spawn`, has no cache"
         );
         let prepared = processes.prepare(&attempt, &policy).unwrap();
-        let variables = processes
-            .cache_env(&attempt, prepared.cache_target.as_ref())
-            .unwrap();
+        let variables = processes.cache_env(
+            &attempt,
+            prepared.cache_target.as_ref(),
+            &RunnerEnv::default(),
+        );
         let npm = variables
             .iter()
             .find(|(name, _)| *name == "npm_config_cache")

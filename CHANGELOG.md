@@ -39,10 +39,10 @@ the version being prepared rather than the version in `Cargo.toml`.
 
 ### Operator notes
 
-- A variable set in `runner.env`, or already in the service's own environment (a systemd
-  drop-in, the launchd plist, a machine-wide Windows variable), still wins over a cache variable
-  of the same name, so hosts that set cache locations by hand keep them; remove those settings to
-  use the new layout.
+- A cache any of whose variables is already set in `runner.env` or in the service's own
+  environment (a systemd drop-in, the launchd plist, a machine-wide Windows variable), in any
+  letter case, is left entirely to that setting, so hosts that set cache locations by hand keep
+  them; remove those settings to use the new layout.
 - A `caches.toml` that does not parse stops native launches, before anything is registered with
   GitHub, like a broken `runner.env`: it may hold a decision to turn a repository's caches off.
   Any other cache problem starts the runner without caches and is logged.

@@ -735,7 +735,7 @@ it until its attempt is cleaned up.
 | `bun` | `BUN_INSTALL_CACHE_DIR` | all | yes | on | Bun global cache docs |
 | `deno` | `DENO_DIR` | all | yes | on | Deno `deno_dir.rs` |
 | `node-gyp` | `npm_config_devdir`, `npm_package_config_node_gyp_devdir` | all | yes | on | node-gyp `lib/node-gyp.js` |
-| `electron` | `electron_config_cache`; `ELECTRON_CACHE` on macOS and Linux | all | yes | on | electron `npm/install.js`; app-builder |
+| `electron` | `electron_config_cache`, `ELECTRON_CACHE` | all | yes | on | electron `npm/install.js`; app-builder |
 | `electron-builder` | `ELECTRON_BUILDER_CACHE` | all | yes | on | electron-builder environment variables docs |
 | `playwright` | `PLAYWRIGHT_BROWSERS_PATH`, `PLAYWRIGHT_SKIP_BROWSER_GC=1` | all | yes | on | Playwright browsers docs; `registry/index.ts` |
 | `cypress` | `CYPRESS_CACHE_FOLDER` | all | per runner | on | Cypress advanced installation docs |
@@ -773,18 +773,21 @@ Some choices are deliberate:
   `/Users/runner/hostedtoolcache`. Create that directory once for the runner account if
   workflows use it; on Linux and Windows `AGENT_TOOLSDIRECTORY` covers it.
 
-A variable you set in `runner.env` always wins: platform defaults, then these caches, then
-`runner.env`, then the attempt's own `TMPDIR`, `TEMP` and `TMP`. So does a variable the service's
-own environment already carries, such as one set in a systemd drop-in, the launchd plist or a
-machine-wide Windows variable: the caches only fill in what nobody set. Turn one cache off for every
+What you set yourself always wins: platform defaults, then these caches, then `runner.env`, then
+the attempt's own `TMPDIR`, `TEMP` and `TMP`. A cache any of whose variables `runner.env` or the
+service's own environment already sets (a systemd drop-in, the launchd plist, a machine-wide
+Windows variable), in any letter case, is left out entirely, so your `RUNNER_TOOL_CACHE` is never
+paired with this `AGENT_TOOLSDIRECTORY`. `repo cache show` marks a cache `runner.env` takes over
+as `set by runner.env or the service`. Turn one cache off for every
 repository with `host cache set-tool TOOL --state off`, or for one with `repo cache set-tool`,
 and every cache off with `host cache set-enabled --enabled false` or `repo cache set-enabled`.
 
 **Disk.** The service measures the cache root every 30 minutes and keeps it under a cap, 20 GiB
 by default (`host cache set-max-size N`, `0` for none), by removing whole namespaces, least
 recently used first. A namespace a runner is still using is never removed; if those alone exceed
-the cap, the service logs `dependency_cache_over_cap`. `host cache prune` does the same pass
-immediately. `status` shows the size and the cap.
+the cap, the service logs `dependency_cache_over_cap`. Only directories a launch created are
+measured or removed. `host cache prune` does the same pass immediately. `status` shows the size
+and the cap.
 
 **Isolated runners** (OCI containers, Hyper-V containers) get no caches: those providers
 deliberately mount no host directory, and their environment is the image's. `host cache show`

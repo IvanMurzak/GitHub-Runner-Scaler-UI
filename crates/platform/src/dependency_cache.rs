@@ -89,6 +89,8 @@ use chrono::{DateTime, Utc};
 use runner_manager_domain::model::ScaleTarget;
 use serde::{Deserialize, Serialize};
 
+use sha2::Digest as _;
+
 use crate::lock::{HostLock, LockKind};
 use crate::paths::AppPaths;
 use crate::runner_env::RunnerPlatform;
@@ -329,11 +331,10 @@ pub const TOOLS: &[CacheTool] = &[
         sharing: Sharing::Namespace,
         default_enabled: true,
         variables: &[
-            // `electron`'s postinstall reads this exact lower-case name. On
-            // Windows the name is case-insensitive and already covers
-            // `ELECTRON_CACHE`, so that one is Unix-only.
+            // `electron`'s postinstall reads this exact lower-case name;
+            // electron-builder's app-builder reads `ELECTRON_CACHE`.
             all("electron_config_cache", VarValue::Dir),
-            unix("ELECTRON_CACHE", VarValue::Dir),
+            all("ELECTRON_CACHE", VarValue::Dir),
         ],
         note: "Electron release downloads",
     },
@@ -709,7 +710,11 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
 /// # Errors
 /// [`CacheError::InvalidRoot`].
 pub fn validate_root_text(root: &str) -> Result<(), CacheError> {
-    if root.chars().any(char::is_whitespace) || !Path::new(root).is_absolute() {
+    // A UNC or device path is a network share or a namespace no tool expects;
+    // `host cache set-root` refuses the first through the runner-root checks,
+    // and a hand-edited file must too.
+    let network = root.starts_with(r"\\") || root.starts_with("//");
+    if network || root.chars().any(char::is_whitespace) || !Path::new(root).is_absolute() {
         return Err(CacheError::InvalidRoot(root.to_owned()));
     }
     Ok(())
@@ -827,9 +832,11 @@ pub fn resolve_root(
 /// The platform location used when the runner root has whitespace in it.
 ///
 /// Windows: `<system drive>\rman\_cache`, short and inside the default runner
-/// root, so one Defender exclusion covers both. macOS and Linux: this
-/// account's cache directory (`~/Library/Caches`, `$XDG_CACHE_HOME`) plus
-/// `runner-manager`, which is on the same volume as the default runner root.
+/// root, so one Defender exclusion covers both. macOS: the `Library/Caches`
+/// beside the `Library/Application Support` the application data is in, so a
+/// boot-mode daemon running as root and the operator's CLI, which share those
+/// directories, resolve the same root; then this account's cache directory.
+/// Linux: this account's cache directory. Each plus `runner-manager`.
 #[must_use]
 pub fn platform_fallback_root(app_paths: &AppPaths) -> Option<PathBuf> {
     if cfg!(windows) {
@@ -837,8 +844,20 @@ pub fn platform_fallback_root(app_paths: &AppPaths) -> Option<PathBuf> {
             .ok()
             .map(|root| root.as_path().join(DEFAULT_ROOT_NAME))
     } else {
-        directories::BaseDirs::new().map(|dirs| dirs.cache_dir().join("runner-manager"))
+        library_caches_beside(app_paths.runtime_dir())
+            .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.cache_dir().to_path_buf()))
+            .map(|caches| caches.join("runner-manager"))
     }
+}
+
+/// `<home>/Library/Caches` for a path under `<home>/Library/Application
+/// Support`, the macOS layout of the application data.
+fn library_caches_beside(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find_map(|ancestor| {
+        let library = ancestor.parent()?;
+        (ancestor.file_name()? == "Application Support" && library.file_name()? == "Library")
+            .then(|| library.join("Caches"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +915,27 @@ impl Namespace {
 /// so does a trailing `.`, which Windows strips, so that `owner/foo.` and
 /// `owner/foo` cannot share one directory.
 fn segment(raw: &str) -> String {
+    let cleaned = portable_segment(raw);
+    if cleaned.len() <= MAX_SEGMENT_LEN {
+        return cleaned;
+    }
+    // GitHub allows a 100-character repository name; a cache path that long
+    // would spend most of the Windows path budget pnpm's 130-character store
+    // file names need. A shortened name keeps a digest of the full one, so two
+    // cannot collide.
+    let digest = hex::encode(sha2::Sha256::digest(raw.as_bytes()));
+    format!(
+        "{}-{}",
+        &cleaned[..MAX_SEGMENT_LEN - SEGMENT_DIGEST_LEN - 1],
+        &digest[..SEGMENT_DIGEST_LEN]
+    )
+}
+
+/// The longest namespace path segment.
+const MAX_SEGMENT_LEN: usize = 32;
+const SEGMENT_DIGEST_LEN: usize = 8;
+
+fn portable_segment(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| {
@@ -923,6 +963,8 @@ pub enum ToolSource {
     Default,
     Host,
     Target,
+    /// `runner.env` or the service's environment sets one of its variables.
+    Operator,
 }
 
 impl ToolSource {
@@ -932,6 +974,7 @@ impl ToolSource {
             Self::Default => "default",
             Self::Host => "host",
             Self::Target => "this target",
+            Self::Operator => "set by runner.env or the service",
         }
     }
 }
@@ -1064,24 +1107,38 @@ pub fn environment<'a>(
     (variables, dirs)
 }
 
-/// `variables` without those `is_set` says the daemon's own environment
-/// already carries. Someone put that value in the service's environment on
-/// purpose; replacing it would silently undo their choice.
-#[must_use]
-pub fn without_inherited(
-    variables: Vec<(&'static str, OsString)>,
-    is_set: impl Fn(&str) -> bool,
-) -> Vec<(&'static str, OsString)> {
-    variables
-        .into_iter()
-        .filter(|(name, _)| !is_set(name))
-        .collect()
+impl Selection {
+    /// Turns off every tool any of whose variables `is_set` says somebody
+    /// already set: in `runner.env`, or in the service's own environment (a
+    /// systemd drop-in, the launchd plist, a machine-wide Windows variable).
+    ///
+    /// The whole tool, not the one name: an operator's `RUNNER_TOOL_CACHE`
+    /// next to this module's `AGENT_TOOLSDIRECTORY` would split one tool cache
+    /// in two (setup-python prefers the latter), and their
+    /// `PLAYWRIGHT_BROWSERS_PATH` would get a `PLAYWRIGHT_SKIP_BROWSER_GC` for
+    /// a directory nothing prunes.
+    pub fn defer_to_operator(&mut self, platform: RunnerPlatform, is_set: impl Fn(&str) -> bool) {
+        for state in &mut self.tools {
+            if state.enabled && state.tool.variables_on(platform).any(|v| is_set(v.name)) {
+                state.enabled = false;
+                state.source = ToolSource::Operator;
+            }
+        }
+    }
 }
 
-/// Whether this process's environment sets `name` to something non-empty.
+/// Whether this process's environment sets a variable named `name`, compared
+/// without regard to case: npm reads `npm_config_*` in any case, so the
+/// service's `NPM_CONFIG_CACHE` and this module's `npm_config_cache` are one
+/// setting even on Unix, and the later one would win.
 #[must_use]
 pub fn inherited(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    std::env::vars_os().any(|(key, value)| {
+        !value.is_empty()
+            && key
+                .to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case(name))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1150,13 @@ pub fn inherited(name: &str) -> bool {
 /// workspace modes.
 #[must_use]
 pub fn runtime_holds_runner(runtime: &Path) -> bool {
-    runtime.join("bin").is_dir()
+    // Fails closed: only "it is not there" releases a lease. A runtime this
+    // account cannot inspect (`host cache prune` run as another user than the
+    // service) is treated as held.
+    match fs::metadata(runtime.join("bin")) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 /// What one launch gets.
@@ -1167,7 +1230,7 @@ fn free_slot(slots: &Path, runtime: &Path, holds_runner: &dyn Fn(&Path) -> bool)
     (1..)
         .find(
             |slot| match fs::read_to_string(slots.join(format!("{slot}.{LEASE_EXTENSION}"))) {
-                Err(_) => true,
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
                 Ok(holder) => holder == own || !holds_runner(Path::new(&holder)),
             },
         )
@@ -1182,7 +1245,7 @@ fn namespace_in_use(namespace_dir: &Path, holds_runner: &dyn Fn(&Path) -> bool) 
     entries.flatten().any(|entry| {
         let path = entry.path();
         path.extension().is_some_and(|ext| ext == LEASE_EXTENSION)
-            && fs::read_to_string(&path).is_ok_and(|holder| holds_runner(Path::new(&holder)))
+            && fs::read_to_string(&path).map_or(true, |holder| holds_runner(Path::new(&holder)))
     })
 }
 
@@ -1247,7 +1310,9 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 /// Every namespace directory under `root`: exactly two levels down, below a
-/// first level that does not start with `.`.
+/// first level that does not start with `.`, and marked as one by a launch
+/// (`.last-used` or `_slots`). A directory nothing here created is never
+/// measured, so never pruned, whatever else shares the root.
 fn namespace_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     let Ok(first) = fs::read_dir(root) else {
@@ -1262,9 +1327,11 @@ fn namespace_dirs(root: &Path) -> Vec<(String, PathBuf)> {
             continue;
         };
         for inner in second.flatten() {
-            if inner.file_type().is_ok_and(|t| t.is_dir()) {
+            let path = inner.path();
+            let marked = path.join(LAST_USED_FILE).is_file() || path.join(SLOTS_DIR).is_dir();
+            if marked && inner.file_type().is_ok_and(|t| t.is_dir()) {
                 let name = format!("{outer_name}/{}", inner.file_name().to_string_lossy());
-                found.push((name, inner.path()));
+                found.push((name, path));
             }
         }
     }

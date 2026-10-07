@@ -90,6 +90,7 @@ fn the_default_variables_are_these_on_each_platform() {
         "npm_config_devdir",
         "npm_package_config_node_gyp_devdir",
         "electron_config_cache",
+        "ELECTRON_CACHE",
     ];
     let after_electron = [
         "ELECTRON_BUILDER_CACHE",
@@ -115,7 +116,6 @@ fn the_default_variables_are_these_on_each_platform() {
 
     let mut unix = vec!["XDG_CACHE_HOME"];
     unix.extend(common);
-    unix.push("ELECTRON_CACHE");
     unix.extend(after_electron);
     unix.extend(["CP_CACHE_DIR", "CCACHE_DIR"]);
     assert_eq!(names_on(MACOS, &config), unix);
@@ -300,6 +300,12 @@ fn namespace_segments_are_portable_path_segments() {
     assert_eq!(segment("my.repo-name_2"), "my.repo-name_2");
     // Windows strips a trailing dot, so `foo.` would otherwise share `foo`.
     assert_eq!(segment("foo."), "foo._");
+    // A long name is cut, keeps a digest of the whole, and so stays unique.
+    let long = "a".repeat(100);
+    let other = format!("{}b", "a".repeat(99));
+    assert_eq!(segment(&long).len(), MAX_SEGMENT_LEN);
+    assert_ne!(segment(&long), segment(&other));
+    assert!(segment(&long).starts_with("aaaa"));
     assert_eq!(
         Namespace::Shared("js".into()).dir(Path::new("/c")),
         Path::new("/c").join("_shared").join("js")
@@ -403,22 +409,82 @@ fn the_root_is_configured_or_under_the_runner_root_and_never_has_spaces() {
     assert!(resolve_root(&default, Some(spaced), Some(PathBuf::from("/a b"))).is_err());
 }
 
+/// A tool whose variable somebody already set is left wholly to them: the
+/// WSL host's systemd drop-in sets DOTNET_INSTALL_DIR by hand, and an
+/// operator's RUNNER_TOOL_CACHE must not be split from AGENT_TOOLSDIRECTORY.
 #[test]
-fn a_value_the_service_environment_already_carries_is_left_alone() {
-    // The WSL host's systemd drop-in sets DOTNET_INSTALL_DIR by hand.
-    let variables = vec![
-        (
-            "DOTNET_INSTALL_DIR",
-            OsString::from("/cache/o/r/_slots/1/dotnet"),
-        ),
-        ("npm_config_cache", OsString::from("/cache/o/r/npm")),
+fn a_tool_whose_variable_is_already_set_is_left_to_whoever_set_it() {
+    let set = [
+        "DOTNET_INSTALL_DIR",
+        "RUNNER_TOOL_CACHE",
+        "PLAYWRIGHT_BROWSERS_PATH",
     ];
-    let kept = without_inherited(variables, |name| name == "DOTNET_INSTALL_DIR");
-    assert_eq!(
-        kept,
-        [("npm_config_cache", OsString::from("/cache/o/r/npm"))]
-    );
+    let mut selection = select(&CacheConfig::default(), &repo("o/r"), LINUX);
+    selection.defer_to_operator(LINUX, |name| set.contains(&name));
+    let names: Vec<&str> = environment(
+        selection.enabled_tools(),
+        Path::new("/ns"),
+        Path::new("/ns/_slots/1"),
+        LINUX,
+    )
+    .0
+    .into_iter()
+    .map(|(name, _)| name)
+    .collect();
+    for gone in [
+        "DOTNET_INSTALL_DIR",
+        "RUNNER_TOOL_CACHE",
+        "AGENT_TOOLSDIRECTORY",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PLAYWRIGHT_SKIP_BROWSER_GC",
+    ] {
+        assert!(!names.contains(&gone), "{gone} was still set");
+    }
+    assert!(names.contains(&"npm_config_cache"));
+    let deferred = selection
+        .tools
+        .iter()
+        .find(|state| state.tool.id == "tool-cache")
+        .unwrap();
+    assert_eq!(deferred.source, ToolSource::Operator);
     assert!(!inherited("RM_CACHE_TEST_SURELY_UNSET_VARIABLE"));
+}
+
+#[test]
+fn the_macos_fallback_follows_the_application_data_not_the_account() {
+    let runtime = Path::new("/Users/me/Library/Application Support/io.github.x/runtime");
+    assert_eq!(
+        library_caches_beside(runtime),
+        Some(PathBuf::from("/Users/me/Library/Caches"))
+    );
+    assert_eq!(library_caches_beside(Path::new("/srv/rm/runtime")), None);
+}
+
+#[test]
+fn a_root_must_be_local_absolute_and_free_of_whitespace() {
+    for bad in [
+        r"\\server\share\cache",
+        "//server/share",
+        r"\\?\C:\cache",
+        "relative",
+    ] {
+        assert!(validate_root_text(bad).is_err(), "{bad} was accepted");
+    }
+    let good = std::env::temp_dir().join("cache");
+    assert!(validate_root_text(good.to_str().unwrap()).is_ok());
+}
+
+#[test]
+fn a_lease_held_by_a_runtime_that_cannot_be_inspected_is_held() {
+    let directory = tempfile::tempdir().unwrap();
+    let gone = directory.path().join("gone");
+    assert!(!runtime_holds_runner(&gone));
+    let live = runtime_with_runner(directory.path(), "live");
+    assert!(runtime_holds_runner(&live));
+    // A lease file that exists but cannot be read keeps its slot.
+    let slots = directory.path().join(SLOTS_DIR);
+    fs::create_dir_all(slots.join(format!("1.{LEASE_EXTENSION}"))).unwrap();
+    assert_eq!(free_slot(&slots, &live, &|_| false), 2);
 }
 
 // -- launch -------------------------------------------------------------------
@@ -605,6 +671,7 @@ fn a_read_only_go_module_cache_is_still_pruned() {
         .join("mod")
         .join("x@v1");
     fill(&module, 128);
+    age(&root.join("o").join("go-user"), 10);
     fs::set_permissions(&module, fs::Permissions::from_mode(0o555)).unwrap();
     let report = prune(&root, Some(0), &runtime_holds_runner).unwrap();
     assert_eq!(report.pruned, ["o/go-user"]);
@@ -617,7 +684,11 @@ fn measurement_ignores_the_roots_own_entries() {
     let root = directory.path();
     fill(&root.join(TRASH_DIR).join("x"), 10);
     fill(&root.join("o").join("r").join("npm"), 10);
+    fs::write(root.join("o").join("r").join(LAST_USED_FILE), b"").unwrap();
     fs::write(root.join(USAGE_FILE), b"{}").unwrap();
+    // Not created by a launch: a runner root or a stray directory that shares
+    // the cache root must never be measured, so never pruned.
+    fill(&root.join("0123456789abcdef").join("_work"), 10);
     let measured = measure(root, &runtime_holds_runner);
     assert_eq!(
         measured
@@ -681,4 +752,23 @@ fn the_readme_table_matches_the_tools_table() {
         })
         .count();
     assert_eq!(documented, TOOLS.len(), "the README lists a cache twice");
+}
+
+/// The longest file a cache normally holds is a pnpm store entry: a
+/// 128-character digest plus `-exec`. Under the default Windows root and with
+/// the longest names GitHub allows (39-character owner, 100-character
+/// repository), it still fits the 259 characters Windows allows without long
+/// path support.
+#[test]
+fn the_deepest_pnpm_store_file_fits_the_windows_path_limit_under_the_default_root() {
+    let namespace = Namespace::Repository {
+        owner: "o".repeat(39),
+        repo: "r".repeat(100),
+    };
+    let store_file = format!(
+        r"{}\pnpm-store\v10\files\ab\{}-exec",
+        namespace.dir(Path::new(r"C:\rman\_cache")).display(),
+        "0".repeat(128)
+    );
+    assert!(store_file.len() < 260, "{} characters", store_file.len());
 }

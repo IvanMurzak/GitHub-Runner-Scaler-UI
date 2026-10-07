@@ -135,41 +135,69 @@ fn host_cache_settings_round_trip_through_caches_toml() {
 #[test]
 fn host_cache_refuses_what_the_daemon_would_refuse_and_writes_nothing() {
     let data = tempfile::tempdir().unwrap();
-    for args in [
-        &["host", "cache", "set-root", "--path", "relative/cache"][..],
-        &["host", "cache", "set-root", "--path", "/has space/cache"][..],
-        &["host", "cache", "set-tool", "not-a-tool", "--state", "on"][..],
-        &[
-            "repo",
-            "cache",
-            "set-namespace",
-            "o/r",
-            "--shared",
-            "Not Valid",
-        ][..],
-        &["repo", "cache", "set-tool", "o/r", "nope", "--state", "off"][..],
-    ] {
-        let outcome = cli(data.path(), args);
+    // Absolute on every platform, so only the space can be what is refused.
+    let spaced = data.path().join("has space").join("cache");
+    let inside = data.path().join("state").join("cache");
+    let cases: [(Vec<&str>, &str); 6] = [
+        (
+            vec!["host", "cache", "set-root", "--path", "relative/cache"],
+            "absolute path without spaces",
+        ),
+        (
+            vec![
+                "host",
+                "cache",
+                "set-root",
+                "--path",
+                spaced.to_str().unwrap(),
+            ],
+            "absolute path without spaces",
+        ),
+        // A root inside the application data tree would be removed with it.
+        (
+            vec![
+                "host",
+                "cache",
+                "set-root",
+                "--path",
+                inside.to_str().unwrap(),
+            ],
+            "application",
+        ),
+        (
+            vec!["host", "cache", "set-tool", "not-a-tool", "--state", "on"],
+            "is not a cache this version knows",
+        ),
+        (
+            vec![
+                "repo",
+                "cache",
+                "set-namespace",
+                "o/r",
+                "--shared",
+                "Not Valid",
+            ],
+            "not a valid shared namespace",
+        ),
+        (
+            vec!["repo", "cache", "set-tool", "o/r", "nope", "--state", "off"],
+            "is not a cache this version knows",
+        ),
+    ];
+    for (args, expected) in cases {
+        let outcome = cli(data.path(), &args);
         assert_ne!(
             outcome.code,
             0,
             "{args:?} was accepted:\n{}",
             outcome.both()
         );
+        assert!(
+            outcome.both().contains(expected),
+            "{args:?} was refused for another reason than {expected:?}:\n{}",
+            outcome.both()
+        );
     }
-    // A root inside the application data tree would be removed with it.
-    let inside = data.path().join("state").join("cache");
-    let outcome = cli(
-        data.path(),
-        &[
-            "host",
-            "cache",
-            "set-root",
-            "--path",
-            inside.to_str().unwrap(),
-        ],
-    );
-    assert_ne!(outcome.code, 0, "{}", outcome.both());
     assert!(
         !caches_file(data.path()).exists(),
         "a refused change created caches.toml"
@@ -184,6 +212,30 @@ fn host_cache_refuses_what_the_daemon_would_refuse_and_writes_nothing() {
     assert_eq!(
         std::fs::read_to_string(caches_file(data.path())).unwrap(),
         "[tools]\nnot-a-tool = true\n"
+    );
+}
+
+/// A configured cache root and a runner root may not overlap in either
+/// direction: the prune would measure workspaces, and cleanup remove caches.
+#[test]
+fn a_runner_root_over_the_cache_root_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let root = data.path().join("cache-root");
+    std::fs::create_dir(&root).unwrap();
+    let root_text = root.to_str().unwrap();
+    ok(&cli(
+        data.path(),
+        &["host", "cache", "set-root", "--path", root_text],
+    ));
+    let outcome = cli(
+        data.path(),
+        &["host", "set-runtime-root", "--path", root_text],
+    );
+    assert_ne!(outcome.code, 0, "{}", outcome.both());
+    assert!(
+        outcome.both().contains("dependency-cache root"),
+        "{}",
+        outcome.both()
     );
 }
 
@@ -299,6 +351,8 @@ fn host_cache_prune_measures_and_keeps_what_fits() {
     let namespace = root.join("octo").join("app");
     std::fs::create_dir_all(namespace.join("npm")).unwrap();
     std::fs::write(namespace.join("npm").join("blob"), vec![0_u8; 4096]).unwrap();
+    // What a launch leaves: only a marked namespace is ever measured or pruned.
+    std::fs::write(namespace.join(".last-used"), b"").unwrap();
     ok(&cli(
         data.path(),
         &[
@@ -336,5 +390,25 @@ fn host_cache_prune_measures_and_keeps_what_fits() {
         status.stdout.contains("4 KiB of 20.0 GiB"),
         "{}",
         status.stdout
+    );
+}
+
+/// `repo cache show` says which caches `runner.env` takes over, as the daemon
+/// would at launch.
+#[test]
+fn repo_cache_show_marks_a_cache_runner_env_takes_over() {
+    let data = tempfile::tempdir().unwrap();
+    ok(&cli(
+        data.path(),
+        &["host", "env", "set", "NPM_CONFIG_CACHE=/operator/npm"],
+    ));
+    let shown = cli(data.path(), &["repo", "cache", "show", "o/r"]);
+    ok(&shown);
+    assert!(
+        shown
+            .stdout
+            .contains("npm               off  (set by runner.env or the service)"),
+        "{}",
+        shown.stdout
     );
 }

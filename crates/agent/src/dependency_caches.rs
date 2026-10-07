@@ -3,12 +3,13 @@
 //!
 //! The settings (`caches.toml`) are read at every launch, like `runner.env`,
 //! so `host cache` and `repo cache` reach the next runner without a restart.
-//! A file that does not parse fails the launch before the runner is registered
-//! with GitHub: it may hold an operator's decision to turn a repository's
-//! caches off, and starting runners without it would silently reverse that.
-//! Anything else that goes wrong — no root, a lock that cannot be taken, a
-//! directory that cannot be created — starts the runner without caches and is
-//! logged: a cache makes a job faster, never possible.
+//! A file that does not parse fails the launch in `prepare`, before the runner
+//! is registered with GitHub: it may hold an operator's decision to turn a
+//! repository's caches off, and starting runners without it would silently
+//! reverse that. Anything that goes wrong after registration — the file broken
+//! since, no root, a lock that cannot be taken, a directory that cannot be
+//! created — starts the runner without caches and is logged: a cache makes a
+//! job faster, never possible.
 //!
 //! Isolated runners (OCI, Hyper-V containers) get no caches. Their environment
 //! is the image's and the providers mount no host directory by design, so a
@@ -19,13 +20,19 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use runner_manager_domain::attempt::FailureReason;
 use runner_manager_domain::model::ScaleTarget;
 use runner_manager_platform::dependency_cache::{
     self, CacheConfig, CacheUsage, ResolvedRoot, runtime_holds_runner,
 };
-use runner_manager_platform::runner_env::RunnerPlatform;
+use runner_manager_platform::runner_env::{RunnerEnv, RunnerPlatform};
+
+/// Set while a prune pass walks the cache root. A daemon reload starts new
+/// maintenance loops while a blocking walk of the old one may still run; two
+/// walks of a pnpm store at once would only double the I/O.
+static PRUNING: AtomicBool = AtomicBool::new(false);
 
 /// The effective host runner root, read when needed: it lives in the journal
 /// and `host set-runtime-root` may change it while the daemon runs.
@@ -97,19 +104,39 @@ impl DependencyCaches {
     /// The variables a native runner of `target` whose attempt is at `runtime`
     /// starts with, after leasing its slot and creating its directories.
     ///
-    /// # Errors
-    /// Only an unusable `caches.toml`; see the module documentation.
+    /// A tool any of whose variables `host_env` or the service's own
+    /// environment already sets is left out entirely, so an operator's setting
+    /// is never mixed with this one. Never fails: `prepare` already refused a
+    /// broken file, and anything wrong now costs the job its caches, not its
+    /// runner.
+    #[must_use]
     pub fn for_launch(
         &self,
         target: &ScaleTarget,
         runtime: &Path,
-    ) -> Result<Vec<(&'static str, OsString)>, FailureReason> {
-        let config = self.config()?;
+        host_env: &RunnerEnv,
+    ) -> Vec<(&'static str, OsString)> {
+        let config = match CacheConfig::load(&self.config_file) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    reason = "dependency_cache_config_invalid",
+                    "starting the runner without dependency caches: {error}"
+                );
+                return Vec::new();
+            }
+        };
         let platform = RunnerPlatform::current();
-        let selection = dependency_cache::select(&config, target, platform);
+        let mut selection = dependency_cache::select(&config, target, platform);
         if selection.disabled.is_some() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
+        selection.defer_to_operator(platform, |name| {
+            dependency_cache::inherited(name)
+                || host_env
+                    .entries()
+                    .any(|(set, _)| set.eq_ignore_ascii_case(name))
+        });
         let root = match self.root(&config) {
             Ok(root) => root,
             Err(why) => {
@@ -117,7 +144,7 @@ impl DependencyCaches {
                     reason = "dependency_cache_root_unresolved",
                     "starting the runner without dependency caches: {why}"
                 );
-                return Ok(Vec::new());
+                return Vec::new();
             }
         };
         match dependency_cache::prepare_launch(
@@ -127,16 +154,13 @@ impl DependencyCaches {
             platform,
             &runtime_holds_runner,
         ) {
-            Ok(launch) => Ok(dependency_cache::without_inherited(
-                launch.variables,
-                dependency_cache::inherited,
-            )),
+            Ok(launch) => launch.variables,
             Err(error) => {
                 tracing::warn!(
                     reason = "dependency_cache_unavailable",
                     "starting the runner without dependency caches: {error}"
                 );
-                Ok(Vec::new())
+                Vec::new()
             }
         }
     }
@@ -145,7 +169,16 @@ impl DependencyCaches {
     /// when caches are off, no root resolves or the root does not exist yet.
     #[must_use]
     pub fn prune_once(&self) -> Option<CacheUsage> {
-        let config = self.config().ok()?;
+        if PRUNING.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let usage = self.prune_unguarded();
+        PRUNING.store(false, Ordering::Release);
+        usage
+    }
+
+    fn prune_unguarded(&self) -> Option<CacheUsage> {
+        let config = CacheConfig::load(&self.config_file).ok()?;
         if !config.host_enabled() {
             return None;
         }
@@ -205,9 +238,11 @@ mod tests {
         let runtime = runner_root.join("a1b2c3d4");
         std::fs::create_dir_all(runtime.join("bin")).unwrap();
         let target = ScaleTarget::repository("Octo/Repo").unwrap();
-        let variables = caches(dir.path(), Some(runner_root.clone()))
-            .for_launch(&target, &runtime)
-            .unwrap();
+        let variables = caches(dir.path(), Some(runner_root.clone())).for_launch(
+            &target,
+            &runtime,
+            &RunnerEnv::default(),
+        );
         let npm = variables
             .iter()
             .find(|(name, _)| *name == "npm_config_cache")
@@ -225,21 +260,55 @@ mod tests {
     }
 
     #[test]
-    fn an_organization_or_a_disabled_host_gets_nothing_and_a_broken_file_fails() {
+    fn an_organization_a_disabled_host_or_a_broken_file_gets_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("a1");
+        let none = RunnerEnv::default();
         let caches = caches(dir.path(), Some(dir.path().to_path_buf()));
         let org = ScaleTarget::organization("acme").unwrap();
-        assert!(caches.for_launch(&org, &runtime).unwrap().is_empty());
+        assert!(caches.for_launch(&org, &runtime, &none).is_empty());
 
         let path = dependency_cache::config_path_in(dir.path());
         std::fs::write(&path, "enabled = false\n").unwrap();
         let repo = ScaleTarget::repository("o/r").unwrap();
-        assert!(caches.for_launch(&repo, &runtime).unwrap().is_empty());
+        assert!(caches.for_launch(&repo, &runtime, &none).is_empty());
 
+        // `prepare` refuses a broken file before registration; one broken
+        // after it costs the job its caches, not its runner.
         std::fs::write(&path, "[tools]\nnope = true\n").unwrap();
-        let failure = caches.for_launch(&repo, &runtime).unwrap_err().to_string();
+        assert!(caches.for_launch(&repo, &runtime, &none).is_empty());
+        let failure = caches.config().unwrap_err().to_string();
         assert!(failure.contains("caches.toml"), "{failure}");
+    }
+
+    /// An operator's `runner.env` takes a whole tool, in any letter case.
+    #[test]
+    fn runner_env_takes_the_whole_tool_whatever_the_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("rman").join("a1");
+        std::fs::create_dir_all(runtime.join("bin")).unwrap();
+        let caches = caches(dir.path(), Some(dir.path().join("rman")));
+        let repo = ScaleTarget::repository("o/r").unwrap();
+        let host_env =
+            RunnerEnv::parse("NPM_CONFIG_STORE_DIR=/operator/pnpm\nRUNNER_TOOL_CACHE=/tc\n")
+                .unwrap();
+        let names: Vec<&str> = caches
+            .for_launch(&repo, &runtime, &host_env)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for gone in [
+            "npm_config_store_dir",
+            "PNPM_CONFIG_STORE_DIR",
+            "RUNNER_TOOL_CACHE",
+            "AGENT_TOOLSDIRECTORY",
+        ] {
+            assert!(
+                !names.contains(&gone),
+                "{gone} was set beside the operator's"
+            );
+        }
+        assert!(names.contains(&"npm_config_cache"));
     }
 
     #[test]
@@ -249,8 +318,7 @@ mod tests {
         let repo = ScaleTarget::repository("o/r").unwrap();
         assert!(
             caches
-                .for_launch(&repo, &dir.path().join("a"))
-                .unwrap()
+                .for_launch(&repo, &dir.path().join("a"), &RunnerEnv::default())
                 .is_empty()
         );
     }

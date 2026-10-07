@@ -476,6 +476,17 @@ fn preflight_against_everything<'a>(
                 preflight.against(RootOwner::Repository(policy.target.slug()), root.clone());
         }
     }
+    // A configured dependency-cache root, so that no runner root is placed
+    // over the caches (or the caches over a runner root): the prune would then
+    // measure workspaces, and attempt cleanup would remove caches.
+    let caches = runner_manager_platform::dependency_cache::config_path_in(app_paths.config_dir());
+    if let Some(root) = runner_manager_platform::dependency_cache::CacheConfig::load(&caches)
+        .ok()
+        .and_then(|config| config.root)
+        .and_then(|root| LocalAbsolutePath::new(root).ok())
+    {
+        preflight = preflight.against(RootOwner::DependencyCache, root);
+    }
     preflight
 }
 

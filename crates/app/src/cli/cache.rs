@@ -717,7 +717,18 @@ fn write_target_show(
     out: &mut dyn Write,
 ) -> io::Result<()> {
     let platform = RunnerPlatform::current();
-    let selection = dependency_cache::select(config, target, platform);
+    let mut selection = dependency_cache::select(config, target, platform);
+    // What the daemon defers to `runner.env`. The service's own environment
+    // is not this process's, so only the file can be asked here.
+    let runner_env = runner_manager_platform::runner_env::RunnerEnv::load(
+        &runner_manager_platform::runner_env::path_in(context.paths().config_dir()),
+    )
+    .unwrap_or_default();
+    selection.defer_to_operator(platform, |name| {
+        runner_env
+            .entries()
+            .any(|(set, _)| set.eq_ignore_ascii_case(name))
+    });
     writeln!(out, "Dependency caches for {}", target.slug())?;
     match selection.disabled {
         Some(why) => writeln!(out, "  state                     off: {why}")?,
