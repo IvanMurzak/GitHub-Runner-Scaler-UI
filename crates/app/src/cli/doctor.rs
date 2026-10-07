@@ -102,7 +102,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const MEMORY_PER_RUNNER_GIB: u64 = 3;
 
 /// A GitHub contact this recent proves the service could read its credential.
-const RECENT_CONTACT_SECS: u64 = 15 * 60;
+pub(crate) const RECENT_CONTACT_SECS: u64 = 15 * 60;
 
 const ALLOW_AV_EXCLUSION: &str = "--allow-av-exclusion";
 const ALLOW_DEVELOPER_MODE: &str = "--allow-developer-mode";
@@ -2104,6 +2104,20 @@ fn current_daemon_contact_age(
         return None;
     }
     u64::try_from((now - contact).num_seconds()).ok()
+}
+
+/// How long ago the installed service last reached GitHub, counted only when
+/// the binary installed now made that contact. See
+/// [`current_daemon_contact_age`].
+pub(crate) fn installed_service_contact_age(context: &Context) -> Option<u64> {
+    let binary = InstallRecord::read(context.paths()).ok().flatten()?.binary;
+    current_daemon_contact_age(
+        runner_manager_platform::service::last_github_contact(context.paths())
+            .ok()
+            .flatten(),
+        replaced_at(&binary),
+        context.clock().now(),
+    )
 }
 
 /// When `binary` was put in place: its status-change time, which a copy or a

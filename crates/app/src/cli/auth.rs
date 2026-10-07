@@ -60,6 +60,8 @@ use runner_manager_github::{
 };
 use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
+use runner_manager_platform::service::InstallRecord;
+use runner_manager_platform::service_request;
 use secrecy::zeroize::Zeroize as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -1374,7 +1376,7 @@ fn store_received_credential(
 /// reason. `f1`'s Definition of Done names four; folding an offline host into
 /// [`CredentialState::Revoked`] would tell an operator with a dropped
 /// connection to sign in again, which is the wrong remedy stated confidently.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum CredentialState {
     /// No value in the store. The ordinary state before `auth login`.
     NotAuthenticated,
@@ -1446,13 +1448,89 @@ pub fn credential_state(
     context: &Context,
     secrets: &dyn SecretStore,
 ) -> Result<CredentialState, CliError> {
-    let Some(secret) = secrets
-        .load()
-        .map_err(|source| secret_store_failure(&source))?
-    else {
-        return Ok(CredentialState::NotAuthenticated);
-    };
-    credential_state_of(context, secret)
+    credential_state_or_ask(context, secrets, || ask_service(context))
+}
+
+fn credential_state_or_ask(
+    context: &Context,
+    secrets: &dyn SecretStore,
+    ask: impl FnOnce() -> Option<Result<CredentialState, String>>,
+) -> Result<CredentialState, CliError> {
+    match secrets.load() {
+        Ok(Some(secret)) => credential_state_of(context, secret),
+        Ok(None) => Ok(CredentialState::NotAuthenticated),
+        Err(source) => through_service(&source, ask),
+    }
+}
+
+/// Asks the service installed from this account's directories what the
+/// credential reaches, for a command that could not read the store itself.
+/// `None` when no service is installed from them, so nothing is waited for.
+///
+/// # Why
+///
+/// On a login-mode Mac reached over SSH the credential is in a login keychain
+/// the SSH session cannot unlock, so `repo add`, `org add` and `auth status`
+/// failed there while the service, in the desktop session, read the same item
+/// every poll. The service answers through
+/// [`service_request::GITHUB_DISCOVERY`]: what GitHub said about the
+/// installations, never the credential.
+fn ask_service(context: &Context) -> Option<Result<CredentialState, String>> {
+    InstallRecord::read(context.paths()).ok().flatten()?;
+    Some(ask_service_at(
+        context.paths().state_dir(),
+        service_request::Wait::GITHUB,
+    ))
+}
+
+fn ask_service_at(
+    state_dir: &std::path::Path,
+    wait: service_request::Wait,
+) -> Result<CredentialState, String> {
+    service_request::GITHUB_DISCOVERY
+        .ask(state_dir, wait)
+        .map_err(|error| error.to_string())
+}
+
+/// The store could not be read: the service's answer when there is one,
+/// otherwise the store's own failure, with what the service said beside it.
+fn through_service(
+    source: &SecretStoreError,
+    ask: impl FnOnce() -> Option<Result<CredentialState, String>>,
+) -> Result<CredentialState, CliError> {
+    match ask() {
+        Some(Ok(state)) => Ok(state),
+        None => Err(secret_store_failure(source)),
+        Some(Err(why)) => {
+            let failure = secret_store_failure(source);
+            Err(CliError::with_remedy(
+                Failure::SecretStore,
+                format!(
+                    "{}; the service was asked instead, and {why}",
+                    failure.message()
+                ),
+                "runner-manager service status",
+            ))
+        }
+    }
+}
+
+/// The service's half of [`ask_service`]: what the credential stored for
+/// `mode` reaches, read in the service's own session.
+pub async fn credential_state_for_service(
+    context: &Context,
+    mode: StartMode,
+) -> Result<CredentialState, String> {
+    let secrets = context
+        .secret_store(mode)
+        .map_err(|error| error.to_string())?;
+    match secrets.load() {
+        Ok(Some(secret)) => discover(context, secret)
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(None) => Ok(CredentialState::NotAuthenticated),
+        Err(source) => Err(format!("it cannot read its credential either: {source}")),
+    }
 }
 
 /// What GitHub makes of a credential already in hand.
@@ -1470,6 +1548,10 @@ pub fn credential_state_of(
     context: &Context,
     secret: SecretString,
 ) -> Result<CredentialState, CliError> {
+    super::runtime()?.block_on(discover(context, secret))
+}
+
+async fn discover(context: &Context, secret: SecretString) -> Result<CredentialState, CliError> {
     let app = context.app_registration()?;
     let client = AuthenticatedClient::new(
         context.endpoints().clone(),
@@ -1478,8 +1560,7 @@ pub fn credential_state_of(
     )
     .map_err(|source| github_failure(&source))?;
 
-    let runtime = super::runtime()?;
-    match runtime.block_on(client.discover_installations(&app)) {
+    match client.discover_installations(&app).await {
         Ok(discovery) => Ok(CredentialState::Authenticated(Box::new(discovery))),
         Err(GithubError::AuthenticationFailed) => Ok(CredentialState::Revoked),
         Err(GithubError::AuthenticationLockout { retry_after }) => Ok(CredentialState::LockedOut {
@@ -2035,6 +2116,75 @@ mod tests {
             ..unchosen
         };
         assert_eq!(assumed_start_mode(recorded_login), StartMode::Login);
+    }
+
+    fn locked_login_keychain() -> SecretStoreError {
+        SecretStoreError::Load {
+            scope: runner_manager_platform::secrets::SecretScope::User,
+            location: "login keychain".into(),
+            source: std::io::Error::other("the login keychain is locked for this session"),
+        }
+    }
+
+    /// An SSH session on a login-mode Mac cannot unlock the login keychain;
+    /// the running service can, and answers for it.
+    #[test]
+    fn a_store_this_session_cannot_read_is_answered_by_the_service() {
+        let answered = through_service(&locked_login_keychain(), || {
+            Some(Ok(CredentialState::Revoked))
+        })
+        .expect("the service's answer");
+        assert!(matches!(answered, CredentialState::Revoked));
+
+        // No service installed from this account's directories: the store's
+        // own failure, as before.
+        let alone = through_service(&locked_login_keychain(), || None).unwrap_err();
+        assert!(alone.message().contains("locked for this session"), "{alone:?}");
+
+        // A service that could not answer either: both reasons.
+        let neither = through_service(&locked_login_keychain(), || {
+            Some(Err("no running service took the request within 8 seconds".into()))
+        })
+        .unwrap_err();
+        assert!(neither.message().contains("locked for this session"), "{neither:?}");
+        assert!(
+            neither.message().contains("the service was asked instead, and no running service"),
+            "{neither:?}"
+        );
+        assert_eq!(neither.remedy(), Some("runner-manager service status"));
+    }
+
+    /// What crosses the request channel survives the trip: the installations,
+    /// never the credential.
+    #[test]
+    fn a_credential_state_round_trips_through_the_service_channel() {
+        let state = CredentialState::LockedOut {
+            retry_after_secs: 60,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: CredentialState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            CredentialState::LockedOut {
+                retry_after_secs: 60
+            }
+        ));
+        let not_installed = CredentialState::Authenticated(Box::new(
+            runner_manager_github::InstallationDiscovery::NotInstalled {
+                install_url: reqwest::Url::parse("https://github.com/apps/x/installations/new")
+                    .unwrap(),
+            },
+        ));
+        let json = serde_json::to_string(&not_installed).unwrap();
+        let CredentialState::Authenticated(discovery) =
+            serde_json::from_str::<CredentialState>(&json).unwrap()
+        else {
+            panic!("{json}");
+        };
+        assert_eq!(
+            discovery.install_url().map(reqwest::Url::as_str),
+            Some("https://github.com/apps/x/installations/new")
+        );
     }
 
     #[test]
@@ -3047,6 +3197,60 @@ mod tests {
                 },
             })
         }
+    }
+
+    /// The whole command half against the real channel: the store refuses,
+    /// a stand-in service takes the request and answers, and the command gets
+    /// the service's answer rather than the store's error.
+    #[test]
+    fn an_unreadable_store_is_answered_by_the_running_service_through_the_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let context = Context::rooted_against(
+            root.path(),
+            runner_manager_github::Endpoints::for_test_server("http://127.0.0.1:9").unwrap(),
+        )
+        .unwrap();
+        let state_dir = context.paths().state_dir().to_path_buf();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let service_dir = state_dir.clone();
+        let service = std::thread::spawn(move || {
+            loop {
+                if let Some(request) = service_request::GITHUB_DISCOVERY.take(&service_dir) {
+                    service_request::GITHUB_DISCOVERY
+                        .answer(
+                            &service_dir,
+                            &request,
+                            Ok(CredentialState::LockedOut {
+                                retry_after_secs: 42,
+                            }),
+                        )
+                        .unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let store = UnreadableStore::holding("{}");
+        let wait = service_request::Wait {
+            taken: Duration::from_secs(5),
+            finished: Duration::from_secs(5),
+            poll: Duration::from_millis(20),
+        };
+        let state = credential_state_or_ask(&context, &store, || {
+            Some(ask_service_at(&state_dir, wait))
+        })
+        .expect("the service's answer");
+        service.join().unwrap();
+        assert!(
+            matches!(
+                state,
+                CredentialState::LockedOut {
+                    retry_after_secs: 42
+                }
+            ),
+            "{state:?}"
+        );
+        assert_eq!(store.loads(), 1);
     }
 
     // -- the device-flow fixture -------------------------------------------

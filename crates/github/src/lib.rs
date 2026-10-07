@@ -2250,7 +2250,8 @@ impl RepositorySelection {
 }
 
 /// Whose account an installation sits on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallationAccount {
     User(String),
     Organization(Org),
@@ -2309,7 +2310,12 @@ impl fmt::Display for InstallationAccount {
 }
 
 /// One installation of the published App, and what it can actually reach.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable, as is everything [`InstallationDiscovery`] holds, so that a
+/// service can answer a discovery for a command that cannot read the
+/// credential itself (an SSH session on a Mac, whose login keychain it cannot
+/// unlock). Nothing in it is a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installation {
     pub id: u64,
     pub account: InstallationAccount,
@@ -2329,7 +2335,7 @@ impl Installation {
 }
 
 /// Everything the stored credential can reach.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReachableTargets {
     installations: Vec<Installation>,
     skipped: usize,
@@ -2396,13 +2402,17 @@ impl ReachableTargets {
 }
 
 /// What `auth status` and `auth login` show after a successful sign-in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallationDiscovery {
     /// The credential is valid, GitHub reported nothing this client could not
     /// describe, and still nothing is reachable: the App is installed nowhere,
     /// or on nothing. `03-control-flows.md` flow 1.1 requires the installation
     /// URL here, and the URL is the remediation.
-    NotInstalled { install_url: Url },
+    NotInstalled {
+        #[serde(with = "url_text")]
+        install_url: Url,
+    },
     /// Nothing is reachable, but at least one installation was **skipped**, so
     /// this client cannot tell "not installed" from "installed on something it
     /// could not describe".
@@ -2460,6 +2470,22 @@ impl InstallationDiscovery {
             Self::Indeterminate { skipped } => *skipped,
             Self::Installed(targets) => targets.skipped(),
         }
+    }
+}
+
+/// A [`Url`] as its text: this workspace builds `url` without its `serde`
+/// feature.
+mod url_text {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+    use url::Url;
+
+    pub(super) fn serialize<S: Serializer>(url: &Url, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(url.as_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Url, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Url::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 

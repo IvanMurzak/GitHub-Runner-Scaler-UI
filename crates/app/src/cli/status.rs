@@ -241,6 +241,14 @@ pub struct Credential {
     pub unreadable: Option<String>,
     pub store_scope: String,
     pub store_location: String,
+    /// While `unreadable` is set: how long ago the installed service, which
+    /// reads the store in its own session, last reached GitHub, in seconds.
+    /// `null` when it has not since its binary was put in place.
+    ///
+    /// A login-mode Mac reached over SSH is the case: the SSH session cannot
+    /// unlock the login keychain, and `status` used to report that as the
+    /// credential's problem while the service was using it every poll.
+    pub service_reached_github_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -466,6 +474,10 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         Ok(value) => (value.is_some(), None),
         Err(source) => (false, Some(source.to_string())),
     };
+    let service_reached_github_secs_ago = unreadable
+        .is_some()
+        .then(|| super::doctor::installed_service_contact_age(context))
+        .flatten();
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
@@ -505,6 +517,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             unreadable,
             store_scope: secrets.scope().to_string(),
             store_location: secrets.location(),
+            service_reached_github_secs_ago,
         },
         host: HostSnapshot {
             configured: host.is_some(),
@@ -636,24 +649,51 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         "  ephemeral paths           {} active, {} awaiting cleanup",
         document.host.active_ephemeral_attempts, document.host.cleanup_blocked_ephemeral_attempts
     )?;
-    writeln!(
-        out,
-        "  credential                {} in the {}-scoped store",
-        match (&document.credential.unreadable, document.credential.present) {
-            // Never "absent". An unreadable store has not answered the
-            // question, and the two words an operator acts on differently must
-            // not be the same word.
-            (Some(_), _) => "not readable by this account",
-            (None, true) => "present",
-            (None, false) => "absent",
-        },
-        document.credential.store_scope
-    )?;
+    // The service reads the store in its own session. When it reached GitHub
+    // recently, a store this session cannot read is this session's limit (an
+    // SSH session and a login keychain), not the credential's problem.
+    let in_use_by_service = document.credential.unreadable.is_some()
+        && document
+            .credential
+            .service_reached_github_secs_ago
+            .is_some_and(|age| age <= super::doctor::RECENT_CONTACT_SECS);
+    if in_use_by_service {
+        let minutes = document
+            .credential
+            .service_reached_github_secs_ago
+            .unwrap_or_default()
+            / 60;
+        writeln!(
+            out,
+            "  credential                in use by the service, which reached GitHub {minutes} \
+             minute(s) ago, in the {}-scoped store",
+            document.credential.store_scope
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  credential                {} in the {}-scoped store",
+            match (&document.credential.unreadable, document.credential.present) {
+                // Never "absent". An unreadable store has not answered the
+                // question, and the two words an operator acts on differently
+                // must not be the same word.
+                (Some(_), _) => "not readable by this account",
+                (None, true) => "present",
+                (None, false) => "absent",
+            },
+            document.credential.store_scope
+        )?;
+    }
     // The store's own words, on their own line, for the same reason the runner
     // root's problem gets one: the reason names a remedy and a two-column table
     // cell would truncate it.
     if let Some(reason) = &document.credential.unreadable {
-        writeln!(out, "  credential problem        {reason}")?;
+        let label = if in_use_by_service {
+            "not readable here  "
+        } else {
+            "credential problem"
+        };
+        writeln!(out, "  {label}        {reason}")?;
     }
     writeln!(
         out,
@@ -765,6 +805,7 @@ mod tests {
                 unreadable: None,
                 store_scope: "machine".to_string(),
                 store_location: "C:/ProgramData/runner-manager/secrets".to_string(),
+                service_reached_github_secs_ago: None,
             },
             host: HostSnapshot {
                 configured: true,
@@ -941,7 +982,13 @@ mod tests {
         );
         assert_eq!(
             keys(&emitted, "/credential"),
-            ["present", "store_location", "store_scope", "unreadable"]
+            [
+                "present",
+                "service_reached_github_secs_ago",
+                "store_location",
+                "store_scope",
+                "unreadable"
+            ]
         );
         assert_eq!(
             keys(&emitted, "/host"),
@@ -1161,6 +1208,44 @@ mod tests {
         // And the rest of the snapshot is still there, which is what failing
         // outright used to cost.
         assert!(text.contains("Policies (1)"), "{text}");
+    }
+
+    /// An SSH session on a login-mode Mac cannot unlock the login keychain,
+    /// while the service, in the desktop session, uses the credential every
+    /// poll. `status` defers to the service's recent contact.
+    #[test]
+    fn a_store_only_the_service_can_read_defers_to_its_recent_contact() {
+        let mut document = document();
+        document.credential.present = false;
+        document.credential.unreadable =
+            Some("the login keychain is locked for this session".to_string());
+        document.credential.service_reached_github_secs_ago = Some(130);
+
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains(
+                "credential                in use by the service, which reached GitHub 2 \
+                 minute(s) ago"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("credential problem"), "{text}");
+        assert!(!text.contains("not readable by this account"), "{text}");
+        assert!(
+            text.contains("not readable here          the login keychain is locked"),
+            "the session's own limit is still said: {text}"
+        );
+
+        // A contact too old to vouch for the credential changes nothing.
+        document.credential.service_reached_github_secs_ago =
+            Some(super::super::doctor::RECENT_CONTACT_SECS + 1);
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(text.contains("not readable by this account"), "{text}");
+        assert!(text.contains("credential problem"), "{text}");
     }
 
     /// Blocked launches name their reason and their remedy, in the text and in

@@ -164,6 +164,9 @@ async fn run_generation(
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
             },
+            () = answer_github_requests(context, host.service_start_mode) => {
+                unreachable!("GitHub requests are answered until the daemon is stopped")
+            },
             // No runner grows the caches on an idle host, so nothing prunes on
             // a schedule; an operator's `host cache prune` is still honoured.
             () = maintain_dependency_caches(
@@ -465,6 +468,9 @@ async fn run_generation(
         ) => {
             unreachable!("dependency cache pruning runs until the daemon is stopped")
         }
+        () = answer_github_requests(context, mode) => {
+            unreachable!("GitHub requests are answered until the daemon is stopped")
+        }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
@@ -640,6 +646,33 @@ async fn maintain_dependency_caches(
             }
         }
         tokio::time::sleep(PRUNE_REQUEST_POLL).await;
+    }
+}
+
+/// Answers what the stored credential reaches, for a command that cannot read
+/// it: `repo add`, `org add` or `auth status` in an SSH session on a login-mode
+/// Mac, whose login keychain that session cannot unlock. This process reads it
+/// in the session it runs in. See
+/// [`GITHUB_DISCOVERY`](runner_manager_platform::service_request::GITHUB_DISCOVERY).
+async fn answer_github_requests(context: &Context, mode: StartMode) {
+    use runner_manager_platform::service_request::{GITHUB_DISCOVERY, POLL};
+    let state_dir = context.paths().state_dir().to_path_buf();
+    let request_file = GITHUB_DISCOVERY.request_path(&state_dir);
+    loop {
+        // Almost every look finds nothing, and a look is one `stat`.
+        if request_file.exists()
+            && let Some(request) = GITHUB_DISCOVERY.take(&state_dir)
+        {
+            let outcome = super::auth::credential_state_for_service(context, mode).await;
+            if let Err(error) = GITHUB_DISCOVERY.answer(&state_dir, &request, outcome) {
+                tracing::warn!(
+                    %error,
+                    reason = "github_request_unanswered",
+                    "could not answer a command waiting for what the credential reaches"
+                );
+            }
+        }
+        tokio::time::sleep(POLL).await;
     }
 }
 
