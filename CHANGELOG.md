@@ -56,6 +56,12 @@ the version being prepared rather than the version in `Cargo.toml`.
 - `host doctor`'s `macos.keychain_credential` check passes after an update once the credential
   has been handed over. When it still fails, it says why (an item written by a build that did not
   hand it over) and that the sign-in has to happen in a Terminal on the Mac, not over SSH.
+- `host doctor` no longer passes the keychain check on the strength of the previous binary: right
+  after an update the last GitHub contact was the old daemon's, made during its drain, so the
+  check said "reached GitHub 0 minute(s) ago" while every start of the new daemon failed with
+  `-25293`. A contact now counts only if it is newer than the service binary, and the daemon's own
+  record that it cannot read its credential fails the check outright. `macos.launchd_priority`
+  no longer says the service runs at normal priority while it is not running.
 - The macOS keychain error says which of three things happened: the System Keychain read by an
   account that is not root, a login keychain locked for this session (an SSH session cannot use
   the desktop session's unlocked login keychain, so even a healthy credential reads `-25293` there),
