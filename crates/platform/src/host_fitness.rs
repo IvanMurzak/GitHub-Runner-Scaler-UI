@@ -113,6 +113,76 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .map_err(|error| error.error)
 }
 
+/// How a bounded look at a directory went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Responsiveness {
+    /// It answered a `stat` and the first entry of a listing in time.
+    Responds,
+    /// It did not answer within the deadline: a hung volume (a stalled USB or
+    /// NVMe enclosure, a dead network mount).
+    Hung,
+    /// It answered with an error.
+    Failed(String),
+}
+
+/// Paths a [`directory_responds`] probe is still blocked on, so a volume that
+/// stays hung costs one stuck thread rather than one per probe.
+static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `directory` (or, when it does not exist yet, its nearest existing
+/// ancestor) answers a `stat` and a one-entry listing within `deadline`.
+///
+/// The look runs on its own thread because a call into a hung filesystem does
+/// not return and cannot be cancelled. That thread is left blocked when the
+/// deadline passes, and while it is, later probes of the same path report
+/// [`Responsiveness::Hung`] at once instead of stacking more threads on it.
+#[must_use]
+pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Responsiveness {
+    let path = directory.to_path_buf();
+    {
+        let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() else {
+            return Responsiveness::Failed("the probe registry is poisoned".into());
+        };
+        if in_flight.contains(&path) {
+            return Responsiveness::Hung;
+        }
+        in_flight.push(path.clone());
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let probed = path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("runner-root-probe".into())
+        .spawn(move || {
+            let existing = probed
+                .ancestors()
+                .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+                .map(Path::to_path_buf);
+            let answer = match existing {
+                None => Responsiveness::Failed(format!("{} does not exist", probed.display())),
+                Some(existing) => match std::fs::read_dir(&existing) {
+                    Ok(mut entries) => match entries.next() {
+                        Some(Err(error)) => Responsiveness::Failed(error.to_string()),
+                        _ => Responsiveness::Responds,
+                    },
+                    Err(error) => Responsiveness::Failed(error.to_string()),
+                },
+            };
+            if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
+                in_flight.retain(|candidate| *candidate != probed);
+            }
+            let _ = sender.send(answer);
+        });
+    if let Err(error) = spawned {
+        if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
+            in_flight.retain(|candidate| *candidate != path);
+        }
+        return Responsiveness::Failed(error.to_string());
+    }
+    receiver
+        .recv_timeout(deadline)
+        .unwrap_or(Responsiveness::Hung)
+}
+
 /// Whether this process can create a symbolic link inside `directory`.
 ///
 /// Measured rather than inferred: a link is created and removed again. On
@@ -955,5 +1025,46 @@ mod tests {
     #[test]
     fn physical_memory_is_reported() {
         assert!(physical_memory_bytes().is_some_and(|bytes| bytes > 256 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_directory_responds_and_a_not_yet_created_one_is_judged_by_its_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let deadline = std::time::Duration::from_secs(10);
+        assert_eq!(
+            directory_responds(directory.path(), deadline),
+            Responsiveness::Responds
+        );
+        assert_eq!(
+            directory_responds(&directory.path().join("not-yet").join("deeper"), deadline),
+            Responsiveness::Responds
+        );
+        // Only this test's paths: the registry is shared with tests running
+        // beside it.
+        assert!(
+            !PROBES_IN_FLIGHT
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with(directory.path())),
+            "a finished probe deregisters"
+        );
+    }
+
+    /// While an earlier probe of a path is still blocked, a new one answers
+    /// `Hung` at once instead of parking another thread on the same volume.
+    #[test]
+    fn a_path_still_being_probed_is_hung_without_a_second_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let stuck = directory.path().join("stuck-volume");
+        PROBES_IN_FLIGHT.lock().unwrap().push(stuck.clone());
+        let started = std::time::Instant::now();
+        let answer = directory_responds(&stuck, std::time::Duration::from_secs(30));
+        PROBES_IN_FLIGHT
+            .lock()
+            .unwrap()
+            .retain(|path| *path != stuck);
+        assert_eq!(answer, Responsiveness::Hung);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

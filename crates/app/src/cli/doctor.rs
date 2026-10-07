@@ -357,6 +357,8 @@ pub trait HostFacts {
     /// `Ok(None)` when Spotlight gave no answer for this volume (a mount point).
     fn spotlight_indexing(&self, volume: &Path) -> Result<Option<bool>, String>;
     fn mount_point(&self, path: &Path) -> Option<PathBuf>;
+    /// A bounded `stat` and one-entry listing of `directory`.
+    fn directory_responds(&self, directory: &Path) -> host_fitness::Responsiveness;
     fn launchd_process_type(&self, plist: &Path) -> Result<Option<String>, String>;
     fn throttled_runner_processes(&self) -> Result<usize, String>;
     fn service_credential(
@@ -692,6 +694,14 @@ pub const CHECKS: &[CheckSpec] = &[
         platform: CheckPlatform::Macos,
         severity: Severity::Required,
         probe: probe_keychain_credential,
+        fix: None,
+    },
+    CheckSpec {
+        id: "host.runner_root_responsive",
+        title: "Runner roots respond",
+        platform: CheckPlatform::Any,
+        severity: Severity::Required,
+        probe: probe_runner_root_responsive,
         fix: None,
     },
     CheckSpec {
@@ -1152,6 +1162,10 @@ fn indexed_roots(
     // Roots usually share a volume; ask Spotlight about each volume once.
     let mut answers: BTreeMap<PathBuf, Option<bool>> = BTreeMap::new();
     for root in setup.runner_roots.iter().filter(|root| !is_noindex(root)) {
+        // `df` and `mdutil` on a hung volume would hang this whole check.
+        if facts.directory_responds(root) != host_fitness::Responsiveness::Responds {
+            return Err(format!("{} does not respond", root.display()));
+        }
         let volume = facts
             .mount_point(root)
             .ok_or_else(|| format!("the volume holding {} could not be found", root.display()))?;
@@ -1288,6 +1302,48 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
         )),
         Err(error) => unknown(format!("the service binary could not be asked: {error}")),
     }
+}
+
+// -- host.runner_root_responsive ----------------------------------------------
+
+/// How long a runner root has to answer a `stat` and a one-entry listing.
+pub const RUNNER_ROOT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A hung volume under a runner root -- seen on the Mac mini, whose external
+/// `/Volumes/NVME` stopped answering `ls` -- wedges every runner placed there
+/// and leaves a slot held by an attempt with no process. Required, so the
+/// daemon registers no runner while it lasts.
+fn probe_runner_root_responsive(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    if setup.runner_roots.is_empty() {
+        return not_applicable("no runner root could be resolved");
+    }
+    let mut hung = Vec::new();
+    let mut errors = Vec::new();
+    for root in &setup.runner_roots {
+        match facts.directory_responds(root) {
+            host_fitness::Responsiveness::Responds => {}
+            host_fitness::Responsiveness::Hung => hung.push(root.display().to_string()),
+            host_fitness::Responsiveness::Failed(error) => {
+                errors.push(format!("{}: {error}", root.display()));
+            }
+        }
+    }
+    if !hung.is_empty() {
+        return fail(format!(
+            "runner root not responding: {} did not answer within {} seconds, so a runner \
+             placed there would hang",
+            hung.join(", "),
+            RUNNER_ROOT_DEADLINE.as_secs()
+        ))
+        .remedy("check the volume holding it (a stalled external disk or network mount); a reboot or reconnect usually clears it");
+    }
+    if !errors.is_empty() {
+        return unknown(format!(
+            "a runner root could not be read: {}",
+            errors.join("; ")
+        ));
+    }
+    pass("every runner root answers")
 }
 
 // -- host.capacity ------------------------------------------------------------
@@ -1868,6 +1924,10 @@ impl HostFacts for SystemFacts {
         } else {
             None
         })
+    }
+
+    fn directory_responds(&self, directory: &Path) -> host_fitness::Responsiveness {
+        host_fitness::directory_responds(directory, RUNNER_ROOT_DEADLINE)
     }
 
     fn mount_point(&self, path: &Path) -> Option<PathBuf> {
@@ -3232,6 +3292,8 @@ mod tests {
         /// Volumes Spotlight gives no answer for.
         unanswered: Vec<PathBuf>,
         mounts: HashMap<PathBuf, PathBuf>,
+        /// Directories that do not answer.
+        hung: Vec<PathBuf>,
         process_type: Option<String>,
         throttled: usize,
         credential: Option<CredentialProbe>,
@@ -3278,6 +3340,13 @@ mod tests {
                 return Ok(None);
             }
             Ok(Some(self.indexed.iter().any(|v| v == volume)))
+        }
+        fn directory_responds(&self, directory: &Path) -> host_fitness::Responsiveness {
+            if self.hung.iter().any(|hung| hung == directory) {
+                host_fitness::Responsiveness::Hung
+            } else {
+                host_fitness::Responsiveness::Responds
+            }
         }
         fn mount_point(&self, path: &Path) -> Option<PathBuf> {
             self.mounts.get(path).cloned()
@@ -3829,6 +3898,33 @@ mod tests {
         );
     }
 
+    /// A hung runner volume is a required failure (the daemon refuses
+    /// runners), and the Spotlight check does not call `df` or `mdutil` on it.
+    #[test]
+    fn a_hung_runner_root_is_unfit_and_spotlight_does_not_touch_it() {
+        let setup = macos_setup();
+        let mut facts = Facts::default();
+        facts.mounts.insert(
+            PathBuf::from("/Volumes/NVME/rman"),
+            PathBuf::from("/Volumes/NVME"),
+        );
+        let id = "host.runner_root_responsive";
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+        assert_eq!(status_of(&setup, &facts, "macos.spotlight"), Status::Pass);
+
+        facts.hung.push(PathBuf::from("/Volumes/NVME/rman"));
+        let report = evaluate(&setup, &facts);
+        let root = finding(&report, id);
+        assert_eq!(root.status, Status::Fail);
+        assert!(
+            root.detail.starts_with("runner root not responding"),
+            "{}",
+            root.detail
+        );
+        assert!(report.required_failing().contains(&id.to_owned()));
+        assert_eq!(finding(&report, "macos.spotlight").status, Status::Unknown);
+    }
+
     #[test]
     fn required_tools_fail_by_name() {
         let mut setup = windows_setup();
@@ -3897,6 +3993,9 @@ mod tests {
             }
             fn spotlight_indexing(&self, _: &Path) -> Result<Option<bool>, String> {
                 Err("x".into())
+            }
+            fn directory_responds(&self, _: &Path) -> host_fitness::Responsiveness {
+                host_fitness::Responsiveness::Failed("x".into())
             }
             fn mount_point(&self, _: &Path) -> Option<PathBuf> {
                 None
