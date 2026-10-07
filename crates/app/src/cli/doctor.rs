@@ -96,6 +96,9 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// recommended. A guide, not a measurement of any particular workload.
 const MEMORY_PER_RUNNER_GIB: u64 = 3;
 
+/// A GitHub contact this recent proves the service could read its credential.
+const RECENT_CONTACT_SECS: u64 = 15 * 60;
+
 const ALLOW_AV_EXCLUSION: &str = "--allow-av-exclusion";
 const ALLOW_DEVELOPER_MODE: &str = "--allow-developer-mode";
 
@@ -230,6 +233,14 @@ pub struct HostSetup {
     /// A directory this account owns, for the symbolic-link probe.
     pub probe_dir: PathBuf,
     pub data_root: Option<PathBuf>,
+    /// How long ago the service last reached GitHub, in seconds, as it
+    /// recorded it. A recent contact proves it could read its credential.
+    #[serde(default)]
+    pub service_contact_age_secs: Option<u64>,
+    /// This executable, to tell a credential the service binary cannot read
+    /// from a keychain this whole session cannot read.
+    #[serde(default)]
+    pub own_binary: Option<PathBuf>,
 }
 
 impl HostSetup {
@@ -1210,6 +1221,15 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
             "a boot service keeps its credential in the System Keychain, which only root reads",
         );
     }
+    if let Some(age) = setup
+        .service_contact_age_secs
+        .filter(|age| *age <= RECENT_CONTACT_SECS)
+    {
+        return pass(format!(
+            "the service reached GitHub {} minute(s) ago, so it reads its credential",
+            age / 60
+        ));
+    }
     match facts.service_credential(&service.binary, setup.data_root.as_deref()) {
         Ok(CredentialProbe::Readable) => {
             pass("the service binary reads its GitHub credential from the login keychain")
@@ -1217,6 +1237,28 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
         Ok(CredentialProbe::Absent) => not_applicable(
             "no GitHub credential is stored yet (`runner-manager auth login --start-at login`)",
         ),
+        // If this executable cannot read it either, the session is the
+        // problem (an SSH session cannot unlock the login keychain), not the
+        // service binary's grant.
+        Ok(CredentialProbe::Unreadable(_))
+            if setup
+                .own_binary
+                .as_ref()
+                .is_none_or(|own| *own == service.binary)
+                || matches!(
+                    setup
+                        .own_binary
+                        .as_ref()
+                        .map(|own| facts.service_credential(own, setup.data_root.as_deref())),
+                    Some(Ok(CredentialProbe::Unreadable(_)))
+                ) =>
+        {
+            unknown(
+                "this session cannot read the login keychain at all (an SSH session cannot unlock \
+                 it), so the service binary's own access cannot be told apart; run `runner-manager \
+                 host doctor` in a Terminal on this Mac",
+            )
+        }
         Ok(CredentialProbe::Unreadable(reason)) => fail(format!(
             "the service binary {} cannot read its GitHub credential ({reason}); a replaced \
              binary needs a fresh keychain grant",
@@ -1635,6 +1677,13 @@ fn setup_from_parts(
         runner_path: runner_path(context, perspective, mode),
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
+        service_contact_age_secs: runner_manager_platform::service::last_github_contact(
+            context.paths(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|at| u64::try_from((context.clock().now() - at).num_seconds()).ok()),
+        own_binary: std::env::current_exe().ok(),
         service,
     }
 }
@@ -3177,6 +3226,8 @@ mod tests {
         process_type: Option<String>,
         throttled: usize,
         credential: Option<CredentialProbe>,
+        /// What this executable reads; `None` answers like the service binary.
+        own_credential: Option<CredentialProbe>,
     }
 
     impl HostFacts for Facts {
@@ -3229,12 +3280,18 @@ mod tests {
         }
         fn service_credential(
             &self,
-            _: &Path,
+            binary: &Path,
             _: Option<&Path>,
         ) -> Result<CredentialProbe, String> {
-            self.credential.clone().ok_or_else(|| "no answer".into())
+            let own = binary == Path::new(OWN_BINARY);
+            own.then(|| self.own_credential.clone())
+                .flatten()
+                .or_else(|| self.credential.clone())
+                .ok_or_else(|| "no answer".into())
         }
     }
+
+    const OWN_BINARY: &str = "/usr/local/bin/runner-manager";
 
     /// Records every write, and applies git writes to the facts.
     #[derive(Default)]
@@ -3308,6 +3365,8 @@ mod tests {
             runner_path: Some(r"C:\Windows\System32".into()),
             probe_dir: PathBuf::from(r"C:\state"),
             data_root: None,
+            service_contact_age_secs: None,
+            own_binary: None,
         }
     }
 
@@ -3673,11 +3732,13 @@ mod tests {
 
     #[test]
     fn an_unreadable_keychain_credential_names_the_exact_login_command() {
-        let setup = macos_setup();
+        let mut setup = macos_setup();
+        setup.own_binary = Some(PathBuf::from(OWN_BINARY));
         let mut facts = Facts {
             credential: Some(CredentialProbe::Unreadable(
                 "errSecInteractionNotAllowed".into(),
             )),
+            own_credential: Some(CredentialProbe::Readable),
             ..Facts::default()
         };
         let report = evaluate(&setup, &facts);
@@ -3689,6 +3750,25 @@ mod tests {
             "{remedy}"
         );
         assert_eq!(report.required_failing(), ["macos.keychain_credential"]);
+
+        // A session that cannot read the keychain at all (SSH) is not the
+        // service binary's fault: measured on the Mac mini, both binaries
+        // answered -25293 over SSH while the daemon was serving jobs.
+        facts.own_credential = None;
+        assert_eq!(
+            status_of(&setup, &facts, "macos.keychain_credential"),
+            Status::Unknown
+        );
+        // And a service that reached GitHub minutes ago read its credential
+        // to do it.
+        let recent = HostSetup {
+            service_contact_age_secs: Some(120),
+            ..setup.clone()
+        };
+        assert_eq!(
+            status_of(&recent, &facts, "macos.keychain_credential"),
+            Status::Pass
+        );
         facts.credential = Some(CredentialProbe::Readable);
         assert_eq!(
             status_of(&setup, &facts, "macos.keychain_credential"),
