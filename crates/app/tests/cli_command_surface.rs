@@ -60,6 +60,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "doctor",
             "prepare",
             "required-tools",
+            "cache",
         ],
     ),
     (
@@ -74,6 +75,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "set-workspace",
             "remove",
             "profile",
+            "cache",
         ],
     ),
     (
@@ -86,6 +88,7 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "add-label",
             "remove-label",
             "remove",
+            "cache",
         ],
     ),
     ("daemon", &["run"]),
@@ -97,10 +100,30 @@ const SURFACE: [(&str, &[&str]); 10] = [
 ];
 
 /// Profile and provider leaves added by the runner-sandbox architecture, and
-/// the host runner environment (`runner.env`).
-const NESTED_SURFACE: [(&str, &[&str]); 3] = [
+/// the host runner environment (`runner.env`), and the dependency caches.
+const NESTED_SURFACE: [(&str, &[&str]); 6] = [
     ("host isolation", &["status"]),
     ("host env", &["show", "set", "unset"]),
+    (
+        "host cache",
+        &[
+            "show",
+            "set-enabled",
+            "set-root",
+            "reset-root",
+            "set-max-size",
+            "set-tool",
+            "prune",
+        ],
+    ),
+    (
+        "repo cache",
+        &["show", "set-enabled", "set-namespace", "set-tool"],
+    ),
+    (
+        "org cache",
+        &["show", "set-enabled", "set-namespace", "set-tool"],
+    ),
     (
         "repo profile",
         &[

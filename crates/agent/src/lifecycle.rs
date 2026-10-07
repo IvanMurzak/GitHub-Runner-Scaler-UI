@@ -45,6 +45,7 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
+use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
@@ -105,12 +106,18 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// supplies that input from the restrictive handoff; the listener command line
 /// must contain only the supported `run` command.
 ///
-/// The environment is the daemon's plus [`runner_env::platform_defaults`] and
-/// then the host's `runner.env`, which wins over a default of the same name.
+/// The environment is the daemon's plus [`runner_env::platform_defaults`], then
+/// the dependency caches (`caches`, from [`DependencyCaches::for_launch`]), then
+/// the host's `runner.env`, which wins over either of the others.
 /// The per-attempt temporary directory goes last and `runner.env` cannot name
 /// it. On macOS a runner that still starts throttled is reported
 /// ([`SpawnSpec::expect_normal_scheduling`]).
-fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
+fn runner_listener_spec(
+    program: PathBuf,
+    runtime: &Path,
+    caches: Vec<(&'static str, std::ffi::OsString)>,
+    host_env: &RunnerEnv,
+) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
     let defaults = runner_env::platform_defaults(
@@ -131,7 +138,7 @@ fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) 
         .arg("run")
         .working_dir(runtime)
         .expect_normal_scheduling();
-    for (name, value) in runner_env::runner_environment(defaults, host_env) {
+    for (name, value) in runner_env::runner_environment(defaults, caches, host_env) {
         spec = spec.env(name, value);
     }
     spec.env("TMPDIR", &tmp).env("TEMP", &tmp).env("TMP", &tmp)
@@ -1803,6 +1810,9 @@ fn safe_isolation_reason(
 pub struct PreparedEnvironment {
     attempt: AttemptId,
     identity: Option<EnvironmentIdentity>,
+    /// The target whose dependency-cache namespace a native runner uses:
+    /// `prepare` sees the policy and `start` does not.
+    cache_target: Option<runner_manager_domain::model::ScaleTarget>,
 }
 
 impl PreparedEnvironment {
@@ -1812,6 +1822,7 @@ impl PreparedEnvironment {
         Self {
             attempt,
             identity: Some(identity),
+            cache_target: None,
         }
     }
 
@@ -1982,6 +1993,7 @@ pub trait ExecutionProvider: fmt::Debug + Send + Sync {
         Ok(PreparedEnvironment {
             attempt: attempt.id,
             identity: None,
+            cache_target: None,
         })
     }
 
@@ -2083,6 +2095,8 @@ pub struct NativeProcesses {
     /// The host's `runner.env`, read at every launch so that `host env set`
     /// reaches the next runner without a daemon restart. `None` applies none.
     runner_env_file: Option<PathBuf>,
+    /// Persistent dependency caches. `None` gives runners none.
+    dependency_caches: Option<DependencyCaches>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2118,6 +2132,14 @@ impl PlatformExecutionProvider {
     #[must_use]
     pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
         self.native = self.native.with_runner_env_file(path);
+        self
+    }
+
+    /// Gives every native runner persistent dependency caches. Isolated
+    /// runners do not get them: their providers mount no host directory.
+    #[must_use]
+    pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
+        self.native = self.native.with_dependency_caches(caches);
         self
     }
 
@@ -2310,6 +2332,117 @@ impl NativeProcesses {
     pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
         self.runner_env_file = Some(path);
         self
+    }
+
+    /// Gives every runner launched persistent dependency caches.
+    #[must_use]
+    pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
+        self.dependency_caches = Some(caches);
+        self
+    }
+
+    /// The cache variables for `attempt`, when `prepare` named its target.
+    fn cache_env(
+        &self,
+        attempt: &RunnerAttempt,
+        target: Option<&runner_manager_domain::model::ScaleTarget>,
+        host_env: &RunnerEnv,
+    ) -> Vec<(&'static str, std::ffi::OsString)> {
+        match (&self.dependency_caches, target) {
+            (Some(caches), Some(target)) => {
+                caches.for_launch(target, attempt.runtime_path(), host_env)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Starts `Runner.Listener` for `attempt`, with the dependency caches of
+    /// `cache_target` when there is one.
+    fn spawn_listener(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+        cache_target: Option<&runner_manager_domain::model::ScaleTarget>,
+    ) -> Result<u32, ProcessStartFailure> {
+        let handoff = RestrictiveHandoff::create(
+            attempt.runtime_path(),
+            SecretString::from(config.expose().to_owned()),
+        )
+        .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
+        #[cfg(windows)]
+        let program = attempt
+            .runtime_path()
+            .join("bin")
+            .join("Runner.Listener.exe");
+        #[cfg(not(windows))]
+        let program = attempt.runtime_path().join("bin").join("Runner.Listener");
+        // Checked after the handoff exists on purpose: the error path below is
+        // a real post-handoff launch failure, and unwinding must delete it.
+        if !program.is_file() {
+            return Err(ProcessStartFailure::before_spawn(
+                FailureReason::ProcessStartFailed,
+            ));
+        }
+        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
+        let caches = self.cache_env(attempt, cache_target, &host_env);
+        #[cfg(test)]
+        let spec = if self
+            .use_long_lived_test_listener
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            SpawnSpec::new(program)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "lifecycle::tests::long_lived_native_listener_helper",
+                    "--nocapture",
+                ])
+                .env(
+                    "RUNNER_MANAGER_TEST_LISTENER_READY",
+                    attempt.runtime_path().join(TEST_LISTENER_READY),
+                )
+                .working_dir(attempt.runtime_path())
+        } else {
+            runner_listener_spec(program, attempt.runtime_path(), caches, &host_env)
+        };
+        #[cfg(not(test))]
+        let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
+        let child = spec
+            .spawn_runner_with_handoff(&handoff)
+            .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
+        // The payload is gone before any state saying "starting" is persisted.
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::HandoffDelete) {
+            drop(handoff);
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        if handoff.delete().is_err() {
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        let identity = match serde_json::to_vec(child.identity()) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Err(self.abort_spawned_child(child, attempt, false));
+            }
+        };
+        if self.persist_identity(attempt, &identity).is_err() {
+            return Err(self.abort_spawned_child(child, attempt, true));
+        }
+        let pid = child.pid();
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
+            return Err(self.abort_spawned_child(child, attempt, true));
+        }
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.insert(attempt.id, child);
+        Ok(pid)
     }
 
     /// The host's `runner.env`, read now.
@@ -2538,10 +2671,35 @@ impl ProcessSupervisor for NativeProcesses {
             ));
         }
         self.host_env()?;
+        // Asked here, before the JIT registration, for the reason `host_env`
+        // is: a broken file must cost no registration.
+        let cache_target = match &self.dependency_caches {
+            Some(caches) => {
+                caches.config()?;
+                Some(policy.target.clone())
+            }
+            None => None,
+        };
         Ok(PreparedEnvironment {
             attempt: attempt.id,
             identity: None,
+            cache_target,
         })
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        if prepared.attempt != attempt.id || !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "execution provider identity mismatch".into(),
+            )));
+        }
+        self.spawn_listener(attempt, handoff.consume(), prepared.cache_target.as_ref())
+            .map(EnvironmentIdentity::NativeProcess)
     }
 
     fn spawn(
@@ -2549,84 +2707,7 @@ impl ProcessSupervisor for NativeProcesses {
         attempt: &RunnerAttempt,
         config: &EncodedJitConfig,
     ) -> Result<u32, ProcessStartFailure> {
-        let handoff = RestrictiveHandoff::create(
-            attempt.runtime_path(),
-            SecretString::from(config.expose().to_owned()),
-        )
-        .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
-        #[cfg(windows)]
-        let program = attempt
-            .runtime_path()
-            .join("bin")
-            .join("Runner.Listener.exe");
-        #[cfg(not(windows))]
-        let program = attempt.runtime_path().join("bin").join("Runner.Listener");
-        // Checked after the handoff exists on purpose: the error path below is
-        // a real post-handoff launch failure, and unwinding must delete it.
-        if !program.is_file() {
-            return Err(ProcessStartFailure::before_spawn(
-                FailureReason::ProcessStartFailed,
-            ));
-        }
-        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
-        #[cfg(test)]
-        let spec = if self
-            .use_long_lived_test_listener
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            SpawnSpec::new(program)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "lifecycle::tests::long_lived_native_listener_helper",
-                    "--nocapture",
-                ])
-                .env(
-                    "RUNNER_MANAGER_TEST_LISTENER_READY",
-                    attempt.runtime_path().join(TEST_LISTENER_READY),
-                )
-                .working_dir(attempt.runtime_path())
-        } else {
-            runner_listener_spec(program, attempt.runtime_path(), &host_env)
-        };
-        #[cfg(not(test))]
-        let spec = runner_listener_spec(program, attempt.runtime_path(), &host_env);
-        let child = spec
-            .spawn_runner_with_handoff(&handoff)
-            .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
-        // The payload is gone before any state saying "starting" is persisted.
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::HandoffDelete) {
-            drop(handoff);
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        if handoff.delete().is_err() {
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        let identity = match serde_json::to_vec(child.identity()) {
-            Ok(identity) => identity,
-            Err(_) => {
-                return Err(self.abort_spawned_child(child, attempt, false));
-            }
-        };
-        if self.persist_identity(attempt, &identity).is_err() {
-            return Err(self.abort_spawned_child(child, attempt, true));
-        }
-        let pid = child.pid();
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
-            return Err(self.abort_spawned_child(child, attempt, true));
-        }
-        let mut children = self
-            .children
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.insert(attempt.id, child);
-        Ok(pid)
+        self.spawn_listener(attempt, config, None)
     }
 
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
@@ -8376,6 +8457,7 @@ mod tests {
         let spec = runner_listener_spec(
             PathBuf::from("Runner.Listener"),
             runtime,
+            Vec::new(),
             &RunnerEnv::default(),
         );
         let arguments: Vec<_> = spec
@@ -8403,13 +8485,33 @@ mod tests {
         let host_env =
             RunnerEnv::parse("ELECTRON_CACHE=/cache/electron\nHOME=/operator/chose/this\n")
                 .unwrap();
-        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), &runtime, &host_env);
+        let caches = vec![
+            (
+                "ELECTRON_CACHE",
+                std::ffi::OsString::from("/rman/_cache/o/r/electron"),
+            ),
+            (
+                "npm_config_cache",
+                std::ffi::OsString::from("/rman/_cache/o/r/npm"),
+            ),
+        ];
+        let spec = runner_listener_spec(
+            PathBuf::from("Runner.Listener"),
+            &runtime,
+            caches,
+            &host_env,
+        );
         let env = |name: &str| spec.configured_env(name).map(PathBuf::from);
 
         assert!(spec.expects_normal_scheduling());
         assert_eq!(
             env("ELECTRON_CACHE"),
-            Some(PathBuf::from("/cache/electron"))
+            Some(PathBuf::from("/cache/electron")),
+            "runner.env must win over a dependency cache of the same name"
+        );
+        assert_eq!(
+            env("npm_config_cache"),
+            Some(PathBuf::from("/rman/_cache/o/r/npm"))
         );
         assert_eq!(
             env("HOME"),
@@ -8471,6 +8573,68 @@ mod tests {
         assert!(processes.prepare(&attempt, &policy).is_ok());
         assert_eq!(processes.host_env().unwrap().get("GOOD"), Some("1"));
         assert!(NativeProcesses::new().host_env().unwrap().is_empty());
+    }
+
+    /// The wiring from `prepare` (which sees the policy) to `spawn` (which
+    /// does not): the policy's repository decides the namespace, and a broken
+    /// `caches.toml` is refused before GitHub is asked for anything.
+    #[test]
+    fn prepare_hands_the_policys_cache_namespace_to_the_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let runner_root = root.path().join("rman");
+        let runtime = runner_root.join("a1");
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        let config = runner_manager_platform::dependency_cache::config_path_in(root.path());
+        let source_root = runner_root.clone();
+        let processes = NativeProcesses::new().with_dependency_caches(DependencyCaches::new(
+            config.clone(),
+            Arc::new(move || Some(source_root.clone())),
+            None,
+        ));
+        let policy = fixtures::policy()
+            .repository("Octo/Repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runtime,
+            FakeClock::default().now(),
+        );
+        assert!(
+            processes
+                .cache_env(&attempt, None, &RunnerEnv::default())
+                .is_empty(),
+            "a launch with no prepared target, such as a bare `spawn`, has no cache"
+        );
+        let prepared = processes.prepare(&attempt, &policy).unwrap();
+        let variables = processes.cache_env(
+            &attempt,
+            prepared.cache_target.as_ref(),
+            &RunnerEnv::default(),
+        );
+        let npm = variables
+            .iter()
+            .find(|(name, _)| *name == "npm_config_cache")
+            .map(|(_, value)| PathBuf::from(value));
+        assert_eq!(
+            npm,
+            Some(
+                runner_root
+                    .join("_cache")
+                    .join("octo")
+                    .join("repo")
+                    .join("npm")
+            )
+        );
+
+        fs::write(&config, "[tools]\nnot-a-tool = true\n").unwrap();
+        let refused = processes
+            .prepare(&attempt, &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("caches.toml"), "{refused}");
     }
 
     #[cfg(windows)]
@@ -9893,6 +10057,33 @@ mod tests {
             .output()
             .ok()?;
         (made.status.success() && link.symlink_metadata().is_ok()).then_some(())
+    }
+
+    /// The dependency caches live beside attempts, under `<runner root>/_cache`,
+    /// and jobs link into them (pnpm hard-links from its store; a workflow may
+    /// symlink or junction a cache into its workspace). Removing an ephemeral
+    /// attempt must take the links and never what they point at.
+    #[test]
+    fn removing_an_attempt_never_reaches_into_the_dependency_caches_it_linked() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("_cache").join("o").join("r").join("npm");
+        fs::create_dir_all(&cache).unwrap();
+        let cached = cache.join("package.tgz");
+        fs::write(&cached, b"kept between jobs").unwrap();
+        let attempt = root.path().join("0123456789abcdef");
+        let work = attempt.join("_work").join("repo");
+        fs::create_dir_all(&work).unwrap();
+        fs::hard_link(&cached, work.join("hard-linked.tgz")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cache, work.join("linked-cache")).unwrap();
+        #[cfg(windows)]
+        if plant_junction(&work.join("linked-cache"), &cache).is_none() {
+            eprintln!("this machine would not create a junction; the hard link is still checked");
+        }
+
+        remove_runtime_tree(&attempt).unwrap();
+        assert!(!attempt.exists());
+        assert_eq!(fs::read(&cached).unwrap(), b"kept between jobs");
     }
 
     #[cfg(windows)]

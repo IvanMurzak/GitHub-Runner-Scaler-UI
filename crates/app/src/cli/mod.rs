@@ -41,6 +41,7 @@
 //! | [`Endpoints`] + [`AppRegistration`] | `c2` | The published App is a product fact, not a per-command one |
 
 pub mod auth;
+pub mod cache;
 pub mod daemon;
 pub mod doctor;
 pub mod host;
@@ -828,6 +829,168 @@ pub enum HostCommand {
     Prepare(HostPrepareArgs),
     /// Name tools every runner must find on its PATH before runners start.
     RequiredTools(HostRequiredToolsArgs),
+    /// Persistent dependency and tool caches for native runners.
+    #[command(subcommand)]
+    Cache(HostCacheCommand),
+}
+
+// -- dependency caches -------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum HostCacheCommand {
+    /// Show the cache root, its size, and the caches each runner gets.
+    Show,
+    /// Turn dependency caches on or off for every policy on this host.
+    SetEnabled(CacheEnabledArgs),
+    /// Put the caches under a directory you choose.
+    SetRoot(HostCacheSetRootArgs),
+    /// Put the caches back under the runner root (`<runner root>/_cache`).
+    ResetRoot,
+    /// Cap the caches' total size in GiB; 0 removes the cap.
+    SetMaxSize(HostCacheSetMaxSizeArgs),
+    /// Turn one cache on or off for every policy, or back to its default.
+    SetTool(CacheToolArgs),
+    /// Measure the caches now and remove the least recently used ones over the cap.
+    Prune,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheEnabledArgs {
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostCacheSetRootArgs {
+    /// An absolute local directory without spaces.
+    ///
+    /// Keep it on the same volume as the runner root so pnpm and uv can
+    /// hard-link from it, and short on Windows. Nothing under the previous
+    /// root is moved or deleted.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub path: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HostCacheSetMaxSizeArgs {
+    /// The cap in GiB across every namespace; 0 means no cap.
+    #[arg(value_name = "GIB")]
+    pub gib: u64,
+}
+
+/// `on`, `off`, or back to the tool's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheToolState {
+    On,
+    Off,
+    Default,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheToolArgs {
+    /// The cache, as `host cache show` names it (npm, pnpm, tool-cache, cargo, ...).
+    #[arg(value_name = "TOOL")]
+    pub tool: String,
+    #[arg(long, value_enum)]
+    pub state: CacheToolState,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoCacheCommand {
+    /// Show the caches this repository's runners get.
+    Show(RepoCacheShowArgs),
+    /// Turn this repository's caches on or off.
+    SetEnabled(RepoCacheEnabledArgs),
+    /// Share a named cache with other policies, or go back to the repository's own.
+    SetNamespace(RepoCacheNamespaceArgs),
+    /// Turn one cache on or off for this repository, or back to the host's setting.
+    SetTool(RepoCacheToolArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RepoCacheShowArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoCacheEnabledArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    #[command(flatten)]
+    pub enabled: CacheEnabledArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoCacheNamespaceArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    #[command(flatten)]
+    pub namespace: CacheNamespaceArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct RepoCacheToolArgs {
+    #[arg(value_name = "OWNER/REPO")]
+    pub repository: String,
+    #[command(flatten)]
+    pub tool: CacheToolArgs,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct CacheNamespaceArgs {
+    /// Share the cache named NAME with every policy that names it too.
+    ///
+    /// Every job of every policy sharing it can read and write what the others
+    /// cached, so share only between repositories you trust equally.
+    #[arg(long, value_name = "NAME")]
+    pub shared: Option<String>,
+    /// Use the target's own namespace again.
+    #[arg(long)]
+    pub own: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgCacheCommand {
+    /// Show the caches this organization's runners get.
+    Show(OrgCacheShowArgs),
+    /// Turn this organization's caches on (they are off by default) or off.
+    SetEnabled(OrgCacheEnabledArgs),
+    /// Share a named cache with other policies, or go back to the organization's own.
+    SetNamespace(OrgCacheNamespaceArgs),
+    /// Turn one cache on or off for this organization, or back to the host's setting.
+    SetTool(OrgCacheToolArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OrgCacheShowArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgCacheEnabledArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+    #[command(flatten)]
+    pub enabled: CacheEnabledArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgCacheNamespaceArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+    #[command(flatten)]
+    pub namespace: CacheNamespaceArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgCacheToolArgs {
+    #[arg(value_name = "ORG")]
+    pub organization: String,
+    #[command(flatten)]
+    pub tool: CacheToolArgs,
 }
 
 #[derive(Debug, Args)]
@@ -994,6 +1157,9 @@ pub enum RepoCommand {
     /// Create, inspect and change named runner profiles.
     #[command(subcommand)]
     Profile(RepoProfileCommand),
+    /// Persistent dependency caches for this repository's runners.
+    #[command(subcommand)]
+    Cache(RepoCacheCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1267,6 +1433,9 @@ pub enum OrgCommand {
     RemoveLabel(OrgLabelArgs),
     /// Remove a policy, optionally with its cache and diagnostics.
     Remove(OrgRemoveArgs),
+    /// Persistent dependency caches for this organization's runners.
+    #[command(subcommand)]
+    Cache(OrgCacheCommand),
 }
 
 #[derive(Debug, Args)]

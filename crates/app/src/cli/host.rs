@@ -442,6 +442,7 @@ pub fn dispatch(
         HostCommand::RequiredTools(args) => {
             super::doctor::required_tools_command(context, args, out)
         }
+        HostCommand::Cache(command) => super::cache::dispatch_host(context, command, out),
     }
 }
 
@@ -985,6 +986,12 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
     };
     writeln!(out, "  runner env file           {}", env_path.display()).map_err(failed)?;
     writeln!(out, "  runner env                {env_state}").map_err(failed)?;
+    writeln!(
+        out,
+        "  dependency caches         {}; `host cache show` lists them",
+        super::cache::snapshot(context, host.as_ref()).line()
+    )
+    .map_err(failed)?;
 
     // -- the secret store ------------------------------------------------
     let secrets = context.secret_store(start_mode)?;

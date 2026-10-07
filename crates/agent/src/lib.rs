@@ -40,6 +40,7 @@
 //! engineer around. [`reconcile`] states the full reasoning and carries a
 //! tripwire against the shape being reintroduced.
 
+pub mod dependency_caches;
 pub mod lifecycle;
 pub mod oci;
 pub mod package;

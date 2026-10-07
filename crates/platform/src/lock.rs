@@ -83,6 +83,10 @@ pub enum LockKind {
     /// Held while one process rotates the credential shared by a service and
     /// foreground tools.
     CredentialRenewal,
+    /// Held while a launch leases a dependency-cache namespace, or while a
+    /// prune moves an idle one aside, so a prune never takes a namespace a
+    /// runner is about to use. It lives in the cache root, not in `state/`.
+    DependencyCache,
 }
 
 impl LockKind {
@@ -93,6 +97,7 @@ impl LockKind {
             Self::SingleInstance => "agent.lock",
             Self::Allocation => "allocation.lock",
             Self::CredentialRenewal => "credential-renewal.lock",
+            Self::DependencyCache => ".lock",
         }
     }
 
@@ -103,6 +108,7 @@ impl LockKind {
             Self::SingleInstance => "the single-instance agent lock",
             Self::Allocation => "the runtime allocation lock",
             Self::CredentialRenewal => "the credential-renewal lock",
+            Self::DependencyCache => "the dependency-cache lock",
         }
     }
 
@@ -123,6 +129,10 @@ impl LockKind {
             Self::CredentialRenewal => {
                 "This lock is held only while one process rotates the shared credential. Retry \
                  shortly."
+            }
+            Self::DependencyCache => {
+                "This lock is held only while a runner leases its cache or a prune moves an idle \
+                 cache aside. Retry shortly."
             }
         }
     }

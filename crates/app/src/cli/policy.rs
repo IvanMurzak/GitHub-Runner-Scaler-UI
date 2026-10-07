@@ -93,6 +93,7 @@ pub fn dispatch_repo(
             out,
         ),
         RepoCommand::Profile(command) => super::profile::dispatch(context, command, out),
+        RepoCommand::Cache(command) => super::cache::dispatch_repo(context, command, out),
     }
 }
 
@@ -146,6 +147,7 @@ pub fn dispatch_org(
             a.purge,
             out,
         ),
+        OrgCommand::Cache(command) => super::cache::dispatch_org(context, command, out),
     }
 }
 
