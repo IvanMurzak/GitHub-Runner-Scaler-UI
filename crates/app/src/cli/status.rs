@@ -652,48 +652,44 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     // The service reads the store in its own session. When it reached GitHub
     // recently, a store this session cannot read is this session's limit (an
     // SSH session and a login keychain), not the credential's problem.
-    let in_use_by_service = document.credential.unreadable.is_some()
-        && document
-            .credential
-            .service_reached_github_secs_ago
-            .is_some_and(|age| age <= super::doctor::RECENT_CONTACT_SECS);
-    if in_use_by_service {
-        let minutes = document
-            .credential
-            .service_reached_github_secs_ago
-            .unwrap_or_default()
-            / 60;
-        writeln!(
-            out,
-            "  credential                in use by the service, which reached GitHub {minutes} \
-             minute(s) ago, in the {}-scoped store",
-            document.credential.store_scope
-        )?;
-    } else {
-        writeln!(
-            out,
-            "  credential                {} in the {}-scoped store",
-            match (&document.credential.unreadable, document.credential.present) {
-                // Never "absent". An unreadable store has not answered the
-                // question, and the two words an operator acts on differently
-                // must not be the same word.
-                (Some(_), _) => "not readable by this account",
-                (None, true) => "present",
-                (None, false) => "absent",
-            },
-            document.credential.store_scope
-        )?;
-    }
+    // Only filled while the store is unreadable here; recent enough, it means
+    // the credential is in use by the service, and this session's limit (an
+    // SSH session and a login keychain) is not the credential's problem.
+    let service_minutes = document
+        .credential
+        .service_reached_github_secs_ago
+        .filter(|age| *age <= super::doctor::RECENT_CONTACT_SECS)
+        .map(|age| age / 60);
+    let state = match (
+        service_minutes,
+        &document.credential.unreadable,
+        document.credential.present,
+    ) {
+        (Some(minutes), ..) => {
+            format!("in use by the service, which reached GitHub {minutes} minute(s) ago,")
+        }
+        // Never "absent". An unreadable store has not answered the question,
+        // and the two words an operator acts on differently must not be the
+        // same word.
+        (None, Some(_), _) => "not readable by this account".to_owned(),
+        (None, None, true) => "present".to_owned(),
+        (None, None, false) => "absent".to_owned(),
+    };
+    writeln!(
+        out,
+        "  {:<26}{state} in the {}-scoped store",
+        "credential", document.credential.store_scope
+    )?;
     // The store's own words, on their own line, for the same reason the runner
     // root's problem gets one: the reason names a remedy and a two-column table
     // cell would truncate it.
     if let Some(reason) = &document.credential.unreadable {
-        let label = if in_use_by_service {
-            "not readable here  "
+        let label = if service_minutes.is_some() {
+            "not readable here"
         } else {
             "credential problem"
         };
-        writeln!(out, "  {label}        {reason}")?;
+        writeln!(out, "  {label:<26}{reason}")?;
     }
     writeln!(
         out,
@@ -1238,7 +1234,7 @@ mod tests {
         assert!(!text.contains("credential problem"), "{text}");
         assert!(!text.contains("not readable by this account"), "{text}");
         assert!(
-            text.contains("not readable here          the login keychain is locked"),
+            text.contains("not readable here         the login keychain is locked"),
             "the session's own limit is still said: {text}"
         );
 

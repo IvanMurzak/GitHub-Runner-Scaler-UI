@@ -4490,13 +4490,16 @@ impl ServiceOperations {
         let credential_rejected_since =
             github_credential_rejected_since(&self.paths).ok().flatten();
         let credential_unreadable_since = credential_unreadable_since(&self.paths).ok().flatten();
+        let probed = self.controls.unattended_login();
         let unattended = record.as_ref().and_then(|record| {
-            unattended_gap(
-                record.start_mode,
-                &service_account_name(&record.account),
-                self.controls.unattended_login().as_ref(),
-            )
+            // The account is only read where something was probed to judge
+            // it against.
+            let account = probed
+                .as_ref()
+                .map_or_else(String::new, |_| service_account_name(&record.account));
+            unattended_gap(record.start_mode, &account, probed.as_ref())
         });
+        let now = Utc::now();
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4508,15 +4511,9 @@ impl ServiceOperations {
         .with_definition_drift(drift)
         .with_credential_rejection(credential_rejected_since)
         .with_credential_unreadable(credential_unreadable_since)
-        .with_launches_blocked(crate::launch_health::launches_blocked(
-            &self.paths,
-            Utc::now(),
-        ))
+        .with_launches_blocked(crate::launch_health::launches_blocked(&self.paths, now))
         .with_unattended_gap(unattended)
-        .with_host_unfit(crate::host_fitness::host_unfit_in_force(
-            &self.paths,
-            Utc::now(),
-        )))
+        .with_host_unfit(crate::host_fitness::host_unfit_in_force(&self.paths, now)))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -4727,8 +4724,10 @@ pub struct UnattendedGap {
     pub remedy: String,
 }
 
-/// The name of the account a registration runs as.
-fn service_account_name(account: &ServiceAccount) -> String {
+/// The name of the account a registration runs as: the invoking user's own
+/// for a login-mode one.
+#[must_use]
+pub fn service_account_name(account: &ServiceAccount) -> String {
     match account {
         ServiceAccount::InvokingUser => {
             crate::unattended_login::current_account().unwrap_or_else(|| "the operator".to_owned())
@@ -4763,11 +4762,13 @@ pub fn unattended_gap(
         });
     };
     let resume = crate::unattended_login::resume(found, mode, account);
-    resume.explain(account).map(|reason| UnattendedGap {
-        reason,
-        remedy: "Follow the steps in `runner-manager service status`; automatic login and \
-                 FileVault are changed only by you, in System Settings."
-            .to_owned(),
+    Some(UnattendedGap {
+        reason: resume.explain(account)?,
+        remedy: resume.remedy().unwrap_or_else(|| {
+            "Run `runner-manager host doctor` on the Mac's desktop, where automatic login and \
+             FileVault can be read."
+                .to_owned()
+        }),
     })
 }
 
@@ -5229,7 +5230,7 @@ impl ServiceStatus {
     /// `verdict healthy`.
     #[must_use]
     pub fn with_host_unfit(mut self, unfit: Option<crate::host_fitness::HostUnfitRecord>) -> Self {
-        if let Some(unfit) = &unfit {
+        if let Some(unfit) = unfit {
             self.problems.push(StatusProblem {
                 subject: HOST_UNFIT_SUBJECT,
                 detail: format!(
@@ -5669,7 +5670,8 @@ impl ControlFactory for HostControls {
 /// unit both live under it — and it is resolved lazily so that a boot-mode
 /// operation on an account with no profile is not refused for wanting something
 /// it never uses.
-fn host_home() -> Option<PathBuf> {
+#[must_use]
+pub fn host_home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 

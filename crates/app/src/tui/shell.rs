@@ -691,7 +691,7 @@ struct LocalServiceReadiness {
     legacy_windows_action: bool,
     /// Why the service does not come back by itself after an unattended
     /// restart, and what changes that. `None` when it does.
-    unattended_gap: Option<(String, String)>,
+    unattended_gap: Option<runner_manager_platform::service::UnattendedGap>,
 }
 
 /// The WSL distribution this process runs inside, if any.
@@ -855,9 +855,7 @@ fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceRe
             .map(|problem| (problem.subject.to_owned(), problem.detail.clone()))
             .collect(),
         legacy_windows_action,
-        unattended_gap: service
-            .unattended_gap()
-            .map(|gap| (gap.reason.clone(), gap.remedy.clone())),
+        unattended_gap: service.unattended_gap().cloned(),
     })
 }
 
@@ -955,12 +953,12 @@ fn readiness_from_facts(
                     remediation,
                 );
             }
-            if let Some((reason, remedy)) = &service.unattended_gap {
+            if let Some(gap) = service.unattended_gap {
                 issue(
                     "local:login-only",
                     OperationalReadiness::Degraded,
-                    reason.clone(),
-                    remedy.clone(),
+                    gap.reason,
+                    gap.remedy,
                 );
             }
             if service.legacy_windows_action {
@@ -5889,10 +5887,10 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     let mut stopped = ready_service();
     stopped.running = false;
     stopped.start_mode = Some(StartMode::Login);
-    stopped.unattended_gap = Some((
-        "This host does not resume work after an unattended reboot.".into(),
-        "Turn on automatic login.".into(),
-    ));
+    stopped.unattended_gap = Some(runner_manager_platform::service::UnattendedGap {
+        reason: "This host does not resume work after an unattended reboot.".into(),
+        remedy: "Turn on automatic login.".into(),
+    });
     stopped.legacy_windows_action = true;
     stopped
         .problems

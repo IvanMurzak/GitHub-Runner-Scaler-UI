@@ -135,9 +135,23 @@ pub enum Responsiveness {
     Failed(String),
 }
 
-/// Paths a [`directory_responds`] probe is still blocked on, so a volume that
-/// stays hung costs one stuck thread rather than one per probe.
-static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// A [`directory_responds`] probe still blocked: its path, and whether its
+/// metadata had answered (so the listing is what blocks).
+type InFlight = (PathBuf, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+/// Probes still blocked, so a volume that stays hung costs one stuck thread
+/// rather than one per probe, and a later probe of it reports what the stuck
+/// one is blocked on.
+static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<InFlight>> = std::sync::Mutex::new(Vec::new());
+
+/// How a probe that has not answered is reported.
+fn unanswered(listing: &std::sync::atomic::AtomicBool) -> Responsiveness {
+    if listing.load(std::sync::atomic::Ordering::Acquire) {
+        Responsiveness::ListingBlocked
+    } else {
+        Responsiveness::Hung
+    }
+}
 
 /// Whether `directory` (or, when it does not exist yet, its nearest existing
 /// ancestor) answers a `stat` and a one-entry listing within `deadline`.
@@ -149,20 +163,20 @@ static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(
 #[must_use]
 pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Responsiveness {
     let path = directory.to_path_buf();
+    // Set once the metadata has answered, so a probe still blocked can say
+    // whether it was the `stat` or the listing that never came back.
+    let listing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() else {
             return Responsiveness::Failed("the probe registry is poisoned".into());
         };
-        if in_flight.contains(&path) {
-            return Responsiveness::Hung;
+        if let Some((_, stuck)) = in_flight.iter().find(|(stuck, _)| *stuck == path) {
+            return unanswered(stuck);
         }
-        in_flight.push(path.clone());
+        in_flight.push((path.clone(), std::sync::Arc::clone(&listing)));
     }
     let (sender, receiver) = std::sync::mpsc::channel();
     let probed = path.clone();
-    // Set once the metadata has answered, so a probe still blocked can say
-    // whether it was the `stat` or the listing that never came back.
-    let listing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let listing_started = std::sync::Arc::clone(&listing);
     let spawned = std::thread::Builder::new()
         .name("runner-root-probe".into())
@@ -190,23 +204,19 @@ pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Re
                 },
             };
             if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
-                in_flight.retain(|candidate| *candidate != probed);
+                in_flight.retain(|(candidate, _)| *candidate != probed);
             }
             let _ = sender.send(answer);
         });
     if let Err(error) = spawned {
         if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
-            in_flight.retain(|candidate| *candidate != path);
+            in_flight.retain(|(candidate, _)| *candidate != path);
         }
         return Responsiveness::Failed(error.to_string());
     }
-    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
-        if listing.load(std::sync::atomic::Ordering::Acquire) {
-            Responsiveness::ListingBlocked
-        } else {
-            Responsiveness::Hung
-        }
-    })
+    receiver
+        .recv_timeout(deadline)
+        .unwrap_or_else(|_| unanswered(&listing))
 }
 
 /// `EPERM`, which a privacy refusal answers, as opposed to `EACCES`.
@@ -382,10 +392,15 @@ pub fn write_registry_string(
 /// The file under `state/` the daemon keeps while it refuses to start runners.
 pub const HOST_UNFIT_FILE: &str = "host-unfit.json";
 
-/// How long the record counts as a refusal in force. A running daemon
-/// re-stamps it on every recheck (every five minutes), so one it has not
-/// touched for three is left behind by a daemon that stopped while refusing.
-pub const HOST_UNFIT_RECORD_FRESH: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How often the daemon re-evaluates the required checks, re-stamping the
+/// record while they fail.
+pub const DAEMON_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long the record counts as a refusal in force: three rechecks, so one
+/// slow evaluation does not hide it, and a record nobody re-stamps for longer
+/// was left behind by a daemon that stopped while refusing.
+pub const HOST_UNFIT_RECORD_FRESH: std::time::Duration =
+    std::time::Duration::from_secs(3 * DAEMON_RECHECK.as_secs());
 const HOST_UNFIT_SCHEMA_VERSION: u32 = 1;
 
 /// What the daemon recorded the last time a required host check failed.
@@ -480,9 +495,7 @@ pub fn clear_host_unfit(paths: &AppPaths) -> Result<(), String> {
 #[must_use]
 pub fn host_unfit_in_force(paths: &AppPaths, now: DateTime<Utc>) -> Option<HostUnfitRecord> {
     host_unfit(paths).ok().flatten().filter(|record| {
-        (now - record.checked_at)
-            .to_std()
-            .is_ok_and(|age| age <= HOST_UNFIT_RECORD_FRESH)
+        !crate::wsl::fence::elapsed_at_least(record.checked_at, now, HOST_UNFIT_RECORD_FRESH)
     })
 }
 
@@ -1141,25 +1154,35 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|path| path.starts_with(directory.path())),
+                .any(|(path, _)| path.starts_with(directory.path())),
             "a finished probe deregisters"
         );
     }
 
-    /// While an earlier probe of a path is still blocked, a new one answers
-    /// `Hung` at once instead of parking another thread on the same volume.
+    /// While an earlier probe of a path is still blocked, a new one answers at
+    /// once instead of parking another thread on the same volume, and says
+    /// what the stuck one is blocked on: a daemon re-checking every five
+    /// minutes behind a pending privacy question keeps naming it.
     #[test]
-    fn a_path_still_being_probed_is_hung_without_a_second_thread() {
+    fn a_path_still_being_probed_answers_without_a_second_thread() {
         let directory = tempfile::tempdir().unwrap();
-        let stuck = directory.path().join("stuck-volume");
-        PROBES_IN_FLIGHT.lock().unwrap().push(stuck.clone());
-        let started = std::time::Instant::now();
-        let answer = directory_responds(&stuck, std::time::Duration::from_secs(30));
-        PROBES_IN_FLIGHT
-            .lock()
-            .unwrap()
-            .retain(|path| *path != stuck);
-        assert_eq!(answer, Responsiveness::Hung);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for (name, listing, expected) in [
+            ("stuck-volume", false, Responsiveness::Hung),
+            ("asking-volume", true, Responsiveness::ListingBlocked),
+        ] {
+            let stuck = directory.path().join(name);
+            PROBES_IN_FLIGHT.lock().unwrap().push((
+                stuck.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(listing)),
+            ));
+            let started = std::time::Instant::now();
+            let answer = directory_responds(&stuck, std::time::Duration::from_secs(30));
+            PROBES_IN_FLIGHT
+                .lock()
+                .unwrap()
+                .retain(|(path, _)| *path != stuck);
+            assert_eq!(answer, expected, "{name}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
     }
 }

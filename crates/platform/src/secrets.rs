@@ -1960,20 +1960,6 @@ mod sys {
 
 // ---------------------------------------------------------------------------
 
-/// `errSecWrPerm`: the keychain refused to be written.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const ERR_SEC_WR_PERM: i32 = -61;
-
-/// Whether a keychain error, as this module words them (`… returned <code>`),
-/// carries [`ERR_SEC_WR_PERM`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn is_keychain_write_refusal(message: &str) -> bool {
-    let needle = format!("returned {ERR_SEC_WR_PERM}");
-    message
-        .match_indices(&needle)
-        .any(|(at, found)| !message[at + found.len()..].starts_with(|c: char| c.is_ascii_digit()))
-}
-
 /// The System keychain's refusal of an ordinary account, explained.
 ///
 /// `auth login` without `--start-at` on a Mac with no service used to reach
@@ -2162,11 +2148,38 @@ mod sys {
         }
     }
 
+    /// `errSecWrPerm`: the keychain refused to be written.
+    const ERR_SEC_WR_PERM: i32 = -61;
+
+    /// A Security.framework status, carried inside the `io::Error` so that a
+    /// caller acts on the code rather than on the words.
+    #[derive(Debug)]
+    struct Status {
+        message: String,
+        code: i32,
+    }
+
+    impl std::fmt::Display for Status {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Status {}
+
+    /// The status an error from this module carries, if it carries one.
+    fn status_of(error: &io::Error) -> Option<i32> {
+        error
+            .get_ref()?
+            .downcast_ref::<Status>()
+            .map(|status| status.code)
+    }
+
     fn sec_error(error: &security_framework::base::Error) -> io::Error {
-        io::Error::other(format!(
-            "Security.framework returned {} ({error})",
-            error.code()
-        ))
+        io::Error::other(Status {
+            message: format!("Security.framework returned {} ({error})", error.code()),
+            code: error.code(),
+        })
     }
 
     fn is_absence(error: &security_framework::base::Error) -> bool {
@@ -2392,12 +2405,11 @@ mod sys {
 
     pub(super) fn store(site: &Site, _scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
         write(site, plaintext).map_err(|error| {
-            let message = error.to_string();
-            if site.kind == Kind::System && !is_root() && super::is_keychain_write_refusal(&message)
+            if site.kind == Kind::System && !is_root() && status_of(&error) == Some(ERR_SEC_WR_PERM)
             {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    super::system_keychain_write_refused(&message),
+                    super::system_keychain_write_refused(&error.to_string()),
                 )
             } else {
                 error
@@ -2711,7 +2723,10 @@ mod sys {
         if status == 0 {
             Ok(())
         } else {
-            Err(io::Error::other(format!("{call} returned {status}")))
+            Err(io::Error::other(Status {
+                message: format!("{call} returned {status}"),
+                code: status,
+            }))
         }
     }
 
@@ -3299,19 +3314,6 @@ mod tests {
 
     #[test]
     fn a_system_keychain_write_refusal_says_which_sign_in_to_run() {
-        for refused in [
-            "SecKeychainItemCreateFromContent returned -61",
-            "Security.framework returned -61 (write permissions error)",
-        ] {
-            assert!(is_keychain_write_refusal(refused), "{refused}");
-        }
-        for other in [
-            "SecKeychainItemCreateFromContent returned -610",
-            "Security.framework returned -25293 (auth failed)",
-            "no keychain",
-        ] {
-            assert!(!is_keychain_write_refusal(other), "{other}");
-        }
         let explained =
             system_keychain_write_refused("SecKeychainItemCreateFromContent returned -61");
         assert!(explained.starts_with("SecKeychainItemCreateFromContent returned -61. "));

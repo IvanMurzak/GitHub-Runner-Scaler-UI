@@ -64,7 +64,9 @@ use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store as _;
 use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::runner_env::{self, Inherited, RunnerEnv, RunnerPlatform};
-use runner_manager_platform::service::{InstallRecord, LAUNCHD_PROCESS_TYPE, plist_string_value};
+use runner_manager_platform::service::{
+    InstallRecord, LAUNCHD_PROCESS_TYPE, ServiceAccount, plist_string_value, service_account_name,
+};
 use runner_manager_platform::unattended_login::{self, Resume, UnattendedLogin};
 use serde::{Deserialize, Serialize};
 
@@ -89,8 +91,7 @@ pub const REQUIRED_TOOLS_FILE: &str = "required-tools.json";
 /// credential, so that copy does not run the doctor in turn.
 pub const SKIP_DOCTOR_VARIABLE: &str = "RUNNER_MANAGER_SKIP_HOST_DOCTOR";
 
-/// How often the daemon re-evaluates the required checks.
-pub const DAEMON_RECHECK: Duration = Duration::from_secs(5 * 60);
+pub use host_fitness::DAEMON_RECHECK;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The memory one concurrent job is assumed to need when a capacity is
@@ -1435,13 +1436,13 @@ fn power_settings_in(output: &str) -> BTreeMap<String, u32> {
 
 /// One power setting against the value a runner host wants.
 fn power_probe(
-    facts: &dyn HostFacts,
+    settings: Result<Option<BTreeMap<String, u32>>, String>,
     name: &str,
     wanted: u32,
     good: &str,
     bad: impl Fn(u32) -> String,
 ) -> Outcome {
-    match facts.power_settings() {
+    match settings {
         Err(error) => unknown(format!("`pmset -g` could not be read: {error}")),
         Ok(None) => not_applicable("this platform has no power settings to check"),
         Ok(Some(settings)) => match settings.get(name) {
@@ -1470,13 +1471,14 @@ fn apply_power(
 }
 
 fn probe_sleep(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
-    if let Ok(Some(settings)) = facts.power_settings()
+    let settings = facts.power_settings();
+    if let Ok(Some(settings)) = &settings
         && settings.get("SleepDisabled") == Some(&1)
     {
         return pass("sleep is disabled for the whole system");
     }
     power_probe(
-        facts,
+        settings,
         "sleep",
         0,
         "the Mac does not sleep on its own",
@@ -1498,12 +1500,18 @@ fn apply_sleep(
 }
 
 fn probe_disk_sleep(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
-    power_probe(facts, "disksleep", 0, "disks do not sleep", |minutes| {
-        format!(
-            "disks sleep after {minutes} minute(s) idle, so the first read after a quiet spell \
+    power_probe(
+        facts.power_settings(),
+        "disksleep",
+        0,
+        "disks do not sleep",
+        |minutes| {
+            format!(
+                "disks sleep after {minutes} minute(s) idle, so the first read after a quiet spell \
              waits for a disk to wake"
-        )
-    })
+            )
+        },
+    )
 }
 
 fn apply_disk_sleep(
@@ -1516,7 +1524,7 @@ fn apply_disk_sleep(
 
 fn probe_autorestart(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     power_probe(
-        facts,
+        facts.power_settings(),
         "autorestart",
         1,
         "the Mac starts again by itself after a power failure",
@@ -1537,7 +1545,7 @@ fn apply_autorestart(
 
 fn probe_wake_on_lan(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     power_probe(
-        facts,
+        facts.power_settings(),
         "womp",
         1,
         "the Mac wakes when the network asks it to",
@@ -1567,19 +1575,19 @@ fn probe_unattended_login(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
         .as_deref()
         .unwrap_or("the service account");
     let verdict = unattended_login::resume(&found, service.start_mode, account);
-    let detail = verdict.detail(account).unwrap_or_default();
-    match (&verdict, verdict.remedy()) {
-        (Resume::Resumes, _) => pass(match service.start_mode {
-            StartMode::Login => format!(
-                "automatic login signs {account} in and FileVault is off, so the service starts \
-                 again after a restart"
-            ),
-            StartMode::Boot => "FileVault is off, so the service starts at boot".to_owned(),
-        }),
-        (Resume::Unknown(_), _) => unknown(detail),
-        (_, Some(remedy)) => fail(detail).remedy(remedy),
-        (_, None) => fail(detail),
-    }
+    let (Some(detail), Some(remedy)) = (verdict.detail(account), verdict.remedy()) else {
+        return match verdict {
+            Resume::Resumes => pass(match service.start_mode {
+                StartMode::Login => format!(
+                    "automatic login signs {account} in and FileVault is off, so the service \
+                     starts again after a restart"
+                ),
+                StartMode::Boot => "FileVault is off, so the service starts at boot".to_owned(),
+            }),
+            _ => unknown(verdict.detail(account).unwrap_or_default()),
+        };
+    };
+    fail(detail).remedy(remedy)
 }
 
 // -- macos.runner_root_location -----------------------------------------------
@@ -2202,11 +2210,16 @@ fn current_daemon_contact_age(
 /// [`current_daemon_contact_age`].
 pub(crate) fn installed_service_contact_age(context: &Context) -> Option<u64> {
     let binary = InstallRecord::read(context.paths()).ok().flatten()?.binary;
+    service_contact_age(context, Some(&binary))
+}
+
+/// [`current_daemon_contact_age`] for the service binary at `binary`.
+fn service_contact_age(context: &Context, binary: Option<&Path>) -> Option<u64> {
     current_daemon_contact_age(
         runner_manager_platform::service::last_github_contact(context.paths())
             .ok()
             .flatten(),
-        replaced_at(&binary),
+        binary.and_then(replaced_at),
         context.clock().now(),
     )
 }
@@ -2295,14 +2308,9 @@ fn setup_from_parts(
         runner_path: runner_path(context, perspective, mode),
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
-        service_contact_age_secs: current_daemon_contact_age(
-            runner_manager_platform::service::last_github_contact(context.paths())
-                .ok()
-                .flatten(),
-            service
-                .as_ref()
-                .and_then(|service| replaced_at(&service.binary)),
-            context.clock().now(),
+        service_contact_age_secs: service_contact_age(
+            context,
+            service.as_ref().map(|service| service.binary.as_path()),
         ),
         service_credential_unreadable:
             runner_manager_platform::service::credential_unreadable_since(context.paths())
@@ -2340,11 +2348,14 @@ fn service_account_and_home(
         return (None, None);
     }
     if perspective == Perspective::Operator && mode == Some(StartMode::Boot) {
-        return (Some("root".into()), Some(PathBuf::from("/var/root")));
+        return (
+            Some(ServiceAccount::Root.as_str().to_owned()),
+            Some(PathBuf::from("/var/root")),
+        );
     }
     (
-        unattended_login::current_account(),
-        std::env::var_os("HOME").map(PathBuf::from),
+        Some(service_account_name(&ServiceAccount::InvokingUser)),
+        runner_manager_platform::service::host_home(),
     )
 }
 
@@ -3907,9 +3918,7 @@ pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String
         host_fitness::clear_host_unfit(context.paths())
     } else {
         let findings: Vec<host_fitness::UnfitFinding> = report
-            .findings
-            .iter()
-            .filter(|finding| verdict.required.iter().any(|id| id == finding.id))
+            .with(Severity::Required, Status::Fail)
             .map(|finding| host_fitness::UnfitFinding {
                 id: finding.id.to_owned(),
                 detail: finding.detail.clone(),

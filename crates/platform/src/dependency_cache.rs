@@ -141,7 +141,7 @@ pub const PRUNE_REQUEST_POLL: Duration = Duration::from_secs(5);
 /// Where a prune request for the service lives.
 #[must_use]
 pub fn prune_request_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(PRUNE_REQUEST_FILE)
+    crate::service_request::CACHE_PRUNE.request_path(state_dir)
 }
 
 /// Takes a pending prune request, if there is one, and returns its identifier.
@@ -150,10 +150,7 @@ pub fn prune_request_path(state_dir: &Path) -> PathBuf {
 /// times it is looked for.
 #[must_use]
 pub fn take_prune_request(state_dir: &Path) -> Option<String> {
-    let path = prune_request_path(state_dir);
-    let request = fs::read_to_string(&path).ok()?;
-    fs::remove_file(&path).ok()?;
-    Some(request.trim().to_owned())
+    crate::service_request::CACHE_PRUNE.take(state_dir)
 }
 
 /// The service's answer to one prune request.
@@ -171,22 +168,24 @@ impl PruneResult {
     /// # Errors
     /// The file could not be written.
     pub fn write(&self, state_dir: &Path) -> Result<(), CacheError> {
-        let path = state_dir.join(PRUNE_RESULT_FILE);
-        let json = serde_json::to_vec_pretty(self).map_err(|error| CacheError::Io {
-            action: "encode",
-            path: path.clone(),
-            source: io::Error::other(error),
-        })?;
-        write_atomically(&path, &json)
+        crate::service_request::CACHE_PRUNE
+            .answer(state_dir, &self.request, self.outcome.clone())
+            .map_err(|source| CacheError::Io {
+                action: "write",
+                path: state_dir.join(PRUNE_RESULT_FILE),
+                source,
+            })
     }
 
     /// The answer to the request `request`, once the service has given it.
     #[must_use]
     pub fn read_for(state_dir: &Path, request: &str) -> Option<Self> {
-        let bytes = fs::read(state_dir.join(PRUNE_RESULT_FILE)).ok()?;
-        serde_json::from_slice::<Self>(&bytes)
-            .ok()
-            .filter(|result| result.request == request)
+        crate::service_request::CACHE_PRUNE
+            .read_answer(state_dir, request)
+            .map(|outcome| Self {
+                request: request.to_owned(),
+                outcome,
+            })
     }
 }
 

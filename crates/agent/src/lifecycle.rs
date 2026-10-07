@@ -3177,28 +3177,26 @@ impl LifecycleLauncher {
         // What the runner's own diagnostics say about whether it ran a job.
         // Read before anything below can conclude the attempt, because cleanup
         // deletes `_diag` with the rest of the runtime directory.
-        let evidence = JobEvidence::of(attempt.runtime_path());
-
         // A one-shot child owned by this invocation exited successfully. This
         // concludes the *runner attempt*, never the workflow outcome; GitHub
-        // remains authoritative for that.
-        //
-        // GitHub's inventory used to be the only witness, and it is a sampled
-        // one: a job of a few seconds starts and ends between two passes, so
-        // the attempt was last seen `starting` (or `idle`), never `busy`, and
-        // its clean exit was recorded `process_exited_unexpectedly` -- and a
-        // replacement runner was started for it. The reverse error came from
-        // the same sampling: a runner GitHub showed assigned, that never took
-        // the job up, was recorded `completed_job` once it exited 0. The
-        // runner's diagnostics decide both, and GitHub's sample only decides
-        // when the diagnostics say nothing.
+        // remains authoritative for that. GitHub's inventory is a sampled
+        // witness: a job of a few seconds starts and ends between two passes,
+        // and an assignment GitHub shows can be one the runner never took up.
+        // The runner's own diagnostics decide, read before cleanup deletes
+        // them, and GitHub's sample only decides when they say nothing.
         if !process_alive && self.ports.processes.completed_successfully(&attempt) {
+            let now = self.ports.clock.now();
+            let evidence = JobEvidence::of(attempt.runtime_path());
             let outcome = match (attempt.state(), evidence) {
-                (
-                    AttemptState::Starting | AttemptState::Idle | AttemptState::Busy,
-                    JobEvidence::RanAJob,
-                ) => Some(AttemptOutcome::CompletedJob),
+                (AttemptState::Starting | AttemptState::Idle, JobEvidence::RanAJob) => {
+                    let runner_id = known_runner_id(&attempt, github.runner_id)
+                        .ok_or(LifecycleError::Transition)?;
+                    self.transition(&mut attempt, |a| a.assigned_job(runner_id, now))?;
+                    Some(AttemptOutcome::CompletedJob)
+                }
+                (AttemptState::Busy, JobEvidence::RanAJob) => Some(AttemptOutcome::CompletedJob),
                 (AttemptState::Busy, JobEvidence::NoJob) => {
+                    self.transition(&mut attempt, |a| a.assignment_not_taken(now))?;
                     Some(AttemptOutcome::ExitedIdleWithoutWork)
                 }
                 (AttemptState::Busy, JobEvidence::Unknown)
@@ -3209,27 +3207,6 @@ impl LifecycleLauncher {
                 _ => None,
             };
             if let Some(outcome) = outcome {
-                let now = self.ports.clock.now();
-                match (&outcome, attempt.state()) {
-                    (AttemptOutcome::CompletedJob, AttemptState::Starting | AttemptState::Idle) => {
-                        let runner_id = attempt
-                            .github_runner_id()
-                            .or(github.runner_id)
-                            .or_else(|| read_runner_id(attempt.runtime_path()))
-                            .ok_or(LifecycleError::Transition)?;
-                        attempt
-                            .assigned_job(runner_id, now)
-                            .map_err(|_| LifecycleError::Transition)?;
-                        self.record(&attempt)?;
-                    }
-                    (AttemptOutcome::ExitedIdleWithoutWork, AttemptState::Busy) => {
-                        attempt
-                            .assignment_not_taken(now)
-                            .map_err(|_| LifecycleError::Transition)?;
-                        self.record(&attempt)?;
-                    }
-                    _ => {}
-                }
                 // An ephemeral runner leaves GitHub's list a little after its
                 // process exits; one still listed is removed here rather than
                 // left for GitHub to time out.
@@ -3249,12 +3226,10 @@ impl LifecycleLauncher {
         if process_alive
             && attempt.state() == AttemptState::Busy
             && github.status == (GithubRunnerObservation::Registered { busy: false })
-            && evidence == JobEvidence::NoJob
+            && JobEvidence::of(attempt.runtime_path()) == JobEvidence::NoJob
         {
-            attempt
-                .assignment_not_taken(self.ports.clock.now())
-                .map_err(|_| LifecycleError::Transition)?;
-            self.record(&attempt)?;
+            let now = self.ports.clock.now();
+            self.transition(&mut attempt, |a| a.assignment_not_taken(now))?;
             return Ok(ReconcileProgress::Reconciled);
         }
 
@@ -3324,10 +3299,7 @@ impl LifecycleLauncher {
                 Ok(ReconcileProgress::Reconciled)
             }
             RecoveryDecision::Observe(state) => {
-                let runner_id = attempt
-                    .github_runner_id()
-                    .or(github.runner_id)
-                    .or_else(|| read_runner_id(attempt.runtime_path()))
+                let runner_id = known_runner_id(&attempt, github.runner_id)
                     .ok_or(LifecycleError::Transition)?;
                 match state {
                     AttemptState::JitReceived => attempt
@@ -3568,6 +3540,18 @@ impl LifecycleLauncher {
                 )
             }
         }
+    }
+
+    /// Takes one domain edge and journals it.
+    fn transition(
+        &self,
+        attempt: &mut RunnerAttempt,
+        edge: impl FnOnce(
+            &mut RunnerAttempt,
+        ) -> Result<(), runner_manager_domain::attempt::AttemptError>,
+    ) -> Result<(), LifecycleError> {
+        edge(attempt).map_err(|_| LifecycleError::Transition)?;
+        self.record(attempt)
     }
 
     fn record(&self, attempt: &RunnerAttempt) -> Result<(), LifecycleError> {
@@ -4762,6 +4746,15 @@ impl JobEvidence {
         }
         if listener { Self::NoJob } else { Self::Unknown }
     }
+}
+
+/// The attempt's GitHub runner id: journalled, observed, or from the sidecar
+/// written at registration.
+fn known_runner_id(attempt: &RunnerAttempt, observed: Option<u64>) -> Option<u64> {
+    attempt
+        .github_runner_id()
+        .or(observed)
+        .or_else(|| read_runner_id(attempt.runtime_path()))
 }
 
 fn read_runner_id(runtime: &Path) -> Option<u64> {

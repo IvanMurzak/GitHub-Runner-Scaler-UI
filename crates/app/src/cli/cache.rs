@@ -23,6 +23,7 @@ use runner_manager_platform::dependency_cache::{
 };
 use runner_manager_platform::runner_env::RunnerPlatform;
 use runner_manager_platform::runner_root::RootOwner;
+use runner_manager_platform::service_request::{self, AskError, Wait};
 use serde::Serialize;
 
 use super::workspace;
@@ -317,7 +318,7 @@ pub fn dispatch_host(
                 service_registered,
                 &resolved.path,
                 config.max_bytes(),
-                ServiceWait::REAL,
+                PRUNE_WAIT,
                 out,
             )? {
                 write_pruned(&usage, &resolved.path, out).map_err(failed)?;
@@ -336,7 +337,7 @@ fn prune_root(
     service_registered: bool,
     root: &Path,
     max_bytes: Option<u64>,
-    wait: ServiceWait,
+    wait: Wait,
     out: &mut dyn Write,
 ) -> Result<Option<CacheUsage>, CliError> {
     match dependency_cache::prune(root, max_bytes, &dependency_cache::runtime_holds_runner) {
@@ -385,24 +386,13 @@ fn write_pruned(usage: &CacheUsage, root: &Path, out: &mut dyn Write) -> io::Res
     )
 }
 
-/// How long `host cache prune` waits on the service, and how often it looks.
-#[derive(Debug, Clone, Copy)]
-struct ServiceWait {
-    /// For the service to take the request. Several of its polls, so a
-    /// service that is running always answers inside it.
-    taken: Duration,
-    /// For the service to finish measuring and pruning once it has.
-    finished: Duration,
-    poll: Duration,
-}
-
-impl ServiceWait {
-    const REAL: Self = Self {
-        taken: Duration::from_secs(4 * dependency_cache::PRUNE_REQUEST_POLL.as_secs()),
-        finished: Duration::from_secs(10 * 60),
-        poll: Duration::from_secs(1),
-    };
-}
+/// How long `host cache prune` waits on the service: several of its polls for
+/// it to take the request, and a measuring and pruning pass for the answer.
+const PRUNE_WAIT: Wait = Wait {
+    taken: Duration::from_secs(4 * dependency_cache::PRUNE_REQUEST_POLL.as_secs()),
+    finished: Duration::from_secs(10 * 60),
+    poll: Duration::from_secs(1),
+};
 
 /// Asks the running service to prune a cache root this account cannot write,
 /// and reports what it did. `None` when the service took the request and was
@@ -415,7 +405,7 @@ fn prune_through_service(
     state_dir: &Path,
     root: &Path,
     denied: &CacheError,
-    wait: ServiceWait,
+    wait: Wait,
     out: &mut dyn Write,
 ) -> Result<Option<CacheUsage>, CliError> {
     let failed = write_failed("the dependency caches");
@@ -423,80 +413,46 @@ fn prune_through_service(
         "runner-manager service status   (the service prunes on request while it runs), or {}",
         elevated_remedy()
     );
-    let request = dependency_cache::prune_request_path(state_dir);
-    let id = format!(
-        "{}-{}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
-        std::process::id()
-    );
-    std::fs::write(&request, &id).map_err(|error| {
+    let mut announced = Ok(());
+    let answer = service_request::CACHE_PRUNE.ask_with(state_dir, wait, || {
+        announced = writeln!(
+            out,
+            "This account cannot write {}; asking the service to prune it.",
+            root.display()
+        )
+        .and_then(|()| out.flush());
+    });
+    announced.map_err(failed)?;
+    let refused = |why: String, remedy: String| {
         CliError::with_remedy(
             Failure::LocalState,
             format!(
-                "this account cannot prune {} ({denied}), and cannot ask the service to either: \
-                 {} is not writable: {error}",
-                root.display(),
-                request.display()
+                "this account cannot prune {} ({denied}), and {why}",
+                root.display()
             ),
-            remedy.clone(),
+            remedy,
         )
-    })?;
-    writeln!(
-        out,
-        "This account cannot write {}; asking the service to prune it.",
-        root.display()
-    )
-    .map_err(failed)?;
-    out.flush().map_err(failed)?;
-
-    let taken_by = std::time::Instant::now() + wait.taken;
-    while request.exists() {
-        if std::time::Instant::now() >= taken_by {
-            // Withdrawn, so a service started later does not act on a request
-            // nobody is waiting for -- unless the service took it meanwhile.
-            match std::fs::remove_file(&request) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-                _ => {}
-            }
-            return Err(CliError::with_remedy(
-                Failure::LocalState,
-                format!(
-                    "this account cannot prune {} ({denied}), and no running service took the \
-                     request within {} seconds",
-                    root.display(),
-                    wait.taken.as_secs()
-                ),
-                remedy,
-            ));
-        }
-        std::thread::sleep(wait.poll);
-    }
-
-    let finished_by = std::time::Instant::now() + wait.finished;
-    loop {
-        if let Some(answer) = dependency_cache::PruneResult::read_for(state_dir, &id) {
-            return answer.outcome.map(Some).map_err(|why| {
-                CliError::with_remedy(
-                    Failure::LocalState,
-                    format!(
-                        "this account cannot prune {} ({denied}), and the service could not \
-                         either: {why}",
-                        root.display()
-                    ),
-                    elevated_remedy(),
-                )
-            });
-        }
-        if std::time::Instant::now() >= finished_by {
+    };
+    match answer {
+        Ok(usage) => Ok(Some(usage)),
+        Err(AskError::NotSent(why)) => Err(refused(
+            format!("cannot ask the service to either: {why}"),
+            remedy,
+        )),
+        Err(error @ AskError::NotTaken(_)) => Err(refused(error.to_string(), remedy)),
+        Err(AskError::Refused(why)) => Err(refused(
+            format!("the service could not either: {why}"),
+            elevated_remedy().to_owned(),
+        )),
+        Err(AskError::NoAnswer(_)) => {
             writeln!(
                 out,
                 "The service took the request and is still working; `runner-manager host cache \
                  show` reports the result once it finishes."
             )
             .map_err(failed)?;
-            return Ok(None);
+            Ok(None)
         }
-        std::thread::sleep(wait.poll);
     }
 }
 
@@ -1010,8 +966,10 @@ mod tests {
         }
     }
 
-    const QUICK: ServiceWait = ServiceWait {
-        taken: Duration::from_millis(400),
+    /// Long enough for a stand-in service on a loaded machine to take the
+    /// request: at 400 ms a full test run's load let it miss.
+    const QUICK: Wait = Wait {
+        taken: Duration::from_secs(2),
         finished: Duration::from_secs(20),
         poll: Duration::from_millis(20),
     };

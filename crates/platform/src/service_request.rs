@@ -8,8 +8,7 @@
 //! service answers in the channel's result file under the same identifier,
 //! which is how the command knows the answer is to this request.
 //!
-//! `host cache prune` uses the same shape with its own files
-//! ([`crate::dependency_cache::PRUNE_REQUEST_FILE`]).
+//! Two channels use it: [`CACHE_PRUNE`] and [`GITHUB_DISCOVERY`].
 
 use std::fs;
 use std::io;
@@ -28,6 +27,14 @@ pub struct Channel {
     request: &'static str,
     result: &'static str,
 }
+
+/// `host cache prune` for a cache root this account cannot write: the root of
+/// a service running as another account (LocalSystem on Windows, root
+/// elsewhere).
+pub const CACHE_PRUNE: Channel = Channel {
+    request: crate::dependency_cache::PRUNE_REQUEST_FILE,
+    result: crate::dependency_cache::PRUNE_RESULT_FILE,
+};
 
 /// What the stored GitHub credential reaches, asked of the service by a
 /// command that cannot read the credential itself.
@@ -116,11 +123,39 @@ impl Channel {
         crate::host_fitness::write_atomically(&state_dir.join(self.result), &json)
     }
 
+    /// The service's answer to `request`, once it has given one.
+    #[must_use]
+    pub fn read_answer<T: DeserializeOwned>(
+        &self,
+        state_dir: &Path,
+        request: &str,
+    ) -> Option<Result<T, String>> {
+        fs::read(state_dir.join(self.result))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Answer<T>>(&bytes).ok())
+            .filter(|answer| answer.request == request)
+            .map(|answer| answer.outcome)
+    }
+
     /// Asks the service and waits for its answer.
     ///
     /// # Errors
     /// [`AskError`], naming which half of the exchange did not happen.
     pub fn ask<T: DeserializeOwned>(&self, state_dir: &Path, wait: Wait) -> Result<T, AskError> {
+        self.ask_with(state_dir, wait, || {})
+    }
+
+    /// [`Self::ask`], calling `sent` once the request is in place, so the
+    /// command can say it is waiting.
+    ///
+    /// # Errors
+    /// As [`Self::ask`].
+    pub fn ask_with<T: DeserializeOwned>(
+        &self,
+        state_dir: &Path,
+        wait: Wait,
+        sent: impl FnOnce(),
+    ) -> Result<T, AskError> {
         let id = format!(
             "{}-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
@@ -129,6 +164,7 @@ impl Channel {
         let request = self.request_path(state_dir);
         crate::host_fitness::write_atomically(&request, id.as_bytes())
             .map_err(|error| AskError::NotSent(format!("{}: {error}", request.display())))?;
+        sent();
 
         let started = Instant::now();
         while request.exists() {
@@ -146,12 +182,8 @@ impl Channel {
 
         let taken = Instant::now();
         loop {
-            if let Some(answer) = fs::read(state_dir.join(self.result))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Answer<T>>(&bytes).ok())
-                .filter(|answer| answer.request == id)
-            {
-                return answer.outcome.map_err(AskError::Refused);
+            if let Some(outcome) = self.read_answer(state_dir, &id) {
+                return outcome.map_err(AskError::Refused);
             }
             if taken.elapsed() >= wait.finished {
                 return Err(AskError::NoAnswer(wait.finished.as_secs()));
