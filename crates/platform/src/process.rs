@@ -2955,14 +2955,6 @@ mod tests {
         child.stop(Duration::from_secs(10)).expect("cleanup");
     }
 
-    /// Opts a macOS host into
-    /// [`a_runner_under_the_rendered_launch_agent_runs_at_normal_priority`],
-    /// which loads two launch agents into the caller's GUI session. CI's macOS
-    /// leg sets it, and `privileged_tests_are_wired_into_ci.rs` asserts that it
-    /// still does.
-    #[cfg(target_os = "macos")]
-    const LAUNCHD_ACCEPTANCE: &str = "RUNNER_MANAGER_LAUNCHD_ACCEPTANCE";
-
     /// What the launchd job below writes into its working directory.
     #[cfg(target_os = "macos")]
     const PRIORITY_REPORT: &str = "priority-report.txt";
@@ -3003,17 +2995,9 @@ mod tests {
     /// again. Returns `(agent priority, child priority)`.
     #[cfg(target_os = "macos")]
     fn priorities_under_launch_agent(tag: &str, edit: impl FnOnce(String) -> String) -> (i32, i32) {
+        use crate::service::launchd_fixture::LoadedAgent;
         use crate::service::{InstallPlan, ServiceDirectories, ServiceIdentity, launchd_plist};
         use runner_manager_domain::model::StartMode;
-
-        struct BootOut(String);
-        impl Drop for BootOut {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", &self.0])
-                    .output();
-            }
-        }
 
         let root = tempfile::tempdir().expect("a temporary directory");
         let directories = ServiceDirectories {
@@ -3042,22 +3026,7 @@ mod tests {
             ]);
         let plist = root.path().join(format!("{label}.plist"));
         std::fs::write(&plist, edit(launchd_plist(&plan))).expect("plist written");
-
-        // SAFETY: `getuid` reads the calling process's real user id and cannot
-        // fail.
-        let domain = format!("gui/{}", unsafe { libc::getuid() });
-        let _loaded = BootOut(format!("{domain}/{label}"));
-        let bootstrap = std::process::Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(&plist)
-            .output()
-            .expect("launchctl runs");
-        assert!(
-            bootstrap.status.success(),
-            "launchctl bootstrap {domain} refused the {tag} agent, so nothing was measured: {}",
-            String::from_utf8_lossy(&bootstrap.stderr)
-        );
+        let _loaded = LoadedAgent::bootstrap(&label, &plist);
 
         let report = directories.state.join(PRIORITY_REPORT);
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -3098,8 +3067,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_runner_under_the_rendered_launch_agent_runs_at_normal_priority() {
-        if std::env::var_os(LAUNCHD_ACCEPTANCE).is_none_or(|value| value != "1") {
-            eprintln!("skipped: set {LAUNCHD_ACCEPTANCE}=1 to load test launch agents");
+        if !crate::service::launchd_fixture::enabled() {
             return;
         }
         let ceiling = sys::BACKGROUND_PRIORITY_CEILING;

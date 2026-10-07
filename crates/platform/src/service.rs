@@ -6845,6 +6845,67 @@ mod sys {
     }
 }
 
+/// What the macOS tests that load real launch agents share.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod launchd_fixture {
+    use std::path::Path;
+
+    /// Opts a macOS host into the tests that load launch agents into the
+    /// caller's GUI session. CI's macOS leg sets it, and
+    /// `privileged_tests_are_wired_into_ci.rs` asserts that it still does.
+    const ACCEPTANCE: &str = "RUNNER_MANAGER_LAUNCHD_ACCEPTANCE";
+
+    /// Whether this run may load launch agents. Says so when it may not, since
+    /// the test then passes having measured nothing.
+    pub(crate) fn enabled() -> bool {
+        let enabled = std::env::var_os(ACCEPTANCE).is_some_and(|value| value == "1");
+        if !enabled {
+            eprintln!("skipped: set {ACCEPTANCE}=1 to load test launch agents");
+        }
+        enabled
+    }
+
+    /// A launch agent loaded into the caller's GUI domain, booted out on drop.
+    pub(crate) struct LoadedAgent(String);
+
+    impl LoadedAgent {
+        /// Bootstraps `plist`, whose `Label` is `label`, and fails the test when
+        /// launchd refuses it.
+        pub(crate) fn bootstrap(label: &str, plist: &Path) -> Self {
+            // SAFETY: `getuid` reads the calling process's real user id and
+            // cannot fail.
+            let domain = format!("gui/{}", unsafe { libc::getuid() });
+            // Armed before the bootstrap, so a half-loaded job is removed too.
+            let loaded = Self(format!("{domain}/{label}"));
+            let bootstrap = std::process::Command::new("launchctl")
+                .arg("bootstrap")
+                .arg(&domain)
+                .arg(plist)
+                .output()
+                .expect("launchctl runs");
+            assert!(
+                bootstrap.status.success(),
+                "launchctl bootstrap {domain} refused {label}, so nothing was measured: {}",
+                String::from_utf8_lossy(&bootstrap.stderr)
+            );
+            loaded
+        }
+
+        /// `gui/<uid>/<label>`.
+        pub(crate) fn target(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for LoadedAgent {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &self.0])
+                .output();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7481,15 +7542,11 @@ mod tests {
     /// The rewrite and the detached reload together, against a real launchd:
     /// a fixture agent loaded as `Background` is replaced by the same plist
     /// with [`LAUNCHD_PROCESS_TYPE`], and launchd must end up running it with
-    /// that spawn type. Gated like the runner-priority test in `process.rs`,
-    /// on the same variable.
+    /// that spawn type.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_rewritten_plist_is_loaded_again_by_the_detached_reload() {
-        if std::env::var_os("RUNNER_MANAGER_LAUNCHD_ACCEPTANCE").is_none_or(|value| value != "1") {
-            eprintln!(
-                "skipped: set RUNNER_MANAGER_LAUNCHD_ACCEPTANCE=1 to load test launch agents"
-            );
+        if !super::launchd_fixture::enabled() {
             return;
         }
         let root = tempfile::tempdir().expect("a temporary directory");
@@ -7507,22 +7564,10 @@ mod tests {
             )
         };
         std::fs::write(&path, plist("Background")).expect("plist written");
-        // SAFETY: `getuid` reads the calling process's real user id and cannot
-        // fail.
-        let domain = format!("gui/{}", unsafe { libc::getuid() });
-        let target = format!("{domain}/{label}");
-        struct BootOut(String);
-        impl Drop for BootOut {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", &self.0])
-                    .output();
-            }
-        }
-        let _loaded = BootOut(target.clone());
+        let loaded = super::launchd_fixture::LoadedAgent::bootstrap(&label, &path);
         let spawn_type = || {
             let printed = std::process::Command::new("launchctl")
-                .args(["print", &target])
+                .args(["print", loaded.target()])
                 .output()
                 .expect("launchctl runs");
             String::from_utf8_lossy(&printed.stdout)
@@ -7533,16 +7578,6 @@ mod tests {
                         .map(str::to_string)
                 })
         };
-        let bootstrap = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&path)
-            .output()
-            .expect("launchctl runs");
-        assert!(
-            bootstrap.status.success(),
-            "{}",
-            String::from_utf8_lossy(&bootstrap.stderr)
-        );
         assert_eq!(spawn_type().as_deref(), Some("background (5)"));
 
         let drift = DefinitionDrift {
