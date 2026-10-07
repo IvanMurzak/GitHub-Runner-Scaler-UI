@@ -7,6 +7,43 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.33
+
+### Features
+
+- `runner-manager host doctor` checks whether this machine is ready to run jobs, without
+  changing anything or needing administrator rights: on Windows the runner account's
+  symbolic-link privilege, `LongPathsEnabled`, git's system `core.longpaths`, Defender real-time
+  scanning of the runner roots, whether the service runs unattended as LocalSystem, the Windows
+  PowerShell execution policy and PowerShell 7; on macOS a `Background` LaunchAgent or throttled
+  runners, Spotlight indexing the runner root, and whether the service binary can still read its
+  keychain credential; everywhere a runner root that does not answer within 5 seconds (a hung
+  external disk or network mount), a capacity larger than memory and cores allow, and any tools
+  named with `host required-tools`. `--json` prints a versioned document. It exits with the new
+  code 25 (`host_unfit`) when a required check fails.
+- `runner-manager host prepare` fixes what the doctor found. It asks before changing anything
+  (`--yes` skips the question; `--only CHECK` narrows it), and asks for administrator rights once,
+  for every fix that needs them: a UAC prompt on Windows, the system password dialog or `sudo` on
+  macOS. A refused prompt is reported and the rest carries on. Excluding the runner roots from
+  Defender and turning on Developer Mode lower security and are never applied by `--yes` alone:
+  they need `--allow-av-exclusion` or `--allow-developer-mode`, or a yes to their own question.
+  Each change is recorded with the value it replaced, and `host prepare --revert CHECK` restores
+  it.
+- `service install` reports the checks for the account the service will run as and, on a
+  terminal, offers to fix them first. `status` and `service status` show a one-line summary
+  (`status --json` gains a `doctor` block). The dashboard lists failing checks in its readiness
+  panel, and `f` fixes them.
+
+### Operator notes
+
+- The service now starts no runner while a **required** check fails. It logs `host_unfit`, every
+  launch is refused with reason `host_unfit` before anything is registered with GitHub, and
+  `status` shows since when and why. It re-checks every five minutes. On Windows a service
+  installed with `--start-at login` runs with a standard token and cannot create symbolic links
+  unless Developer Mode is on, so such a host stops starting runners after this update until you
+  run `runner-manager host prepare --allow-developer-mode` or reinstall the service with
+  `--start-at boot`. A check that cannot be evaluated never holds runners back.
+
 ## 0.4.32
 
 ### Fixes

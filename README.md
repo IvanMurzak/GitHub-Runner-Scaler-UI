@@ -299,6 +299,10 @@ runner-manager host isolation status [--json]                  # Report executio
 runner-manager host env show                                   # Show what native runners add to their environment
 runner-manager host env set NAME=VALUE                         # Give every native runner a variable
 runner-manager host env unset NAME                             # Remove a runner variable
+runner-manager host doctor [--json]                            # Check this machine is ready to run jobs
+runner-manager host prepare [--yes] [--only CHECK]             # Fix what the doctor found, elevating only if needed
+runner-manager host prepare --revert CHECK                     # Undo what prepare changed for one check
+runner-manager host required-tools [--set git,node]            # Tools every runner must find on its PATH
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
@@ -573,6 +577,43 @@ they are. The command prints the explicit Linux commands to run inside the distr
 want to undo that half as well.
 
 ## Customize your setup
+
+### Get the machine ready for jobs
+
+Some host settings make every job slower or make some fail, and none of them is visible from a
+workflow log. `runner-manager host doctor` checks them, changes nothing, and needs no
+administrator rights:
+
+| Check | Platform | Severity | `host prepare` fix | Needs admin |
+|---|---|---|---|---|
+| `windows.symlink_privilege` | Windows | required | turn on Developer Mode (needs `--allow-developer-mode`) | yes |
+| `windows.long_paths` | Windows | recommended | `LongPathsEnabled = 1` | yes |
+| `windows.git_long_paths` | Windows | recommended | `git config --system core.longpaths true` | yes |
+| `windows.defender_exclusion` | Windows | recommended | exclude the runner roots from real-time scanning (needs `--allow-av-exclusion`) | yes |
+| `windows.execution_account` | Windows | recommended | none; use `service install --start-at boot` | - |
+| `windows.execution_policy` | Windows | recommended | `Set-ExecutionPolicy RemoteSigned -Scope LocalMachine` | yes |
+| `windows.pwsh` | Windows | info | none; install PowerShell 7 | - |
+| `macos.launchd_priority` | macOS | recommended | none; `runner-manager update` repairs the plist | - |
+| `macos.spotlight` | macOS | recommended | `mdutil -i off` for a runner root on its own volume | yes |
+| `macos.keychain_credential` | macOS | required | none; prints the exact `auth login --start-at login` | - |
+| `host.runner_root_responsive` | all | required | none; a runner root that does not answer within 5 s (a hung external disk or network mount) | - |
+| `host.capacity` | all | recommended | none; suggests `host set-capacity N` from memory and cores | - |
+| `host.required_tools` | all | required | none; install the tool or extend PATH | - |
+
+`runner-manager host prepare` applies the fixes. It lists them and asks before changing anything
+(`--yes` skips that question), runs what needs no privilege itself, and asks for administrator
+rights once, for the rest together: a UAC prompt on Windows, the system password dialog (or
+`sudo` on a terminal) on macOS. If you refuse, it reports what is left and carries on. A fix
+that lowers security, Defender exclusion or Developer Mode, is never applied by `--yes` alone:
+pass its flag or answer its own question. Every change is recorded with the value it replaced,
+and `host prepare --revert CHECK` puts it back.
+
+The same checks run on their own: `service install` reports them for the account the service
+will run as and offers to fix them on a terminal, `status` and `service status` show a one-line
+summary, and the dashboard lists failing checks with `f` to fix them. While a **required** check
+fails, the service starts no runner and logs `host_unfit`; it re-checks every five minutes, so a
+fix takes effect without a restart. A check it could not evaluate never holds runners back.
+Name the tools every job needs with `runner-manager host required-tools --set git,pwsh,node`.
 
 ### Choose where runners work
 

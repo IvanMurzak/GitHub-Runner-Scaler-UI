@@ -80,6 +80,7 @@ pub enum Boundary {
     LivePermissionProbe,
     ProfileStateSpace,
     RunnerEnvironmentFile,
+    HostConfiguration,
 }
 
 impl Boundary {
@@ -111,6 +112,10 @@ impl Boundary {
             Self::RunnerEnvironmentFile => {
                 "reads or rewrites the host's runner.env, a file outside the chain oracle's \
                  modelled state whose only effect is on a native runner's environment at launch"
+            }
+            Self::HostConfiguration => {
+                "reads or changes machine-wide operating-system settings (registry, Defender, \
+                 git's system configuration, Spotlight) outside every scenario's temporary roots"
             }
         }
     }
@@ -160,6 +165,7 @@ const UPDATE: &str = "crates/app/tests/update_command.rs";
 const WSL_ACCEPTANCE: &str = "crates/app/src/cli/wsl_acceptance.rs";
 const PROFILE_COMMANDS: &str = "crates/app/tests/profile_commands.rs";
 const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
+const HOST_DOCTOR_COMMANDS: &str = "crates/app/tests/host_doctor_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -245,6 +251,20 @@ macro_rules! runner_env_row {
     };
 }
 
+macro_rules! host_doctor_row {
+    ($leaf:literal, $test:literal, $reason:literal) => {
+        Classification {
+            leaf: $leaf,
+            coverage: Coverage::Dedicated,
+            evidence: &[at(HOST_DOCTOR_COMMANDS, $test)],
+            exclusion: Some(Exclusion {
+                boundary: Boundary::HostConfiguration,
+                reason: $reason,
+            }),
+        }
+    };
+}
+
 /// The reviewed classification of every published leaf.
 pub const MANIFEST: &[Classification] = &[
     // -- auth: sign-in state is modelled as credential presence -------------
@@ -298,6 +318,27 @@ pub const MANIFEST: &[Classification] = &[
     runner_env_row!(
         "host env unset",
         "host_env_set_show_and_unset_round_trip_through_runner_env"
+    ),
+    host_doctor_row!(
+        "host doctor",
+        "host_doctor_reports_the_versioned_document_and_exits_unfit_on_a_required_failure",
+        "Its answer is a reading of this machine's registry, Defender, git and service account, \
+         which the generated oracle does not model; a dedicated real-process test pins the JSON \
+         document and the host_unfit exit against a required tool that cannot be on PATH."
+    ),
+    host_doctor_row!(
+        "host prepare",
+        "host_prepare_without_a_terminal_or_yes_changes_nothing",
+        "Applying a fix changes machine-wide settings and asks for administrator rights, which \
+         no CI leg may do to its host; a real-process test pins that nothing is applied without \
+         consent, and the planner, elevation and revert logic are unit-tested against fakes."
+    ),
+    host_doctor_row!(
+        "host required-tools",
+        "host_required_tools_round_trip_under_the_data_dir",
+        "The list lives in its own file under config/ and changes only what the doctor and the \
+         daemon's preflight require; a real-process test drives set, show and clear and pins \
+         the refusal of a path-like name."
     ),
     // -- repo ----------------------------------------------------------------
     generated("repo add"),

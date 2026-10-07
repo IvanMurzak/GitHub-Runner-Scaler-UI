@@ -225,9 +225,24 @@ remove_dir_all = "1.0.0"
 #                                hand instead would be three magic numbers in
 #                                the one place that decides whether a runner
 #                                root is remote.
+#   Win32_System_Registry        `RegGetValueW`, `RegCreateKeyExW`,
+#                                `RegSetValueExW`, `RegDeleteKeyValueW` and
+#                                `RegEnumValueW`. `host doctor` reads
+#                                `LongPathsEnabled`, Developer Mode, the
+#                                PowerShell execution policy and Defender's
+#                                exclusion list without starting a process;
+#                                `host prepare` writes the first three back.
+#                                Defender's own keys are tamper-protected and go
+#                                through `Add-MpPreference` instead. Also a
+#                                prerequisite of `SHELLEXECUTEINFOW` below.
+#   Win32_UI_Shell               `ShellExecuteExW` with the `runas` verb, the
+#                                documented way to ask the user for elevation.
+#                                `host prepare` relaunches only its own fix step
+#                                that way, so a batch of fixes costs one UAC
+#                                prompt.
 #
-# Neither of the two `b1` modules adds a package to `Cargo.lock`: the `windows`
-# crate's features are cfg gates over its own generated bindings and pull in no
+# None of these modules adds a package to `Cargo.lock`: the `windows` crate's
+# features are cfg gates over its own generated bindings and pull in no
 # optional dependency.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -235,9 +250,11 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
 ] }
 windows-service = "0.8.1"
 

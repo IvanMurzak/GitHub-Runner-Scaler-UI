@@ -42,6 +42,7 @@
 
 pub mod auth;
 pub mod daemon;
+pub mod doctor;
 pub mod host;
 pub mod policy;
 pub mod profile;
@@ -317,6 +318,11 @@ failure_taxonomy! {
     /// nothing was changed and rerunning without fixing the distribution
     /// changes nothing either.
     WslProvisioning = 24 => "wsl_provisioning",
+    /// A required host check fails (`host doctor`), so the daemon starts no
+    /// runner on this host. `host doctor` exits with it after printing its
+    /// whole report, and `host prepare` when a required check still fails
+    /// after it ran. Remedy: `host prepare`, or what the report names.
+    HostUnfit = 25 => "host_unfit",
 }
 
 impl Failure {
@@ -816,6 +822,66 @@ pub enum HostCommand {
     /// View or change the environment every native runner starts with.
     #[command(subcommand)]
     Env(HostEnvCommand),
+    /// Check this machine is ready to run jobs, changing nothing.
+    Doctor(HostDoctorArgs),
+    /// Fix what `host doctor` found, asking for administrator rights only if needed.
+    Prepare(HostPrepareArgs),
+    /// Name tools every runner must find on its PATH before runners start.
+    RequiredTools(HostRequiredToolsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HostDoctorArgs {
+    /// Emit the versioned JSON report instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostPrepareArgs {
+    /// Apply without asking. Never implies a change that lowers security;
+    /// those need their own flag.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Fix only this check; repeat for several. `host doctor` lists the ids.
+    #[arg(long, value_name = "CHECK")]
+    pub only: Vec<String>,
+    /// Allow excluding the runner roots from Windows Defender real-time
+    /// scanning. Files there are then no longer scanned on access.
+    #[arg(long)]
+    pub allow_av_exclusion: bool,
+    /// Allow turning on Windows Developer Mode, which lets every account create
+    /// symbolic links (and sideload apps).
+    #[arg(long)]
+    pub allow_developer_mode: bool,
+    /// Undo what `host prepare` changed for this check; repeat for several.
+    #[arg(
+        long,
+        value_name = "CHECK",
+        conflicts_with_all = ["only", "allow_av_exclusion", "allow_developer_mode"]
+    )]
+    pub revert: Vec<String>,
+    /// The plan an elevated copy of this command carries out. Not for people.
+    #[arg(long, hide = true, requires = "elevated_result")]
+    pub elevated_request: Option<String>,
+    /// Where the elevated copy reports. Not for people.
+    #[arg(long, hide = true, requires = "elevated_request")]
+    pub elevated_result: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct HostRequiredToolsArgs {
+    /// Replace the list, comma-separated: `--set git,pwsh,node`.
+    #[arg(
+        long,
+        value_name = "TOOLS",
+        value_delimiter = ',',
+        conflicts_with = "clear"
+    )]
+    pub set: Option<Vec<String>>,
+    /// Require no tools.
+    #[arg(long)]
+    pub clear: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1742,6 +1808,18 @@ pub fn dispatch() -> ExitCode {
         return wsl::dispatch_to_selected_host(&cli, distribution, &argv);
     }
 
+    // The elevated copy `host prepare` starts carries its whole plan on its
+    // command line and must touch no local state: as root on macOS a database
+    // or log file it opened would be left owned by root.
+    if let Command::Host(HostCommand::Prepare(HostPrepareArgs {
+        elevated_request: Some(request),
+        elevated_result: Some(result),
+        ..
+    })) = &cli.command
+    {
+        return doctor::run_elevated_child(request, result);
+    }
+
     // The terminal UI owns the terminal and owns its own exit code, so it is
     // routed here rather than through `run`: `ExitCode` cannot be inspected, so
     // a TUI that exited non-zero for its own reasons would otherwise be
@@ -1882,6 +1960,11 @@ fn is_decorated_report(command: &Command) -> bool {
         // prompt and a download that an operator waits in front of.
         Command::Wsl(WslCommand::Status(args)) => !args.json,
         Command::Wsl(WslCommand::List | WslCommand::Detach(_)) => true,
+        // `host prepare` asks questions and waits for an elevation prompt, and
+        // `host doctor --json` is a document; neither may be buffered or
+        // decorated.
+        Command::Host(HostCommand::Prepare(_)) => false,
+        Command::Host(HostCommand::Doctor(args)) => !args.json,
         Command::Host(_) | Command::Service(_) | Command::Repo(_) | Command::Org(_) => true,
         // `auth status` and `auth logout` are reports; `auth login` is a
         // conversation with a person and streams.

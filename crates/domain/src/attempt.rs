@@ -424,6 +424,14 @@ pub enum FailureReason {
     /// path concludes an attempt with it, which also keeps it out of the
     /// journal that an older binary might read.
     WorkspaceCleanupDeferred,
+    /// A required host capability is missing (`runner-manager host doctor`),
+    /// so the daemon refused to start a runner at all.
+    ///
+    /// **A launch refusal, never an attempt outcome**, for the reason
+    /// [`Self::WorkspaceCleanupDeferred`] gives: no attempt exists yet when
+    /// the daemon refuses, no runner is registered with GitHub, and the event
+    /// and the log name the refusal instead of `other`.
+    HostUnfit,
     /// Anything else. Must carry no credential.
     Other(String),
 }
@@ -506,7 +514,7 @@ impl FailureReason {
     /// invocation are markedly worse to read and to `rustdoc`. That is a
     /// legibility trade, deliberately taken — not an impossibility. If the
     /// documentation ever thins out, the macro is the better answer.
-    pub const ALL: [FailureReason; 11] = [
+    pub const ALL: [FailureReason; 12] = [
         FailureReason::JitRequestFailed,
         FailureReason::JitExpired,
         FailureReason::RunnerPackageUnverified,
@@ -517,6 +525,7 @@ impl FailureReason {
         FailureReason::TerminatedAfterRegistrationTimeout,
         FailureReason::IsolationProvider(IsolationProviderFailure::RuntimeOperationFailed),
         FailureReason::WorkspaceCleanupDeferred,
+        FailureReason::HostUnfit,
         FailureReason::Other(String::new()),
     ];
 }
@@ -557,6 +566,10 @@ impl fmt::Display for FailureReason {
             FailureReason::WorkspaceCleanupDeferred => {
                 f.write_str("the attempt workspace could not be removed yet; cleanup will retry")
             }
+            FailureReason::HostUnfit => f.write_str(
+                "a required host check fails, so no runner is started; run \
+                 `runner-manager host doctor`",
+            ),
             FailureReason::Other(detail) => write!(f, "{detail}"),
         }
     }
@@ -2300,7 +2313,9 @@ mod tests {
             // `WorkspaceCleanupDeferred` is never recorded as an outcome (see
             // the variant), so the only claim made for it is the one `Other`
             // makes: the type would accept it.
-            FailureReason::WorkspaceCleanupDeferred | FailureReason::Other(_) => AttemptState::Busy,
+            FailureReason::WorkspaceCleanupDeferred
+            | FailureReason::HostUnfit
+            | FailureReason::Other(_) => AttemptState::Busy,
         }
     }
 
@@ -2317,7 +2332,7 @@ mod tests {
         // The table is written out rather than derived so each pairing carries
         // its reason; `earliest_state_producing` above is what makes a new
         // variant a compile error, and the two are cross-checked below.
-        let cases: [(FailureReason, AttemptState); 11] = [
+        let cases: [(FailureReason, AttemptState); 12] = [
             // Step 5: the package is verified before the JIT request is made.
             (
                 FailureReason::RunnerPackageUnverified,
@@ -2349,6 +2364,7 @@ mod tests {
                 AttemptState::Allocated,
             ),
             (FailureReason::WorkspaceCleanupDeferred, AttemptState::Busy),
+            (FailureReason::HostUnfit, AttemptState::Busy),
             (
                 FailureReason::Other("a reason b1 did not anticipate".into()),
                 AttemptState::Busy,

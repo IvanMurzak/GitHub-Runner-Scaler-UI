@@ -107,7 +107,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -986,6 +986,54 @@ pub trait RunnerLauncher: fmt::Debug + Send + Sync {
     async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure>;
 }
 
+/// A [`RunnerLauncher`] that refuses every launch with
+/// [`FailureReason::HostUnfit`] while `unfit` is set, and passes everything
+/// else straight through.
+///
+/// The daemon sets the flag while a required host check fails (`host
+/// doctor`). The refusal comes before the inner launcher runs, so nothing is
+/// registered with GitHub, and the reconciler reports it as a
+/// `runner_start_failed` event with reason `host_unfit` -- visible, rather than
+/// a host that silently stopped serving. Supervision, the attempt set and
+/// cleanup are never gated: what already runs is still looked after.
+#[derive(Debug)]
+pub struct FitnessGatedLauncher {
+    inner: Arc<dyn RunnerLauncher>,
+    unfit: Arc<AtomicBool>,
+}
+
+impl FitnessGatedLauncher {
+    #[must_use]
+    pub const fn new(inner: Arc<dyn RunnerLauncher>, unfit: Arc<AtomicBool>) -> Self {
+        Self { inner, unfit }
+    }
+}
+
+#[async_trait::async_trait]
+impl RunnerLauncher for FitnessGatedLauncher {
+    async fn supervise(
+        &self,
+        policy: &ScalePolicy,
+    ) -> Result<Vec<ReplacementIntent>, LaunchFailure> {
+        self.inner.supervise(policy).await
+    }
+
+    async fn attempts(&self) -> Result<Vec<RunnerAttempt>, LaunchFailure> {
+        self.inner.attempts().await
+    }
+
+    async fn launch(&self, request: LaunchRequest<'_>) -> Result<RunnerAttempt, LaunchFailure> {
+        if self.unfit.load(Ordering::Acquire) {
+            return Err(LaunchFailure::new(FailureReason::HostUnfit));
+        }
+        self.inner.launch(request).await
+    }
+
+    async fn clean(&self, attempt: AttemptId) -> Result<(), LaunchFailure> {
+        self.inner.clean(attempt).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The host-wide allocation lock
 // ---------------------------------------------------------------------------
@@ -1271,6 +1319,7 @@ pub const fn failure_reason_kind(reason: &FailureReason) -> &'static str {
             IsolationProviderFailure::JitHandoffRejected => "isolation_jit_handoff_rejected",
         },
         FailureReason::WorkspaceCleanupDeferred => "ephemeral_workspace_could_not_be_removed",
+        FailureReason::HostUnfit => "host_unfit",
         FailureReason::Other(_) => "other",
     }
 }
@@ -5152,6 +5201,51 @@ mod tests {
             !failures[0].contains("ghp_"),
             "an event carried a `FailureReason::Other` detail verbatim"
         );
+    }
+
+    /// The host-fitness preflight: while a required host check fails, the pass
+    /// still decides what it would start, but nothing reaches the inner
+    /// launcher -- so nothing is registered with GitHub -- and the event names
+    /// `host_unfit`. Clearing the flag lets the next pass start runners.
+    #[tokio::test]
+    async fn an_unfit_host_registers_no_runner_and_reports_host_unfit() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let unfit = Arc::new(AtomicBool::new(true));
+        let events = Arc::new(EventLog::new());
+        let mut reconciler = Reconciler::new(
+            host_with(4),
+            ReconcilerPorts {
+                demand: Arc::new(FakeDemand::ready(2, &repo("acme/app"))),
+                launcher: Arc::new(FitnessGatedLauncher::new(
+                    Arc::clone(&launcher) as Arc<dyn RunnerLauncher>,
+                    Arc::clone(&unfit),
+                )),
+                lock: Arc::new(InProcessAllocationLock::new()),
+                directory: Arc::new(FakeDirectory::default()),
+                clock: Arc::new(FakeClock::default()) as Arc<dyn Clock>,
+                jitter: Arc::new(NoJitter) as Arc<dyn Jitter>,
+                events: Arc::clone(&events) as Arc<dyn EventSink>,
+            },
+        );
+        let policies = [policy(1, "acme/app", 4)];
+
+        let report = reconciler.reconcile(&policies).await;
+        assert_eq!(report.started, 0);
+        assert_eq!(launcher.launches(), 0, "the inner launcher must not run");
+        let reasons: Vec<&'static str> = events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::RunnerStartFailed { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, ["host_unfit"]);
+
+        unfit.store(false, Ordering::Release);
+        let report = reconciler.reconcile(&policies).await;
+        assert_eq!(report.started, 2);
+        assert_eq!(launcher.launches(), 2);
     }
 
     #[tokio::test]

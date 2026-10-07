@@ -37,6 +37,7 @@ use runner_manager_github::rest::refreshes_per_hour;
 use runner_manager_platform::service::{InstallRecord, github_credential_rejected_since};
 use serde::Serialize;
 
+use super::doctor::DoctorSummary;
 use super::host::{FALLBACK_COST_MULTIPLE, HostBudget, local_host, max_repository_targets};
 use super::workspace;
 use super::{CliError, Context, Failure, StatusArgs, write_failed};
@@ -124,6 +125,10 @@ pub struct StatusDocument {
     pub host: HostSnapshot,
     pub budget: BudgetSnapshot,
     pub policies: Vec<PolicySnapshot>,
+    /// `host doctor`'s verdict, from this command's point of view, and the
+    /// daemon's recorded refusal to start runners, if it has one. Read-only
+    /// probes of this machine; still nothing is contacted.
+    pub doctor: DoctorSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -393,11 +398,25 @@ fn registration_labels(labels: &runner_manager_domain::policy::RoutingLabels) ->
 // Building it
 // ---------------------------------------------------------------------------
 
-/// Reads local state and assembles the snapshot.
+/// Reads local state and assembles the snapshot, `host doctor` included.
 ///
 /// # Errors
 /// [`Failure::LocalState`] and [`Failure::SecretStore`].
 pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
+    snapshot_with(context, true)
+}
+
+/// The same snapshot with the doctor left out (`doctor.checked` is 0), for a
+/// caller that refreshes it on its own cadence: the TUI polls every minute
+/// and must not wait on the doctor's probes for its first frame.
+///
+/// # Errors
+/// As [`snapshot`].
+pub fn snapshot_without_doctor(context: &Context) -> Result<StatusDocument, CliError> {
+    snapshot_with(context, false)
+}
+
+fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument, CliError> {
     let store = context.store()?;
     let host = local_host(&store)?;
     let attempts = store.attempts().map_err(|source| {
@@ -452,6 +471,11 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
         .iter()
         .map(|policy| workspace::repository_workspace(&store, &runner_root, policy))
         .collect::<Result<Vec<_>, CliError>>()?;
+    let doctor = if with_doctor {
+        super::doctor::status_summary(context, host.as_ref(), &policies, &runner_root)
+    } else {
+        super::doctor::pending_summary(context)
+    };
 
     Ok(StatusDocument {
         schema_version: SCHEMA_VERSION,
@@ -517,6 +541,7 @@ pub fn snapshot(context: &Context) -> Result<StatusDocument, CliError> {
                 )
             })
             .collect(),
+        doctor,
     })
 }
 
@@ -624,6 +649,19 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         out,
         "  GitHub contacted          no (this is a local snapshot; `auth status` asks GitHub)"
     )?;
+    writeln!(
+        out,
+        "  host doctor               {}",
+        document.doctor.line()
+    )?;
+    if let Some(unfit) = &document.doctor.daemon_host_unfit {
+        writeln!(
+            out,
+            "  daemon starts no runner   since {}: host unfit ({})",
+            unfit.since,
+            unfit.checks.join(", ")
+        )?;
+    }
     writeln!(out)?;
 
     writeln!(out, "Policies ({})", document.policies.len())?;
@@ -762,6 +800,24 @@ mod tests {
                     cleanup_blocked: false,
                 }],
             }],
+            doctor: DoctorSummary {
+                checked: 9,
+                failing: vec![super::super::doctor::FindingSummary {
+                    id: "windows.symlink_privilege".to_string(),
+                    severity: super::super::doctor::Severity::Required,
+                    title: "Symbolic links for the runner account".to_string(),
+                    detail: "the login service runs with a standard token".to_string(),
+                    remedy: Some("runner-manager service install --start-at boot".to_string()),
+                    fixable: true,
+                    needs_admin: true,
+                    consent_flag: Some("--allow-developer-mode".to_string()),
+                }],
+                unknown: vec!["windows.defender_exclusion".to_string()],
+                daemon_host_unfit: Some(super::super::doctor::HostUnfitSummary {
+                    since: chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap(),
+                    checks: vec!["windows.symlink_privilege".to_string()],
+                }),
+            },
         }
     }
 
@@ -797,6 +853,7 @@ mod tests {
             [
                 "budget",
                 "credential",
+                "doctor",
                 "generated_at",
                 "github_contacted",
                 "host",
@@ -804,6 +861,27 @@ mod tests {
                 "product",
                 "schema_version",
             ]
+        );
+        assert_eq!(
+            keys(&emitted, "/doctor"),
+            ["checked", "daemon_host_unfit", "failing", "unknown"]
+        );
+        assert_eq!(
+            keys(&emitted, "/doctor/failing/0"),
+            [
+                "consent_flag",
+                "detail",
+                "fixable",
+                "id",
+                "needs_admin",
+                "remedy",
+                "severity",
+                "title"
+            ]
+        );
+        assert_eq!(
+            keys(&emitted, "/doctor/daemon_host_unfit"),
+            ["checks", "since"]
         );
         assert_eq!(
             keys(&emitted, "/product"),
@@ -1038,6 +1116,39 @@ mod tests {
         // And the rest of the snapshot is still there, which is what failing
         // outright used to cost.
         assert!(text.contains("Policies (1)"), "{text}");
+    }
+
+    /// One line for the doctor's verdict, and one more when the daemon is
+    /// refusing to start runners, naming the checks it refuses on.
+    #[test]
+    fn the_doctor_verdict_and_the_daemons_refusal_are_one_line_each() {
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document()).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains(
+                "  host doctor               1 required, 0 recommended failing \
+                 (windows.symlink_privilege); runner-manager host doctor"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  daemon starts no runner   since ")
+                && text.contains("host unfit (windows.symlink_privilege)"),
+            "{text}"
+        );
+
+        let mut healthy = document();
+        healthy.doctor.failing.clear();
+        healthy.doctor.daemon_host_unfit = None;
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &healthy).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("  host doctor               ok (9 checks)"),
+            "{text}"
+        );
+        assert!(!text.contains("daemon starts no runner"), "{text}");
     }
 
     /// The version is in the document, and it is the constant. A schema that
