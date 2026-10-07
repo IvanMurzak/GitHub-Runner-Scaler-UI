@@ -3001,6 +3001,11 @@ mod tests {
     }
 
     fn answer_profile_github(mut stream: TcpStream) {
+        // An accepted socket inherits the listener's non-blocking mode on macOS
+        // and Windows, so a request whose bytes had not arrived yet failed the
+        // read below with `WouldBlock` (seen on the macOS CI leg). The other
+        // fixtures do the same; see `tests/support/mod.rs`, `serve`.
+        stream.set_nonblocking(false).unwrap();
         let mut request = String::new();
         {
             let mut reader = BufReader::new(&mut stream);
