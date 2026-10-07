@@ -81,6 +81,8 @@ pub enum RootOwner {
     Host,
     /// A repository's persistent workspace root, by `owner/name`.
     Repository(String),
+    /// The host's persistent dependency-cache root, when one is configured.
+    DependencyCache,
 }
 
 impl RootOwner {
@@ -96,6 +98,9 @@ impl RootOwner {
             RootOwner::Repository(repository) => format!(
                 "runner-manager repo set-workspace {repository} --mode persistent --path <PATH>"
             ),
+            RootOwner::DependencyCache => {
+                "runner-manager host cache set-root --path <PATH>".to_string()
+            }
         }
     }
 }
@@ -107,6 +112,7 @@ impl fmt::Display for RootOwner {
             RootOwner::Repository(repository) => {
                 write!(f, "the persistent workspace root for {repository}")
             }
+            RootOwner::DependencyCache => f.write_str("the dependency-cache root"),
         }
     }
 }

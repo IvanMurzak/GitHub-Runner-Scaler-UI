@@ -48,6 +48,7 @@
 //! ("no other local user can read this") through a platform-specific check
 //! behind one cross-platform name.
 
+pub mod dependency_cache;
 pub mod host_fitness;
 pub mod lock;
 pub mod logging;
