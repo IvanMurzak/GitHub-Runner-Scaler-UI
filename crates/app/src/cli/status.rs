@@ -34,6 +34,7 @@ use runner_manager_domain::model::{RefreshInterval, StartMode, Timestamp};
 use runner_manager_domain::policy::{PolicyMode, ScalePolicy};
 use runner_manager_domain::store::Store;
 use runner_manager_github::rest::refreshes_per_hour;
+use runner_manager_platform::launch_health::{LaunchesBlocked, launches_blocked};
 use runner_manager_platform::service::{InstallRecord, github_credential_rejected_since};
 use serde::Serialize;
 
@@ -149,6 +150,10 @@ pub struct Product {
     /// The build that wrote the service definition, when that definition is no
     /// longer what this build renders; `null` when it is current.
     pub service_definition_outdated_since_version: Option<String>,
+    /// Why the local daemon starts no runner -- its allocations keep being
+    /// refused, or its WSL launch fence is stuck -- as `since`, `reason` and
+    /// `remedy`; `null` while launches can proceed.
+    pub service_launches_blocked: Option<LaunchesBlocked>,
 }
 
 fn binary_version(path: &std::path::Path) -> Option<String> {
@@ -492,6 +497,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                 .ok()
                 .flatten(),
             service_definition_outdated_since_version: outdated_service_definition(context),
+            service_launches_blocked: launches_blocked(context.paths(), context.clock().now()),
         },
         github_contacted: false,
         credential: Credential {
@@ -666,6 +672,10 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
             unfit.checks.join(", ")
         )?;
     }
+    if let Some(blocked) = &document.product.service_launches_blocked {
+        writeln!(out, "  daemon starts no runner   {blocked}")?;
+        writeln!(out, "  launches remedy           {}", blocked.remedy)?;
+    }
     writeln!(
         out,
         "  dependency caches         {}",
@@ -747,6 +757,7 @@ mod tests {
                 service_binary_version: None,
                 service_credential_rejected_since: None,
                 service_definition_outdated_since_version: None,
+                service_launches_blocked: None,
             },
             github_contacted: false,
             credential: Credential {
@@ -924,6 +935,7 @@ mod tests {
                 "service_binary_version",
                 "service_credential_rejected_since",
                 "service_definition_outdated_since_version",
+                "service_launches_blocked",
                 "version"
             ]
         );
@@ -1149,6 +1161,38 @@ mod tests {
         // And the rest of the snapshot is still there, which is what failing
         // outright used to cost.
         assert!(text.contains("Policies (1)"), "{text}");
+    }
+
+    /// Blocked launches name their reason and their remedy, in the text and in
+    /// the JSON document a `wsl status` on Windows reads back.
+    #[test]
+    fn blocked_launches_are_reported_with_their_reason_and_remedy() {
+        let mut document = document();
+        document.product.service_launches_blocked =
+            Some(runner_manager_platform::launch_health::LaunchesBlocked {
+                since: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+                reason: "a runner launch by process 189 has held the WSL launch fence".into(),
+                remedy: "restart the service".into(),
+            });
+
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("daemon starts no runner   since 2026-09-21")
+                && text.contains("process 189"),
+            "{text}"
+        );
+        assert!(
+            text.contains("launches remedy           restart the service"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(
+            json["product"]["service_launches_blocked"]["remedy"],
+            "restart the service"
+        );
     }
 
     /// One line for the doctor's verdict, and one more when the daemon is

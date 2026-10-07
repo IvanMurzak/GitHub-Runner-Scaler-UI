@@ -165,6 +165,9 @@ pub const CREDENTIAL_UNREADABLE_FILE: &str = "credential-unreadable.toml";
 /// under, which the TUI matches to offer the same command.
 pub const CREDENTIAL_UNREADABLE_SUBJECT: &str = "stored credential";
 
+/// The `service status` subject blocked runner launches are reported under.
+pub const LAUNCHES_BLOCKED_SUBJECT: &str = "runner launches";
+
 /// The agent's last runner-root refusal, for `service status` to report.
 ///
 /// See [`record_runner_root_refusal`] for the contract.
@@ -3109,7 +3112,7 @@ pub fn contact_path(paths: &AppPaths) -> PathBuf {
 
 /// Writes a small TOML record under `state/`, through a temporary in the same
 /// directory and a rename, so a status command never reads half of one.
-fn write_state_record(path: &Path, record: &impl Serialize) -> Result<(), ServiceError> {
+pub(crate) fn write_state_record(path: &Path, record: &impl Serialize) -> Result<(), ServiceError> {
     let failed = |detail: String| ServiceError::Record {
         operation: "write",
         path: path.to_path_buf(),
@@ -3125,7 +3128,7 @@ fn write_state_record(path: &Path, record: &impl Serialize) -> Result<(), Servic
 
 /// Reads a record [`write_state_record`] wrote. `Ok(None)` when there is none;
 /// one that exists and does not parse is an error, never absence.
-fn read_state_record<T: serde::de::DeserializeOwned>(
+pub(crate) fn read_state_record<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Option<T>, ServiceError> {
     let failed = |detail: String| ServiceError::Record {
@@ -3144,7 +3147,7 @@ fn read_state_record<T: serde::de::DeserializeOwned>(
 }
 
 /// Removes a record; one that is not there is already removed.
-fn remove_state_record(path: &Path) -> Result<(), ServiceError> {
+pub(crate) fn remove_state_record(path: &Path) -> Result<(), ServiceError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -4485,7 +4488,11 @@ impl ServiceOperations {
         )
         .with_definition_drift(drift)
         .with_credential_rejection(credential_rejected_since)
-        .with_credential_unreadable(credential_unreadable_since))
+        .with_credential_unreadable(credential_unreadable_since)
+        .with_launches_blocked(crate::launch_health::launches_blocked(
+            &self.paths,
+            Utc::now(),
+        )))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -4680,6 +4687,7 @@ pub struct ServiceStatus {
     last_github_contact: Option<DateTime<Utc>>,
     runner_root: Option<(PathBuf, RootAccessReport)>,
     credential_rejected_since: Option<DateTime<Utc>>,
+    launches_blocked: Option<crate::launch_health::LaunchesBlocked>,
     problems: Vec<StatusProblem>,
     notes: Vec<String>,
 }
@@ -4953,6 +4961,7 @@ impl ServiceStatus {
             last_github_contact,
             runner_root,
             credential_rejected_since: None,
+            launches_blocked: None,
             problems,
             notes,
         }
@@ -5041,6 +5050,32 @@ impl ServiceStatus {
     #[must_use]
     pub const fn credential_rejected_since(&self) -> Option<DateTime<Utc>> {
         self.credential_rejected_since
+    }
+
+    /// Reports that the daemon starts no runner because its launches are
+    /// blocked. See [`crate::launch_health`].
+    #[must_use]
+    pub fn with_launches_blocked(
+        mut self,
+        blocked: Option<crate::launch_health::LaunchesBlocked>,
+    ) -> Self {
+        if let Some(blocked) = &blocked {
+            self.problems.push(StatusProblem {
+                subject: LAUNCHES_BLOCKED_SUBJECT,
+                detail: format!(
+                    "the service has started no runner {blocked}. Fix: {}.",
+                    blocked.remedy
+                ),
+            });
+        }
+        self.launches_blocked = blocked;
+        self
+    }
+
+    /// Why the service starts no runner, when its launches are blocked.
+    #[must_use]
+    pub const fn launches_blocked(&self) -> Option<&crate::launch_health::LaunchesBlocked> {
+        self.launches_blocked.as_ref()
     }
 
     /// Reports that the daemon cannot read its own stored credential, and the
@@ -8514,6 +8549,53 @@ mod tests {
         clear_github_credential_rejection(&host.paths).unwrap();
         clear_github_credential_rejection(&host.paths).unwrap();
         assert_eq!(github_credential_rejected_since(&host.paths).unwrap(), None);
+    }
+
+    /// A guest that started nothing for 13 days while this said `healthy`.
+    #[test]
+    fn blocked_launches_make_the_service_unhealthy_with_their_remedy() {
+        use crate::launch_health::{
+            BlockCause, Viewpoint, clear_launches_blocked, launches_blocked,
+            record_launches_blocked,
+        };
+
+        let host = Host::new();
+        let compose = || {
+            ServiceStatus::compose(
+                ServiceIdentity::product(),
+                None,
+                None,
+                None,
+                None,
+                &host.paths,
+            )
+            .with_launches_blocked(launches_blocked(&host.paths, Utc::now()))
+        };
+        assert!(
+            !compose()
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == LAUNCHES_BLOCKED_SUBJECT)
+        );
+        let blocked = BlockCause::FenceHeld {
+            directory: PathBuf::from("launch-fence"),
+            owner: None,
+        }
+        .blocked_since(Utc::now(), Viewpoint::Guest);
+        record_launches_blocked(&host.paths, &blocked, Utc::now()).unwrap();
+
+        let status = compose();
+        assert!(!status.is_healthy());
+        assert_eq!(status.launches_blocked(), Some(&blocked));
+        let problem = status
+            .problems()
+            .iter()
+            .find(|problem| problem.subject == LAUNCHES_BLOCKED_SUBJECT)
+            .expect("reported under its own subject");
+        assert!(problem.detail.contains("systemctl restart"), "{status}");
+
+        clear_launches_blocked(&host.paths).unwrap();
+        assert_eq!(compose().launches_blocked(), None);
     }
 
     /// The daemon's own "I cannot read my credential", which used to exist

@@ -50,6 +50,7 @@
 
 pub mod dependency_cache;
 pub mod host_fitness;
+pub mod launch_health;
 pub mod lock;
 pub mod logging;
 pub mod os;

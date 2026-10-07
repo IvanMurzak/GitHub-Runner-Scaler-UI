@@ -5,6 +5,21 @@
 //! side can create the same directory. The directory is intentionally durable
 //! on process death; an abandoned owner blocks recovery instead of allowing a
 //! possibly concurrent runner launch.
+//!
+//! # A guest claim whose owner is provably gone is reclaimed
+//!
+//! Durability has a price: a guest daemon that dies mid-launch -- WSL shut down
+//! under it, or the directory removal failing on DrvFS -- leaves a claim that
+//! nothing ever removes, and every later launch on that distribution is refused
+//! for good. That happened for 13 days on one host while the distribution
+//! looked healthy. So a guest claim records its owner's [`ProcessIdentity`],
+//! and [`try_claim_guest_launch`] reclaims one only when that owner is *provably*
+//! gone: the process exited, its PID now belongs to somebody else, the claim
+//! predates this boot, or this very process wrote it and its release failed.
+//! A live owner, an owner that cannot be inspected, and a Windows recovery
+//! claim are never touched. Only one guest launcher can exist per distribution,
+//! because the guest configuration and the agent's single-instance lock live
+//! under the same account's paths.
 
 use std::fs;
 use std::io::Write as _;
@@ -15,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::discovery::{escaped_name_with_digest, validate_distribution_name};
 use crate::paths::AppPaths;
+use crate::process::{Adoption, ProcessIdentity};
 use runner_manager_domain::model::ScaleTarget;
 
 pub const GUEST_CONFIG_FILE: &str = "wsl-recovery.toml";
@@ -206,14 +222,24 @@ pub enum FenceOwnerKind {
     WindowsRecovery,
 }
 
+/// Who holds the launch fence, as recorded by the holder.
+///
+/// Unlike the other documents here this one tolerates unknown fields, so that
+/// a later build can add to the owner record without this build reading a
+/// newer guest's claim as undecodable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FenceOwner {
     pub schema_version: u32,
     pub kind: FenceOwnerKind,
     pub generation: Option<u64>,
     pub process_id: u32,
     pub acquired_at: DateTime<Utc>,
+    /// The claimer's PID plus start token, the record `HostLock` keeps. A PID
+    /// alone cannot tell the owner from whatever holds that PID after a WSL
+    /// restart. Absent in claims written before 0.4.35, and when the claimer
+    /// could not read its own identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ProcessIdentity>,
 }
 
 /// A successfully created cross-boundary directory claim.
@@ -244,6 +270,7 @@ impl FenceClaim {
             generation,
             process_id: std::process::id(),
             acquired_at: Utc::now(),
+            identity: ProcessIdentity::of_current_process().ok(),
         };
         if let Err(error) = write_json(&directory.join(OWNER_FILE), &owner) {
             let _ = fs::remove_dir_all(&directory);
@@ -277,6 +304,369 @@ impl Drop for FenceClaim {
             let _ = remove_claim(&self.directory);
         }
     }
+}
+
+/// Whether at least `limit` has passed between `since` and `now`. A `since` in
+/// the future -- clock skew -- has not.
+#[must_use]
+pub fn elapsed_at_least(
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    limit: std::time::Duration,
+) -> bool {
+    (now - since).to_std().is_ok_and(|age| age >= limit)
+}
+
+/// When the fence directory under `root` was last modified, or `None` when
+/// there is no fence.
+pub(crate) fn fence_modified(root: &Path) -> Result<Option<DateTime<Utc>>, FenceError> {
+    let directory = root.join(FENCE_DIRECTORY);
+    match fs::metadata(&directory).and_then(|meta| meta.modified()) {
+        Ok(modified) => Ok(Some(modified.into())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(io("inspect", &directory, source)),
+    }
+}
+
+/// How many times [`GuestLaunchClaim::release`] tries to remove the claim.
+const RELEASE_ATTEMPTS: u32 = 3;
+/// The pause before the first retry; each later one waits a step longer.
+const RELEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Why a guest launch claim no longer has an owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleGuestClaim {
+    /// The recorded process has exited, or its PID now belongs to another
+    /// process.
+    OwnerExited,
+    /// The claim was written before this boot, so its owner cannot be running.
+    EarlierBoot,
+    /// A claim with no identity, written before this daemon started. Only
+    /// one launcher per distribution can run, so its owner is gone.
+    WrittenBeforeThisDaemon,
+    /// This process wrote the claim, no longer holds it, and could not remove
+    /// it when it let go.
+    ReleaseFailed,
+    /// The claim never recorded an owner and is older than any claimer takes
+    /// to write one.
+    OwnerNeverRecorded,
+}
+
+impl std::fmt::Display for StaleGuestClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OwnerExited => "owner_exited",
+            Self::EarlierBoot => "earlier_boot",
+            Self::WrittenBeforeThisDaemon => "written_before_this_daemon",
+            Self::ReleaseFailed => "release_failed",
+            Self::OwnerNeverRecorded => "owner_never_recorded",
+        })
+    }
+}
+
+/// How long a claim directory may exist without `owner.json` before it is
+/// treated as abandoned. Every claimer writes the owner straight after
+/// creating the directory, so this is generous by orders of magnitude.
+pub(crate) const OWNERLESS_CLAIM_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// What reclaiming needs to know about processes. A port, so that every branch
+/// can be exercised on every leg of the CI matrix.
+pub(crate) trait ProcessProbe {
+    /// This process's identity, when it can be read.
+    fn current(&self) -> Option<ProcessIdentity>;
+    /// What a recorded identity refers to now; `None` when the operating
+    /// system will not say.
+    fn recheck(&self, identity: &ProcessIdentity) -> Option<Adoption>;
+    /// Whether anything holds `pid`; `None` when the operating system will not
+    /// say.
+    fn pid_alive(&self, pid: u32) -> Option<bool>;
+    /// When this machine booted, where the platform reports it.
+    fn boot_time(&self) -> Option<DateTime<Utc>>;
+    /// When this process started reclaiming: no claim without an identity
+    /// written before then can be this process's, and the single-instance
+    /// lock means no other launcher of this distribution is running.
+    fn process_started(&self) -> DateTime<Utc>;
+}
+
+/// [`ProcessProbe`] against the machine this runs on.
+pub(crate) struct HostProcesses;
+
+impl ProcessProbe for HostProcesses {
+    fn current(&self) -> Option<ProcessIdentity> {
+        ProcessIdentity::of_current_process().ok()
+    }
+
+    fn recheck(&self, identity: &ProcessIdentity) -> Option<Adoption> {
+        identity.recheck().ok()
+    }
+
+    fn pid_alive(&self, pid: u32) -> Option<bool> {
+        match ProcessIdentity::resolve(pid) {
+            Ok(_) => Some(true),
+            Err(crate::process::ProcessError::NoSuchProcess { .. }) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    fn boot_time(&self) -> Option<DateTime<Utc>> {
+        crate::process::boot_time()
+    }
+
+    fn process_started(&self) -> DateTime<Utc> {
+        // Set by the first reclaim, which the daemon makes at start.
+        static STARTED: std::sync::LazyLock<DateTime<Utc>> = std::sync::LazyLock::new(Utc::now);
+        *STARTED
+    }
+}
+
+/// Decide whether a recorded guest launch owner is provably gone.
+///
+/// Must not be asked while this process holds the claim: a claim carrying this
+/// process's own identity is read as one whose release failed. `None` means
+/// the claim must be honoured -- a live owner, an owner the operating system
+/// will not describe, and every Windows recovery claim.
+fn stale_guest_owner(owner: &FenceOwner, probe: &dyn ProcessProbe) -> Option<StaleGuestClaim> {
+    if owner.kind != FenceOwnerKind::GuestLaunch {
+        return None;
+    }
+    let current = probe.current();
+    if let Some(identity) = &owner.identity {
+        if current.as_ref() == Some(identity) {
+            return Some(StaleGuestClaim::ReleaseFailed);
+        }
+        return match probe.recheck(identity)? {
+            Adoption::Live => None,
+            Adoption::Gone | Adoption::PidRecycled { .. } => Some(StaleGuestClaim::OwnerExited),
+        };
+    }
+    // No identity: written before 0.4.35, or by a claimer that could not read
+    // its own. Judge it by the boot, by this process's start, and by the bare
+    // PID. The boot alone is not enough: restarting one distribution gives it
+    // a new PID namespace inside the same WSL VM, so the boot time stays put
+    // while its recorded PID -- a low, early-boot number -- now belongs to
+    // somebody else.
+    if probe
+        .boot_time()
+        .is_some_and(|booted| owner.acquired_at < booted)
+    {
+        return Some(StaleGuestClaim::EarlierBoot);
+    }
+    if owner.acquired_at < probe.process_started() {
+        return Some(StaleGuestClaim::WrittenBeforeThisDaemon);
+    }
+    if current.is_some_and(|me| me.pid() == owner.process_id) {
+        // This process wrote it and lost it, or a predecessor holding this PID
+        // earlier in the boot did. Neither is holding it now.
+        return Some(StaleGuestClaim::ReleaseFailed);
+    }
+    match probe.pid_alive(owner.process_id)? {
+        true => None,
+        false => Some(StaleGuestClaim::OwnerExited),
+    }
+}
+
+/// A stale guest claim that was removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimedGuestClaim {
+    pub reason: StaleGuestClaim,
+    /// The record that was removed; `None` for a claim with no owner file.
+    pub owner: Option<FenceOwner>,
+}
+
+impl std::fmt::Display for ReclaimedGuestClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)?;
+        if let Some(owner) = &self.owner {
+            write!(
+                f,
+                " (pid {}, acquired {})",
+                owner.process_id,
+                owner.acquired_at.to_rfc3339()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Fence directories this process holds a guest claim on right now.
+///
+/// Process-wide rather than per lock, because "this process holds it" is a
+/// fact about the process: a daemon that reloads builds a new allocation lock,
+/// and a claim from the previous generation must still not look abandoned.
+static HELD_HERE: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The held-set entry for the fence under `root`: canonical where possible,
+/// so two spellings of one shared root cannot each look unheld.
+fn held_key(root: &Path) -> PathBuf {
+    fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(FENCE_DIRECTORY)
+}
+
+fn held_here() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
+    HELD_HERE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The outcome of [`try_claim_guest_launch`].
+#[derive(Debug)]
+pub enum GuestClaimAttempt {
+    Claimed {
+        claim: GuestLaunchClaim,
+        /// A stale claim that had to be removed first.
+        reclaimed: Option<ReclaimedGuestClaim>,
+    },
+    /// Somebody that may still be running holds it.
+    Busy,
+}
+
+/// A held guest launch claim. [`GuestLaunchClaim::release`] lets go of it and
+/// reports a failure; dropping it lets go silently.
+#[derive(Debug)]
+pub struct GuestLaunchClaim {
+    claim: Option<FenceClaim>,
+    /// This claim's entry in the held set.
+    key: PathBuf,
+}
+
+impl GuestLaunchClaim {
+    /// Release the claim, retrying the failures DrvFS reports transiently -- a
+    /// handle the Windows side still has open, an antivirus scan.
+    ///
+    /// # Errors
+    /// The last removal failure. The claim is left behind and the next launch
+    /// reclaims it as one whose release failed; the caller should say so,
+    /// because this once failed silently while a distribution started nothing
+    /// for 13 days.
+    pub fn release(mut self) -> Result<(), FenceError> {
+        self.release_now()
+    }
+
+    fn release_now(&mut self) -> Result<(), FenceError> {
+        let Some(mut claim) = self.claim.take() else {
+            return Ok(());
+        };
+        claim.release_on_drop = false;
+        let mut held = held_here();
+        held.remove(&self.key);
+        let mut result = Ok(());
+        for attempt in 1..=RELEASE_ATTEMPTS {
+            result = remove_claim(&claim.directory);
+            if result.is_ok() || attempt == RELEASE_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(RELEASE_RETRY_DELAY * attempt);
+        }
+        result
+    }
+}
+
+impl Drop for GuestLaunchClaim {
+    fn drop(&mut self) {
+        let _ = self.release_now();
+    }
+}
+
+/// Claim the guest launch boundary, first reclaiming a claim whose owner is
+/// provably gone, and retrying once after that.
+///
+/// # Errors
+/// [`FenceError`] when the fence cannot be created, read, or removed.
+pub fn try_claim_guest_launch(root: &Path) -> Result<GuestClaimAttempt, FenceError> {
+    try_claim_guest_launch_with(root, &HostProcesses, Utc::now())
+}
+
+pub(crate) fn try_claim_guest_launch_with(
+    root: &Path,
+    probe: &dyn ProcessProbe,
+    now: DateTime<Utc>,
+) -> Result<GuestClaimAttempt, FenceError> {
+    // The root must exist for its canonical spelling to be the key.
+    fs::create_dir_all(root).map_err(|source| io("create", root, source))?;
+    let key = held_key(root);
+    let mut held = held_here();
+    if held.contains(&key) {
+        return Ok(GuestClaimAttempt::Busy);
+    }
+    let mut claim = FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)?;
+    let mut reclaimed = None;
+    if claim.is_none() {
+        reclaimed = reclaim_unheld(root, probe, now)?;
+        if reclaimed.is_some() {
+            claim = FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)?;
+        }
+    }
+    let Some(claim) = claim else {
+        return Ok(GuestClaimAttempt::Busy);
+    };
+    held.insert(key.clone());
+    Ok(GuestClaimAttempt::Claimed {
+        claim: GuestLaunchClaim {
+            claim: Some(claim),
+            key,
+        },
+        reclaimed,
+    })
+}
+
+/// Remove the guest launch claim under `root` when its owner is provably gone
+/// and this process does not hold it. The daemon calls this at start, after
+/// taking its single-instance lock and before any launch.
+///
+/// # Errors
+/// [`FenceError`] when the claim cannot be read or removed.
+pub fn reclaim_stale_guest_claim(root: &Path) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
+    reclaim_stale_guest_claim_with(root, &HostProcesses, Utc::now())
+}
+
+pub(crate) fn reclaim_stale_guest_claim_with(
+    root: &Path,
+    probe: &dyn ProcessProbe,
+    now: DateTime<Utc>,
+) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
+    let held = held_here();
+    if held.contains(&held_key(root)) {
+        return Ok(None);
+    }
+    reclaim_unheld(root, probe, now)
+}
+
+/// The reclaim itself. The caller holds [`HELD_HERE`] and has checked that
+/// this process does not hold the claim.
+fn reclaim_unheld(
+    root: &Path,
+    probe: &dyn ProcessProbe,
+    now: DateTime<Utc>,
+) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
+    let directory = root.join(FENCE_DIRECTORY);
+    let Some(owner) = FenceClaim::owner(root)? else {
+        let abandoned = fence_modified(root)?
+            .is_some_and(|modified| elapsed_at_least(modified, now, OWNERLESS_CLAIM_GRACE));
+        if !abandoned || FenceClaim::owner(root)?.is_some() {
+            return Ok(None);
+        }
+        remove_claim(&directory)?;
+        return Ok(Some(ReclaimedGuestClaim {
+            reason: StaleGuestClaim::OwnerNeverRecorded,
+            owner: None,
+        }));
+    };
+    let Some(reason) = stale_guest_owner(&owner, probe) else {
+        return Ok(None);
+    };
+    // Re-read immediately before removing, so a claim that changed hands since
+    // it was judged is not the one removed.
+    if FenceClaim::owner(root)?.as_ref() != Some(&owner) {
+        return Ok(None);
+    }
+    remove_claim(&directory)?;
+    Ok(Some(ReclaimedGuestClaim {
+        reason,
+        owner: Some(owner),
+    }))
 }
 
 pub fn clear_recovery(root: &Path, generation: u64) -> Result<(), FenceError> {
@@ -345,7 +735,7 @@ pub fn retire_abandoned_windows_recovery(
     now: DateTime<Utc>,
     abandoned_after: std::time::Duration,
 ) -> Result<bool, FenceError> {
-    let abandoned = |at: DateTime<Utc>| (now - at).to_std().is_ok_and(|age| age >= abandoned_after);
+    let abandoned = |at: DateTime<Utc>| elapsed_at_least(at, now, abandoned_after);
     let request = DrainRequest::read(root)?;
     if request
         .as_ref()
@@ -443,6 +833,362 @@ pub fn unmanaged_runner_service_count() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A [`ProcessProbe`] whose every answer is chosen by the test.
+    #[derive(Default)]
+    struct FakeProbe {
+        current: Option<ProcessIdentity>,
+        recheck: Option<Adoption>,
+        pid_alive: Option<bool>,
+        boot_time: Option<DateTime<Utc>>,
+        /// `None` reads as the beginning of time, so no record predates it.
+        process_started: Option<DateTime<Utc>>,
+    }
+
+    impl ProcessProbe for FakeProbe {
+        fn current(&self) -> Option<ProcessIdentity> {
+            self.current.clone()
+        }
+        fn recheck(&self, _: &ProcessIdentity) -> Option<Adoption> {
+            self.recheck.clone()
+        }
+        fn pid_alive(&self, _: u32) -> Option<bool> {
+            self.pid_alive
+        }
+        fn boot_time(&self) -> Option<DateTime<Utc>> {
+            self.boot_time
+        }
+        fn process_started(&self) -> DateTime<Utc> {
+            self.process_started.unwrap_or(DateTime::<Utc>::MIN_UTC)
+        }
+    }
+
+    fn identity(pid: u32, token: &str) -> ProcessIdentity {
+        serde_json::from_value(serde_json::json!({ "pid": pid, "start_token": token })).unwrap()
+    }
+
+    fn guest_owner(
+        process_id: u32,
+        acquired_at: DateTime<Utc>,
+        identity: Option<ProcessIdentity>,
+    ) -> FenceOwner {
+        FenceOwner {
+            schema_version: SCHEMA_VERSION,
+            kind: FenceOwnerKind::GuestLaunch,
+            generation: None,
+            process_id,
+            acquired_at,
+            identity,
+        }
+    }
+
+    /// Plants a guest claim exactly as an abandoned one looks on disk.
+    fn plant(root: &Path, owner: &FenceOwner) {
+        fs::create_dir_all(root.join(FENCE_DIRECTORY)).unwrap();
+        write_json(&root.join(FENCE_DIRECTORY).join(OWNER_FILE), owner).unwrap();
+    }
+
+    fn claimed(attempt: GuestClaimAttempt) -> (GuestLaunchClaim, Option<ReclaimedGuestClaim>) {
+        match attempt {
+            GuestClaimAttempt::Claimed { claim, reclaimed } => (claim, reclaimed),
+            GuestClaimAttempt::Busy => panic!("the launch was refused"),
+        }
+    }
+
+    /// A child that has already exited: its PID is free or somebody else's.
+    fn exited_child() -> u32 {
+        let mut child = crate::process::tests::quick_exit().spawn().unwrap();
+        child.wait().unwrap();
+        child.pid()
+    }
+
+    #[test]
+    fn a_guest_claim_whose_owner_exited_is_reclaimed_and_the_launch_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = exited_child();
+        plant(
+            root.path(),
+            &guest_owner(pid, Utc::now(), Some(identity(pid, "platform:gone"))),
+        );
+
+        let (claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+
+        let reclaimed = reclaimed.expect("the dead owner's claim was reclaimed");
+        assert_eq!(reclaimed.reason, StaleGuestClaim::OwnerExited);
+        assert_eq!(reclaimed.owner.unwrap().process_id, pid);
+        let owner = FenceClaim::owner(root.path()).unwrap().unwrap();
+        assert_eq!(
+            owner.identity,
+            HostProcesses.current(),
+            "the new claim is ours"
+        );
+        drop(claim);
+        assert!(!root.path().join(FENCE_DIRECTORY).exists());
+    }
+
+    /// A claim whose PID now belongs to a different process -- here, this one
+    /// -- is reclaimed: the start token, not the PID, names the owner.
+    #[test]
+    fn a_guest_claim_whose_pid_now_belongs_to_another_process_is_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        plant(
+            root.path(),
+            &guest_owner(
+                pid,
+                Utc::now(),
+                Some(identity(pid, "linux:earlier-boot:189")),
+            ),
+        );
+
+        let (_claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+
+        assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::OwnerExited);
+    }
+
+    #[test]
+    fn a_live_guest_claim_is_never_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = crate::process::tests::long_running().spawn().unwrap();
+        let live = child.identity().clone();
+        assert_eq!(
+            HostProcesses.recheck(&live),
+            Some(Adoption::Live),
+            "the owner must be known live, not merely uninspectable"
+        );
+        plant(
+            root.path(),
+            &guest_owner(child.pid(), Utc::now(), Some(live.clone())),
+        );
+
+        let attempt = try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now());
+        let startup = reclaim_stale_guest_claim_with(root.path(), &HostProcesses, Utc::now());
+        live.terminate(std::time::Duration::from_secs(5)).unwrap();
+        child.wait().unwrap();
+
+        assert!(matches!(attempt.unwrap(), GuestClaimAttempt::Busy));
+        assert_eq!(startup.unwrap(), None);
+        assert_eq!(
+            FenceClaim::owner(root.path()).unwrap().unwrap().identity,
+            Some(live)
+        );
+    }
+
+    #[test]
+    fn a_claim_this_process_holds_refuses_every_other_launch_of_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        assert_eq!(reclaimed, None);
+        assert!(matches!(
+            try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap(),
+            GuestClaimAttempt::Busy
+        ));
+        assert_eq!(
+            reclaim_stale_guest_claim_with(root.path(), &HostProcesses, Utc::now()).unwrap(),
+            None
+        );
+        drop(claim);
+        claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn a_claim_this_process_failed_to_release_is_reclaimed_by_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut claim, _) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        // What a failed removal leaves: the claim let go, the directory kept.
+        claim.claim.take().unwrap().make_durable();
+        held_here().remove(&held_key(root.path()));
+        drop(claim);
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
+
+        let (_claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::ReleaseFailed);
+    }
+
+    #[test]
+    fn a_windows_recovery_claim_is_never_reclaimed_by_the_guest() {
+        let root = tempfile::tempdir().unwrap();
+        let claim = FenceClaim::try_claim(root.path(), FenceOwnerKind::WindowsRecovery, Some(3))
+            .unwrap()
+            .unwrap();
+        claim.make_durable();
+        let dead = FakeProbe {
+            recheck: Some(Adoption::Gone),
+            pid_alive: Some(false),
+            boot_time: Some(Utc::now() + chrono::Duration::days(1)),
+            ..FakeProbe::default()
+        };
+        assert!(matches!(
+            try_claim_guest_launch_with(root.path(), &dead, Utc::now()).unwrap(),
+            GuestClaimAttempt::Busy
+        ));
+        assert!(root.path().join(FENCE_DIRECTORY).exists());
+    }
+
+    /// The record that blocked the incident host, as 0.4.34 wrote it.
+    const PRE_0_4_35_RECORD: &str = r#"{
+  "schema_version": 1,
+  "kind": "guest_launch",
+  "generation": null,
+  "process_id": 189,
+  "acquired_at": "2026-09-24T00:47:18.724Z"
+}"#;
+
+    #[test]
+    fn an_old_schema_record_is_judged_by_the_boot_and_the_pid() {
+        let old: FenceOwner = serde_json::from_str(PRE_0_4_35_RECORD).unwrap();
+        assert_eq!(old.identity, None);
+        let after = old.acquired_at + chrono::Duration::hours(1);
+        let before = old.acquired_at - chrono::Duration::hours(1);
+        let me = Some(identity(4242, "platform:me"));
+
+        let rebooted = FakeProbe {
+            boot_time: Some(after),
+            pid_alive: Some(true),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            stale_guest_owner(&old, &rebooted),
+            Some(StaleGuestClaim::EarlierBoot)
+        );
+
+        let exited = FakeProbe {
+            boot_time: Some(before),
+            pid_alive: Some(false),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            stale_guest_owner(&old, &exited),
+            Some(StaleGuestClaim::OwnerExited)
+        );
+
+        let alive = FakeProbe {
+            boot_time: Some(before),
+            pid_alive: Some(true),
+            current: me.clone(),
+            ..FakeProbe::default()
+        };
+        assert_eq!(stale_guest_owner(&old, &alive), None);
+
+        let unknown = FakeProbe::default();
+        assert_eq!(stale_guest_owner(&old, &unknown), None);
+
+        // One distribution restarted inside a running WSL VM: same boot, a
+        // new PID namespace where PID 189 is somebody else's.
+        let distribution_restarted = FakeProbe {
+            boot_time: Some(before),
+            pid_alive: Some(true),
+            process_started: Some(after),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            stale_guest_owner(&old, &distribution_restarted),
+            Some(StaleGuestClaim::WrittenBeforeThisDaemon)
+        );
+
+        let mine = FakeProbe {
+            boot_time: Some(before),
+            pid_alive: Some(true),
+            current: Some(identity(189, "platform:me")),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            stale_guest_owner(&old, &mine),
+            Some(StaleGuestClaim::ReleaseFailed)
+        );
+    }
+
+    /// The incident record, read by an updated daemon whose WSL VM was never
+    /// rebooted, with PID 189 now somebody else's: the case the boot time
+    /// alone cannot settle.
+    #[test]
+    fn the_incident_record_is_reclaimed_at_daemon_start_after_an_update() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(FENCE_DIRECTORY)).unwrap();
+        fs::write(
+            root.path().join(FENCE_DIRECTORY).join(OWNER_FILE),
+            PRE_0_4_35_RECORD,
+        )
+        .unwrap();
+        let same_boot_new_daemon = FakeProbe {
+            boot_time: Some("2026-09-20T00:00:00Z".parse().unwrap()),
+            pid_alive: Some(true),
+            process_started: Some("2026-10-07T18:00:00Z".parse().unwrap()),
+            ..FakeProbe::default()
+        };
+
+        let reclaimed =
+            reclaim_stale_guest_claim_with(root.path(), &same_boot_new_daemon, Utc::now())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(reclaimed.reason, StaleGuestClaim::WrittenBeforeThisDaemon);
+        assert!(!root.path().join(FENCE_DIRECTORY).exists());
+        claimed(
+            try_claim_guest_launch_with(root.path(), &same_boot_new_daemon, Utc::now()).unwrap(),
+        );
+    }
+
+    /// The real boot time is read on the one platform that reclaims by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_linux_host_reports_when_it_booted() {
+        let booted = HostProcesses
+            .boot_time()
+            .expect("/proc/stat names the boot");
+        assert!(booted < Utc::now(), "{booted}");
+    }
+
+    #[test]
+    fn an_ownerless_claim_is_reclaimed_only_after_the_grace() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(FENCE_DIRECTORY)).unwrap();
+        let probe = FakeProbe::default();
+        assert_eq!(
+            reclaim_stale_guest_claim_with(root.path(), &probe, Utc::now()).unwrap(),
+            None
+        );
+        let later = Utc::now() + chrono::Duration::minutes(6);
+        let reclaimed = reclaim_stale_guest_claim_with(root.path(), &probe, later)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.reason, StaleGuestClaim::OwnerNeverRecorded);
+        assert!(!root.path().join(FENCE_DIRECTORY).exists());
+    }
+
+    /// A release that cannot remove the claim says so, naming the path, and
+    /// leaves a claim the next launch reclaims as one whose release failed.
+    #[test]
+    fn a_release_that_fails_reports_its_path_and_the_next_launch_reclaims_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (claim, _) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        // Something the removal cannot take away: a file where the claim
+        // directory was, holding this process's own owner record.
+        let directory = root.path().join(FENCE_DIRECTORY);
+        let owner = fs::read(directory.join(OWNER_FILE)).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        fs::write(&directory, b"not a directory").unwrap();
+        assert!(
+            remove_claim(&directory).is_err(),
+            "the plant must make removal fail"
+        );
+
+        let error = claim.release().expect_err("the removal failed");
+        assert!(error.to_string().contains(FENCE_DIRECTORY), "{error}");
+
+        fs::remove_file(&directory).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(OWNER_FILE), owner).unwrap();
+        let (_claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::ReleaseFailed);
+    }
 
     #[test]
     fn one_directory_has_exactly_one_owner_and_drop_releases_guest_claim() {

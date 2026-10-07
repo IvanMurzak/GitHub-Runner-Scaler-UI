@@ -40,6 +40,40 @@ the version being prepared rather than the version in `Cargo.toml`.
   directories to prune, waits for its answer and prints it. The service takes the request within
   five seconds even while a scheduled pass is running. When no service takes it, or the service
   cannot prune either, the command says so at once and names the remedy.
+- A managed WSL host no longer stops starting runners for good when its daemon dies mid-launch.
+  The guest's launch claim on the fence it shares with Windows was never removed once its owner
+  was gone. A WSL restart, a killed daemon, or a removal that failed on `/mnt/c` left it in
+  place, and every later launch was refused (`allocation_deferred
+  reason=allocation_lock_unavailable`) while the host reported itself healthy. One host started
+  nothing for 13 days that way. A guest claim now records its owner's process identity, and the
+  daemon reclaims a claim whose owner has provably gone. That covers a process that exited, a
+  PID that now belongs to another process, a claim written before this boot, and a claim this
+  same daemon failed to remove. The daemon checks at start and again before each launch. Claims
+  written by 0.4.34 and earlier carry no identity. They are judged by the boot time, by whether
+  they predate the running daemon, and by the recorded PID, so the claim that blocked that host is
+  reclaimed by the updated daemon even when only the distribution, not the WSL VM, restarted. A
+  live owner, an owner that cannot be inspected, and a Windows recovery claim are never touched.
+- A launch claim that cannot be released is retried and then logged with its path and the error,
+  instead of being dropped silently. That includes a claim given back because Windows asked the
+  distribution to drain.
+- `status`, `status --json` (new `product.service_launches_blocked`), `service status`, `wsl
+  status` and `host doctor` (new Recommended check `host.launches`) report a host that starts no
+  runner, with the reason and the remedy. That covers five refusals in a row spanning at least
+  five minutes, and a launch fence held for more than 30 minutes. A run of refusals restarts after
+  five quiet minutes. The record expires 15 minutes after the last refusal, so a host whose demand
+  went elsewhere is not reported blocked forever. `wsl status` reads the fence from Windows too,
+  aged by the Windows clock, so it catches a guest that is too old to report or that has no queued
+  job to be refused. Its fix line names the restart command rather than a reinstall, which would
+  not unblock the fence, and `wsl install` no longer refuses a provisioned host only because its
+  launches are blocked. A fence whose owner record cannot be read names the directory to delete.
+
+### Operator notes
+
+- A Windows host still on 0.4.34 or earlier cannot read the owner record a 0.4.35 guest writes
+  while that guest is launching. It logs `abandoned WSL recovery coordination could not be
+  inspected` until both sides run the same version. Update Windows first, then bring the guest up
+  to date with `runner-manager wsl install --distribution NAME`, which `wsl status` already asks
+  for whenever the two versions differ.
 
 ## 0.4.34
 
