@@ -1810,6 +1810,9 @@ fn safe_isolation_reason(
 pub struct PreparedEnvironment {
     attempt: AttemptId,
     identity: Option<EnvironmentIdentity>,
+    /// The target whose dependency-cache namespace a native runner uses:
+    /// `prepare` sees the policy and `start` does not.
+    cache_target: Option<runner_manager_domain::model::ScaleTarget>,
 }
 
 impl PreparedEnvironment {
@@ -1819,6 +1822,7 @@ impl PreparedEnvironment {
         Self {
             attempt,
             identity: Some(identity),
+            cache_target: None,
         }
     }
 
@@ -1989,6 +1993,7 @@ pub trait ExecutionProvider: fmt::Debug + Send + Sync {
         Ok(PreparedEnvironment {
             attempt: attempt.id,
             identity: None,
+            cache_target: None,
         })
     }
 
@@ -2092,10 +2097,6 @@ pub struct NativeProcesses {
     runner_env_file: Option<PathBuf>,
     /// Persistent dependency caches. `None` gives runners none.
     dependency_caches: Option<DependencyCaches>,
-    /// The target each prepared attempt belongs to, from `prepare` to `spawn`:
-    /// the cache namespace is the target's, and `spawn` is not given the
-    /// policy.
-    cache_targets: Mutex<BTreeMap<AttemptId, runner_manager_domain::model::ScaleTarget>>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2340,20 +2341,107 @@ impl NativeProcesses {
         self
     }
 
-    /// The cache variables for `attempt`, if `prepare` saw its policy.
+    /// The cache variables for `attempt`, when `prepare` named its target.
     fn cache_env(
         &self,
         attempt: &RunnerAttempt,
+        target: Option<&runner_manager_domain::model::ScaleTarget>,
     ) -> Result<Vec<(&'static str, std::ffi::OsString)>, FailureReason> {
-        let target = self
-            .cache_targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&attempt.id);
         match (&self.dependency_caches, target) {
-            (Some(caches), Some(target)) => caches.for_launch(&target, attempt.runtime_path()),
+            (Some(caches), Some(target)) => caches.for_launch(target, attempt.runtime_path()),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Starts `Runner.Listener` for `attempt`, with the dependency caches of
+    /// `cache_target` when there is one.
+    fn spawn_listener(
+        &self,
+        attempt: &RunnerAttempt,
+        config: &EncodedJitConfig,
+        cache_target: Option<&runner_manager_domain::model::ScaleTarget>,
+    ) -> Result<u32, ProcessStartFailure> {
+        let handoff = RestrictiveHandoff::create(
+            attempt.runtime_path(),
+            SecretString::from(config.expose().to_owned()),
+        )
+        .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
+        #[cfg(windows)]
+        let program = attempt
+            .runtime_path()
+            .join("bin")
+            .join("Runner.Listener.exe");
+        #[cfg(not(windows))]
+        let program = attempt.runtime_path().join("bin").join("Runner.Listener");
+        // Checked after the handoff exists on purpose: the error path below is
+        // a real post-handoff launch failure, and unwinding must delete it.
+        if !program.is_file() {
+            return Err(ProcessStartFailure::before_spawn(
+                FailureReason::ProcessStartFailed,
+            ));
+        }
+        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
+        let caches = self
+            .cache_env(attempt, cache_target)
+            .map_err(ProcessStartFailure::before_spawn)?;
+        #[cfg(test)]
+        let spec = if self
+            .use_long_lived_test_listener
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            SpawnSpec::new(program)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "lifecycle::tests::long_lived_native_listener_helper",
+                    "--nocapture",
+                ])
+                .env(
+                    "RUNNER_MANAGER_TEST_LISTENER_READY",
+                    attempt.runtime_path().join(TEST_LISTENER_READY),
+                )
+                .working_dir(attempt.runtime_path())
+        } else {
+            runner_listener_spec(program, attempt.runtime_path(), caches, &host_env)
+        };
+        #[cfg(not(test))]
+        let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
+        let child = spec
+            .spawn_runner_with_handoff(&handoff)
+            .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
+        // The payload is gone before any state saying "starting" is persisted.
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::HandoffDelete) {
+            drop(handoff);
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        if handoff.delete().is_err() {
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
+            return Err(self.abort_spawned_child(child, attempt, false));
+        }
+        let identity = match serde_json::to_vec(child.identity()) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Err(self.abort_spawned_child(child, attempt, false));
+            }
+        };
+        if self.persist_identity(attempt, &identity).is_err() {
+            return Err(self.abort_spawned_child(child, attempt, true));
+        }
+        let pid = child.pid();
+        #[cfg(test)]
+        if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
+            return Err(self.abort_spawned_child(child, attempt, true));
+        }
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.insert(attempt.id, child);
+        Ok(pid)
     }
 
     /// The host's `runner.env`, read now.
@@ -2584,17 +2672,33 @@ impl ProcessSupervisor for NativeProcesses {
         self.host_env()?;
         // Asked here, before the JIT registration, for the reason `host_env`
         // is: a broken file must cost no registration.
-        if let Some(caches) = &self.dependency_caches {
-            caches.config()?;
-            self.cache_targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(attempt.id, policy.target.clone());
-        }
+        let cache_target = match &self.dependency_caches {
+            Some(caches) => {
+                caches.config()?;
+                Some(policy.target.clone())
+            }
+            None => None,
+        };
         Ok(PreparedEnvironment {
             attempt: attempt.id,
             identity: None,
+            cache_target,
         })
+    }
+
+    fn start(
+        &self,
+        prepared: PreparedEnvironment,
+        attempt: &RunnerAttempt,
+        handoff: OneTimeJitHandoff<'_>,
+    ) -> Result<EnvironmentIdentity, ProcessStartFailure> {
+        if prepared.attempt != attempt.id || !attempt.execution().is_native() {
+            return Err(ProcessStartFailure::before_spawn(FailureReason::Other(
+                "execution provider identity mismatch".into(),
+            )));
+        }
+        self.spawn_listener(attempt, handoff.consume(), prepared.cache_target.as_ref())
+            .map(EnvironmentIdentity::NativeProcess)
     }
 
     fn spawn(
@@ -2602,87 +2706,7 @@ impl ProcessSupervisor for NativeProcesses {
         attempt: &RunnerAttempt,
         config: &EncodedJitConfig,
     ) -> Result<u32, ProcessStartFailure> {
-        let handoff = RestrictiveHandoff::create(
-            attempt.runtime_path(),
-            SecretString::from(config.expose().to_owned()),
-        )
-        .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
-        #[cfg(windows)]
-        let program = attempt
-            .runtime_path()
-            .join("bin")
-            .join("Runner.Listener.exe");
-        #[cfg(not(windows))]
-        let program = attempt.runtime_path().join("bin").join("Runner.Listener");
-        // Checked after the handoff exists on purpose: the error path below is
-        // a real post-handoff launch failure, and unwinding must delete it.
-        if !program.is_file() {
-            return Err(ProcessStartFailure::before_spawn(
-                FailureReason::ProcessStartFailed,
-            ));
-        }
-        let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
-        let caches = self
-            .cache_env(attempt)
-            .map_err(ProcessStartFailure::before_spawn)?;
-        #[cfg(test)]
-        let spec = if self
-            .use_long_lived_test_listener
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            SpawnSpec::new(program)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "lifecycle::tests::long_lived_native_listener_helper",
-                    "--nocapture",
-                ])
-                .env(
-                    "RUNNER_MANAGER_TEST_LISTENER_READY",
-                    attempt.runtime_path().join(TEST_LISTENER_READY),
-                )
-                .working_dir(attempt.runtime_path())
-        } else {
-            runner_listener_spec(program, attempt.runtime_path(), caches, &host_env)
-        };
-        #[cfg(not(test))]
-        let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
-        let child = spec
-            .spawn_runner_with_handoff(&handoff)
-            .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
-        // The payload is gone before any state saying "starting" is persisted.
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::HandoffDelete) {
-            drop(handoff);
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        if handoff.delete().is_err() {
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::IdentitySerialize) {
-            return Err(self.abort_spawned_child(child, attempt, false));
-        }
-        let identity = match serde_json::to_vec(child.identity()) {
-            Ok(identity) => identity,
-            Err(_) => {
-                return Err(self.abort_spawned_child(child, attempt, false));
-            }
-        };
-        if self.persist_identity(attempt, &identity).is_err() {
-            return Err(self.abort_spawned_child(child, attempt, true));
-        }
-        let pid = child.pid();
-        #[cfg(test)]
-        if self.faults_at(PostSpawnBoundary::ChildMapInsert) {
-            return Err(self.abort_spawned_child(child, attempt, true));
-        }
-        let mut children = self
-            .children
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.insert(attempt.id, child);
-        Ok(pid)
+        self.spawn_listener(attempt, config, None)
     }
 
     fn is_alive(&self, attempt: &RunnerAttempt) -> Result<bool, FailureReason> {
@@ -8578,11 +8602,13 @@ mod tests {
             FakeClock::default().now(),
         );
         assert!(
-            processes.cache_env(&attempt).unwrap().is_empty(),
-            "an attempt never prepared has no target, so no cache"
+            processes.cache_env(&attempt, None).unwrap().is_empty(),
+            "a launch with no prepared target, such as a bare `spawn`, has no cache"
         );
-        processes.prepare(&attempt, &policy).unwrap();
-        let variables = processes.cache_env(&attempt).unwrap();
+        let prepared = processes.prepare(&attempt, &policy).unwrap();
+        let variables = processes
+            .cache_env(&attempt, prepared.cache_target.as_ref())
+            .unwrap();
         let npm = variables
             .iter()
             .find(|(name, _)| *name == "npm_config_cache")

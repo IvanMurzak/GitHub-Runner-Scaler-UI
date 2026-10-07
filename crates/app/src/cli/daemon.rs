@@ -568,9 +568,6 @@ const fn wsl_recovery_is_available(windows_service_host: bool) -> bool {
 
 const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Publish only local, non-secret evidence. Windows owns the destructive
-/// decision; the guest owns the authoritative attempt journal and the audit
-/// for persistent runner services Windows cannot safely infer.
 /// Measures the dependency caches and prunes them to the cap, at start and
 /// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL).
 /// The walk runs on a blocking thread: a pnpm store holds hundreds of
@@ -585,6 +582,9 @@ async fn maintain_dependency_caches(
     }
 }
 
+/// Publish only local, non-secret evidence. Windows owns the destructive
+/// decision; the guest owns the authoritative attempt journal and the audit
+/// for persistent runner services Windows cannot safely infer.
 async fn maintain_wsl_guest_heartbeat(
     paths: runner_manager_platform::paths::AppPaths,
     store: Arc<dyn Store>,

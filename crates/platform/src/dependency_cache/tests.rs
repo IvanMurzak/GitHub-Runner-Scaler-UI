@@ -296,8 +296,10 @@ fn host_switch_target_switch_and_tool_overrides_compose_in_order() {
 fn namespace_segments_are_portable_path_segments() {
     assert_eq!(segment("con"), "con_");
     assert_eq!(segment("COM1.js"), "COM1.js_");
-    assert_eq!(segment(".."), "_..");
+    assert_eq!(segment(".."), "_.._");
     assert_eq!(segment("my.repo-name_2"), "my.repo-name_2");
+    // Windows strips a trailing dot, so `foo.` would otherwise share `foo`.
+    assert_eq!(segment("foo."), "foo._");
     assert_eq!(
         Namespace::Shared("js".into()).dir(Path::new("/c")),
         Path::new("/c").join("_shared").join("js")
@@ -625,4 +627,58 @@ fn measurement_ignores_the_roots_own_entries() {
         ["o/r"]
     );
     assert_eq!(measured[0].bytes, 10);
+}
+
+/// The README's table of caches is what operators read; it must say what
+/// `TOOLS` does, row for row.
+#[test]
+fn the_readme_table_matches_the_tools_table() {
+    let readme = include_str!("../../../../README.md");
+    let rows: Vec<&str> = readme
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect();
+    for tool in TOOLS {
+        let prefix = format!("| `{}` |", tool.id);
+        let row = rows
+            .iter()
+            .find(|row| row.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("the README has no row for `{}`", tool.id));
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        // ["", id, variables, platforms, shared, default, source, ""]
+        for variable in tool.variables {
+            assert!(
+                cells[2].contains(&format!("`{}", variable.name)),
+                "the README row for `{}` does not name {}",
+                tool.id,
+                variable.name
+            );
+        }
+        let platforms = if tool
+            .variables
+            .iter()
+            .all(|v| v.platforms == Platforms::UNIX)
+        {
+            "macOS, Linux"
+        } else {
+            "all"
+        };
+        assert_eq!(cells[3], platforms, "platforms of `{}`", tool.id);
+        let shared = match tool.sharing {
+            Sharing::Namespace => "yes",
+            Sharing::Slot => "per runner",
+        };
+        assert_eq!(cells[4], shared, "sharing of `{}`", tool.id);
+        let default = if tool.default_enabled { "on" } else { "off" };
+        assert_eq!(cells[5], default, "default of `{}`", tool.id);
+    }
+    let documented = rows
+        .iter()
+        .filter(|row| {
+            row.split('|')
+                .nth(1)
+                .is_some_and(|cell| tool(cell.trim().trim_matches('`')).is_some())
+        })
+        .count();
+    assert_eq!(documented, TOOLS.len(), "the README lists a cache twice");
 }

@@ -18,11 +18,10 @@ use runner_manager_domain::model::{Host, HostId, ScaleTarget, Timestamp};
 use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store;
 use runner_manager_platform::dependency_cache::{
-    self, CacheConfig, CacheError, CacheUsage, ResolvedRoot, Selection, Sharing, TOOLS, ToolSource,
-    VarValue,
+    self, CacheConfig, CacheError, CacheUsage, ResolvedRoot, Selection, Sharing, TOOLS, VarValue,
 };
 use runner_manager_platform::runner_env::RunnerPlatform;
-use runner_manager_platform::runner_root::{RootOwner, default_runner_root};
+use runner_manager_platform::runner_root::RootOwner;
 use serde::Serialize;
 
 use super::workspace;
@@ -89,14 +88,10 @@ pub fn daemon_caches(
 ) -> DependencyCaches {
     let paths = context.paths().clone();
     let runner_root = Arc::new(move || {
-        let configured = store
-            .host(host_id)
-            .ok()
-            .flatten()
-            .and_then(|host| host.runner_root_override);
-        configured
-            .or_else(|| default_runner_root(&paths).ok())
-            .map(|root| PathBuf::from(root.as_str()))
+        let host = store.host(host_id).ok().flatten();
+        workspace::host_root(&paths, host.as_ref())
+            .effective
+            .map(|root| root.as_path().to_path_buf())
     });
     DependencyCaches::new(
         config_path(context),
@@ -210,14 +205,7 @@ pub fn dispatch_host(
     let mut config = load(context)?;
     match command {
         HostCacheCommand::Show => {
-            let store = context.store()?;
-            let host = super::host::local_host(&store)?;
-            let policies = store.policies().map_err(|source| {
-                CliError::new(
-                    Failure::LocalState,
-                    format!("cannot read this host's policies: {source}"),
-                )
-            })?;
+            let (host, policies) = host_and_policies(context)?;
             write_host_show(context, host.as_ref(), &policies, &config, out).map_err(failed)?;
         }
         HostCacheCommand::SetEnabled(args) => {
@@ -344,6 +332,19 @@ pub fn dispatch_host(
     Ok(())
 }
 
+/// This host's record and policies, for the `show` commands.
+fn host_and_policies(context: &Context) -> Result<(Option<Host>, Vec<ScalePolicy>), CliError> {
+    let store = context.store()?;
+    let host = super::host::local_host(&store)?;
+    let policies = store.policies().map_err(|source| {
+        CliError::new(
+            Failure::LocalState,
+            format!("cannot read this host's policies: {source}"),
+        )
+    })?;
+    Ok((host, policies))
+}
+
 fn known_tool(raw: &str) -> Result<&'static str, CliError> {
     dependency_cache::tool(raw)
         .map(|tool| tool.id)
@@ -352,10 +353,7 @@ fn known_tool(raw: &str) -> Result<&'static str, CliError> {
                 Failure::InvalidArgument,
                 format!(
                     "`{raw}` is not a cache this version knows; one of: {}",
-                    dependency_cache::tool_ids()
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    dependency_cache::tool_ids().join(", ")
                 ),
                 "runner-manager host cache show",
             )
@@ -511,7 +509,7 @@ fn write_host_show(
     let mut seen = std::collections::BTreeSet::new();
     for policy in policies {
         if !seen.insert((
-            policy.target.slug().to_ascii_lowercase(),
+            dependency_cache::target_key(&policy.target),
             policy.execution_policy().is_native(),
         )) {
             continue;
@@ -636,14 +634,7 @@ fn target_command(
     let slug = target.slug();
     match command {
         TargetCommand::Show => {
-            let store = context.store()?;
-            let host = super::host::local_host(&store)?;
-            let policies = store.policies().map_err(|source| {
-                CliError::new(
-                    Failure::LocalState,
-                    format!("cannot read this host's policies: {source}"),
-                )
-            })?;
+            let (host, policies) = host_and_policies(context)?;
             write_target_show(context, host.as_ref(), &policies, &config, target, out)
                 .map_err(failed)?;
             return Ok(());
@@ -775,11 +766,7 @@ fn write_target_show(
     }
     writeln!(out, "  caches:")?;
     for state in &selection.tools {
-        let source = match state.source {
-            ToolSource::Default => "default",
-            ToolSource::Host => "host",
-            ToolSource::Target => "this target",
-        };
+        let source = state.source.as_token();
         let names: Vec<&str> = state
             .tool
             .variables_on(platform)

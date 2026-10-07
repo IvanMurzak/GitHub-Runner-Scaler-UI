@@ -78,10 +78,10 @@
 //! systemd drop-in, a launchd plist, a machine-wide variable on Windows): a
 //! cache variable only fills in what nobody set ([`without_inherited`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -696,21 +696,7 @@ impl CacheConfig {
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(io_error("create the directory of", path))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error("write", path))?;
-    temporary
-        .write_all(bytes)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(io_error("write", path))?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| CacheError::Io {
-            action: "replace",
-            path: path.to_path_buf(),
-            source: error.error,
-        })
+    crate::host_fitness::write_atomically(path, bytes).map_err(io_error("write", path))
 }
 
 /// A cache root an operator may configure: absolute and free of whitespace.
@@ -767,8 +753,7 @@ fn is_windows_device_name(segment: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Where the cache root came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootSource {
     /// `host cache set-root`.
     Configured,
@@ -906,7 +891,10 @@ impl Namespace {
 }
 
 /// One path segment, made safe for every platform. GitHub names already use
-/// only letters, digits, `.`, `-` and `_`; a Windows device name gets a `_`.
+/// only letters, digits, `.`, `-` and `_`, so the character mapping is
+/// defence in depth. What does matter: a Windows device name gets a `_`, and
+/// so does a trailing `.`, which Windows strips, so that `owner/foo.` and
+/// `owner/foo` cannot share one directory.
 fn segment(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -922,7 +910,7 @@ fn segment(raw: &str) -> String {
         "" | "." | ".." => format!("_{cleaned}"),
         _ => cleaned,
     };
-    if is_windows_device_name(&cleaned) {
+    if is_windows_device_name(&cleaned) || cleaned.ends_with('.') {
         format!("{cleaned}_")
     } else {
         cleaned
@@ -930,12 +918,22 @@ fn segment(raw: &str) -> String {
 }
 
 /// Where one tool's on/off state came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSource {
     Default,
     Host,
     Target,
+}
+
+impl ToolSource {
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Host => "host",
+            Self::Target => "this target",
+        }
+    }
 }
 
 /// One tool's state for a target.
@@ -1022,7 +1020,7 @@ pub fn select(config: &CacheConfig, target: &ScaleTarget, platform: RunnerPlatfo
 
 /// The directory a tool uses: under the namespace, or under the slot.
 #[must_use]
-pub fn tool_dir(tool: &CacheTool, namespace_dir: &Path, slot_dir: &Path) -> PathBuf {
+fn tool_dir(tool: &CacheTool, namespace_dir: &Path, slot_dir: &Path) -> PathBuf {
     match tool.sharing {
         Sharing::Namespace => namespace_dir.join(tool.dir),
         Sharing::Slot => slot_dir.join(tool.dir),
@@ -1276,7 +1274,7 @@ fn namespace_dirs(root: &Path) -> Vec<(String, PathBuf)> {
 
 /// Measures every namespace under `root`.
 #[must_use]
-pub fn measure(root: &Path, holds_runner: &dyn Fn(&Path) -> bool) -> Vec<NamespaceUsage> {
+pub(crate) fn measure(root: &Path, holds_runner: &dyn Fn(&Path) -> bool) -> Vec<NamespaceUsage> {
     namespace_dirs(root)
         .into_iter()
         .map(|(name, dir)| NamespaceUsage {
@@ -1294,7 +1292,7 @@ pub fn measure(root: &Path, holds_runner: &dyn Fn(&Path) -> bool) -> Vec<Namespa
 /// not in use, least recently used first, until the total fits. In-use
 /// namespaces are never chosen, even if the total cannot fit without them.
 #[must_use]
-pub fn plan_prune(namespaces: &[NamespaceUsage], max_bytes: Option<u64>) -> Vec<String> {
+pub(crate) fn plan_prune(namespaces: &[NamespaceUsage], max_bytes: Option<u64>) -> Vec<String> {
     let Some(max) = max_bytes else {
         return Vec::new();
     };
@@ -1372,50 +1370,58 @@ fn empty_trash(root: &Path) {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        make_removable(&path);
-        let _ = remove_dir_all::remove_dir_all(&path);
+        let _ = remove_tree(&entry.path());
     }
 }
 
-/// Lets a tree be deleted by the account that owns it: Go makes its module
-/// cache read-only, and a read-only directory keeps its entries on Unix, a
-/// read-only file refuses deletion on Windows. Links are not followed.
-fn make_removable(path: &Path) {
+/// Removes a pruned namespace without following links.
+///
+/// Windows uses the `remove_dir_all` crate, which clears the read-only
+/// attribute Go puts on its module cache. Unix uses `std`, as the attempt
+/// cleanup does (the crate can block on a FIFO there), and only after a
+/// refusal opens the read-only directories Go leaves and tries once more.
+fn remove_tree(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        remove_dir_all::remove_dir_all(path)
+    }
+    #[cfg(not(windows))]
+    {
+        match fs::remove_dir_all(path) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                open_directories(path);
+                fs::remove_dir_all(path)
+            }
+            other => other,
+        }
+    }
+}
+
+/// Gives the owner `rwx` on every directory under `path`, not following links.
+#[cfg(not(windows))]
+fn open_directories(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
     let mut pending = vec![path.to_path_buf()];
     while let Some(current) = pending.pop() {
         let Ok(metadata) = fs::symlink_metadata(&current) else {
             continue;
         };
-        if metadata.file_type().is_symlink() {
+        if !metadata.is_dir() {
             continue;
         }
-        let mut permissions = metadata.permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if metadata.is_dir() && permissions.mode() & 0o700 != 0o700 {
-                permissions.set_mode(permissions.mode() | 0o700);
-                let _ = fs::set_permissions(&current, permissions);
-            }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(&current, fs::Permissions::from_mode(mode | 0o700));
         }
-        #[cfg(not(unix))]
-        if permissions.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = fs::set_permissions(&current, permissions);
-        }
-        if metadata.is_dir()
-            && let Ok(entries) = fs::read_dir(&current)
-        {
+        if let Ok(entries) = fs::read_dir(&current) {
             pending.extend(entries.flatten().map(|entry| entry.path()));
         }
     }
 }
 
-/// Every tool id, for help text and errors.
+/// Every tool id, in table order, for help text and errors.
 #[must_use]
-pub fn tool_ids() -> BTreeSet<&'static str> {
+pub fn tool_ids() -> Vec<&'static str> {
     TOOLS.iter().map(|tool| tool.id).collect()
 }
 
