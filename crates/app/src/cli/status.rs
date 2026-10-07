@@ -1168,6 +1168,38 @@ mod tests {
         assert!(text.contains("Policies (1)"), "{text}");
     }
 
+    /// Blocked launches name their reason and their remedy, in the text and in
+    /// the JSON document a `wsl status` on Windows reads back.
+    #[test]
+    fn blocked_launches_are_reported_with_their_reason_and_remedy() {
+        let mut document = document();
+        document.product.service_launches_blocked =
+            Some(runner_manager_platform::launch_health::LaunchesBlocked {
+                since: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+                reason: "a runner launch by process 189 has held the WSL launch fence".into(),
+                remedy: "restart the service".into(),
+            });
+
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("daemon starts no runner   since 2026-09-21")
+                && text.contains("process 189"),
+            "{text}"
+        );
+        assert!(
+            text.contains("launches remedy           restart the service"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(
+            json["product"]["service_launches_blocked"]["remedy"],
+            "restart the service"
+        );
+    }
+
     /// One line for the doctor's verdict, and one more when the daemon is
     /// refusing to start runners, naming the checks it refuses on.
     #[test]
