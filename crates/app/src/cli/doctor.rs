@@ -345,8 +345,8 @@ pub trait HostFacts {
     fn file_exists(&self, path: &Path) -> bool;
     fn memory_bytes(&self) -> Option<u64>;
     fn cpu_count(&self) -> usize;
-    /// `Ok(None)` when Spotlight gave no answer for this path.
-    fn spotlight_indexing(&self, path: &Path) -> Result<Option<bool>, String>;
+    /// `Ok(None)` when Spotlight gave no answer for this volume (a mount point).
+    fn spotlight_indexing(&self, volume: &Path) -> Result<Option<bool>, String>;
     fn mount_point(&self, path: &Path) -> Option<PathBuf>;
     fn launchd_process_type(&self, plist: &Path) -> Result<Option<String>, String>;
     fn throttled_runner_processes(&self) -> Result<usize, String>;
@@ -1126,14 +1126,24 @@ fn is_startup_volume(volume: &Path) -> bool {
 }
 
 /// The indexed runner roots and the volume each lives on.
+///
+/// Spotlight answers per volume: `mdutil -s` on a folder inside a volume says
+/// "unknown indexing state" (measured on the Mac mini), so the question is put
+/// to the root's mount point. A volume it gives no answer for is an error, not
+/// a pass.
 fn indexed_roots(
     setup: &HostSetup,
     facts: &dyn HostFacts,
-) -> Result<Vec<(PathBuf, Option<PathBuf>)>, String> {
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let mut indexed = Vec::new();
     for root in setup.runner_roots.iter().filter(|root| !is_noindex(root)) {
-        if facts.spotlight_indexing(root)? == Some(true) {
-            indexed.push((root.clone(), facts.mount_point(root)));
+        let volume = facts
+            .mount_point(root)
+            .ok_or_else(|| format!("the volume holding {} could not be found", root.display()))?;
+        match facts.spotlight_indexing(&volume)? {
+            Some(true) => indexed.push((root.clone(), volume)),
+            Some(false) => {}
+            None => return Err(format!("Spotlight gave no answer for {}", volume.display())),
         }
     }
     Ok(indexed)
@@ -1148,7 +1158,7 @@ fn probe_spotlight(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
         Err(error) => return unknown(format!("Spotlight's status could not be read: {error}")),
     };
     if indexed.is_empty() {
-        return pass("Spotlight does not index the runner roots");
+        return pass("Spotlight does not index the volumes holding the runner roots");
     }
     let names = indexed
         .iter()
@@ -1158,9 +1168,7 @@ fn probe_spotlight(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     let outcome = fail(format!(
         "Spotlight indexes {names}, re-reading every file jobs write there"
     ));
-    let on_startup_volume = indexed
-        .iter()
-        .all(|(_, volume)| volume.as_deref().is_none_or(is_startup_volume));
+    let on_startup_volume = indexed.iter().all(|(_, volume)| is_startup_volume(volume));
     if on_startup_volume {
         outcome.not_fixable().remedy(format!(
             "the root is on the startup volume: move it into a folder whose name ends in \
@@ -1181,7 +1189,7 @@ fn apply_spotlight(
     let mut changes = Vec::new();
     let mut volumes: Vec<PathBuf> = indexed_roots(setup, facts)?
         .into_iter()
-        .filter_map(|(_, volume)| volume)
+        .map(|(_, volume)| volume)
         .filter(|volume| !is_startup_volume(volume))
         .collect();
     volumes.dedup();
@@ -1831,14 +1839,10 @@ impl HostFacts for SystemFacts {
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
 
-    fn spotlight_indexing(&self, path: &Path) -> Result<Option<bool>, String> {
-        let existing = path
-            .ancestors()
-            .find(|ancestor| ancestor.exists())
-            .unwrap_or(path);
+    fn spotlight_indexing(&self, volume: &Path) -> Result<Option<bool>, String> {
         let output = run_capture(
             Path::new("/usr/bin/mdutil"),
-            &["-s", &existing.to_string_lossy()],
+            &["-s", &volume.to_string_lossy()],
         )?;
         let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
         Ok(if text.contains("indexing enabled") {
@@ -3221,7 +3225,10 @@ mod tests {
         files: Vec<PathBuf>,
         memory: Option<u64>,
         cores: usize,
+        /// Volumes Spotlight indexes; any other volume answers "disabled".
         indexed: Vec<PathBuf>,
+        /// Volumes Spotlight gives no answer for.
+        unanswered: Vec<PathBuf>,
         mounts: HashMap<PathBuf, PathBuf>,
         process_type: Option<String>,
         throttled: usize,
@@ -3266,8 +3273,11 @@ mod tests {
         fn cpu_count(&self) -> usize {
             self.cores
         }
-        fn spotlight_indexing(&self, path: &Path) -> Result<Option<bool>, String> {
-            Ok(Some(self.indexed.iter().any(|root| root == path)))
+        fn spotlight_indexing(&self, volume: &Path) -> Result<Option<bool>, String> {
+            if self.unanswered.iter().any(|v| v == volume) {
+                return Ok(None);
+            }
+            Ok(Some(self.indexed.iter().any(|v| v == volume)))
         }
         fn mount_point(&self, path: &Path) -> Option<PathBuf> {
             self.mounts.get(path).cloned()
@@ -3691,12 +3701,24 @@ mod tests {
         let mut setup = macos_setup();
         let mut facts = Facts::default();
         let id = "macos.spotlight";
-        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
-        facts.indexed.push(PathBuf::from("/Volumes/NVME/rman"));
+        assert_eq!(
+            status_of(&setup, &facts, id),
+            Status::Unknown,
+            "a root whose volume cannot be found is not a pass"
+        );
         facts.mounts.insert(
             PathBuf::from("/Volumes/NVME/rman"),
             PathBuf::from("/Volumes/NVME"),
         );
+        facts.unanswered.push(PathBuf::from("/Volumes/NVME"));
+        assert_eq!(
+            status_of(&setup, &facts, id),
+            Status::Unknown,
+            "mdutil's `unknown indexing state` is not a pass"
+        );
+        facts.unanswered.clear();
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+        facts.indexed.push(PathBuf::from("/Volumes/NVME"));
         let report = evaluate(&setup, &facts);
         assert_eq!(finding(&report, id).status, Status::Fail);
         assert!(finding(&report, id).fix.is_some());
@@ -3711,7 +3733,7 @@ mod tests {
             }
         );
         setup.runner_roots = vec![PathBuf::from("/Users/me/rman")];
-        facts.indexed = setup.runner_roots.clone();
+        facts.indexed = vec![PathBuf::from("/System/Volumes/Data")];
         facts.mounts.insert(
             PathBuf::from("/Users/me/rman"),
             PathBuf::from("/System/Volumes/Data"),
@@ -3726,8 +3748,11 @@ mod tests {
                 .contains(".noindex")
         );
         setup.runner_roots = vec![PathBuf::from("/Users/me/rman.noindex/x")];
-        facts.indexed = setup.runner_roots.clone();
-        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+        assert_eq!(
+            status_of(&setup, &facts, id),
+            Status::Pass,
+            "a `.noindex` folder is skipped even on an indexed volume"
+        );
     }
 
     #[test]
