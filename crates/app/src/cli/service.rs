@@ -121,10 +121,20 @@ fn announce_fixture(
 }
 
 fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
-    let paths = context.paths();
-    let mut arguments: Vec<OsString> = [
-        OsString::from("daemon"),
-        OsString::from("run"),
+    let mut arguments = vec![OsString::from("daemon"), OsString::from("run")];
+    arguments.extend(service_directory_arguments(context.paths()));
+    if cfg!(windows) && mode == StartMode::Boot {
+        arguments.push(OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
+    }
+    arguments
+}
+
+/// The four hidden `--service-*-dir` options naming `paths`, as a registration
+/// passes them to `daemon run`.
+pub(super) fn service_directory_arguments(
+    paths: &runner_manager_platform::paths::AppPaths,
+) -> [OsString; 8] {
+    [
         OsString::from("--service-config-dir"),
         paths.config_dir().as_os_str().to_owned(),
         OsString::from("--service-state-dir"),
@@ -134,12 +144,6 @@ fn daemon_arguments(context: &Context, mode: StartMode) -> Vec<OsString> {
         OsString::from("--service-logs-dir"),
         paths.logs_dir().as_os_str().to_owned(),
     ]
-    .into_iter()
-    .collect();
-    if cfg!(windows) && mode == StartMode::Boot {
-        arguments.push(OsString::from(WINDOWS_SCM_HOST_ARGUMENT));
-    }
-    arguments
 }
 
 /// The copy of this executable that the service runs, and how to undo making
@@ -799,7 +803,10 @@ mod tests {
         let Command::Daemon(DaemonCommand::Run(args)) = cli.command else {
             panic!("wrong command");
         };
-        assert_eq!(args.service_paths().as_ref(), Some(context.paths()));
+        assert_eq!(
+            args.directories.service_paths().as_ref(),
+            Some(context.paths())
+        );
         assert_eq!(
             args.windows_service_host,
             cfg!(windows),

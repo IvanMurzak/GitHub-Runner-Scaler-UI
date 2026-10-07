@@ -1289,12 +1289,15 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
                  host doctor` in a Terminal on this Mac",
         ),
         Ok(CredentialProbe::Unreadable(reason)) => fail(format!(
-            "the service binary {} cannot read its GitHub credential ({reason}); a replaced \
-             binary needs a fresh keychain grant",
+            "the service binary {} cannot read its GitHub credential ({reason}). The login \
+             keychain ties an item to the exact build that wrote it; the daemon hands the \
+             credential to the new build when it updates, so this is an item written by a build \
+             that did not: the first update to 0.4.34 or later, or a binary replaced by hand",
             service.binary.display()
         ))
         .remedy(format!(
-            "{} (sign in again with the service binary; never switch to --start-at boot for this)",
+            "{} in a Terminal on this Mac, not over SSH (sign in again with the service binary; \
+             never switch to --start-at boot for this)",
             super::update::force::auth_command_line(
                 setup.data_root.as_deref(),
                 StartMode::Login,

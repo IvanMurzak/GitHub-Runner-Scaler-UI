@@ -1493,6 +1493,17 @@ pub struct OrgRemoveArgs {
 pub enum DaemonCommand {
     /// Run the reconciliation loop in the foreground.
     Run(DaemonRunArgs),
+    /// Store a credential the previous build of the daemon hands over while it
+    /// upgrades.
+    ///
+    /// The daemon starts this from the binary it has just put in place, with
+    /// the credential document on stdin. On macOS the keychain ties an item to
+    /// the exact build that wrote it, so the new build has to be the writer:
+    /// that is the only way it can read its own credential after the restart
+    /// without somebody signing in at the Mac. Not a command anybody types, so
+    /// it is hidden for the reason `auth receive` is.
+    #[command(hide = true)]
+    AdoptCredential(DaemonAdoptCredentialArgs),
 }
 
 /// Arguments normally supplied by `service install`.
@@ -1504,6 +1515,17 @@ pub enum DaemonCommand {
 /// start mode.
 #[derive(Debug, Args, Default)]
 pub struct DaemonRunArgs {
+    #[command(flatten)]
+    pub directories: ServiceDirectoryArgs,
+    /// Installed only in Windows boot-service registrations. Login scheduled
+    /// tasks carry the same directory arguments but must never enter SCM.
+    #[arg(long, hide = true, requires = "service_config_dir")]
+    pub windows_service_host: bool,
+}
+
+/// The application-data directories a service registration records.
+#[derive(Debug, Args, Default)]
+pub struct ServiceDirectoryArgs {
     #[arg(long, hide = true, requires_all = ["service_state_dir", "service_runtime_dir", "service_logs_dir"])]
     pub service_config_dir: Option<PathBuf>,
     #[arg(long, hide = true, requires_all = ["service_config_dir", "service_runtime_dir", "service_logs_dir"])]
@@ -1512,13 +1534,22 @@ pub struct DaemonRunArgs {
     pub service_runtime_dir: Option<PathBuf>,
     #[arg(long, hide = true, requires_all = ["service_config_dir", "service_state_dir", "service_runtime_dir"])]
     pub service_logs_dir: Option<PathBuf>,
-    /// Installed only in Windows boot-service registrations. Login scheduled
-    /// tasks carry the same directory arguments but must never enter SCM.
-    #[arg(long, hide = true, requires = "service_config_dir")]
-    pub windows_service_host: bool,
 }
 
-impl DaemonRunArgs {
+/// `daemon adopt-credential`. See [`DaemonCommand::AdoptCredential`].
+#[derive(Debug, Args)]
+pub struct DaemonAdoptCredentialArgs {
+    /// Which start mode's credential store to write. Required: the daemon
+    /// handing over knows which store it reads.
+    #[arg(long, value_name = "WHEN")]
+    pub start_at: StartAt,
+    /// The handing-over daemon's own directories, so this process opens the
+    /// same state and writes the same log as the daemon it replaces.
+    #[command(flatten)]
+    pub directories: ServiceDirectoryArgs,
+}
+
+impl ServiceDirectoryArgs {
     fn service_paths(&self) -> Option<AppPaths> {
         Some(AppPaths::from_directories(
             self.service_config_dir.as_ref()?,
@@ -2038,7 +2069,8 @@ fn run_with_shutdown(
     service_shutdown: Option<runner_manager_platform::service::ServiceShutdown>,
 ) -> Result<(), CliError> {
     let service_paths = match &cli.command {
-        Command::Daemon(DaemonCommand::Run(args)) => args.service_paths(),
+        Command::Daemon(DaemonCommand::Run(args)) => args.directories.service_paths(),
+        Command::Daemon(DaemonCommand::AdoptCredential(args)) => args.directories.service_paths(),
         _ => None,
     };
     if service_paths.is_some() && cli.data_dir.is_some() {

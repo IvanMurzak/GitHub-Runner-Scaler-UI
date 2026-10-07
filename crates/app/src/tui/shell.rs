@@ -923,6 +923,13 @@ fn readiness_from_facts(
                 let remediation = if subject == "github credential" {
                     "Run `runner-manager auth login`; the service picks up the new credential without a restart."
                         .into()
+                } else if subject == runner_manager_platform::service::CREDENTIAL_UNREADABLE_SUBJECT {
+                    let mode = service.start_mode.unwrap_or_default();
+                    format!(
+                        "Run `{}`{}; the service reads it on its next start, within seconds.",
+                        runner_manager_platform::service::sign_in_command(mode),
+                        runner_manager_platform::service::sign_in_where(mode)
+                    )
                 } else if subject == "definition" {
                     "Run `runner-manager service status` for the exact re-registration command; configuration and credentials are kept."
                         .into()

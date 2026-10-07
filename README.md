@@ -175,12 +175,15 @@ job-safe handover from the currently installed binary regardless of that path,
 run `runner-manager update --force` (or inspect it first with `update --check
 --force`). This retains a recoverable backup beside the old service source and
 replaces only that source; it does not stop the service or cancel a job. The
-command can return while a long job is still running. On macOS, the new binary
-may need a new login-Keychain grant: **do not run `auth login` until `service
-status` reports the new version**. If prompted, run the exact `auth login`
-command printed by `update --force`, which names the new service binary and its
-existing data directory. Authentication replaces the credential, not the
-database, runner profiles or settings.
+command can return while a long job is still running. On macOS, the old daemon
+hands its login-Keychain credential to the new binary just before it restarts,
+because the keychain ties an item to the exact build that wrote it. If `service
+status` still reports an unreadable credential after the new version starts,
+**and only then**, run the exact `auth login` command printed by `update
+--force`, in a Terminal in the Mac's desktop session (an SSH session cannot
+unlock the login keychain). It names the new service binary and its existing
+data directory. Authentication replaces the credential, not the database, runner
+profiles or settings.
 
 `update` refuses two things rather than overwriting them: a `cargo build` inside
 a checkout of this repository, and the private copy the service runs. Both name

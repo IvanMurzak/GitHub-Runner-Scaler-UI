@@ -2444,9 +2444,17 @@ mod sys {
     /// The **login** keychain is the one place where the ACL is a real boundary
     /// — every process running as the operator can reach that keychain, and the
     /// per-application grant is what stops one of them reading this token
-    /// silently. So it keeps the default, and pays the upgrade prompt instead.
-    /// A user-scoped host has an operator present to answer that prompt, which
-    /// is exactly what a boot-mode daemon does not.
+    /// silently. So it keeps the default.
+    ///
+    /// Widening would not help there anyway. The login keychain also records
+    /// the *partition* of the code that created an item -- `cdhash:<hash>` for
+    /// an ad-hoc signed binary -- and refuses every other partition without a
+    /// prompt, whatever the application list says. Measured on macOS 27 with
+    /// two ad-hoc builds of one program: an item granted to every application
+    /// in the login keychain was refused to the second build, and the same item
+    /// in a keychain of its own was not. What survives an upgrade there is the
+    /// new build writing the item itself, which the daemon arranges while it
+    /// upgrades (`hand_over_credential_to_new_binary` in the application).
     fn grants_every_application(site: &Site) -> bool {
         match site.kind {
             Kind::System | Kind::Rooted => true,
@@ -2684,6 +2692,9 @@ mod sys {
         pub const SEC_SERVICE_ITEM_ATTR: u32 = u32::from_be_bytes(*b"svce");
         /// `kSecAccountItemAttr`, `'acct'`.
         pub const SEC_ACCOUNT_ITEM_ATTR: u32 = u32::from_be_bytes(*b"acct");
+        /// `kSecUnlockStateStatus`, the bit `SecKeychainGetStatus` sets for an
+        /// unlocked keychain.
+        pub const SEC_UNLOCK_STATE_STATUS: u32 = 1;
 
         /// `SecKeychainAttribute` from `SecBase.h`.
         #[repr(C)]
@@ -2727,6 +2738,7 @@ mod sys {
                 description: CFStringRef,
                 prompt_selector: u16,
             ) -> i32;
+            pub fn SecKeychainGetStatus(keychain: SecKeychainRef, status: *mut u32) -> i32;
             pub fn SecKeychainItemCreateFromContent(
                 item_class: u32,
                 attributes: *mut SecKeychainAttributeList,
@@ -2750,17 +2762,19 @@ mod sys {
             Err(error) if is_absence(&error) => Ok(None),
             // The one refusal an operator can act on, and the one they cannot
             // guess. See `locked_out`.
-            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => Err(locked_out(site, &error)),
+            Err(error) if error.code() == ERR_SEC_AUTH_FAILED => {
+                Err(locked_out(site, &keychain, &error))
+            }
             Err(error) => Err(sec_error(&error)),
         }
     }
 
     /// Why a keychain refuses a program its own credential, and what ends it.
     ///
-    /// # Two states wear the same number
+    /// # Three states wear the same number
     ///
     /// `errSecAuthFailed` is what a keychain says when the item is there and
-    /// the caller may not have it, and there are two quite different reasons
+    /// the caller may not have it, and there are three quite different reasons
     /// for that. Telling an operator the wrong one sends them to a remedy that
     /// cannot work, so this reads which one it is instead of guessing:
     ///
@@ -2769,37 +2783,92 @@ mod sys {
     ///    ordinary `runner-manager status` gets `-25293` on a perfectly healthy
     ///    credential. Nothing is broken and nothing needs repairing — the value
     ///    belongs to the account the boot-mode daemon runs as.
-    /// 2. **The item was written by an older version.** Before the store
-    ///    granted its items to every application, the ACL named the single
-    ///    binary that wrote them, and an upgrade replaces that binary. This is
-    ///    what took a real host down twice; [`grants_every_application`] is the
-    ///    fix, and one more `auth login` rewrites the item so it cannot happen
-    ///    again.
-    fn locked_out(site: &Site, error: &security_framework::base::Error) -> io::Error {
+    /// 2. **The keychain is locked for this session.** A login keychain is
+    ///    unlocked for the desktop session that logged in, and an SSH session
+    ///    is not that session: measured on macOS 27, even the binary that wrote
+    ///    an item reads `-25293` over SSH while the LaunchAgent beside it reads
+    ///    the same item fine. Nothing about the item is wrong, and signing in
+    ///    from there cannot work either.
+    /// 3. **The item was written by a different build.** The login keychain
+    ///    partitions every item to the code that created it, and an ad-hoc
+    ///    signed binary's partition is its code hash, so every release is a
+    ///    stranger to the item the previous one wrote. The daemon hands its
+    ///    credential to the new build while it upgrades (see
+    ///    `daemon adopt-credential`); this is what is left when that did not
+    ///    happen, and one sign-in by the build that will read it ends it.
+    fn locked_out(
+        site: &Site,
+        keychain: &SecKeychain,
+        error: &security_framework::base::Error,
+    ) -> io::Error {
+        let code = error.code();
         if site.kind == Kind::System && !is_root() {
             return io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "Security.framework returned {} ({error}). The machine-scoped store is the \
+                    "Security.framework returned {code} ({error}). The machine-scoped store is the \
                      System Keychain, and what decrypts it is /var/db/SystemKey, which only \
                      root may read -- so this is what a healthy credential looks like to an \
                      account that is not the one holding it. The boot-mode daemon runs as root \
                      and reads it. Nothing here needs repairing: run this command with sudo if \
                      you need the value itself, or install with `--start-at login` to keep the \
-                     token in your own login keychain instead.",
-                    error.code()
+                     token in your own login keychain instead."
                 ),
             );
         }
+        if site.kind == Kind::Login && is_locked(keychain) {
+            return io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Security.framework returned {code} ({error}). {} is locked for this \
+                     session, so nothing in it can be read from here -- the service, which runs \
+                     in the desktop session, may be reading it fine. An SSH session does not \
+                     share the desktop session's unlocked login keychain. Run this from a \
+                     Terminal in the Mac's desktop session, or unlock the keychain for this \
+                     session first with `security unlock-keychain`.",
+                    site.path.display()
+                ),
+            );
+        }
+        if site.kind == Kind::Login {
+            return io::Error::other(format!(
+                "Security.framework returned {code} ({error}). The item is there and this keychain \
+                 does not grant it to the program asking. macOS ties a login-keychain item to the \
+                 exact build that wrote it -- an ad-hoc signed binary is known by the hash of its \
+                 code -- so every release, and every rebuild, is a different program to it. The \
+                 service hands its credential to the new build while it upgrades; an item written \
+                 by a version that could not, or by a binary the service does not run, needs one \
+                 more sign-in by the build that will read it: run `runner-manager auth login \
+                 --start-at login` in a Terminal in the Mac's desktop session (not over SSH)."
+            ));
+        }
         io::Error::other(format!(
-            "Security.framework returned {} ({error}). The item is there and this keychain does \
+            "Security.framework returned {code} ({error}). The item is there and this keychain does \
              not grant it to the program asking. An earlier version granted the stored token to \
              the single binary that wrote it, and an upgrade replaces that binary -- so an item \
              written by one of those versions locks out every later copy, the daemon's included. \
-             Signing in once more rewrites it with a grant that survives upgrades: run \
-             `runner-manager auth login`, with sudo if this is the machine-scoped store.",
-            error.code()
+             Signing in once more rewrites it so that every application may read it: run \
+             `runner-manager auth login`, with sudo if this is the machine-scoped store."
         ))
+    }
+
+    /// Whether `keychain` is locked as far as this process can tell.
+    ///
+    /// Unlocking is per security session, so the answer is this session's: a
+    /// login keychain reads as unlocked to a LaunchAgent and as locked to an SSH
+    /// login of the same account at the same moment. A status this process
+    /// cannot read is treated as unlocked, so that the explanation falls back to
+    /// the one it gave before this was asked.
+    fn is_locked(keychain: &SecKeychain) -> bool {
+        use core_foundation::base::TCFType as _;
+
+        let mut status = 0_u32;
+        // SAFETY: `keychain` is a live reference and `status` a valid
+        // out-pointer that is only read when the call reports success.
+        let result = unsafe {
+            ffi::SecKeychainGetStatus(keychain.as_concrete_TypeRef().cast(), &raw mut status)
+        };
+        result == 0 && status & ffi::SEC_UNLOCK_STATE_STATUS == 0
     }
 
     pub(super) fn delete(site: &Site) -> io::Result<bool> {
