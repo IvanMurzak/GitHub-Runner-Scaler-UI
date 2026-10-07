@@ -165,26 +165,19 @@ impl DependencyCaches {
         }
     }
 
-    /// Measures the cache root and prunes it to the configured cap. `None`
-    /// when caches are off, no root resolves or the root does not exist yet.
-    #[must_use]
-    pub fn prune_once(&self) -> Option<CacheUsage> {
-        self.prune_guarded(true)
-    }
-
-    /// One look by the service: prunes when an operator's `host cache prune`
-    /// left a [`dependency_cache::PRUNE_REQUEST_FILE`] in `state_dir`, or else
-    /// when `due`. Returns whether it took a request.
+    /// One pass by the service: measures the cache root and prunes it to the
+    /// configured cap when an operator's `host cache prune` left a
+    /// [`dependency_cache::PRUNE_REQUEST_FILE`] in `state_dir`, or else when
+    /// `due`. Returns whether it took a request.
     ///
     /// A request is carried out whether or not caches are on, exactly as the
     /// command does when its account can write the root itself; only the
-    /// scheduled pass respects the switch.
+    /// scheduled pass respects the switch. Nothing happens when caches are off
+    /// for a scheduled pass, no root resolves or the root does not exist yet.
     pub fn prune_if_requested_or_due(&self, state_dir: &Path, due: bool) -> bool {
         let requested = dependency_cache::take_prune_request(state_dir);
-        if requested {
-            let _ = self.prune_guarded(false);
-        } else if due {
-            let _ = self.prune_once();
+        if requested || due {
+            let _ = self.prune_guarded(!requested);
         }
         requested
     }

@@ -881,15 +881,10 @@ fn report_managed_wsl_hosts(
     )
     .map_err(failed)?;
     for record in behind {
-        let name = &record.distribution;
-        let name = if name.contains(char::is_whitespace) {
-            format!("\"{name}\"")
-        } else {
-            name.clone()
-        };
         writeln!(
             out,
-            "  runner-manager wsl install --distribution {name}   (runs {})",
+            "  {}   (runs {})",
+            super::wsl::install_remediation(&record.distribution),
             record.installed_version
         )
         .map_err(failed)?;
@@ -1543,7 +1538,7 @@ mod tests {
         report_managed_wsl_hosts(&paths, "0.4.35", &mut out).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(
-            said.contains("runner-manager wsl install --distribution Ubuntu   (runs 0.4.34)"),
+            said.contains("runner-manager wsl install --distribution \"Ubuntu\"   (runs 0.4.34)"),
             "{said}"
         );
         assert!(

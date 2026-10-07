@@ -63,7 +63,6 @@ use runner_manager_domain::model::{Clock, StartMode};
 use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{InventoryGateway, RestInventory};
 use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
-use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::{InstallRecord, TaskPrincipal};
 use runner_manager_platform::wsl::artifact::{
@@ -87,7 +86,7 @@ use super::auth::{
     BrokeredCredential, SecretSink, SecretSinkError, StoredCredential, StoringRenewal,
     broker_user_credential,
 };
-use super::doctor::ElevationFailure;
+use super::doctor::{ElevationFailure, run_elevated_reporting};
 use super::update::{AssetSource, fetch_file, fetch_text};
 use super::{
     AuthCommand, Cli, CliError, Command, Context, Failure, HOST_OPTION, StartAt, Styling,
@@ -359,8 +358,8 @@ fn supervise(
     let started = std::time::SystemTime::now();
     // Only under the stable supervisor: it restarts the same path when this
     // exits with `UpgradePending`, and nothing else would.
-    let own_image =
-        std::env::var_os(SUPERVISED_ENVIRONMENT).and_then(|_| std::env::current_exe().ok());
+    let own_image = std::env::var_os(super::service::SUPERVISED_ENVIRONMENT)
+        .and_then(|_| std::env::current_exe().ok());
 
     let store = context.store()?;
     let mode = context
@@ -411,7 +410,6 @@ fn supervise(
         "WSL lifecycle and recovery supervisor running for {distribution}"
     )
     .map_err(write_failed("the WSL lifecycle supervisor"))?;
-    let replaced_by = own_image.clone();
     super::runtime()?.block_on(async move {
         tokio::select! {
             () = keep_guest_holder_alive(executable, distribution.clone(), linux_binary, shared_root) => {
@@ -426,20 +424,16 @@ fn supervise(
     // Only the replacement watch ends. Dropping the holder loop above stopped
     // the holder it owned; the supervisor starts the new companion from the
     // same path at once, and that starts a holder of its own.
-    tracing::info!(
-        image = ?replaced_by,
-        "a newer WSL lifecycle companion was installed; restarting onto it"
-    );
     Err(CliError::with_remedy(
         Failure::UpgradePending,
         "a newer WSL lifecycle companion was installed at this path; exiting so its supervisor \
          starts it",
-        "runner-manager wsl status --distribution <NAME>",
+        format!(
+            "runner-manager wsl status --distribution {:?}",
+            args.distribution
+        ),
     ))
 }
-
-/// What `runner-manager-supervisor` sets in its child's environment.
-const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
 
 /// How often a running companion looks for a replacement of its own file.
 const COMPANION_REPLACEMENT_POLL: Duration = Duration::from_secs(15);
@@ -459,6 +453,10 @@ async fn wait_for_companion_replacement(image: Option<PathBuf>, started: std::ti
     loop {
         tokio::time::sleep(COMPANION_REPLACEMENT_POLL).await;
         if companion_replaced_since(&image, started) {
+            tracing::info!(
+                image = %image.display(),
+                "a newer WSL lifecycle companion was installed; restarting onto it"
+            );
             return;
         }
     }
@@ -2455,7 +2453,7 @@ impl Provisioner<'_> {
                 } else {
                     TaskChange::Create
                 };
-                self.apply_task_request(&request, why, out)?;
+                self.apply_task_request(&request, identity.name(), why, out)?;
             }
         }
         out.flush().map_err(failed)?;
@@ -2536,14 +2534,11 @@ impl Provisioner<'_> {
     fn apply_task_request(
         &self,
         request: &LifecycleTaskRequest,
+        name: &str,
         change: TaskChange,
         out: &mut dyn Write,
     ) -> Result<(), CliError> {
         let failed = write_failed("this install");
-        let name = LifecycleTaskIdentity::for_distribution(&request.distribution)
-            .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?
-            .name()
-            .to_string();
         let denied = match apply_lifecycle_task_request(self.host, request) {
             Ok(()) => {
                 writeln!(out, "Lifecycle task {name} {} and started.", change.done())
@@ -2586,9 +2581,8 @@ impl Provisioner<'_> {
                         change.why_once()
                     ),
                     format!(
-                        "runner-manager wsl install --distribution {}   (once, from an elevated \
-                         prompt)",
-                        shell_word(&request.distribution)
+                        "{}   (once, from an elevated prompt)",
+                        install_remediation(&request.distribution)
                     ),
                 ),
             )),
@@ -2989,22 +2983,12 @@ fn replace_in_place(source: &Path, destination: &Path) -> io::Result<bool> {
 
 /// Whether two files hold the same bytes.
 fn same_contents(left: &Path, right: &Path) -> io::Result<bool> {
-    use std::io::Read as _;
+    // The length first, so that a different build is told apart without
+    // reading either file.
     if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
         return Ok(false);
     }
-    let (mut left, mut right) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
-    let (mut a, mut b) = (vec![0_u8; 64 * 1024], vec![0_u8; 64 * 1024]);
-    loop {
-        let read = left.read(&mut a)?;
-        if read == 0 {
-            return Ok(true);
-        }
-        right.read_exact(&mut b[..read])?;
-        if a[..read] != b[..read] {
-            return Ok(false);
-        }
-    }
+    Ok(std::fs::read(left)? == std::fs::read(right)?)
 }
 
 /// A name beside `path` that no earlier swap used, so that a file still
@@ -3052,15 +3036,6 @@ fn is_retired_companion_file(name: &str) -> bool {
         version.starts_with(|c: char| c.is_ascii_digit())
             && version.to_ascii_lowercase().ends_with(".exe")
     })
-}
-
-/// A distribution name as an operator would type it in a command.
-fn shell_word(text: &str) -> String {
-    if text.contains(char::is_whitespace) {
-        format!("\"{text}\"")
-    } else {
-        text.to_string()
-    }
 }
 
 /// Why the lifecycle task is being registered, for the sentences around it.
@@ -3168,7 +3143,7 @@ pub trait TaskElevation: fmt::Debug {
 }
 
 /// Relaunches this binary once through the same administrator prompt `host
-/// prepare` uses ([`host_fitness::run_elevated`]), running only
+/// prepare` uses ([`run_elevated_reporting`]), running only
 /// `wsl-host register-task`.
 #[derive(Debug, Clone, Copy)]
 pub struct SystemTaskElevation {
@@ -3185,31 +3160,24 @@ impl TaskElevation for SystemTaskElevation {
                 "this session has no terminal, so nobody can answer an administrator prompt".into(),
             ));
         }
-        let failed = |error: String| ElevationFailure::Failed(error);
-        let program = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
-        let directory = tempfile::tempdir().map_err(|error| failed(error.to_string()))?;
-        let result = directory.path().join("result.json");
-        let encoded = serde_json::to_string(request).map_err(|error| failed(error.to_string()))?;
-        let args = [
-            OsString::from("wsl-host"),
-            OsString::from("register-task"),
-            OsString::from("--request"),
-            OsString::from(encoded),
-            OsString::from("--result"),
-            result.clone().into_os_string(),
-        ];
-        match host_fitness::run_elevated(&program, &args, true) {
-            ElevationOutcome::Refused => Err(ElevationFailure::Refused),
-            ElevationOutcome::Unavailable(detail) => Err(ElevationFailure::Unavailable(detail)),
-            ElevationOutcome::Exited(code) => {
-                let text = std::fs::read_to_string(&result).map_err(|error| {
-                    failed(format!("it exited {code} and wrote no result ({error})"))
-                })?;
-                let reported: ElevatedTaskResult =
-                    serde_json::from_str(&text).map_err(|error| failed(error.to_string()))?;
-                reported.error.map_or(Ok(()), |error| Err(failed(error)))
-            }
-        }
+        let encoded = serde_json::to_string(request)
+            .map_err(|error| ElevationFailure::Failed(error.to_string()))?;
+        let reported: ElevatedTaskResult = run_elevated_reporting(
+            |result| {
+                vec![
+                    OsString::from("wsl-host"),
+                    OsString::from("register-task"),
+                    OsString::from("--request"),
+                    OsString::from(encoded),
+                    OsString::from("--result"),
+                    result.as_os_str().to_owned(),
+                ]
+            },
+            true,
+        )?;
+        reported
+            .error
+            .map_or(Ok(()), |error| Err(ElevationFailure::Failed(error)))
     }
 }
 
@@ -6134,7 +6102,7 @@ mod tests {
         }
         let remedy = refusal.remedy().expect("a command").to_string();
         assert!(
-            remedy.starts_with("runner-manager wsl install --distribution Ubuntu"),
+            remedy.starts_with("runner-manager wsl install --distribution \"Ubuntu\""),
             "{remedy}"
         );
         assert!(remedy.contains("elevated prompt"), "{remedy}");

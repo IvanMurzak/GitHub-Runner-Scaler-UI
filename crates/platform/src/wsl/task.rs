@@ -479,9 +479,12 @@ impl RegisteredTask {
     /// `schtasks /Query /FO CSV` prints its `Status` column in the machine's
     /// display language and there is no locale-independent equivalent short of
     /// COM. On a non-English Windows this is `false` for a task that is in fact
-    /// running. Nothing in the provisioning transaction branches on it — the
-    /// authority for "is the Linux host healthy" is the Linux service's own
-    /// status — so it is a display value and only that.
+    /// running. The authority for "is the Linux host healthy" is the Linux
+    /// service's own status, never this. `wsl install` does branch on it, and
+    /// only where a wrong `false` is harmless: it runs `/Run` on a current
+    /// task that already runs, which `IgnoreNew` makes a no-op, and it skips
+    /// restarting a task it re-registered, which leaves the old companion
+    /// running until the next logon rather than doing anything to it.
     #[must_use]
     pub fn running(&self) -> bool {
         self.running

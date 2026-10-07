@@ -37,7 +37,7 @@ pub fn dispatch(
 ///
 /// See [`identity`].
 pub(super) const SERVICE_TAG_VARIABLE: &str = "RUNNER_MANAGER_SERVICE_NAME_TAG";
-#[cfg(windows)]
+/// What `runner-manager-supervisor` sets in the environment of the child it restarts.
 pub(super) const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
 
 /// The one place that decides which registration this process acts on.

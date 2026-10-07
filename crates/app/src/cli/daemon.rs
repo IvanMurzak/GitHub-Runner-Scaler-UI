@@ -604,13 +604,20 @@ async fn maintain_dependency_caches(
     state_dir: std::path::PathBuf,
     scheduled: bool,
 ) {
-    use runner_manager_platform::dependency_cache::{PRUNE_INTERVAL, PRUNE_REQUEST_POLL};
+    use runner_manager_platform::dependency_cache::{
+        PRUNE_INTERVAL, PRUNE_REQUEST_POLL, prune_request_path,
+    };
+    let request = prune_request_path(&state_dir);
     let mut next_scheduled = scheduled.then(std::time::Instant::now);
     loop {
         let due = next_scheduled.is_some_and(|at| std::time::Instant::now() >= at);
-        let (pass, state) = (caches.clone(), state_dir.clone());
-        let _ =
-            tokio::task::spawn_blocking(move || pass.prune_if_requested_or_due(&state, due)).await;
+        // Almost every look finds nothing to do, and a look is one `stat`.
+        if due || request.exists() {
+            let (pass, state) = (caches.clone(), state_dir.clone());
+            let _ =
+                tokio::task::spawn_blocking(move || pass.prune_if_requested_or_due(&state, due))
+                    .await;
+        }
         // A pass ran either way, so the schedule starts again from now.
         if due {
             next_scheduled = Some(std::time::Instant::now() + PRUNE_INTERVAL);
