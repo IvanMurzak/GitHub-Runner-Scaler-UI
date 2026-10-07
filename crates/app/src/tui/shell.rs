@@ -689,6 +689,9 @@ struct LocalServiceReadiness {
     log_file: String,
     problems: Vec<(String, String)>,
     legacy_windows_action: bool,
+    /// Why the service does not come back by itself after an unattended
+    /// restart, and what changes that. `None` when it does.
+    unattended_gap: Option<(String, String)>,
 }
 
 /// The WSL distribution this process runs inside, if any.
@@ -852,6 +855,9 @@ fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceRe
             .map(|problem| (problem.subject.to_owned(), problem.detail.clone()))
             .collect(),
         legacy_windows_action,
+        unattended_gap: service
+            .unattended_gap()
+            .map(|gap| (gap.reason.clone(), gap.remedy.clone())),
     })
 }
 
@@ -949,14 +955,12 @@ fn readiness_from_facts(
                     remediation,
                 );
             }
-            if service.start_mode == Some(StartMode::Login) {
+            if let Some((reason, remedy)) = &service.unattended_gap {
                 issue(
                     "local:login-only",
                     OperationalReadiness::Degraded,
-                    "Local service starts only after this user signs in; it will not cover an unattended reboot."
-                        .into(),
-                    "For machine-on operation, move the service and credential to `--start-at boot` from an elevated terminal."
-                        .into(),
+                    reason.clone(),
+                    remedy.clone(),
                 );
             }
             if service.legacy_windows_action {
@@ -5854,6 +5858,7 @@ fn ready_service() -> LocalServiceReadiness {
         log_file: "service.log".into(),
         problems: vec![],
         legacy_windows_action: false,
+        unattended_gap: None,
     }
 }
 
@@ -5872,6 +5877,7 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
             log_file: "service.log".into(),
             problems: vec![],
             legacy_windows_action: false,
+            unattended_gap: None,
         }),
         false,
         &[],
@@ -5883,6 +5889,10 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     let mut stopped = ready_service();
     stopped.running = false;
     stopped.start_mode = Some(StartMode::Login);
+    stopped.unattended_gap = Some((
+        "This host does not resume work after an unattended reboot.".into(),
+        "Turn on automatic login.".into(),
+    ));
     stopped.legacy_windows_action = true;
     stopped
         .problems
@@ -6000,6 +6010,7 @@ fn a_missing_service_registration_is_one_actionable_problem() {
                 "the service record exists but SCM has no registration".into(),
             )],
             legacy_windows_action: false,
+            unattended_gap: None,
         }),
         true,
         &[],

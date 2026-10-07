@@ -3854,6 +3854,14 @@ pub trait ControlFactory: fmt::Debug + Send + Sync {
     fn installed_definition(&self, _path: &Path) -> Option<String> {
         None
     }
+
+    /// Whether this Mac signs somebody in after a restart, and whether
+    /// FileVault holds it at the unlock screen. `None` where the platform has
+    /// no such probe; the default probes nothing, for the same reason as
+    /// [`Self::installed_definition`].
+    fn unattended_login(&self) -> Option<crate::unattended_login::UnattendedLogin> {
+        None
+    }
 }
 
 /// The real service managers of the host this binary was built for.
@@ -4478,6 +4486,13 @@ impl ServiceOperations {
         let credential_rejected_since =
             github_credential_rejected_since(&self.paths).ok().flatten();
         let credential_unreadable_since = credential_unreadable_since(&self.paths).ok().flatten();
+        let unattended = record.as_ref().and_then(|record| {
+            unattended_gap(
+                record.start_mode,
+                &service_account_name(&record.account),
+                self.controls.unattended_login().as_ref(),
+            )
+        });
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4492,7 +4507,8 @@ impl ServiceOperations {
         .with_launches_blocked(crate::launch_health::launches_blocked(
             &self.paths,
             Utc::now(),
-        )))
+        ))
+        .with_unattended_gap(unattended))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -4688,8 +4704,62 @@ pub struct ServiceStatus {
     runner_root: Option<(PathBuf, RootAccessReport)>,
     credential_rejected_since: Option<DateTime<Utc>>,
     launches_blocked: Option<crate::launch_health::LaunchesBlocked>,
+    unattended_gap: Option<UnattendedGap>,
     problems: Vec<StatusProblem>,
     notes: Vec<String>,
+}
+
+/// Why a registration does not come back by itself after an unattended
+/// restart, and what an operator can do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattendedGap {
+    /// One or more sentences, the way `service status` prints them.
+    pub reason: String,
+    /// What changes it. Never something this product does by itself.
+    pub remedy: String,
+}
+
+/// The name of the account a registration runs as.
+fn service_account_name(account: &ServiceAccount) -> String {
+    match account {
+        ServiceAccount::InvokingUser => crate::unattended_login::current_account()
+            .unwrap_or_else(|| "the operator".to_owned()),
+        other => other.as_str().to_owned(),
+    }
+}
+
+/// Works out the gap for a registration in `mode` running as `account`.
+///
+/// `found` is `None` where nothing could be probed (every platform but macOS):
+/// a login registration then keeps the general statement that it waits for a
+/// sign-in. On a Mac the statement depends on automatic login and FileVault,
+/// and a login registration that automatic login brings back has no gap. The
+/// earlier statement was printed for every login registration, so a Mac set to
+/// sign its runner account in automatically was told it would not resume.
+#[must_use]
+pub fn unattended_gap(
+    mode: StartMode,
+    account: &str,
+    found: Option<&crate::unattended_login::UnattendedLogin>,
+) -> Option<UnattendedGap> {
+    let Some(found) = found else {
+        return (mode == StartMode::Login).then(|| UnattendedGap {
+            reason: "This registration starts at login, so the agent does not run until the \
+                     operator signs in; this host does not resume work after an unattended \
+                     reboot."
+                .to_owned(),
+            remedy: "For machine-on operation, move the service and credential to `--start-at \
+                     boot` from an elevated terminal."
+                .to_owned(),
+        });
+    };
+    let resume = crate::unattended_login::resume(found, mode, account);
+    resume.explain(account).map(|reason| UnattendedGap {
+        reason,
+        remedy: "Follow the steps in `runner-manager service status`; automatic login and \
+                 FileVault are changed only by you, in System Settings."
+            .to_owned(),
+    })
 }
 
 impl ServiceStatus {
@@ -4855,13 +4925,6 @@ impl ServiceStatus {
             });
         }
 
-        if record.as_ref().map(|record| record.start_mode) == Some(StartMode::Login) {
-            notes.push(
-                "This registration starts at login, so the agent does not run until the operator \
-                 signs in; this host does not resume work after an unattended reboot."
-                    .to_string(),
-            );
-        }
         if last_github_contact.is_none() {
             notes.push(
                 "GitHub has not been reached successfully since this host's state directory was \
@@ -4962,6 +5025,7 @@ impl ServiceStatus {
             runner_root,
             credential_rejected_since: None,
             launches_blocked: None,
+            unattended_gap: None,
             problems,
             notes,
         }
@@ -5148,6 +5212,24 @@ impl ServiceStatus {
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
+    }
+
+    /// Records whether this registration comes back by itself after an
+    /// unattended restart, as a note. See [`unattended_gap`].
+    #[must_use]
+    pub fn with_unattended_gap(mut self, gap: Option<UnattendedGap>) -> Self {
+        if let Some(gap) = &gap {
+            self.notes.push(gap.reason.clone());
+        }
+        self.unattended_gap = gap;
+        self
+    }
+
+    /// Why this registration does not come back by itself after an
+    /// unattended restart, when it does not.
+    #[must_use]
+    pub const fn unattended_gap(&self) -> Option<&UnattendedGap> {
+        self.unattended_gap.as_ref()
     }
 
     /// The recorded start mode. Journey 5 step 4.
@@ -5545,6 +5627,10 @@ impl ControlFactory for HostControls {
 
     fn installed_definition(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    fn unattended_login(&self) -> Option<crate::unattended_login::UnattendedLogin> {
+        crate::unattended_login::probe()
     }
 }
 
@@ -9937,6 +10023,41 @@ logs = \"/d\"
                 .any(|note| note.contains("does not run until the operator signs in")),
             "05-infrastructure.md requires `service status` to say so: {status}"
         );
+    }
+
+    /// A Mac that signs its runner account in automatically does resume, and
+    /// `service status` used to tell it otherwise.
+    #[test]
+    fn a_mac_with_automatic_login_as_the_service_account_resumes_after_a_reboot() {
+        use crate::unattended_login::{AutoLogin, UnattendedLogin};
+        let automatic = UnattendedLogin {
+            auto_login: AutoLogin::As("ivan".into()),
+            filevault_on: Some(false),
+        };
+        assert_eq!(
+            unattended_gap(StartMode::Login, "ivan", Some(&automatic)),
+            None
+        );
+
+        let off = UnattendedLogin {
+            auto_login: AutoLogin::Off,
+            filevault_on: Some(false),
+        };
+        let gap = unattended_gap(StartMode::Login, "ivan", Some(&off)).expect("a gap");
+        assert!(gap.reason.contains("automatic login is off"), "{gap:?}");
+        assert!(gap.reason.contains("Automatically log in as"), "{gap:?}");
+
+        let locked = UnattendedLogin {
+            auto_login: AutoLogin::As("ivan".into()),
+            filevault_on: Some(true),
+        };
+        let gap = unattended_gap(StartMode::Boot, "root", Some(&locked)).expect("a gap");
+        assert!(gap.reason.contains("FileVault is on"), "{gap:?}");
+
+        // Where nothing can be probed, a login registration still says so.
+        let gap = unattended_gap(StartMode::Login, "ivan", None).expect("a gap");
+        assert!(gap.reason.contains("does not run until the operator signs in"));
+        assert_eq!(unattended_gap(StartMode::Boot, "root", None), None);
     }
 
     // -----------------------------------------------------------------------
