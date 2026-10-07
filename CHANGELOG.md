@@ -7,6 +7,49 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.34
+
+### Features
+
+- Native runners keep their dependency and tool caches between jobs, on Windows, macOS, Linux
+  and managed WSL hosts, with nothing to configure per machine. Each runner starts with
+  variables such as `npm_config_cache`, the pnpm store (`npm_config_store_dir`,
+  `PNPM_CONFIG_STORE_DIR`), `YARN_GLOBAL_FOLDER`, `BUN_INSTALL_CACHE_DIR`, `NUGET_PACKAGES`,
+  `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `GOMODCACHE`/`GOCACHE`, `ELECTRON_BUILDER_CACHE`,
+  `PLAYWRIGHT_BROWSERS_PATH` and, on macOS and Linux, `XDG_CACHE_HOME`, pointing under
+  `<runner root>/_cache`. `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY` keep the toolchains
+  `setup-node`, `setup-go` and `setup-java` download, and `DOTNET_INSTALL_DIR` the SDKs
+  `setup-dotnet` installs. pnpm finds its store and `actions/cache` paths stop changing every
+  job. `CARGO_HOME`, `GRADLE_USER_HOME`, Maven, Poetry, pub and Bundler are opt-in, because those
+  directories hold more than a cache. `host cache show` lists every variable.
+- Each repository has its own cache namespace, so one repository's jobs cannot plant packages
+  another's install. Organization policies have none until `org cache set-enabled ORG --enabled
+  true`, and two repositories share one only when both are given the same name with
+  `repo cache set-namespace OWNER/REPO --shared NAME`. Caches that are not safe for concurrent
+  writers (the Actions tool cache, `setup-dotnet`, Cypress, Poetry, Maven) are kept per
+  concurrent runner.
+- The service keeps the caches under a cap, 20 GiB by default, by removing the least recently
+  used namespaces that no runner is using, every 30 minutes. `host cache prune` does it now,
+  `host cache set-max-size N` changes the cap, and `status`, `status --json` (a new `caches`
+  block) and `host show` report the size.
+- `host cache`, `repo cache` and `org cache` turn caches or single tools on and off and move the
+  root (`host cache set-root --path PATH`, checked like a runner root, so network shares and WSL
+  `/mnt/c` paths are refused). A cache root outside the runner roots gets the same `host doctor`
+  checks, and `host prepare` excludes it from Defender with them.
+
+### Operator notes
+
+- A variable set in `runner.env` still wins over a cache variable of the same name, so hosts
+  that set cache locations by hand keep them; remove those lines to use the new layout.
+- A `caches.toml` that does not parse stops native launches, before anything is registered with
+  GitHub, like a broken `runner.env`: it may hold a decision to turn a repository's caches off.
+  Any other cache problem starts the runner without caches and is logged.
+- Isolated runners get no caches; their providers mount no host directory.
+- npm 12 prints `Unknown env config "store-dir"`, caused by the pnpm 9/10 variable. Turn `pnpm`
+  off for a repository that does not use it to silence it.
+- `setup-python` on macOS ignores the tool cache and installs under
+  `/Users/runner/hostedtoolcache`.
+
 ## 0.4.33
 
 ### Features

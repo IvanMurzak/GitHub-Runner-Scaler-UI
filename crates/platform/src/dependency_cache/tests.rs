@@ -141,7 +141,10 @@ fn opt_in_tools_are_off_until_enabled_and_never_include_whole_homes_by_default()
             "LOCALAPPDATA",
             "APPDATA",
         ] {
-            assert!(!names.contains(&home), "{home} is on by default on {platform:?}");
+            assert!(
+                !names.contains(&home),
+                "{home} is on by default on {platform:?}"
+            );
         }
     }
     let mut cargo = CacheConfig::default();
@@ -175,8 +178,14 @@ fn values_point_into_the_namespace_or_the_slot_with_the_platforms_separator() {
     assert_eq!(value("npm_config_cache"), namespace.join("npm"));
     assert_eq!(value("npm_config_store_dir"), namespace.join("pnpm-store"));
     assert_eq!(value("PNPM_CONFIG_STORE_DIR"), namespace.join("pnpm-store"));
-    assert_eq!(value("NUGET_PACKAGES"), namespace.join("nuget").join("packages"));
-    assert_eq!(value("NUGET_SCRATCH"), namespace.join("nuget").join("scratch"));
+    assert_eq!(
+        value("NUGET_PACKAGES"),
+        namespace.join("nuget").join("packages")
+    );
+    assert_eq!(
+        value("NUGET_SCRATCH"),
+        namespace.join("nuget").join("scratch")
+    );
     assert_eq!(value("GOMODCACHE"), namespace.join("go").join("mod"));
     assert_eq!(value("RUNNER_TOOL_CACHE"), slot.join("tool-cache"));
     assert_eq!(value("AGENT_TOOLSDIRECTORY"), slot.join("tool-cache"));
@@ -212,7 +221,10 @@ fn a_repository_gets_its_own_namespace_and_an_organization_must_opt_in() {
     assert_eq!(own.namespace.label(), "ivanmurzak/app");
 
     let other = select(&config, &repo("IvanMurzak/Other"), LINUX);
-    assert_ne!(own.namespace, other.namespace, "two repositories never share by default");
+    assert_ne!(
+        own.namespace, other.namespace,
+        "two repositories never share by default"
+    );
 
     let organization = select(&config, &org("Acme"), LINUX);
     assert_eq!(organization.disabled, Some(ORGANIZATION_OPT_IN));
@@ -231,7 +243,10 @@ fn sharing_is_explicit_and_names_the_same_directory_for_both_policies() {
     let one = select(&config, &repo("a/one"), MACOS);
     let two = select(&config, &repo("A/Two"), MACOS);
     assert_eq!(one.namespace, Namespace::Shared("js".into()));
-    assert_eq!(one.namespace.dir(Path::new("/c")), two.namespace.dir(Path::new("/c")));
+    assert_eq!(
+        one.namespace.dir(Path::new("/c")),
+        two.namespace.dir(Path::new("/c"))
+    );
     assert_eq!(
         select(&config, &repo("a/three"), MACOS).namespace.label(),
         "a/three"
@@ -243,7 +258,10 @@ fn host_switch_target_switch_and_tool_overrides_compose_in_order() {
     let mut config = CacheConfig::default();
     config.tools.insert("npm".into(), false);
     config.tools.insert("cargo".into(), true);
-    config.target_mut(&repo("o/r")).tools.insert("npm".into(), true);
+    config
+        .target_mut(&repo("o/r"))
+        .tools
+        .insert("npm".into(), true);
     let state = |config: &CacheConfig, slug: &str, id: &str| {
         select(config, &repo(slug), LINUX)
             .tools
@@ -255,7 +273,10 @@ fn host_switch_target_switch_and_tool_overrides_compose_in_order() {
     assert_eq!(state(&config, "o/r", "npm"), (true, ToolSource::Target));
     assert_eq!(state(&config, "o/other", "npm"), (false, ToolSource::Host));
     assert_eq!(state(&config, "o/other", "cargo"), (true, ToolSource::Host));
-    assert_eq!(state(&config, "o/other", "pip"), (true, ToolSource::Default));
+    assert_eq!(
+        state(&config, "o/other", "pip"),
+        (true, ToolSource::Default)
+    );
 
     config.target_mut(&repo("o/r")).enabled = Some(false);
     assert_eq!(
@@ -314,20 +335,31 @@ fn a_bad_file_is_refused_with_what_is_wrong() {
     let path = Path::new("caches.toml");
     for (text, expected) in [
         ("unknown = 1\n", "unknown field"),
-        ("[tools]\nnot-a-tool = true\n", "`not-a-tool` is not a cache"),
+        (
+            "[tools]\nnot-a-tool = true\n",
+            "`not-a-tool` is not a cache",
+        ),
         (
             "[targets.\"o/r\"]\nnamespace = \"Has Space\"\n",
             "not a valid shared namespace",
         ),
-        ("[targets.\"not a target\"]\nenabled = true\n", "is not a repository"),
+        (
+            "[targets.\"not a target\"]\nenabled = true\n",
+            "is not a repository",
+        ),
         ("root = \"relative/dir\"\n", "absolute path without spaces"),
-        ("root = \"/has space/cache\"\n", "absolute path without spaces"),
+        (
+            "root = \"/has space/cache\"\n",
+            "absolute path without spaces",
+        ),
     ] {
         let error = CacheConfig::parse(text, path).unwrap_err().to_string();
         assert!(error.contains(expected), "{text:?}: {error}");
     }
     assert_eq!(
-        CacheConfig::parse("max_size_gib = 0\n", path).unwrap().max_bytes(),
+        CacheConfig::parse("max_size_gib = 0\n", path)
+            .unwrap()
+            .max_bytes(),
         None
     );
     assert_eq!(
@@ -381,7 +413,11 @@ fn runtime_with_runner(parent: &Path, name: &str) -> PathBuf {
 fn a_launch_leases_the_lowest_free_slot_and_creates_its_directories() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("_cache");
-    let selection = select(&CacheConfig::default(), &repo("o/r"), RunnerPlatform::current());
+    let selection = select(
+        &CacheConfig::default(),
+        &repo("o/r"),
+        RunnerPlatform::current(),
+    );
     let first = runtime_with_runner(directory.path(), "a1");
     let second = runtime_with_runner(directory.path(), "a2");
 
@@ -404,7 +440,13 @@ fn a_launch_leases_the_lowest_free_slot_and_creates_its_directories() {
     assert_eq!((one.slot, two.slot), (1, 2), "a live lease is not shared");
     assert_eq!(one.namespace_dir, two.namespace_dir);
     assert!(one.namespace_dir.join("npm").is_dir());
-    assert!(one.namespace_dir.join(SLOTS_DIR).join("1").join("tool-cache").is_dir());
+    assert!(
+        one.namespace_dir
+            .join(SLOTS_DIR)
+            .join("1")
+            .join("tool-cache")
+            .is_dir()
+    );
     assert!(one.namespace_dir.join(LAST_USED_FILE).is_file());
 
     // The first attempt is cleaned: its package goes, and its slot is free.
@@ -444,7 +486,10 @@ fn the_plan_removes_least_recently_used_idle_namespaces_until_the_total_fits() {
     assert_eq!(plan_prune(&namespaces, Some(110)), ["o/old"]);
     assert_eq!(plan_prune(&namespaces, Some(95)), ["o/old", "o/middle"]);
     // Even when nothing else fits, an in-use namespace is never planned.
-    assert_eq!(plan_prune(&namespaces, Some(0)), ["o/old", "o/middle", "o/new"]);
+    assert_eq!(
+        plan_prune(&namespaces, Some(0)),
+        ["o/old", "o/middle", "o/new"]
+    );
     assert!(plan_prune(&namespaces, None).is_empty());
 }
 
@@ -487,7 +532,10 @@ fn pruning_never_deletes_a_namespace_a_live_runner_holds() {
     lease(&busy, 1, &live);
 
     let report = prune(&root, Some(0), &runtime_holds_runner).unwrap();
-    assert!(busy.join("npm").join("blob").is_file(), "an in-use namespace was pruned");
+    assert!(
+        busy.join("npm").join("blob").is_file(),
+        "an in-use namespace was pruned"
+    );
     assert!(!idle.exists(), "the idle namespace should have gone");
     assert_eq!(report.pruned, ["o/idle"]);
     assert_eq!(CacheUsage::read(&root).unwrap().pruned, ["o/idle"]);
@@ -530,7 +578,12 @@ fn a_read_only_go_module_cache_is_still_pruned() {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("_cache");
-    let module = root.join("o").join("go-user").join("go").join("mod").join("x@v1");
+    let module = root
+        .join("o")
+        .join("go-user")
+        .join("go")
+        .join("mod")
+        .join("x@v1");
     fill(&module, 128);
     fs::set_permissions(&module, fs::Permissions::from_mode(0o555)).unwrap();
     let report = prune(&root, Some(0), &runtime_holds_runner).unwrap();
@@ -547,7 +600,10 @@ fn measurement_ignores_the_roots_own_entries() {
     fs::write(root.join(USAGE_FILE), b"{}").unwrap();
     let measured = measure(root, &runtime_holds_runner);
     assert_eq!(
-        measured.iter().map(|ns| ns.name.as_str()).collect::<Vec<_>>(),
+        measured
+            .iter()
+            .map(|ns| ns.name.as_str())
+            .collect::<Vec<_>>(),
         ["o/r"]
     );
     assert_eq!(measured[0].bytes, 10);

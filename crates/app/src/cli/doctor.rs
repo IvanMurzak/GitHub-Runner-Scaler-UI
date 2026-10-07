@@ -226,8 +226,9 @@ pub struct HostSetup {
     pub os: HostOs,
     pub perspective: Perspective,
     pub service: Option<ServiceSetup>,
-    /// Where jobs run: the effective host runner root and every persistent
-    /// repository root.
+    /// Where jobs run: the effective host runner root, every persistent
+    /// repository root, and the dependency-cache root when no runner root
+    /// contains it.
     pub runner_roots: Vec<PathBuf>,
     pub capacity: u16,
     pub required_tools: Vec<String>,
@@ -1732,6 +1733,17 @@ fn setup_from_parts(
                 runner_roots.push(root);
             }
         }
+    }
+    // Jobs read and write the dependency-cache root as much as their own
+    // workspace, so it gets the same Defender, Spotlight and responsiveness
+    // checks, and `host prepare` excludes it with the runner roots. Only when it
+    // exists and no runner root already contains it, which the default
+    // (`<runner root>/_cache`) always is.
+    if let Some(cache_root) = super::cache::active_root(context, host)
+        && cache_root.is_dir()
+        && !runner_roots.iter().any(|root| cache_root.starts_with(root))
+    {
+        runner_roots.push(cache_root);
     }
     let mode = service.as_ref().map(|service| service.start_mode);
     let (required_tools, required_tools_error) = match required_tools(context) {

@@ -657,10 +657,12 @@ impl CacheConfig {
             "# Dependency caches for native runners. Edited by `runner-manager host cache`,\n\
              # `repo cache` and `org cache`; see `host cache show`.\n",
         );
-        text.push_str(&toml::to_string(&config).map_err(|error| CacheError::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?);
+        text.push_str(
+            &toml::to_string(&config).map_err(|error| CacheError::Parse {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?,
+        );
         write_atomically(path, text.as_bytes())
     }
 
@@ -747,7 +749,11 @@ pub fn validate_namespace_name(name: &str) -> Result<(), CacheError> {
 /// `CON`, `NUL`, `COM1` and the rest, which Windows will not create as a
 /// directory whatever follows a dot.
 fn is_windows_device_name(segment: &str) -> bool {
-    let stem = segment.split('.').next().unwrap_or(segment).to_ascii_uppercase();
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
@@ -1139,10 +1145,12 @@ pub fn prepare_launch(
 fn free_slot(slots: &Path, runtime: &Path, holds_runner: &dyn Fn(&Path) -> bool) -> u32 {
     let own = runtime.to_string_lossy();
     (1..)
-        .find(|slot| match fs::read_to_string(slots.join(format!("{slot}.{LEASE_EXTENSION}"))) {
-            Err(_) => true,
-            Ok(holder) => holder == own || !holds_runner(Path::new(&holder)),
-        })
+        .find(
+            |slot| match fs::read_to_string(slots.join(format!("{slot}.{LEASE_EXTENSION}"))) {
+                Err(_) => true,
+                Ok(holder) => holder == own || !holds_runner(Path::new(&holder)),
+            },
+        )
         .expect("an unbounded range has a free slot")
 }
 

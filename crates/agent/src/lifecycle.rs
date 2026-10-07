@@ -8461,8 +8461,14 @@ mod tests {
             RunnerEnv::parse("ELECTRON_CACHE=/cache/electron\nHOME=/operator/chose/this\n")
                 .unwrap();
         let caches = vec![
-            ("ELECTRON_CACHE", std::ffi::OsString::from("/rman/_cache/o/r/electron")),
-            ("npm_config_cache", std::ffi::OsString::from("/rman/_cache/o/r/npm")),
+            (
+                "ELECTRON_CACHE",
+                std::ffi::OsString::from("/rman/_cache/o/r/electron"),
+            ),
+            (
+                "npm_config_cache",
+                std::ffi::OsString::from("/rman/_cache/o/r/npm"),
+            ),
         ];
         let spec = runner_listener_spec(
             PathBuf::from("Runner.Listener"),
@@ -8583,11 +8589,20 @@ mod tests {
             .map(|(_, value)| PathBuf::from(value));
         assert_eq!(
             npm,
-            Some(runner_root.join("_cache").join("octo").join("repo").join("npm"))
+            Some(
+                runner_root
+                    .join("_cache")
+                    .join("octo")
+                    .join("repo")
+                    .join("npm")
+            )
         );
 
         fs::write(&config, "[tools]\nnot-a-tool = true\n").unwrap();
-        let refused = processes.prepare(&attempt, &policy).unwrap_err().to_string();
+        let refused = processes
+            .prepare(&attempt, &policy)
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("caches.toml"), "{refused}");
     }
 

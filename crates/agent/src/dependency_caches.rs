@@ -52,7 +52,11 @@ impl DependencyCaches {
     /// `config_file` is `caches.toml`; `fallback` is
     /// [`dependency_cache::platform_fallback_root`].
     #[must_use]
-    pub fn new(config_file: PathBuf, runner_root: RunnerRootSource, fallback: Option<PathBuf>) -> Self {
+    pub fn new(
+        config_file: PathBuf,
+        runner_root: RunnerRootSource,
+        fallback: Option<PathBuf>,
+    ) -> Self {
         Self {
             config_file,
             runner_root,
@@ -83,7 +87,11 @@ impl DependencyCaches {
     /// # Errors
     /// Why no root resolves.
     pub fn root(&self, config: &CacheConfig) -> Result<ResolvedRoot, String> {
-        dependency_cache::resolve_root(config, (self.runner_root)().as_deref(), self.fallback.clone())
+        dependency_cache::resolve_root(
+            config,
+            (self.runner_root)().as_deref(),
+            self.fallback.clone(),
+        )
     }
 
     /// The variables a native runner of `target` whose attempt is at `runtime`
@@ -202,7 +210,14 @@ mod tests {
             .find(|(name, _)| *name == "npm_config_cache")
             .map(|(_, value)| PathBuf::from(value))
             .unwrap();
-        assert_eq!(npm, runner_root.join("_cache").join("octo").join("repo").join("npm"));
+        assert_eq!(
+            npm,
+            runner_root
+                .join("_cache")
+                .join("octo")
+                .join("repo")
+                .join("npm")
+        );
         assert!(npm.is_dir());
     }
 
@@ -229,6 +244,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let caches = caches(dir.path(), Some(PathBuf::from("/has space/rman")));
         let repo = ScaleTarget::repository("o/r").unwrap();
-        assert!(caches.for_launch(&repo, &dir.path().join("a")).unwrap().is_empty());
+        assert!(
+            caches
+                .for_launch(&repo, &dir.path().join("a"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

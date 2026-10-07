@@ -129,6 +129,9 @@ pub struct StatusDocument {
     /// daemon's recorded refusal to start runners, if it has one. Read-only
     /// probes of this machine; still nothing is contacted.
     pub doctor: DoctorSummary,
+    /// The persistent dependency caches native runners get: the root, the cap
+    /// and the daemon's last measurement.
+    pub caches: super::cache::CacheSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +533,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             max_repository_targets: max_repository_targets(interval),
             best_case_multiple_when_paging: FALLBACK_COST_MULTIPLE,
         },
+        caches: super::cache::snapshot(context, host.as_ref()),
         policies: policies
             .iter()
             .zip(workspaces.iter())
@@ -662,6 +666,11 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
             unfit.checks.join(", ")
         )?;
     }
+    writeln!(
+        out,
+        "  dependency caches         {}",
+        document.caches.line()
+    )?;
     writeln!(out)?;
 
     writeln!(out, "Policies ({})", document.policies.len())?;
@@ -818,6 +827,16 @@ mod tests {
                     checks: vec!["windows.symlink_privilege".to_string()],
                 }),
             },
+            caches: super::super::cache::CacheSnapshot {
+                enabled: true,
+                root: Some("/rman/_cache".to_string()),
+                root_source: Some("runner-root"),
+                problem: None,
+                max_bytes: Some(21_474_836_480),
+                used_bytes: Some(1_073_741_824),
+                namespaces: Some(2),
+                measured_at: Some(chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap()),
+            },
         }
     }
 
@@ -852,6 +871,7 @@ mod tests {
             keys(&emitted, ""),
             [
                 "budget",
+                "caches",
                 "credential",
                 "doctor",
                 "generated_at",
@@ -882,6 +902,19 @@ mod tests {
         assert_eq!(
             keys(&emitted, "/doctor/daemon_host_unfit"),
             ["checks", "since"]
+        );
+        assert_eq!(
+            keys(&emitted, "/caches"),
+            [
+                "enabled",
+                "max_bytes",
+                "measured_at",
+                "namespaces",
+                "problem",
+                "root",
+                "root_source",
+                "used_bytes"
+            ]
         );
         assert_eq!(
             keys(&emitted, "/product"),

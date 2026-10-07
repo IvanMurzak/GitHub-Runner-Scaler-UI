@@ -268,6 +268,10 @@ async fn run_generation(
     // cleanup and recovery of what already runs carry on.
     let host_unfit = Arc::new(AtomicBool::new(false));
     observe_host_fitness(context, &host_unfit, true).await;
+    // One handle for every target: the settings file and the cache root are
+    // the host's, and the namespace comes from each launch's policy.
+    let dependency_caches =
+        super::cache::daemon_caches(context, Arc::clone(&store) as Arc<dyn Store>, host.id);
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -302,9 +306,11 @@ async fn run_generation(
                 github: Arc::clone(&lifecycle_github) as Arc<dyn LifecycleGithub>,
                 packages: Arc::new(CachedRuntimePackages::new(cache)),
                 processes: Arc::new(
-                    PlatformExecutionProvider::new(host.id).with_runner_env_file(
-                        runner_manager_platform::runner_env::path_in(context.paths().config_dir()),
-                    ),
+                    PlatformExecutionProvider::new(host.id)
+                        .with_runner_env_file(runner_manager_platform::runner_env::path_in(
+                            context.paths().config_dir(),
+                        ))
+                        .with_dependency_caches(dependency_caches.clone()),
                 ),
                 clock: Arc::clone(&clock),
                 demand: Arc::new(PersistentDemand),
@@ -430,6 +436,9 @@ async fn run_generation(
         }
         () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
             unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
+        }
+        () = maintain_dependency_caches(dependency_caches.clone()) => {
+            unreachable!("dependency cache pruning runs until the daemon is stopped")
         }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
@@ -562,6 +571,20 @@ const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Publish only local, non-secret evidence. Windows owns the destructive
 /// decision; the guest owns the authoritative attempt journal and the audit
 /// for persistent runner services Windows cannot safely infer.
+/// Measures the dependency caches and prunes them to the cap, at start and
+/// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL).
+/// The walk runs on a blocking thread: a pnpm store holds hundreds of
+/// thousands of files.
+async fn maintain_dependency_caches(
+    caches: runner_manager_agent::dependency_caches::DependencyCaches,
+) {
+    loop {
+        let pass = caches.clone();
+        let _ = tokio::task::spawn_blocking(move || pass.prune_once()).await;
+        tokio::time::sleep(runner_manager_platform::dependency_cache::PRUNE_INTERVAL).await;
+    }
+}
+
 async fn maintain_wsl_guest_heartbeat(
     paths: runner_manager_platform::paths::AppPaths,
     store: Arc<dyn Store>,

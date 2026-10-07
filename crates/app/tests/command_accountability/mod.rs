@@ -81,6 +81,7 @@ pub enum Boundary {
     ProfileStateSpace,
     RunnerEnvironmentFile,
     HostConfiguration,
+    DependencyCacheFile,
 }
 
 impl Boundary {
@@ -116,6 +117,9 @@ impl Boundary {
             Self::HostConfiguration => {
                 "reads or changes machine-wide operating-system settings (registry, Defender, \
                  git's system configuration, Spotlight) outside every scenario's temporary roots"
+            }
+            Self::DependencyCacheFile => {
+                "reads or rewrites the host's caches.toml, or measures the cache root, outside the chain oracle's modelled state; its only effect is on a native runner's environment at launch and on which idle cache directories exist"
             }
         }
     }
@@ -166,6 +170,7 @@ const WSL_ACCEPTANCE: &str = "crates/app/src/cli/wsl_acceptance.rs";
 const PROFILE_COMMANDS: &str = "crates/app/tests/profile_commands.rs";
 const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
 const HOST_DOCTOR_COMMANDS: &str = "crates/app/tests/host_doctor_commands.rs";
+const DEPENDENCY_CACHE_COMMANDS: &str = "crates/app/tests/dependency_cache_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -246,6 +251,20 @@ macro_rules! runner_env_row {
             exclusion: Some(Exclusion {
                 boundary: Boundary::RunnerEnvironmentFile,
                 reason: "runner.env changes nothing the generated oracle observes: no policy, attempt, root or credential, only what a launched native runner inherits. Dedicated real-process tests drive set, unset and show against the file under --data-dir and pin the refusals.",
+            }),
+        }
+    };
+}
+
+macro_rules! cache_row {
+    ($leaf:literal, $test:literal) => {
+        Classification {
+            leaf: $leaf,
+            coverage: Coverage::Dedicated,
+            evidence: &[at(DEPENDENCY_CACHE_COMMANDS, $test)],
+            exclusion: Some(Exclusion {
+                boundary: Boundary::DependencyCacheFile,
+                reason: "caches.toml changes nothing the generated oracle observes: no policy, attempt, root or credential, only the variables a launched native runner gets. Dedicated real-process tests drive every leaf against the file under --data-dir and pin the refusals; selection, leasing and pruning are unit-tested in the platform crate.",
             }),
         }
     };
@@ -340,6 +359,34 @@ pub const MANIFEST: &[Classification] = &[
          daemon's preflight require; a real-process test drives set, show and clear and pins \
          the refusal of a path-like name."
     ),
+    cache_row!(
+        "host cache show",
+        "host_cache_settings_round_trip_through_caches_toml"
+    ),
+    cache_row!(
+        "host cache set-enabled",
+        "host_cache_settings_round_trip_through_caches_toml"
+    ),
+    cache_row!(
+        "host cache set-root",
+        "host_cache_refuses_what_the_daemon_would_refuse_and_writes_nothing"
+    ),
+    cache_row!(
+        "host cache reset-root",
+        "host_cache_settings_round_trip_through_caches_toml"
+    ),
+    cache_row!(
+        "host cache set-max-size",
+        "host_cache_settings_round_trip_through_caches_toml"
+    ),
+    cache_row!(
+        "host cache set-tool",
+        "host_cache_settings_round_trip_through_caches_toml"
+    ),
+    cache_row!(
+        "host cache prune",
+        "host_cache_prune_measures_and_keeps_what_fits"
+    ),
     // -- repo ----------------------------------------------------------------
     generated("repo add"),
     generated("repo list"),
@@ -389,6 +436,22 @@ pub const MANIFEST: &[Classification] = &[
         "repo profile remove",
         "profile_commands_mutate_and_remove_only_the_selected_sibling"
     ),
+    cache_row!(
+        "repo cache show",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "repo cache set-enabled",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "repo cache set-namespace",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "repo cache set-tool",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
     // -- org -----------------------------------------------------------------
     generated("org add"),
     generated("org list"),
@@ -397,6 +460,22 @@ pub const MANIFEST: &[Classification] = &[
     generated("org add-label"),
     generated("org remove-label"),
     generated("org remove"),
+    cache_row!(
+        "org cache show",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "org cache set-enabled",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "org cache set-namespace",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
+    cache_row!(
+        "org cache set-tool",
+        "repo_and_org_cache_settings_scope_one_target"
+    ),
     // -- daemon --------------------------------------------------------------
     Classification {
         leaf: "daemon run",

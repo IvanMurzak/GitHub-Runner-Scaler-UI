@@ -303,6 +303,13 @@ runner-manager host doctor [--json]                            # Check this mach
 runner-manager host prepare [--yes] [--only CHECK]             # Fix what the doctor found, elevating only if needed
 runner-manager host prepare --revert CHECK                     # Undo what prepare changed for one check
 runner-manager host required-tools [--set git,node]            # Tools every runner must find on its PATH
+runner-manager host cache show                                 # Show the dependency caches runners get, and their size
+runner-manager host cache set-enabled --enabled BOOL           # Turn dependency caches on or off for every policy
+runner-manager host cache set-root --path PATH                 # Keep the caches under PATH instead of <runner root>/_cache
+runner-manager host cache reset-root                           # Keep the caches under <runner root>/_cache again
+runner-manager host cache set-max-size N                       # Cap the caches' total size in GiB (0 removes the cap)
+runner-manager host cache set-tool TOOL --state on|off|default # Turn one cache on or off for every policy
+runner-manager host cache prune                                # Remove least recently used idle caches over the cap now
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
@@ -330,6 +337,11 @@ runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode nat
 runner-manager repo profile set-execution OWNER/REPO [--profile NAME] --mode isolated \
   --backend auto --image PINNED-REFERENCE [--cpu N --memory N --disk N]
 runner-manager repo profile remove OWNER/REPO [--profile NAME] [--purge]
+runner-manager repo cache show OWNER/REPO                      # Show the caches this repository's runners get
+runner-manager repo cache set-enabled OWNER/REPO --enabled BOOL
+runner-manager repo cache set-namespace OWNER/REPO --shared NAME  # Share one cache between policies you trust equally
+runner-manager repo cache set-namespace OWNER/REPO --own
+runner-manager repo cache set-tool OWNER/REPO TOOL --state on|off|default
 
 runner-manager org add ORG --host-label HOST                   # Add an organization in monitor-only mode
 runner-manager org add ORG --host-label HOST \
@@ -340,6 +352,11 @@ runner-manager org set-scale ORG --enabled BOOL                # Enable scaling 
 runner-manager org add-label ORG --label LABEL                 # Add a runs-on label
 runner-manager org remove-label ORG --label LABEL              # Remove a runs-on label
 runner-manager org remove ORG [--purge]                        # Remove a policy and optional retained data
+runner-manager org cache show ORG                              # Show the caches this organization's runners get
+runner-manager org cache set-enabled ORG --enabled BOOL        # Organizations have no cache until you turn it on
+runner-manager org cache set-namespace ORG --shared NAME
+runner-manager org cache set-namespace ORG --own
+runner-manager org cache set-tool ORG TOOL --state on|off|default
 
 runner-manager status [--json]                                 # Print a host snapshot
 runner-manager daemon run                                      # Run the agent in the foreground
@@ -662,13 +679,115 @@ Each platform also adds a few variables unless `runner.env` sets the same name:
   priority.
 - **Windows:** `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point at a profile inside
   each runner's own attempt directory, so concurrent jobs no longer share the service account's
-  caches. That profile goes with the attempt, so tool caches under it (npm, pnpm, NuGet, bun)
-  start empty for every job; point them at a shared directory with `runner.env`, for example
-  `npm_config_cache` or `NUGET_PACKAGES`, if you want them kept. .NET known-folder APIs ignore
-  these variables and still report the service account's profile.
+  caches. That profile goes with the attempt; the dependency caches below are kept outside it.
+  .NET known-folder APIs ignore these variables and still report the service account's profile.
 
 `TMPDIR`, `TEMP` and `TMP` are always the attempt's own and cannot be changed. Isolated runners
 do not get any of this; their environment is the image's.
+
+### Keep dependency caches between jobs
+
+Every job starts in a fresh workspace, and on Windows with a fresh profile, so without help
+pnpm, npm, NuGet and `setup-node` would download everything again in every job, and
+`actions/cache` would never hit, because the cached paths change every attempt. `runner-manager`
+points the common caches at directories that outlive the attempt, for every native runner,
+with nothing to configure per machine:
+
+```sh
+runner-manager host cache show          # the root, its size, and every variable runners get
+runner-manager repo cache show OWNER/REPO
+```
+
+**Where.** Under `<runner root>/_cache` (for example `C:\rman\_cache`), so one Defender exclusion
+and one Spotlight setting cover both, and paths stay short. A runner root with a space in it,
+such as the macOS default under `Application Support`, uses `~/Library/Caches/runner-manager`
+instead, because unquoted paths in tool installers break on spaces. `host cache set-root --path
+PATH` moves it; the path is checked like a runner root (local, writable, outside application
+data, not inside a runner root), so a network share or a WSL `/mnt/c` path is refused.
+`host doctor` checks a cache root outside the runner roots like one of them, and `host prepare`
+excludes it from Defender with them.
+
+**Who shares a cache.** Each repository gets its own namespace, `<root>/<owner>/<repo>`, shared
+by all of its profiles and concurrent runners. A cache is an input to the next job: a job that
+can write the npm cache can plant a package the next job installs, so no repository can read or
+write another's. Organization policies accept jobs from every repository in the organization,
+so they get no cache until you turn it on with `org cache set-enabled ORG --enabled true`. To
+share one cache between repositories you trust equally, give them the same name with
+`repo cache set-namespace OWNER/REPO --shared NAME`. This keeps repositories apart; it does not
+protect a repository from a hostile workflow of its own, which is the model GitHub documents for
+self-hosted runners.
+
+**What runners get.** Caches built for concurrent use are shared by every runner of the
+namespace. The others are per runner: each runner leases a numbered slot, `_slots/<n>`, and keeps
+it until its attempt is cleaned up.
+
+| Cache | Variables | Platforms | Shared | Default | Verified against |
+|---|---|---|---|---|---|
+| `xdg` | `XDG_CACHE_HOME` | macOS, Linux | yes | on | XDG base directory specification |
+| `tool-cache` | `RUNNER_TOOL_CACHE`, `AGENT_TOOLSDIRECTORY` | all | per runner | on | actions/runner `HostContext.cs`; @actions/tool-cache `_getCacheDirectory` |
+| `dotnet` | `DOTNET_INSTALL_DIR` | all | per runner | on | actions/setup-dotnet `installer.ts` |
+| `npm` | `npm_config_cache` | all | yes | on | npm config docs; `@npmcli/config` `loadEnv` |
+| `pnpm` | `npm_config_store_dir` (pnpm 9, 10), `PNPM_CONFIG_STORE_DIR` (pnpm 11+) | all | yes | on | `@pnpm/npm-conf`; pnpm 11 release notes |
+| `yarn` | `YARN_GLOBAL_FOLDER` | all | yes | on | Yarn configuration docs; berry `Configuration.ts` |
+| `bun` | `BUN_INSTALL_CACHE_DIR` | all | yes | on | Bun global cache docs |
+| `deno` | `DENO_DIR` | all | yes | on | Deno `deno_dir.rs` |
+| `node-gyp` | `npm_config_devdir`, `npm_package_config_node_gyp_devdir` | all | yes | on | node-gyp `lib/node-gyp.js` |
+| `electron` | `electron_config_cache`; `ELECTRON_CACHE` on macOS and Linux | all | yes | on | electron `npm/install.js`; app-builder |
+| `electron-builder` | `ELECTRON_BUILDER_CACHE` | all | yes | on | electron-builder environment variables docs |
+| `playwright` | `PLAYWRIGHT_BROWSERS_PATH`, `PLAYWRIGHT_SKIP_BROWSER_GC=1` | all | yes | on | Playwright browsers docs; `registry/index.ts` |
+| `cypress` | `CYPRESS_CACHE_FOLDER` | all | per runner | on | Cypress advanced installation docs |
+| `nuget` | `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`, `NUGET_PLUGINS_CACHE_PATH`, `NUGET_SCRATCH` | all | yes | on | NuGet "Managing the global packages and cache folders" |
+| `pip` | `PIP_CACHE_DIR` | all | yes | on | pip caching docs |
+| `uv` | `UV_CACHE_DIR` | all | yes | on | uv environment reference |
+| `go` | `GOMODCACHE`, `GOCACHE` | all | yes | on | Go modules reference; `go help environment` |
+| `composer` | `COMPOSER_CACHE_DIR` | all | yes | on | Composer CLI docs |
+| `cocoapods` | `CP_CACHE_DIR` | macOS, Linux | yes | on | CocoaPods `config.rb` |
+| `ccache` | `CCACHE_DIR` | all | yes | on | ccache manual |
+| `poetry` | `POETRY_CACHE_DIR` | all | per runner | off | Poetry configuration docs |
+| `cargo` | `CARGO_HOME` | all | yes | off | Cargo environment variables |
+| `gradle` | `GRADLE_USER_HOME` | all | yes | off | Gradle directory layout |
+| `maven` | `MAVEN_ARGS=-Dmaven.repo.local=...` | all | per runner | off | Maven configuration docs |
+| `pub` | `PUB_CACHE` | all | per runner | off | Dart pub environment variables |
+| `bundler` | `BUNDLE_USER_CACHE` | all | per runner | off | `bundle config` man page |
+
+Some choices are deliberate:
+
+- **Per runner, not shared**: `@actions/tool-cache` deletes a version's folder before filling it,
+  with no lock, so two jobs installing the same Node version at once would delete each other's;
+  `setup-dotnet` replaces the shared `dotnet` host; Cypress and Poetry take no cross-process lock;
+  Maven 3.9 locks only within one JVM.
+- **Off until you turn them on** (`host cache set-tool TOOL --state on`): `CARGO_HOME`,
+  `GRADLE_USER_HOME` and `PUB_CACHE` hold configuration, credentials, init scripts or installed
+  tools as well as caches, and Poetry keeps a virtualenv per workspace path in its cache.
+- **Never set**: `YARN_CACHE_FOLDER` would override a zero-install project's committed cache and
+  break `--immutable-cache`; `LOCALAPPDATA` and `APPDATA` stay per attempt on Windows, because
+  they also hold tools' configuration and credentials, so each cache above is named explicitly
+  instead.
+- **pnpm**: npm 12 prints `Unknown env config "store-dir"` because of `npm_config_store_dir`,
+  which pnpm 9 and 10 need. Turn `pnpm` off for a repository that does not use pnpm if the
+  warning bothers you.
+- **setup-python on macOS** ignores the tool cache and installs under
+  `/Users/runner/hostedtoolcache`. Create that directory once for the runner account if
+  workflows use it; on Linux and Windows `AGENT_TOOLSDIRECTORY` covers it.
+
+A variable you set in `runner.env` always wins: platform defaults, then these caches, then
+`runner.env`, then the attempt's own `TMPDIR`, `TEMP` and `TMP`. Turn one cache off for every
+repository with `host cache set-tool TOOL --state off`, or for one with `repo cache set-tool`,
+and every cache off with `host cache set-enabled --enabled false` or `repo cache set-enabled`.
+
+**Disk.** The service measures the cache root every 30 minutes and keeps it under a cap, 20 GiB
+by default (`host cache set-max-size N`, `0` for none), by removing whole namespaces, least
+recently used first. A namespace a runner is still using is never removed; if those alone exceed
+the cap, the service logs `dependency_cache_over_cap`. `host cache prune` does the same pass
+immediately. `status` shows the size and the cap.
+
+**Isolated runners** (OCI containers, Hyper-V containers) get no caches: those providers
+deliberately mount no host directory, and their environment is the image's. `host cache show`
+names each such policy.
+
+**WSL.** A managed WSL distribution is a Linux host of its own: `--host wsl:NAME host cache ...`
+runs in the distribution and edits its settings, and its caches live under its own runner root
+on the Linux filesystem, never on `/mnt/c`.
 
 ### Keep a build cache between jobs
 
