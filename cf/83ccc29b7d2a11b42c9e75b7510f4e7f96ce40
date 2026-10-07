@@ -1,0 +1,31 @@
+crates/app/src/cli/cache.rs
+  s_468234d3364cc1::t_6fcc3d8a0eedaa 257-268
+CHANGELOG.md
+  s_468234d3364cc1::t_f27210f6507d57 42-45
+README.md
+  s_468234d3364cc1::t_d5bcc77ca3af27 706-709,777-779
+crates/agent/src/dependency_caches.rs
+  s_468234d3364cc1::t_03535c9e594663 130-133
+crates/agent/src/reconcile.rs
+  s_468234d3364cc1::t_a789437b0cbf9c 5656
+crates/platform/src/dependency_cache.rs
+  s_468234d3364cc1::t_621370c530c4cb 77-79,1069-1088
+crates/platform/src/dependency_cache/tests.rs
+  s_468234d3364cc1::t_1470dfa3f95543 404-421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cf83ccc29b7d2a11b42c9e75b7510f4e7f96ce40",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

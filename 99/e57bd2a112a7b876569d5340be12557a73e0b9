@@ -1,0 +1,53 @@
+crates/app/src/cli/doctor.rs
+  s_468234d3364cc1::t_8f218ccf00bcac 1747
+  s_468234d3364cc1::t_02f01e21a1ad5e 229-231,1737-1746
+README.md
+  s_468234d3364cc1::t_71c9925bcdee08 682-683,688-790
+  s_468234d3364cc1::t_6f9cf69f545d1f 306-312,340-344,355-359,791
+CHANGELOG.md
+  s_468234d3364cc1::t_25b955192ec7ed 10-52
+crates/app/src/cli/cache.rs
+  s_468234d3364cc1::t_3e18560e2b9fab 1-806
+  s_468234d3364cc1::t_5b00699798bae2 807-834
+crates/app/tests/dependency_cache_commands.rs
+  s_468234d3364cc1::t_2a024e95ebec81 1-194,198
+  s_468234d3364cc1::t_a5cf30f345f8f3 195-197,199-340
+crates/agent/src/dependency_caches.rs
+  s_468234d3364cc1::t_c3e4c0ff659ebc 55-59,90-94,213-220,247-252
+crates/agent/src/lifecycle.rs
+  s_468234d3364cc1::t_a73c9748668180 8464-8471,8592-8598,8602-8605
+crates/app/src/cli/daemon.rs
+  s_468234d3364cc1::t_8d78693fb00c3e 271-274,309-313,440-442,574-587
+crates/app/src/cli/host.rs
+  s_468234d3364cc1::t_6bc4c53fa03258 445,989-994
+crates/app/src/cli/mod.rs
+  s_468234d3364cc1::t_812e31909185ae 44,832-993,1160-1162,1436-1438
+crates/app/src/cli/policy.rs
+  s_468234d3364cc1::t_92936f530c3186 96,150
+crates/app/src/cli/status.rs
+  s_468234d3364cc1::t_df4fa63d4f3c8d 132-134,536,669-673,830-839,874,906-918
+crates/app/tests/cli_command_surface.rs
+  s_468234d3364cc1::t_2dc1150cc08cf3 63,78,91,103-104,107-126
+crates/app/tests/command_accountability/mod.rs
+  s_468234d3364cc1::t_e1325ee8518c7a 84,121-123,173,259-272,362-389,439-454,463-478
+crates/platform/src/dependency_cache.rs
+  s_468234d3364cc1::t_9c019709e80523 660-665,752-756,1148-1153
+crates/platform/src/dependency_cache/tests.rs
+  s_468234d3364cc1::t_08dcba3e123271 144-147,181-188,224-227,246-249,261-264,276-279,338-341,346-349,351-354,360-362,416-420,443-449,489-492,535-538,581-586,603-606
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "99e57bd2a112a7b876569d5340be12557a73e0b9",
+  "prompts": {},
+  "sessions": {
+    "s_468234d3364cc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbf51f18-13c6-455f-8d79-896e526f740f",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
