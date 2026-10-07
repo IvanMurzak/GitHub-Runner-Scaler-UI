@@ -45,6 +45,7 @@ use runner_manager_platform::runner_root::{
 };
 use secrecy::SecretString;
 
+use crate::dependency_caches::DependencyCaches;
 use crate::oci::OciProcesses;
 use crate::package::{PackageCache, PackageError, RunnerVersion};
 use crate::reconcile::{
@@ -105,12 +106,18 @@ const TEST_LISTENER_READY: &str = ".test-listener-ready";
 /// supplies that input from the restrictive handoff; the listener command line
 /// must contain only the supported `run` command.
 ///
-/// The environment is the daemon's plus [`runner_env::platform_defaults`] and
-/// then the host's `runner.env`, which wins over a default of the same name.
+/// The environment is the daemon's plus [`runner_env::platform_defaults`], then
+/// the dependency caches (`caches`, from [`DependencyCaches::for_launch`]), then
+/// the host's `runner.env`, which wins over either of the others.
 /// The per-attempt temporary directory goes last and `runner.env` cannot name
 /// it. On macOS a runner that still starts throttled is reported
 /// ([`SpawnSpec::expect_normal_scheduling`]).
-fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) -> SpawnSpec {
+fn runner_listener_spec(
+    program: PathBuf,
+    runtime: &Path,
+    caches: Vec<(&'static str, std::ffi::OsString)>,
+    host_env: &RunnerEnv,
+) -> SpawnSpec {
     let tmp = runtime.join("tmp");
     let _ = std::fs::create_dir_all(&tmp);
     let defaults = runner_env::platform_defaults(
@@ -131,7 +138,7 @@ fn runner_listener_spec(program: PathBuf, runtime: &Path, host_env: &RunnerEnv) 
         .arg("run")
         .working_dir(runtime)
         .expect_normal_scheduling();
-    for (name, value) in runner_env::runner_environment(defaults, host_env) {
+    for (name, value) in runner_env::runner_environment(defaults, caches, host_env) {
         spec = spec.env(name, value);
     }
     spec.env("TMPDIR", &tmp).env("TEMP", &tmp).env("TMP", &tmp)
@@ -2083,6 +2090,12 @@ pub struct NativeProcesses {
     /// The host's `runner.env`, read at every launch so that `host env set`
     /// reaches the next runner without a daemon restart. `None` applies none.
     runner_env_file: Option<PathBuf>,
+    /// Persistent dependency caches. `None` gives runners none.
+    dependency_caches: Option<DependencyCaches>,
+    /// The target each prepared attempt belongs to, from `prepare` to `spawn`:
+    /// the cache namespace is the target's, and `spawn` is not given the
+    /// policy.
+    cache_targets: Mutex<BTreeMap<AttemptId, runner_manager_domain::model::ScaleTarget>>,
     #[cfg(test)]
     post_spawn_faults: Mutex<VecDeque<PostSpawnBoundary>>,
     #[cfg(test)]
@@ -2118,6 +2131,14 @@ impl PlatformExecutionProvider {
     #[must_use]
     pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
         self.native = self.native.with_runner_env_file(path);
+        self
+    }
+
+    /// Gives every native runner persistent dependency caches. Isolated
+    /// runners do not get them: their providers mount no host directory.
+    #[must_use]
+    pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
+        self.native = self.native.with_dependency_caches(caches);
         self
     }
 
@@ -2310,6 +2331,29 @@ impl NativeProcesses {
     pub fn with_runner_env_file(mut self, path: PathBuf) -> Self {
         self.runner_env_file = Some(path);
         self
+    }
+
+    /// Gives every runner launched persistent dependency caches.
+    #[must_use]
+    pub fn with_dependency_caches(mut self, caches: DependencyCaches) -> Self {
+        self.dependency_caches = Some(caches);
+        self
+    }
+
+    /// The cache variables for `attempt`, if `prepare` saw its policy.
+    fn cache_env(
+        &self,
+        attempt: &RunnerAttempt,
+    ) -> Result<Vec<(&'static str, std::ffi::OsString)>, FailureReason> {
+        let target = self
+            .cache_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt.id);
+        match (&self.dependency_caches, target) {
+            (Some(caches), Some(target)) => caches.for_launch(&target, attempt.runtime_path()),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// The host's `runner.env`, read now.
@@ -2538,6 +2582,15 @@ impl ProcessSupervisor for NativeProcesses {
             ));
         }
         self.host_env()?;
+        // Asked here, before the JIT registration, for the reason `host_env`
+        // is: a broken file must cost no registration.
+        if let Some(caches) = &self.dependency_caches {
+            caches.config()?;
+            self.cache_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(attempt.id, policy.target.clone());
+        }
         Ok(PreparedEnvironment {
             attempt: attempt.id,
             identity: None,
@@ -2569,6 +2622,9 @@ impl ProcessSupervisor for NativeProcesses {
             ));
         }
         let host_env = self.host_env().map_err(ProcessStartFailure::before_spawn)?;
+        let caches = self
+            .cache_env(attempt)
+            .map_err(ProcessStartFailure::before_spawn)?;
         #[cfg(test)]
         let spec = if self
             .use_long_lived_test_listener
@@ -2587,10 +2643,10 @@ impl ProcessSupervisor for NativeProcesses {
                 )
                 .working_dir(attempt.runtime_path())
         } else {
-            runner_listener_spec(program, attempt.runtime_path(), &host_env)
+            runner_listener_spec(program, attempt.runtime_path(), caches, &host_env)
         };
         #[cfg(not(test))]
-        let spec = runner_listener_spec(program, attempt.runtime_path(), &host_env);
+        let spec = runner_listener_spec(program, attempt.runtime_path(), caches, &host_env);
         let child = spec
             .spawn_runner_with_handoff(&handoff)
             .map_err(|_| ProcessStartFailure::before_spawn(FailureReason::ProcessStartFailed))?;
@@ -8376,6 +8432,7 @@ mod tests {
         let spec = runner_listener_spec(
             PathBuf::from("Runner.Listener"),
             runtime,
+            Vec::new(),
             &RunnerEnv::default(),
         );
         let arguments: Vec<_> = spec
@@ -8403,13 +8460,27 @@ mod tests {
         let host_env =
             RunnerEnv::parse("ELECTRON_CACHE=/cache/electron\nHOME=/operator/chose/this\n")
                 .unwrap();
-        let spec = runner_listener_spec(PathBuf::from("Runner.Listener"), &runtime, &host_env);
+        let caches = vec![
+            ("ELECTRON_CACHE", std::ffi::OsString::from("/rman/_cache/o/r/electron")),
+            ("npm_config_cache", std::ffi::OsString::from("/rman/_cache/o/r/npm")),
+        ];
+        let spec = runner_listener_spec(
+            PathBuf::from("Runner.Listener"),
+            &runtime,
+            caches,
+            &host_env,
+        );
         let env = |name: &str| spec.configured_env(name).map(PathBuf::from);
 
         assert!(spec.expects_normal_scheduling());
         assert_eq!(
             env("ELECTRON_CACHE"),
-            Some(PathBuf::from("/cache/electron"))
+            Some(PathBuf::from("/cache/electron")),
+            "runner.env must win over a dependency cache of the same name"
+        );
+        assert_eq!(
+            env("npm_config_cache"),
+            Some(PathBuf::from("/rman/_cache/o/r/npm"))
         );
         assert_eq!(
             env("HOME"),
@@ -8471,6 +8542,53 @@ mod tests {
         assert!(processes.prepare(&attempt, &policy).is_ok());
         assert_eq!(processes.host_env().unwrap().get("GOOD"), Some("1"));
         assert!(NativeProcesses::new().host_env().unwrap().is_empty());
+    }
+
+    /// The wiring from `prepare` (which sees the policy) to `spawn` (which
+    /// does not): the policy's repository decides the namespace, and a broken
+    /// `caches.toml` is refused before GitHub is asked for anything.
+    #[test]
+    fn prepare_hands_the_policys_cache_namespace_to_the_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let runner_root = root.path().join("rman");
+        let runtime = runner_root.join("a1");
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        let config = runner_manager_platform::dependency_cache::config_path_in(root.path());
+        let source_root = runner_root.clone();
+        let processes = NativeProcesses::new().with_dependency_caches(DependencyCaches::new(
+            config.clone(),
+            Arc::new(move || Some(source_root.clone())),
+            None,
+        ));
+        let policy = fixtures::policy()
+            .repository("Octo/Repo")
+            .autoscale("home", 1)
+            .active()
+            .build();
+        let attempt = RunnerAttempt::allocate(
+            AttemptId::new_random(),
+            policy.id,
+            &runtime,
+            FakeClock::default().now(),
+        );
+        assert!(
+            processes.cache_env(&attempt).unwrap().is_empty(),
+            "an attempt never prepared has no target, so no cache"
+        );
+        processes.prepare(&attempt, &policy).unwrap();
+        let variables = processes.cache_env(&attempt).unwrap();
+        let npm = variables
+            .iter()
+            .find(|(name, _)| *name == "npm_config_cache")
+            .map(|(_, value)| PathBuf::from(value));
+        assert_eq!(
+            npm,
+            Some(runner_root.join("_cache").join("octo").join("repo").join("npm"))
+        );
+
+        fs::write(&config, "[tools]\nnot-a-tool = true\n").unwrap();
+        let refused = processes.prepare(&attempt, &policy).unwrap_err().to_string();
+        assert!(refused.contains("caches.toml"), "{refused}");
     }
 
     #[cfg(windows)]

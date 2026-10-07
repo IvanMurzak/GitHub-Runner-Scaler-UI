@@ -509,15 +509,18 @@ fn split_colon_path(path: &OsStr) -> Vec<&OsStr> {
 
 /// The variables a native runner starts with on top of the daemon's
 /// environment, in the order they must be applied: the platform defaults, then
-/// `file`. Applied in order the last value for a name wins, as it does for
-/// `Command::env`, so `file` overrides a default of the same name.
+/// the dependency caches (`crate::dependency_cache`), then `file`. Applied in
+/// order the last value for a name wins, as it does for `Command::env`, so
+/// `file` overrides a cache or a default of the same name.
 #[must_use]
 pub fn runner_environment(
     defaults: Vec<(&'static str, OsString)>,
+    caches: Vec<(&'static str, OsString)>,
     file: &RunnerEnv,
 ) -> Vec<(OsString, OsString)> {
     defaults
         .into_iter()
+        .chain(caches)
         .map(|(name, value)| (OsString::from(name), value))
         .chain(
             file.entries()
@@ -732,7 +735,7 @@ mod tests {
             ("LANG", OsString::from(MACOS_DEFAULT_LANG)),
         ];
         assert_eq!(
-            runner_environment(defaults, &file),
+            runner_environment(defaults, Vec::new(), &file),
             [
                 (
                     OsString::from("PATH"),
@@ -746,5 +749,30 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Platform defaults < dependency caches < `runner.env`: a cache variable
+    /// replaces a default of the same name, and `runner.env` replaces both.
+    #[test]
+    fn caches_sit_between_the_platform_defaults_and_runner_env() {
+        let file = RunnerEnv::parse("npm_config_cache=/operator/npm\n").unwrap();
+        let defaults = vec![("HOME", OsString::from("/attempt/home"))];
+        let caches = vec![
+            ("npm_config_cache", OsString::from("/cache/o/r/npm")),
+            ("HOME", OsString::from("/cache-would-never-set-this")),
+        ];
+        let applied = runner_environment(defaults, caches, &file);
+        let last = |name: &str| {
+            applied
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(last("npm_config_cache"), Some("/operator/npm".into()));
+        assert_eq!(last("HOME"), Some("/cache-would-never-set-this".into()));
+        let position = |value: &str| applied.iter().position(|(_, v)| v == value).unwrap();
+        assert!(position("/attempt/home") < position("/cache/o/r/npm"));
+        assert!(position("/cache/o/r/npm") < position("/operator/npm"));
     }
 }
