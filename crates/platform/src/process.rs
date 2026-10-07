@@ -957,6 +957,14 @@ pub(crate) fn current_user_sid() -> std::io::Result<String> {
     sys::current_user_sid()
 }
 
+/// Whether this process runs at the background priority ceiling, by the same
+/// reading the post-spawn runner check uses.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn runs_at_background_priority() -> bool {
+    sys::runs_throttled(std::process::id())
+}
+
 pub fn permissions_summary(path: &Path) -> Result<PermissionsSummary, HandoffError> {
     sys::describe_permissions(path)
         .map(
@@ -3009,12 +3017,7 @@ mod tests {
         for directory in directories.all() {
             std::fs::create_dir_all(directory).expect("directory created");
         }
-        // A copy on the temporary volume: a launchd job whose program lives on
-        // an external volume waits on a privacy approval nobody gives before
-        // `main` runs (measured with a target directory under `/Volumes`).
-        let binary = root.path().join("launch-agent-job");
-        std::fs::copy(std::env::current_exe().expect("test binary"), &binary)
-            .expect("test binary copied");
+        let binary = crate::service::launchd_fixture::job_binary(root.path());
         let identity = ServiceIdentity::fixture(&format!("priority-{tag}-{}", std::process::id()));
         let label = identity.launchd_label();
         let plan = InstallPlan::unchecked(identity, StartMode::Login, binary, directories.clone())

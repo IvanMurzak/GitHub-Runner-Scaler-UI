@@ -2419,7 +2419,7 @@ fn review_launchd(
             detail: format!(
                 "is {}, and launchd applies it to every runner the daemon starts, so their jobs \
                  run below normal priority. The daemon rewrites it to `{LAUNCHD_PROCESS_TYPE}` \
-                 the next time it holds no runner; `service install` rewrites it now",
+                 when it next starts with no runner; `service status` says how to restart it",
                 found.map_or_else(
                     || "absent (launchd's `Standard`)".to_string(),
                     |value| format!("`{value}`")
@@ -4446,7 +4446,33 @@ impl ServiceOperations {
     /// is untouched in both cases.
     #[cfg(target_os = "macos")]
     pub fn reload_launchd_definition(&self, drift: &DefinitionDrift) -> Result<(), ServiceError> {
+        // The record names the start mode; the account this process runs as has
+        // to agree, or the record describes a registration other than the one
+        // running, and root would end up rewriting an operator's LaunchAgent.
+        // SAFETY: `getuid` reads the calling process's real user id and cannot
+        // fail.
+        let root = unsafe { libc::getuid() } == 0;
+        if root != (drift.start_mode == StartMode::Boot) {
+            return Err(ServiceError::Control {
+                operation: "rewrite",
+                name: self.identity.name().to_string(),
+                manager: "launchd",
+                detail: format!(
+                    "the install record says --start-at {}, but this daemon runs as {}; the plist \
+                     is left as it is",
+                    drift.start_mode,
+                    if root { "root" } else { "the operator" }
+                ),
+            });
+        }
         replace_definition(self.identity.name(), drift)?;
+        // The definition is now this build's, as after the WSL unit rewrite.
+        // Best effort: the record says who wrote the plist and nothing reads it
+        // to decide whether to repair.
+        if let Ok(Some(mut record)) = InstallRecord::read(&self.paths) {
+            record.installed_by_version = env!("CARGO_PKG_VERSION").to_string();
+            let _ = record.write(&self.paths);
+        }
         sys::reload_detached(&self.identity, drift.start_mode, &drift.path)
     }
 
@@ -4861,9 +4887,18 @@ impl ServiceStatus {
     pub fn with_definition_drift(mut self, drift: Option<DefinitionDrift>) -> Self {
         if let Some(drift) = drift {
             if drift.manager == DefinitionKind::LaunchdPlist {
-                let elevation = match drift.start_mode {
-                    StartMode::Boot => "sudo ",
-                    StartMode::Login => "",
+                // A restart, not `service install`: the running daemon holds the
+                // single-instance lock, which refuses an install, and a daemon
+                // that starts with no runner repairs the plist itself.
+                let restart = match drift.start_mode {
+                    StartMode::Boot => format!(
+                        "sudo launchctl kickstart -k system/{}",
+                        self.identity.launchd_label()
+                    ),
+                    StartMode::Login => format!(
+                        "launchctl kickstart -k gui/$(id -u)/{}",
+                        self.identity.launchd_label()
+                    ),
                 };
                 self.problems.push(StatusProblem {
                     subject: "definition",
@@ -4871,12 +4906,11 @@ impl ServiceStatus {
                         "{} was written by runner-manager {} with a `ProcessType` other than \
                          `{LAUNCHD_PROCESS_TYPE}`, which launchd applies to every runner the \
                          daemon starts, so their jobs run below normal priority. The daemon \
-                         rewrites it and reloads itself the next time it holds no runner; to do \
-                         it now, run `{elevation}runner-manager service install --start-at {}`. \
-                         Configuration and credentials are kept.",
+                         rewrites it and reloads itself when it starts with no runner, which it \
+                         does after every upgrade; to do it now, restart the service while no \
+                         job is running: `{restart}`. Configuration and credentials are kept.",
                         drift.path.display(),
                         drift.installed_by_version,
-                        drift.start_mode,
                     ),
                 });
                 return self;
@@ -6566,11 +6600,13 @@ mod sys {
     /// Boots the job out and bootstraps it again from `plist`, from a shell
     /// that outlives this process.
     ///
-    /// `setsid` puts the shell in a session and process group of its own, and
-    /// launchd kills only the job's own process group when it boots the job out
-    /// (measured: such a helper survives and its bootstrap succeeds). The work
-    /// runs in a background subshell, so the outer shell exits at once and is
-    /// reaped here rather than left behind. `bootout` blocks until the daemon
+    /// `setsid` puts the shell in a session and process group of its own. On a
+    /// bootout launchd sends SIGTERM to the job's whole process group, the
+    /// process that asked for the bootout included, and spares a child in
+    /// another session (measured on macOS 27). Without `setsid` the helper
+    /// survived that only by luck: one run in four left the job unloaded. The
+    /// work runs in a background subshell, so the outer shell exits at once and
+    /// is reaped here rather than left behind. `bootout` blocks until the daemon
     /// has exited; the bootstrap is retried for a minute because launchd
     /// refuses it while the old job is still being torn down. When the job is
     /// still loaded after a failed bootout, every bootstrap fails and the
@@ -6584,12 +6620,12 @@ mod sys {
 
         const SCRIPT: &str = r#"(
   sleep 1
-  launchctl bootout "$1"
+  /bin/launchctl bootout "$1"
   tries=0
-  until launchctl bootstrap "$2" "$3"; do
+  until /bin/launchctl bootstrap "$2" "$3"; do
     tries=$((tries + 1))
     if [ "$tries" -ge 60 ]; then
-      echo "runner-manager: launchd did not load $3 again; run: runner-manager service install" >&2
+      echo "runner-manager: launchd did not load $3 again; run: $4" >&2
       exit 1
     fi
     sleep 1
@@ -6597,12 +6633,19 @@ mod sys {
 ) </dev/null &"#;
 
         let control = LaunchdControl { mode };
+        // Once the job is booted out nothing holds the single-instance lock,
+        // so a reinstall in the same start mode is the remedy.
+        let reinstall = match mode {
+            StartMode::Boot => "sudo runner-manager service install --start-at boot",
+            StartMode::Login => "runner-manager service install --start-at login",
+        };
         let mut command = std::process::Command::new("/bin/sh");
         command
             .args(["-c", SCRIPT, "runner-manager-reload"])
             .arg(control.service_target(identity))
             .arg(control.domain())
             .arg(plist)
+            .arg(reinstall)
             .stdin(std::process::Stdio::null());
         // SAFETY: one async-signal-safe system call between `fork` and `exec`,
         // touching no memory, allocator or lock.
@@ -6848,7 +6891,7 @@ mod sys {
 /// What the macOS tests that load real launch agents share.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod launchd_fixture {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Opts a macOS host into the tests that load launch agents into the
     /// caller's GUI session. CI's macOS leg sets it, and
@@ -6863,6 +6906,20 @@ pub(crate) mod launchd_fixture {
             eprintln!("skipped: set {ACCEPTANCE}=1 to load test launch agents");
         }
         enabled
+    }
+
+    /// A copy of the running test binary in `directory`, for a launchd job to
+    /// run as its program.
+    ///
+    /// A copy, because a launchd job whose program lives on an external volume
+    /// waits on a privacy approval nobody gives before `main` runs (measured
+    /// with a target directory under `/Volumes`), and the temporary directory
+    /// is on the boot volume.
+    pub(crate) fn job_binary(directory: &Path) -> PathBuf {
+        let binary = directory.join("launch-agent-job");
+        std::fs::copy(std::env::current_exe().expect("test binary"), &binary)
+            .expect("test binary copied");
+        binary
     }
 
     /// A launch agent loaded into the caller's GUI domain, booted out on drop.
@@ -7488,17 +7545,19 @@ mod tests {
 
         let status = ServiceStatus::compose(identity, None, None, None, None, &host.paths)
             .with_definition_drift(Some(drift));
-        assert!(!status.is_healthy());
         let problem = status
             .problems()
             .iter()
             .find(|problem| problem.subject == "definition")
             .expect("the drift is reported");
+        // The remedy is a restart: a running daemon holds the lock that refuses
+        // `service install`.
         assert!(
             problem.detail.contains("0.4.31")
-                && problem
-                    .detail
-                    .contains("runner-manager service install --start-at login")
+                && problem.detail.contains(
+                    "launchctl kickstart -k gui/$(id -u)/io.github.IvanMurzak.runner-manager`"
+                )
+                && !problem.detail.contains("service install")
                 && !problem.detail.contains("systemctl")
                 && !problem.detail.contains("sudo"),
             "{}",
@@ -7539,13 +7598,59 @@ mod tests {
         );
     }
 
-    /// The rewrite and the detached reload together, against a real launchd:
-    /// a fixture agent loaded as `Background` is replaced by the same plist
-    /// with [`LAUNCHD_PROCESS_TYPE`], and launchd must end up running it with
-    /// that spawn type.
+    /// The job of [`a_job_reloads_itself_from_its_rewritten_plist`], run by
+    /// launchd and by nothing else.
+    ///
+    /// It does what the daemon does when it starts: when its own plist (kept
+    /// in its working directory) does not carry [`LAUNCHD_PROCESS_TYPE`], it
+    /// rewrites the plist and asks for the reload from inside the job that the
+    /// reload boots out. Either way it then stays up, to be booted out by the
+    /// helper or, once reloaded, by the test.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_rewritten_plist_is_loaded_again_by_the_detached_reload() {
+    #[ignore = "run only by launchd, as the job of the detached-reload test"]
+    fn detached_reload_job() {
+        let label = std::env::var("XPC_SERVICE_NAME").unwrap_or_default();
+        let tag = label
+            .split_once("-selftest-")
+            .map(|(_, tag)| tag.to_string())
+            .unwrap_or_else(|| panic!("run only by launchd for the reload test, not {label:?}"));
+        let identity = ServiceIdentity::fixture(&tag);
+        assert_eq!(identity.launchd_label(), label);
+        let path = std::env::current_dir()
+            .expect("working directory")
+            .join(format!("{label}.plist"));
+        let installed = std::fs::read_to_string(&path).expect("own plist");
+        if plist_string_value(&installed, "ProcessType").as_deref() != Some(LAUNCHD_PROCESS_TYPE) {
+            let drift = DefinitionDrift {
+                path: path.clone(),
+                installed_by_version: "0.4.31".into(),
+                rendered: installed.replace(
+                    "<string>Background</string>",
+                    &format!("<string>{LAUNCHD_PROCESS_TYPE}</string>"),
+                ),
+                start_mode: StartMode::Login,
+                manager: DefinitionKind::LaunchdPlist,
+            };
+            replace_definition(identity.name(), &drift).expect("plist replaced");
+            super::sys::reload_detached(&identity, StartMode::Login, &path)
+                .expect("helper started");
+        }
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    /// A job that rewrites its own plist and asks for the reload comes back
+    /// under the rewritten plist.
+    ///
+    /// The request comes from inside the job, as the daemon's does, so the
+    /// helper has to outlive the bootout of the very job that started it.
+    /// launchd sends SIGTERM to the job's whole process group, so a helper that
+    /// stayed in it would sometimes die before its bootstrap and leave the job
+    /// unloaded. Measured with `setsid` removed, that failed one run in four
+    /// here: this test catches it, though not on every run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_job_reloads_itself_from_its_rewritten_plist() {
         if !super::launchd_fixture::enabled() {
             return;
         }
@@ -7553,17 +7658,29 @@ mod tests {
         let identity = ServiceIdentity::fixture(&format!("reload-{}", std::process::id()));
         let label = identity.launchd_label();
         let path = root.path().join(format!("{label}.plist"));
-        let plist = |process_type: &str| {
-            format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
-                 {}  <key>ProgramArguments</key>\n  <array>\n    <string>/bin/sleep</string>\n\
-                 \x20   <string>600</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n\
-                 {}</dict>\n</plist>\n",
-                plist_string("Label", &label),
-                plist_string("ProcessType", process_type)
-            )
-        };
-        std::fs::write(&path, plist("Background")).expect("plist written");
+        let binary = super::launchd_fixture::job_binary(root.path());
+        let mut plist = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        plist.push_str("<plist version=\"1.0\">\n<dict>\n");
+        plist.push_str(&plist_string("Label", &label));
+        plist.push_str("  <key>ProgramArguments</key>\n  <array>\n");
+        for argument in [
+            binary.to_string_lossy().as_ref(),
+            "--ignored",
+            "--exact",
+            "service::tests::detached_reload_job",
+            "--test-threads=1",
+        ] {
+            plist.push_str(&format!("    <string>{}</string>\n", xml_escape(argument)));
+        }
+        plist.push_str("  </array>\n  <key>RunAtLoad</key>\n  <true/>\n");
+        plist.push_str(&plist_string(
+            "WorkingDirectory",
+            &root.path().to_string_lossy(),
+        ));
+        plist.push_str(&plist_string("ProcessType", "Background"));
+        plist.push_str("</dict>\n</plist>\n");
+        std::fs::write(&path, plist).expect("plist written");
+
         let loaded = super::launchd_fixture::LoadedAgent::bootstrap(&label, &path);
         let spawn_type = || {
             let printed = std::process::Command::new("launchctl")
@@ -7580,28 +7697,20 @@ mod tests {
         };
         assert_eq!(spawn_type().as_deref(), Some("background (5)"));
 
-        let drift = DefinitionDrift {
-            path: path.clone(),
-            installed_by_version: "0.4.31".into(),
-            rendered: plist(LAUNCHD_PROCESS_TYPE),
-            start_mode: StartMode::Login,
-            manager: DefinitionKind::LaunchdPlist,
-        };
-        replace_definition(identity.name(), &drift).expect("plist replaced");
-        super::sys::reload_detached(&identity, StartMode::Login, &path).expect("helper started");
-
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        loop {
-            if spawn_type().as_deref() == Some("interactive (4)") {
-                break;
-            }
+        while spawn_type().as_deref() != Some("interactive (4)") {
             assert!(
                 std::time::Instant::now() < deadline,
-                "launchd still reports {:?} for the rewritten agent",
+                "the job did not come back under its rewritten plist; launchd reports {:?}",
                 spawn_type()
             );
             std::thread::sleep(Duration::from_millis(250));
         }
+        let rewritten = std::fs::read_to_string(&path).expect("plist readable");
+        assert_eq!(
+            plist_string_value(&rewritten, "ProcessType").as_deref(),
+            Some(LAUNCHD_PROCESS_TYPE)
+        );
     }
 
     #[test]

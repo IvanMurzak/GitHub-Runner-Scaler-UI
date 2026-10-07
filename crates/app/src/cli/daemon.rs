@@ -791,6 +791,27 @@ async fn converge_launchd_definition(
         }
     };
     let Some(drift) = drift else {
+        // The file can be current while the loaded job is not: a rewrite whose
+        // reload failed, or a hand edit nobody reloaded. Reported, never acted
+        // on: a reload that did not help would repeat on every start.
+        // `kickstart` would not help: it restarts from the job launchd holds.
+        if runner_manager_platform::process::runs_at_background_priority()
+            && let Ok(Some(record)) = InstallRecord::read(context.paths())
+            && let Some(plist) = record.definition_path
+        {
+            let (sudo, domain) = match record.start_mode {
+                StartMode::Boot => ("sudo ", "system".to_string()),
+                StartMode::Login => ("", "gui/$(id -u)".to_string()),
+            };
+            tracing::warn!(
+                reason = "launchd_job_outdated",
+                "launchd runs this daemon at background priority although its plist is current, \
+                 so the plist was never reloaded and every runner is throttled; reload it while no \
+                 job is running: {sudo}launchctl bootout {domain}/{label} && {sudo}launchctl \
+                 bootstrap {domain} '{}'",
+                plist.display()
+            );
+        }
         return Ok(false);
     };
     let active = match context
@@ -811,7 +832,7 @@ async fn converge_launchd_definition(
             path = %drift.path.display(),
             active_runners = active,
             reason = "launchd_plist_outdated",
-            "the launchd plist throttles every runner; it is rewritten when the daemon next starts with no runner"
+            "the launchd plist throttles every runner; it is rewritten when the daemon next starts with no runner, or restarts with none after a policy change"
         );
         return Ok(false);
     }

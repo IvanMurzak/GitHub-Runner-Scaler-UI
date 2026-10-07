@@ -20,11 +20,11 @@ the version being prepared rather than the version in `Cargo.toml`.
   waits.
 - An existing installation is repaired without `service install`. After `runner-manager update`,
   the new daemon finds the old `ProcessType` in its plist, rewrites the plist and has launchd load
-  the job again. It does this only while it holds no runner, which is always the case right after
-  the upgrade drain, so no job is interrupted. The start mode is kept. `service status` reports a
-  plist that still carries the old value. A plist that has the right `ProcessType` is left alone,
-  including any edits made to it; one with the old value is replaced whole, as `service install`
-  would replace it.
+  the job again. It does this only when it starts with no runner, which is always the case right
+  after the upgrade drain, so no job is interrupted. The start mode is kept. `service status`
+  reports a plist that still carries the old value, with the command that restarts the service so
+  it repairs itself. A plist that has the right `ProcessType` is left alone, including any edits
+  made to it; one with the old value is replaced whole, as `service install` would replace it.
 
 ## 0.4.31
 
