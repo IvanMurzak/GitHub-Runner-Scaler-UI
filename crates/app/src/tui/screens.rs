@@ -90,6 +90,25 @@ pub enum OperationalReadiness {
 }
 
 impl OperationalReadiness {
+    /// The worse of the two, for folding several causes into one verdict:
+    /// ready, then unknown, then degraded, then blocked.
+    #[must_use]
+    pub const fn worse(self, other: Self) -> Self {
+        const fn rank(value: OperationalReadiness) -> u8 {
+            match value {
+                OperationalReadiness::Ready => 0,
+                OperationalReadiness::Unknown => 1,
+                OperationalReadiness::Degraded => 2,
+                OperationalReadiness::Blocked => 3,
+            }
+        }
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::Unknown => "UNKNOWN",

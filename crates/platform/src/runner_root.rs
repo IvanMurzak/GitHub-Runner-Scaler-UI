@@ -666,6 +666,11 @@ pub fn default_runner_root(app_paths: &AppPaths) -> Result<LocalAbsolutePath, Ru
     default_runner_root_from(PlatformDefault::WindowsSystemDirectory(&system))
 }
 
+/// The Windows system directory, as the kernel reports it. Shared with
+/// `host_fitness`, which starts `powershell.exe` from it.
+#[cfg(windows)]
+pub(crate) use sys::system_directory as windows_system_directory;
+
 /// The platform default host runner root for this machine.
 ///
 /// macOS and Linux keep the directory attempts have always used —
@@ -1362,7 +1367,7 @@ mod sys {
     /// are writable by whatever started this process; the value read here
     /// decides where a recursive cleanup will later run, so it comes from the
     /// kernel.
-    pub(super) fn system_directory() -> io::Result<String> {
+    pub(crate) fn system_directory() -> io::Result<String> {
         // The system directory is `<drive>\Windows\system32` on every supported
         // release, so `MAX_PATH` is already generous; the length is checked
         // rather than assumed all the same.

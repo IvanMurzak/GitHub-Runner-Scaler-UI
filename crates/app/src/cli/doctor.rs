@@ -64,7 +64,7 @@ use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store as _;
 use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::runner_env::{self, Inherited, RunnerEnv, RunnerPlatform};
-use runner_manager_platform::service::InstallRecord;
+use runner_manager_platform::service::{InstallRecord, LAUNCHD_PROCESS_TYPE, plist_string_value};
 use serde::{Deserialize, Serialize};
 
 use super::workspace::{self, HostRoot};
@@ -237,10 +237,11 @@ pub struct HostSetup {
     /// recorded it. A recent contact proves it could read its credential.
     #[serde(default)]
     pub service_contact_age_secs: Option<u64>,
-    /// This executable, to tell a credential the service binary cannot read
-    /// from a keychain this whole session cannot read.
+    /// Whether this process reads the login-mode credential itself, to tell a
+    /// credential the service binary cannot read from a keychain this whole
+    /// session cannot read. `None` when not asked (not a macOS login service).
     #[serde(default)]
-    pub own_binary: Option<PathBuf>,
+    pub own_keychain_readable: Option<bool>,
 }
 
 impl HostSetup {
@@ -497,10 +498,6 @@ impl Change {
             )),
         }
     }
-
-    const fn needs_admin(&self) -> bool {
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,12 +708,18 @@ fn check(id: &str) -> Option<&'static CheckSpec> {
     CHECKS.iter().find(|check| check.id == id)
 }
 
+fn fix(id: &str) -> Option<&'static FixSpec> {
+    check(id).and_then(|check| check.fix.as_ref())
+}
+
+fn fix_needs_admin(id: &str) -> bool {
+    fix(id).is_some_and(|fix| fix.needs_admin)
+}
+
 /// Whether the fix for `id` lowers security and so needs explicit consent.
 #[must_use]
 pub fn lowers_security(id: &str) -> bool {
-    check(id)
-        .and_then(|check| check.fix.as_ref())
-        .is_some_and(|fix| fix.consent_flag.is_some())
+    fix(id).is_some_and(|fix| fix.consent_flag.is_some())
 }
 
 fn set_dword(
@@ -1070,13 +1073,15 @@ fn probe_launchd_priority(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
         .as_ref()
         .and_then(|service| service.definition_path.as_ref());
     if let Some(plist) = plist {
+        // The same rule `service status` applies to the plist it rendered.
         match facts.launchd_process_type(plist) {
-            Ok(Some(kind)) if kind == "Background" || kind == "Adaptive" => problems.push(format!(
-                "{} sets ProcessType = {kind}, so launchd runs the daemon and every runner it \
-                 starts at background priority (efficiency cores, throttled I/O)",
-                plist.display()
+            Ok(Some(kind)) if kind == LAUNCHD_PROCESS_TYPE => {}
+            Ok(kind) => problems.push(format!(
+                "{} sets ProcessType = {}, not {LAUNCHD_PROCESS_TYPE}, so launchd runs the daemon \
+                 and every runner it starts below normal priority",
+                plist.display(),
+                kind.as_deref().unwrap_or("nothing (Standard)")
             )),
-            Ok(_) => {}
             Err(error) => {
                 return unknown(format!("{} could not be read: {error}", plist.display()));
             }
@@ -1136,11 +1141,21 @@ fn indexed_roots(
     facts: &dyn HostFacts,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let mut indexed = Vec::new();
+    // Roots usually share a volume; ask Spotlight about each volume once.
+    let mut answers: BTreeMap<PathBuf, Option<bool>> = BTreeMap::new();
     for root in setup.runner_roots.iter().filter(|root| !is_noindex(root)) {
         let volume = facts
             .mount_point(root)
             .ok_or_else(|| format!("the volume holding {} could not be found", root.display()))?;
-        match facts.spotlight_indexing(&volume)? {
+        let answer = match answers.get(&volume) {
+            Some(answer) => *answer,
+            None => {
+                let answer = facts.spotlight_indexing(&volume)?;
+                answers.insert(volume.clone(), answer);
+                answer
+            }
+        };
+        match answer {
             Some(true) => indexed.push((root.clone(), volume)),
             Some(false) => {}
             None => return Err(format!("Spotlight gave no answer for {}", volume.display())),
@@ -1192,6 +1207,7 @@ fn apply_spotlight(
         .map(|(_, volume)| volume)
         .filter(|volume| !is_startup_volume(volume))
         .collect();
+    volumes.sort();
     volumes.dedup();
     if volumes.is_empty() {
         return Err("every indexed runner root is on the startup volume; see the remedy".into());
@@ -1204,18 +1220,6 @@ fn apply_spotlight(
 }
 
 // -- macos.keychain_credential ------------------------------------------------
-
-fn auth_login_command(binary: &Path, data_root: Option<&Path>) -> String {
-    let quote = |path: &Path| host_fitness::quote_posix_argument(&path.display().to_string());
-    match data_root {
-        Some(root) => format!(
-            "{} --data-dir {} auth login --start-at login",
-            quote(binary),
-            quote(root)
-        ),
-        None => format!("{} auth login --start-at login", quote(binary)),
-    }
-}
 
 fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     if setup.perspective == Perspective::Daemon {
@@ -1245,28 +1249,14 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
         Ok(CredentialProbe::Absent) => not_applicable(
             "no GitHub credential is stored yet (`runner-manager auth login --start-at login`)",
         ),
-        // If this executable cannot read it either, the session is the
-        // problem (an SSH session cannot unlock the login keychain), not the
-        // service binary's grant.
-        Ok(CredentialProbe::Unreadable(_))
-            if setup
-                .own_binary
-                .as_ref()
-                .is_none_or(|own| *own == service.binary)
-                || matches!(
-                    setup
-                        .own_binary
-                        .as_ref()
-                        .map(|own| facts.service_credential(own, setup.data_root.as_deref())),
-                    Some(Ok(CredentialProbe::Unreadable(_)))
-                ) =>
-        {
-            unknown(
-                "this session cannot read the login keychain at all (an SSH session cannot unlock \
+        // If this process cannot read it either, the session is the problem
+        // (an SSH session cannot unlock the login keychain), not the service
+        // binary's grant.
+        Ok(CredentialProbe::Unreadable(_)) if setup.own_keychain_readable != Some(true) => unknown(
+            "this session cannot read the login keychain at all (an SSH session cannot unlock \
                  it), so the service binary's own access cannot be told apart; run `runner-manager \
                  host doctor` in a Terminal on this Mac",
-            )
-        }
+        ),
         Ok(CredentialProbe::Unreadable(reason)) => fail(format!(
             "the service binary {} cannot read its GitHub credential ({reason}); a replaced \
              binary needs a fresh keychain grant",
@@ -1274,7 +1264,11 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
         ))
         .remedy(format!(
             "{} (sign in again with the service binary; never switch to --start-at boot for this)",
-            auth_login_command(&service.binary, setup.data_root.as_deref())
+            super::update::force::auth_command_line(
+                setup.data_root.as_deref(),
+                StartMode::Login,
+                &service.binary
+            )
         )),
         Err(error) => unknown(format!("the service binary could not be asked: {error}")),
     }
@@ -1395,20 +1389,29 @@ impl Report {
     /// The ids of the required checks that fail. Unknown never counts.
     #[must_use]
     pub fn required_failing(&self) -> Vec<String> {
-        self.findings
-            .iter()
-            .filter(|finding| {
-                finding.severity == Severity::Required && finding.status == Status::Fail
-            })
+        self.with(Severity::Required, Status::Fail)
             .map(|finding| finding.id.to_owned())
             .collect()
     }
 
-    fn count(&self, severity: Severity, status: Status) -> usize {
+    /// The findings of one severity in one status.
+    fn with(&self, severity: Severity, status: Status) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
-            .filter(|finding| finding.severity == severity && finding.status == status)
-            .count()
+            .filter(move |finding| finding.severity == severity && finding.status == status)
+    }
+}
+
+impl Finding {
+    /// `id  status (severity): detail`, the line every report prints.
+    fn line(&self, width: usize) -> String {
+        format!(
+            "{:<width$}  {} ({}): {}",
+            self.id,
+            self.status.as_str(),
+            self.severity.as_str(),
+            self.detail
+        )
     }
 }
 
@@ -1474,14 +1477,7 @@ fn write_report(out: &mut dyn Write, report: &Report) -> io::Result<()> {
         .max()
         .unwrap_or(0);
     for finding in &report.findings {
-        writeln!(
-            out,
-            "  {:<widest$}  {} ({}): {}",
-            finding.id,
-            finding.status.as_str(),
-            finding.severity.as_str(),
-            finding.detail
-        )?;
+        writeln!(out, "  {}", finding.line(widest))?;
         if finding.status == Status::Pass || finding.status == Status::NotApplicable {
             continue;
         }
@@ -1515,8 +1511,8 @@ fn write_report(out: &mut dyn Write, report: &Report) -> io::Result<()> {
             out,
             "  {:<12}{} failing, {} unknown",
             severity.as_str(),
-            report.count(severity, Status::Fail),
-            report.count(severity, Status::Unknown)
+            report.with(severity, Status::Fail).count(),
+            report.with(severity, Status::Unknown).count()
         )?;
     }
     let fixable = report.findings.iter().filter(|f| f.wants_fix()).count();
@@ -1540,6 +1536,8 @@ struct RequiredToolsFile {
     tools: Vec<String>,
 }
 
+const REQUIRED_TOOLS_SCHEMA_VERSION: u32 = 1;
+
 fn required_tools_path(context: &Context) -> PathBuf {
     context.paths().config_dir().join(REQUIRED_TOOLS_FILE)
 }
@@ -1549,23 +1547,7 @@ fn required_tools_path(context: &Context) -> PathBuf {
 /// # Errors
 /// [`Failure::LocalState`] when the file exists and cannot be read.
 pub fn required_tools(context: &Context) -> Result<Vec<String>, CliError> {
-    let path = required_tools_path(context);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<RequiredToolsFile>(&text)
-            .map(|file| file.tools)
-            .map_err(|error| {
-                CliError::with_remedy(
-                    Failure::LocalState,
-                    format!("{} is not valid: {error}", path.display()),
-                    "runner-manager host required-tools --clear",
-                )
-            }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(CliError::new(
-            Failure::LocalState,
-            format!("cannot read {}: {error}", path.display()),
-        )),
-    }
+    read_json_or(&required_tools_path(context), RequiredToolsFile::default).map(|file| file.tools)
 }
 
 fn validate_tool(tool: &str) -> Result<(), CliError> {
@@ -1691,7 +1673,14 @@ fn setup_from_parts(
         .ok()
         .flatten()
         .and_then(|at| u64::try_from((context.clock().now() - at).num_seconds()).ok()),
-        own_binary: std::env::current_exe().ok(),
+        own_keychain_readable: (HostOs::current() == HostOs::Macos
+            && perspective == Perspective::Operator
+            && mode == Some(StartMode::Login))
+        .then(|| {
+            context
+                .secret_store(StartMode::Login)
+                .is_ok_and(|store| store.load().is_ok())
+        }),
         service,
     }
 }
@@ -1902,25 +1891,22 @@ impl HostFacts for SystemFacts {
         let mut child = command
             .spawn()
             .map_err(|error| format!("{} could not be started: {error}", binary.display()))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("it did not answer within 20 seconds".into());
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        // Read on a thread so a large document can never fill the pipe and
+        // stall the child, and so the answer is taken the moment it is ready.
+        let mut stdout = child.stdout.take().ok_or("the child had no stdout")?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = sender.send(io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes));
+        });
+        let Ok(read) = receiver.recv_timeout(Duration::from_secs(20)) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("it did not answer within 20 seconds".into());
+        };
+        let _ = child.wait();
+        let bytes = read.map_err(|error| error.to_string())?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| format!("its status document did not parse: {error}"))?;
         let credential = &document["credential"];
         Ok(match credential["unreadable"].as_str() {
@@ -1929,14 +1915,6 @@ impl HostFacts for SystemFacts {
             None => CredentialProbe::Absent,
         })
     }
-}
-
-/// The first `<string>` after `<key>name</key>` in an XML property list.
-fn plist_string_value(text: &str, name: &str) -> Option<String> {
-    let after = &text[text.find(&format!("<key>{name}</key>"))?..];
-    let start = after.find("<string>")? + "<string>".len();
-    let end = after[start..].find("</string>")?;
-    Some(after[start..start + end].trim().to_owned())
 }
 
 /// Runner processes in `ps -axo pri=,comm=` output at background priority.
@@ -2211,18 +2189,14 @@ fn execute(
     elevator: &dyn Elevator,
 ) -> Vec<FixResult> {
     let elevated = facts.elevated();
-    let needs_admin = |id: &str| {
-        !elevated
-            && check(id)
-                .and_then(|check| check.fix.as_ref())
-                .is_some_and(|fix| fix.needs_admin)
-    };
-    let (admin_apply, local_apply): (Vec<String>, Vec<String>) =
-        request.apply.into_iter().partition(|id| needs_admin(id));
-    let (admin_revert, local_revert): (Vec<_>, Vec<_>) = request
-        .revert
+    let (admin_apply, local_apply): (Vec<String>, Vec<String>) = request
+        .apply
         .into_iter()
-        .partition(|(_, changes)| !elevated && changes.iter().any(Change::needs_admin));
+        .partition(|id| !elevated && fix_needs_admin(id));
+    // Every kind of `Change` is a machine-wide setting, so undoing one needs
+    // the same rights making it did.
+    let (admin_revert, local_revert): (Vec<_>, Vec<_>) =
+        request.revert.into_iter().partition(|_| !elevated);
     let mut results = run_request(
         &ElevatedRequest {
             setup: request.setup.clone(),
@@ -2292,7 +2266,11 @@ fn journal_path(context: &Context) -> PathBuf {
     context.paths().config_dir().join(JOURNAL_FILE)
 }
 
-fn read_journal(path: &Path) -> Result<Journal, CliError> {
+/// A JSON file under `config/`, or `missing()` when there is none.
+fn read_json_or<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    missing: impl FnOnce() -> T,
+) -> Result<T, CliError> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|error| {
             CliError::new(
@@ -2300,10 +2278,7 @@ fn read_journal(path: &Path) -> Result<Journal, CliError> {
                 format!("{} is not valid: {error}", path.display()),
             )
         }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Journal {
-            schema_version: JOURNAL_SCHEMA_VERSION,
-            entries: BTreeMap::new(),
-        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(missing()),
         Err(error) => Err(CliError::new(
             Failure::LocalState,
             format!("cannot read {}: {error}", path.display()),
@@ -2311,21 +2286,23 @@ fn read_journal(path: &Path) -> Result<Journal, CliError> {
     }
 }
 
-fn write_journal(path: &Path, journal: &Journal) -> Result<(), CliError> {
-    let failed = |error: String| {
-        CliError::new(
-            Failure::LocalState,
-            format!(
-                "cannot record what host prepare changed in {}: {error}",
-                path.display()
-            ),
-        )
-    };
-    let text = serde_json::to_string_pretty(journal).map_err(|error| failed(error.to_string()))?;
-    let temporary = path.with_extension("json.new");
-    std::fs::write(&temporary, text)
-        .and_then(|()| std::fs::rename(&temporary, path))
-        .map_err(|error| failed(error.to_string()))
+fn write_json(path: &Path, value: &impl Serialize) -> Result<(), CliError> {
+    serde_json::to_vec_pretty(value)
+        .map_err(io::Error::other)
+        .and_then(|bytes| host_fitness::write_atomically(path, &bytes))
+        .map_err(|error| {
+            CliError::new(
+                Failure::LocalState,
+                format!("cannot write {}: {error}", path.display()),
+            )
+        })
+}
+
+fn read_journal(path: &Path) -> Result<Journal, CliError> {
+    read_json_or(path, || Journal {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        entries: BTreeMap::new(),
+    })
 }
 
 /// Records applied changes and forgets reverted checks. A change already
@@ -2581,9 +2558,7 @@ pub fn prepare(
     } else {
         writeln!(out, "Host prepare will apply:").map_err(failed)?;
         for id in &plan.apply {
-            let fix = check(id)
-                .and_then(|check| check.fix.as_ref())
-                .expect("planned ids have fixes");
+            let fix = fix(id).expect("planned ids have fixes");
             let admin = if fix.needs_admin && !run.facts.elevated() {
                 " (administrator)"
             } else {
@@ -2627,12 +2602,7 @@ pub fn prepare(
             }
         }
     }
-    if plan.apply.iter().any(|id| {
-        check(id)
-            .and_then(|c| c.fix.as_ref())
-            .is_some_and(|fix| fix.needs_admin)
-    }) && !run.facts.elevated()
-    {
+    if !run.facts.elevated() && plan.apply.iter().any(|id| fix_needs_admin(id)) {
         writeln!(
             out,
             "Asking for administrator rights once for the changes that need them..."
@@ -2640,20 +2610,16 @@ pub fn prepare(
         .map_err(failed)?;
         out.flush().map_err(failed)?;
     }
-    let results = execute(
+    let results = apply_and_report(
+        run.context,
         ElevatedRequest {
             setup: run.setup.clone(),
             apply: plan.apply.iter().map(|id| (*id).to_owned()).collect(),
             revert: Vec::new(),
         },
-        run.facts,
-        run.actions,
-        run.elevator,
-    );
-    record(run.context, &results)?;
-    for result in &results {
-        writeln!(out, "  {}  {}", result.id, describe_result(result)).map_err(failed)?;
-    }
+        (run.facts, run.actions, run.elevator),
+        out,
+    )?;
     let after = evaluate(&run.setup, run.facts);
     Ok(PrepareOutcome {
         results,
@@ -2663,17 +2629,29 @@ pub fn prepare(
     })
 }
 
-fn record(context: &Context, results: &[FixResult]) -> Result<(), CliError> {
-    if !results
+/// Carries out `request` (elevating what needs it), journals what changed,
+/// and prints one line per check.
+fn apply_and_report(
+    context: &Context,
+    request: ElevatedRequest,
+    (facts, actions, elevator): (&dyn HostFacts, &dyn HostActions, &dyn Elevator),
+    out: &mut dyn Write,
+) -> Result<Vec<FixResult>, CliError> {
+    let results = execute(request, facts, actions, elevator);
+    if results
         .iter()
         .any(|r| matches!(r.outcome, FixOutcome::Applied { .. } | FixOutcome::Reverted))
     {
-        return Ok(());
+        let path = journal_path(context);
+        let mut journal = read_journal(&path)?;
+        update_journal(&mut journal, &results, context.clock().now());
+        write_json(&path, &journal)?;
     }
-    let path = journal_path(context);
-    let mut journal = read_journal(&path)?;
-    update_journal(&mut journal, results, context.clock().now());
-    write_journal(&path, &journal)
+    for result in &results {
+        writeln!(out, "  {}  {}", result.id, describe_result(result))
+            .map_err(write_failed("this host preparation"))?;
+    }
+    Ok(results)
 }
 
 /// `host prepare [--yes] [--only ID]... [--allow-…] | --revert ID...`.
@@ -2736,7 +2714,6 @@ fn revert_command(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     known_ids(ids)?;
-    let failed = write_failed("this revert");
     let journal = read_journal(&journal_path(context))?;
     let mut revert = Vec::new();
     for id in ids {
@@ -2752,20 +2729,16 @@ fn revert_command(
         };
         revert.push((id.clone(), entry.changes.clone()));
     }
-    let results = execute(
+    let results = apply_and_report(
+        context,
         ElevatedRequest {
             setup,
             apply: Vec::new(),
             revert,
         },
-        &SystemFacts,
-        &SystemActions,
-        elevator,
-    );
-    record(context, &results)?;
-    for result in &results {
-        writeln!(out, "  {}  {}", result.id, describe_result(result)).map_err(failed)?;
-    }
+        (&SystemFacts, &SystemActions, elevator),
+        out,
+    )?;
     if results.iter().all(|r| r.outcome == FixOutcome::Reverted) {
         Ok(())
     } else {
@@ -2811,17 +2784,13 @@ pub fn required_tools_command(
                 list.push(tool.to_owned());
             }
         }
-        let text = serde_json::to_string_pretty(&RequiredToolsFile {
-            schema_version: 1,
-            tools: list,
-        })
-        .map_err(|error| CliError::new(Failure::LocalState, error.to_string()))?;
-        std::fs::write(&path, text).map_err(|error| {
-            CliError::new(
-                Failure::LocalState,
-                format!("cannot write {}: {error}", path.display()),
-            )
-        })?;
+        write_json(
+            &path,
+            &RequiredToolsFile {
+                schema_version: REQUIRED_TOOLS_SCHEMA_VERSION,
+                tools: list,
+            },
+        )?;
     }
     let tools = required_tools(context)?;
     writeln!(out, "Required tools").map_err(failed)?;
@@ -3038,15 +3007,7 @@ pub fn before_service_install(
     }
     writeln!(out, "Host checks for a {start_mode} service").map_err(failed)?;
     for finding in &attention {
-        writeln!(
-            out,
-            "  {}  {} ({}): {}",
-            finding.id,
-            finding.status.as_str(),
-            finding.severity.as_str(),
-            finding.detail
-        )
-        .map_err(failed)?;
+        writeln!(out, "  {}", finding.line(0)).map_err(failed)?;
     }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     let fixable = report.findings.iter().any(Finding::wants_fix);
@@ -3182,9 +3143,7 @@ pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String
     let verdict = DaemonVerdict {
         required: report.required_failing(),
         recommended: report
-            .findings
-            .iter()
-            .filter(|f| f.severity == Severity::Recommended && f.status == Status::Fail)
+            .with(Severity::Recommended, Status::Fail)
             .map(|f| f.id.to_owned())
             .collect(),
     };
@@ -3233,8 +3192,6 @@ mod tests {
         process_type: Option<String>,
         throttled: usize,
         credential: Option<CredentialProbe>,
-        /// What this executable reads; `None` answers like the service binary.
-        own_credential: Option<CredentialProbe>,
     }
 
     impl HostFacts for Facts {
@@ -3290,18 +3247,12 @@ mod tests {
         }
         fn service_credential(
             &self,
-            binary: &Path,
+            _: &Path,
             _: Option<&Path>,
         ) -> Result<CredentialProbe, String> {
-            let own = binary == Path::new(OWN_BINARY);
-            own.then(|| self.own_credential.clone())
-                .flatten()
-                .or_else(|| self.credential.clone())
-                .ok_or_else(|| "no answer".into())
+            self.credential.clone().ok_or_else(|| "no answer".into())
         }
     }
-
-    const OWN_BINARY: &str = "/usr/local/bin/runner-manager";
 
     /// Records every write, and applies git writes to the facts.
     #[derive(Default)]
@@ -3376,7 +3327,7 @@ mod tests {
             probe_dir: PathBuf::from(r"C:\state"),
             data_root: None,
             service_contact_age_secs: None,
-            own_binary: None,
+            own_keychain_readable: None,
         }
     }
 
@@ -3664,7 +3615,14 @@ mod tests {
         let setup = macos_setup();
         let mut facts = Facts::default();
         let id = "macos.launchd_priority";
+        facts.process_type = Some(LAUNCHD_PROCESS_TYPE.into());
         assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+        facts.process_type = None;
+        assert_eq!(
+            status_of(&setup, &facts, id),
+            Status::Fail,
+            "no ProcessType is Standard, below normal priority, as `service status` judges it"
+        );
         facts.process_type = Some("Background".into());
         let report = evaluate(&setup, &facts);
         assert_eq!(finding(&report, id).status, Status::Fail);
@@ -3684,16 +3642,6 @@ mod tests {
     fn throttled_runners_are_counted_from_ps_output() {
         let listing = "  4 /Users/me/rman/a/bin/Runner.Listener\n 31 /Users/me/rman/b/bin/Runner.Listener\n  4 /usr/libexec/other\n  4 /x/bin/Runner.Worker\n";
         assert_eq!(throttled_runners_in(listing), 2);
-    }
-
-    #[test]
-    fn a_plist_string_value_is_read() {
-        let plist = "<dict>\n<key>Label</key><string>x</string>\n<key>ProcessType</key>\n  <string>Background</string>\n</dict>";
-        assert_eq!(
-            plist_string_value(plist, "ProcessType").as_deref(),
-            Some("Background")
-        );
-        assert_eq!(plist_string_value(plist, "Missing"), None);
     }
 
     #[test]
@@ -3758,12 +3706,11 @@ mod tests {
     #[test]
     fn an_unreadable_keychain_credential_names_the_exact_login_command() {
         let mut setup = macos_setup();
-        setup.own_binary = Some(PathBuf::from(OWN_BINARY));
+        setup.own_keychain_readable = Some(true);
         let mut facts = Facts {
             credential: Some(CredentialProbe::Unreadable(
                 "errSecInteractionNotAllowed".into(),
             )),
-            own_credential: Some(CredentialProbe::Readable),
             ..Facts::default()
         };
         let report = evaluate(&setup, &facts);
@@ -3771,7 +3718,9 @@ mod tests {
         assert_eq!(keychain.status, Status::Fail);
         let remedy = keychain.remedy.as_deref().unwrap();
         assert!(
-            remedy.starts_with("'/Users/me/rm/runner-manager' auth login --start-at login"),
+            remedy.contains("/Users/me/rm/runner-manager")
+                && remedy.contains(" auth login --start-at login")
+                && !remedy.contains("sudo"),
             "{remedy}"
         );
         assert_eq!(report.required_failing(), ["macos.keychain_credential"]);
@@ -3779,7 +3728,7 @@ mod tests {
         // A session that cannot read the keychain at all (SSH) is not the
         // service binary's fault: measured on the Mac mini, both binaries
         // answered -25293 over SSH while the daemon was serving jobs.
-        facts.own_credential = None;
+        setup.own_keychain_readable = Some(false);
         assert_eq!(
             status_of(&setup, &facts, "macos.keychain_credential"),
             Status::Unknown
@@ -4245,8 +4194,6 @@ mod tests {
             )],
         };
         let text = serde_json::to_string(&request).unwrap();
-        let quoted = host_fitness::quote_windows_argument(&text);
-        assert!(quoted.starts_with('"'));
         assert_eq!(
             serde_json::from_str::<ElevatedRequest>(&text).unwrap(),
             request

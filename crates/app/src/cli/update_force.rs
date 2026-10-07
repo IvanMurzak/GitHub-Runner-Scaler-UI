@@ -322,6 +322,17 @@ fn write_auth_command(
     binary: &Path,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
+    let command = auth_command_line(context.data_root.as_deref(), mode, binary);
+    writeln!(out, "  {command}").map_err(write_failed("this update"))
+}
+
+/// The `auth login` command that signs `binary` in again for `mode`, quoted
+/// for this platform's shell. `host doctor` names the same command.
+pub(in crate::cli) fn auth_command_line(
+    data_root: Option<&Path>,
+    mode: StartMode,
+    binary: &Path,
+) -> String {
     let elevation = if mode == StartMode::Boot && cfg!(unix) {
         "sudo "
     } else {
@@ -332,7 +343,7 @@ fn write_auth_command(
     } else {
         format!("'{}'", display_path(binary).replace('\'', "'\\''"))
     };
-    let command = match context.data_root.as_deref() {
+    match data_root {
         Some(root) if cfg!(windows) => format!(
             "{elevation}{executable} --data-dir \"{}\" auth login --start-at {mode}",
             display_path(root),
@@ -347,8 +358,7 @@ fn write_auth_command(
             "{elevation}{executable} auth login --start-at {}",
             mode_name(mode)
         ),
-    };
-    writeln!(out, "  {command}").map_err(write_failed("this update"))
+    }
 }
 
 fn mode_name(mode: StartMode) -> &'static str {

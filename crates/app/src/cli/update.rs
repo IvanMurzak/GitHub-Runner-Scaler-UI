@@ -61,7 +61,7 @@ use super::{CliError, Context, Failure, UpdateArgs, write_failed};
 use runner_manager_platform::service::InstallRecord;
 
 #[path = "update_force.rs"]
-mod force;
+pub(super) mod force;
 use force::{force_service_handover, preflight_force, report_force_check};
 
 // ---------------------------------------------------------------------------

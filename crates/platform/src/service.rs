@@ -2719,7 +2719,7 @@ fn plist_value_after_key<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     Some(text[start..].trim_start())
 }
 
-fn plist_string_value(text: &str, key: &str) -> Option<String> {
+pub fn plist_string_value(text: &str, key: &str) -> Option<String> {
     let rest = plist_value_after_key(text, key)?;
     if !rest.starts_with("<string>") {
         return None;

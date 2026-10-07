@@ -609,19 +609,8 @@ fn with_host_doctor(
     now: String,
 ) -> ReadinessAssessment {
     use crate::cli::doctor::Severity;
-    let rank = |value| match value {
-        OperationalReadiness::Ready => 0,
-        OperationalReadiness::Unknown => 1,
-        OperationalReadiness::Degraded => 2,
-        OperationalReadiness::Blocked => 3,
-    };
-    let raise = |assessment: &mut ReadinessAssessment, next| {
-        if rank(next) > rank(assessment.state) {
-            assessment.state = next;
-        }
-    };
     if let Some(unfit) = &doctor.daemon_host_unfit {
-        raise(&mut assessment, OperationalReadiness::Blocked);
+        assessment.state = assessment.state.worse(OperationalReadiness::Blocked);
         assessment.activity.push(screens::ActivityRow {
             id: "readiness:host:unfit".into(),
             occurred_at: now.clone(),
@@ -641,7 +630,7 @@ fn with_host_doctor(
         } else {
             OperationalReadiness::Degraded
         };
-        raise(&mut assessment, severity);
+        assessment.state = assessment.state.worse(severity);
         let remediation = match (&finding.remedy, finding.fixable) {
             (_, true) if finding.consent_flag.is_some() => format!(
                 "Press f to fix (asks for administrator rights; it lowers security, so you are \
@@ -715,17 +704,7 @@ fn readiness_from_facts(
 ) -> ReadinessAssessment {
     let mut state = OperationalReadiness::Ready;
     let mut activity = Vec::new();
-    let mut raise = |next| {
-        let rank = |value| match value {
-            OperationalReadiness::Ready => 0,
-            OperationalReadiness::Unknown => 1,
-            OperationalReadiness::Degraded => 2,
-            OperationalReadiness::Blocked => 3,
-        };
-        if rank(next) > rank(state) {
-            state = next;
-        }
-    };
+    let mut raise = |next| state = state.worse(next);
     let mut issue =
         |id: &str, severity: OperationalReadiness, summary: String, remediation: String| {
             raise(severity);

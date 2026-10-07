@@ -61,43 +61,6 @@ pub fn run_elevated(program: &Path, args: &[OsString], terminal: bool) -> Elevat
     sys::run_elevated(program, args, terminal)
 }
 
-/// Quotes one argument for a Windows command line so that
-/// `CommandLineToArgvW` (and Rust's own argument parser) reads it back
-/// unchanged.
-///
-/// `ShellExecuteExW` takes one parameter string rather than a vector, so the
-/// relaunch has to build that string itself.
-#[must_use]
-pub fn quote_windows_argument(argument: &str) -> String {
-    if !argument.is_empty() && !argument.contains([' ', '\t', '\n', '\x0b', '"']) {
-        return argument.to_owned();
-    }
-    let mut quoted = String::with_capacity(argument.len() + 2);
-    quoted.push('"');
-    let mut backslashes = 0usize;
-    for character in argument.chars() {
-        match character {
-            '\\' => backslashes += 1,
-            '"' => {
-                // Every backslash before a quote is doubled, and the quote is
-                // escaped with one more.
-                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            other => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes));
-                quoted.push(other);
-                backslashes = 0;
-            }
-        }
-    }
-    // Backslashes before the closing quote are doubled so it is not escaped.
-    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    quoted
-}
-
 /// Quotes one argument for a POSIX shell.
 #[must_use]
 pub fn quote_posix_argument(argument: &str) -> String {
@@ -129,16 +92,25 @@ pub fn physical_memory_bytes() -> Option<u64> {
 /// The system's error when the directory cannot be reported.
 #[cfg(windows)]
 pub fn system_directory() -> std::io::Result<PathBuf> {
-    let mut buffer = [0u16; 512];
-    // SAFETY: `GetSystemDirectoryW` writes at most `buffer.len()` code units
-    // into a slice this frame owns.
-    let written = unsafe {
-        windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buffer))
-    } as usize;
-    if written == 0 || written > buffer.len() {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..written])))
+    crate::runner_root::windows_system_directory().map(PathBuf::from)
+}
+
+/// Replaces `path` with `bytes` atomically: a temporary file beside it, flushed
+/// to disk, then renamed over it, so a reader never sees half a file.
+///
+/// # Errors
+/// The I/O error of any step.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 /// Whether this process can create a symbolic link inside `directory`.
@@ -333,10 +305,8 @@ pub fn record_host_unfit(
         checks: checks.to_vec(),
     };
     let path = host_unfit_path(paths);
-    let text = serde_json::to_string_pretty(&record).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.new");
-    std::fs::write(&temporary, text)
-        .and_then(|()| std::fs::rename(&temporary, &path))
+    let text = serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?;
+    write_atomically(&path, &text)
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
@@ -678,7 +648,7 @@ mod sys {
             .collect();
         let parameters = args
             .iter()
-            .map(|argument| super::quote_windows_argument(&argument.to_string_lossy()))
+            .map(|argument| crate::service::quote_argument(&argument.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(" ");
         let parameters = wide(&parameters);
@@ -889,7 +859,11 @@ mod tests {
             ("a\\\"b", "\"a\\\\\\\"b\""),
             ("{\"k\":\"C:\\\\r m\"}", "\"{\\\"k\\\":\\\"C:\\\\r m\\\"}\""),
         ] {
-            assert_eq!(quote_windows_argument(argument), expected, "{argument}");
+            assert_eq!(
+                crate::service::quote_argument(argument),
+                expected,
+                "{argument}"
+            );
         }
     }
 
