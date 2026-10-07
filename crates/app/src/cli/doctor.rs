@@ -2234,7 +2234,7 @@ pub enum ElevationFailure {
 }
 
 impl ElevationFailure {
-    fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         match self {
             Self::Refused => "administrator rights were refused".to_owned(),
             Self::Unavailable(detail) => {

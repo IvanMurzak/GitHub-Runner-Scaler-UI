@@ -52,7 +52,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, Stdio};
 use std::sync::Arc;
@@ -63,6 +63,7 @@ use runner_manager_domain::model::{Clock, StartMode};
 use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{InventoryGateway, RestInventory};
 use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
+use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::{InstallRecord, TaskPrincipal};
 use runner_manager_platform::wsl::artifact::{
@@ -80,17 +81,18 @@ use runner_manager_platform::wsl::task::{
 };
 use runner_manager_platform::wsl::{WslError, WslHost};
 use secrecy::SecretString;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::auth::{
     BrokeredCredential, SecretSink, SecretSinkError, StoredCredential, StoringRenewal,
     broker_user_credential,
 };
+use super::doctor::ElevationFailure;
 use super::update::{AssetSource, fetch_file, fetch_text};
 use super::{
     AuthCommand, Cli, CliError, Command, Context, Failure, HOST_OPTION, StartAt, Styling,
-    WslCommand, WslDetachArgs, WslHostCommand, WslHostSuperviseArgs, WslInstallArgs, WslStatusArgs,
-    write_failed,
+    WslCommand, WslDetachArgs, WslHostCommand, WslHostRegisterTaskArgs, WslHostSuperviseArgs,
+    WslInstallArgs, WslStatusArgs, write_failed,
 };
 
 /// `--host=` — the other spelling clap accepts for the same option.
@@ -269,6 +271,7 @@ pub fn dispatch_wsl_host(
             hold(&HostSystemd, &unit, out, &mut wait)
         }
         WslHostCommand::Supervise(args) => supervise(context, args, out),
+        WslHostCommand::RegisterTask(args) => register_task_elevated(args),
         WslHostCommand::ConfigureRecovery(args) => {
             require_linux()?;
             if !args.shared_root.is_absolute() {
@@ -351,6 +354,14 @@ fn supervise(
         ));
     }
 
+    // Taken first, so that a replacement landing while this starts is still
+    // newer than the start it is compared with.
+    let started = std::time::SystemTime::now();
+    // Only under the stable supervisor: it restarts the same path when this
+    // exits with `UpgradePending`, and nothing else would.
+    let own_image =
+        std::env::var_os(SUPERVISED_ENVIRONMENT).and_then(|_| std::env::current_exe().ok());
+
     let store = context.store()?;
     let mode = context
         .recorded_start_mode(&store)
@@ -400,6 +411,7 @@ fn supervise(
         "WSL lifecycle and recovery supervisor running for {distribution}"
     )
     .map_err(write_failed("the WSL lifecycle supervisor"))?;
+    let replaced_by = own_image.clone();
     super::runtime()?.block_on(async move {
         tokio::select! {
             () = keep_guest_holder_alive(executable, distribution.clone(), linux_binary, shared_root) => {
@@ -408,9 +420,74 @@ fn supervise(
             () = super::wsl_watchdog::maintain_distribution(paths, inventory, distribution) => {
                 unreachable!("the WSL recovery watchdog runs until its task is stopped")
             }
+            () = wait_for_companion_replacement(own_image, started) => {}
         }
     });
-    Ok(())
+    // Only the replacement watch ends. Dropping the holder loop above stopped
+    // the holder it owned; the supervisor starts the new companion from the
+    // same path at once, and that starts a holder of its own.
+    tracing::info!(
+        image = ?replaced_by,
+        "a newer WSL lifecycle companion was installed; restarting onto it"
+    );
+    Err(CliError::with_remedy(
+        Failure::UpgradePending,
+        "a newer WSL lifecycle companion was installed at this path; exiting so its supervisor \
+         starts it",
+        "runner-manager wsl status --distribution <NAME>",
+    ))
+}
+
+/// What `runner-manager-supervisor` sets in its child's environment.
+const SUPERVISED_ENVIRONMENT: &str = "RUNNER_MANAGER_SUPERVISED";
+
+/// How often a running companion looks for a replacement of its own file.
+const COMPANION_REPLACEMENT_POLL: Duration = Duration::from_secs(15);
+
+/// Returns once `wsl install` has put a different companion at `image`.
+///
+/// This is how an update reaches a companion that is already running without
+/// touching the lifecycle task: `wsl install` swaps the file in place
+/// ([`replace_in_place`]) and this process, seeing a file newer than itself,
+/// exits for the supervisor to start the new one. Never returns when there is
+/// nothing to watch -- a companion started outside the supervisor, or under a
+/// versioned path nothing replaces.
+async fn wait_for_companion_replacement(image: Option<PathBuf>, started: std::time::SystemTime) {
+    let Some(image) = image else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(COMPANION_REPLACEMENT_POLL).await;
+        if companion_replaced_since(&image, started) {
+            return;
+        }
+    }
+}
+
+/// Whether the file at `image` was put there after `started`.
+///
+/// A missing file is not a replacement: [`replace_in_place`] renames the old
+/// file aside a moment before the new one arrives, and a look in between must
+/// not exit for a program that is not there yet.
+fn companion_replaced_since(image: &Path, started: std::time::SystemTime) -> bool {
+    std::fs::metadata(image)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified > started)
+}
+
+/// The guest holder process, stopped when its owner lets go of it.
+///
+/// So that a companion exiting for its replacement does not leave a holder
+/// behind for the new one to duplicate.
+struct HolderProcess(Child);
+
+impl Drop for HolderProcess {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 async fn keep_guest_holder_alive(
@@ -421,19 +498,22 @@ async fn keep_guest_holder_alive(
 ) {
     loop {
         match spawn_guest_holder(&executable, &distribution, &linux_binary, &shared_root) {
-            Ok(mut child) => loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        tracing::warn!(%distribution, %status, "the WSL guest holder exited; restarting it");
-                        break;
-                    }
-                    Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
-                    Err(error) => {
-                        tracing::warn!(%distribution, %error, "the WSL guest holder cannot be observed; restarting it");
-                        break;
+            Ok(child) => {
+                let mut holder = HolderProcess(child);
+                loop {
+                    match holder.0.try_wait() {
+                        Ok(Some(status)) => {
+                            tracing::warn!(%distribution, %status, "the WSL guest holder exited; restarting it");
+                            break;
+                        }
+                        Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
+                        Err(error) => {
+                            tracing::warn!(%distribution, %error, "the WSL guest holder cannot be observed; restarting it");
+                            break;
+                        }
                     }
                 }
-            },
+            }
             Err(error) => {
                 tracing::warn!(%distribution, %error, "the WSL guest holder cannot be started")
             }
@@ -2079,6 +2159,8 @@ pub struct Provisioner<'a> {
     pub assets: &'a dyn ReleaseAssets,
     /// Who runs the device flow when a credential has to be issued.
     pub issuer: &'a dyn CredentialIssuer,
+    /// Who registers the lifecycle task when Windows refuses this process.
+    pub elevation: &'a dyn TaskElevation,
     /// This machine's config directory, for the provider record.
     pub paths: &'a AppPaths,
     /// The Windows account the login task is registered for.
@@ -2295,49 +2377,93 @@ impl Provisioner<'_> {
                 format!("cannot create the WSL recovery directory: {source}"),
             )
         })?;
-        let task = LifecycleTask::new(
-            identity.clone(),
-            self.principal.clone(),
-            self.host.executable(),
-            self.linux_binary.clone(),
-        )
-        .with_recovery_root(recovery_root);
-        let task = match &self.windows_binary {
-            Some(binary) => {
-                let (supervisor, child) = self
-                    .install_windows_lifecycle_companion(binary)
-                    .map_err(|source| {
-                        in_stage(
-                            Stage::LifecycleTask,
-                            CliError::new(
-                                Failure::LocalState,
-                                format!(
-                                    "cannot install the Windows WSL recovery companion: {source}"
-                                ),
-                            ),
-                        )
-                    })?;
-                task.with_windows_supervisor(supervisor, child)
-            }
-            None => task,
+        let companion = match &self.windows_binary {
+            Some(binary) => Some(self.install_windows_lifecycle_companion(binary).map_err(
+                |source| {
+                    in_stage(
+                        Stage::LifecycleTask,
+                        CliError::new(
+                            Failure::LocalState,
+                            format!("cannot install the Windows WSL recovery companion: {source}"),
+                        ),
+                    )
+                },
+            )?),
+            None => None,
         };
+        let mut request = LifecycleTaskRequest {
+            distribution: distribution.clone(),
+            principal: self.principal.user_id().to_string(),
+            linux_binary: self.linux_binary.clone(),
+            recovery_root,
+            companion: companion
+                .as_ref()
+                .map(|files| (files.supervisor.clone(), files.child.clone())),
+            restart: false,
+        };
+        let task = request
+            .task(self.host.executable())
+            .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?;
         let tasks = self.host.tasks();
-        tasks
-            .register(&task)
+        let registered = tasks
+            .query(&identity)
             .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?;
-        // Started now as well as at logon: the operator asked for a runner
-        // host, and one that only exists after the next sign-out would look
-        // broken for the rest of today.
-        tasks
-            .start(&identity)
-            .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?;
-        writeln!(
-            out,
-            "Lifecycle task {} registered and started.",
-            identity.name()
-        )
-        .map_err(failed)?;
+        match registered {
+            // The common update: the document is version-independent, so it
+            // is already right, and this makes no Task Scheduler write at all
+            // -- the write is what needed administrator rights on every host
+            // whose task an elevated prompt created.
+            Some(existing) if task.is_registered_as(&existing) => {
+                if existing.running() {
+                    let restarting = if companion.as_ref().is_some_and(|files| files.replaced) {
+                        format!(
+                            " Its Windows companion notices the new {} and restarts onto it by \
+                             itself.",
+                            self.version
+                        )
+                    } else {
+                        String::new()
+                    };
+                    writeln!(
+                        out,
+                        "Lifecycle task {} is current and running; it was left as it is.{restarting}",
+                        identity.name()
+                    )
+                    .map_err(failed)?;
+                } else {
+                    // Started now as well as at logon: the operator asked for
+                    // a runner host, and one that only exists after the next
+                    // sign-out would look broken for the rest of today.
+                    tasks
+                        .start(&identity)
+                        .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?;
+                    writeln!(
+                        out,
+                        "Lifecycle task {} is current; started.",
+                        identity.name()
+                    )
+                    .map_err(failed)?;
+                }
+            }
+            registered => {
+                // A running task is restarted after it is re-registered, or
+                // the companion it is running stays the old one -- under the
+                // versioned paths of 0.4.34 and earlier, until the next logon.
+                request.restart = registered.as_ref().is_some_and(RegisteredTask::running);
+                let why = if registered.is_some() {
+                    TaskChange::Replace
+                } else {
+                    TaskChange::Create
+                };
+                self.apply_task_request(&request, why, out)?;
+            }
+        }
         out.flush().map_err(failed)?;
+        // Only once the task names the version-independent paths: until then
+        // a versioned copy may be the very program it starts.
+        if let Some(files) = &companion {
+            remove_retired_companion_files(&files.directory);
+        }
 
         // -- Stage 8: the record, then the read-back -----------------------
         // The record is written before the read-back so that a host which is
@@ -2375,23 +2501,98 @@ impl Provisioner<'_> {
         ))
     }
 
-    fn install_windows_lifecycle_companion(
-        &self,
-        source: &Path,
-    ) -> Result<(PathBuf, PathBuf), io::Error> {
+    /// Puts this build's Windows companion at the version-independent paths
+    /// the lifecycle task names.
+    ///
+    /// The task document never changes on an update because these paths do
+    /// not; the files behind them are swapped in place by
+    /// [`replace_in_place`], which works while the old companion is running.
+    fn install_windows_lifecycle_companion(&self, source: &Path) -> io::Result<CompanionFiles> {
         let directory = self.paths.state_dir().join("bin");
         std::fs::create_dir_all(&directory)?;
-        let child = directory.join(format!("runner-manager-wsl-{}.exe", self.version));
-        let supervisor = directory.join(format!(
-            "runner-manager-wsl-supervisor-{}.exe",
-            self.version
-        ));
-        install_versioned_copy(source, &child)?;
-        install_versioned_copy(
+        let child = directory.join(COMPANION_CHILD);
+        let supervisor = directory.join(COMPANION_SUPERVISOR);
+        let child_replaced = replace_in_place(source, &child)?;
+        let supervisor_replaced = replace_in_place(
             &source.with_file_name("runner-manager-supervisor.exe"),
             &supervisor,
         )?;
-        Ok((supervisor, child))
+        Ok(CompanionFiles {
+            directory,
+            supervisor,
+            child,
+            replaced: child_replaced || supervisor_replaced,
+        })
+    }
+
+    /// Registers the task the request describes, restarting it when asked,
+    /// and asks for administrator rights only when Windows refuses without
+    /// them.
+    ///
+    /// # Errors
+    /// The stage failure for anything Task Scheduler refused, and one that
+    /// names the exact command to run elevated when the administrator prompt
+    /// could not be shown or was declined.
+    fn apply_task_request(
+        &self,
+        request: &LifecycleTaskRequest,
+        change: TaskChange,
+        out: &mut dyn Write,
+    ) -> Result<(), CliError> {
+        let failed = write_failed("this install");
+        let name = LifecycleTaskIdentity::for_distribution(&request.distribution)
+            .map_err(|source| self.stage_failure(Stage::LifecycleTask, &source))?
+            .name()
+            .to_string();
+        let denied = match apply_lifecycle_task_request(self.host, request) {
+            Ok(()) => {
+                writeln!(out, "Lifecycle task {name} {} and started.", change.done())
+                    .map_err(failed)?;
+                return Ok(());
+            }
+            Err(WslError::NeedsElevation { detail, .. }) => detail,
+            Err(source) => return Err(self.stage_failure(Stage::LifecycleTask, &source)),
+        };
+
+        writeln!(
+            out,
+            "Windows refused to {} the lifecycle task {name} without administrator rights; \
+             asking for them once.",
+            change.verb()
+        )
+        .map_err(failed)?;
+        out.flush().map_err(failed)?;
+        match self.elevation.apply(request) {
+            Ok(()) => {
+                writeln!(
+                    out,
+                    "Lifecycle task {name} {} and started with administrator rights.",
+                    change.done()
+                )
+                .map_err(failed)?;
+                Ok(())
+            }
+            Err(failure) => Err(in_stage(
+                Stage::LifecycleTask,
+                CliError::with_remedy(
+                    Failure::WslProvisioning,
+                    format!(
+                        "Windows will {} the lifecycle task {name} only with administrator rights \
+                         ({}), and {}. {} Nothing else needs them: once the task names the \
+                         version-independent companion, updates leave it as it is.",
+                        change.verb(),
+                        denied.trim(),
+                        failure.reason(),
+                        change.why_once()
+                    ),
+                    format!(
+                        "runner-manager wsl install --distribution {}   (once, from an elevated \
+                         prompt)",
+                        shell_word(&request.distribution)
+                    ),
+                ),
+            )),
+        }
     }
 
     /// Stage 2, whole: the checksum document, the exact release, and the
@@ -2708,20 +2909,346 @@ impl Provisioner<'_> {
     }
 }
 
-fn install_versioned_copy(source: &Path, destination: &Path) -> io::Result<()> {
-    if destination.is_file() {
-        return Ok(());
+// ---------------------------------------------------------------------------
+// The Windows companion and its lifecycle task
+// ---------------------------------------------------------------------------
+
+/// The companion's version-independent file names, under `state/bin`.
+///
+/// Up to 0.4.34 these carried the version (`runner-manager-wsl-0.4.34.exe`),
+/// which made every update a different task document and so a `schtasks
+/// /Create` -- the call Windows refuses an ordinary token for a task that an
+/// elevated prompt created. See [`LifecycleTask::is_registered_as`].
+const COMPANION_CHILD: &str = "runner-manager-wsl.exe";
+const COMPANION_SUPERVISOR: &str = "runner-manager-wsl-supervisor.exe";
+
+/// The prefix every companion file shares, current, set aside or retired.
+const COMPANION_PREFIX: &str = "runner-manager-wsl";
+
+/// Where the companion was put, and whether this install changed it.
+#[derive(Debug)]
+struct CompanionFiles {
+    directory: PathBuf,
+    supervisor: PathBuf,
+    child: PathBuf,
+    /// A running companion restarts onto a replaced file by itself; see
+    /// [`wait_for_companion_replacement`].
+    replaced: bool,
+}
+
+/// Replaces `destination` with a copy of `source`, even while `destination`
+/// is a running program. Returns whether anything changed.
+///
+/// # A running image can be renamed, not overwritten
+///
+/// Windows refuses to write or delete an executable that a process is
+/// running, but it allows renaming it. So the running file is renamed aside
+/// to a unique name and the new one is moved into the freed name; the old
+/// process keeps running from the renamed file, and the next start of the
+/// path is the new build. A copy whose bytes already match is left alone, so
+/// a rerun of the same version restarts nothing.
+///
+/// The new file's modification time is set *after* it is in place: that is
+/// what a running companion compares against its own start time
+/// ([`companion_replaced_since`]), and setting it any earlier would let a
+/// companion that started between the write and the rename -- from the old
+/// file -- believe it was already the new one.
+fn replace_in_place(source: &Path, destination: &Path) -> io::Result<bool> {
+    if destination.is_file() && same_contents(source, destination)? {
+        return Ok(false);
     }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let mut input = std::fs::File::open(source)?;
-    io::copy(&mut input, temporary.as_file_mut())?;
+    io::copy(&mut std::fs::File::open(source)?, temporary.as_file_mut())?;
     temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(destination) {
-        Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error.error),
+
+    let aside = if destination.exists() {
+        let aside = aside_path(destination);
+        std::fs::rename(destination, &aside)?;
+        Some(aside)
+    } else {
+        None
+    };
+    if let Err(error) = temporary.persist_noclobber(destination) {
+        if let Some(aside) = &aside {
+            let _ = std::fs::rename(aside, destination);
+        }
+        return Err(error.error);
+    }
+    if let Some(aside) = aside {
+        // Succeeds when nothing is running it; otherwise a later install's
+        // sweep removes it once that process has gone.
+        let _ = std::fs::remove_file(aside);
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(destination) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    Ok(true)
+}
+
+/// Whether two files hold the same bytes.
+fn same_contents(left: &Path, right: &Path) -> io::Result<bool> {
+    use std::io::Read as _;
+    if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let (mut left, mut right) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
+    let (mut a, mut b) = (vec![0_u8; 64 * 1024], vec![0_u8; 64 * 1024]);
+    loop {
+        let read = left.read(&mut a)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        right.read_exact(&mut b[..read])?;
+        if a[..read] != b[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// A name beside `path` that no earlier swap used, so that a file still
+/// running from an earlier swap's aside name never blocks this one.
+fn aside_path(path: &Path) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let name = path
+        .file_name()
+        .map_or_else(|| COMPANION_PREFIX.into(), |name| name.to_string_lossy());
+    path.with_file_name(format!("{name}.{unique}-{}.old", std::process::id()))
+}
+
+/// Best-effort removal of companion files nothing names any more: the
+/// aside copies [`replace_in_place`] leaves while their process runs, and the
+/// versioned copies 0.4.34 and earlier installed. A file that is still
+/// running cannot be deleted and is left for the next install.
+fn remove_retired_companion_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_retired_companion_file(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `runner-manager-wsl.exe.<id>.old`, `runner-manager-wsl-0.4.34.exe` and
+/// `runner-manager-wsl-supervisor-0.4.34.exe` -- never the two current files
+/// and never the service's own `runner-manager.exe` / `.old` beside them.
+fn is_retired_companion_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(COMPANION_PREFIX) else {
+        return false;
+    };
+    if name.ends_with(".old") {
+        return true;
+    }
+    let versioned = rest
+        .strip_prefix("-supervisor-")
+        .or_else(|| rest.strip_prefix('-'));
+    versioned.is_some_and(|version| {
+        version.starts_with(|c: char| c.is_ascii_digit())
+            && version.to_ascii_lowercase().ends_with(".exe")
+    })
+}
+
+/// A distribution name as an operator would type it in a command.
+fn shell_word(text: &str) -> String {
+    if text.contains(char::is_whitespace) {
+        format!("\"{text}\"")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Why the lifecycle task is being registered, for the sentences around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskChange {
+    Create,
+    Replace,
+}
+
+impl TaskChange {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Create => "register",
+            Self::Replace => "replace",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Self::Create => "registered",
+            Self::Replace => "re-registered",
+        }
+    }
+
+    fn why_once(self) -> &'static str {
+        match self {
+            Self::Create => "A distribution's lifecycle task is registered once.",
+            Self::Replace => {
+                "The registered task differs from the one this release writes -- up to 0.4.34 it \
+                 named a companion whose path carried the version -- so it is replaced once."
+            }
+        }
+    }
+}
+
+/// Everything needed to register a distribution's lifecycle task, in a form
+/// that can be handed to an elevated copy of this binary.
+///
+/// The task built from it is the same whichever process builds it:
+/// [`Provisioner::install`] compares and registers [`Self::task`], and so does
+/// the elevated `wsl-host register-task`, so the two cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleTaskRequest {
+    pub distribution: String,
+    /// The Windows account the task runs as, `DOMAIN\user`. Carried rather
+    /// than re-read: an elevated copy may run as a different administrator.
+    pub principal: String,
+    pub linux_binary: String,
+    pub recovery_root: PathBuf,
+    /// The companion's supervisor and child, when there is one.
+    pub companion: Option<(PathBuf, PathBuf)>,
+    /// End the running instance after registering, so that the new document
+    /// is what runs.
+    pub restart: bool,
+}
+
+impl LifecycleTaskRequest {
+    /// The task this request describes.
+    ///
+    /// # Errors
+    /// [`WslError::InvalidName`] for a distribution name that cannot name a
+    /// task.
+    pub fn task(&self, wsl: &WslExecutable) -> Result<LifecycleTask, WslError> {
+        let task = LifecycleTask::new(
+            LifecycleTaskIdentity::for_distribution(&self.distribution)?,
+            TaskPrincipal::named(self.principal.clone()),
+            wsl,
+            self.linux_binary.clone(),
+        )
+        .with_recovery_root(self.recovery_root.clone());
+        Ok(match &self.companion {
+            Some((supervisor, child)) => {
+                task.with_windows_supervisor(supervisor.clone(), child.clone())
+            }
+            None => task,
+        })
+    }
+}
+
+/// Registers the requested task, restarts it when asked, and starts it.
+///
+/// # Errors
+/// Whatever Task Scheduler refused, [`WslError::NeedsElevation`] among them.
+fn apply_lifecycle_task_request(
+    host: &WslHost,
+    request: &LifecycleTaskRequest,
+) -> Result<(), WslError> {
+    let task = request.task(host.executable())?;
+    let tasks = host.tasks();
+    tasks.register(&task)?;
+    if request.restart {
+        tasks.stop(task.identity())?;
+    }
+    // Started now as well as at logon: the operator asked for a runner host,
+    // and one that only exists after the next sign-out would look broken for
+    // the rest of today.
+    tasks.start(task.identity())
+}
+
+/// Carries out a [`LifecycleTaskRequest`] with administrator rights.
+pub trait TaskElevation: fmt::Debug {
+    /// # Errors
+    /// Why no elevated copy did it.
+    fn apply(&self, request: &LifecycleTaskRequest) -> Result<(), ElevationFailure>;
+}
+
+/// Relaunches this binary once through the same administrator prompt `host
+/// prepare` uses ([`host_fitness::run_elevated`]), running only
+/// `wsl-host register-task`.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemTaskElevation {
+    /// Whether a person is at this terminal to answer a prompt. Without one --
+    /// a script, a service, an SSH session -- nothing is asked, and the
+    /// failure names the command to run elevated instead.
+    pub interactive: bool,
+}
+
+impl TaskElevation for SystemTaskElevation {
+    fn apply(&self, request: &LifecycleTaskRequest) -> Result<(), ElevationFailure> {
+        if !self.interactive {
+            return Err(ElevationFailure::Unavailable(
+                "this session has no terminal, so nobody can answer an administrator prompt".into(),
+            ));
+        }
+        let failed = |error: String| ElevationFailure::Failed(error);
+        let program = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
+        let directory = tempfile::tempdir().map_err(|error| failed(error.to_string()))?;
+        let result = directory.path().join("result.json");
+        let encoded = serde_json::to_string(request).map_err(|error| failed(error.to_string()))?;
+        let args = [
+            OsString::from("wsl-host"),
+            OsString::from("register-task"),
+            OsString::from("--request"),
+            OsString::from(encoded),
+            OsString::from("--result"),
+            result.clone().into_os_string(),
+        ];
+        match host_fitness::run_elevated(&program, &args, true) {
+            ElevationOutcome::Refused => Err(ElevationFailure::Refused),
+            ElevationOutcome::Unavailable(detail) => Err(ElevationFailure::Unavailable(detail)),
+            ElevationOutcome::Exited(code) => {
+                let text = std::fs::read_to_string(&result).map_err(|error| {
+                    failed(format!("it exited {code} and wrote no result ({error})"))
+                })?;
+                let reported: ElevatedTaskResult =
+                    serde_json::from_str(&text).map_err(|error| failed(error.to_string()))?;
+                reported.error.map_or(Ok(()), |error| Err(failed(error)))
+            }
+        }
+    }
+}
+
+/// What the elevated `wsl-host register-task` reports back.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ElevatedTaskResult {
+    error: Option<String>,
+}
+
+/// `runner-manager wsl-host register-task`: the elevated half of
+/// [`SystemTaskElevation`]. Opens no database and touches nothing but Task
+/// Scheduler, then reports into the file it was given.
+///
+/// # Errors
+/// [`Failure::WslProvisioning`] when the request was not carried out; the
+/// reason is also in the result file.
+fn register_task_elevated(args: &WslHostRegisterTaskArgs) -> Result<(), CliError> {
+    let outcome = serde_json::from_str::<LifecycleTaskRequest>(&args.request)
+        .map_err(|error| format!("the request is unreadable: {error}"))
+        .and_then(|request| {
+            let host = WslHost::on_this_host("the elevated lifecycle-task registration")
+                .map_err(|error| error.to_string())?;
+            apply_lifecycle_task_request(&host, &request).map_err(|error| error.to_string())
+        });
+    let report = ElevatedTaskResult {
+        error: outcome.as_ref().err().cloned(),
+    };
+    let written = serde_json::to_vec(&report)
+        .map_err(io::Error::other)
+        .and_then(|bytes| std::fs::write(&args.result, bytes));
+    match (outcome, written) {
+        (Err(error), _) => Err(CliError::new(Failure::WslProvisioning, error)),
+        (Ok(()), Err(error)) => Err(CliError::new(
+            Failure::LocalState,
+            format!(
+                "the lifecycle task was registered but the result could not be written: {error}"
+            ),
+        )),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -2898,6 +3425,9 @@ pub fn install(
     let version = env!("CARGO_PKG_VERSION").to_string();
     let assets = PublishedReleaseAssets::for_version(&version, &mut err)?;
     let issuer = DeviceFlowIssuer::new(context, styling);
+    let elevation = SystemTaskElevation {
+        interactive: io::stdin().is_terminal() && io::stderr().is_terminal(),
+    };
     let principal = TaskPrincipal::current().map_err(|source| {
         CliError::with_remedy(
             Failure::WslProvisioning,
@@ -2910,6 +3440,7 @@ pub fn install(
         host: &host,
         assets: &assets,
         issuer: &issuer,
+        elevation: &elevation,
         paths: context.paths(),
         principal,
         version,
@@ -3656,21 +4187,191 @@ mod tests {
     }
 
     #[test]
-    fn versioned_windows_companion_copy_is_immutable_and_never_locks_the_package_source() {
+    fn the_companion_is_replaced_in_place_and_a_matching_copy_is_left_alone() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.exe");
-        let destination = root.path().join("state/bin/runner-manager-wsl-1.exe");
+        let destination = root.path().join("state/bin").join(COMPANION_CHILD);
         std::fs::write(&source, b"first").unwrap();
-        install_versioned_copy(&source, &destination).unwrap();
+        assert!(replace_in_place(&source, &destination).unwrap());
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
 
-        std::fs::write(&source, b"new package version").unwrap();
-        install_versioned_copy(&source, &destination).unwrap();
-        assert_eq!(
-            std::fs::read(&destination).unwrap(),
-            b"first",
-            "a running versioned companion is never overwritten"
+        // The same build again: nothing changes, so nothing restarts.
+        let started = std::time::SystemTime::now();
+        assert!(!replace_in_place(&source, &destination).unwrap());
+        assert!(!companion_replaced_since(&destination, started));
+
+        std::fs::write(&source, b"the next build").unwrap();
+        assert!(replace_in_place(&source, &destination).unwrap());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"the next build");
+        assert!(
+            companion_replaced_since(&destination, started),
+            "a companion started before the swap sees a newer file"
         );
+        assert!(
+            !companion_replaced_since(&destination, std::time::SystemTime::now()),
+            "and the one started after it does not, so it never restarts in a loop"
+        );
+        assert_eq!(
+            std::fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "nothing is left beside it when nothing was running the old file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_companion_is_replaced_without_stopping_it() {
+        // The claim the version-independent path rests on: Windows refuses to
+        // overwrite or delete a running image but lets it be renamed. Proved
+        // with a real running program rather than asserted.
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join(COMPANION_CHILD);
+        let ping = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("PING.EXE");
+        std::fs::copy(&ping, &destination).unwrap();
+        let mut running = std::process::Command::new(&destination)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            std::fs::remove_file(&destination).is_err(),
+            "the running image cannot simply be deleted, or this test proves nothing"
+        );
+
+        let source = root.path().join("new.exe");
+        std::fs::write(&source, b"the next build").unwrap();
+        let replaced = replace_in_place(&source, &destination);
+        let _ = running.kill();
+        let _ = running.wait();
+
+        assert!(replaced.unwrap(), "replaced while running");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"the next build");
+        let leftovers: Vec<String> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_retired_companion_file(name))
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "the running file was set aside: {leftovers:?}"
+        );
+        remove_retired_companion_files(root.path());
+        assert!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !is_retired_companion_file(&entry.file_name().to_string_lossy())),
+            "and swept once it stopped running"
+        );
+    }
+
+    #[test]
+    fn only_retired_companion_files_are_swept() {
+        for retired in [
+            "runner-manager-wsl-0.4.34.exe",
+            "runner-manager-wsl-supervisor-0.4.30.exe",
+            "runner-manager-wsl.exe.1759800000000000000-4242.old",
+            "runner-manager-wsl-supervisor.exe.1-2.old",
+        ] {
+            assert!(is_retired_companion_file(retired), "{retired}");
+        }
+        for kept in [
+            COMPANION_CHILD,
+            COMPANION_SUPERVISOR,
+            "runner-manager.exe",
+            "runner-manager.old",
+            "runner-manager-supervisor.exe",
+            "runner-manager-supervisor.old",
+            "runner-manager-wsl-recovery.json",
+        ] {
+            assert!(!is_retired_companion_file(kept), "{kept}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            COMPANION_CHILD,
+            "runner-manager.exe",
+            "runner-manager-wsl-0.4.34.exe",
+        ] {
+            std::fs::write(root.path().join(name), b"x").unwrap();
+        }
+        remove_retired_companion_files(root.path());
+        let mut left: Vec<String> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![COMPANION_CHILD, "runner-manager.exe"]);
+    }
+
+    #[test]
+    fn the_elevated_registration_always_reports_into_its_result_file() {
+        // The prompting process reads only this file: the elevated window is
+        // hidden and its exit code alone cannot say what went wrong.
+        let root = tempfile::tempdir().unwrap();
+        let result = root.path().join("result.json");
+        let refusal = register_task_elevated(&WslHostRegisterTaskArgs {
+            request: "{not a request".to_string(),
+            result: result.clone(),
+        })
+        .expect_err("an unreadable request");
+        assert_eq!(refusal.class(), Failure::WslProvisioning);
+        let reported: ElevatedTaskResult =
+            serde_json::from_str(&std::fs::read_to_string(&result).unwrap()).unwrap();
+        assert!(
+            reported
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unreadable")),
+            "{reported:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_request_survives_the_trip_to_the_elevated_copy_unchanged() {
+        let request = LifecycleTaskRequest {
+            distribution: "My Ubuntu".to_string(),
+            principal: "IVANPC\\IvanD".to_string(),
+            linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
+            recovery_root: PathBuf::from(r"C:\state\wsl-recovery\My Ubuntu"),
+            companion: Some((
+                PathBuf::from(r"C:\state\bin\runner-manager-wsl-supervisor.exe"),
+                PathBuf::from(r"C:\state\bin\runner-manager-wsl.exe"),
+            )),
+            restart: true,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: LifecycleTaskRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let wsl = WslExecutable::at("wsl.exe");
+        assert_eq!(
+            decoded.task(&wsl).unwrap().xml(),
+            request.task(&wsl).unwrap().xml(),
+            "both processes build the same document"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_older_companion_file_is_not_a_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join(COMPANION_CHILD);
+        assert!(!companion_replaced_since(
+            &image,
+            std::time::SystemTime::now()
+        ));
+        std::fs::write(&image, b"x").unwrap();
+        assert!(!companion_replaced_since(
+            &image,
+            std::time::SystemTime::now() + Duration::from_secs(60)
+        ));
     }
 
     /// Shaped like a stored credential document and unmistakably not one.
@@ -3828,6 +4529,52 @@ mod tests {
                     format!("cannot write the fixture archive: {source}"),
                 )
             })
+        }
+    }
+
+    /// An administrator prompt that is answered without a person, and says
+    /// so in the journal. By default nobody is there to answer it.
+    #[derive(Debug)]
+    struct FakeElevation {
+        journal: Journal,
+        answer: Option<ElevationFailure>,
+        requests: Mutex<Vec<LifecycleTaskRequest>>,
+    }
+
+    impl FakeElevation {
+        fn unavailable(journal: Journal) -> Self {
+            Self {
+                journal,
+                answer: Some(ElevationFailure::Unavailable(
+                    "this fixture has nobody to answer a prompt".into(),
+                )),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn granting(journal: Journal) -> Self {
+            Self {
+                answer: None,
+                ..Self::unavailable(journal)
+            }
+        }
+
+        fn requests(&self) -> Vec<LifecycleTaskRequest> {
+            self.requests
+                .lock()
+                .expect("not shared across a panic")
+                .clone()
+        }
+    }
+
+    impl TaskElevation for FakeElevation {
+        fn apply(&self, request: &LifecycleTaskRequest) -> Result<(), ElevationFailure> {
+            self.journal.note("elevated register-task");
+            self.requests
+                .lock()
+                .expect("not shared across a panic")
+                .push(request.clone());
+            self.answer.clone().map_or(Ok(()), Err)
         }
     }
 
@@ -4065,6 +4812,8 @@ mod tests {
         runner: Arc<ScriptedRunner>,
         assets: FakeAssets,
         issuer: FakeIssuer,
+        elevation: FakeElevation,
+        windows_binary: Option<PathBuf>,
         _root: tempfile::TempDir,
         paths: AppPaths,
         out: Vec<u8>,
@@ -4072,12 +4821,20 @@ mod tests {
 
     impl Fixture {
         fn over(script: ScriptedRunner) -> Self {
+            Self::over_paths(|_| script)
+        }
+
+        /// A fixture whose script is built knowing where its directories
+        /// are, for a script that answers with a document naming them.
+        fn over_paths(script: impl FnOnce(&AppPaths) -> ScriptedRunner) -> Self {
             let journal = Journal::default();
-            let (host, runner) = wrap(script, &journal);
             let (root, paths) = fixture_paths();
+            let (host, runner) = wrap(script(&paths), &journal);
             Self {
                 assets: FakeAssets::publishing(journal.clone()),
                 issuer: FakeIssuer::issuing(journal.clone()),
+                elevation: FakeElevation::unavailable(journal.clone()),
+                windows_binary: None,
                 journal,
                 host,
                 runner,
@@ -4091,6 +4848,19 @@ mod tests {
             Self::over(fresh_script())
         }
 
+        /// Installs from a Windows package holding `contents` as both the
+        /// binary and its supervisor, so the companion stage really runs.
+        fn with_package(mut self, contents: &[u8]) -> Self {
+            let package = self._root.path().join("package");
+            std::fs::create_dir_all(&package).expect("a package directory");
+            let binary = package.join("runner-manager.exe");
+            std::fs::write(&binary, contents).expect("the package binary");
+            std::fs::write(package.join("runner-manager-supervisor.exe"), contents)
+                .expect("the package supervisor");
+            self.windows_binary = Some(binary);
+            self
+        }
+
         fn install(
             &mut self,
             capacity: Option<u16>,
@@ -4099,11 +4869,12 @@ mod tests {
                 host: &self.host,
                 assets: &self.assets,
                 issuer: &self.issuer,
+                elevation: &self.elevation,
                 paths: &self.paths,
                 principal: TaskPrincipal::named("FIXTURE\\ivan"),
                 version: version().to_string(),
                 linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
-                windows_binary: None,
+                windows_binary: self.windows_binary.clone(),
                 unit: UNIT.to_string(),
                 now: DateTime::from_timestamp(1_800_000_000, 0).expect("a fixed instant"),
             };
@@ -5149,9 +5920,63 @@ mod tests {
         }
     }
 
+    /// The task document this fixture's install writes, as Task Scheduler
+    /// would export it once registered.
+    fn desired_task_xml(paths: &AppPaths, companion: Option<(PathBuf, PathBuf)>) -> String {
+        LifecycleTaskRequest {
+            distribution: DISTRIBUTION.to_string(),
+            principal: "FIXTURE\\ivan".to_string(),
+            linux_binary: DEFAULT_LINUX_DESTINATION.to_string(),
+            recovery_root: runner_manager_platform::wsl::fence::recovery_root(paths, DISTRIBUTION)
+                .expect("a recovery root"),
+            companion,
+            restart: false,
+        }
+        .task(&WslExecutable::at("wsl.exe"))
+        .expect("a usable fixture name")
+        .xml()
+    }
+
+    /// The version-independent companion paths under a fixture's state.
+    fn stable_companion(paths: &AppPaths) -> (PathBuf, PathBuf) {
+        let bin = paths.state_dir().join("bin");
+        (bin.join(COMPANION_SUPERVISOR), bin.join(COMPANION_CHILD))
+    }
+
+    /// 0.4.34's versioned companion paths under a fixture's state.
+    fn versioned_companion(paths: &AppPaths) -> (PathBuf, PathBuf) {
+        let bin = paths.state_dir().join("bin");
+        (
+            bin.join("runner-manager-wsl-supervisor-0.4.34.exe"),
+            bin.join("runner-manager-wsl-0.4.34.exe"),
+        )
+    }
+
+    /// Windows' answer to an ordinary token replacing a task that an elevated
+    /// prompt created.
+    fn access_denied() -> CommandOutput {
+        refused("ERROR: Access is denied.\n")
+    }
+
+    /// A healthy managed host whose registered task is `task`, in the state
+    /// `status`, where `/Create` answers `create`.
+    fn provisioned_with_task(task: &str, status: &str, create: CommandOutput) -> ScriptedRunner {
+        preflight_script()
+            .always("--exec systemctl is-enabled", ok("enabled\n"))
+            .always("--exec systemctl is-active", ok("active\n"))
+            .always("--exec docker info", ok("27.1.1\n"))
+            .always("--version", ok(&format!("runner-manager {}\n", version())))
+            .always("status --json", ok(&linux_status_json(true, 8, version())))
+            .always("/XML ONE", ok(task))
+            .always("/FO CSV", ok(&format!("\"task\",\"N/A\",\"{status}\"\n")))
+            .always("/Create", create)
+    }
+
     #[test]
     fn a_rerun_over_a_provisioned_host_changes_nothing_and_still_succeeds() {
-        let mut fixture = Fixture::over(provisioned_script(ok("27.1.1\n")));
+        let mut fixture = Fixture::over_paths(|paths| {
+            provisioned_with_task(&desired_task_xml(paths, None), "Running", access_denied())
+        });
         let (document, outcome) = fixture.install(None).expect("a convergent rerun");
 
         assert!(document.healthy);
@@ -5169,12 +5994,165 @@ mod tests {
         fixture.journal.never("--exec mkdir");
         fixture.journal.never("device flow");
         fixture.journal.never("service install");
-        // The task IS re-registered and restarted: `/Create ... /F` is
-        // idempotent and `MultipleInstancesPolicy IgnoreNew` makes `/Run`
-        // idempotent too, and between them they repair a task an operator
-        // disabled or deleted by hand.
-        fixture.journal.at("/Create");
+        // The task is already the one this release writes, and running: no
+        // Task Scheduler write at all, which is what lets a rerun or an update
+        // run from an ordinary prompt.
+        fixture.journal.never("/Create");
+        fixture.journal.never("/Run");
+        fixture.journal.never("elevated register-task");
+    }
+
+    #[test]
+    fn a_current_task_that_is_not_running_is_started_without_being_registered() {
+        let mut fixture = Fixture::over_paths(|paths| {
+            provisioned_with_task(&desired_task_xml(paths, None), "Ready", access_denied())
+        });
+        fixture.install(None).expect("a convergent rerun");
+        fixture.journal.never("/Create");
         fixture.journal.at("/Run");
+        assert!(
+            fixture.output().contains("is current; started"),
+            "{}",
+            fixture.output()
+        );
+    }
+
+    #[test]
+    fn an_update_over_a_task_an_elevated_prompt_created_needs_no_administrator_rights() {
+        // The IVANPC report: every update exited 24 with "cannot register the
+        // scheduled task ... without elevation: Access is denied", because the
+        // document named the companion by version. Here the previous build's
+        // companion is in place and running, the task names the
+        // version-independent paths, and `/Create` is refused as Windows
+        // refuses it.
+        let mut fixture = Fixture::over_paths(|paths| {
+            provisioned_with_task(
+                &desired_task_xml(paths, Some(stable_companion(paths))),
+                "Running",
+                access_denied(),
+            )
+        })
+        .with_package(b"the new build");
+        let (supervisor, child) = stable_companion(&fixture.paths);
+        std::fs::create_dir_all(child.parent().expect("a bin directory")).expect("bin");
+        std::fs::write(&child, b"the previous build").expect("the previous companion");
+        std::fs::write(&supervisor, b"the previous build").expect("the previous supervisor");
+
+        fixture
+            .install(None)
+            .expect("an update needs no administrator rights");
+
+        fixture.journal.never("/Create");
+        fixture.journal.never("elevated register-task");
+        fixture.journal.never("/End");
+        assert_eq!(
+            std::fs::read(&child).expect("the companion"),
+            b"the new build"
+        );
+        assert_eq!(
+            std::fs::read(&supervisor).expect("the supervisor"),
+            b"the new build"
+        );
+        assert!(
+            fixture.output().contains("restarts onto it by itself"),
+            "the running companion picks the new build up: {}",
+            fixture.output()
+        );
+        let record = WslProviderRecord::read(&fixture.paths, DISTRIBUTION)
+            .expect("a readable record")
+            .expect("a record");
+        assert_eq!(
+            record.installed_version,
+            version(),
+            "the Windows-side record moves to the new version"
+        );
+    }
+
+    #[test]
+    fn a_versioned_task_is_migrated_once_with_one_administrator_prompt_and_restarted() {
+        let mut fixture = Fixture::over_paths(|paths| {
+            provisioned_with_task(
+                &desired_task_xml(paths, Some(versioned_companion(paths))),
+                "Running",
+                access_denied(),
+            )
+        })
+        .with_package(b"the new build");
+        fixture.elevation = FakeElevation::granting(fixture.journal.clone());
+        let (old_supervisor, old_child) = versioned_companion(&fixture.paths);
+        std::fs::create_dir_all(old_child.parent().expect("a bin directory")).expect("bin");
+        std::fs::write(&old_child, b"0.4.34").expect("the versioned companion");
+        std::fs::write(&old_supervisor, b"0.4.34").expect("the versioned supervisor");
+
+        fixture.install(None).expect("migrated with one prompt");
+
+        // Tried as this account first; rights are asked for only on refusal.
+        assert!(fixture.journal.at("/Create") < fixture.journal.at("elevated register-task"));
+        let requests = fixture.elevation.requests();
+        assert_eq!(requests.len(), 1, "one prompt: {requests:#?}");
+        assert_eq!(
+            requests[0].companion,
+            Some(stable_companion(&fixture.paths)),
+            "the elevated copy registers the version-independent paths"
+        );
+        assert!(
+            requests[0].restart,
+            "a running 0.4.34 companion is restarted onto the new document"
+        );
+        assert!(
+            fixture.output().contains("with administrator rights"),
+            "{}",
+            fixture.output()
+        );
+        assert!(!old_child.exists(), "the versioned copies are removed");
+        assert!(!old_supervisor.exists(), "the versioned copies are removed");
+        assert!(stable_companion(&fixture.paths).1.exists());
+    }
+
+    #[test]
+    fn a_migration_that_cannot_ask_for_rights_says_it_is_needed_once_and_prints_the_command() {
+        let mut fixture = Fixture::over_paths(|paths| {
+            provisioned_with_task(
+                &desired_task_xml(paths, Some(versioned_companion(paths))),
+                "Running",
+                access_denied(),
+            )
+        })
+        .with_package(b"the new build");
+
+        let refusal = fixture.install(None).expect_err("no prompt can be shown");
+
+        assert_eq!(refusal.class(), Failure::WslProvisioning);
+        let message = refusal.to_string();
+        for expected in [
+            "only with administrator rights",
+            "replaced once",
+            "updates leave it as it is",
+            "safe to run again",
+        ] {
+            assert!(message.contains(expected), "{expected:?}: {message}");
+        }
+        let remedy = refusal.remedy().expect("a command").to_string();
+        assert!(
+            remedy.starts_with("runner-manager wsl install --distribution Ubuntu"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("elevated prompt"), "{remedy}");
+    }
+
+    #[test]
+    fn a_running_task_whose_document_changed_is_restarted_after_it_is_registered() {
+        // A task this account may replace -- one an un-elevated install
+        // created -- is re-registered without a prompt, then ended and run so
+        // that the new document is what runs.
+        let mut fixture = Fixture::over(provisioned_with_task(
+            &our_task_xml(DISTRIBUTION),
+            "Running",
+            ok("SUCCESS: The scheduled task has successfully been created.\n"),
+        ));
+        fixture.install(None).expect("re-registered");
+        fixture.journal.in_order(&["/Create", "/End", "/Run"]);
+        fixture.journal.never("elevated register-task");
     }
 
     #[test]
