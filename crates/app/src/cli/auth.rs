@@ -374,38 +374,17 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
     }
 }
 
-/// What decides the start mode a sign-in assumes when `--start-at` was not
-/// given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AssumptionFacts {
-    /// The mode this host has on record, `boot` when it has none.
-    recorded: StartMode,
-    /// Whether this is macOS, where the two modes are two different keychains.
-    macos: bool,
-    /// Whether a service is installed. `None` when that could not be told.
-    service_installed: Option<bool>,
-    /// Whether this process runs as root.
-    root: bool,
-}
-
-impl AssumptionFacts {
-    fn of_this_host(context: &Context, recorded: StartMode) -> Self {
-        let macos = cfg!(target_os = "macos");
-        Self {
-            recorded,
-            macos,
-            // Asked only where the answer can change anything.
-            service_installed: if macos {
-                super::service::operations(context)
-                    .status()
-                    .ok()
-                    .map(|status| status.is_installed())
-            } else {
-                None
-            },
-            root: runner_manager_platform::host_fitness::is_elevated(),
-        }
+/// Whether a service is installed from this account's directories, asked
+/// only where the answer decides anything: on a Mac whose two stores are the
+/// two keychains. With `--data-dir` both stores live under the data directory,
+/// where either mode's can be written. `None` everywhere else.
+fn service_installed_on_a_keychain_mac(context: &Context) -> Option<bool> {
+    if !cfg!(target_os = "macos") || context.data_root.is_some() {
+        return None;
     }
+    InstallRecord::read(context.paths())
+        .ok()
+        .map(|record| record.is_some())
 }
 
 /// The start mode a sign-in uses when the operator did not name one.
@@ -417,11 +396,15 @@ impl AssumptionFacts {
 /// `SecKeychainItemCreateFromContent returned -61`. With no service yet, the
 /// service this credential is for is the one this account would install, and
 /// without `sudo` that is a `login` service.
-fn assumed_start_mode(facts: AssumptionFacts) -> StartMode {
-    if facts.macos && facts.service_installed == Some(false) && !facts.root {
+fn assumed_start_mode(
+    recorded: StartMode,
+    service_installed: Option<bool>,
+    root: bool,
+) -> StartMode {
+    if service_installed == Some(false) && !root {
         StartMode::Login
     } else {
-        facts.recorded
+        recorded
     }
 }
 
@@ -618,8 +601,13 @@ pub fn login(
     // warning that they were signing in to the wrong half. Hence the flag, and
     // hence the line printed below whether or not it was passed.
     let recorded = context.recorded_start_mode(&store)?;
-    let start_mode = requested_mode
-        .unwrap_or_else(|| assumed_start_mode(AssumptionFacts::of_this_host(context, recorded)));
+    let start_mode = requested_mode.unwrap_or_else(|| {
+        assumed_start_mode(
+            recorded,
+            service_installed_on_a_keychain_mac(context),
+            runner_manager_platform::host_fitness::is_elevated(),
+        )
+    });
     let secrets = context.secret_store(start_mode)?;
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
     // The mode used is recorded, so that `repo add`, `auth status` and the
@@ -2080,41 +2068,23 @@ mod tests {
     /// the System keychain and fail with `-61` after the device code.
     #[test]
     fn a_mac_with_no_service_signs_an_ordinary_account_in_for_a_login_service() {
-        let unchosen = AssumptionFacts {
-            recorded: StartMode::Boot,
-            macos: true,
-            service_installed: Some(false),
-            root: false,
-        };
-        assert_eq!(assumed_start_mode(unchosen), StartMode::Login);
-
-        // Everywhere else the recorded mode stands.
-        for facts in [
-            AssumptionFacts {
-                root: true,
-                ..unchosen
-            },
-            AssumptionFacts {
-                service_installed: Some(true),
-                ..unchosen
-            },
-            AssumptionFacts {
-                service_installed: None,
-                ..unchosen
-            },
-            AssumptionFacts {
-                macos: false,
-                ..unchosen
-            },
-        ] {
-            assert_eq!(assumed_start_mode(facts), StartMode::Boot, "{facts:?}");
+        assert_eq!(
+            assumed_start_mode(StartMode::Boot, Some(false), false),
+            StartMode::Login
+        );
+        // Everywhere else the recorded mode stands: as root, with a service,
+        // and where nothing was asked (not a Mac, or `--data-dir`).
+        for (installed, root) in [(Some(false), true), (Some(true), false), (None, false)] {
+            assert_eq!(
+                assumed_start_mode(StartMode::Boot, installed, root),
+                StartMode::Boot,
+                "{installed:?} {root}"
+            );
         }
-        let recorded_login = AssumptionFacts {
-            recorded: StartMode::Login,
-            root: true,
-            ..unchosen
-        };
-        assert_eq!(assumed_start_mode(recorded_login), StartMode::Login);
+        assert_eq!(
+            assumed_start_mode(StartMode::Login, Some(false), true),
+            StartMode::Login
+        );
     }
 
     fn locked_login_keychain() -> SecretStoreError {
