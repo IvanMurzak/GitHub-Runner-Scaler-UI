@@ -673,12 +673,7 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         )?;
     }
     if let Some(blocked) = &document.product.service_launches_blocked {
-        writeln!(
-            out,
-            "  daemon starts no runner   since {}: {}",
-            blocked.since.to_rfc3339(),
-            blocked.reason
-        )?;
+        writeln!(out, "  daemon starts no runner   {blocked}")?;
         writeln!(out, "  launches remedy           {}", blocked.remedy)?;
     }
     writeln!(

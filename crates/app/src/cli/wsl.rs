@@ -1579,11 +1579,7 @@ impl WslStatusDocument {
             ));
         }
         if let Some(blocked) = &self.service.launches_blocked {
-            parts.push(format!(
-                "the Linux service has started no runner since {}: {}",
-                blocked.since.to_rfc3339(),
-                blocked.reason
-            ));
+            parts.push(format!("the Linux service has started no runner {blocked}"));
         }
         if !(self.service.active.as_deref() == Some("active") && self.service.matches_expected) {
             parts.push(format!(

@@ -5063,9 +5063,7 @@ impl ServiceStatus {
             self.problems.push(StatusProblem {
                 subject: LAUNCHES_BLOCKED_SUBJECT,
                 detail: format!(
-                    "the service has started no runner since {}: {}. Fix: {}.",
-                    blocked.since.to_rfc3339(),
-                    blocked.reason,
+                    "the service has started no runner {blocked}. Fix: {}.",
                     blocked.remedy
                 ),
             });
@@ -8584,7 +8582,7 @@ mod tests {
             owner: None,
         }
         .blocked_since(Utc::now(), GUEST_RESTART);
-        record_launches_blocked(&host.paths, &blocked, 5).unwrap();
+        record_launches_blocked(&host.paths, &blocked).unwrap();
 
         let status = compose();
         assert!(!status.is_healthy());

@@ -303,31 +303,12 @@ fn the_wsl_adapter_emits_no_diagnostics_at_all() {
     // diagnostic here should add one *and* delete this test on purpose, having
     // checked that what it records is a program name, an argument, or a bound
     // -- never a `PipedInput`. Deleting it by accident is what it prevents.
-    //
-    // Reviewed exception: `fence.rs` logs the path and the I/O error of a
-    // launch claim it could not release. Silence there once hid a fence that
-    // blocked a distribution for 13 days. The fence carries only paths and JSON
-    // coordination documents, never a credential, and the check below keeps it
-    // that way.
-    const REVIEWED: &[&str] = &["fence.rs"];
     let wsl = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/wsl");
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(&wsl).expect("the wsl module is there") {
         let path = entry.expect("readable").path();
         let source = std::fs::read_to_string(&path).expect("readable");
-        let reviewed = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| REVIEWED.contains(&name));
-        if reviewed {
-            for credential in ["PipedInput", "SecretString", "secrecy", "expose_"] {
-                assert!(
-                    !source.contains(credential),
-                    "{} logs diagnostics, so it must not handle `{credential}`",
-                    path.display()
-                );
-            }
-        } else if source.contains("tracing::") {
+        if source.contains("tracing::") {
             offenders.push(path.display().to_string());
         }
     }

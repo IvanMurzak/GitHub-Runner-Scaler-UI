@@ -581,7 +581,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
         {
             let mode = status.start_mode().unwrap_or(StartMode::Boot);
             format!("runner-manager service install --start-at {mode}")
-        } else if let Some(blocked) = status.launches_blocked().filter(|_| only_launches) {
+        } else if only_launches && let Some(blocked) = status.launches_blocked() {
             // Reinstalling the service is not what unblocks a launch fence.
             blocked.remedy.clone()
         } else {

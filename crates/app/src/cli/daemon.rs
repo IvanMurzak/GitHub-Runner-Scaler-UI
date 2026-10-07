@@ -2052,7 +2052,7 @@ fn acquire_instance(context: &Context) -> Result<HostLock, CliError> {
 /// minute or more away.
 fn reset_launch_state(context: &Context) {
     use runner_manager_platform::launch_health::clear_launches_blocked;
-    use runner_manager_platform::wsl::fence::{HostProcesses, reclaim_stale_guest_claim};
+    use runner_manager_platform::wsl::fence::reclaim_stale_guest_claim;
 
     if let Err(error) = clear_launches_blocked(context.paths()) {
         tracing::warn!(%error, "the previous daemon's blocked-launch record cannot be cleared");
@@ -2060,7 +2060,7 @@ fn reset_launch_state(context: &Context) {
     let Ok(Some(config)) = GuestRecoveryConfig::read(context.paths()) else {
         return;
     };
-    match reclaim_stale_guest_claim(&config.shared_root, &HostProcesses, chrono::Utc::now()) {
+    match reclaim_stale_guest_claim(&config.shared_root) {
         Ok(Some(reclaimed)) => tracing::warn!(
             shared_root = %config.shared_root.display(),
             %reclaimed,

@@ -1429,12 +1429,8 @@ fn probe_capacity(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
 fn probe_launches(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
     match &setup.launches_blocked {
         None => pass("no blocked launches recorded"),
-        Some(blocked) => fail(format!(
-            "the service has started no runner since {}: {}",
-            blocked.since.to_rfc3339(),
-            blocked.reason
-        ))
-        .remedy(blocked.remedy.clone()),
+        Some(blocked) => fail(format!("the service has started no runner {blocked}"))
+            .remedy(blocked.remedy.clone()),
     }
 }
 

@@ -300,37 +300,35 @@ impl FenceClaim {
 
 impl Drop for FenceClaim {
     fn drop(&mut self) {
-        if !self.release_on_drop {
-            return;
-        }
-        // DrvFS reports transient failures -- a handle the Windows side still
-        // has open, an antivirus scan -- that are gone a moment later. A
-        // failure that outlasts the retries leaves the claim behind, so it is
-        // said in the log rather than discarded: this path once failed with no
-        // trace at all while a distribution started nothing for 13 days.
-        let mut attempt = 1;
-        loop {
-            match remove_claim(&self.directory) {
-                Ok(()) => return,
-                Err(error) if attempt >= RELEASE_ATTEMPTS => {
-                    tracing::warn!(
-                        path = %self.directory.display(),
-                        %error,
-                        attempts = RELEASE_ATTEMPTS,
-                        "the WSL launch fence could not be released; the next launch reclaims it once its owner is gone"
-                    );
-                    return;
-                }
-                Err(_) => {
-                    std::thread::sleep(RELEASE_RETRY_DELAY * attempt);
-                    attempt += 1;
-                }
-            }
+        if self.release_on_drop {
+            let _ = remove_claim(&self.directory);
         }
     }
 }
 
-/// How many times dropping a [`FenceClaim`] tries to remove its directory.
+/// Whether at least `limit` has passed between `since` and `now`. A `since` in
+/// the future -- clock skew -- has not.
+#[must_use]
+pub fn elapsed_at_least(
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    limit: std::time::Duration,
+) -> bool {
+    (now - since).to_std().is_ok_and(|age| age >= limit)
+}
+
+/// When the fence directory under `root` was last modified, or `None` when
+/// there is no fence.
+pub(crate) fn fence_modified(root: &Path) -> Result<Option<DateTime<Utc>>, FenceError> {
+    let directory = root.join(FENCE_DIRECTORY);
+    match fs::metadata(&directory).and_then(|meta| meta.modified()) {
+        Ok(modified) => Ok(Some(modified.into())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(io("inspect", &directory, source)),
+    }
+}
+
+/// How many times [`GuestLaunchClaim::release`] tries to remove the claim.
 const RELEASE_ATTEMPTS: u32 = 3;
 /// The pause before the first retry; each later one waits a step longer.
 const RELEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -351,26 +349,26 @@ pub enum StaleGuestClaim {
     OwnerNeverRecorded,
 }
 
-impl StaleGuestClaim {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
+impl std::fmt::Display for StaleGuestClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             Self::OwnerExited => "owner_exited",
             Self::EarlierBoot => "earlier_boot",
             Self::ReleaseFailed => "release_failed",
             Self::OwnerNeverRecorded => "owner_never_recorded",
-        }
+        })
     }
 }
 
 /// How long a claim directory may exist without `owner.json` before it is
 /// treated as abandoned. Every claimer writes the owner straight after
 /// creating the directory, so this is generous by orders of magnitude.
-pub const OWNERLESS_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+pub(crate) const OWNERLESS_CLAIM_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
 
 /// What reclaiming needs to know about processes. A port, so that every branch
 /// can be exercised on every leg of the CI matrix.
-pub trait ProcessProbe {
+pub(crate) trait ProcessProbe {
     /// This process's identity, when it can be read.
     fn current(&self) -> Option<ProcessIdentity>;
     /// What a recorded identity refers to now; `None` when the operating
@@ -384,8 +382,7 @@ pub trait ProcessProbe {
 }
 
 /// [`ProcessProbe`] against the machine this runs on.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HostProcesses;
+pub(crate) struct HostProcesses;
 
 impl ProcessProbe for HostProcesses {
     fn current(&self) -> Option<ProcessIdentity> {
@@ -405,27 +402,8 @@ impl ProcessProbe for HostProcesses {
     }
 
     fn boot_time(&self) -> Option<DateTime<Utc>> {
-        boot_time()
+        crate::process::boot_time()
     }
-}
-
-/// The boot wall-clock time from `/proc/stat`. Only the guest reclaims guest
-/// claims, and the guest is Linux.
-#[cfg(target_os = "linux")]
-fn boot_time() -> Option<DateTime<Utc>> {
-    let stat = fs::read_to_string("/proc/stat").ok()?;
-    let seconds = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse::<i64>()
-        .ok()?;
-    DateTime::from_timestamp(seconds, 0)
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn boot_time() -> Option<DateTime<Utc>> {
-    None
 }
 
 /// Decide whether a recorded guest launch owner is provably gone.
@@ -434,8 +412,7 @@ const fn boot_time() -> Option<DateTime<Utc>> {
 /// process's own identity is read as one whose release failed. `None` means
 /// the claim must be honoured -- a live owner, an owner the operating system
 /// will not describe, and every Windows recovery claim.
-#[must_use]
-pub fn stale_guest_owner(owner: &FenceOwner, probe: &dyn ProcessProbe) -> Option<StaleGuestClaim> {
+fn stale_guest_owner(owner: &FenceOwner, probe: &dyn ProcessProbe) -> Option<StaleGuestClaim> {
     if owner.kind != FenceOwnerKind::GuestLaunch {
         return None;
     }
@@ -478,7 +455,7 @@ pub struct ReclaimedGuestClaim {
 
 impl std::fmt::Display for ReclaimedGuestClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.reason.as_str())?;
+        write!(f, "{}", self.reason)?;
         if let Some(owner) = &self.owner {
             write!(
                 f,
@@ -517,18 +494,48 @@ pub enum GuestClaimAttempt {
     Busy,
 }
 
-/// A held guest launch claim. Dropping it releases the claim.
+/// A held guest launch claim. [`GuestLaunchClaim::release`] lets go of it and
+/// reports a failure; dropping it lets go silently.
 #[derive(Debug)]
 pub struct GuestLaunchClaim {
     claim: Option<FenceClaim>,
 }
 
+impl GuestLaunchClaim {
+    /// Release the claim, retrying the failures DrvFS reports transiently -- a
+    /// handle the Windows side still has open, an antivirus scan.
+    ///
+    /// # Errors
+    /// The last removal failure. The claim is left behind and the next launch
+    /// reclaims it as one whose release failed; the caller should say so,
+    /// because this once failed silently while a distribution started nothing
+    /// for 13 days.
+    pub fn release(mut self) -> Result<(), FenceError> {
+        self.release_now()
+    }
+
+    fn release_now(&mut self) -> Result<(), FenceError> {
+        let Some(mut claim) = self.claim.take() else {
+            return Ok(());
+        };
+        claim.release_on_drop = false;
+        let mut held = held_here();
+        held.remove(&claim.directory);
+        let mut result = Ok(());
+        for attempt in 1..=RELEASE_ATTEMPTS {
+            result = remove_claim(&claim.directory);
+            if result.is_ok() || attempt == RELEASE_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(RELEASE_RETRY_DELAY * attempt);
+        }
+        result
+    }
+}
+
 impl Drop for GuestLaunchClaim {
     fn drop(&mut self) {
-        let mut held = held_here();
-        if let Some(claim) = self.claim.take() {
-            held.remove(&claim.directory);
-        }
+        let _ = self.release_now();
     }
 }
 
@@ -537,7 +544,11 @@ impl Drop for GuestLaunchClaim {
 ///
 /// # Errors
 /// [`FenceError`] when the fence cannot be created, read, or removed.
-pub fn try_claim_guest_launch(
+pub fn try_claim_guest_launch(root: &Path) -> Result<GuestClaimAttempt, FenceError> {
+    try_claim_guest_launch_with(root, &HostProcesses, Utc::now())
+}
+
+pub(crate) fn try_claim_guest_launch_with(
     root: &Path,
     probe: &dyn ProcessProbe,
     now: DateTime<Utc>,
@@ -546,19 +557,16 @@ pub fn try_claim_guest_launch(
     if held.contains(&root.join(FENCE_DIRECTORY)) {
         return Ok(GuestClaimAttempt::Busy);
     }
+    let mut claim = FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)?;
     let mut reclaimed = None;
-    let claim = match FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)? {
-        Some(claim) => claim,
-        None => {
-            reclaimed = reclaim_unheld(root, probe, now)?;
-            if reclaimed.is_none() {
-                return Ok(GuestClaimAttempt::Busy);
-            }
-            match FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)? {
-                Some(claim) => claim,
-                None => return Ok(GuestClaimAttempt::Busy),
-            }
+    if claim.is_none() {
+        reclaimed = reclaim_unheld(root, probe, now)?;
+        if reclaimed.is_some() {
+            claim = FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)?;
         }
+    }
+    let Some(claim) = claim else {
+        return Ok(GuestClaimAttempt::Busy);
     };
     held.insert(claim.directory.clone());
     Ok(GuestClaimAttempt::Claimed {
@@ -573,7 +581,11 @@ pub fn try_claim_guest_launch(
 ///
 /// # Errors
 /// [`FenceError`] when the claim cannot be read or removed.
-pub fn reclaim_stale_guest_claim(
+pub fn reclaim_stale_guest_claim(root: &Path) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
+    reclaim_stale_guest_claim_with(root, &HostProcesses, Utc::now())
+}
+
+pub(crate) fn reclaim_stale_guest_claim_with(
     root: &Path,
     probe: &dyn ProcessProbe,
     now: DateTime<Utc>,
@@ -582,9 +594,7 @@ pub fn reclaim_stale_guest_claim(
     if held.contains(&root.join(FENCE_DIRECTORY)) {
         return Ok(None);
     }
-    let reclaimed = reclaim_unheld(root, probe, now);
-    drop(held);
-    reclaimed
+    reclaim_unheld(root, probe, now)
 }
 
 /// The reclaim itself. The caller holds [`HELD_HERE`] and has checked that
@@ -596,14 +606,8 @@ fn reclaim_unheld(
 ) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
     let directory = root.join(FENCE_DIRECTORY);
     let Some(owner) = FenceClaim::owner(root)? else {
-        let modified = match fs::metadata(&directory).and_then(|meta| meta.modified()) {
-            Ok(modified) => DateTime::<Utc>::from(modified),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(io("inspect", &directory, source)),
-        };
-        let abandoned = (now - modified)
-            .to_std()
-            .is_ok_and(|age| age >= OWNERLESS_CLAIM_GRACE);
+        let abandoned = fence_modified(root)?
+            .is_some_and(|modified| elapsed_at_least(modified, now, OWNERLESS_CLAIM_GRACE));
         if !abandoned || FenceClaim::owner(root)?.is_some() {
             return Ok(None);
         }
@@ -694,7 +698,7 @@ pub fn retire_abandoned_windows_recovery(
     now: DateTime<Utc>,
     abandoned_after: std::time::Duration,
 ) -> Result<bool, FenceError> {
-    let abandoned = |at: DateTime<Utc>| (now - at).to_std().is_ok_and(|age| age >= abandoned_after);
+    let abandoned = |at: DateTime<Utc>| elapsed_at_least(at, now, abandoned_after);
     let request = DrainRequest::read(root)?;
     if request
         .as_ref()
@@ -851,30 +855,9 @@ mod tests {
 
     /// A child that has already exited: its PID is free or somebody else's.
     fn exited_child() -> u32 {
-        let mut command = if cfg!(windows) {
-            let mut command = std::process::Command::new("cmd");
-            command.args(["/C", "exit 0"]);
-            command
-        } else {
-            std::process::Command::new("true")
-        };
-        let mut child = command.spawn().unwrap();
-        let pid = child.id();
+        let mut child = crate::process::tests::quick_exit().spawn().unwrap();
         child.wait().unwrap();
-        pid
-    }
-
-    fn sleeping_child() -> std::process::Child {
-        let mut command = if cfg!(windows) {
-            let mut command = std::process::Command::new("ping");
-            command.args(["-n", "60", "127.0.0.1"]);
-            command
-        } else {
-            let mut command = std::process::Command::new("sleep");
-            command.arg("60");
-            command
-        };
-        command.stdout(std::process::Stdio::null()).spawn().unwrap()
+        child.pid()
     }
 
     #[test]
@@ -887,7 +870,7 @@ mod tests {
         );
 
         let (claim, reclaimed) =
-            claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
 
         let reclaimed = reclaimed.expect("the dead owner's claim was reclaimed");
         assert_eq!(reclaimed.reason, StaleGuestClaim::OwnerExited);
@@ -918,7 +901,7 @@ mod tests {
         );
 
         let (_claim, reclaimed) =
-            claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
 
         assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::OwnerExited);
     }
@@ -926,16 +909,16 @@ mod tests {
     #[test]
     fn a_live_guest_claim_is_never_reclaimed() {
         let root = tempfile::tempdir().unwrap();
-        let mut child = sleeping_child();
-        let live = ProcessIdentity::resolve(child.id()).unwrap();
+        let mut child = crate::process::tests::long_running().spawn().unwrap();
+        let live = child.identity().clone();
         plant(
             root.path(),
-            &guest_owner(child.id(), Utc::now(), Some(live.clone())),
+            &guest_owner(child.pid(), Utc::now(), Some(live.clone())),
         );
 
-        let attempt = try_claim_guest_launch(root.path(), &HostProcesses, Utc::now());
-        let startup = reclaim_stale_guest_claim(root.path(), &HostProcesses, Utc::now());
-        child.kill().unwrap();
+        let attempt = try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now());
+        let startup = reclaim_stale_guest_claim_with(root.path(), &HostProcesses, Utc::now());
+        live.terminate(std::time::Duration::from_secs(5)).unwrap();
         child.wait().unwrap();
 
         assert!(matches!(attempt.unwrap(), GuestClaimAttempt::Busy));
@@ -950,25 +933,25 @@ mod tests {
     fn a_claim_this_process_holds_refuses_every_other_launch_of_it() {
         let root = tempfile::tempdir().unwrap();
         let (claim, reclaimed) =
-            claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
         assert_eq!(reclaimed, None);
         assert!(matches!(
-            try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap(),
+            try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap(),
             GuestClaimAttempt::Busy
         ));
         assert_eq!(
-            reclaim_stale_guest_claim(root.path(), &HostProcesses, Utc::now()).unwrap(),
+            reclaim_stale_guest_claim_with(root.path(), &HostProcesses, Utc::now()).unwrap(),
             None
         );
         drop(claim);
-        claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+        claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
     }
 
     #[test]
     fn a_claim_this_process_failed_to_release_is_reclaimed_by_it() {
         let root = tempfile::tempdir().unwrap();
         let (mut claim, _) =
-            claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
         // What a failed removal leaves: the claim let go, the directory kept.
         claim.claim.take().unwrap().make_durable();
         held_here().remove(&root.path().join(FENCE_DIRECTORY));
@@ -976,7 +959,7 @@ mod tests {
         assert!(root.path().join(FENCE_DIRECTORY).exists());
 
         let (_claim, reclaimed) =
-            claimed(try_claim_guest_launch(root.path(), &HostProcesses, Utc::now()).unwrap());
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
         assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::ReleaseFailed);
     }
 
@@ -994,7 +977,7 @@ mod tests {
             ..FakeProbe::default()
         };
         assert!(matches!(
-            try_claim_guest_launch(root.path(), &dead, Utc::now()).unwrap(),
+            try_claim_guest_launch_with(root.path(), &dead, Utc::now()).unwrap(),
             GuestClaimAttempt::Busy
         ));
         assert!(root.path().join(FENCE_DIRECTORY).exists());
@@ -1075,13 +1058,13 @@ mod tests {
             ..FakeProbe::default()
         };
 
-        let reclaimed = reclaim_stale_guest_claim(root.path(), &this_boot, Utc::now())
+        let reclaimed = reclaim_stale_guest_claim_with(root.path(), &this_boot, Utc::now())
             .unwrap()
             .unwrap();
 
         assert_eq!(reclaimed.reason, StaleGuestClaim::EarlierBoot);
         assert!(!root.path().join(FENCE_DIRECTORY).exists());
-        claimed(try_claim_guest_launch(root.path(), &this_boot, Utc::now()).unwrap());
+        claimed(try_claim_guest_launch_with(root.path(), &this_boot, Utc::now()).unwrap());
     }
 
     #[test]
@@ -1090,40 +1073,28 @@ mod tests {
         fs::create_dir_all(root.path().join(FENCE_DIRECTORY)).unwrap();
         let probe = FakeProbe::default();
         assert_eq!(
-            reclaim_stale_guest_claim(root.path(), &probe, Utc::now()).unwrap(),
+            reclaim_stale_guest_claim_with(root.path(), &probe, Utc::now()).unwrap(),
             None
         );
         let later = Utc::now() + chrono::Duration::minutes(6);
-        let reclaimed = reclaim_stale_guest_claim(root.path(), &probe, later)
+        let reclaimed = reclaim_stale_guest_claim_with(root.path(), &probe, later)
             .unwrap()
             .unwrap();
         assert_eq!(reclaimed.reason, StaleGuestClaim::OwnerNeverRecorded);
         assert!(!root.path().join(FENCE_DIRECTORY).exists());
     }
 
-    /// Captures what `tracing` writes on this thread.
-    #[derive(Clone, Default)]
-    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
+    /// A release that cannot remove the claim says so, naming the path, and
+    /// leaves a claim the next launch reclaims as one whose release failed.
     #[test]
-    fn a_release_that_fails_is_logged_with_its_path_and_error() {
+    fn a_release_that_fails_reports_its_path_and_the_next_launch_reclaims_it() {
         let root = tempfile::tempdir().unwrap();
-        let claim = FenceClaim::try_claim(root.path(), FenceOwnerKind::GuestLaunch, None)
-            .unwrap()
-            .unwrap();
+        let (claim, _) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
         // Something the removal cannot take away: a file where the claim
-        // directory was.
+        // directory was, holding this process's own owner record.
         let directory = root.path().join(FENCE_DIRECTORY);
+        let owner = fs::read(directory.join(OWNER_FILE)).unwrap();
         fs::remove_dir_all(&directory).unwrap();
         fs::write(&directory, b"not a directory").unwrap();
         assert!(
@@ -1131,18 +1102,15 @@ mod tests {
             "the plant must make removal fail"
         );
 
-        let logs = Logs::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || drop(claim));
+        let error = claim.release().expect_err("the removal failed");
+        assert!(error.to_string().contains(FENCE_DIRECTORY), "{error}");
 
-        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("WARN"), "{text}");
-        assert!(text.contains("could not be released"), "{text}");
-        assert!(text.contains(FENCE_DIRECTORY), "the path is named: {text}");
+        fs::remove_file(&directory).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(OWNER_FILE), owner).unwrap();
+        let (_claim, reclaimed) =
+            claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
+        assert_eq!(reclaimed.unwrap().reason, StaleGuestClaim::ReleaseFailed);
     }
 
     #[test]

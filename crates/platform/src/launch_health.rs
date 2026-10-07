@@ -23,12 +23,12 @@ use crate::paths::AppPaths;
 use crate::service::{ServiceError, read_state_record, remove_state_record, write_state_record};
 use crate::wsl::fence::{
     FENCE_DIRECTORY, FenceClaim, FenceOwner, FenceOwnerKind, GuestRecoveryConfig,
-    OWNERLESS_CLAIM_GRACE,
+    OWNERLESS_CLAIM_GRACE, elapsed_at_least, fence_modified,
 };
 
 /// Present while the daemon's allocations keep being refused, inside
 /// `state/`.
-pub const LAUNCHES_BLOCKED_FILE: &str = "launches-blocked.toml";
+const LAUNCHES_BLOCKED_FILE: &str = "launches-blocked.toml";
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -43,7 +43,7 @@ pub const BLOCKED_AFTER: Duration = Duration::from_secs(5 * 60);
 /// How long a launch fence may be held before it counts as stuck. A launch
 /// holds it through a package download, the registration and the spawn, which
 /// take minutes at worst.
-pub const FENCE_HELD_TOO_LONG: Duration = Duration::from_secs(30 * 60);
+const FENCE_HELD_TOO_LONG: Duration = Duration::from_secs(30 * 60);
 
 /// How to restart the service from inside a managed WSL distribution.
 pub const GUEST_RESTART: &str =
@@ -61,6 +61,13 @@ pub struct LaunchesBlocked {
     pub since: DateTime<Utc>,
     pub reason: String,
     pub remedy: String,
+}
+
+/// "since <when>: <reason>", the sentence every surface prints.
+impl std::fmt::Display for LaunchesBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "since {}: {}", self.since.to_rfc3339(), self.reason)
+    }
 }
 
 /// What refused an allocation, as the daemon saw it.
@@ -153,10 +160,8 @@ fn fence_held(directory: &Path, owner: Option<&FenceOwner>, restart: &str) -> (S
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchesBlockedRecord {
     schema_version: u32,
-    since: DateTime<Utc>,
-    consecutive_refusals: u32,
-    reason: String,
-    remedy: String,
+    #[serde(flatten)]
+    blocked: LaunchesBlocked,
 }
 
 /// Records that the daemon's allocations keep being refused.
@@ -166,16 +171,12 @@ struct LaunchesBlockedRecord {
 pub fn record_launches_blocked(
     paths: &AppPaths,
     blocked: &LaunchesBlocked,
-    consecutive_refusals: u32,
 ) -> Result<(), ServiceError> {
     write_state_record(
         &launches_blocked_path(paths),
         &LaunchesBlockedRecord {
             schema_version: SCHEMA_VERSION,
-            since: blocked.since,
-            consecutive_refusals,
-            reason: blocked.reason.clone(),
-            remedy: blocked.remedy.clone(),
+            blocked: blocked.clone(),
         },
     )
 }
@@ -196,19 +197,14 @@ pub fn recorded_launches_blocked(
     paths: &AppPaths,
 ) -> Result<Option<LaunchesBlocked>, ServiceError> {
     Ok(
-        read_state_record::<LaunchesBlockedRecord>(&launches_blocked_path(paths))?.map(|record| {
-            LaunchesBlocked {
-                since: record.since,
-                reason: record.reason,
-                remedy: record.remedy,
-            }
-        }),
+        read_state_record::<LaunchesBlockedRecord>(&launches_blocked_path(paths))?
+            .map(|record| record.blocked),
     )
 }
 
 /// Where the record lives.
 #[must_use]
-pub fn launches_blocked_path(paths: &AppPaths) -> PathBuf {
+fn launches_blocked_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(LAUNCHES_BLOCKED_FILE)
 }
 
@@ -221,31 +217,22 @@ pub fn stuck_launch_fence(
     restart: &str,
 ) -> Option<LaunchesBlocked> {
     let directory = root.join(FENCE_DIRECTORY);
-    let created = std::fs::metadata(&directory)
-        .and_then(|meta| meta.modified())
-        .map(DateTime::<Utc>::from);
-    if created
-        .as_ref()
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return None;
-    }
-    let held_too_long = |since: DateTime<Utc>, limit: Duration| {
-        (now - since).to_std().is_ok_and(|age| age >= limit)
-    };
     match FenceClaim::owner(root) {
-        Ok(Some(owner)) => held_too_long(owner.acquired_at, FENCE_HELD_TOO_LONG).then(|| {
-            BlockCause::FenceHeld {
-                directory,
-                owner: Some(owner.clone()),
-            }
-            .blocked_since(owner.acquired_at, restart)
-        }),
+        Ok(Some(owner)) => {
+            let since = owner.acquired_at;
+            elapsed_at_least(since, now, FENCE_HELD_TOO_LONG).then(|| {
+                BlockCause::FenceHeld {
+                    directory,
+                    owner: Some(owner),
+                }
+                .blocked_since(since, restart)
+            })
+        }
         // A claimer writes its owner straight after creating the directory, so
         // one still missing after the reclaim grace is not a launch in progress.
         Ok(None) => {
-            let since = created.ok()?;
-            held_too_long(since, OWNERLESS_CLAIM_GRACE).then(|| {
+            let since = fence_modified(root).ok()??;
+            elapsed_at_least(since, now, OWNERLESS_CLAIM_GRACE).then(|| {
                 BlockCause::FenceHeld {
                     directory,
                     owner: None,
@@ -257,7 +244,7 @@ pub fn stuck_launch_fence(
             BlockCause::FenceUnusable {
                 detail: error.to_string(),
             }
-            .blocked_since(created.unwrap_or(now), restart),
+            .blocked_since(fence_modified(root).ok().flatten().unwrap_or(now), restart),
         ),
     }
 }
@@ -291,7 +278,7 @@ mod tests {
             path: PathBuf::from("allocation.lock"),
         }
         .blocked_since(Utc::now(), GUEST_RESTART);
-        record_launches_blocked(&paths, &blocked, 7).unwrap();
+        record_launches_blocked(&paths, &blocked).unwrap();
         assert_eq!(
             recorded_launches_blocked(&paths).unwrap(),
             Some(blocked.clone())

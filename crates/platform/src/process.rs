@@ -417,6 +417,23 @@ impl ProcessIdentity {
     }
 }
 
+/// When this machine booted, as Linux reports it in `/proc/stat`. `None`
+/// elsewhere, and where it cannot be read.
+#[must_use]
+pub fn boot_time() -> Option<chrono::DateTime<chrono::Utc>> {
+    #[cfg(target_os = "linux")]
+    {
+        sys::btime()
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 impl fmt::Display for ProcessIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pid {} started {}", self.pid, self.start_token)
@@ -1767,17 +1784,29 @@ mod sys {
         // the same purpose here: it distinguishes boots. It is only ever the
         // fallback because two boots within the same second would collide, and
         // `boot_id` cannot.
+        btime()
+            .map(|value| format!("btime-{value}"))
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "neither /proc/sys/kernel/random/boot_id nor /proc/stat btime is \
+                         readable, so a process identity that survives a reboot cannot be formed",
+                    )
+                } else {
+                    error
+                }
+            })
+    }
+
+    /// `btime` from `/proc/stat`: the boot wall-clock time, in whole seconds.
+    #[cfg(target_os = "linux")]
+    pub(super) fn btime() -> io::Result<String> {
         let stat = std::fs::read_to_string("/proc/stat")?;
         stat.lines()
             .find_map(|line| line.strip_prefix("btime "))
-            .map(|value| format!("btime-{}", value.trim()))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "neither /proc/sys/kernel/random/boot_id nor /proc/stat btime is readable, \
-                     so a process identity that survives a reboot cannot be formed",
-                )
-            })
+            .map(|value| value.trim().to_string())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "/proc/stat has no btime"))
     }
 
     #[cfg(target_os = "macos")]
@@ -1912,7 +1941,7 @@ mod sys {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A child can be gone before its parent reads its identity, and launching
@@ -1943,7 +1972,7 @@ mod tests {
     }
 
     /// A program that exits immediately, on every supported platform.
-    fn quick_exit() -> SpawnSpec {
+    pub(crate) fn quick_exit() -> SpawnSpec {
         if cfg!(windows) {
             SpawnSpec::new("cmd").args(["/C", "exit", "0"])
         } else {
@@ -1962,7 +1991,7 @@ mod tests {
     /// `ping -n 600 127.0.0.1` sends one loopback echo a second for ten
     /// minutes: it needs no console, writes to the null device this spec
     /// already sets, and burns no CPU while waiting.
-    fn long_running() -> SpawnSpec {
+    pub(crate) fn long_running() -> SpawnSpec {
         if cfg!(windows) {
             SpawnSpec::new("ping").args(["-n", "600", "127.0.0.1"])
         } else {
