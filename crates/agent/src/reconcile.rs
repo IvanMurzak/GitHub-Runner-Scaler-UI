@@ -1206,6 +1206,8 @@ pub struct WslRecoveryAllocationLock {
     inner: Arc<dyn AllocationLock>,
     blocked_after_refusals: u32,
     blocked_after: Duration,
+    /// A quiet spell this long between refusals starts a new run.
+    streak_gap: Duration,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     refusals: Mutex<Refusals>,
 }
@@ -1213,9 +1215,17 @@ pub struct WslRecoveryAllocationLock {
 /// The refusals since the last grant.
 #[derive(Debug, Default)]
 struct Refusals {
-    /// When the current run of refusals began, and how many it holds.
-    streak: Option<(chrono::DateTime<chrono::Utc>, u32)>,
+    /// The current run of refusals: when it began, the latest one, and how
+    /// many it holds.
+    streak: Option<Streak>,
     recorded: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Streak {
+    since: chrono::DateTime<chrono::Utc>,
+    latest: chrono::DateTime<chrono::Utc>,
+    count: u32,
 }
 
 /// Counts a launch of this process as in progress until dropped.
@@ -1264,6 +1274,7 @@ impl WslRecoveryAllocationLock {
             inner,
             blocked_after_refusals: BLOCKED_AFTER_DEFERRALS,
             blocked_after: BLOCKED_AFTER,
+            streak_gap: BLOCKED_AFTER,
             in_flight: Arc::default(),
             refusals: Mutex::default(),
         }
@@ -1278,6 +1289,13 @@ impl WslRecoveryAllocationLock {
         self
     }
 
+    /// Start a new run of refusals after a quiet spell of `gap`.
+    #[cfg(test)]
+    const fn with_streak_gap(mut self, gap: Duration) -> Self {
+        self.streak_gap = gap;
+        self
+    }
+
     fn refusals(&self) -> std::sync::MutexGuard<'_, Refusals> {
         self.refusals
             .lock()
@@ -1285,16 +1303,19 @@ impl WslRecoveryAllocationLock {
     }
 
     fn note_granted(&self) {
-        if std::mem::take(&mut *self.refusals()).recorded
-            && let Err(error) =
-                runner_manager_platform::launch_health::clear_launches_blocked(&self.paths)
-        {
-            tracing::warn!(%error, "the blocked-launch record cannot be cleared");
+        let mut refusals = self.refusals();
+        refusals.streak = None;
+        if refusals.recorded {
+            match runner_manager_platform::launch_health::clear_launches_blocked(&self.paths) {
+                Ok(()) => refusals.recorded = false,
+                // Kept, so the next grant tries again.
+                Err(error) => tracing::warn!(%error, "the blocked-launch record cannot be cleared"),
+            }
         }
     }
 
     fn note_refused(&self, cause: &runner_manager_platform::launch_health::BlockCause) {
-        use runner_manager_platform::launch_health::{GUEST_RESTART, record_launches_blocked};
+        use runner_manager_platform::launch_health::{Viewpoint, record_launches_blocked};
         use runner_manager_platform::wsl::fence::elapsed_at_least;
 
         if self.in_flight.load(Ordering::SeqCst) > 0 {
@@ -1302,22 +1323,37 @@ impl WslRecoveryAllocationLock {
         }
         let now = chrono::Utc::now();
         let mut refusals = self.refusals();
-        let (since, count) = refusals.streak.get_or_insert((now, 0));
-        *count = count.saturating_add(1);
-        let (since, count) = (*since, *count);
-        if refusals.recorded
-            || count < self.blocked_after_refusals
-            || !elapsed_at_least(since, now, self.blocked_after)
+        // A refusal long after the previous one starts a new run: two brief
+        // contentions days apart are not five minutes of nothing but refusals.
+        let streak = match refusals.streak {
+            Some(streak) if !elapsed_at_least(streak.latest, now, self.streak_gap) => Streak {
+                latest: now,
+                count: streak.count.saturating_add(1),
+                ..streak
+            },
+            _ => Streak {
+                since: now,
+                latest: now,
+                count: 1,
+            },
+        };
+        refusals.streak = Some(streak);
+        if streak.count < self.blocked_after_refusals
+            || !elapsed_at_least(streak.since, now, self.blocked_after)
         {
             return;
         }
-        let blocked = cause.blocked_since(since, GUEST_RESTART);
-        tracing::warn!(
-            refusals = count,
-            "runner launches are blocked {blocked}: {}",
-            blocked.remedy
-        );
-        match record_launches_blocked(&self.paths, &blocked) {
+        let blocked = cause.blocked_since(streak.since, Viewpoint::Guest);
+        if !refusals.recorded {
+            tracing::warn!(
+                refusals = streak.count,
+                "runner launches are blocked {blocked}: {}",
+                blocked.remedy
+            );
+        }
+        // Rewritten on every refusal, so readers can tell a record nobody
+        // refreshes -- no demand any more -- from one still being refused.
+        match record_launches_blocked(&self.paths, &blocked, now) {
             Ok(()) => refusals.recorded = true,
             Err(error) => tracing::warn!(%error, "the blocked-launch record cannot be written"),
         }
@@ -1340,7 +1376,7 @@ impl AllocationLock for WslRecoveryAllocationLock {
             };
             let config = match GuestRecoveryConfig::read(&paths) {
                 Ok(Some(config)) => config,
-                Ok(None) => return Ok(None),
+                Ok(None) => return Ok(LaunchFenceGuard(None)),
                 Err(error) => return Err(unusable(&error)),
             };
             let root = config.shared_root;
@@ -1353,18 +1389,34 @@ impl AllocationLock for WslRecoveryAllocationLock {
                             "reclaimed a WSL launch fence claim whose owner is gone"
                         );
                     }
-                    claim
+                    // Guarded at once, so a claim let go on the drain path below
+                    // is released -- and logged when it cannot be -- like any other.
+                    LaunchFenceGuard(Some(claim))
                 }
                 Ok(GuestClaimAttempt::Busy) => {
-                    return Err(BlockCause::FenceHeld {
-                        directory: root.join(FENCE_DIRECTORY),
-                        owner: FenceClaim::owner(&root).ok().flatten(),
+                    let directory = root.join(FENCE_DIRECTORY);
+                    return Err(match FenceClaim::owner(&root) {
+                        Ok(owner) => BlockCause::FenceHeld { directory, owner },
+                        Err(error) => BlockCause::FenceOwnerUnreadable {
+                            directory,
+                            detail: error.to_string(),
+                        },
                     });
                 }
-                Err(error) => return Err(unusable(&error)),
+                Err(error) => {
+                    // An owner record nobody can decode stops the reclaim the
+                    // same way on every pass; name it rather than the config.
+                    return Err(match FenceClaim::owner(&root) {
+                        Err(owner_error) => BlockCause::FenceOwnerUnreadable {
+                            directory: root.join(FENCE_DIRECTORY),
+                            detail: owner_error.to_string(),
+                        },
+                        Ok(_) => unusable(&error),
+                    });
+                }
             };
             match DrainRequest::read(&root) {
-                Ok(None) => Ok(Some(claim)),
+                Ok(None) => Ok(claim),
                 Ok(Some(_)) => Err(BlockCause::DrainRequested { root }),
                 Err(error) => Err(unusable(&error)),
             }
@@ -1373,7 +1425,7 @@ impl AllocationLock for WslRecoveryAllocationLock {
         .map_err(|_| AllocationLockBusy)?;
 
         let claim = match claim {
-            Ok(claim) => LaunchFenceGuard(claim),
+            Ok(claim) => claim,
             Err(cause) => {
                 self.note_refused(&cause);
                 return Err(AllocationLockBusy);
@@ -3582,9 +3634,13 @@ mod tests {
         for _ in 0..2 {
             assert!(lock.acquire().await.is_err());
         }
-        assert_eq!(recorded_launches_blocked(&paths).unwrap(), None, "not yet");
+        assert_eq!(
+            recorded_launches_blocked(&paths, chrono::Utc::now()).unwrap(),
+            None,
+            "not yet"
+        );
         assert!(lock.acquire().await.is_err());
-        let blocked = recorded_launches_blocked(&paths)
+        let blocked = recorded_launches_blocked(&paths, chrono::Utc::now())
             .unwrap()
             .expect("three refusals in a row are recorded");
         assert!(
@@ -3594,7 +3650,10 @@ mod tests {
 
         windows.release().unwrap();
         let guard = lock.acquire().await.unwrap();
-        assert_eq!(recorded_launches_blocked(&paths).unwrap(), None);
+        assert_eq!(
+            recorded_launches_blocked(&paths, chrono::Utc::now()).unwrap(),
+            None
+        );
         drop(guard);
     }
 
@@ -3609,8 +3668,51 @@ mod tests {
         for _ in 0..3 {
             assert!(lock.acquire().await.is_err());
         }
-        assert_eq!(recorded_launches_blocked(&paths).unwrap(), None);
+        assert_eq!(
+            recorded_launches_blocked(&paths, chrono::Utc::now()).unwrap(),
+            None
+        );
         drop(launching);
+    }
+
+    /// Refusals separated by quiet spells -- brief contention days apart --
+    /// never add up to a blocked host.
+    #[tokio::test]
+    async fn refusals_with_quiet_spells_between_them_never_add_up() {
+        use runner_manager_platform::launch_health::recorded_launches_blocked;
+        use runner_manager_platform::wsl::fence::{FenceClaim, FenceOwnerKind};
+
+        let (_local, shared, paths) = guest_paths();
+        let lock = WslRecoveryAllocationLock::new(Arc::clone(&paths), Arc::new(NoLock))
+            .with_blocked_after(3, Duration::ZERO)
+            .with_streak_gap(Duration::ZERO);
+        let windows =
+            FenceClaim::try_claim(shared.path(), FenceOwnerKind::WindowsRecovery, Some(1))
+                .unwrap()
+                .unwrap();
+        for _ in 0..5 {
+            assert!(lock.acquire().await.is_err());
+        }
+        assert_eq!(
+            recorded_launches_blocked(&paths, chrono::Utc::now()).unwrap(),
+            None
+        );
+        windows.release().unwrap();
+    }
+
+    /// A drain request refuses the launch after the claim was made; that
+    /// claim is released rather than left to block the next pass.
+    #[tokio::test]
+    async fn a_claim_refused_by_a_drain_request_is_released() {
+        use runner_manager_platform::wsl::fence::{DrainRequest, FENCE_DIRECTORY};
+
+        let (_local, shared, paths) = guest_paths();
+        DrainRequest::new(4, chrono::Utc::now())
+            .write(shared.path())
+            .unwrap();
+        let lock = WslRecoveryAllocationLock::new(paths, Arc::new(NoLock));
+        assert!(lock.acquire().await.is_err());
+        assert!(!shared.path().join(FENCE_DIRECTORY).exists());
     }
 
     /// A lock nobody can take.

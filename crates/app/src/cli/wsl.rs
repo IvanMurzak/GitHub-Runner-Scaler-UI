@@ -63,9 +63,7 @@ use runner_manager_domain::model::{Clock, StartMode};
 use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{InventoryGateway, RestInventory};
 use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
-use runner_manager_platform::launch_health::{
-    LaunchesBlocked, stuck_launch_fence, windows_restart,
-};
+use runner_manager_platform::launch_health::{LaunchesBlocked, Viewpoint, stuck_launch_fence};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::{InstallRecord, TaskPrincipal};
 use runner_manager_platform::wsl::artifact::{
@@ -1526,6 +1524,13 @@ impl WslStatusDocument {
         }
     }
 
+    /// Whether a blocked launch is the one thing wrong, so its own remedy is
+    /// the whole fix and a reinstall would not help.
+    #[must_use]
+    pub fn only_launches_blocked(&self) -> bool {
+        self.service.launches_blocked.is_some() && self.unhealthy_parts().len() == 1
+    }
+
     /// The named parts that are not yet in place, for a failure message.
     ///
     /// # A distribution that is not ready reports one problem, not six
@@ -1760,7 +1765,7 @@ pub fn probe(
                 runner_manager_platform::wsl::fence::recovery_root(paths, distribution)
         {
             service.launches_blocked =
-                stuck_launch_fence(&root, now, &windows_restart(distribution));
+                stuck_launch_fence(&root, now, Viewpoint::Windows { distribution });
         }
         service.healthy = service.active.as_deref() == Some("active")
             && service.matches_expected
@@ -3746,7 +3751,9 @@ fn write_what_detach_left_alone(distribution: &str, out: &mut dyn Write) -> Resu
 /// # Errors
 /// [`Failure::WslProvisioning`], naming every part that is not in place.
 fn refuse_a_partial_host(document: &WslStatusDocument) -> Result<(), CliError> {
-    if document.healthy {
+    // A host whose only problem is a blocked launch is provisioned; refusing it
+    // would send the operator to run this again, which cannot unblock it.
+    if document.healthy || document.only_launches_blocked() {
         return Ok(());
     }
     Err(CliError::with_remedy(
@@ -3911,13 +3918,12 @@ fn write_status_text(document: &WslStatusDocument, out: &mut dyn Write) -> Resul
         if document.wsl.ready {
             writeln!(out).map_err(failed)?;
             writeln!(out, "Fix:").map_err(failed)?;
-            let blocked = document.service.launches_blocked.as_ref();
-            if let Some(blocked) = blocked {
+            if let Some(blocked) = &document.service.launches_blocked {
                 writeln!(out, "  {}", blocked.remedy).map_err(failed)?;
             }
             // Reinstalling does not unblock a launch fence, so it is offered
             // only when something else is wrong too.
-            if blocked.is_none() || document.unhealthy_parts().len() > 1 {
+            if !document.only_launches_blocked() {
                 writeln!(out, "  {}", install_remediation(&document.distribution))
                     .map_err(failed)?;
                 writeln!(
@@ -6493,7 +6499,7 @@ mod tests {
         };
         let journal = Journal::default();
         let (root, paths) = fixture_paths();
-        let status = |script| {
+        let status = |script, now| {
             let (host, _) = wrap(script, &journal);
             probe(
                 &host,
@@ -6502,11 +6508,14 @@ mod tests {
                 DEFAULT_LINUX_DESTINATION,
                 UNIT,
                 version(),
-                Utc::now(),
+                now,
             )
             .expect("a readable host")
         };
-        assert!(status(script()).healthy, "the control is healthy");
+        assert!(
+            status(script(), Utc::now()).healthy,
+            "the control is healthy"
+        );
 
         let fence = recovery_root(&paths, DISTRIBUTION)
             .unwrap()
@@ -6517,16 +6526,14 @@ mod tests {
             r#"{"schema_version":1,"kind":"guest_launch","generation":null,"process_id":189,"acquired_at":"2026-09-24T00:47:18.724Z"}"#,
         )
         .unwrap();
-        let document = status(script());
+        // Aged by the fence directory's own (Windows) clock: an hour from now.
+        let document = status(script(), Utc::now() + chrono::Duration::hours(1));
         drop(root);
 
         assert!(!document.healthy);
         assert!(!document.service.healthy);
         let parts = document.unhealthy_parts().join("; ");
-        assert!(
-            parts.contains("started no runner since 2026-09-24"),
-            "{parts}"
-        );
+        assert!(parts.contains("started no runner since"), "{parts}");
         assert!(parts.contains("process 189"), "{parts}");
         let mut rendered = Vec::new();
         write_status_text(&document, &mut rendered).expect("it renders");
@@ -6538,6 +6545,10 @@ mod tests {
         assert!(
             !text.contains("runner-manager wsl install"),
             "reinstalling does not unblock a fence: {text}"
+        );
+        assert!(
+            refuse_a_partial_host(&document).is_ok(),
+            "an install must not refuse a provisioned host and loop on a blocked launch"
         );
     }
 

@@ -8555,7 +8555,7 @@ mod tests {
     #[test]
     fn blocked_launches_make_the_service_unhealthy_with_their_remedy() {
         use crate::launch_health::{
-            BlockCause, GUEST_RESTART, clear_launches_blocked, launches_blocked,
+            BlockCause, Viewpoint, clear_launches_blocked, launches_blocked,
             record_launches_blocked,
         };
 
@@ -8581,8 +8581,8 @@ mod tests {
             directory: PathBuf::from("launch-fence"),
             owner: None,
         }
-        .blocked_since(Utc::now(), GUEST_RESTART);
-        record_launches_blocked(&host.paths, &blocked).unwrap();
+        .blocked_since(Utc::now(), Viewpoint::Guest);
+        record_launches_blocked(&host.paths, &blocked, Utc::now()).unwrap();
 
         let status = compose();
         assert!(!status.is_healthy());

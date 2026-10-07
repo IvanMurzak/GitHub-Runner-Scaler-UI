@@ -341,6 +341,9 @@ pub enum StaleGuestClaim {
     OwnerExited,
     /// The claim was written before this boot, so its owner cannot be running.
     EarlierBoot,
+    /// A claim with no identity, written before this daemon started. Only
+    /// one launcher per distribution can run, so its owner is gone.
+    WrittenBeforeThisDaemon,
     /// This process wrote the claim, no longer holds it, and could not remove
     /// it when it let go.
     ReleaseFailed,
@@ -354,6 +357,7 @@ impl std::fmt::Display for StaleGuestClaim {
         f.write_str(match self {
             Self::OwnerExited => "owner_exited",
             Self::EarlierBoot => "earlier_boot",
+            Self::WrittenBeforeThisDaemon => "written_before_this_daemon",
             Self::ReleaseFailed => "release_failed",
             Self::OwnerNeverRecorded => "owner_never_recorded",
         })
@@ -379,6 +383,10 @@ pub(crate) trait ProcessProbe {
     fn pid_alive(&self, pid: u32) -> Option<bool>;
     /// When this machine booted, where the platform reports it.
     fn boot_time(&self) -> Option<DateTime<Utc>>;
+    /// When this process started reclaiming: no claim without an identity
+    /// written before then can be this process's, and the single-instance
+    /// lock means no other launcher of this distribution is running.
+    fn process_started(&self) -> DateTime<Utc>;
 }
 
 /// [`ProcessProbe`] against the machine this runs on.
@@ -404,6 +412,12 @@ impl ProcessProbe for HostProcesses {
     fn boot_time(&self) -> Option<DateTime<Utc>> {
         crate::process::boot_time()
     }
+
+    fn process_started(&self) -> DateTime<Utc> {
+        // Set by the first reclaim, which the daemon makes at start.
+        static STARTED: std::sync::LazyLock<DateTime<Utc>> = std::sync::LazyLock::new(Utc::now);
+        *STARTED
+    }
 }
 
 /// Decide whether a recorded guest launch owner is provably gone.
@@ -427,12 +441,19 @@ fn stale_guest_owner(owner: &FenceOwner, probe: &dyn ProcessProbe) -> Option<Sta
         };
     }
     // No identity: written before 0.4.35, or by a claimer that could not read
-    // its own. Judge it by the boot and the bare PID.
+    // its own. Judge it by the boot, by this process's start, and by the bare
+    // PID. The boot alone is not enough: restarting one distribution gives it
+    // a new PID namespace inside the same WSL VM, so the boot time stays put
+    // while its recorded PID -- a low, early-boot number -- now belongs to
+    // somebody else.
     if probe
         .boot_time()
         .is_some_and(|booted| owner.acquired_at < booted)
     {
         return Some(StaleGuestClaim::EarlierBoot);
+    }
+    if owner.acquired_at < probe.process_started() {
+        return Some(StaleGuestClaim::WrittenBeforeThisDaemon);
     }
     if current.is_some_and(|me| me.pid() == owner.process_id) {
         // This process wrote it and lost it, or a predecessor holding this PID
@@ -476,6 +497,14 @@ impl std::fmt::Display for ReclaimedGuestClaim {
 static HELD_HERE: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// The held-set entry for the fence under `root`: canonical where possible,
+/// so two spellings of one shared root cannot each look unheld.
+fn held_key(root: &Path) -> PathBuf {
+    fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(FENCE_DIRECTORY)
+}
+
 fn held_here() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
     HELD_HERE
         .lock()
@@ -499,6 +528,8 @@ pub enum GuestClaimAttempt {
 #[derive(Debug)]
 pub struct GuestLaunchClaim {
     claim: Option<FenceClaim>,
+    /// This claim's entry in the held set.
+    key: PathBuf,
 }
 
 impl GuestLaunchClaim {
@@ -520,7 +551,7 @@ impl GuestLaunchClaim {
         };
         claim.release_on_drop = false;
         let mut held = held_here();
-        held.remove(&claim.directory);
+        held.remove(&self.key);
         let mut result = Ok(());
         for attempt in 1..=RELEASE_ATTEMPTS {
             result = remove_claim(&claim.directory);
@@ -553,8 +584,11 @@ pub(crate) fn try_claim_guest_launch_with(
     probe: &dyn ProcessProbe,
     now: DateTime<Utc>,
 ) -> Result<GuestClaimAttempt, FenceError> {
+    // The root must exist for its canonical spelling to be the key.
+    fs::create_dir_all(root).map_err(|source| io("create", root, source))?;
+    let key = held_key(root);
     let mut held = held_here();
-    if held.contains(&root.join(FENCE_DIRECTORY)) {
+    if held.contains(&key) {
         return Ok(GuestClaimAttempt::Busy);
     }
     let mut claim = FenceClaim::try_claim(root, FenceOwnerKind::GuestLaunch, None)?;
@@ -568,9 +602,12 @@ pub(crate) fn try_claim_guest_launch_with(
     let Some(claim) = claim else {
         return Ok(GuestClaimAttempt::Busy);
     };
-    held.insert(claim.directory.clone());
+    held.insert(key.clone());
     Ok(GuestClaimAttempt::Claimed {
-        claim: GuestLaunchClaim { claim: Some(claim) },
+        claim: GuestLaunchClaim {
+            claim: Some(claim),
+            key,
+        },
         reclaimed,
     })
 }
@@ -591,7 +628,7 @@ pub(crate) fn reclaim_stale_guest_claim_with(
     now: DateTime<Utc>,
 ) -> Result<Option<ReclaimedGuestClaim>, FenceError> {
     let held = held_here();
-    if held.contains(&root.join(FENCE_DIRECTORY)) {
+    if held.contains(&held_key(root)) {
         return Ok(None);
     }
     reclaim_unheld(root, probe, now)
@@ -804,6 +841,8 @@ mod tests {
         recheck: Option<Adoption>,
         pid_alive: Option<bool>,
         boot_time: Option<DateTime<Utc>>,
+        /// `None` reads as the beginning of time, so no record predates it.
+        process_started: Option<DateTime<Utc>>,
     }
 
     impl ProcessProbe for FakeProbe {
@@ -818,6 +857,9 @@ mod tests {
         }
         fn boot_time(&self) -> Option<DateTime<Utc>> {
             self.boot_time
+        }
+        fn process_started(&self) -> DateTime<Utc> {
+            self.process_started.unwrap_or(DateTime::<Utc>::MIN_UTC)
         }
     }
 
@@ -885,10 +927,10 @@ mod tests {
         assert!(!root.path().join(FENCE_DIRECTORY).exists());
     }
 
-    /// The incident: a claim written in an earlier WSL boot, whose PID is held
-    /// now by a different process -- here, this one.
+    /// A claim whose PID now belongs to a different process -- here, this one
+    /// -- is reclaimed: the start token, not the PID, names the owner.
     #[test]
-    fn a_guest_claim_from_an_earlier_boot_is_reclaimed_even_when_its_pid_is_reused() {
+    fn a_guest_claim_whose_pid_now_belongs_to_another_process_is_reclaimed() {
         let root = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         plant(
@@ -911,6 +953,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut child = crate::process::tests::long_running().spawn().unwrap();
         let live = child.identity().clone();
+        assert_eq!(
+            HostProcesses.recheck(&live),
+            Some(Adoption::Live),
+            "the owner must be known live, not merely uninspectable"
+        );
         plant(
             root.path(),
             &guest_owner(child.pid(), Utc::now(), Some(live.clone())),
@@ -954,7 +1001,7 @@ mod tests {
             claimed(try_claim_guest_launch_with(root.path(), &HostProcesses, Utc::now()).unwrap());
         // What a failed removal leaves: the claim let go, the directory kept.
         claim.claim.take().unwrap().make_durable();
-        held_here().remove(&root.path().join(FENCE_DIRECTORY));
+        held_here().remove(&held_key(root.path()));
         drop(claim);
         assert!(root.path().join(FENCE_DIRECTORY).exists());
 
@@ -1031,6 +1078,19 @@ mod tests {
         let unknown = FakeProbe::default();
         assert_eq!(stale_guest_owner(&old, &unknown), None);
 
+        // One distribution restarted inside a running WSL VM: same boot, a
+        // new PID namespace where PID 189 is somebody else's.
+        let distribution_restarted = FakeProbe {
+            boot_time: Some(before),
+            pid_alive: Some(true),
+            process_started: Some(after),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            stale_guest_owner(&old, &distribution_restarted),
+            Some(StaleGuestClaim::WrittenBeforeThisDaemon)
+        );
+
         let mine = FakeProbe {
             boot_time: Some(before),
             pid_alive: Some(true),
@@ -1043,8 +1103,11 @@ mod tests {
         );
     }
 
+    /// The incident record, read by an updated daemon whose WSL VM was never
+    /// rebooted, with PID 189 now somebody else's: the case the boot time
+    /// alone cannot settle.
     #[test]
-    fn the_incident_record_is_reclaimed_at_daemon_start_after_a_wsl_restart() {
+    fn the_incident_record_is_reclaimed_at_daemon_start_after_an_update() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join(FENCE_DIRECTORY)).unwrap();
         fs::write(
@@ -1052,19 +1115,33 @@ mod tests {
             PRE_0_4_35_RECORD,
         )
         .unwrap();
-        let this_boot = FakeProbe {
-            boot_time: Some("2026-10-07T00:00:00Z".parse().unwrap()),
+        let same_boot_new_daemon = FakeProbe {
+            boot_time: Some("2026-09-20T00:00:00Z".parse().unwrap()),
             pid_alive: Some(true),
+            process_started: Some("2026-10-07T18:00:00Z".parse().unwrap()),
             ..FakeProbe::default()
         };
 
-        let reclaimed = reclaim_stale_guest_claim_with(root.path(), &this_boot, Utc::now())
-            .unwrap()
-            .unwrap();
+        let reclaimed =
+            reclaim_stale_guest_claim_with(root.path(), &same_boot_new_daemon, Utc::now())
+                .unwrap()
+                .unwrap();
 
-        assert_eq!(reclaimed.reason, StaleGuestClaim::EarlierBoot);
+        assert_eq!(reclaimed.reason, StaleGuestClaim::WrittenBeforeThisDaemon);
         assert!(!root.path().join(FENCE_DIRECTORY).exists());
-        claimed(try_claim_guest_launch_with(root.path(), &this_boot, Utc::now()).unwrap());
+        claimed(
+            try_claim_guest_launch_with(root.path(), &same_boot_new_daemon, Utc::now()).unwrap(),
+        );
+    }
+
+    /// The real boot time is read on the one platform that reclaims by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_linux_host_reports_when_it_booted() {
+        let booted = HostProcesses
+            .boot_time()
+            .expect("/proc/stat names the boot");
+        assert!(booted < Utc::now(), "{booted}");
     }
 
     #[test]

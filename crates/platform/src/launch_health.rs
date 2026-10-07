@@ -45,14 +45,40 @@ pub const BLOCKED_AFTER: Duration = Duration::from_secs(5 * 60);
 /// take minutes at worst.
 const FENCE_HELD_TOO_LONG: Duration = Duration::from_secs(30 * 60);
 
-/// How to restart the service from inside a managed WSL distribution.
-pub const GUEST_RESTART: &str =
-    "`sudo systemctl restart runner-manager.service` inside the distribution";
+/// How long a daemon's record counts after its last refusal. Refusals happen
+/// only while there is demand, so a record no longer being refreshed means
+/// nothing is being refused; a fence that is still stuck is caught by
+/// [`stuck_launch_fence`] instead.
+const RECORD_FRESH: Duration = Duration::from_secs(15 * 60);
 
-/// How to restart a managed distribution's service from Windows.
-#[must_use]
-pub fn windows_restart(distribution: &str) -> String {
-    format!("`wsl.exe -d {distribution} -u root systemctl restart runner-manager.service`")
+/// Which side of the WSL boundary a report is written for: the commands it
+/// can name, and the clock a fence is aged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Viewpoint<'a> {
+    /// Inside the managed distribution, whose name the guest does not know.
+    Guest,
+    /// On Windows, for one named distribution.
+    Windows { distribution: &'a str },
+}
+
+impl Viewpoint<'_> {
+    fn name(self) -> String {
+        match self {
+            Self::Guest => "<name>".to_string(),
+            Self::Windows { distribution } => distribution.to_string(),
+        }
+    }
+
+    fn restart(self) -> String {
+        match self {
+            Self::Guest => {
+                "`sudo systemctl restart runner-manager.service` inside the distribution".into()
+            }
+            Self::Windows { distribution } => format!(
+                "`wsl.exe -d {distribution} -u root systemctl restart runner-manager.service`"
+            ),
+        }
+    }
 }
 
 /// Why this host starts no runner, and what ends it.
@@ -78,9 +104,12 @@ pub enum BlockCause {
         directory: PathBuf,
         owner: Option<FenceOwner>,
     },
+    /// The fence's owner record exists and cannot be read, so it can never
+    /// be judged, let alone reclaimed.
+    FenceOwnerUnreadable { directory: PathBuf, detail: String },
     /// Windows asked the distribution to drain for WSL recovery.
     DrainRequested { root: PathBuf },
-    /// The fence or its configuration could not be used at all.
+    /// The recovery configuration could not be used.
     FenceUnusable { detail: String },
     /// Another process kept the host-wide allocation lock.
     AllocationLockBusy { path: PathBuf },
@@ -89,24 +118,74 @@ pub enum BlockCause {
 impl BlockCause {
     /// The operator-facing reason and remedy, refused since `since`.
     #[must_use]
-    pub fn blocked_since(&self, since: DateTime<Utc>, restart: &str) -> LaunchesBlocked {
+    pub fn blocked_since(&self, since: DateTime<Utc>, viewpoint: Viewpoint<'_>) -> LaunchesBlocked {
+        let name = viewpoint.name();
+        let restart = viewpoint.restart();
+        let watch_recovery = format!(
+            "launches resume when Windows finishes recovering it (`runner-manager wsl status \
+             --distribution {name}` on Windows shows the phase), and coordination no watchdog \
+             maintains is retired 5 minutes after it stops"
+        );
         let (reason, remedy) = match self {
-            Self::FenceHeld { directory, owner } => fence_held(directory, owner.as_ref(), restart),
+            Self::FenceHeld {
+                directory,
+                owner: Some(owner),
+            } if owner.kind == FenceOwnerKind::WindowsRecovery => (
+                format!(
+                    "Windows WSL recovery holds the launch fence ({})",
+                    directory.display()
+                ),
+                watch_recovery,
+            ),
+            Self::FenceHeld {
+                directory,
+                owner: Some(owner),
+            } => (
+                format!(
+                    "a runner launch by process {} holds the WSL launch fence ({})",
+                    owner.process_id,
+                    directory.display()
+                ),
+                format!(
+                    "if no runner is being registered, restart the service with {restart}; the \
+                     restarted daemon reclaims a fence whose owner is gone"
+                ),
+            ),
+            Self::FenceHeld {
+                directory,
+                owner: None,
+            } => (
+                format!(
+                    "the WSL launch fence ({}) has no owner record",
+                    directory.display()
+                ),
+                format!(
+                    "restart the service with {restart}; if the fence survives the restart, \
+                     delete {} once no runner-manager launch is in progress",
+                    directory.display()
+                ),
+            ),
+            Self::FenceOwnerUnreadable { directory, detail } => (
+                format!("the WSL launch fence's owner record cannot be read: {detail}"),
+                format!(
+                    "delete {} once no runner-manager launch is in progress on {name}; no daemon \
+                     reclaims a fence whose owner it cannot read",
+                    directory.display()
+                ),
+            ),
             Self::DrainRequested { root } => (
                 format!(
                     "Windows has asked this distribution to drain for WSL recovery ({})",
                     root.join(crate::wsl::fence::REQUEST_FILE).display()
                 ),
-                "run `runner-manager wsl status --distribution <name>` on Windows; launches resume \
-                 when the recovery ends, and a request no watchdog maintains is retired after 5 \
-                 minutes"
-                    .to_string(),
+                watch_recovery,
             ),
             Self::FenceUnusable { detail } => (
-                format!("the WSL launch fence cannot be used: {detail}"),
-                "repair the managed host from Windows with `runner-manager wsl install \
-                 --distribution <name>`"
-                    .to_string(),
+                format!("the WSL recovery configuration cannot be used: {detail}"),
+                format!(
+                    "repair the managed host from Windows with `runner-manager wsl install \
+                     --distribution {name}`"
+                ),
             ),
             Self::AllocationLockBusy { path } => (
                 format!(
@@ -124,58 +203,30 @@ impl BlockCause {
     }
 }
 
-fn fence_held(directory: &Path, owner: Option<&FenceOwner>, restart: &str) -> (String, String) {
-    let directory = directory.display();
-    match owner {
-        Some(owner) if owner.kind == FenceOwnerKind::WindowsRecovery => (
-            format!(
-                "Windows WSL recovery has held the launch fence ({directory}) since {}",
-                owner.acquired_at.to_rfc3339()
-            ),
-            "run `runner-manager wsl status --distribution <name>` on Windows; a recovery no \
-             watchdog maintains is retired 5 minutes after it stops"
-                .to_string(),
-        ),
-        Some(owner) => (
-            format!(
-                "a runner launch by process {} has held the WSL launch fence ({directory}) since {}",
-                owner.process_id,
-                owner.acquired_at.to_rfc3339()
-            ),
-            format!(
-                "if no runner is being registered, restart the service with {restart}; the \
-                 restarted daemon reclaims a fence whose owner is gone"
-            ),
-        ),
-        None => (
-            format!("the WSL launch fence ({directory}) has no readable owner"),
-            format!(
-                "restart the service with {restart}; if the fence survives the restart, delete \
-                 {directory} once no runner-manager launch is in progress"
-            ),
-        ),
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchesBlockedRecord {
     schema_version: u32,
+    /// The latest refusal, rewritten on each one. See [`RECORD_FRESH`].
+    last_refused_at: DateTime<Utc>,
     #[serde(flatten)]
     blocked: LaunchesBlocked,
 }
 
-/// Records that the daemon's allocations keep being refused.
+/// Records that the daemon's allocations keep being refused, the latest
+/// refusal at `last_refused_at`.
 ///
 /// # Errors
 /// [`ServiceError::Record`] when `state/` cannot be written.
 pub fn record_launches_blocked(
     paths: &AppPaths,
     blocked: &LaunchesBlocked,
+    last_refused_at: DateTime<Utc>,
 ) -> Result<(), ServiceError> {
     write_state_record(
         &launches_blocked_path(paths),
         &LaunchesBlockedRecord {
             schema_version: SCHEMA_VERSION,
+            last_refused_at,
             blocked: blocked.clone(),
         },
     )
@@ -189,75 +240,86 @@ pub fn clear_launches_blocked(paths: &AppPaths) -> Result<(), ServiceError> {
     remove_state_record(&launches_blocked_path(paths))
 }
 
-/// The daemon's own record of blocked launches, if it wrote one.
+/// The daemon's own record of blocked launches, if it wrote one and refused
+/// an allocation within [`RECORD_FRESH`] of `now`.
 ///
 /// # Errors
 /// [`ServiceError::Record`] when the file exists and cannot be read or parsed.
 pub fn recorded_launches_blocked(
     paths: &AppPaths,
+    now: DateTime<Utc>,
 ) -> Result<Option<LaunchesBlocked>, ServiceError> {
     Ok(
         read_state_record::<LaunchesBlockedRecord>(&launches_blocked_path(paths))?
+            .filter(|record| !elapsed_at_least(record.last_refused_at, now, RECORD_FRESH))
             .map(|record| record.blocked),
     )
 }
 
-/// Where the record lives.
-#[must_use]
 fn launches_blocked_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(LAUNCHES_BLOCKED_FILE)
 }
 
 /// A launch fence under `root` that has been held for longer than any launch
-/// takes, from either side of the WSL boundary.
+/// takes, seen from `viewpoint`.
+///
+/// The guest ages a claim by the owner's own `acquired_at`, written by the
+/// guest clock. Windows ages it by the directory's modification time, which
+/// NTFS stamps with the Windows clock, because a WSL clock can lag the host's
+/// by a long way after the machine sleeps.
 #[must_use]
 pub fn stuck_launch_fence(
     root: &Path,
     now: DateTime<Utc>,
-    restart: &str,
+    viewpoint: Viewpoint<'_>,
 ) -> Option<LaunchesBlocked> {
     let directory = root.join(FENCE_DIRECTORY);
+    let modified = || fence_modified(root).ok().flatten();
     match FenceClaim::owner(root) {
         Ok(Some(owner)) => {
-            let since = owner.acquired_at;
+            let since = match viewpoint {
+                Viewpoint::Guest => owner.acquired_at,
+                Viewpoint::Windows { .. } => modified()?,
+            };
             elapsed_at_least(since, now, FENCE_HELD_TOO_LONG).then(|| {
                 BlockCause::FenceHeld {
                     directory,
                     owner: Some(owner),
                 }
-                .blocked_since(since, restart)
+                .blocked_since(since, viewpoint)
             })
         }
         // A claimer writes its owner straight after creating the directory, so
         // one still missing after the reclaim grace is not a launch in progress.
         Ok(None) => {
-            let since = fence_modified(root).ok()??;
+            let since = modified()?;
             elapsed_at_least(since, now, OWNERLESS_CLAIM_GRACE).then(|| {
                 BlockCause::FenceHeld {
                     directory,
                     owner: None,
                 }
-                .blocked_since(since, restart)
+                .blocked_since(since, viewpoint)
             })
         }
         Err(error) => Some(
-            BlockCause::FenceUnusable {
+            BlockCause::FenceOwnerUnreadable {
+                directory,
                 detail: error.to_string(),
             }
-            .blocked_since(fence_modified(root).ok().flatten().unwrap_or(now), restart),
+            .blocked_since(modified().unwrap_or(now), viewpoint),
         ),
     }
 }
 
-/// Whether this host's own daemon starts no runner: its record first, then,
-/// inside a managed WSL distribution, the fence itself.
+/// Whether this host's own daemon starts no runner: its fresh record first,
+/// then, inside a managed WSL distribution, the fence itself.
 #[must_use]
 pub fn launches_blocked(paths: &AppPaths, now: DateTime<Utc>) -> Option<LaunchesBlocked> {
-    if let Ok(Some(blocked)) = recorded_launches_blocked(paths) {
+    if let Ok(Some(blocked)) = recorded_launches_blocked(paths, now) {
         return Some(blocked);
     }
     let config = GuestRecoveryConfig::read(paths).ok().flatten()?;
-    stuck_launch_fence(&config.shared_root, now, GUEST_RESTART)
+    stuck_launch_fence(&config.shared_root, now, Viewpoint::Guest)
 }
 
 #[cfg(test)]
@@ -273,54 +335,120 @@ mod tests {
     fn the_record_round_trips_and_clears() {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(dir.path());
-        assert_eq!(recorded_launches_blocked(&paths).unwrap(), None);
+        let now = Utc::now();
+        assert_eq!(recorded_launches_blocked(&paths, now).unwrap(), None);
         let blocked = BlockCause::AllocationLockBusy {
             path: PathBuf::from("allocation.lock"),
         }
-        .blocked_since(Utc::now(), GUEST_RESTART);
-        record_launches_blocked(&paths, &blocked).unwrap();
+        .blocked_since(now, Viewpoint::Guest);
+        record_launches_blocked(&paths, &blocked, now).unwrap();
         assert_eq!(
-            recorded_launches_blocked(&paths).unwrap(),
+            recorded_launches_blocked(&paths, now).unwrap(),
             Some(blocked.clone())
         );
-        assert_eq!(launches_blocked(&paths, Utc::now()), Some(blocked));
+        assert_eq!(launches_blocked(&paths, now), Some(blocked));
         clear_launches_blocked(&paths).unwrap();
-        assert_eq!(launches_blocked(&paths, Utc::now()), None);
+        assert_eq!(launches_blocked(&paths, now), None);
+    }
+
+    /// A daemon refuses only while there is demand. A record nobody refreshes
+    /// -- the demand went elsewhere, the service was stopped -- must not keep
+    /// a host that would launch fine reported as blocked.
+    #[test]
+    fn a_record_no_refusal_refreshes_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let refused = Utc::now();
+        let blocked = BlockCause::AllocationLockBusy {
+            path: PathBuf::from("allocation.lock"),
+        }
+        .blocked_since(refused, Viewpoint::Guest);
+        record_launches_blocked(&paths, &blocked, refused).unwrap();
+
+        let soon = refused + chrono::Duration::minutes(14);
+        assert_eq!(launches_blocked(&paths, soon), Some(blocked));
+        let later = refused + chrono::Duration::minutes(16);
+        assert_eq!(launches_blocked(&paths, later), None);
     }
 
     #[test]
     fn a_fence_is_stuck_only_once_it_outlives_any_launch() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            stuck_launch_fence(dir.path(), Utc::now(), GUEST_RESTART),
+            stuck_launch_fence(dir.path(), Utc::now(), Viewpoint::Guest),
             None
         );
         let claim = FenceClaim::try_claim(dir.path(), FenceOwnerKind::GuestLaunch, None)
             .unwrap()
             .unwrap();
         assert_eq!(
-            stuck_launch_fence(dir.path(), Utc::now(), GUEST_RESTART),
+            stuck_launch_fence(dir.path(), Utc::now(), Viewpoint::Guest),
             None
         );
         let later = Utc::now() + chrono::Duration::minutes(31);
-        let stuck = stuck_launch_fence(dir.path(), later, GUEST_RESTART).expect("stuck");
+        let stuck = stuck_launch_fence(dir.path(), later, Viewpoint::Guest).expect("stuck");
         assert!(
             stuck.reason.contains("runner launch by process"),
             "{stuck:?}"
         );
         assert!(stuck.remedy.contains("systemctl restart"), "{stuck:?}");
+        let windows = stuck_launch_fence(
+            dir.path(),
+            later,
+            Viewpoint::Windows {
+                distribution: "Ubuntu",
+            },
+        )
+        .expect("stuck from Windows too");
+        assert!(
+            windows.remedy.contains("wsl.exe -d Ubuntu -u root"),
+            "{windows:?}"
+        );
         drop(claim);
-        assert_eq!(stuck_launch_fence(dir.path(), later, GUEST_RESTART), None);
+        assert_eq!(
+            stuck_launch_fence(dir.path(), later, Viewpoint::Guest),
+            None
+        );
+    }
+
+    /// Windows ages a claim by its own clock, not by the guest-written
+    /// `acquired_at`: a WSL clock lagging the host's by an hour must not make a
+    /// claim made a moment ago look stuck.
+    #[test]
+    fn windows_ages_a_fence_by_its_own_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let fence = dir.path().join(FENCE_DIRECTORY);
+        std::fs::create_dir_all(&fence).unwrap();
+        let lagging = FenceOwner {
+            schema_version: crate::wsl::fence::SCHEMA_VERSION,
+            kind: FenceOwnerKind::GuestLaunch,
+            generation: None,
+            process_id: 7,
+            acquired_at: Utc::now() - chrono::Duration::hours(1),
+            identity: None,
+        };
+        std::fs::write(
+            fence.join(crate::wsl::fence::OWNER_FILE),
+            serde_json::to_vec(&lagging).unwrap(),
+        )
+        .unwrap();
+        let windows = Viewpoint::Windows {
+            distribution: "Ubuntu",
+        };
+        assert_eq!(stuck_launch_fence(dir.path(), Utc::now(), windows), None);
+        assert!(stuck_launch_fence(dir.path(), Utc::now(), Viewpoint::Guest).is_some());
     }
 
     #[test]
-    fn an_unreadable_owner_is_reported_at_once() {
+    fn an_unreadable_owner_is_reported_at_once_with_the_directory_to_delete() {
         let dir = tempfile::tempdir().unwrap();
         let fence = dir.path().join(FENCE_DIRECTORY);
         std::fs::create_dir_all(&fence).unwrap();
         std::fs::write(fence.join(crate::wsl::fence::OWNER_FILE), b"{not json").unwrap();
-        let stuck = stuck_launch_fence(dir.path(), Utc::now(), GUEST_RESTART).expect("stuck");
-        assert!(stuck.reason.contains("cannot be used"), "{stuck:?}");
+        let stuck = stuck_launch_fence(dir.path(), Utc::now(), Viewpoint::Guest).expect("stuck");
+        assert!(stuck.reason.contains("cannot be read"), "{stuck:?}");
+        assert!(stuck.remedy.starts_with("delete "), "{stuck:?}");
+        assert!(!stuck.remedy.contains("wsl install"), "{stuck:?}");
     }
 
     #[test]
