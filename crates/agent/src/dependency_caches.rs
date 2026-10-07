@@ -172,12 +172,21 @@ impl DependencyCaches {
         self.prune_guarded(true)
     }
 
-    /// [`Self::prune_once`] for an operator's `host cache prune` that this
-    /// service carries out on their behalf: it prunes whether or not caches
-    /// are on, exactly as the command does when it can write the root itself.
-    #[must_use]
-    pub fn prune_on_request(&self) -> Option<CacheUsage> {
-        self.prune_guarded(false)
+    /// One look by the service: prunes when an operator's `host cache prune`
+    /// left a [`dependency_cache::PRUNE_REQUEST_FILE`] in `state_dir`, or else
+    /// when `due`. Returns whether it took a request.
+    ///
+    /// A request is carried out whether or not caches are on, exactly as the
+    /// command does when its account can write the root itself; only the
+    /// scheduled pass respects the switch.
+    pub fn prune_if_requested_or_due(&self, state_dir: &Path, due: bool) -> bool {
+        let requested = dependency_cache::take_prune_request(state_dir);
+        if requested {
+            let _ = self.prune_guarded(false);
+        } else if due {
+            let _ = self.prune_once();
+        }
+        requested
     }
 
     fn prune_guarded(&self, only_when_enabled: bool) -> Option<CacheUsage> {
@@ -241,6 +250,41 @@ mod tests {
             Arc::new(move || runner_root.clone()),
             None,
         )
+    }
+
+    #[test]
+    fn an_operators_prune_request_is_carried_out_even_with_caches_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let root = dir.path().join("_cache");
+        std::fs::create_dir_all(root.join("octo")).unwrap();
+        let caches = caches(dir.path(), Some(dir.path().to_path_buf()));
+        let config = CacheConfig {
+            enabled: Some(false),
+            ..CacheConfig::default()
+        };
+        config
+            .save(&dependency_cache::config_path_in(dir.path()))
+            .unwrap();
+
+        assert!(!caches.prune_if_requested_or_due(&state, true));
+        assert!(
+            CacheUsage::read(&root).is_none(),
+            "the scheduled pass respects caches being off"
+        );
+
+        std::fs::write(dependency_cache::prune_request_path(&state), b"now").unwrap();
+        assert!(caches.prune_if_requested_or_due(&state, false));
+        assert!(
+            CacheUsage::read(&root).is_some(),
+            "the operator's request is carried out and recorded for the asking command"
+        );
+        assert!(!dependency_cache::prune_request_path(&state).exists());
+        assert!(
+            !caches.prune_if_requested_or_due(&state, false),
+            "and honoured once"
+        );
     }
 
     #[test]
