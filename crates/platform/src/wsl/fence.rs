@@ -13,7 +13,7 @@
 //! nothing ever removes, and every later launch on that distribution is refused
 //! for good. That happened for 13 days on one host while the distribution
 //! looked healthy. So a guest claim records its owner's [`ProcessIdentity`],
-//! and [`GuestLaunchFence`] reclaims one only when that owner is *provably*
+//! and [`try_claim_guest_launch`] reclaims one only when that owner is *provably*
 //! gone: the process exited, its PID now belongs to somebody else, the claim
 //! predates this boot, or this very process wrote it and its release failed.
 //! A live owner, an owner that cannot be inspected, and a Windows recovery
