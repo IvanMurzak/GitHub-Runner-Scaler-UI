@@ -245,6 +245,11 @@ pub fn install(
             format!("cannot resolve this executable's own path: {source}"),
         )
     })?;
+    // Before anything is registered: the host checks that matter for the
+    // account this service is about to run as, and on a terminal an offer to
+    // fix them. It never refuses the install; the daemon holds runners back
+    // until a required check passes.
+    super::doctor::before_service_install(context, args.start_at.into(), out)?;
     install_from(context, args, out, &source)
 }
 
@@ -532,7 +537,16 @@ pub fn uninstall(context: &Context, out: &mut dyn Write) -> Result<(), CliError>
 }
 
 pub fn status(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
-    status_with(&operations(context), out)
+    let result = status_with(&operations(context), out);
+    // Last, and whatever the service's own verdict: a host that is not ready
+    // to run jobs is worth one line beside a healthy service too.
+    writeln!(
+        out,
+        "  host doctor               {}",
+        super::doctor::service_status_line(context)
+    )
+    .map_err(write_failed("this service status"))?;
+    result
 }
 
 fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<(), CliError> {

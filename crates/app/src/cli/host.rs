@@ -437,6 +437,11 @@ pub fn dispatch(
             isolation_status(args.json, out)
         }
         HostCommand::Env(command) => runner_env_command(context, command, out),
+        HostCommand::Doctor(args) => super::doctor::doctor(context, args, out),
+        HostCommand::Prepare(args) => super::doctor::prepare_command(context, args, out),
+        HostCommand::RequiredTools(args) => {
+            super::doctor::required_tools_command(context, args, out)
+        }
     }
 }
 

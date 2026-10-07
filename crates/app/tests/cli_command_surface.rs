@@ -57,6 +57,9 @@ const SURFACE: [(&str, &[&str]); 10] = [
             "show",
             "isolation",
             "env",
+            "doctor",
+            "prepare",
+            "required-tools",
         ],
     ),
     (

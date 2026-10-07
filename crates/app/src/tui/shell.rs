@@ -582,15 +582,94 @@ fn operational_readiness(
     wsl_hosts: &[WslHostRow],
 ) -> ReadinessAssessment {
     let service = inspect_local_service(context);
-    readiness_from_facts(
+    let now = compact_activity_time(context.clock().now());
+    let assessment = readiness_from_facts(
         service,
         local
             .policies
             .iter()
             .any(|policy| policy.enabled && policy.mode == "autoscale"),
         wsl_hosts,
-        compact_activity_time(context.clock().now()),
-    )
+        now.clone(),
+    );
+    with_host_doctor(assessment, &local.doctor, now)
+}
+
+/// The activity-row id prefix of a `host doctor` finding; the rest is the
+/// check id, which is what the one-key fix reads back.
+const DOCTOR_ROW_PREFIX: &str = "readiness:doctor:";
+
+/// Folds `host doctor`'s failing checks, and the daemon's refusal to start
+/// runners, into the readiness the dashboard leads with. A failing required
+/// check blocks; a recommended one degrades. The doctor itself ran on this
+/// TUI's background reader thread, with the rest of the status snapshot.
+fn with_host_doctor(
+    mut assessment: ReadinessAssessment,
+    doctor: &crate::cli::doctor::DoctorSummary,
+    now: String,
+) -> ReadinessAssessment {
+    use crate::cli::doctor::Severity;
+    let rank = |value| match value {
+        OperationalReadiness::Ready => 0,
+        OperationalReadiness::Unknown => 1,
+        OperationalReadiness::Degraded => 2,
+        OperationalReadiness::Blocked => 3,
+    };
+    let raise = |assessment: &mut ReadinessAssessment, next| {
+        if rank(next) > rank(assessment.state) {
+            assessment.state = next;
+        }
+    };
+    if let Some(unfit) = &doctor.daemon_host_unfit {
+        raise(&mut assessment, OperationalReadiness::Blocked);
+        assessment.activity.push(screens::ActivityRow {
+            id: "readiness:host:unfit".into(),
+            occurred_at: now.clone(),
+            outcome: screens::ActivityOutcome::Failed,
+            summary: format!(
+                "The service starts no runner: required host check(s) fail ({}).",
+                unfit.checks.join(", ")
+            ),
+            remediation: "Press f to run host prepare, or run `runner-manager host prepare`; the \
+                          service re-checks within five minutes."
+                .into(),
+        });
+    }
+    for finding in &doctor.failing {
+        let severity = if finding.severity == Severity::Required {
+            OperationalReadiness::Blocked
+        } else {
+            OperationalReadiness::Degraded
+        };
+        raise(&mut assessment, severity);
+        let remediation = match (&finding.remedy, finding.fixable) {
+            (_, true) if finding.consent_flag.is_some() => format!(
+                "Press f to fix (asks for administrator rights; it lowers security, so you are \
+                 asked first), or run `runner-manager host prepare --only {}`.",
+                finding.id
+            ),
+            (_, true) => format!(
+                "Press f to fix (asks for administrator rights once), or run `runner-manager host \
+                 prepare --only {}`.",
+                finding.id
+            ),
+            (Some(remedy), false) => format!("Do: {remedy}"),
+            (None, false) => "Run `runner-manager host doctor` for the details.".into(),
+        };
+        assessment.activity.push(screens::ActivityRow {
+            id: format!("{DOCTOR_ROW_PREFIX}{}", finding.id),
+            occurred_at: now.clone(),
+            outcome: if severity == OperationalReadiness::Blocked {
+                screens::ActivityOutcome::Failed
+            } else {
+                screens::ActivityOutcome::Retry
+            },
+            summary: format!("{}: {}", finding.title, finding.detail),
+            remediation,
+        });
+    }
+    assessment.summary = readiness_summary(assessment.state, assessment.activity.len());
+    assessment
 }
 
 fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceReadiness, String> {
@@ -801,26 +880,27 @@ fn readiness_from_facts(
         }
     }
 
-    let summary = match state {
+    ReadinessAssessment {
+        state,
+        summary: readiness_summary(state, activity.len()),
+        activity,
+    }
+}
+
+fn readiness_summary(state: OperationalReadiness, issues: usize) -> String {
+    match state {
         OperationalReadiness::Ready => {
             "Local service and every managed WSL host are ready for the next job.".to_owned()
         }
-        OperationalReadiness::Degraded => format!(
-            "The host can run, but {} readiness warning(s) need attention.",
-            activity.len()
-        ),
+        OperationalReadiness::Degraded => {
+            format!("The host can run, but {issues} readiness warning(s) need attention.")
+        }
         OperationalReadiness::Blocked => format!(
-            "The next job may not start; {} blocking or degraded condition(s) were found.",
-            activity.len()
+            "The next job may not start; {issues} blocking or degraded condition(s) were found."
         ),
         OperationalReadiness::Unknown => {
             "The next job cannot be guaranteed because readiness inspection failed.".to_owned()
         }
-    };
-    ReadinessAssessment {
-        state,
-        summary,
-        activity,
     }
 }
 
@@ -1460,6 +1540,9 @@ fn failure_remediation(reason: &FailureReason) -> &'static str {
         FailureReason::WorkspaceCleanupDeferred => {
             "Stop whatever still holds files in the attempt workspace; cleanup retries."
         }
+        FailureReason::HostUnfit => {
+            "Run `runner-manager host doctor`, then `runner-manager host prepare` (or press f on the Dashboard)."
+        }
         FailureReason::Other(_) => "Inspect the local runner log and the copy-safe diagnostic.",
     }
 }
@@ -1602,6 +1685,59 @@ pub enum Effect {
     OpenFullDiskAccess,
     ActivateFocusedControl,
     Settings(SettingsCommand),
+    /// Run `host prepare` for every failing check it can fix, elevating
+    /// through the system's own prompt. `allow_security_tradeoffs` includes
+    /// the fixes that lower security (Defender exclusion, Developer Mode).
+    PrepareHost {
+        allow_security_tradeoffs: bool,
+    },
+}
+
+/// The one-key host fix's dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HostPrepareUi {
+    #[default]
+    Hidden,
+    /// Waiting for the person to choose. `tradeoffs` names the failing checks
+    /// whose fix lowers security; with none, the choice is only yes or no.
+    Confirm { tradeoffs: Vec<String> },
+    /// What the last run did.
+    Done(String),
+}
+
+/// The failing `host doctor` checks the dashboard currently shows.
+fn failing_doctor_checks(state: &AppState) -> Vec<&str> {
+    state
+        .screen_model
+        .snapshot
+        .activity
+        .iter()
+        .filter_map(|row| row.id.strip_prefix(DOCTOR_ROW_PREFIX))
+        .collect()
+}
+
+fn reduce_host_prepare_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
+    match &state.host_prepare {
+        HostPrepareUi::Hidden => None,
+        HostPrepareUi::Done(_) => {
+            state.host_prepare = HostPrepareUi::Hidden;
+            // The key that closes the result is not also a command.
+            Some(Vec::new())
+        }
+        HostPrepareUi::Confirm { tradeoffs } => {
+            let choice = match key.code {
+                KeyCode::Char('y' | 'Y') => Some(!tradeoffs.is_empty()),
+                KeyCode::Char('s' | 'S') if !tradeoffs.is_empty() => Some(false),
+                _ => None,
+            };
+            state.host_prepare = HostPrepareUi::Hidden;
+            Some(choice.map_or_else(Vec::new, |allow_security_tradeoffs| {
+                vec![Effect::PrepareHost {
+                    allow_security_tradeoffs,
+                }]
+            }))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1746,6 +1882,7 @@ pub struct AppState {
     /// environment what the terminal can print.
     pub skin: Skin,
     navigation: NavigationLayout,
+    pub host_prepare: HostPrepareUi,
 }
 
 impl AppState {
@@ -1771,6 +1908,7 @@ impl AppState {
             settings: SettingsUi::default(),
             skin: Skin::detect(),
             navigation: NavigationLayout::for_area(navigation_area(Rect::new(0, 0, width, height))),
+            host_prepare: HostPrepareUi::Hidden,
         }
     }
 
@@ -2013,6 +2151,11 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             .unwrap_or_default();
     }
 
+    // An open host-prepare dialog owns the next key, as an open path editor does.
+    if let Some(effects) = reduce_host_prepare_key(state, key) {
+        return effects;
+    }
+
     if matches!(
         state.screen,
         Screen::HostSettings | Screen::RepositorySettings
@@ -2058,6 +2201,20 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             return vec![Effect::Settings(SettingsCommand::LoadHost)];
         }
         KeyCode::Char('a') => state.open_screen(Screen::Activity),
+        KeyCode::Char('f') => {
+            let failing = failing_doctor_checks(state);
+            state.host_prepare = if failing.is_empty() {
+                HostPrepareUi::Done("Host doctor reports nothing to fix.".into())
+            } else {
+                HostPrepareUi::Confirm {
+                    tradeoffs: failing
+                        .into_iter()
+                        .filter(|id| crate::cli::doctor::lowers_security(id))
+                        .map(str::to_owned)
+                        .collect(),
+                }
+            };
+        }
         KeyCode::Char('p')
             if state.screen == Screen::Dashboard && state.presentation.privacy_access_denied =>
         {
@@ -2441,9 +2598,72 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         )
     };
     frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[3]);
+    render_host_prepare(frame, rows[2], &state.host_prepare);
     if state.help_open || compact {
         render_help(frame, area, compact);
     }
+}
+
+/// The one-key host fix's dialog, centred over the content.
+fn render_host_prepare(frame: &mut Frame<'_>, area: Rect, dialog: &HostPrepareUi) {
+    let lines: Vec<Line<'static>> = match dialog {
+        HostPrepareUi::Hidden => return,
+        HostPrepareUi::Confirm { tradeoffs } if tradeoffs.is_empty() => vec![
+            Line::from("Fix what host doctor found?"),
+            Line::from("Changes that need administrator rights are made in one step,"),
+            Line::from("after the system's own administrator prompt."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[y] fix   [any other key] cancel",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ],
+        HostPrepareUi::Confirm { tradeoffs } => vec![
+            Line::from("Fix what host doctor found?"),
+            Line::from(Span::styled(
+                format!("These fixes lower security: {}", tradeoffs.join(", ")),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from("A Defender exclusion stops on-access scanning of the runner roots;"),
+            Line::from("Developer Mode lets every account create symbolic links."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[y] fix all   [s] fix only the others   [any other key] cancel",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ],
+        HostPrepareUi::Done(message) => vec![
+            Line::from(message.clone()),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[any key] close",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ],
+    };
+    let width = area.width.saturating_sub(4).min(76);
+    let height = (u16::try_from(lines.len()).unwrap_or(u16::MAX) + 4).min(area.height);
+    if width < 10 || height < 3 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Host prepare")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, compact: bool) {
@@ -2473,7 +2693,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, compact: bool) {
     let help = if compact {
         "d Dashboard  r Repositories  n Runners\ns Repo settings  h Host settings  a Activity\n/ Filter F5 Refresh ? Help Esc Back q Quit\nTab Shift-Tab Arrows Focus  Enter Activate\nc Copy diagnostics  m Mouse capture  o Sort\nKeys mirror every mouse action"
     } else {
-        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   o sort   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture\nPath fields: Enter edit   type or paste   Esc cancel   Enter accept\nMouse actions always have the keyboard equivalents above."
+        "d Dashboard   r Repositories   n Runners\ns Repository settings   h Host settings   a Activity\n/ filter   o sort   F5 refresh   ? help   Esc close/back   q quit\nTab / Shift-Tab / arrows focus   Enter activate\nc copy diagnostics   m release/re-enable mouse capture   f fix host\nPath fields: Enter edit   type or paste   Esc cancel   Enter accept\nMouse actions always have the keyboard equivalents above."
     };
     frame.render_widget(Clear, popup);
     let title = if compact {
@@ -2692,7 +2912,7 @@ pub fn copy_to_terminal_clipboard(writer: &mut dyn Write, text: &str) -> io::Res
     writer.flush()
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -2814,6 +3034,20 @@ where
                                 .into(),
                         );
                     }
+                }
+                Effect::PrepareHost {
+                    allow_security_tradeoffs,
+                } => {
+                    // Synchronous on purpose: while it runs the person is
+                    // answering the system's administrator prompt, not this UI.
+                    let message = match context {
+                        Some(context) => {
+                            crate::cli::doctor::prepare_from_tui(context, allow_security_tradeoffs)
+                        }
+                        None => "host prepare needs the local application context".into(),
+                    };
+                    state.host_prepare = HostPrepareUi::Done(message);
+                    refresh.request_refresh()?;
                 }
             }
         }
@@ -5551,4 +5785,179 @@ fn stopped_service_repair_commands_are_accepted_by_the_published_cli() {
             "TUI remediation must be executable: {command}"
         );
     }
+}
+
+#[cfg(test)]
+fn doctor_summary(
+    failing: &[(&str, crate::cli::doctor::Severity, bool)],
+    unfit: bool,
+) -> crate::cli::doctor::DoctorSummary {
+    crate::cli::doctor::DoctorSummary {
+        checked: 9,
+        failing: failing
+            .iter()
+            .map(
+                |(id, severity, fixable)| crate::cli::doctor::FindingSummary {
+                    id: (*id).to_owned(),
+                    severity: *severity,
+                    title: "A check".into(),
+                    detail: "it fails".into(),
+                    remedy: Some("do the thing".into()),
+                    fixable: *fixable,
+                    needs_admin: true,
+                    consent_flag: crate::cli::doctor::lowers_security(id)
+                        .then(|| "--allow-av-exclusion".to_owned()),
+                },
+            )
+            .collect(),
+        unknown: Vec::new(),
+        daemon_host_unfit: unfit.then(|| crate::cli::doctor::HostUnfitSummary {
+            since: chrono::Utc::now(),
+            checks: vec!["windows.symlink_privilege".into()],
+        }),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_doctor_findings_and_the_daemons_refusal_lead_the_readiness() {
+    use crate::cli::doctor::Severity;
+
+    let ready = readiness_from_facts(Ok(ready_service()), true, &[], "12:00:00Z".into());
+    let degraded = with_host_doctor(
+        ready,
+        &doctor_summary(
+            &[("windows.long_paths", Severity::Recommended, true)],
+            false,
+        ),
+        "12:00:00Z".into(),
+    );
+    assert_eq!(degraded.state, OperationalReadiness::Degraded);
+    assert_eq!(degraded.activity.len(), 1);
+    assert_eq!(
+        degraded.activity[0].id,
+        "readiness:doctor:windows.long_paths"
+    );
+    assert!(
+        degraded.activity[0].remediation.contains("Press f"),
+        "{degraded:?}"
+    );
+    assert!(
+        degraded.summary.contains("1 readiness warning"),
+        "{}",
+        degraded.summary
+    );
+
+    let ready = readiness_from_facts(Ok(ready_service()), true, &[], "12:00:00Z".into());
+    let blocked = with_host_doctor(
+        ready,
+        &doctor_summary(&[("host.required_tools", Severity::Required, false)], true),
+        "12:00:00Z".into(),
+    );
+    assert_eq!(blocked.state, OperationalReadiness::Blocked);
+    assert!(
+        blocked
+            .activity
+            .iter()
+            .any(|row| row.id == "readiness:host:unfit")
+    );
+    let tools = blocked
+        .activity
+        .iter()
+        .find(|row| row.id == "readiness:doctor:host.required_tools")
+        .expect("the failing required check is a row");
+    assert_eq!(
+        tools.remediation, "Do: do the thing",
+        "no fix, so the remedy"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn f_offers_the_host_fix_and_asks_before_a_security_tradeoff() {
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    let press = |code| {
+        AppEvent::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    };
+    let with_rows = |ids: &[&str]| {
+        let mut state = AppState::new(PresentationState::default(), 120, 40);
+        state.screen_model = ScreenModel::new(Snapshot {
+            activity: ids
+                .iter()
+                .map(|id| screens::ActivityRow {
+                    id: format!("{DOCTOR_ROW_PREFIX}{id}"),
+                    occurred_at: "12:00:00Z".into(),
+                    outcome: screens::ActivityOutcome::Retry,
+                    summary: String::new(),
+                    remediation: String::new(),
+                })
+                .collect(),
+            ..Snapshot::default()
+        });
+        state
+    };
+
+    let mut nothing = with_rows(&[]);
+    assert!(reduce(&mut nothing, press(KeyCode::Char('f'))).is_empty());
+    assert!(matches!(nothing.host_prepare, HostPrepareUi::Done(_)));
+    assert!(reduce(&mut nothing, press(KeyCode::Char('q'))).is_empty());
+    assert_eq!(nothing.host_prepare, HostPrepareUi::Hidden);
+    assert!(
+        !nothing.should_exit,
+        "the key that closes the result is not a command"
+    );
+
+    let mut safe = with_rows(&["windows.long_paths"]);
+    reduce(&mut safe, press(KeyCode::Char('f')));
+    assert_eq!(
+        safe.host_prepare,
+        HostPrepareUi::Confirm { tradeoffs: vec![] }
+    );
+    assert_eq!(
+        reduce(&mut safe, press(KeyCode::Char('y'))),
+        [Effect::PrepareHost {
+            allow_security_tradeoffs: false
+        }]
+    );
+
+    let mut tradeoff = with_rows(&["windows.long_paths", "windows.defender_exclusion"]);
+    reduce(&mut tradeoff, press(KeyCode::Char('f')));
+    assert_eq!(
+        tradeoff.host_prepare,
+        HostPrepareUi::Confirm {
+            tradeoffs: vec!["windows.defender_exclusion".into()]
+        }
+    );
+    let frame = {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &tradeoff)).unwrap();
+        crate::tui::buffer_text(terminal.backend().buffer())
+    };
+    assert!(frame.contains("These fixes lower security"), "{frame}");
+    assert_eq!(
+        reduce(&mut tradeoff, press(KeyCode::Char('s'))),
+        [Effect::PrepareHost {
+            allow_security_tradeoffs: false
+        }]
+    );
+    reduce(&mut tradeoff, press(KeyCode::Char('f')));
+    assert_eq!(
+        reduce(&mut tradeoff, press(KeyCode::Char('y'))),
+        [Effect::PrepareHost {
+            allow_security_tradeoffs: true
+        }]
+    );
+    reduce(&mut tradeoff, press(KeyCode::Char('f')));
+    assert!(
+        reduce(&mut tradeoff, press(KeyCode::Esc)).is_empty(),
+        "anything else cancels"
+    );
+    assert_eq!(tradeoff.host_prepare, HostPrepareUi::Hidden);
 }

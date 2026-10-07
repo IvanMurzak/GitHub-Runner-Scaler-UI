@@ -22,8 +22,9 @@ use runner_manager_agent::package::{
     CachePorts, ExponentialBackoff, GatewayCatalog, HttpFetcher, PackageCache,
 };
 use runner_manager_agent::reconcile::{
-    AllocationLock, FileAllocationLock, GatewayDemand, RandomJitter, ReconcileReport, Reconciler,
-    ReconcilerPorts, RepositoryDirectory, TeeEvents, TracingEvents, WslRecoveryAllocationLock,
+    AllocationLock, FileAllocationLock, FitnessGatedLauncher, GatewayDemand, RandomJitter,
+    ReconcileReport, Reconciler, ReconcilerPorts, RepositoryDirectory, TeeEvents, TracingEvents,
+    WslRecoveryAllocationLock,
 };
 use runner_manager_domain::attempt::{AttemptState, FailureReason, active_count, active_count_for};
 use runner_manager_domain::model::{AttemptId, Clock, Org, OwnerRepo, ScaleTarget, StartMode};
@@ -258,6 +259,15 @@ async fn run_generation(
         Arc::clone(&paths),
         base_lock,
     ));
+    // ------------------------------------------------------------------
+    // NO RUNNER STARTS ON A HOST THAT FAILS A REQUIRED CHECK.
+    // ------------------------------------------------------------------
+    // Evaluated before the first pass, and again every few minutes by
+    // `maintain_host_fitness`. While it fails, every launch is refused with
+    // `host_unfit` before a runner is registered with GitHub; supervision,
+    // cleanup and recovery of what already runs carry on.
+    let host_unfit = Arc::new(AtomicBool::new(false));
+    observe_host_fitness(context, &host_unfit, true).await;
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -328,7 +338,10 @@ async fn run_generation(
                 host.clone(),
                 ReconcilerPorts {
                     demand,
-                    launcher,
+                    launcher: Arc::new(FitnessGatedLauncher::new(
+                        launcher,
+                        Arc::clone(&host_unfit),
+                    )),
                     lock: Arc::clone(&shared_lock) as Arc<_>,
                     directory: Arc::clone(&directory) as Arc<_>,
                     clock: Arc::clone(&clock),
@@ -411,6 +424,9 @@ async fn run_generation(
         }
         () = maintain_credential(Arc::clone(&client)) => {
             unreachable!("credential maintenance runs until the daemon is stopped")
+        }
+        () = maintain_host_fitness(context, Arc::clone(&host_unfit)) => {
+            unreachable!("host fitness checks run until the daemon is stopped")
         }
         () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
             unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
@@ -623,6 +639,57 @@ const CREDENTIAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CREDENTIAL_RENEWAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Keep the daemon's credential alive even when no runner request uses it.
+/// Evaluates the required host checks and updates `unfit`, logging only when
+/// the verdict changes so a host that stays unfit does not fill the log. The
+/// first evaluation of a generation also names the missing recommended
+/// preparation, once.
+async fn observe_host_fitness(context: &Context, unfit: &AtomicBool, first: bool) {
+    match super::doctor::daemon_preflight(context).await {
+        Ok(verdict) => {
+            let now_unfit = !verdict.required.is_empty();
+            let was_unfit = unfit.swap(now_unfit, Ordering::AcqRel);
+            if now_unfit && (first || !was_unfit) {
+                tracing::warn!(
+                    event = "host_unfit",
+                    reason = %verdict.required.join(","),
+                    count = verdict.required.len(),
+                    "required host checks fail; no runner is started until `runner-manager host doctor` passes"
+                );
+            } else if was_unfit && !now_unfit {
+                tracing::warn!(
+                    event = "host_fit",
+                    "required host checks pass again; runners may start"
+                );
+            }
+            if first && !verdict.recommended.is_empty() {
+                tracing::warn!(
+                    event = "host_doctor",
+                    reason = %verdict.recommended.join(","),
+                    count = verdict.recommended.len(),
+                    "recommended host preparation is missing; run `runner-manager host doctor`"
+                );
+            }
+        }
+        Err(error) => {
+            // A check that could not run is not evidence the host is unfit.
+            unfit.store(false, Ordering::Release);
+            tracing::warn!(
+                event = "host_doctor_unavailable",
+                "host checks could not run, so no runner is held back: {error}"
+            );
+        }
+    }
+}
+
+/// Re-evaluates the required host checks every few minutes, so a fix made with
+/// `host prepare` is picked up without restarting the daemon.
+async fn maintain_host_fitness(context: &Context, unfit: Arc<AtomicBool>) {
+    loop {
+        tokio::time::sleep(super::doctor::DAEMON_RECHECK).await;
+        observe_host_fitness(context, &unfit, false).await;
+    }
+}
+
 async fn maintain_credential(client: Arc<AuthenticatedClient>) {
     loop {
         client
