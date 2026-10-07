@@ -155,6 +155,16 @@ pub const CONTACT_FILE: &str = "github-contact.toml";
 /// See [`record_github_credential_rejected`] for the contract.
 pub const CREDENTIAL_REJECTION_FILE: &str = "github-credential-rejected.toml";
 
+/// Present while the daemon cannot read its own stored credential, inside
+/// `state/`.
+///
+/// See [`record_credential_unreadable`] for the contract.
+pub const CREDENTIAL_UNREADABLE_FILE: &str = "credential-unreadable.toml";
+
+/// The `service status` subject a [`CREDENTIAL_UNREADABLE_FILE`] is reported
+/// under, which the TUI matches to offer the same command.
+pub const CREDENTIAL_UNREADABLE_SUBJECT: &str = "stored credential";
+
 /// The agent's last runner-root refusal, for `service status` to report.
 ///
 /// See [`record_runner_root_refusal`] for the contract.
@@ -3067,22 +3077,13 @@ struct ContactRecord {
 ///
 /// [`ServiceError::Record`] when `state/` cannot be written.
 pub fn record_github_contact(paths: &AppPaths, at: DateTime<Utc>) -> Result<(), ServiceError> {
-    let path = contact_path(paths);
-    let record = ContactRecord {
-        schema_version: CONTACT_SCHEMA_VERSION,
-        last_success: at,
-    };
-    let failed = |detail: String| ServiceError::Record {
-        operation: "write",
-        path: path.clone(),
-        detail,
-    };
-    let text = toml::to_string_pretty(&record).map_err(|error| failed(error.to_string()))?;
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
-    std::fs::rename(&temporary, &path).map_err(|error| failed(error.to_string()))
+    write_state_record(
+        &contact_path(paths),
+        &ContactRecord {
+            schema_version: CONTACT_SCHEMA_VERSION,
+            last_success: at,
+        },
+    )
 }
 
 /// Reads the last successful GitHub contact, or reports that none was recorded.
@@ -3097,30 +3098,62 @@ pub fn record_github_contact(paths: &AppPaths, at: DateTime<Utc>) -> Result<(), 
 /// means *"the agent has never reached GitHub"*, and reporting a parse failure
 /// as that would be a wrong answer to the question Journey 5 asks.
 pub fn last_github_contact(paths: &AppPaths) -> Result<Option<DateTime<Utc>>, ServiceError> {
-    let path = contact_path(paths);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ServiceError::Record {
-                operation: "read",
-                path,
-                detail: error.to_string(),
-            });
-        }
-    };
-    let record: ContactRecord = toml::from_str(&text).map_err(|error| ServiceError::Record {
-        operation: "read",
-        path,
-        detail: error.to_string(),
-    })?;
-    Ok(Some(record.last_success))
+    Ok(read_state_record::<ContactRecord>(&contact_path(paths))?.map(|record| record.last_success))
 }
 
 /// Where the heartbeat lives.
 #[must_use]
 pub fn contact_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(CONTACT_FILE)
+}
+
+/// Writes a small TOML record under `state/`, through a temporary in the same
+/// directory and a rename, so a status command never reads half of one.
+fn write_state_record(path: &Path, record: &impl Serialize) -> Result<(), ServiceError> {
+    let failed = |detail: String| ServiceError::Record {
+        operation: "write",
+        path: path.to_path_buf(),
+        detail,
+    };
+    let text = toml::to_string_pretty(record).map_err(|error| failed(error.to_string()))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
+    std::fs::rename(&temporary, path).map_err(|error| failed(error.to_string()))
+}
+
+/// Reads a record [`write_state_record`] wrote. `Ok(None)` when there is none;
+/// one that exists and does not parse is an error, never absence.
+fn read_state_record<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, ServiceError> {
+    let failed = |detail: String| ServiceError::Record {
+        operation: "read",
+        path: path.to_path_buf(),
+        detail,
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|error| failed(error.to_string()))
+}
+
+/// Removes a record; one that is not there is already removed.
+fn remove_state_record(path: &Path) -> Result<(), ServiceError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServiceError::Record {
+            operation: "remove",
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3160,22 +3193,13 @@ pub fn record_github_credential_rejected(
     {
         return Ok(());
     }
-    let path = credential_rejection_path(paths);
-    let record = CredentialRejectionRecord {
-        schema_version: CONTACT_SCHEMA_VERSION,
-        rejected_since: at,
-    };
-    let failed = |detail: String| ServiceError::Record {
-        operation: "write",
-        path: path.clone(),
-        detail,
-    };
-    let text = toml::to_string_pretty(&record).map_err(|error| failed(error.to_string()))?;
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
-    std::fs::rename(&temporary, &path).map_err(|error| failed(error.to_string()))
+    write_state_record(
+        &credential_rejection_path(paths),
+        &CredentialRejectionRecord {
+            schema_version: CONTACT_SCHEMA_VERSION,
+            rejected_since: at,
+        },
+    )
 }
 
 /// Clears a recorded rejection once GitHub accepts the credential again.
@@ -3184,16 +3208,7 @@ pub fn record_github_credential_rejected(
 ///
 /// [`ServiceError::Record`] when the record exists and cannot be removed.
 pub fn clear_github_credential_rejection(paths: &AppPaths) -> Result<(), ServiceError> {
-    let path = credential_rejection_path(paths);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ServiceError::Record {
-            operation: "remove",
-            path,
-            detail: error.to_string(),
-        }),
-    }
+    remove_state_record(&credential_rejection_path(paths))
 }
 
 /// Since when GitHub has been rejecting the daemon's credential, if it is.
@@ -3204,25 +3219,10 @@ pub fn clear_github_credential_rejection(paths: &AppPaths) -> Result<(), Service
 pub fn github_credential_rejected_since(
     paths: &AppPaths,
 ) -> Result<Option<DateTime<Utc>>, ServiceError> {
-    let path = credential_rejection_path(paths);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ServiceError::Record {
-                operation: "read",
-                path,
-                detail: error.to_string(),
-            });
-        }
-    };
-    let record: CredentialRejectionRecord =
-        toml::from_str(&text).map_err(|error| ServiceError::Record {
-            operation: "read",
-            path,
-            detail: error.to_string(),
-        })?;
-    Ok(Some(record.rejected_since))
+    Ok(
+        read_state_record::<CredentialRejectionRecord>(&credential_rejection_path(paths))?
+            .map(|record| record.rejected_since),
+    )
 }
 
 /// Where the rejection record lives.
@@ -3230,6 +3230,109 @@ pub fn github_credential_rejected_since(
 pub fn credential_rejection_path(paths: &AppPaths) -> PathBuf {
     paths.state_dir().join(CREDENTIAL_REJECTION_FILE)
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialUnreadableRecord {
+    schema_version: u32,
+    unreadable_since: DateTime<Utc>,
+}
+
+/// Records that the daemon could not read its stored credential, keeping the
+/// first moment of an ongoing failure.
+///
+/// # Why a file of its own
+///
+/// A daemon that cannot read its credential exits, and the service manager
+/// starts it again a few seconds later, for ever. `service status` reads the
+/// registration, which is fine, and the heartbeat, which merely stops moving --
+/// so it said `healthy` while a macOS host that had just been upgraded was
+/// locked out of its own keychain item and started no runner. The reason was
+/// only in the daemon's log. The daemon is the one process whose view of the
+/// store matters, and it shares no memory with `service status`, so it says
+/// so on disk; [`clear_credential_unreadable`] removes it as soon as a read
+/// succeeds.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when `state/` cannot be written.
+pub fn record_credential_unreadable(
+    paths: &AppPaths,
+    at: DateTime<Utc>,
+) -> Result<(), ServiceError> {
+    if credential_unreadable_since(paths).ok().flatten().is_some() {
+        return Ok(());
+    }
+    write_state_record(
+        &credential_unreadable_path(paths),
+        &CredentialUnreadableRecord {
+            schema_version: CONTACT_SCHEMA_VERSION,
+            unreadable_since: at,
+        },
+    )
+}
+
+/// Clears a recorded failure once the daemon reads its credential again.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when the record exists and cannot be removed.
+pub fn clear_credential_unreadable(paths: &AppPaths) -> Result<(), ServiceError> {
+    remove_state_record(&credential_unreadable_path(paths))
+}
+
+/// Since when the daemon has been unable to read its stored credential, if it
+/// has.
+///
+/// # Errors
+///
+/// [`ServiceError::Record`] when the file exists and cannot be read or parsed.
+pub fn credential_unreadable_since(
+    paths: &AppPaths,
+) -> Result<Option<DateTime<Utc>>, ServiceError> {
+    Ok(
+        read_state_record::<CredentialUnreadableRecord>(&credential_unreadable_path(paths))?
+            .map(|record| record.unreadable_since),
+    )
+}
+
+/// Where the unreadable-credential record lives.
+#[must_use]
+pub fn credential_unreadable_path(paths: &AppPaths) -> PathBuf {
+    paths.state_dir().join(CREDENTIAL_UNREADABLE_FILE)
+}
+
+/// How to sign this host in again for `mode`: the exact command, in
+/// backticks, and where to run it when that matters.
+///
+/// A machine-scoped store needs privilege: `sudo` on Unix, an elevated
+/// terminal on Windows. A login-mode store on macOS is the login keychain,
+/// which is unlocked for the desktop session only, so an SSH session cannot
+/// write it.
+#[must_use]
+pub fn sign_in_instruction(mode: StartMode) -> String {
+    let (command, place) = match mode {
+        StartMode::Boot if cfg!(unix) => ("sudo runner-manager auth login --start-at boot", ""),
+        StartMode::Boot => (
+            "runner-manager auth login --start-at boot",
+            " from an elevated terminal",
+        ),
+        StartMode::Login => (
+            "runner-manager auth login --start-at login",
+            MACOS_LOGIN_PLACE,
+        ),
+    };
+    format!("`{command}`{place}")
+}
+
+/// Where a login-mode sign-in has to happen on macOS, as a phrase to follow
+/// the command; nothing elsewhere.
+pub const MACOS_LOGIN_PLACE: &str = if cfg!(target_os = "macos") {
+    " in a Terminal in this Mac's desktop session (an SSH session cannot unlock the login \
+     keychain)"
+} else {
+    ""
+};
 
 // ---------------------------------------------------------------------------
 // A definition written by an older build
@@ -3481,40 +3584,11 @@ pub fn runner_root_refusals(paths: &AppPaths) -> Result<Vec<RunnerRootRefusal>, 
 }
 
 fn read_refusal_file(paths: &AppPaths) -> Result<Option<RootRefusalFile>, ServiceError> {
-    let path = root_refusal_path(paths);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ServiceError::Record {
-                operation: "read",
-                path,
-                detail: error.to_string(),
-            });
-        }
-    };
-    toml::from_str(&text)
-        .map(Some)
-        .map_err(|error| ServiceError::Record {
-            operation: "read",
-            path,
-            detail: error.to_string(),
-        })
+    read_state_record(&root_refusal_path(paths))
 }
 
 fn write_refusal_file(paths: &AppPaths, file: &RootRefusalFile) -> Result<(), ServiceError> {
-    let path = root_refusal_path(paths);
-    let failed = |detail: String| ServiceError::Record {
-        operation: "write",
-        path: path.clone(),
-        detail,
-    };
-    let text = toml::to_string_pretty(file).map_err(|error| failed(error.to_string()))?;
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(|error| failed(error.to_string()))?;
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, text).map_err(|error| failed(error.to_string()))?;
-    std::fs::rename(&temporary, &path).map_err(|error| failed(error.to_string()))
+    write_state_record(&root_refusal_path(paths), file)
 }
 
 /// Where the refusals live.
@@ -4400,6 +4474,7 @@ impl ServiceOperations {
             .and_then(|record| definition_drift(self.controls.as_ref(), &self.identity, record));
         let credential_rejected_since =
             github_credential_rejected_since(&self.paths).ok().flatten();
+        let credential_unreadable_since = credential_unreadable_since(&self.paths).ok().flatten();
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4409,7 +4484,8 @@ impl ServiceOperations {
             &self.paths,
         )
         .with_definition_drift(drift)
-        .with_credential_rejection(credential_rejected_since))
+        .with_credential_rejection(credential_rejected_since)
+        .with_credential_unreadable(credential_unreadable_since))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -4965,6 +5041,31 @@ impl ServiceStatus {
     #[must_use]
     pub const fn credential_rejected_since(&self) -> Option<DateTime<Utc>> {
         self.credential_rejected_since
+    }
+
+    /// Reports that the daemon cannot read its own stored credential, and the
+    /// exact command that ends it. See [`record_credential_unreadable`].
+    #[must_use]
+    pub fn with_credential_unreadable(mut self, since: Option<DateTime<Utc>>) -> Self {
+        if let Some(since) = since {
+            let mode = self.start_mode().unwrap_or_default();
+            self.problems.push(StatusProblem {
+                subject: CREDENTIAL_UNREADABLE_SUBJECT,
+                detail: format!(
+                    "the service has been unable to read its stored GitHub credential since {}, \
+                     so it starts no runner; the diagnostic log has the store's own answer.{} \
+                     Sign in again: {}.",
+                    since.to_rfc3339(),
+                    if cfg!(target_os = "macos") {
+                        " That is what a keychain item written by a different build looks like."
+                    } else {
+                        ""
+                    },
+                    sign_in_instruction(mode)
+                ),
+            });
+        }
+        self
     }
 
     /// What this host's default runner root grants, and to whom.
@@ -8413,6 +8514,78 @@ mod tests {
         clear_github_credential_rejection(&host.paths).unwrap();
         clear_github_credential_rejection(&host.paths).unwrap();
         assert_eq!(github_credential_rejected_since(&host.paths).unwrap(), None);
+    }
+
+    /// The daemon's own "I cannot read my credential", which used to exist
+    /// only in its log while `service status` said `healthy`.
+    #[test]
+    fn an_unreadable_credential_keeps_its_first_moment_and_names_the_exact_command() {
+        let host = Host::new();
+        assert_eq!(credential_unreadable_since(&host.paths).unwrap(), None);
+        let first = Utc::now() - chrono::Duration::minutes(40);
+        record_credential_unreadable(&host.paths, first).unwrap();
+        record_credential_unreadable(&host.paths, Utc::now()).unwrap();
+        let since = credential_unreadable_since(&host.paths).unwrap();
+        assert_eq!(since, Some(first), "a restart loop must not move the start");
+
+        let status = ServiceStatus::compose(
+            ServiceIdentity::product(),
+            None,
+            None,
+            None,
+            None,
+            &host.paths,
+        )
+        .with_credential_unreadable(since);
+        assert!(!status.is_healthy());
+        let problem = status
+            .problems()
+            .iter()
+            .find(|problem| problem.subject == CREDENTIAL_UNREADABLE_SUBJECT)
+            .expect("reported under its own subject");
+        // No record, so the default start mode, whose exact command is named.
+        assert!(
+            problem
+                .detail
+                .contains(&sign_in_instruction(StartMode::default())),
+            "{status}"
+        );
+
+        clear_credential_unreadable(&host.paths).unwrap();
+        clear_credential_unreadable(&host.paths).unwrap();
+        assert_eq!(credential_unreadable_since(&host.paths).unwrap(), None);
+        let healthy = ServiceStatus::compose(
+            ServiceIdentity::product(),
+            None,
+            None,
+            None,
+            None,
+            &host.paths,
+        )
+        .with_credential_unreadable(None);
+        assert!(
+            !healthy
+                .problems()
+                .iter()
+                .any(|problem| problem.subject == CREDENTIAL_UNREADABLE_SUBJECT),
+            "{healthy}"
+        );
+    }
+
+    #[test]
+    fn the_sign_in_instruction_names_the_start_mode_it_writes() {
+        assert!(sign_in_instruction(StartMode::Login).contains("auth login --start-at login`"));
+        assert!(sign_in_instruction(StartMode::Boot).contains("auth login --start-at boot`"));
+        assert_eq!(
+            sign_in_instruction(StartMode::Boot).starts_with("`sudo "),
+            cfg!(unix),
+            "a machine-scoped store needs root on Unix"
+        );
+        assert_eq!(
+            sign_in_instruction(StartMode::Login).contains("SSH"),
+            cfg!(target_os = "macos"),
+            "only the macOS login keychain is out of an SSH session's reach"
+        );
     }
 
     /// The record is readable by the account whose directory it is in.

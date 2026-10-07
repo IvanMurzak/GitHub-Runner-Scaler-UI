@@ -37,6 +37,37 @@ the version being prepared rather than the version in `Cargo.toml`.
   `/mnt/c` paths are refused). A cache root outside the runner roots gets the same `host doctor`
   checks, and `host prepare` excludes it from Defender with them.
 
+### Fixes
+
+- macOS login-mode hosts keep their GitHub credential across `runner-manager update`. The login
+  keychain ties an item to the exact build that wrote it: an ad-hoc signed binary is known by the
+  hash of its code, so every release was a stranger to the item the previous one wrote, the new
+  daemon failed with `-25293` on every start, and somebody had to run `auth login` at the Mac.
+  Granting the item to every application does not help there; measured on macOS 27, the login
+  keychain refuses another build regardless. Now the old daemon, which can still read the
+  credential, hands it to the new binary just before it restarts, and the new binary writes it
+  again as its own. **The first update to this version still needs one sign-in**, because the
+  version doing that update is the old one: after it, run
+  `runner-manager auth login --start-at login` in a Terminal in the Mac's desktop session. Updates
+  after that need none.
+- `service status` and the TUI report a daemon that cannot read its stored credential, with the
+  exact `auth login` command, instead of `healthy`. The daemon records the failure when it starts
+  and clears it as soon as a read succeeds.
+- `host doctor`'s `macos.keychain_credential` check passes after an update once the credential
+  has been handed over. When it still fails, it says why (an item written by a build that did not
+  hand it over) and that the sign-in has to happen in a Terminal on the Mac, not over SSH.
+- `host doctor` no longer passes the keychain check on the strength of the previous binary: right
+  after an update the last GitHub contact was the old daemon's, made during its drain, so the
+  check said "reached GitHub 0 minute(s) ago" while every start of the new daemon failed with
+  `-25293`. A contact now counts only if it is newer than the service binary, and the daemon's own
+  record that it cannot read its credential fails the check outright. `macos.launchd_priority`
+  no longer says the service runs at normal priority while it is not running.
+- The macOS keychain error says which of three things happened: the System Keychain read by an
+  account that is not root, a login keychain locked for this session (an SSH session cannot use
+  the desktop session's unlocked login keychain, so even a healthy credential reads `-25293` there),
+  or an item written by a different build. It no longer claims that signing in once survives
+  upgrades.
+
 ### Operator notes
 
 - A cache any of whose variables is already set in `runner.env` or in the service's own

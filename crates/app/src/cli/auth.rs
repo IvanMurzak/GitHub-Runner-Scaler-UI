@@ -1031,6 +1031,30 @@ pub fn receive(
     store_received_credential(secrets.as_ref(), &document, out)
 }
 
+/// `daemon adopt-credential --start-at boot|login`.
+///
+/// The receiving half of the upgrade handover (`hand_over_credential_to_new_binary`
+/// in `daemon.rs` says why the new binary has to be the writer): the document
+/// the exiting daemon read goes back into the ordinary [`SecretStore`], written
+/// by this process.
+///
+/// Unlike [`receive`], this records no start mode: the daemon handing over
+/// already runs under the mode it names, and this process opens that daemon's
+/// own directories, so a custom data directory never gains a stray database.
+///
+/// # Errors
+/// As [`receive`], less the start-mode record.
+pub fn adopt_credential(
+    context: &Context,
+    start_at: super::StartAt,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    refuse_a_terminal(io::stdin().is_terminal())?;
+    let document = read_credential_document(&mut io::stdin().lock())?;
+    let secrets = context.secret_store(StartMode::from(start_at))?;
+    store_received_credential(secrets.as_ref(), &document, out)
+}
+
 /// The refusal a terminal stdin earns.
 ///
 /// Takes the answer rather than asking [`io::stdin`] itself, so that both
@@ -1054,7 +1078,7 @@ fn refuse_a_terminal(stdin_is_a_terminal: bool) -> Result<(), CliError> {
     // platform bridge".
     Err(CliError::with_remedy(
         Failure::InvalidArgument,
-        "`auth receive` is a bridge between two processes and takes its input from a pipe. \
+        "This command is a bridge between two processes and takes its input from a pipe. \
          It refuses a terminal so that nobody is ever invited to type or paste a credential \
          at a prompt, where it would survive in this shell's history and on this screen.",
         "runner-manager auth login   (the way a person authenticates this host)",

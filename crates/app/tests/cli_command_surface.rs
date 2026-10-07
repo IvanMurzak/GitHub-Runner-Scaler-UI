@@ -300,7 +300,7 @@ fn every_documented_command_is_reachable() {
 }
 
 // ----------------------------------------------------------------------------
-// THE TWO HIDDEN BRIDGES ARE PART OF THE SURFACE CONTRACT, BY BEING ABSENT
+// THE HIDDEN BRIDGES ARE PART OF THE SURFACE CONTRACT, BY BEING ABSENT
 // FROM IT.
 // ----------------------------------------------------------------------------
 // `SURFACE` above is the *published* list, and the two assertions it drives
@@ -308,13 +308,18 @@ fn every_documented_command_is_reachable() {
 // existing altogether. They are not published, and they are also not optional:
 // `auth receive` is the only door a credential document goes through on its way
 // into a WSL distribution, and `wsl-host hold` is what the Windows lifecycle
-// task starts. So both directions are pinned here -- reachable, and hidden --
+// task starts. `daemon adopt-credential` is how an upgrading macOS daemon hands
+// its keychain item to the build replacing it. So both directions are pinned
+// here -- reachable, and hidden --
 // which is `b3-acceptance-docs`'s "command-surface guards for every new
 // private/public command".
 
 /// The hidden cross-process bridges, and the family each is hidden inside.
-const HIDDEN_BRIDGES: [(&str, &[&str]); 2] =
-    [("auth", &["auth", "receive"]), ("", &["wsl-host", "hold"])];
+const HIDDEN_BRIDGES: [(&str, &[&str]); 3] = [
+    ("auth", &["auth", "receive"]),
+    ("", &["wsl-host", "hold"]),
+    ("daemon", &["daemon", "adopt-credential"]),
+];
 
 #[test]
 fn every_hidden_bridge_still_parses_and_is_still_absent_from_help() {

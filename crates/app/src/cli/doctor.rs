@@ -216,6 +216,10 @@ pub struct ServiceSetup {
     pub definition_path: Option<PathBuf>,
     /// The launchd label, for the restart command a macOS remedy names.
     pub label: String,
+    /// Whether the service manager reports the daemon running. `None` when
+    /// not asked: the daemon's own view, and a service about to be installed.
+    #[serde(default)]
+    pub running: Option<bool>,
 }
 
 /// Everything about this host's configuration a check reads. Serializable
@@ -243,9 +247,15 @@ pub struct HostSetup {
     pub probe_dir: PathBuf,
     pub data_root: Option<PathBuf>,
     /// How long ago the service last reached GitHub, in seconds, as it
-    /// recorded it. A recent contact proves it could read its credential.
+    /// recorded it -- counted only when the contact is newer than the service
+    /// binary, see [`current_daemon_contact_age`]. A recent contact by the
+    /// binary now installed proves it could read its credential.
     #[serde(default)]
     pub service_contact_age_secs: Option<u64>,
+    /// Whether the daemon recorded that it cannot read its stored credential:
+    /// its own answer, from the session it runs in.
+    #[serde(default)]
+    pub service_credential_unreadable: bool,
     /// Whether this process reads the login-mode credential itself, to tell a
     /// credential the service binary cannot read from a keychain this whole
     /// session cannot read. `None` when not asked (not a macOS login service).
@@ -1133,6 +1143,12 @@ fn probe_launchd_priority(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     if plist.is_none() {
         return not_applicable("no LaunchAgent or LaunchDaemon is installed");
     }
+    if setup.service.as_ref().and_then(|service| service.running) == Some(false) {
+        return unknown(
+            "the plist asks for normal priority, but the service is not running, so the \
+             priority it runs at cannot be seen; `runner-manager service status` says why",
+        );
+    }
     pass("the service runs at normal priority and no runner is throttled")
 }
 
@@ -1264,12 +1280,32 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
             "a boot service keeps its credential in the System Keychain, which only root reads",
         );
     }
+    let sign_in = || {
+        format!(
+            "{}{} (sign in again with the service binary; never switch to --start-at boot for \
+             this)",
+            super::update::force::auth_command_line(
+                setup.data_root.as_deref(),
+                StartMode::Login,
+                &service.binary
+            ),
+            runner_manager_platform::service::MACOS_LOGIN_PLACE
+        )
+    };
+    if setup.service_credential_unreadable {
+        return fail(
+            "the service recorded that it cannot read its stored GitHub credential, so it starts \
+             no runner",
+        )
+        .remedy(sign_in());
+    }
     if let Some(age) = setup
         .service_contact_age_secs
         .filter(|age| *age <= RECENT_CONTACT_SECS)
     {
         return pass(format!(
-            "the service reached GitHub {} minute(s) ago, so it reads its credential",
+            "the service binary now installed reached GitHub {} minute(s) ago, so it reads its \
+             credential",
             age / 60
         ));
     }
@@ -1289,18 +1325,13 @@ fn probe_keychain_credential(setup: &HostSetup, facts: &dyn HostFacts) -> Outcom
                  host doctor` in a Terminal on this Mac",
         ),
         Ok(CredentialProbe::Unreadable(reason)) => fail(format!(
-            "the service binary {} cannot read its GitHub credential ({reason}); a replaced \
-             binary needs a fresh keychain grant",
+            "the service binary {} cannot read its GitHub credential ({reason}). The login \
+             keychain ties an item to the exact build that wrote it; the daemon hands the \
+             credential to the new build when it updates, so this is an item written by a build \
+             that did not: the first update to 0.4.34 or later, or a binary replaced by hand",
             service.binary.display()
         ))
-        .remedy(format!(
-            "{} (sign in again with the service binary; never switch to --start-at boot for this)",
-            super::update::force::auth_command_line(
-                setup.data_root.as_deref(),
-                StartMode::Login,
-                &service.binary
-            )
-        )),
+        .remedy(sign_in()),
         Err(error) => unknown(format!("the service binary could not be asked: {error}")),
     }
 }
@@ -1698,6 +1729,44 @@ fn runner_path(
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+/// How long ago the daemon now installed reached GitHub, if it has.
+///
+/// The contact file is written by whichever daemon ran last. Straight after an
+/// upgrade that is the *previous* binary, which kept reaching GitHub through
+/// its drain -- so its contact said nothing about whether the new binary can
+/// read the credential, and the keychain check passed while every start of the
+/// new daemon failed with `-25293` (watched on the 0.4.33 rollout). A contact
+/// counts only when it is newer than the moment the service binary was put in
+/// place, which the old daemon cannot have reached.
+fn current_daemon_contact_age(
+    contact: Option<chrono::DateTime<chrono::Utc>>,
+    binary_replaced_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let contact = contact?;
+    if binary_replaced_at.is_some_and(|replaced| contact <= replaced) {
+        return None;
+    }
+    u64::try_from((now - contact).num_seconds()).ok()
+}
+
+/// When `binary` was put in place: its status-change time, which a copy or a
+/// rename sets and nothing can set back (a copy may keep the source's
+/// modification time). The modification time where there is no such field.
+fn replaced_at(binary: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let metadata = std::fs::metadata(binary).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let nanos = u32::try_from(metadata.ctime_nsec()).unwrap_or(0);
+        chrono::DateTime::from_timestamp(metadata.ctime(), nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.modified().ok().map(chrono::DateTime::from)
+    }
+}
+
 /// Builds the setup from values the caller has already read.
 ///
 /// `service` overrides the installed registration; `service install` passes
@@ -1719,6 +1788,10 @@ fn setup_from_parts(
                 binary: record.binary,
                 definition_path: record.definition_path,
                 label: super::service::identity().launchd_label(),
+                running: (perspective == Perspective::Operator)
+                    .then(|| super::service::operations(context).status().ok())
+                    .flatten()
+                    .map(|status| status.is_running()),
             })
     });
     let mut runner_roots: Vec<PathBuf> = runner_root
@@ -1760,12 +1833,18 @@ fn setup_from_parts(
         runner_path: runner_path(context, perspective, mode),
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
-        service_contact_age_secs: runner_manager_platform::service::last_github_contact(
-            context.paths(),
-        )
-        .ok()
-        .flatten()
-        .and_then(|at| u64::try_from((context.clock().now() - at).num_seconds()).ok()),
+        service_contact_age_secs: current_daemon_contact_age(
+            runner_manager_platform::service::last_github_contact(context.paths())
+                .ok()
+                .flatten(),
+            service
+                .as_ref()
+                .and_then(|service| replaced_at(&service.binary)),
+            context.clock().now(),
+        ),
+        service_credential_unreadable:
+            runner_manager_platform::service::credential_unreadable_since(context.paths())
+                .is_ok_and(|since| since.is_some()),
         own_keychain_readable: (HostOs::current() == HostOs::Macos
             && perspective == Perspective::Operator
             && mode == Some(StartMode::Login))
@@ -3119,6 +3198,7 @@ pub fn before_service_install(
             binary,
             definition_path: None,
             label: super::service::identity().launchd_label(),
+            running: None,
         }),
     ) else {
         return Ok(());
@@ -3464,6 +3544,7 @@ mod tests {
                 binary: PathBuf::from(r"C:\rm\runner-manager.exe"),
                 definition_path: None,
                 label: "rm".into(),
+                running: None,
             }),
             runner_roots: vec![PathBuf::from(r"C:\rman")],
             capacity: 2,
@@ -3473,6 +3554,7 @@ mod tests {
             probe_dir: PathBuf::from(r"C:\state"),
             data_root: None,
             service_contact_age_secs: None,
+            service_credential_unreadable: false,
             own_keychain_readable: None,
         }
     }
@@ -3485,6 +3567,7 @@ mod tests {
                 binary: PathBuf::from("/Users/me/rm/runner-manager"),
                 definition_path: Some(PathBuf::from("/Users/me/Library/LaunchAgents/rm.plist")),
                 label: "io.github.IvanMurzak.runner-manager".into(),
+                running: None,
             }),
             runner_roots: vec![PathBuf::from("/Volumes/NVME/rman")],
             runner_path: Some("/usr/bin".into()),
@@ -3901,6 +3984,89 @@ mod tests {
         assert_eq!(
             status_of(&daemon, &facts, "macos.keychain_credential"),
             Status::NotApplicable
+        );
+    }
+
+    /// The 0.4.33 rollout: right after the binary swap every start of the new
+    /// daemon failed with `-25293`, and the check passed on the contact the
+    /// *old* daemon had made during its drain, "0 minute(s) ago".
+    #[test]
+    fn a_contact_made_before_the_binary_was_replaced_proves_nothing() {
+        let now = chrono::Utc::now();
+        let swapped = now - chrono::Duration::seconds(20);
+        let old_daemon_contact = Some(swapped - chrono::Duration::seconds(5));
+        assert_eq!(
+            current_daemon_contact_age(old_daemon_contact, Some(swapped), now),
+            None,
+            "the previous binary's contact is not the installed binary's"
+        );
+        let new_daemon_contact = Some(swapped + chrono::Duration::seconds(10));
+        assert_eq!(
+            current_daemon_contact_age(new_daemon_contact, Some(swapped), now),
+            Some(10)
+        );
+        assert_eq!(
+            current_daemon_contact_age(new_daemon_contact, None, now),
+            Some(10),
+            "a binary whose time cannot be read does not discard a contact"
+        );
+
+        // End to end through the check: the stale contact is gone, so the
+        // service binary is asked, and it cannot read the item.
+        let mut setup = macos_setup();
+        setup.own_keychain_readable = Some(true);
+        setup.service_contact_age_secs =
+            current_daemon_contact_age(old_daemon_contact, Some(swapped), now);
+        let facts = Facts {
+            credential: Some(CredentialProbe::Unreadable("-25293".into())),
+            ..Facts::default()
+        };
+        assert_eq!(
+            status_of(&setup, &facts, "macos.keychain_credential"),
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn the_daemons_own_unreadable_record_fails_the_check_whatever_else_says() {
+        let setup = HostSetup {
+            service_credential_unreadable: true,
+            service_contact_age_secs: Some(0),
+            ..macos_setup()
+        };
+        let facts = Facts {
+            credential: Some(CredentialProbe::Readable),
+            ..Facts::default()
+        };
+        let report = evaluate(&setup, &facts);
+        let keychain = finding(&report, "macos.keychain_credential");
+        assert_eq!(keychain.status, Status::Fail);
+        assert!(
+            keychain
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains(" auth login --start-at login"),
+            "{keychain:?}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_service_is_not_reported_as_running_at_normal_priority() {
+        let mut setup = macos_setup();
+        let facts = Facts {
+            process_type: Some(LAUNCHD_PROCESS_TYPE.to_string()),
+            ..Facts::default()
+        };
+        setup.service.as_mut().unwrap().running = Some(true);
+        assert_eq!(
+            status_of(&setup, &facts, "macos.launchd_priority"),
+            Status::Pass
+        );
+        setup.service.as_mut().unwrap().running = Some(false);
+        assert_eq!(
+            status_of(&setup, &facts, "macos.launchd_priority"),
+            Status::Unknown
         );
     }
 

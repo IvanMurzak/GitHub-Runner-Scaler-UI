@@ -41,13 +41,17 @@ use runner_manager_github::{
 };
 use runner_manager_platform::lock::{HostLock, LockError, LockKind};
 use runner_manager_platform::service::{
-    InstallRecord, clear_github_credential_rejection, record_github_contact,
-    record_github_credential_rejected,
+    InstallRecord, clear_credential_unreadable, clear_github_credential_rejection,
+    record_credential_unreadable, record_github_contact, record_github_credential_rejected,
+    sign_in_instruction,
 };
 use runner_manager_platform::wsl::fence::{
     DrainRequest, GuestHeartbeat, GuestRecoveryConfig,
     SCHEMA_VERSION as WSL_RECOVERY_SCHEMA_VERSION, unmanaged_runner_service_count,
 };
+
+use runner_manager_platform::secrets::SecretStore;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use super::{CliError, Context, DaemonCommand, Failure, write_failed};
 
@@ -77,6 +81,9 @@ pub fn dispatch(
                 service_shutdown,
                 args.windows_service_host,
             ))
+        }
+        DaemonCommand::AdoptCredential(args) => {
+            super::auth::adopt_credential(context, args.start_at, out)
         }
     }
 }
@@ -146,7 +153,7 @@ async fn run_generation(
                     None => std::future::pending().await,
                 }
             } => {
-                return stop_for_upgrade(own_binary.as_deref(), &version, out)
+                return stop_for_upgrade(context, host.service_start_mode, own_binary.as_deref(), &version, out)
                     .map(|()| DaemonOutcome::Stopped);
             }
             () = wait_for_policy_set_change(Arc::clone(&store) as Arc<dyn Store>, BTreeSet::new()) => {
@@ -171,20 +178,24 @@ async fn run_generation(
 
     let mode = host.service_start_mode;
     let secrets = context.secret_store(mode)?;
-    let secret = secrets
-        .load()
+    let loaded = secrets.load();
+    // Said on disk either way, because this process is about to exit and be
+    // restarted by the service manager, and `service status` cannot see why
+    // otherwise.
+    note_credential_readability(context, loaded.is_ok());
+    let secret = loaded
         .map_err(|source| {
             CliError::with_remedy(
                 Failure::SecretStore,
                 format!("cannot read the stored GitHub credential: {source}"),
-                "runner-manager auth login",
+                sign_in_instruction(mode),
             )
         })?
         .ok_or_else(|| {
             CliError::with_remedy(
                 Failure::NotAuthenticated,
                 "no GitHub credential is stored for this daemon's start mode",
-                "runner-manager auth login",
+                sign_in_instruction(mode),
             )
         })?;
     let app = context.app_registration()?;
@@ -461,7 +472,7 @@ async fn run_generation(
         // same one, and putting a file in place for it would be a write nobody
         // asked for.
         if let Some(version) = upgraded_to {
-            return stop_for_upgrade(own_binary.as_deref(), &version, out)
+            return stop_for_upgrade(context, mode, own_binary.as_deref(), &version, out)
                 .map(|()| DaemonOutcome::Stopped);
         }
         let reason = restart_reason.unwrap_or("this daemon was asked to reload");
@@ -754,7 +765,14 @@ fn idle_credential_client(context: &Context, mode: StartMode) -> Option<Arc<Auth
             return None;
         }
     };
-    let secret = match secrets.load() {
+    let loaded = secrets.load();
+    // Only ever cleared here, never recorded: idle mode does not need a
+    // readable store, but a record left by an earlier, policy-serving start
+    // must not outlive the sign-in that ended it.
+    if loaded.is_ok() {
+        note_credential_readability(context, true);
+    }
+    let secret = match loaded {
         Ok(Some(secret)) => secret,
         Ok(None) => return None,
         Err(error) => {
@@ -803,18 +821,24 @@ fn idle_credential_client(context: &Context, mode: StartMode) -> Option<Arc<Auth
 }
 
 fn stop_for_upgrade(
+    context: &Context,
+    mode: StartMode,
     source: Option<&std::path::Path>,
     version: &str,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    if let Some(source) = source
-        && let Err(error) = replace_own_binary(source)
-    {
-        tracing::warn!(
-            %error,
-            "the new binary could not be put in place; the service manager will restart the version already there"
-        );
-        writeln!(out, "warning: {error}").map_err(write_failed("the daemon state"))?;
+    match source.map(replace_own_binary) {
+        Some(Ok(())) if hands_over_credential(context, mode) => {
+            hand_over_credential_to_new_binary(context, mode);
+        }
+        Some(Err(error)) => {
+            tracing::warn!(
+                %error,
+                "the new binary could not be put in place; the service manager will restart the version already there"
+            );
+            writeln!(out, "warning: {error}").map_err(write_failed("the daemon state"))?;
+        }
+        _ => {}
     }
     writeln!(
         out,
@@ -827,6 +851,233 @@ fn stop_for_upgrade(
             "a newer runner-manager ({version}) is installed and every runner this daemon held has finished; stopping so the service manager starts the new one"
         ),
         "runner-manager service status",
+    ))
+}
+
+/// Says on disk whether this daemon could read its stored credential, for
+/// `service status` to report. See `record_credential_unreadable`.
+fn note_credential_readability(context: &Context, readable: bool) {
+    let marked = if readable {
+        clear_credential_unreadable(context.paths())
+    } else {
+        record_credential_unreadable(context.paths(), context.clock().now())
+    };
+    if let Err(error) = marked {
+        tracing::warn!(%error, "cannot record whether the stored credential is readable");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handing the credential to the new binary
+// ---------------------------------------------------------------------------
+
+/// Whether an upgrade hands the stored credential to the new binary.
+///
+/// Only the standard macOS **login** keychain binds an item to the build that
+/// wrote it. The System Keychain (boot mode) and a keychain under `--data-dir`
+/// grant their item to every application, and DPAPI and a `0600` file are
+/// readable by any program the account runs, so a rewrite anywhere else would
+/// change nothing -- except to delete and re-add a credential that works.
+fn hands_over_credential(context: &Context, mode: StartMode) -> bool {
+    cfg!(target_os = "macos") && mode == StartMode::Login && context.data_root.is_none()
+}
+
+/// How long the handover waits for a renewal in another process to finish.
+const HANDOVER_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// How long the handover waits for the new binary to store the credential.
+///
+/// Every runner has already drained by then, so a child that never finishes
+/// would hold the host with no runner and no restart; past this it is stopped
+/// and the restart happens anyway.
+const HANDOVER_CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What the handover did.
+#[derive(Debug, PartialEq, Eq)]
+enum Handover {
+    /// There was no credential to hand over.
+    NothingStored,
+    /// This daemon could not read its own credential, so it had nothing to
+    /// hand over either. The new daemon will report the same thing.
+    Unreadable,
+    /// The new binary stored the credential, so it is now the writer.
+    HandedOver,
+    /// The new binary did not store it. `restored` says whether this daemon
+    /// had to put the credential back because the failed attempt had already
+    /// removed it.
+    Failed { restored: bool },
+}
+
+/// Has the binary that just replaced this one store this daemon's credential,
+/// so that the daemon it becomes after the restart can read it.
+///
+/// # Why the new binary has to be the writer
+///
+/// The login keychain records, with every item, the *partition* of the code
+/// that created it, and for an ad-hoc signed binary that partition is
+/// `cdhash:<hash of this exact build>`. A caller from another partition is
+/// refused with `errSecAuthFailed` (`-25293`) without a prompt, however wide
+/// the item's application list is -- measured on macOS 27 with two ad-hoc
+/// builds of one program: an item granted to *any application*, and one whose
+/// list named the second build explicitly, both refused it. Every release is a
+/// new build, so every upgrade locked the new daemon out of the item its
+/// predecessor wrote, and somebody had to sign in again at the Mac.
+///
+/// The one program that can still read the item at this moment is this one,
+/// and the one that has to own it next is the binary now at
+/// [`std::env::current_exe`]. So this reads the credential and pipes it into
+/// `daemon adopt-credential` run from the new binary, whose ordinary store
+/// replaces the item with one partitioned to the new build. The command-line
+/// copy the package manager installed is byte-identical to the service's copy,
+/// so `runner-manager auth status` reads it too.
+///
+/// Best effort: every failure is logged and leaves the restart to happen
+/// anyway, which is the state the operator was in before this existed.
+fn hand_over_credential_to_new_binary(context: &Context, mode: StartMode) {
+    let binary = match std::env::current_exe() {
+        Ok(binary) => binary,
+        Err(error) => {
+            tracing::warn!(%error, "the credential cannot be handed over: this binary's own path is unknown");
+            return;
+        }
+    };
+    let secrets = match context.secret_store(mode) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            tracing::warn!(error = %error.message(), "the credential cannot be handed over: the store is unreachable");
+            return;
+        }
+    };
+    // Held so that a renewal in another process cannot rewrite the item between
+    // the read and the new binary's write. A lock that cannot be had is not a
+    // reason to skip the handover: without it the new daemon is locked out for
+    // certain.
+    let _renewal = HostLock::acquire(
+        context.paths(),
+        LockKind::CredentialRenewal,
+        HANDOVER_LOCK_WAIT,
+    )
+    .map_err(|error| tracing::warn!(%error, "handing the credential over without the renewal lock"))
+    .ok();
+    let outcome = hand_over(secrets.as_ref(), |document| {
+        adopt_through(&binary, context, mode, document)
+    });
+    match outcome {
+        Handover::HandedOver => tracing::info!("the credential was handed over to the new binary"),
+        Handover::NothingStored => tracing::info!("no credential is stored; nothing to hand over"),
+        Handover::Unreadable | Handover::Failed { .. } => tracing::warn!(
+            ?outcome,
+            remedy = %sign_in_instruction(mode),
+            "the credential was not handed over; the new daemon may need a sign-in"
+        ),
+    }
+}
+
+/// The handover, with the new binary behind `adopt` so it can be tested
+/// without one.
+fn hand_over(
+    secrets: &dyn SecretStore,
+    adopt: impl FnOnce(&SecretString) -> Result<(), String>,
+) -> Handover {
+    let document = match secrets.load() {
+        // Normalised through the credential type, so that a bare token written
+        // by an old version reaches the new binary as the envelope it accepts.
+        Ok(Some(secret)) => UserAccessToken::from_stored(secret).to_stored_document(),
+        Ok(None) => return Handover::NothingStored,
+        Err(error) => {
+            tracing::warn!(%error, "this daemon cannot read its own credential to hand it over");
+            return Handover::Unreadable;
+        }
+    };
+    let Err(reason) = adopt(&document) else {
+        return Handover::HandedOver;
+    };
+    tracing::warn!(%reason, "the new binary did not store the credential");
+    // Replacing an item this program may not read starts by deleting it, so a
+    // write that failed after that would leave nothing at all. An item still
+    // there, readable or not, is left alone: it is either the original or the
+    // new binary's.
+    let restored = matches!(secrets.load(), Ok(None)) && secrets.store(&document).is_ok();
+    Handover::Failed { restored }
+}
+
+/// Runs `daemon adopt-credential` from `binary` with `document` on its stdin,
+/// against the same directories and store this daemon uses.
+///
+/// Only reached without `--data-dir` (see [`hands_over_credential`]), so the
+/// store is the platform-standard one and the directories are this daemon's.
+fn adopt_through(
+    binary: &std::path::Path,
+    context: &Context,
+    mode: StartMode,
+    document: &SecretString,
+) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(binary)
+        .args([
+            "daemon",
+            "adopt-credential",
+            "--start-at",
+            &mode.to_string(),
+        ])
+        .args(super::service::service_directory_arguments(context.paths()))
+        .env_remove(super::DATA_DIR_VARIABLE)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{} could not be started: {error}", binary.display()))?;
+    // Drained on its own thread so that a chatty child can never block on a
+    // full pipe while this waits for it to exit.
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("stderr was configured as a pipe");
+    let stderr = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
+    // Dropped at the end of the statement, which closes the pipe before the wait.
+    let written = child
+        .stdin
+        .take()
+        .expect("stdin was configured as a pipe")
+        .write_all(document.expose_secret().as_bytes())
+        .map_err(|error| format!("the credential could not be written to it: {error}"));
+    // Waited for even when the write failed, so the child is never left behind,
+    // and never for longer than the deadline: every runner has drained already.
+    let deadline = std::time::Instant::now() + HANDOVER_CHILD_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "it did not finish within {} seconds and was stopped",
+                    HANDOVER_CHILD_DEADLINE.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("the new binary could not be waited for: {error}"));
+            }
+        }
+    };
+    written?;
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = stderr.join().unwrap_or_default();
+    Err(format!(
+        "it exited with {status}: {}",
+        String::from_utf8_lossy(&stderr).trim()
     ))
 }
 
@@ -2298,8 +2549,10 @@ mod tests {
 
     #[test]
     fn an_idle_host_uses_the_normal_upgrade_handover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
         let mut output = Vec::new();
-        let error = stop_for_upgrade(None, "9.9.9", &mut output)
+        let error = stop_for_upgrade(&context, StartMode::Login, None, "9.9.9", &mut output)
             .expect_err("an upgrade exits for the service manager to restart it");
         assert_eq!(error.class(), Failure::UpgradePending);
         let output = String::from_utf8(output).unwrap();
@@ -2930,5 +3183,181 @@ mod tests {
             0,
             "busy child was terminated"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The upgrade handover
+    // -----------------------------------------------------------------------
+
+    use runner_manager_platform::secrets::{
+        PlatformSecretStore, Removal, SecretScope, SecretStoreError,
+    };
+
+    fn handover_document() -> String {
+        format!(
+            r#"{{"access_token":"{}","refresh_token":"{}","access_expires_at":"2026-09-06T20:00:00Z","refresh_expires_at":"2027-03-05T12:00:00Z"}}"#,
+            format_args!("{}{}", "ghu_", "handoverAccessCanary0000000000"),
+            format_args!("{}{}", "ghr_", "handoverRefreshCanary000000000"),
+        )
+    }
+
+    fn handover_store(root: &std::path::Path) -> PlatformSecretStore {
+        PlatformSecretStore::rooted_at(SecretScope::User, root).expect("a rooted store resolves")
+    }
+
+    fn held(store: &dyn SecretStore) -> Option<String> {
+        store
+            .load()
+            .expect("the store is readable")
+            .map(|secret| secret.expose_secret().to_string())
+    }
+
+    #[test]
+    fn the_new_binary_is_handed_exactly_the_stored_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let store = handover_store(root.path());
+        store
+            .store(&SecretString::from(handover_document()))
+            .unwrap();
+
+        let mut handed = None;
+        let outcome = hand_over(&store, |document| {
+            handed = Some(document.expose_secret().to_string());
+            Ok(())
+        });
+
+        assert_eq!(outcome, Handover::HandedOver);
+        let handed: serde_json::Value =
+            serde_json::from_str(&handed.expect("the new binary was run")).unwrap();
+        let original: serde_json::Value = serde_json::from_str(&handover_document()).unwrap();
+        assert_eq!(
+            handed, original,
+            "both halves of the pair reach the new binary"
+        );
+    }
+
+    /// A bare token is what versions before the envelope stored, and `daemon
+    /// adopt-credential` refuses anything that is not the envelope.
+    #[test]
+    fn a_bare_token_is_handed_over_as_the_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let store = handover_store(root.path());
+        let bare = format!("{}{}", "ghu_", "handoverBareToken000000000000");
+        store.store(&SecretString::from(bare.clone())).unwrap();
+
+        let mut handed = None;
+        hand_over(&store, |document| {
+            handed = Some(document.expose_secret().to_string());
+            Ok(())
+        });
+
+        let handed: serde_json::Value =
+            serde_json::from_str(&handed.expect("the new binary was run")).unwrap();
+        assert_eq!(handed["access_token"], serde_json::Value::String(bare));
+    }
+
+    #[test]
+    fn nothing_is_run_when_nothing_is_stored() {
+        let root = tempfile::tempdir().unwrap();
+        let store = handover_store(root.path());
+        let outcome = hand_over(&store, |_| panic!("there was nothing to hand over"));
+        assert_eq!(outcome, Handover::NothingStored);
+    }
+
+    #[test]
+    fn nothing_is_run_when_this_daemon_cannot_read_its_own_credential() {
+        let outcome = hand_over(&RefusingStore, |_| panic!("there was nothing to hand over"));
+        assert_eq!(outcome, Handover::Unreadable);
+    }
+
+    /// Replacing an item the new binary may not read starts by deleting it, so
+    /// a write that fails after that must not leave the host with nothing.
+    #[test]
+    fn a_credential_the_failed_attempt_removed_is_put_back() {
+        let root = tempfile::tempdir().unwrap();
+        let store = handover_store(root.path());
+        store
+            .store(&SecretString::from(handover_document()))
+            .unwrap();
+
+        let outcome = hand_over(&store, |_| {
+            store.delete().unwrap();
+            Err("the keychain refused the write".to_string())
+        });
+
+        assert_eq!(outcome, Handover::Failed { restored: true });
+        let restored: serde_json::Value =
+            serde_json::from_str(&held(&store).expect("the credential is back")).unwrap();
+        let original: serde_json::Value = serde_json::from_str(&handover_document()).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    /// An item that is still there is either the original or the new
+    /// binary's, and neither is this daemon's to overwrite.
+    #[test]
+    fn a_credential_still_in_place_after_a_failure_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let store = handover_store(root.path());
+        store
+            .store(&SecretString::from(handover_document()))
+            .unwrap();
+        let replacement = format!("{}{}", "ghu_", "handoverWrittenByTheNewBuild00");
+
+        let outcome = hand_over(&store, |_| {
+            store
+                .store(&SecretString::from(replacement.clone()))
+                .unwrap();
+            Err("the new binary exited non-zero after writing".to_string())
+        });
+
+        assert_eq!(outcome, Handover::Failed { restored: false });
+        assert_eq!(held(&store), Some(replacement));
+    }
+
+    /// A store whose every read is refused, as a keychain refuses a program it
+    /// does not grant the item to.
+    #[derive(Debug)]
+    struct RefusingStore;
+
+    impl RefusingStore {
+        fn refusal() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "refused")
+        }
+    }
+
+    impl SecretStore for RefusingStore {
+        fn scope(&self) -> SecretScope {
+            SecretScope::User
+        }
+
+        fn location(&self) -> String {
+            "a store that refuses".to_string()
+        }
+
+        fn store(&self, _secret: &SecretString) -> Result<(), SecretStoreError> {
+            panic!("the handover must not write a store it could not read")
+        }
+
+        fn ensure_writable(&self) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Option<SecretString>, SecretStoreError> {
+            Err(SecretStoreError::Load {
+                scope: self.scope(),
+                location: self.location(),
+                source: Self::refusal(),
+            })
+        }
+
+        fn delete(&self) -> Result<Removal, SecretStoreError> {
+            panic!("the handover never deletes")
+        }
+
+        fn protection(
+            &self,
+        ) -> Result<runner_manager_platform::secrets::Protection, SecretStoreError> {
+            panic!("not asked")
+        }
     }
 }

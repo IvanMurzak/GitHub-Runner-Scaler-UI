@@ -128,7 +128,7 @@ pub(super) fn report_force_check(
     )
     .map_err(write_failed("this update"))?;
     if cfg!(target_os = "macos") && record.start_mode == StartMode::Login {
-        writeln!(out, "warning: a replacement may need a new login-Keychain grant. Do not sign in while the old daemon is still serving jobs.")
+        writeln!(out, "note: a daemon at 0.4.34 or later hands its login-Keychain credential to the new build before it restarts; an older one cannot, so the first update from one needs a sign-in. If the service then reports an unreadable credential, sign in again, but not while the old daemon is still serving jobs.")
             .map_err(write_failed("this update"))?;
         if version == super::running_version() {
             write_auth_command(context, record.start_mode, &record.binary, out)?;
@@ -284,7 +284,7 @@ fn report_auth_after_handover(
         writeln!(out, "warning: the service binary cannot currently read the GitHub credential. The service may report signed out.")
             .map_err(failed)?;
     }
-    writeln!(out, "warning: after the service reports {version}, its new binary may need a fresh Keychain grant. If it reports an unreadable or rejected credential, authorize using the service binary below. Do not do this while old jobs are running. Profiles, settings and the database are preserved:")
+    writeln!(out, "warning: after the service reports {version}, check `runner-manager service status`. If it reports an unreadable or rejected credential, authorize using the service binary below. Do not do this while old jobs are running. Profiles, settings and the database are preserved:")
         .map_err(failed)?;
     write_auth_command(context, record.start_mode, &record.binary, out)?;
     Ok(())
