@@ -5653,6 +5653,7 @@ mod tests {
     #[test]
     fn nothing_in_this_crate_reserves_or_claims_a_job() {
         const SOURCES: &[(&str, &str)] = &[
+            ("dependency_caches.rs", include_str!("dependency_caches.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             (

@@ -401,6 +401,24 @@ fn the_root_is_configured_or_under_the_runner_root_and_never_has_spaces() {
     assert!(resolve_root(&default, Some(spaced), Some(PathBuf::from("/a b"))).is_err());
 }
 
+#[test]
+fn a_value_the_service_environment_already_carries_is_left_alone() {
+    // The WSL host's systemd drop-in sets DOTNET_INSTALL_DIR by hand.
+    let variables = vec![
+        (
+            "DOTNET_INSTALL_DIR",
+            OsString::from("/cache/o/r/_slots/1/dotnet"),
+        ),
+        ("npm_config_cache", OsString::from("/cache/o/r/npm")),
+    ];
+    let kept = without_inherited(variables, |name| name == "DOTNET_INSTALL_DIR");
+    assert_eq!(
+        kept,
+        [("npm_config_cache", OsString::from("/cache/o/r/npm"))]
+    );
+    assert!(!inherited("RM_CACHE_TEST_SURELY_UNSET_VARIABLE"));
+}
+
 // -- launch -------------------------------------------------------------------
 
 fn runtime_with_runner(parent: &Path, name: &str) -> PathBuf {

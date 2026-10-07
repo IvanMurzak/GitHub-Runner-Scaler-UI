@@ -74,7 +74,9 @@
 //!
 //! Platform defaults < these variables < `runner.env` < the per-attempt
 //! `TMPDIR`/`TEMP`/`TMP`. A variable an operator sets in `runner.env` always
-//! wins.
+//! wins, and so does one the service's own environment already carries (a
+//! systemd drop-in, a launchd plist, a machine-wide variable on Windows): a
+//! cache variable only fills in what nobody set ([`without_inherited`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -1062,6 +1064,26 @@ pub fn environment<'a>(
         }
     }
     (variables, dirs)
+}
+
+/// `variables` without those `is_set` says the daemon's own environment
+/// already carries. Someone put that value in the service's environment on
+/// purpose; replacing it would silently undo their choice.
+#[must_use]
+pub fn without_inherited(
+    variables: Vec<(&'static str, OsString)>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, OsString)> {
+    variables
+        .into_iter()
+        .filter(|(name, _)| !is_set(name))
+        .collect()
+}
+
+/// Whether this process's environment sets `name` to something non-empty.
+#[must_use]
+pub fn inherited(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
 // ---------------------------------------------------------------------------

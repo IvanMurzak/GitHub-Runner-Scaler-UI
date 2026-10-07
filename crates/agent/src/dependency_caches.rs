@@ -127,7 +127,10 @@ impl DependencyCaches {
             platform,
             &runtime_holds_runner,
         ) {
-            Ok(launch) => Ok(launch.variables),
+            Ok(launch) => Ok(dependency_cache::without_inherited(
+                launch.variables,
+                dependency_cache::inherited,
+            )),
             Err(error) => {
                 tracing::warn!(
                     reason = "dependency_cache_unavailable",

@@ -703,7 +703,10 @@ and one Spotlight setting cover both, and paths stay short. A runner root with a
 such as the macOS default under `Application Support`, uses `~/Library/Caches/runner-manager`
 instead, because unquoted paths in tool installers break on spaces. `host cache set-root --path
 PATH` moves it; the path is checked like a runner root (local, writable, outside application
-data, not inside a runner root), so a network share or a WSL `/mnt/c` path is refused.
+data, not inside a runner root), so a network share or a WSL `/mnt/c` path is refused. On Linux
+the systemd unit lets the service write only its own directories, so a root outside the runner
+runtime directory also needs a `ReadWritePaths=` drop-in; without one, runners start without
+caches and the service logs `dependency_cache_unavailable`.
 `host doctor` checks a cache root outside the runner roots like one of them, and `host prepare`
 excludes it from Defender with them.
 
@@ -771,7 +774,9 @@ Some choices are deliberate:
   workflows use it; on Linux and Windows `AGENT_TOOLSDIRECTORY` covers it.
 
 A variable you set in `runner.env` always wins: platform defaults, then these caches, then
-`runner.env`, then the attempt's own `TMPDIR`, `TEMP` and `TMP`. Turn one cache off for every
+`runner.env`, then the attempt's own `TMPDIR`, `TEMP` and `TMP`. So does a variable the service's
+own environment already carries, such as one set in a systemd drop-in, the launchd plist or a
+machine-wide Windows variable: the caches only fill in what nobody set. Turn one cache off for every
 repository with `host cache set-tool TOOL --state off`, or for one with `repo cache set-tool`,
 and every cache off with `host cache set-enabled --enabled false` or `repo cache set-enabled`.
 

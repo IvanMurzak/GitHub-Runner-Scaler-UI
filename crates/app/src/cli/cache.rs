@@ -254,6 +254,18 @@ pub fn dispatch_host(
                 root.as_str()
             )
             .map_err(failed)?;
+            if RunnerPlatform::current() == RunnerPlatform::Linux {
+                // The unit's `ProtectSystem=strict` leaves only the service's
+                // own directories writable, and runners inherit that sandbox.
+                writeln!(
+                    out,
+                    "Note: a systemd service can write only its own directories. Add \
+                     `ReadWritePaths={}` to the unit with a drop-in, or runners start without \
+                     caches (`dependency_cache_unavailable` in the log).",
+                    root.as_str()
+                )
+                .map_err(failed)?;
+            }
         }
         HostCacheCommand::ResetRoot => {
             config.root = None;
