@@ -772,3 +772,27 @@ fn the_deepest_pnpm_store_file_fits_the_windows_path_limit_under_the_default_roo
     );
     assert!(store_file.len() < 260, "{} characters", store_file.len());
 }
+
+#[test]
+fn a_prune_request_is_taken_exactly_once() {
+    let state = tempfile::tempdir().unwrap();
+    assert!(!take_prune_request(state.path()), "nothing was asked");
+    fs::write(prune_request_path(state.path()), b"now").unwrap();
+    assert!(take_prune_request(state.path()));
+    assert!(
+        !take_prune_request(state.path()),
+        "a request is honoured once however often it is looked for"
+    );
+}
+
+#[test]
+fn only_an_access_refusal_reads_as_needing_the_service_account() {
+    let refusal = |kind| CacheError::Io {
+        action: "write",
+        path: PathBuf::from("/cache/.usage.json"),
+        source: io::Error::from(kind),
+    };
+    assert!(refusal(io::ErrorKind::PermissionDenied).is_permission_denied());
+    assert!(!refusal(io::ErrorKind::NotFound).is_permission_denied());
+    assert!(!CacheError::Lock("held by pid 7".into()).is_permission_denied());
+}

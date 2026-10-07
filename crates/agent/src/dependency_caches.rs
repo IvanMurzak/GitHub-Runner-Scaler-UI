@@ -169,17 +169,29 @@ impl DependencyCaches {
     /// when caches are off, no root resolves or the root does not exist yet.
     #[must_use]
     pub fn prune_once(&self) -> Option<CacheUsage> {
+        self.prune_guarded(true)
+    }
+
+    /// [`Self::prune_once`] for an operator's `host cache prune` that this
+    /// service carries out on their behalf: it prunes whether or not caches
+    /// are on, exactly as the command does when it can write the root itself.
+    #[must_use]
+    pub fn prune_on_request(&self) -> Option<CacheUsage> {
+        self.prune_guarded(false)
+    }
+
+    fn prune_guarded(&self, only_when_enabled: bool) -> Option<CacheUsage> {
         if PRUNING.swap(true, Ordering::AcqRel) {
             return None;
         }
-        let usage = self.prune_unguarded();
+        let usage = self.prune_unguarded(only_when_enabled);
         PRUNING.store(false, Ordering::Release);
         usage
     }
 
-    fn prune_unguarded(&self) -> Option<CacheUsage> {
+    fn prune_unguarded(&self, only_when_enabled: bool) -> Option<CacheUsage> {
         let config = CacheConfig::load(&self.config_file).ok()?;
-        if !config.host_enabled() {
+        if only_when_enabled && !config.host_enabled() {
             return None;
         }
         let root = self.root(&config).ok()?;

@@ -113,6 +113,38 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// The daemon's last measurement, inside the cache root.
 pub const USAGE_FILE: &str = ".usage.json";
 
+/// The file in the state directory that asks a running service to prune now.
+///
+/// # Why a file
+///
+/// On a host whose service runs as another account (LocalSystem on Windows,
+/// root elsewhere), the cache root belongs to that account, so `host cache
+/// prune` from an ordinary prompt cannot write it -- while `host cache show`,
+/// which only reads, works. The service already reads the state directory it
+/// shares with the account that installed it, so a request left there is the
+/// one channel both sides can use without administrator rights. The service
+/// takes the request by deleting the file, which is also how the asking
+/// command knows somebody is listening.
+pub const PRUNE_REQUEST_FILE: &str = "cache-prune.request";
+
+/// How often the service looks for a [`PRUNE_REQUEST_FILE`].
+pub const PRUNE_REQUEST_POLL: Duration = Duration::from_secs(5);
+
+/// Where a prune request for the service lives.
+#[must_use]
+pub fn prune_request_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(PRUNE_REQUEST_FILE)
+}
+
+/// Takes a pending prune request, if there is one. Returns whether there was.
+///
+/// Taking it is deleting it, so a request is honoured once however many
+/// times it is looked for.
+#[must_use]
+pub fn take_prune_request(state_dir: &Path) -> bool {
+    fs::remove_file(prune_request_path(state_dir)).is_ok()
+}
+
 const TRASH_DIR: &str = ".trash";
 const SLOTS_DIR: &str = "_slots";
 const LEASE_EXTENSION: &str = "lease";
@@ -523,6 +555,15 @@ pub enum CacheError {
     },
     #[error("{0}")]
     Lock(String),
+}
+
+impl CacheError {
+    /// Whether this failed only because this account may not write there:
+    /// the cache root of a service that runs as another account.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied)
+    }
 }
 
 fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> CacheError + use<> {
@@ -1173,7 +1214,17 @@ fn lock_cache_root(root: &Path) -> Result<HostLock, CacheError> {
         LockKind::DependencyCache,
         LOCK_WAIT,
     )
-    .map_err(|error| CacheError::Lock(error.to_string()))
+    .map_err(|error| match error {
+        // Kept an I/O error, so that a lock file this account may not open --
+        // the cache root of a service running as another account -- reads as
+        // the permission problem it is ([`CacheError::is_permission_denied`]).
+        crate::lock::LockError::Io { path, source } => CacheError::Io {
+            action: "lock",
+            path,
+            source,
+        },
+        other => CacheError::Lock(other.to_string()),
+    })
 }
 
 /// Leases a slot in `selection`'s namespace for the attempt at `runtime`,

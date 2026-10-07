@@ -7,6 +7,39 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.35
+
+### Fixes
+
+- Updating a managed WSL host no longer needs administrator rights. `wsl install` from an
+  ordinary prompt used to drain the Linux service, swap its binary and restart it, and then exit
+  24 with `cannot register the scheduled task runner-manager-wsl-… without elevation: Access is
+  denied`, leaving the Windows lifecycle task on the previous companion and the Windows-side
+  record on the previous version. The task named its Windows companion by version
+  (`runner-manager-wsl-0.4.34.exe`), so every update was a new task definition, and replacing a
+  task that an elevated prompt created is refused to an ordinary token. The companion now lives
+  at version-independent paths (`state/bin/runner-manager-wsl.exe` and
+  `runner-manager-wsl-supervisor.exe`) that an update swaps in place, `wsl install` leaves the
+  task alone when it is already the one it would write, and a running companion notices the new
+  file and restarts onto it by itself (its guest holder is replaced within seconds; the Linux
+  service is not touched).
+- The first `wsl install` after upgrading from 0.4.34 or earlier moves the task to the new
+  paths once. If Windows refuses that without administrator rights, `wsl install` asks for them
+  with one administrator prompt, the same one `host prepare` uses, and restarts the running
+  companion onto the new task. Where no prompt can be shown (a script, an SSH session), it says
+  the change is needed once and prints the exact command to run from an elevated prompt.
+  Registering a distribution's task for the first time works the same way. The versioned
+  companion copies are removed once nothing runs them.
+- `runner-manager update` names every managed WSL host that runs another version, with the
+  `wsl install --distribution NAME` command that updates it. It does not run that command
+  itself: updating a WSL host drains that host's jobs with no deadline, and `update` returns as
+  soon as this machine's own binary is replaced.
+- `host cache prune` works from an ordinary prompt on a host whose service runs as another
+  account (LocalSystem on Windows, root elsewhere). It used to fail with `cannot write
+  …\_cache\.usage.json: Access is denied`; it now asks the running service to prune, waits for
+  its result and prints it. When no service takes the request it says so and names both remedies:
+  start the service, or run the command from an elevated prompt.
+
 ## 0.4.34
 
 ### Features

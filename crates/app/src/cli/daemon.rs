@@ -163,6 +163,15 @@ async fn run_generation(
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
             },
+            // No runner grows the caches on an idle host, so nothing prunes on
+            // a schedule; an operator's `host cache prune` is still honoured.
+            () = maintain_dependency_caches(
+                super::cache::daemon_caches(context, Arc::clone(&store) as Arc<dyn Store>, host.id),
+                context.paths().state_dir().to_path_buf(),
+                false,
+            ) => {
+                unreachable!("dependency cache maintenance runs until the daemon is stopped")
+            },
             () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
                 unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
             },
@@ -448,7 +457,11 @@ async fn run_generation(
         () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
             unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
         }
-        () = maintain_dependency_caches(dependency_caches.clone()) => {
+        () = maintain_dependency_caches(
+            dependency_caches.clone(),
+            context.paths().state_dir().to_path_buf(),
+            true,
+        ) => {
             unreachable!("dependency cache pruning runs until the daemon is stopped")
         }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
@@ -580,16 +593,39 @@ const fn wsl_recovery_is_available(windows_service_host: bool) -> bool {
 const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Measures the dependency caches and prunes them to the cap, at start and
-/// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL).
-/// The walk runs on a blocking thread: a pnpm store holds hundreds of
-/// thousands of files.
+/// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL)
+/// when `scheduled`, and whenever `host cache prune` asks through a
+/// [`PRUNE_REQUEST_FILE`](runner_manager_platform::dependency_cache::PRUNE_REQUEST_FILE)
+/// in `state_dir` -- which is how an operator whose account cannot write the
+/// service's cache root still gets a prune. The walk runs on a blocking
+/// thread: a pnpm store holds hundreds of thousands of files.
 async fn maintain_dependency_caches(
     caches: runner_manager_agent::dependency_caches::DependencyCaches,
+    state_dir: std::path::PathBuf,
+    scheduled: bool,
 ) {
+    use runner_manager_platform::dependency_cache::{
+        PRUNE_INTERVAL, PRUNE_REQUEST_POLL, take_prune_request,
+    };
+    let mut next_scheduled = scheduled.then(std::time::Instant::now);
     loop {
-        let pass = caches.clone();
-        let _ = tokio::task::spawn_blocking(move || pass.prune_once()).await;
-        tokio::time::sleep(runner_manager_platform::dependency_cache::PRUNE_INTERVAL).await;
+        let requested = take_prune_request(&state_dir);
+        let due = next_scheduled.is_some_and(|at| std::time::Instant::now() >= at);
+        if requested || due {
+            let pass = caches.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if requested {
+                    pass.prune_on_request()
+                } else {
+                    pass.prune_once()
+                }
+            })
+            .await;
+            if due {
+                next_scheduled = Some(std::time::Instant::now() + PRUNE_INTERVAL);
+            }
+        }
+        tokio::time::sleep(PRUNE_REQUEST_POLL).await;
     }
 }
 

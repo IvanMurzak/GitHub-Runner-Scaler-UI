@@ -10,8 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use runner_manager_agent::dependency_caches::DependencyCaches;
 use runner_manager_domain::model::{Host, HostId, ScaleTarget, Timestamp};
@@ -308,28 +309,150 @@ pub fn dispatch_host(
                 .map_err(failed)?;
                 return Ok(());
             }
-            let usage = dependency_cache::prune(
+            if let Some(usage) = prune_root(
+                context.paths().state_dir(),
                 &resolved.path,
                 config.max_bytes(),
-                &dependency_cache::runtime_holds_runner,
-            )
-            .map_err(cache_failure)?;
-            writeln!(
+                ServiceWait::REAL,
                 out,
-                "{} in {} namespace(s) at {}; removed {}.",
-                dependency_cache::human_bytes(usage.total_bytes),
-                usage.namespaces.len(),
-                resolved.path.display(),
-                if usage.pruned.is_empty() {
-                    "nothing".to_owned()
-                } else {
-                    usage.pruned.join(", ")
-                }
-            )
-            .map_err(failed)?;
+            )? {
+                write_pruned(&usage, &resolved.path, out).map_err(failed)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Prunes `root` here, or -- when this account may not write it, as with the
+/// cache root of a service running as LocalSystem or root -- has the running
+/// service do it. `None` when the service is still working and that has been
+/// said.
+fn prune_root(
+    state_dir: &Path,
+    root: &Path,
+    max_bytes: Option<u64>,
+    wait: ServiceWait,
+    out: &mut dyn Write,
+) -> Result<Option<CacheUsage>, CliError> {
+    match dependency_cache::prune(root, max_bytes, &dependency_cache::runtime_holds_runner) {
+        Ok(usage) => Ok(Some(usage)),
+        Err(error) if error.is_permission_denied() => {
+            prune_through_service(state_dir, root, &error, wait, out)
+        }
+        Err(error) => Err(cache_failure(error)),
+    }
+}
+
+fn write_pruned(usage: &CacheUsage, root: &Path, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "{} in {} namespace(s) at {}; removed {}.",
+        dependency_cache::human_bytes(usage.total_bytes),
+        usage.namespaces.len(),
+        root.display(),
+        if usage.pruned.is_empty() {
+            "nothing".to_owned()
+        } else {
+            usage.pruned.join(", ")
+        }
+    )
+}
+
+/// How long `host cache prune` waits on the service, and how often it looks.
+#[derive(Debug, Clone, Copy)]
+struct ServiceWait {
+    /// For the service to take the request. Several of its polls, so a
+    /// service that is running always answers inside it.
+    taken: Duration,
+    /// For the service to finish measuring and pruning once it has.
+    finished: Duration,
+    poll: Duration,
+}
+
+impl ServiceWait {
+    const REAL: Self = Self {
+        taken: Duration::from_secs(4 * dependency_cache::PRUNE_REQUEST_POLL.as_secs()),
+        finished: Duration::from_secs(10 * 60),
+        poll: Duration::from_secs(1),
+    };
+}
+
+/// Asks the running service to prune a cache root this account cannot write,
+/// and reports what it did. `None` when the service took the request and was
+/// still working when the wait ran out; the outcome has been said.
+///
+/// # Errors
+/// [`Failure::LocalState`] naming the remedies when the request cannot be
+/// left, or no running service took it.
+fn prune_through_service(
+    state_dir: &Path,
+    root: &Path,
+    denied: &CacheError,
+    wait: ServiceWait,
+    out: &mut dyn Write,
+) -> Result<Option<CacheUsage>, CliError> {
+    let failed = write_failed("the dependency caches");
+    let remedy = "start the service (`runner-manager service start`) so it can prune on request, \
+                  or run `runner-manager host cache prune` from an elevated prompt";
+    let request = dependency_cache::prune_request_path(state_dir);
+    let asked_at = chrono::Utc::now();
+    std::fs::write(&request, asked_at.to_rfc3339()).map_err(|error| {
+        CliError::with_remedy(
+            Failure::LocalState,
+            format!(
+                "this account cannot prune {} ({denied}), and cannot ask the service to either: \
+                 {} is not writable: {error}",
+                root.display(),
+                request.display()
+            ),
+            remedy,
+        )
+    })?;
+    writeln!(
+        out,
+        "{} belongs to the service's account, so the service was asked to prune it.",
+        root.display()
+    )
+    .map_err(failed)?;
+    out.flush().map_err(failed)?;
+
+    let taken_by = std::time::Instant::now() + wait.taken;
+    while request.exists() {
+        if std::time::Instant::now() >= taken_by {
+            // Withdrawn, so a service started later does not act on a request
+            // nobody is waiting for.
+            let _ = std::fs::remove_file(&request);
+            return Err(CliError::with_remedy(
+                Failure::LocalState,
+                format!(
+                    "this account cannot prune {} ({denied}), and no running service took the \
+                     request within {} seconds",
+                    root.display(),
+                    wait.taken.as_secs()
+                ),
+                remedy,
+            ));
+        }
+        std::thread::sleep(wait.poll);
+    }
+
+    let finished_by = std::time::Instant::now() + wait.finished;
+    loop {
+        if let Some(usage) = CacheUsage::read(root).filter(|usage| usage.measured_at >= asked_at) {
+            return Ok(Some(usage));
+        }
+        if std::time::Instant::now() >= finished_by {
+            writeln!(
+                out,
+                "The service took the request but has not recorded a result yet; \
+                 `runner-manager host cache show` reports it once it does, and the service log \
+                 says why if it could not."
+            )
+            .map_err(failed)?;
+            return Ok(None);
+        }
+        std::thread::sleep(wait.poll);
+    }
 }
 
 /// This host's record and policies, for the `show` commands.
@@ -797,6 +920,118 @@ fn write_target_show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cache root this account may not write, as the cache root of a
+    /// service running as another account is. `None` where the environment
+    /// cannot express that (a test run as root ignores Unix permissions).
+    fn unwritable_root() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        let root = base.path().join("_cache");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(root.join("some-namespace")).unwrap();
+        set_writable(&root, false);
+        let refused = std::fs::write(root.join(dependency_cache::USAGE_FILE), b"{}").is_err();
+        if !refused {
+            set_writable(&root, true);
+            eprintln!("this account can write anything, so a refusal cannot be staged here");
+            return None;
+        }
+        Some((base, state, root))
+    }
+
+    /// Windows: a read-only usage file, which the atomic rename cannot
+    /// replace. Unix: a read-only directory.
+    fn set_writable(root: &Path, writable: bool) {
+        #[cfg(windows)]
+        {
+            let usage = root.join(dependency_cache::USAGE_FILE);
+            if !usage.exists() {
+                std::fs::write(&usage, b"{}").unwrap();
+            }
+            let mut permissions = std::fs::metadata(&usage).unwrap().permissions();
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "the test undoes its own lock"
+            )]
+            permissions.set_readonly(!writable);
+            std::fs::set_permissions(&usage, permissions).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = if writable { 0o755 } else { 0o555 };
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    const QUICK: ServiceWait = ServiceWait {
+        taken: Duration::from_millis(400),
+        finished: Duration::from_secs(20),
+        poll: Duration::from_millis(20),
+    };
+
+    #[test]
+    fn a_root_this_account_cannot_write_is_pruned_by_the_running_service() {
+        let Some((_base, state, root)) = unwritable_root() else {
+            return;
+        };
+        // The service: it takes the request by deleting it, and prunes with
+        // the rights the asking account does not have.
+        let service = {
+            let (state, root) = (state.clone(), root.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !dependency_cache::take_prune_request(&state) {
+                    assert!(std::time::Instant::now() < deadline, "no request arrived");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                set_writable(&root, true);
+                dependency_cache::prune(&root, None, &|_| false).unwrap();
+            })
+        };
+
+        let mut out = Vec::new();
+        let usage = prune_root(&state, &root, None, QUICK, &mut out)
+            .expect("the service pruned it")
+            .expect("and reported back in time");
+        service.join().unwrap();
+
+        assert_eq!(
+            Some(usage.measured_at),
+            CacheUsage::read(&root).map(|recorded| recorded.measured_at),
+            "what is reported is the measurement the service just recorded"
+        );
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("the service was asked to prune it"), "{said}");
+        assert!(!dependency_cache::prune_request_path(&state).exists());
+    }
+
+    #[test]
+    fn a_root_this_account_cannot_write_with_no_service_running_names_both_remedies() {
+        let Some((_base, state, root)) = unwritable_root() else {
+            return;
+        };
+        let mut out = Vec::new();
+        let refusal =
+            prune_root(&state, &root, None, QUICK, &mut out).expect_err("nobody took the request");
+        set_writable(&root, true);
+
+        assert_eq!(refusal.class(), Failure::LocalState);
+        assert!(
+            refusal
+                .to_string()
+                .contains("no running service took the request"),
+            "{refusal}"
+        );
+        let remedy = refusal.remedy().expect("a remedy").to_string();
+        assert!(remedy.contains("runner-manager service start"), "{remedy}");
+        assert!(remedy.contains("elevated prompt"), "{remedy}");
+        assert!(
+            !dependency_cache::prune_request_path(&state).exists(),
+            "a request nobody waits for is withdrawn"
+        );
+    }
 
     #[test]
     fn the_table_describes_shared_and_per_runner_directories_distinctly() {
