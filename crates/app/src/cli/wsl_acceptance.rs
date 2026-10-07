@@ -520,6 +520,7 @@ impl Workstation {
             host: &self.host,
             assets: &self.assets,
             issuer,
+            elevation: &SystemTaskElevation { interactive: false },
             paths: &self.paths,
             principal: TaskPrincipal::named(PRINCIPAL),
             version: version().to_string(),
@@ -2792,7 +2793,22 @@ mod chains {
                 "systemctl stop",
                 "systemctl enable",
             ])
-            .runs(&["/Create /TN", "/Run /TN"])
+    }
+
+    /// [`converged`] over a host whose lifecycle task is already the one this
+    /// release writes, and running: no Task Scheduler write at all. That write
+    /// is what needed administrator rights on every host whose task an
+    /// elevated prompt created.
+    fn converged_with_task(distribution: &str) -> Expect {
+        converged(distribution)
+            .says(&["is current and running; it was left as it is"])
+            .never(&["/Create /TN", "/Run /TN"])
+    }
+
+    /// [`converged`] over a host that has no lifecycle task: registered and
+    /// started.
+    fn converged_without_task(distribution: &str) -> Expect {
+        converged(distribution).runs(&["/Create /TN", "/Run /TN"])
     }
 
     /// A failure after the preflight: what landed stands, and a rerun is safe.
@@ -2925,7 +2941,7 @@ mod chains {
                     (install(UBUNTU, Some(8)), provisioned(UBUNTU, Some(8))),
                     (
                         install(UBUNTU, None),
-                        converged(UBUNTU)
+                        converged_with_task(UBUNTU)
                             .capacity(8)
                             .linux(UBUNTU, Fact::Received(1))
                             .linux(UBUNTU, Fact::Capacity(8)),
@@ -2951,7 +2967,7 @@ mod chains {
                     ),
                     (
                         install(UBUNTU, None),
-                        converged(UBUNTU)
+                        converged_with_task(UBUNTU)
                             .capacity(2)
                             .linux(UBUNTU, Fact::Capacity(2)),
                     ),
@@ -3030,7 +3046,7 @@ mod chains {
                 world: World::with([Distro::adopted(UBUNTU, 4)]),
                 steps: vec![(
                     install(UBUNTU, None),
-                    converged(UBUNTU)
+                    converged_without_task(UBUNTU)
                         .capacity(4)
                         .linux(UBUNTU, credential_of(PREEXISTING))
                         .linux(UBUNTU, Fact::Received(0))
@@ -3928,7 +3944,7 @@ mod chains {
                     (detach(UBUNTU), Expect::succeeds().record(UBUNTU, false)),
                     (
                         install(UBUNTU, None),
-                        converged(UBUNTU)
+                        converged_without_task(UBUNTU)
                             .capacity(8)
                             .linux(UBUNTU, Fact::Received(1))
                             .linux(UBUNTU, our_task(true)),

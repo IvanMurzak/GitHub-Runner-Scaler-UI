@@ -671,7 +671,10 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
             )
         };
         writeln!(out, "{sentence}").map_err(failed)?;
-        return Ok(());
+        // This machine is current, which says nothing about the hosts it
+        // manages: one installed before this binary was updated still runs
+        // the version it was given.
+        return report_managed_wsl_hosts(context.paths(), running_version(), out);
     }
 
     // ------------------------------------------------------------------
@@ -829,6 +832,65 @@ pub fn dispatch(context: &Context, args: &UpdateArgs, out: &mut dyn Write) -> Re
         force_service_handover(context, &installation, &published.version, out)?;
     } else {
         report_service_consequence(context, &installation, &published.version, out)?;
+    }
+    report_managed_wsl_hosts(context.paths(), &published.version, out)
+}
+
+// ---------------------------------------------------------------------------
+// What it means for managed WSL hosts
+// ---------------------------------------------------------------------------
+
+/// Names every managed WSL host that runs a version older than `version`, and
+/// the command that brings it up to date.
+///
+/// # Why `update` says this rather than doing it
+///
+/// A managed WSL distribution is a second runner host with its own binary, its
+/// own service and its own credential. Updating one is `wsl install`'s
+/// convergent transaction, and that transaction waits -- with no deadline, on
+/// purpose -- for every job the Linux service is running to finish before its
+/// service copy is replaced, and signs in through the device flow if the
+/// distribution holds no credential. Neither belongs inside `update`, which
+/// returns as soon as this machine's own binary is replaced and lets its
+/// service drain in the background. Updating a host with `wsl install` needs
+/// no administrator rights, except once for a host whose lifecycle task 0.4.34
+/// or earlier registered from an elevated prompt; it asks for them itself.
+///
+/// Never a failure: a record this build cannot read is `wsl list`'s business.
+fn report_managed_wsl_hosts(
+    paths: &runner_manager_platform::paths::AppPaths,
+    version: &str,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let failed = write_failed("this update");
+    let Ok(records) = runner_manager_platform::wsl::record::WslProviderRecord::all(paths) else {
+        return Ok(());
+    };
+    let behind: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            compare_versions(&record.installed_version, version) == std::cmp::Ordering::Less
+        })
+        .collect();
+    if behind.is_empty() {
+        return Ok(());
+    }
+    writeln!(out).map_err(failed)?;
+    writeln!(
+        out,
+        "Managed WSL hosts are updated separately, because updating one drains its own jobs. \
+         Run, from this prompt (no administrator rights needed, except once for a host first \
+         set up before 0.4.35 from an elevated prompt, which asks for them itself):"
+    )
+    .map_err(failed)?;
+    for record in behind {
+        writeln!(
+            out,
+            "  {}   (runs {})",
+            super::wsl::install_remediation(&record.distribution),
+            record.installed_version
+        )
+        .map_err(failed)?;
     }
     Ok(())
 }
@@ -1454,6 +1516,46 @@ mod tests {
         AssetSource::Remote {
             base: "https://example.invalid/download".to_string(),
         }
+    }
+
+    #[test]
+    fn managed_wsl_hosts_behind_the_new_version_are_named_with_the_command_that_updates_them() {
+        use runner_manager_platform::wsl::record::WslProviderRecord;
+        let root = tempfile::tempdir().unwrap();
+        let paths = runner_manager_platform::paths::AppPaths::rooted_at(root.path());
+        paths.create_all().unwrap();
+
+        let mut out = Vec::new();
+        report_managed_wsl_hosts(&paths, "0.4.35", &mut out).unwrap();
+        assert!(out.is_empty(), "no managed host, nothing to say");
+
+        for (distribution, version) in [
+            ("Ubuntu", "0.4.34"),
+            ("My Debian", "0.4.30"),
+            ("Current", "0.4.35"),
+            ("Newer", "0.4.100"),
+        ] {
+            WslProviderRecord::new(distribution, "task", version, chrono::Utc::now())
+                .write(&paths)
+                .unwrap();
+        }
+        report_managed_wsl_hosts(&paths, "0.4.35", &mut out).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains("runner-manager wsl install --distribution \"Ubuntu\"   (runs 0.4.34)"),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "runner-manager wsl install --distribution \"My Debian\"   (runs 0.4.30)"
+            ),
+            "{said}"
+        );
+        assert!(
+            !said.contains("Current") && !said.contains("Newer"),
+            "a current or newer host is not named: {said}"
+        );
+        assert!(said.contains("no administrator rights"), "{said}");
     }
 
     #[test]

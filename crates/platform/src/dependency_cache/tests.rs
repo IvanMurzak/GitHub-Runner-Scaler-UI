@@ -772,3 +772,51 @@ fn the_deepest_pnpm_store_file_fits_the_windows_path_limit_under_the_default_roo
     );
     assert!(store_file.len() < 260, "{} characters", store_file.len());
 }
+
+#[test]
+fn a_prune_request_is_taken_exactly_once() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(take_prune_request(state.path()), None, "nothing was asked");
+    fs::write(prune_request_path(state.path()), b"request-7\n").unwrap();
+    assert_eq!(
+        take_prune_request(state.path()).as_deref(),
+        Some("request-7")
+    );
+    assert_eq!(
+        take_prune_request(state.path()),
+        None,
+        "a request is honoured once however often it is looked for"
+    );
+}
+
+#[test]
+fn a_prune_result_answers_only_the_request_it_names() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(PruneResult::read_for(state.path(), "request-7"), None);
+    let result = PruneResult {
+        request: "request-7".into(),
+        outcome: Err("the root is gone".into()),
+    };
+    result.write(state.path()).unwrap();
+    assert_eq!(
+        PruneResult::read_for(state.path(), "request-7"),
+        Some(result)
+    );
+    assert_eq!(
+        PruneResult::read_for(state.path(), "request-8"),
+        None,
+        "an answer to an earlier request is not this one's"
+    );
+}
+
+#[test]
+fn only_an_access_refusal_reads_as_needing_the_service_account() {
+    let refusal = |kind| CacheError::Io {
+        action: "write",
+        path: PathBuf::from("/cache/.usage.json"),
+        source: io::Error::from(kind),
+    };
+    assert!(refusal(io::ErrorKind::PermissionDenied).is_permission_denied());
+    assert!(!refusal(io::ErrorKind::NotFound).is_permission_denied());
+    assert!(!CacheError::Lock("held by pid 7".into()).is_permission_denied());
+}

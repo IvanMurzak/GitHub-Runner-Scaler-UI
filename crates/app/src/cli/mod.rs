@@ -708,6 +708,20 @@ pub enum WslHostCommand {
     /// Rewrite a systemd unit an older build installed. Not for people.
     #[command(hide = true)]
     ConvergeService,
+    /// Register a managed distribution's lifecycle task with the
+    /// administrator rights `wsl install` asked for. Not for people.
+    #[command(hide = true)]
+    RegisterTask(WslHostRegisterTaskArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WslHostRegisterTaskArgs {
+    /// The task to register, as `wsl install` describes it.
+    #[arg(long, value_name = "JSON")]
+    pub request: String,
+    /// Where to report the outcome, for the process that asked.
+    #[arg(long, value_name = "PATH")]
+    pub result: PathBuf,
 }
 
 #[derive(Debug, Args, Default)]

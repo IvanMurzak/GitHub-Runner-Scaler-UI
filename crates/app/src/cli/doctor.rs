@@ -2234,7 +2234,7 @@ pub enum ElevationFailure {
 }
 
 impl ElevationFailure {
-    fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         match self {
             Self::Refused => "administrator rights were refused".to_owned(),
             Self::Unavailable(detail) => {
@@ -2260,29 +2260,48 @@ pub struct SystemElevator {
 
 impl Elevator for SystemElevator {
     fn elevate(&self, request: &ElevatedRequest) -> Result<Vec<FixResult>, ElevationFailure> {
-        let failed = |error: String| ElevationFailure::Failed(error);
-        let program = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
-        let directory = tempfile::tempdir().map_err(|error| failed(error.to_string()))?;
-        let result = directory.path().join("result.json");
-        let plan = serde_json::to_string(request).map_err(|error| failed(error.to_string()))?;
-        let args: Vec<OsString> = [
-            OsString::from("host"),
-            OsString::from("prepare"),
-            OsString::from("--elevated-request"),
-            OsString::from(plan),
-            OsString::from("--elevated-result"),
-            result.clone().into_os_string(),
-        ]
-        .into();
-        match host_fitness::run_elevated(&program, &args, self.terminal) {
-            ElevationOutcome::Refused => Err(ElevationFailure::Refused),
-            ElevationOutcome::Unavailable(detail) => Err(ElevationFailure::Unavailable(detail)),
-            ElevationOutcome::Exited(code) => {
-                let text = std::fs::read_to_string(&result).map_err(|error| {
-                    failed(format!("it exited {code} and wrote no result ({error})"))
-                })?;
-                serde_json::from_str(&text).map_err(|error| failed(error.to_string()))
-            }
+        let plan = serde_json::to_string(request)
+            .map_err(|error| ElevationFailure::Failed(error.to_string()))?;
+        run_elevated_reporting(
+            |result| {
+                vec![
+                    OsString::from("host"),
+                    OsString::from("prepare"),
+                    OsString::from("--elevated-request"),
+                    OsString::from(plan),
+                    OsString::from("--elevated-result"),
+                    result.as_os_str().to_owned(),
+                ]
+            },
+            self.terminal,
+        )
+    }
+}
+
+/// Runs one elevated copy of this binary with the arguments `args` builds
+/// around the file it is to report into, waits for it, and reads that
+/// report back. The elevated window is hidden, so the file is its only voice.
+///
+/// # Errors
+/// [`ElevationFailure::Refused`] or [`ElevationFailure::Unavailable`] when no
+/// elevated copy ran, and [`ElevationFailure::Failed`] when one ran and left
+/// no readable report.
+pub(crate) fn run_elevated_reporting<T: serde::de::DeserializeOwned>(
+    args: impl FnOnce(&Path) -> Vec<OsString>,
+    terminal: bool,
+) -> Result<T, ElevationFailure> {
+    let failed = |error: String| ElevationFailure::Failed(error);
+    let program = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
+    let directory = tempfile::tempdir().map_err(|error| failed(error.to_string()))?;
+    let result = directory.path().join("result.json");
+    match host_fitness::run_elevated(&program, &args(&result), terminal) {
+        ElevationOutcome::Refused => Err(ElevationFailure::Refused),
+        ElevationOutcome::Unavailable(detail) => Err(ElevationFailure::Unavailable(detail)),
+        ElevationOutcome::Exited(code) => {
+            let text = std::fs::read_to_string(&result).map_err(|error| {
+                failed(format!("it exited {code} and wrote no result ({error})"))
+            })?;
+            serde_json::from_str(&text).map_err(|error| failed(error.to_string()))
         }
     }
 }

@@ -113,6 +113,83 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// The daemon's last measurement, inside the cache root.
 pub const USAGE_FILE: &str = ".usage.json";
 
+/// The file in the state directory that asks a running service to prune now.
+///
+/// # Why a file
+///
+/// On a host whose service runs as another account (LocalSystem on Windows,
+/// root elsewhere), the cache root belongs to that account, so `host cache
+/// prune` from an ordinary prompt cannot write it -- while `host cache show`,
+/// which only reads, works. The service already reads the state directory it
+/// shares with the account that installed it, so a request left there is the
+/// one channel both sides can use without administrator rights. The file holds
+/// an identifier the asking command chose. The service takes the request by
+/// deleting the file, which is how the command knows somebody is listening,
+/// and answers in [`PRUNE_RESULT_FILE`] under the same identifier, which is
+/// how it knows the answer is to this request and not to a pass that was
+/// already under way.
+pub const PRUNE_REQUEST_FILE: &str = "cache-prune.request";
+
+/// The service's answer to the last [`PRUNE_REQUEST_FILE`] it took.
+pub const PRUNE_RESULT_FILE: &str = "cache-prune.result";
+
+/// How often the service looks for a [`PRUNE_REQUEST_FILE`]. It looks while a
+/// pass is running too, so a request is taken within this however long the
+/// pass takes.
+pub const PRUNE_REQUEST_POLL: Duration = Duration::from_secs(5);
+
+/// Where a prune request for the service lives.
+#[must_use]
+pub fn prune_request_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(PRUNE_REQUEST_FILE)
+}
+
+/// Takes a pending prune request, if there is one, and returns its identifier.
+///
+/// Taking it is deleting it, so a request is honoured once however many
+/// times it is looked for.
+#[must_use]
+pub fn take_prune_request(state_dir: &Path) -> Option<String> {
+    let path = prune_request_path(state_dir);
+    let request = fs::read_to_string(&path).ok()?;
+    fs::remove_file(&path).ok()?;
+    Some(request.trim().to_owned())
+}
+
+/// The service's answer to one prune request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneResult {
+    /// The identifier the request carried.
+    pub request: String,
+    /// What the pass measured and removed, or why it could not run.
+    pub outcome: Result<CacheUsage, String>,
+}
+
+impl PruneResult {
+    /// Records this answer where the asking command looks for it.
+    ///
+    /// # Errors
+    /// The file could not be written.
+    pub fn write(&self, state_dir: &Path) -> Result<(), CacheError> {
+        let path = state_dir.join(PRUNE_RESULT_FILE);
+        let json = serde_json::to_vec_pretty(self).map_err(|error| CacheError::Io {
+            action: "encode",
+            path: path.clone(),
+            source: io::Error::other(error),
+        })?;
+        write_atomically(&path, &json)
+    }
+
+    /// The answer to the request `request`, once the service has given it.
+    #[must_use]
+    pub fn read_for(state_dir: &Path, request: &str) -> Option<Self> {
+        let bytes = fs::read(state_dir.join(PRUNE_RESULT_FILE)).ok()?;
+        serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|result| result.request == request)
+    }
+}
+
 const TRASH_DIR: &str = ".trash";
 const SLOTS_DIR: &str = "_slots";
 const LEASE_EXTENSION: &str = "lease";
@@ -523,6 +600,15 @@ pub enum CacheError {
     },
     #[error("{0}")]
     Lock(String),
+}
+
+impl CacheError {
+    /// Whether this failed only because this account may not write there:
+    /// the cache root of a service that runs as another account.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied)
+    }
 }
 
 fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> CacheError + use<> {
@@ -1173,7 +1259,17 @@ fn lock_cache_root(root: &Path) -> Result<HostLock, CacheError> {
         LockKind::DependencyCache,
         LOCK_WAIT,
     )
-    .map_err(|error| CacheError::Lock(error.to_string()))
+    .map_err(|error| match error {
+        // Kept an I/O error, so that a lock file this account may not open --
+        // the cache root of a service running as another account -- reads as
+        // the permission problem it is ([`CacheError::is_permission_denied`]).
+        crate::lock::LockError::Io { path, source } => CacheError::Io {
+            action: "lock",
+            path,
+            source,
+        },
+        other => CacheError::Lock(other.to_string()),
+    })
 }
 
 /// Leases a slot in `selection`'s namespace for the attempt at `runtime`,

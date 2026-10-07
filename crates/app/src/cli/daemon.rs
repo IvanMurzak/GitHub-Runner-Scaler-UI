@@ -163,6 +163,15 @@ async fn run_generation(
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
             },
+            // No runner grows the caches on an idle host, so nothing prunes on
+            // a schedule; an operator's `host cache prune` is still honoured.
+            () = maintain_dependency_caches(
+                super::cache::daemon_caches(context, Arc::clone(&store) as Arc<dyn Store>, host.id),
+                context.paths().state_dir().to_path_buf(),
+                false,
+            ) => {
+                unreachable!("dependency cache maintenance runs until the daemon is stopped")
+            },
             () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
                 unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
             },
@@ -448,7 +457,11 @@ async fn run_generation(
         () = maintain_wsl_guest_heartbeat(heartbeat_paths, heartbeat_store) => {
             unreachable!("WSL heartbeat maintenance runs until the daemon is stopped")
         }
-        () = maintain_dependency_caches(dependency_caches.clone()) => {
+        () = maintain_dependency_caches(
+            dependency_caches.clone(),
+            context.paths().state_dir().to_path_buf(),
+            true,
+        ) => {
             unreachable!("dependency cache pruning runs until the daemon is stopped")
         }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
@@ -580,16 +593,52 @@ const fn wsl_recovery_is_available(windows_service_host: bool) -> bool {
 const WSL_GUEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Measures the dependency caches and prunes them to the cap, at start and
-/// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL).
-/// The walk runs on a blocking thread: a pnpm store holds hundreds of
-/// thousands of files.
+/// then every [`PRUNE_INTERVAL`](runner_manager_platform::dependency_cache::PRUNE_INTERVAL)
+/// when `scheduled`, and whenever `host cache prune` asks through a
+/// [`PRUNE_REQUEST_FILE`](runner_manager_platform::dependency_cache::PRUNE_REQUEST_FILE)
+/// in `state_dir` -- which is how an operator whose account cannot write the
+/// service's cache root still gets a prune. The walk runs on a blocking
+/// thread: a pnpm store holds hundreds of thousands of files.
+///
+/// Requests are taken while a pass is running too -- a walk of a full cache
+/// can outlast the time the asking command waits to hear that somebody is
+/// listening -- and carried out once that pass ends, one pass at a time.
 async fn maintain_dependency_caches(
     caches: runner_manager_agent::dependency_caches::DependencyCaches,
+    state_dir: std::path::PathBuf,
+    scheduled: bool,
 ) {
+    use runner_manager_platform::dependency_cache::{
+        PRUNE_INTERVAL, PRUNE_REQUEST_POLL, prune_request_path, take_prune_request,
+    };
+    let request_file = prune_request_path(&state_dir);
+    let mut next_scheduled = scheduled.then(std::time::Instant::now);
+    let mut pending: Option<String> = None;
+    let mut running: Option<tokio::task::JoinHandle<()>> = None;
     loop {
-        let pass = caches.clone();
-        let _ = tokio::task::spawn_blocking(move || pass.prune_once()).await;
-        tokio::time::sleep(runner_manager_platform::dependency_cache::PRUNE_INTERVAL).await;
+        // Almost every look finds nothing, and a look is one `stat`.
+        if pending.is_none() && request_file.exists() {
+            pending = take_prune_request(&state_dir);
+        }
+        if running
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            running = None;
+        }
+        if running.is_none() {
+            let pass = caches.clone();
+            if let Some(request) = pending.take() {
+                let state = state_dir.clone();
+                running = Some(tokio::task::spawn_blocking(move || {
+                    pass.answer_prune_request(&state, request);
+                }));
+            } else if next_scheduled.is_some_and(|at| std::time::Instant::now() >= at) {
+                running = Some(tokio::task::spawn_blocking(move || pass.prune_scheduled()));
+                next_scheduled = Some(std::time::Instant::now() + PRUNE_INTERVAL);
+            }
+        }
+        tokio::time::sleep(PRUNE_REQUEST_POLL).await;
     }
 }
 

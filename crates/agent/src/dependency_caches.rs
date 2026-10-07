@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use runner_manager_domain::attempt::FailureReason;
 use runner_manager_domain::model::ScaleTarget;
 use runner_manager_platform::dependency_cache::{
-    self, CacheConfig, CacheUsage, ResolvedRoot, runtime_holds_runner,
+    self, CacheConfig, CacheUsage, PruneResult, ResolvedRoot, runtime_holds_runner,
 };
 use runner_manager_platform::runner_env::{RunnerEnv, RunnerPlatform};
 
@@ -165,26 +165,53 @@ impl DependencyCaches {
         }
     }
 
-    /// Measures the cache root and prunes it to the configured cap. `None`
-    /// when caches are off, no root resolves or the root does not exist yet.
-    #[must_use]
-    pub fn prune_once(&self) -> Option<CacheUsage> {
-        if PRUNING.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        let usage = self.prune_unguarded();
-        PRUNING.store(false, Ordering::Release);
-        usage
+    /// The service's scheduled pass: measures the cache root and prunes it to
+    /// the configured cap. Does nothing when caches are off, no root resolves
+    /// or the root does not exist yet.
+    pub fn prune_scheduled(&self) {
+        let _ = self.prune_guarded(true);
     }
 
-    fn prune_unguarded(&self) -> Option<CacheUsage> {
-        let config = CacheConfig::load(&self.config_file).ok()?;
-        if !config.host_enabled() {
-            return None;
+    /// Carries out an operator's `host cache prune` that their account could
+    /// not, and answers it in [`dependency_cache::PRUNE_RESULT_FILE`] under
+    /// the identifier `request` carried.
+    ///
+    /// A request is carried out whether or not caches are on, exactly as the
+    /// command does when its account can write the root itself; only the
+    /// scheduled pass respects the switch.
+    pub fn answer_prune_request(&self, state_dir: &Path, request: String) {
+        let outcome = self
+            .prune_guarded(false)
+            .and_then(|usage| usage.ok_or_else(|| "caches are off".to_owned()));
+        if let Err(error) = (PruneResult { request, outcome }).write(state_dir) {
+            tracing::warn!(
+                reason = "dependency_cache_prune_unanswered",
+                "an operator's prune request could not be answered: {error}"
+            );
         }
-        let root = self.root(&config).ok()?;
+    }
+
+    fn prune_guarded(&self, only_when_enabled: bool) -> Result<Option<CacheUsage>, String> {
+        let Some(_pruning) = PruningGuard::take() else {
+            return Err(
+                "another prune is still running in the service; run the command again in a moment"
+                    .to_owned(),
+            );
+        };
+        self.prune_unguarded(only_when_enabled)
+    }
+
+    fn prune_unguarded(&self, only_when_enabled: bool) -> Result<Option<CacheUsage>, String> {
+        let config = CacheConfig::load(&self.config_file).map_err(|error| error.to_string())?;
+        if only_when_enabled && !config.host_enabled() {
+            return Ok(None);
+        }
+        let root = self.root(&config)?;
         if !root.path.is_dir() {
-            return None;
+            return Err(format!(
+                "{} does not exist yet; there is nothing to prune",
+                root.path.display()
+            ));
         }
         match dependency_cache::prune(&root.path, config.max_bytes(), &runtime_holds_runner) {
             Ok(usage) => {
@@ -206,16 +233,32 @@ impl DependencyCaches {
                         dependency_cache::human_bytes(usage.max_bytes.unwrap_or_default())
                     );
                 }
-                Some(usage)
+                Ok(Some(usage))
             }
             Err(error) => {
                 tracing::warn!(
                     reason = "dependency_cache_prune_failed",
                     "the dependency caches could not be pruned: {error}"
                 );
-                None
+                Err(error.to_string())
             }
         }
+    }
+}
+
+/// Holds [`PRUNING`] for one pass, and lets go of it however the pass ends --
+/// a panic included, which would otherwise stop every later pass for good.
+struct PruningGuard;
+
+impl PruningGuard {
+    fn take() -> Option<Self> {
+        (!PRUNING.swap(true, Ordering::AcqRel)).then_some(Self)
+    }
+}
+
+impl Drop for PruningGuard {
+    fn drop(&mut self) {
+        PRUNING.store(false, Ordering::Release);
     }
 }
 
@@ -229,6 +272,50 @@ mod tests {
             Arc::new(move || runner_root.clone()),
             None,
         )
+    }
+
+    #[test]
+    fn an_operators_prune_request_is_carried_out_even_with_caches_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let root = dir.path().join("_cache");
+        std::fs::create_dir_all(root.join("octo")).unwrap();
+        let caches = caches(dir.path(), Some(dir.path().to_path_buf()));
+        let config = CacheConfig {
+            enabled: Some(false),
+            ..CacheConfig::default()
+        };
+        config
+            .save(&dependency_cache::config_path_in(dir.path()))
+            .unwrap();
+
+        caches.prune_scheduled();
+        assert!(
+            CacheUsage::read(&root).is_none(),
+            "the scheduled pass respects caches being off"
+        );
+
+        caches.answer_prune_request(&state, "request-1".to_owned());
+        let answer = PruneResult::read_for(&state, "request-1").expect("an answer");
+        let usage = answer
+            .outcome
+            .expect("the operator's request is carried out");
+        assert_eq!(
+            CacheUsage::read(&root),
+            Some(usage),
+            "and the answer is the measurement it recorded"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+        caches.answer_prune_request(&state, "request-2".to_owned());
+        let answer = PruneResult::read_for(&state, "request-2").expect("an answer");
+        assert!(
+            answer
+                .outcome
+                .is_err_and(|why| why.contains("does not exist")),
+            "a pass that cannot run says why instead of leaving the command waiting"
+        );
     }
 
     #[test]

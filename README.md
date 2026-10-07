@@ -169,6 +169,12 @@ waits without a deadline for every job it owns, swaps its private copy, and is
 restarted by the operating system. Until then, `runner-manager service status`
 still reports the old version.
 
+Managed WSL hosts are separate hosts and are not updated by `update`, because
+updating one drains that host's own jobs. `update` names each one that runs
+another version with the command that updates it,
+`runner-manager wsl install --distribution NAME`, which needs no administrator
+rights.
+
 If `service install` recorded a **different** source binary, ordinary `update`
 leaves that service alone and names the separate path. To request the same
 job-safe handover from the currently installed binary regardless of that path,
@@ -461,10 +467,19 @@ runner-manager wsl install --distribution Ubuntu --capacity 8
    installer waits for that restarted process before continuing; it never uses a
    systemd stop to upgrade a running service. A legacy copy that cannot provide
    this handover is left running and the upgrade refuses rather than risking a job.
-7. The Windows login task that keeps the distribution alive.
+7. The Windows login task that keeps the distribution alive. It starts a companion from
+   version-independent paths under `state/bin`, so an update swaps those files and leaves the task
+   as it is; a running companion restarts onto the new build by itself.
 8. A read-back of the real state, which is what decides whether the command succeeded.
 
 Nothing is changed and no sign-in happens until the preflight has passed.
+
+**Administrator rights.** Updating a host needs none. Windows may refuse to *register* the
+lifecycle task without them: the first time for a distribution, and once more when upgrading from
+0.4.34 or earlier, whose task named a versioned companion. Then `wsl install` asks for them with
+one administrator prompt (the same one `host prepare` uses) for that step alone. Where no prompt
+can be shown, such as over SSH, it says so and prints the exact command to run once from an
+elevated prompt.
 
 ### Adopting a distribution that already runs runner-manager
 
@@ -789,8 +804,10 @@ and every cache off with `host cache set-enabled --enabled false` or `repo cache
 by default (`host cache set-max-size N`, `0` for none), by removing whole namespaces, least
 recently used first. A namespace a runner is still using is never removed; if those alone exceed
 the cap, the service logs `dependency_cache_over_cap`. Only directories a launch created are
-measured or removed. `host cache prune` does the same pass immediately. `status` shows the size
-and the cap.
+measured or removed. `host cache prune` does the same pass immediately; when the service runs as
+another account (LocalSystem on Windows, root elsewhere) and yours cannot write its cache root, it
+asks the running service to do the pass and prints the result. `status` shows the size and the
+cap.
 
 **Isolated runners** (OCI containers, Hyper-V containers) get no caches: those providers
 deliberately mount no host directory, and their environment is the image's. `host cache show`
