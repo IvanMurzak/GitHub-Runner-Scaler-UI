@@ -119,6 +119,7 @@ async fn run_generation(
     windows_service_host: bool,
 ) -> Result<DaemonOutcome, CliError> {
     let instance = acquire_instance(context)?;
+    reset_launch_state(context);
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
     let targets = active_autoscale_targets(store.policies().map_err(local_store_failure)?);
@@ -2039,6 +2040,39 @@ fn acquire_instance(context: &Context) -> Result<HostLock, CliError> {
             format!("cannot acquire the daemon's single-instance lock: {other}"),
         ),
     })
+}
+
+/// Start each daemon generation with nothing inherited about launches.
+///
+/// A blocked-launch record describes the refusals one daemon saw, so a new one
+/// starts without it and counts afresh. And with the single-instance lock held,
+/// no other launcher can be using this distribution's guest claim, so a claim
+/// whose owner is gone -- a daemon killed mid-launch, a WSL restart -- is
+/// reclaimed here rather than at the first launch, which would otherwise be a
+/// minute or more away.
+fn reset_launch_state(context: &Context) {
+    use runner_manager_platform::launch_health::clear_launches_blocked;
+    use runner_manager_platform::wsl::fence::{HostProcesses, reclaim_stale_guest_claim};
+
+    if let Err(error) = clear_launches_blocked(context.paths()) {
+        tracing::warn!(%error, "the previous daemon's blocked-launch record cannot be cleared");
+    }
+    let Ok(Some(config)) = GuestRecoveryConfig::read(context.paths()) else {
+        return;
+    };
+    match reclaim_stale_guest_claim(&config.shared_root, &HostProcesses, chrono::Utc::now()) {
+        Ok(Some(reclaimed)) => tracing::warn!(
+            shared_root = %config.shared_root.display(),
+            %reclaimed,
+            "reclaimed a WSL launch fence claim whose owner is gone"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            shared_root = %config.shared_root.display(),
+            %error,
+            "the WSL launch fence cannot be inspected at daemon start"
+        ),
+    }
 }
 
 fn local_store_failure(source: runner_manager_domain::store::StoreError) -> CliError {

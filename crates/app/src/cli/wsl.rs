@@ -63,6 +63,9 @@ use runner_manager_domain::model::{Clock, StartMode};
 use runner_manager_github::device_flow::DeviceFlow;
 use runner_manager_github::rest::{InventoryGateway, RestInventory};
 use runner_manager_github::{AuthenticatedClient, CredentialRenewal, UserAccessToken};
+use runner_manager_platform::launch_health::{
+    LaunchesBlocked, stuck_launch_fence, windows_restart,
+};
 use runner_manager_platform::paths::AppPaths;
 use runner_manager_platform::service::{InstallRecord, TaskPrincipal};
 use runner_manager_platform::wsl::artifact::{
@@ -1482,6 +1485,9 @@ pub struct ServiceSnapshot {
     pub credential_rejected_since: Option<DateTime<Utc>>,
     /// The build that wrote the systemd unit, when that unit is outdated.
     pub definition_outdated_since_version: Option<String>,
+    /// Why the Linux service starts no runner: its own record of refused
+    /// allocations, or a launch fence this machine can see is stuck.
+    pub launches_blocked: Option<LaunchesBlocked>,
     pub healthy: bool,
 }
 
@@ -1572,6 +1578,13 @@ impl WslStatusDocument {
                 install_remediation(&self.distribution)
             ));
         }
+        if let Some(blocked) = &self.service.launches_blocked {
+            parts.push(format!(
+                "the Linux service has started no runner since {}: {}",
+                blocked.since.to_rfc3339(),
+                blocked.reason
+            ));
+        }
         if !(self.service.active.as_deref() == Some("active") && self.service.matches_expected) {
             parts.push(format!(
                 "the systemd unit {} is {}; its binary is {} (expected {})",
@@ -1636,6 +1649,10 @@ struct LinuxProduct {
     service_credential_rejected_since: Option<DateTime<Utc>>,
     #[serde(default)]
     service_definition_outdated_since_version: Option<String>,
+    // Absent from a guest older than 0.4.35; this machine still reads the
+    // fence itself.
+    #[serde(default)]
+    service_launches_blocked: Option<LaunchesBlocked>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1701,6 +1718,7 @@ pub fn probe(
         matches_expected: false,
         credential_rejected_since: None,
         definition_outdated_since_version: None,
+        launches_blocked: None,
         healthy: false,
     };
     let mut capacity = None;
@@ -1719,6 +1737,7 @@ pub fn probe(
                     status.product.service_credential_rejected_since;
                 service.definition_outdated_since_version =
                     status.product.service_definition_outdated_since_version;
+                service.launches_blocked = status.product.service_launches_blocked;
                 credential.present = status.credential.present;
                 credential.unreadable = status.credential.unreadable;
                 credential.store_scope = status.credential.store_scope;
@@ -1738,10 +1757,20 @@ pub fn probe(
 
         service.enabled = systemctl_word(&invoker, distribution, &["is-enabled", unit]);
         service.active = systemctl_word(&invoker, distribution, &["is-active", unit]);
+        // The fence lives on this side, so a guest too old to report its own
+        // record -- or one with no demand to be refused -- is still caught.
+        if service.launches_blocked.is_none()
+            && let Ok(root) =
+                runner_manager_platform::wsl::fence::recovery_root(paths, distribution)
+        {
+            service.launches_blocked =
+                stuck_launch_fence(&root, now, &windows_restart(distribution));
+        }
         service.healthy = service.active.as_deref() == Some("active")
             && service.matches_expected
             && service.credential_rejected_since.is_none()
-            && service.definition_outdated_since_version.is_none();
+            && service.definition_outdated_since_version.is_none()
+            && service.launches_blocked.is_none();
 
         diagnostics.push(docker_diagnostic(&invoker, distribution));
     }
@@ -3886,12 +3915,21 @@ fn write_status_text(document: &WslStatusDocument, out: &mut dyn Write) -> Resul
         if document.wsl.ready {
             writeln!(out).map_err(failed)?;
             writeln!(out, "Fix:").map_err(failed)?;
-            writeln!(out, "  {}", install_remediation(&document.distribution)).map_err(failed)?;
-            writeln!(
-                out,
-                "  This safely brings an existing host up to date; do not uninstall its Linux service first."
-            )
-            .map_err(failed)?;
+            let blocked = document.service.launches_blocked.as_ref();
+            if let Some(blocked) = blocked {
+                writeln!(out, "  {}", blocked.remedy).map_err(failed)?;
+            }
+            // Reinstalling does not unblock a launch fence, so it is offered
+            // only when something else is wrong too.
+            if blocked.is_none() || document.unhealthy_parts().len() > 1 {
+                writeln!(out, "  {}", install_remediation(&document.distribution))
+                    .map_err(failed)?;
+                writeln!(
+                    out,
+                    "  This safely brings an existing host up to date; do not uninstall its Linux service first."
+                )
+                .map_err(failed)?;
+            }
         }
     }
     if !document.drift.is_empty() {
@@ -6439,6 +6477,71 @@ mod tests {
         assert!(
             text.contains("do not uninstall its Linux service first"),
             "{text}"
+        );
+    }
+
+    /// The incident: every part in place, and a guest launch claim stuck in
+    /// the fence this machine shares with the distribution.
+    #[test]
+    fn a_stuck_launch_fence_makes_an_otherwise_healthy_host_unhealthy() {
+        use runner_manager_platform::wsl::fence::{FENCE_DIRECTORY, OWNER_FILE, recovery_root};
+
+        let script = || {
+            preflight_script()
+                .always("status --json", ok(&linux_status_json(true, 8, version())))
+                .always("--exec systemctl is-enabled", ok("enabled\n"))
+                .always("--exec systemctl is-active", ok("active\n"))
+                .always("--exec docker info", ok("27.1.1\n"))
+                .always("/XML ONE", ok(&our_task_xml(DISTRIBUTION)))
+                .always("/FO CSV", ok("\"task\",\"N/A\",\"Running\"\n"))
+        };
+        let journal = Journal::default();
+        let (root, paths) = fixture_paths();
+        let status = |script| {
+            let (host, _) = wrap(script, &journal);
+            probe(
+                &host,
+                &paths,
+                DISTRIBUTION,
+                DEFAULT_LINUX_DESTINATION,
+                UNIT,
+                version(),
+                Utc::now(),
+            )
+            .expect("a readable host")
+        };
+        assert!(status(script()).healthy, "the control is healthy");
+
+        let fence = recovery_root(&paths, DISTRIBUTION)
+            .unwrap()
+            .join(FENCE_DIRECTORY);
+        std::fs::create_dir_all(&fence).unwrap();
+        std::fs::write(
+            fence.join(OWNER_FILE),
+            r#"{"schema_version":1,"kind":"guest_launch","generation":null,"process_id":189,"acquired_at":"2026-09-24T00:47:18.724Z"}"#,
+        )
+        .unwrap();
+        let document = status(script());
+        drop(root);
+
+        assert!(!document.healthy);
+        assert!(!document.service.healthy);
+        let parts = document.unhealthy_parts().join("; ");
+        assert!(
+            parts.contains("started no runner since 2026-09-24"),
+            "{parts}"
+        );
+        assert!(parts.contains("process 189"), "{parts}");
+        let mut rendered = Vec::new();
+        write_status_text(&document, &mut rendered).expect("it renders");
+        let text = String::from_utf8(rendered).expect("utf-8");
+        assert!(
+            text.contains("wsl.exe -d Ubuntu -u root systemctl restart runner-manager.service"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("runner-manager wsl install"),
+            "reinstalling does not unblock a fence: {text}"
         );
     }
 

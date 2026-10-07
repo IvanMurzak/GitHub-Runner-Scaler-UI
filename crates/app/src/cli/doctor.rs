@@ -261,6 +261,10 @@ pub struct HostSetup {
     /// session cannot read. `None` when not asked (not a macOS login service).
     #[serde(default)]
     pub own_keychain_readable: Option<bool>,
+    /// Why the daemon starts no runner, from its own record or a stuck WSL
+    /// launch fence. See [`runner_manager_platform::launch_health`].
+    #[serde(default)]
+    pub launches_blocked: Option<runner_manager_platform::launch_health::LaunchesBlocked>,
 }
 
 impl HostSetup {
@@ -729,6 +733,16 @@ pub const CHECKS: &[CheckSpec] = &[
         platform: CheckPlatform::Any,
         severity: Severity::Required,
         probe: probe_required_tools,
+        fix: None,
+    },
+    // Recommended, not Required: a Required failure makes the daemon refuse
+    // every launch, and this check reports exactly that refusal.
+    CheckSpec {
+        id: "host.launches",
+        title: "The service can start runners",
+        platform: CheckPlatform::Any,
+        severity: Severity::Recommended,
+        probe: probe_launches,
         fix: None,
     },
 ];
@@ -1410,6 +1424,20 @@ fn probe_capacity(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
     .remedy(format!("runner-manager host set-capacity {recommended}"))
 }
 
+// -- host.launches ------------------------------------------------------------
+
+fn probe_launches(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
+    match &setup.launches_blocked {
+        None => pass("no blocked launches recorded"),
+        Some(blocked) => fail(format!(
+            "the service has started no runner since {}: {}",
+            blocked.since.to_rfc3339(),
+            blocked.reason
+        ))
+        .remedy(blocked.remedy.clone()),
+    }
+}
+
 // -- host.required_tools ------------------------------------------------------
 
 fn probe_required_tools(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
@@ -1853,6 +1881,10 @@ fn setup_from_parts(
                 .secret_store(StartMode::Login)
                 .is_ok_and(|store| store.load().is_ok())
         }),
+        launches_blocked: runner_manager_platform::launch_health::launches_blocked(
+            context.paths(),
+            context.clock().now(),
+        ),
         service,
     }
 }
@@ -3575,6 +3607,7 @@ mod tests {
             service_contact_age_secs: None,
             service_credential_unreadable: false,
             own_keychain_readable: None,
+            launches_blocked: None,
         }
     }
 
@@ -4168,6 +4201,35 @@ mod tests {
         assert_eq!(
             status_of(&setup, &facts, "host.required_tools"),
             Status::Unknown
+        );
+    }
+
+    /// Blocked launches fail the doctor with the reason and the remedy, and
+    /// never as a Required check: that would make the daemon refuse launches
+    /// because launches are refused.
+    #[test]
+    fn blocked_launches_fail_with_their_remedy_but_never_make_the_host_unfit() {
+        let mut setup = windows_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, "host.launches"), Status::Pass);
+        setup.launches_blocked = Some(runner_manager_platform::launch_health::LaunchesBlocked {
+            since: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            reason: "a runner launch by process 189 has held the WSL launch fence".into(),
+            remedy: "restart the service".into(),
+        });
+        let report = evaluate(&setup, &facts);
+        let launches = finding(&report, "host.launches");
+        assert_eq!(launches.status, Status::Fail);
+        assert!(
+            launches.detail.contains("process 189"),
+            "{}",
+            launches.detail
+        );
+        assert_eq!(launches.remedy.as_deref(), Some("restart the service"));
+        assert!(
+            !report
+                .required_failing()
+                .contains(&"host.launches".to_owned())
         );
     }
 
