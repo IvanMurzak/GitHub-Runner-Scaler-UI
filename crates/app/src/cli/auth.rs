@@ -343,9 +343,8 @@ pub fn dispatch(
 /// Names the store this sign-in will write to, before it writes anything.
 ///
 /// Printed unconditionally. The case worth catching is the one where the
-/// operator did *not* choose — the default is `boot`, and on macOS that is the
-/// System keychain, which needs privilege and is not where a `--start-at login`
-/// service will ever look.
+/// operator did *not* choose: the line then names the mode that was assumed and
+/// the flag that picks the other one.
 fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io::Result<()> {
     let scope = match mode {
         StartMode::Boot => "machine-scoped",
@@ -362,10 +361,65 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
     if chosen {
         writeln!(out, "Credential store: {scope} (start mode {mode}).")
     } else {
+        let other = match mode {
+            StartMode::Boot => StartMode::Login,
+            StartMode::Login => StartMode::Boot,
+        };
         writeln!(
             out,
-            "Credential store: {scope} (start mode {mode}, assumed; `--start-at login` to change)."
+            "Credential store: {scope} (start mode {mode}, assumed; `--start-at {other}` to change)."
         )
+    }
+}
+
+/// What decides the start mode a sign-in assumes when `--start-at` was not
+/// given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssumptionFacts {
+    /// The mode this host has on record, `boot` when it has none.
+    recorded: StartMode,
+    /// Whether this is macOS, where the two modes are two different keychains.
+    macos: bool,
+    /// Whether a service is installed. `None` when that could not be told.
+    service_installed: Option<bool>,
+    /// Whether this process runs as root.
+    root: bool,
+}
+
+impl AssumptionFacts {
+    fn of_this_host(context: &Context, recorded: StartMode) -> Self {
+        let macos = cfg!(target_os = "macos");
+        Self {
+            recorded,
+            macos,
+            // Asked only where the answer can change anything.
+            service_installed: if macos {
+                super::service::operations(context)
+                    .status()
+                    .ok()
+                    .map(|status| status.is_installed())
+            } else {
+                None
+            },
+            root: runner_manager_platform::host_fitness::is_elevated(),
+        }
+    }
+}
+
+/// The start mode a sign-in uses when the operator did not name one.
+///
+/// The recorded mode, except on a Mac with no service installed, signing in as
+/// an ordinary account. The recorded mode there is a default nobody chose
+/// (`boot`), and `boot`'s store is the System keychain, which only root may
+/// write: the sign-in got as far as the device code and then failed with
+/// `SecKeychainItemCreateFromContent returned -61`. With no service yet, the
+/// service this credential is for is the one this account would install, and
+/// without `sudo` that is a `login` service.
+fn assumed_start_mode(facts: AssumptionFacts) -> StartMode {
+    if facts.macos && facts.service_installed == Some(false) && !facts.root {
+        StartMode::Login
+    } else {
+        facts.recorded
     }
 }
 
@@ -562,15 +616,16 @@ pub fn login(
     // warning that they were signing in to the wrong half. Hence the flag, and
     // hence the line printed below whether or not it was passed.
     let recorded = context.recorded_start_mode(&store)?;
-    let start_mode = requested_mode.unwrap_or(recorded);
+    let start_mode = requested_mode.unwrap_or_else(|| {
+        assumed_start_mode(AssumptionFacts::of_this_host(context, recorded))
+    });
     let secrets = context.secret_store(start_mode)?;
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
-    // An explicit choice is recorded, so that `repo add`, `auth status` and the
+    // The mode used is recorded, so that `repo add`, `auth status` and the
     // daemon all agree with the sign-in that just happened rather than with a
-    // default nobody chose.
-    if let Some(mode) = requested_mode {
-        record_start_mode(context, &store, recorded, mode)?;
-    }
+    // default nobody chose. That includes an assumed `login`: left unrecorded,
+    // every later command would look for the credential in the System keychain.
+    record_start_mode(context, &store, recorded, start_mode)?;
 
     // ------------------------------------------------------------------------
     // A HOST THAT IS ALREADY SIGNED IN RESUMES; IT DOES NOT SIGN IN AGAIN.
@@ -1940,6 +1995,61 @@ mod tests {
 
     /// The prefix every counted action line starts with.
     const ACTION_PREFIX: &str = "Action ";
+
+    /// A Mac with no service, signing in as an ordinary account, used to go to
+    /// the System keychain and fail with `-61` after the device code.
+    #[test]
+    fn a_mac_with_no_service_signs_an_ordinary_account_in_for_a_login_service() {
+        let unchosen = AssumptionFacts {
+            recorded: StartMode::Boot,
+            macos: true,
+            service_installed: Some(false),
+            root: false,
+        };
+        assert_eq!(assumed_start_mode(unchosen), StartMode::Login);
+
+        // Everywhere else the recorded mode stands.
+        for facts in [
+            AssumptionFacts {
+                root: true,
+                ..unchosen
+            },
+            AssumptionFacts {
+                service_installed: Some(true),
+                ..unchosen
+            },
+            AssumptionFacts {
+                service_installed: None,
+                ..unchosen
+            },
+            AssumptionFacts {
+                macos: false,
+                ..unchosen
+            },
+        ] {
+            assert_eq!(assumed_start_mode(facts), StartMode::Boot, "{facts:?}");
+        }
+        let recorded_login = AssumptionFacts {
+            recorded: StartMode::Login,
+            root: true,
+            ..unchosen
+        };
+        assert_eq!(assumed_start_mode(recorded_login), StartMode::Login);
+    }
+
+    #[test]
+    fn an_assumed_start_mode_names_the_flag_that_picks_the_other_one() {
+        for (mode, flag) in [
+            (StartMode::Login, "`--start-at boot` to change"),
+            (StartMode::Boot, "`--start-at login` to change"),
+        ] {
+            let mut out = Vec::new();
+            write_store_choice(&mut out, mode, false).unwrap();
+            let line = String::from_utf8(out).unwrap();
+            assert!(line.contains(&format!("start mode {mode}, assumed")), "{line}");
+            assert!(line.contains(flag), "{line}");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // THE ACTION ORACLE LIVES IN THE TEST MODULE, AND SO DOES ITS TWIN IN
