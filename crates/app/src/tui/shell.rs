@@ -288,9 +288,20 @@ impl DoctorCache {
         control: &std::sync::Weak<(Mutex<SourceState>, Condvar)>,
     ) {
         loop {
-            let summary = crate::cli::doctor::current_summary(context).ok();
+            // The database can be busy for a moment (the snapshot reads it
+            // too), so a read failure is retried before it is shown as an
+            // unchecked doctor.
+            let mut summary = crate::cli::doctor::current_summary(context);
+            for _ in 0..3 {
+                if summary.is_ok() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(2));
+                summary = crate::cli::doctor::current_summary(context);
+            }
             if let Ok(mut state) = self.state.lock() {
-                state.summary = summary;
+                state.summary =
+                    Some(summary.unwrap_or_else(|_| crate::cli::doctor::pending_summary(context)));
                 state.stale = false;
             }
             let Some(control) = control.upgrade() else {
@@ -3853,7 +3864,12 @@ mod tests {
                     1,
                 ))))
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // `select!` picks among ready sources at random and draws a frame
+            // after each, so `q` must come late enough that the already-queued
+            // agent event is taken first even on a busy machine. Five
+            // milliseconds was not: under a parallel test run `q` won and the
+            // loop exited still showing Loading.
+            tokio::time::sleep(Duration::from_millis(250)).await;
             input_sender
                 .unbounded_send(Ok(Event::Key(crossterm_key(KeyCode::Char('q')))))
                 .unwrap();
