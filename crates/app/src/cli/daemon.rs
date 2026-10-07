@@ -181,14 +181,8 @@ async fn run_generation(
     let loaded = secrets.load();
     // Said on disk either way, because this process is about to exit and be
     // restarted by the service manager, and `service status` cannot see why
-    // otherwise. See `record_credential_unreadable`.
-    let marked = match &loaded {
-        Ok(_) => clear_credential_unreadable(context.paths()),
-        Err(_) => record_credential_unreadable(context.paths(), context.clock().now()),
-    };
-    if let Err(error) = marked {
-        tracing::warn!(%error, "cannot record whether the stored credential is readable");
-    }
+    // otherwise.
+    note_credential_readability(context, loaded.is_ok());
     let secret = loaded
         .map_err(|source| {
             CliError::with_remedy(
@@ -201,7 +195,7 @@ async fn run_generation(
             CliError::with_remedy(
                 Failure::NotAuthenticated,
                 "no GitHub credential is stored for this daemon's start mode",
-                "runner-manager auth login",
+                sign_in_instruction(mode),
             )
         })?;
     let app = context.app_registration()?;
@@ -771,7 +765,14 @@ fn idle_credential_client(context: &Context, mode: StartMode) -> Option<Arc<Auth
             return None;
         }
     };
-    let secret = match secrets.load() {
+    let loaded = secrets.load();
+    // Only ever cleared here, never recorded: idle mode does not need a
+    // readable store, but a record left by an earlier, policy-serving start
+    // must not outlive the sign-in that ended it.
+    if loaded.is_ok() {
+        note_credential_readability(context, true);
+    }
+    let secret = match loaded {
         Ok(Some(secret)) => secret,
         Ok(None) => return None,
         Err(error) => {
@@ -827,7 +828,9 @@ fn stop_for_upgrade(
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
     match source.map(replace_own_binary) {
-        Some(Ok(())) if HANDS_OVER_CREDENTIAL => hand_over_credential_to_new_binary(context, mode),
+        Some(Ok(())) if hands_over_credential(context, mode) => {
+            hand_over_credential_to_new_binary(context, mode);
+        }
         Some(Err(error)) => {
             tracing::warn!(
                 %error,
@@ -851,19 +854,43 @@ fn stop_for_upgrade(
     ))
 }
 
+/// Says on disk whether this daemon could read its stored credential, for
+/// `service status` to report. See `record_credential_unreadable`.
+fn note_credential_readability(context: &Context, readable: bool) {
+    let marked = if readable {
+        clear_credential_unreadable(context.paths())
+    } else {
+        record_credential_unreadable(context.paths(), context.clock().now())
+    };
+    if let Err(error) = marked {
+        tracing::warn!(%error, "cannot record whether the stored credential is readable");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handing the credential to the new binary
 // ---------------------------------------------------------------------------
 
 /// Whether an upgrade hands the stored credential to the new binary.
 ///
-/// macOS only, because macOS is the only platform whose store binds an item to
-/// the program that wrote it. DPAPI and a `0600` file are readable by any
-/// program the account runs, so a rewrite there would change nothing.
-const HANDS_OVER_CREDENTIAL: bool = cfg!(target_os = "macos");
+/// Only the standard macOS **login** keychain binds an item to the build that
+/// wrote it. The System Keychain (boot mode) and a keychain under `--data-dir`
+/// grant their item to every application, and DPAPI and a `0600` file are
+/// readable by any program the account runs, so a rewrite anywhere else would
+/// change nothing -- except to delete and re-add a credential that works.
+fn hands_over_credential(context: &Context, mode: StartMode) -> bool {
+    cfg!(target_os = "macos") && mode == StartMode::Login && context.data_root.is_none()
+}
 
 /// How long the handover waits for a renewal in another process to finish.
 const HANDOVER_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// How long the handover waits for the new binary to store the credential.
+///
+/// Every runner has already drained by then, so a child that never finishes
+/// would hold the host with no runner and no restart; past this it is stopped
+/// and the restart happens anyway.
+const HANDOVER_CHILD_DEADLINE: Duration = Duration::from_secs(60);
 
 /// What the handover did.
 #[derive(Debug, PartialEq, Eq)]
@@ -976,33 +1003,43 @@ fn hand_over(
 
 /// Runs `daemon adopt-credential` from `binary` with `document` on its stdin,
 /// against the same directories and store this daemon uses.
+///
+/// Only reached without `--data-dir` (see [`hands_over_credential`]), so the
+/// store is the platform-standard one and the directories are this daemon's.
 fn adopt_through(
     binary: &std::path::Path,
     context: &Context,
     mode: StartMode,
     document: &SecretString,
 ) -> Result<(), String> {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::process::{Command, Stdio};
 
-    let mut command = Command::new(binary);
-    command.args([
-        "daemon",
-        "adopt-credential",
-        "--start-at",
-        &mode.to_string(),
-    ]);
-    match context.data_root.as_deref() {
-        Some(root) => command.arg("--data-dir").arg(root),
-        None => command.args(super::service::service_directory_arguments(context.paths())),
-    };
-    let mut child = command
+    let mut child = Command::new(binary)
+        .args([
+            "daemon",
+            "adopt-credential",
+            "--start-at",
+            &mode.to_string(),
+        ])
+        .args(super::service::service_directory_arguments(context.paths()))
         .env_remove(super::DATA_DIR_VARIABLE)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("{} could not be started: {error}", binary.display()))?;
+    // Drained on its own thread so that a chatty child can never block on a
+    // full pipe while this waits for it to exit.
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("stderr was configured as a pipe");
+    let stderr = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
     // Dropped at the end of the statement, which closes the pipe before the wait.
     let written = child
         .stdin
@@ -1010,18 +1047,37 @@ fn adopt_through(
         .expect("stdin was configured as a pipe")
         .write_all(document.expose_secret().as_bytes())
         .map_err(|error| format!("the credential could not be written to it: {error}"));
-    // Waited for even when the write failed, so the child is never left behind.
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("the new binary could not be waited for: {error}"))?;
+    // Waited for even when the write failed, so the child is never left behind,
+    // and never for longer than the deadline: every runner has drained already.
+    let deadline = std::time::Instant::now() + HANDOVER_CHILD_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "it did not finish within {} seconds and was stopped",
+                    HANDOVER_CHILD_DEADLINE.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("the new binary could not be waited for: {error}"));
+            }
+        }
+    };
     written?;
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
+    let stderr = stderr.join().unwrap_or_default();
     Err(format!(
-        "it exited with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        "it exited with {status}: {}",
+        String::from_utf8_lossy(&stderr).trim()
     ))
 }
 

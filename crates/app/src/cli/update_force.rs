@@ -128,7 +128,7 @@ pub(super) fn report_force_check(
     )
     .map_err(write_failed("this update"))?;
     if cfg!(target_os = "macos") && record.start_mode == StartMode::Login {
-        writeln!(out, "note: the old daemon hands its login-Keychain credential to the new build before it restarts. If the service then reports an unreadable credential, sign in again, but not while the old daemon is still serving jobs.")
+        writeln!(out, "note: a daemon at 0.4.34 or later hands its login-Keychain credential to the new build before it restarts; an older one cannot, so the first update from one needs a sign-in. If the service then reports an unreadable credential, sign in again, but not while the old daemon is still serving jobs.")
             .map_err(write_failed("this update"))?;
         if version == super::running_version() {
             write_auth_command(context, record.start_mode, &record.binary, out)?;

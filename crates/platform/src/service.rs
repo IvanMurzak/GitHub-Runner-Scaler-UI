@@ -5053,10 +5053,14 @@ impl ServiceStatus {
                 subject: CREDENTIAL_UNREADABLE_SUBJECT,
                 detail: format!(
                     "the service has been unable to read its stored GitHub credential since {}, \
-                     so it starts no runner; the diagnostic log has the store's own answer. On \
-                     macOS that is what a keychain item written by a different build looks \
-                     like. Sign in again: {}.",
+                     so it starts no runner; the diagnostic log has the store's own answer.{} \
+                     Sign in again: {}.",
                     since.to_rfc3339(),
+                    if cfg!(target_os = "macos") {
+                        " That is what a keychain item written by a different build looks like."
+                    } else {
+                        ""
+                    },
                     sign_in_instruction(mode)
                 ),
             });
