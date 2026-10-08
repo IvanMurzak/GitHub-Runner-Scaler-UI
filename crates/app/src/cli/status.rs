@@ -154,6 +154,10 @@ pub struct Product {
     /// refused, or its WSL launch fence is stuck -- as `since`, `reason` and
     /// `remedy`; `null` while launches can proceed.
     pub service_launches_blocked: Option<LaunchesBlocked>,
+    /// Why the local daemon, which its service manager reports running, has
+    /// stopped making progress; `null` while it beats. See
+    /// [`runner_manager_platform::daemon_heartbeat`].
+    pub service_stalled: Option<String>,
 }
 
 fn binary_version(path: &std::path::Path) -> Option<String> {
@@ -510,6 +514,15 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                 .flatten(),
             service_definition_outdated_since_version: outdated_service_definition(context),
             service_launches_blocked: launches_blocked(context.paths(), context.clock().now()),
+            service_stalled: runner_manager_platform::daemon_heartbeat::liveness(
+                context.paths(),
+                context.clock().now(),
+            )
+            .stall(
+                runner_manager_platform::service::last_github_contact(context.paths())
+                    .ok()
+                    .flatten(),
+            ),
         },
         github_contacted: false,
         credential: Credential {
@@ -713,6 +726,9 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         writeln!(out, "  daemon starts no runner   {blocked}")?;
         writeln!(out, "  launches remedy           {}", blocked.remedy)?;
     }
+    if let Some(stall) = &document.product.service_stalled {
+        writeln!(out, "  daemon stalled            {stall}")?;
+    }
     writeln!(
         out,
         "  dependency caches         {}",
@@ -795,6 +811,7 @@ mod tests {
                 service_credential_rejected_since: None,
                 service_definition_outdated_since_version: None,
                 service_launches_blocked: None,
+                service_stalled: None,
             },
             github_contacted: false,
             credential: Credential {
@@ -977,6 +994,7 @@ mod tests {
                 "service_credential_rejected_since",
                 "service_definition_outdated_since_version",
                 "service_launches_blocked",
+                "service_stalled",
                 "version"
             ]
         );
@@ -1246,6 +1264,29 @@ mod tests {
         let text = String::from_utf8(buffer).unwrap();
         assert!(text.contains("not readable by this account"), "{text}");
         assert!(text.contains("credential problem"), "{text}");
+    }
+
+    /// A stalled daemon is said, with what to do.
+    #[test]
+    fn a_stalled_daemon_is_reported() {
+        let mut document = document();
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        assert!(
+            !String::from_utf8(buffer)
+                .unwrap()
+                .contains("daemon stalled")
+        );
+
+        document.product.service_stalled =
+            Some("the service (process 7) has made no progress since then".into());
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("  daemon stalled            the service (process 7) has made"),
+            "{text}"
+        );
     }
 
     /// Blocked launches name their reason and their remedy, in the text and in

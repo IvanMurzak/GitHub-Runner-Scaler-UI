@@ -586,6 +586,10 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
                 // Reinstalling the service is not what unblocks a launch fence.
                 blocked.remedy.clone()
             } else if status.problems().iter().all(|problem| {
+                problem.subject == runner_manager_platform::service::DAEMON_STALLED_SUBJECT
+            }) {
+                "runner-manager service stop && runner-manager service start".into()
+            } else if status.problems().iter().all(|problem| {
                 problem.subject == runner_manager_platform::service::HOST_UNFIT_SUBJECT
             }) {
                 // Nor a host check: the problem line names its fix, and `host

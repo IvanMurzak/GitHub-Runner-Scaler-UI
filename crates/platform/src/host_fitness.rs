@@ -61,6 +61,29 @@ pub fn run_elevated(program: &Path, args: &[OsString], terminal: bool) -> Elevat
     sys::run_elevated(program, args, terminal)
 }
 
+/// Whether somebody can answer an administrator prompt from this process.
+///
+/// On Windows the prompt is UAC's, a dialog on the desktop of this process's
+/// session, so a terminal has nothing to do with it: what matters is whether
+/// the session has a desktop somebody sits at. Every session but session 0
+/// does; session 0 is where services, tasks that run whether or not anybody is
+/// signed in, and OpenSSH logins run, and a dialog there is seen by nobody. A
+/// command started on the desktop by a script or an agent, with no terminal at
+/// all, used to be refused the prompt it could have shown.
+///
+/// Elsewhere it is `terminal`: whether stdin and stderr are a terminal, where
+/// `sudo` asks for the password.
+#[must_use]
+pub fn can_answer_elevation_prompt(terminal: bool) -> bool {
+    prompt_answerable(sys::session_id(), terminal)
+}
+
+/// [`can_answer_elevation_prompt`] from what was found: the Windows session
+/// when there is one to ask about, otherwise the terminal.
+fn prompt_answerable(session: Option<u32>, terminal: bool) -> bool {
+    session.map_or(terminal, |session| session != 0)
+}
+
 /// Quotes one argument for a POSIX shell.
 #[must_use]
 pub fn quote_posix_argument(argument: &str) -> String {
@@ -490,12 +513,22 @@ pub fn clear_host_unfit(paths: &AppPaths) -> Result<(), String> {
     }
 }
 
-/// The daemon's refusal, when one is in force at `now`: recorded, and
-/// re-stamped within [`HOST_UNFIT_RECORD_FRESH`].
+/// The daemon's refusal, when one is in force at `now`: recorded, and either
+/// re-stamped within [`HOST_UNFIT_RECORD_FRESH`] or left by a daemon that is
+/// still running and has stalled.
+///
+/// A record nobody re-stamps is a stopped daemon's, not a refusal in force.
+/// But a daemon that stalls stops re-stamping too, and its cause usually
+/// persists: the refusal used to vanish from `status` after fifteen minutes on
+/// a daemon still blocked behind the very question that made the host unfit.
 #[must_use]
 pub fn host_unfit_in_force(paths: &AppPaths, now: DateTime<Utc>) -> Option<HostUnfitRecord> {
     host_unfit(paths).ok().flatten().filter(|record| {
         !crate::wsl::fence::elapsed_at_least(record.checked_at, now, HOST_UNFIT_RECORD_FRESH)
+            || matches!(
+                crate::daemon_heartbeat::liveness(paths, now),
+                crate::daemon_heartbeat::Liveness::Stalled { .. }
+            )
     })
 }
 
@@ -529,7 +562,7 @@ mod sys {
         ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0, WIN32_ERROR,
     };
     use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenSessionId,
     };
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
@@ -566,6 +599,32 @@ mod sys {
         } else {
             RegistryError::Other(format!("registry error {}", code.0))
         }
+    }
+
+    /// The Terminal Services session this process runs in.
+    pub(super) fn session_id() -> Option<u32> {
+        let mut token = HANDLE::default();
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` needs no closing;
+        // `token` is a live out-parameter owned by this frame.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
+            return None;
+        }
+        let mut session = 0u32;
+        let mut returned = 0u32;
+        // SAFETY: `session` is a `u32` owned by this frame, which is what
+        // `TokenSessionId` returns, and its size is the length passed.
+        let queried = unsafe {
+            GetTokenInformation(
+                token,
+                TokenSessionId,
+                Some((&raw mut session).cast()),
+                4,
+                &raw mut returned,
+            )
+        };
+        // SAFETY: `token` was opened above and is closed exactly once.
+        let _ = unsafe { CloseHandle(token) };
+        queried.is_ok().then_some(session)
     }
 
     pub(super) fn is_elevated() -> bool {
@@ -892,6 +951,11 @@ mod sys {
     use std::path::Path;
     use std::process::Command;
 
+    /// No session to ask about: the terminal decides.
+    pub(super) const fn session_id() -> Option<u32> {
+        None
+    }
+
     use super::{ElevationOutcome, RegistryError};
 
     pub(super) fn is_elevated() -> bool {
@@ -1109,6 +1173,51 @@ mod tests {
             detail: "it fails".into(),
             remedy: None,
         }
+    }
+
+    /// A UAC prompt is a desktop dialog: a session with a desktop can answer it
+    /// with no terminal at all, and session 0 cannot even with one.
+    #[test]
+    fn who_can_answer_an_administrator_prompt() {
+        assert!(
+            prompt_answerable(Some(1), false),
+            "the desktop, no terminal"
+        );
+        assert!(prompt_answerable(Some(2), true));
+        assert!(!prompt_answerable(Some(0), true), "services and SSH");
+        assert!(prompt_answerable(None, true), "sudo on a terminal");
+        assert!(!prompt_answerable(None, false));
+    }
+
+    /// A stalled daemon cannot re-stamp its refusal, and the refusal stands.
+    #[test]
+    fn an_unfit_record_stays_in_force_while_its_daemon_is_stalled() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(root.path());
+        paths.create_all().unwrap();
+        let then = Utc::now();
+        record_host_unfit(
+            &paths,
+            &[unfit_finding("host.runner_root_responsive")],
+            then,
+        )
+        .unwrap();
+        let later = then + chrono::Duration::hours(1);
+        assert_eq!(
+            host_unfit_in_force(&paths, later),
+            None,
+            "nobody beats: stopped"
+        );
+
+        // The same process, still running, last heard from with the record.
+        crate::daemon_heartbeat::beat(&paths, then).unwrap();
+        assert!(host_unfit_in_force(&paths, later).is_some(), "stalled");
+        crate::daemon_heartbeat::beat(&paths, later).unwrap();
+        assert_eq!(
+            host_unfit_in_force(&paths, later),
+            None,
+            "a daemon still beating would have re-stamped a refusal in force"
+        );
     }
 
     #[test]

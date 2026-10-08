@@ -3263,9 +3263,12 @@ pub trait TaskElevation: fmt::Debug {
 /// `wsl-host register-task`.
 #[derive(Debug, Clone, Copy)]
 pub struct SystemTaskElevation {
-    /// Whether a person is at this terminal to answer a prompt. Without one --
-    /// a script, a service, an SSH session -- nothing is asked, and the
-    /// failure names the command to run elevated instead.
+    /// Whether a person can answer the prompt: on Windows, whether this
+    /// session has a desktop (see
+    /// [`runner_manager_platform::host_fitness::can_answer_elevation_prompt`]),
+    /// not whether there is a terminal. Without one -- a service, a scheduled
+    /// task, an SSH login -- nothing is asked, and the failure names the
+    /// command to run elevated instead.
     pub interactive: bool,
 }
 
@@ -3273,7 +3276,7 @@ impl TaskElevation for SystemTaskElevation {
     fn apply(&self, request: &LifecycleTaskRequest) -> Result<(), ElevationFailure> {
         if !self.interactive {
             return Err(ElevationFailure::Unavailable(
-                "this session has no terminal, so nobody can answer an administrator prompt".into(),
+                "nobody can answer an administrator prompt from this session: it has no desktop (a service, a scheduled task or an SSH login)".into(),
             ));
         }
         let encoded = serde_json::to_string(request)
@@ -3510,7 +3513,9 @@ pub fn install(
     let assets = PublishedReleaseAssets::for_version(&version, &mut err)?;
     let issuer = DeviceFlowIssuer::new(context, styling);
     let elevation = SystemTaskElevation {
-        interactive: io::stdin().is_terminal() && io::stderr().is_terminal(),
+        interactive: runner_manager_platform::host_fitness::can_answer_elevation_prompt(
+            io::stdin().is_terminal() && io::stderr().is_terminal(),
+        ),
     };
     let principal = TaskPrincipal::current().map_err(|source| {
         CliError::with_remedy(

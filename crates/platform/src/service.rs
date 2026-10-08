@@ -168,6 +168,9 @@ pub const CREDENTIAL_UNREADABLE_SUBJECT: &str = "stored credential";
 /// The `service status` subject blocked runner launches are reported under.
 pub const LAUNCHES_BLOCKED_SUBJECT: &str = "runner launches";
 
+/// The [`StatusProblem::subject`] of a daemon that has stopped making progress.
+pub const DAEMON_STALLED_SUBJECT: &str = "daemon progress";
+
 /// The [`StatusProblem::subject`] of a daemon that refuses to start runners
 /// because a required host check fails from its own session.
 pub const HOST_UNFIT_SUBJECT: &str = "host fitness";
@@ -4513,7 +4516,8 @@ impl ServiceOperations {
         .with_credential_unreadable(credential_unreadable_since)
         .with_launches_blocked(crate::launch_health::launches_blocked(&self.paths, now))
         .with_unattended_gap(unattended)
-        .with_host_unfit(crate::host_fitness::host_unfit_in_force(&self.paths, now)))
+        .with_host_unfit(crate::host_fitness::host_unfit_in_force(&self.paths, now))
+        .with_stall(crate::daemon_heartbeat::liveness(&self.paths, now).stall(last_github_contact)))
     }
 
     /// The installed definition, when it is not what this build renders for
@@ -5239,6 +5243,20 @@ impl ServiceStatus {
                     unfit.since.to_rfc3339(),
                     unfit.describe()
                 ),
+            });
+        }
+        self
+    }
+
+    /// Reports a daemon that is running and has stopped making progress. See
+    /// [`crate::daemon_heartbeat`]: launchd, systemd and the SCM all report
+    /// such a daemon running, so this used to read `verdict healthy`.
+    #[must_use]
+    pub fn with_stall(mut self, stall: Option<String>) -> Self {
+        if let Some(detail) = stall {
+            self.problems.push(StatusProblem {
+                subject: DAEMON_STALLED_SUBJECT,
+                detail,
             });
         }
         self
@@ -10092,6 +10110,37 @@ logs = \"/d\"
                 .contains("does not run until the operator signs in")
         );
         assert_eq!(unattended_gap(StartMode::Boot, "root", None), None);
+    }
+
+    /// A daemon blocked in a file system call is still "running" to the
+    /// service manager; its heartbeat is what says it is stuck.
+    #[test]
+    fn a_daemon_that_stopped_beating_makes_the_service_unhealthy() {
+        let host = Host::new();
+        let operations = host.operations();
+        operations
+            .install(&host.request(StartMode::Login))
+            .expect("an install at login");
+        let stalled_problem = |operations: &ServiceOperations| {
+            operations
+                .status()
+                .expect("a status")
+                .problems()
+                .iter()
+                .find(|problem| problem.subject == DAEMON_STALLED_SUBJECT)
+                .map(|problem| problem.detail.clone())
+        };
+        crate::daemon_heartbeat::beat(&operations.paths, Utc::now()).unwrap();
+        assert_eq!(stalled_problem(&operations), None, "beating");
+
+        crate::daemon_heartbeat::beat(
+            &operations.paths,
+            Utc::now() - chrono::Duration::minutes(20),
+        )
+        .unwrap();
+        let detail = stalled_problem(&operations).expect("a stall is a problem");
+        assert!(detail.contains("has made no progress since"), "{detail}");
+        assert!(detail.contains("runner-manager service stop"), "{detail}");
     }
 
     /// A daemon refusing every runner is not a healthy service.

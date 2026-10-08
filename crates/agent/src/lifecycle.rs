@@ -4720,6 +4720,9 @@ fn runner_name(attempt: AttemptId) -> String {
 /// wrote, and nothing is concluded from it. `_diag` is scrubbed with the rest of
 /// the runtime after every attempt, persistent slots included, so a log found
 /// here belongs to this attempt.
+/// How long reading a runner's diagnostics may take.
+const EVIDENCE_DEADLINE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobEvidence {
     RanAJob,
@@ -4729,7 +4732,16 @@ enum JobEvidence {
 
 impl JobEvidence {
     fn of(runtime: &Path) -> Self {
-        let Ok(entries) = fs::read_dir(runtime.join("_diag")) else {
+        let diag = runtime.join("_diag");
+        // Bounded and off this thread: the daemon's loop runs on one thread,
+        // and a runtime on a volume that does not answer (a hung disk, a
+        // pending macOS question) must not stall it.
+        if runner_manager_platform::host_fitness::directory_responds(&diag, EVIDENCE_DEADLINE)
+            != runner_manager_platform::host_fitness::Responsiveness::Responds
+        {
+            return Self::Unknown;
+        }
+        let Ok(entries) = fs::read_dir(diag) else {
             return Self::Unknown;
         };
         let mut listener = false;
