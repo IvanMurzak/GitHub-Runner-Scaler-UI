@@ -834,10 +834,15 @@ async fn bounded_preflight(
             deadline.as_secs()
         ),
         remedy: Some(
-            "look for a dialog on this Mac's desktop asking whether runner-manager may access \
-             files on a volume, and click Allow; otherwise check the volume holding the runner \
-             root"
-                .to_owned(),
+            if cfg!(target_os = "macos") {
+                "look for a dialog on this Mac's desktop asking whether runner-manager may \
+                 access files on a volume, and click Allow; otherwise check the volume holding \
+                 the runner root"
+            } else {
+                "check the volume holding the runner root (a stalled external disk or network \
+                 mount); `runner-manager host doctor` names it"
+            }
+            .to_owned(),
         ),
     };
     if let Err(error) = runner_manager_platform::host_fitness::record_host_unfit(
@@ -2396,7 +2401,7 @@ mod tests {
         let record = runner_manager_platform::host_fitness::host_unfit(context.paths())
             .unwrap()
             .expect("recorded for status");
-        assert!(record.describe().contains("click Allow"), "{record:?}");
+        assert!(record.describe().contains("runner root"), "{record:?}");
 
         // A preflight that answers is passed through untouched.
         let answered = bounded_preflight(
