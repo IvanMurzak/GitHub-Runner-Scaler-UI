@@ -148,9 +148,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use runner_manager_domain::{
@@ -160,11 +161,14 @@ use runner_manager_domain::{
 use serde::Deserialize;
 
 use crate::{
-    ApiRequest, ApiResponse, AuthenticatedClient, GithubError,
+    ApiRequest, AuthenticatedClient, GithubError,
+    conditional::{ConditionalCache, Fetched},
     rest::{
-        ActivityScope, CancelToken, InventoryError, PER_PAGE, RateLimited, TargetCost,
+        ActivityScope, CancelToken, DEFAULT_RATE_LIMIT_BACKOFF, InventoryError,
+        MAX_RATE_LIMIT_BACKOFF, PER_PAGE, RateLimitKind, RateLimited, TargetCost,
         UnavailableRepository,
     },
+    traffic::RateLimitSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -384,6 +388,11 @@ pub struct QueuedDemand {
     unavailable: Vec<UnavailableRepository>,
     /// Repositories whose count is a floor rather than a total.
     truncated: BTreeSet<OwnerRepo>,
+    /// Repositories with runs under way whose listings **changed** since the
+    /// previous poll. See [`QueuedDemand::is_quiet`].
+    busy: BTreeSet<OwnerRepo>,
+    /// The account's hourly quota as GitHub reported it during this poll.
+    rate_limit: Option<RateLimitSnapshot>,
 }
 
 impl QueuedDemand {
@@ -393,6 +402,8 @@ impl QueuedDemand {
             per_repository,
             unavailable: Vec::new(),
             truncated: BTreeSet::new(),
+            busy: BTreeSet::new(),
+            rate_limit: None,
         }
     }
 
@@ -411,6 +422,52 @@ impl QueuedDemand {
     pub fn with_truncated(mut self, repository: OwnerRepo) -> Self {
         self.truncated.insert(repository);
         self
+    }
+
+    /// Record that `repository` has runs under way whose listings changed.
+    #[must_use]
+    pub fn with_busy(mut self, repository: OwnerRepo) -> Self {
+        self.busy.insert(repository);
+        self
+    }
+
+    /// Attach the hourly-quota reading GitHub sent during this poll.
+    #[must_use]
+    pub const fn with_rate_limit(mut self, rate_limit: Option<RateLimitSnapshot>) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
+
+    /// Whether nothing is happening in any repository this poll read.
+    ///
+    /// A repository is quiet when it had **no run under way**, or when every
+    /// listing it took to find out was answered `304 Not Modified`. The second
+    /// half matters: a run stuck in the queue for a label no host serves stays
+    /// in the listing for hours, and treating that as activity would hold the
+    /// whole target at the slower active interval for no reason, when its
+    /// listings cost nothing while they do not change.
+    ///
+    /// `e1` polls a quiet target at the host's *idle* interval. That is the
+    /// moment latency matters most, because work arrives after idle, and the
+    /// moment polling is free, because every answer is a `304`.
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        self.busy.is_empty()
+    }
+
+    /// The repositories that made this reading not quiet.
+    #[must_use]
+    pub const fn busy(&self) -> &BTreeSet<OwnerRepo> {
+        &self.busy
+    }
+
+    /// The account's hourly quota as GitHub reported it during this poll.
+    ///
+    /// Every response carries it, a `304` included, and it describes every
+    /// client signed in as the same user, so it is what `e1` slows down on.
+    #[must_use]
+    pub const fn rate_limit(&self) -> Option<&RateLimitSnapshot> {
+        self.rate_limit.as_ref()
     }
 
     /// Record that `repository` could not be read at all, and why.
@@ -635,6 +692,72 @@ pub struct RestDemand {
     client: Arc<AuthenticatedClient>,
     clock: Arc<dyn Clock>,
     requests_issued: AtomicU64,
+    /// Every listing's `ETag` and body, so a repeat poll can be answered `304`.
+    conditional: ConditionalCache,
+    /// One repository's reading, shared between every target that covers it.
+    shared: SharedReadings,
+    /// The host-wide quiet period after GitHub said "rate limited".
+    hold: Mutex<Option<RateLimitHold>>,
+    stats: PollCounters,
+}
+
+/// A repository's reading, handed to every target that asks for it within a
+/// window.
+///
+/// # Why: one poll per repository, not one per target
+///
+/// The daemon runs one loop per target, and two targets can cover the same
+/// repository: an organization target and a repository target inside it.
+/// Each loop used to poll for itself. With one `RestDemand` shared by every
+/// loop on the host and a window here, a repository is read **once** per
+/// window however many targets, policies and profiles want it, and the others
+/// are handed that reading.
+///
+/// A zero window, the default, shares nothing: every call reads GitHub. That
+/// is what a single-target caller and the tests of the reading itself want.
+struct SharedReadings {
+    /// The window, in milliseconds. Atomic so the daemon can change it when
+    /// the host's idle interval changes, without stopping a loop.
+    window_ms: AtomicU64,
+    readings: Mutex<BTreeMap<OwnerRepo, (Timestamp, RepositoryDemand)>>,
+    /// One gate per repository, so two loops asking at once make one request
+    /// between them.
+    gates: Mutex<BTreeMap<OwnerRepo, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// The rate-limit quiet period, host-wide.
+#[derive(Debug, Clone, Copy)]
+struct RateLimitHold {
+    until: Timestamp,
+    limit: RateLimited,
+    /// Secondary limits in a row. GitHub: "If your request continues to fail
+    /// due to a secondary rate limit, wait for an exponentially increasing
+    /// amount of time between retries."
+    consecutive_secondary: u32,
+}
+
+#[derive(Debug, Default)]
+struct PollCounters {
+    reads: AtomicU64,
+    unchanged_reads: AtomicU64,
+    shared_reads: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+/// What [`RestDemand`] has done, for `status` and `doctor`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DemandStats {
+    /// Repository readings fetched from GitHub.
+    pub reads: u64,
+    /// Of those, readings where every listing came back `304`.
+    pub unchanged_reads: u64,
+    /// Readings handed to another target instead of being fetched again.
+    pub shared_reads: u64,
+    /// Polls answered "rate limited" without a request, inside the host-wide
+    /// quiet period.
+    pub suppressed: u64,
+    /// Whether that quiet period is in force now.
+    pub held: bool,
 }
 
 impl fmt::Debug for RestDemand {
@@ -655,9 +778,138 @@ impl RestDemand {
     #[must_use]
     pub fn new(client: Arc<AuthenticatedClient>, clock: Arc<dyn Clock>) -> Self {
         Self {
+            conditional: ConditionalCache::new(Arc::clone(&clock)),
             client,
             clock,
             requests_issued: AtomicU64::new(0),
+            shared: SharedReadings {
+                window_ms: AtomicU64::new(0),
+                readings: Mutex::new(BTreeMap::new()),
+                gates: Mutex::new(BTreeMap::new()),
+            },
+            hold: Mutex::new(None),
+            stats: PollCounters::default(),
+        }
+    }
+
+    /// Hand a repository's reading to every target that asks within `window`
+    /// of it being fetched. See [`SharedReadings`].
+    ///
+    /// The daemon passes its idle interval: a repository is then read at most
+    /// once per idle interval, and a target sharing it sees a reading no older
+    /// than that.
+    #[must_use]
+    pub fn with_shared_readings(self, window: Duration) -> Self {
+        self.set_shared_window(window);
+        self
+    }
+
+    /// Change the sharing window while running.
+    pub fn set_shared_window(&self, window: Duration) {
+        self.shared.window_ms.store(
+            u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The window readings are shared for.
+    #[must_use]
+    pub fn shared_window(&self) -> Duration {
+        Duration::from_millis(self.shared.window_ms.load(Ordering::SeqCst))
+    }
+
+    /// What this gateway has done.
+    #[must_use]
+    pub fn stats(&self) -> DemandStats {
+        DemandStats {
+            reads: self.stats.reads.load(Ordering::SeqCst),
+            unchanged_reads: self.stats.unchanged_reads.load(Ordering::SeqCst),
+            shared_reads: self.stats.shared_reads.load(Ordering::SeqCst),
+            suppressed: self.stats.suppressed.load(Ordering::SeqCst),
+            held: self.held(self.clock.now()).is_some(),
+        }
+    }
+
+    /// The client every request goes through, for its traffic counters.
+    #[must_use]
+    pub const fn client(&self) -> &Arc<AuthenticatedClient> {
+        &self.client
+    }
+
+    /// The rate limit still being waited out, with the time left on it.
+    fn held(&self, now: Timestamp) -> Option<RateLimited> {
+        let hold = (*self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let left = hold.until.signed_duration_since(now).to_std().ok()?;
+        if left.is_zero() {
+            return None;
+        }
+        Some(RateLimited {
+            retry_after: Some(left),
+            ..hold.limit
+        })
+    }
+
+    /// Start, or lengthen, the host-wide quiet period for `limit`, and say
+    /// how long it is.
+    ///
+    /// # Why a quiet period here, when `e1` already waits
+    ///
+    /// `e1`'s schedule waits per loop, and the daemon runs one loop per
+    /// target. A secondary limit hit by one target's poll used to leave every
+    /// other target's loop polling on its own schedule, which is exactly the
+    /// "continuing to make requests while you are rate limited" GitHub warns
+    /// "may result in the banning of your integration"
+    /// (<https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately>).
+    /// Every loop shares this gateway, so a quiet period here silences them
+    /// all.
+    ///
+    /// The wait is GitHub's own: `retry-after` when sent, else until
+    /// `x-ratelimit-reset` for the primary limit, else one minute. A secondary
+    /// limit that recurs doubles it each time, up to
+    /// [`MAX_RATE_LIMIT_BACKOFF`], which is GitHub's "exponentially increasing
+    /// amount of time between retries".
+    fn hold_for(&self, limit: RateLimited, now: Timestamp) -> RateLimited {
+        let mut hold = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let consecutive_secondary = match (limit.kind, *hold) {
+            (RateLimitKind::Secondary, Some(previous)) => {
+                previous.consecutive_secondary.saturating_add(1)
+            }
+            (RateLimitKind::Secondary, None) => 1,
+            (RateLimitKind::Primary, _) => 0,
+        };
+        let mut wait = limit.delay_from(now);
+        if consecutive_secondary > 1 {
+            let doubled = DEFAULT_RATE_LIMIT_BACKOFF
+                .saturating_mul(1_u32 << (consecutive_secondary - 1).min(10));
+            wait = wait.max(doubled).min(MAX_RATE_LIMIT_BACKOFF);
+        }
+        let until = now + chrono::TimeDelta::from_std(wait).unwrap_or(chrono::TimeDelta::MAX);
+        *hold = Some(RateLimitHold {
+            until,
+            limit,
+            consecutive_secondary,
+        });
+        RateLimited {
+            retry_after: Some(wait),
+            ..limit
+        }
+    }
+
+    /// A request went through: the next secondary limit starts the doubling
+    /// again from one minute.
+    fn clear_hold(&self) {
+        let mut hold = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hold.is_some_and(|h| h.until <= self.clock.now()) {
+            *hold = None;
         }
     }
 
@@ -677,12 +929,20 @@ impl RestDemand {
     /// Cancellation is consulted twice for `c3`'s reason, and the two are not
     /// redundant: [`CancelToken::check`] stops a multi-page walk *between*
     /// pages, and [`CancelToken::run`] stops one already blocked on a socket.
+    ///
+    /// Every request is **conditional** once its listing has been seen: see
+    /// [`crate::conditional`]. And none is sent at all inside the host-wide
+    /// rate-limit quiet period; see [`Self::hold_for`].
     async fn get(
         &self,
         request: &ApiRequest,
         cancel: &CancelToken,
-    ) -> Result<ApiResponse, InventoryError> {
+    ) -> Result<Fetched, InventoryError> {
         cancel.check()?;
+        if let Some(limit) = self.held(self.clock.now()) {
+            self.stats.suppressed.fetch_add(1, Ordering::SeqCst);
+            return Err(InventoryError::RateLimited(limit));
+        }
 
         let result = cancel
             .run(async {
@@ -691,32 +951,38 @@ impl RestDemand {
                 // `Cancelled` without polling this block when the token is
                 // already flipped, and no socket is opened.
                 self.requests_issued.fetch_add(1, Ordering::SeqCst);
-                self.client
-                    .send(request)
+                self.conditional
+                    .send(&self.client, request)
                     .await
                     .map_err(InventoryError::from)
             })
             .await;
-
         match result {
-            Ok(response) => Ok(response),
-            Err(InventoryError::Github(error)) => Err(Self::classify(error)),
+            Ok(fetched) => {
+                self.clear_hold();
+                Ok(fetched)
+            }
+            Err(InventoryError::Github(error)) => Err(self.classify(error)),
             Err(other) => Err(other),
         }
     }
 
     /// Turn a failure into a rate limit when GitHub's own evidence says it is
-    /// one, using `c3`'s decision procedure rather than a second one.
-    fn classify(error: GithubError) -> InventoryError {
+    /// one, using `c3`'s decision procedure rather than a second one, and
+    /// start the host-wide quiet period for it.
+    fn classify(&self, error: GithubError) -> InventoryError {
         let Some(limit) = RateLimited::detect(&error) else {
             return InventoryError::Github(error);
         };
+        let held = self.hold_for(limit, self.clock.now());
         tracing::warn!(
             kind = %limit.kind,
             remaining = limit.remaining,
-            "GitHub is rate limiting this credential; demand for this poll is unknown, not zero"
+            quiet_secs = held.retry_after.map_or(0, |wait| wait.as_secs()),
+            "GitHub is rate limiting this credential; demand for this poll is unknown, not zero, \
+             and no demand request leaves this host until the quiet period ends"
         );
-        InventoryError::RateLimited(limit)
+        InventoryError::RateLimited(held)
     }
 
     /// Queued **jobs** for one repository, each with the `runs-on` it requires.
@@ -755,6 +1021,7 @@ impl RestDemand {
     ) -> Result<RepositoryDemand, InventoryError> {
         let mut jobs: Vec<RunsOn> = Vec::new();
         let mut exact = true;
+        let mut changed = false;
         let mut resolved: BTreeSet<u64> = BTreeSet::new();
 
         for (status, cap) in [
@@ -766,6 +1033,7 @@ impl RestDemand {
         ] {
             let listing = self.active_runs(repository, status, cap, cancel).await?;
             exact &= listing.complete;
+            changed |= listing.changed;
 
             for run_id in listing.run_ids {
                 // A run that changed status between the two listings is in both.
@@ -775,11 +1043,68 @@ impl RestDemand {
                 }
                 let run = self.queued_jobs_of_run(repository, run_id, cancel).await?;
                 exact &= run.complete;
+                changed |= run.changed;
                 jobs.extend(run.jobs);
             }
         }
 
-        Ok(RepositoryDemand { jobs, exact })
+        self.stats.reads.fetch_add(1, Ordering::SeqCst);
+        if !changed {
+            self.stats.unchanged_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(RepositoryDemand {
+            jobs,
+            exact,
+            busy: changed && !resolved.is_empty(),
+        })
+    }
+
+    /// One repository's reading, from the shared window when another target
+    /// fetched it recently enough, from GitHub otherwise.
+    async fn repository_reading(
+        &self,
+        repository: &OwnerRepo,
+        cancel: &CancelToken,
+    ) -> Result<RepositoryDemand, InventoryError> {
+        let window = self.shared_window();
+        if window.is_zero() {
+            return self.repository_queued(repository, cancel).await;
+        }
+        let gate = Arc::clone(
+            self.shared
+                .gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(repository.clone())
+                .or_default(),
+        );
+        // Held across the fetch, so a second loop asking for this repository
+        // meanwhile waits for this reading instead of making its own request.
+        let _gate = gate.lock().await;
+        let now = self.clock.now();
+        let fresh = self
+            .shared
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(repository)
+            .filter(|(at, _)| {
+                now.signed_duration_since(*at)
+                    .to_std()
+                    .is_ok_and(|age| age < window)
+            })
+            .map(|(_, reading)| reading.clone());
+        if let Some(reading) = fresh {
+            self.stats.shared_reads.fetch_add(1, Ordering::SeqCst);
+            return Ok(reading);
+        }
+        let reading = self.repository_queued(repository, cancel).await?;
+        self.shared
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(repository.clone(), (now, reading.clone()));
+        Ok(reading)
     }
 
     /// The ids of one repository's runs in `status`, up to `cap`.
@@ -806,7 +1131,10 @@ impl RestDemand {
         .query("status", status)
         .query("per_page", PER_PAGE);
 
-        let response = self.get(&request, cancel).await?;
+        let Fetched {
+            response,
+            not_modified,
+        } = self.get(&request, cancel).await?;
         let has_next_page = response.next_page().is_some();
         let page: QueuedRunsPage = response.json()?;
 
@@ -862,6 +1190,7 @@ impl RestDemand {
             // first page was itself short of the whole filtered set.
             complete: listed <= cap && !has_next_page,
             run_ids,
+            changed: !not_modified,
         })
     }
 
@@ -890,6 +1219,7 @@ impl RestDemand {
 
         let mut jobs = Vec::new();
         let mut pages = 0_usize;
+        let mut changed = false;
 
         while let Some(next) = request.take() {
             if pages >= MAX_JOB_PAGES_PER_RUN {
@@ -903,10 +1233,15 @@ impl RestDemand {
                 return Ok(RunJobs {
                     jobs,
                     complete: false,
+                    changed,
                 });
             }
 
-            let response = self.get(&next, cancel).await?;
+            let Fetched {
+                response,
+                not_modified,
+            } = self.get(&next, cancel).await?;
+            changed |= !not_modified;
             let following = response
                 .next_page()
                 .map(|url| ApiRequest::get(url.as_str()));
@@ -926,6 +1261,7 @@ impl RestDemand {
         Ok(RunJobs {
             jobs,
             complete: true,
+            changed,
         })
     }
 }
@@ -963,10 +1299,14 @@ impl DemandGateway for RestDemand {
         // Only an aggregate steps over a bad repository; see
         // `is_repository_local_failure`.
         let aggregating = scope.target().scope() == TargetScope::Organization;
+        self.conditional.evict_idle();
 
         for repository in scope.repositories() {
-            match self.repository_queued(repository, cancel).await {
+            match self.repository_reading(repository, cancel).await {
                 Ok(reading) => {
+                    if reading.busy {
+                        demand.busy.insert(repository.clone());
+                    }
                     demand
                         .per_repository
                         .insert(repository.clone(), reading.jobs);
@@ -994,6 +1334,7 @@ impl DemandGateway for RestDemand {
             }
         }
 
+        demand.rate_limit = self.client.traffic().latest_rate_limit();
         Ok(demand)
     }
 
@@ -1014,6 +1355,9 @@ struct RepositoryDemand {
     /// `false` when `jobs` is a **floor**: a run cap or a job page budget
     /// stopped the walk before the whole queue had been seen.
     exact: bool,
+    /// Runs were under way and at least one listing changed since the last
+    /// poll. See [`QueuedDemand::is_quiet`].
+    busy: bool,
 }
 
 /// One run listing's ids, and whether the cap left any behind.
@@ -1021,6 +1365,8 @@ struct RepositoryDemand {
 struct RunListing {
     run_ids: Vec<u64>,
     complete: bool,
+    /// `false` when GitHub answered `304`.
+    changed: bool,
 }
 
 /// One run's queued jobs, and whether the page budget saw all of them.
@@ -1028,6 +1374,8 @@ struct RunListing {
 struct RunJobs {
     jobs: Vec<RunsOn>,
     complete: bool,
+    /// `false` when every page was answered `304`.
+    changed: bool,
 }
 
 /// One page of `GET …/actions/runs?status=…`.
@@ -2162,6 +2510,447 @@ mod tests {
         assert_eq!(limit.retry_after, Some(std::time::Duration::from_secs(42)));
     }
 
+    // -- conditional polling, the shared window, and the quiet period -------
+
+    fn gateway_at(server: &MockServer, clock: &Arc<TestClock>) -> RestDemand {
+        let endpoints = Endpoints::for_test_server(&server.uri()).expect("a test server base");
+        let token = UserAccessToken::from_stored(SecretString::from(FIXTURE_TOKEN));
+        let client =
+            AuthenticatedClient::new(endpoints, token, Arc::clone(clock) as Arc<dyn Clock>)
+                .expect("a client over the test server");
+        RestDemand::new(Arc::new(client), Arc::clone(clock) as Arc<dyn Clock>)
+    }
+
+    /// The account-wide quota headers GitHub puts on every response, `304`s
+    /// included.
+    fn with_quota(template: ResponseTemplate, remaining: u64) -> ResponseTemplate {
+        template
+            .insert_header("x-ratelimit-limit", "5000")
+            .insert_header("x-ratelimit-remaining", remaining.to_string().as_str())
+            .insert_header("x-ratelimit-used", (5000 - remaining).to_string().as_str())
+            .insert_header("x-ratelimit-reset", "1787274000")
+            .insert_header("x-ratelimit-resource", "core")
+    }
+
+    /// One listing that answers `304` to its own tag and `200` + tag
+    /// otherwise. Mounted conditional-first, because wiremock answers with the
+    /// first mock whose matchers all pass.
+    async fn mount_tagged(
+        server: &MockServer,
+        listing: &str,
+        status: Option<&str>,
+        etag: &str,
+        body: serde_json::Value,
+    ) {
+        let mut not_modified = Mock::given(method("GET"))
+            .and(path(listing.to_string()))
+            .and(wiremock::matchers::header("if-none-match", etag));
+        if let Some(status) = status {
+            not_modified = not_modified.and(query_param("status", status));
+        }
+        not_modified
+            .respond_with(with_quota(
+                ResponseTemplate::new(304).insert_header("etag", etag),
+                4_000,
+            ))
+            .mount(server)
+            .await;
+        let mut full = Mock::given(method("GET")).and(path(listing.to_string()));
+        if let Some(status) = status {
+            full = full.and(query_param("status", status));
+        }
+        full.respond_with(with_quota(
+            ResponseTemplate::new(200)
+                .insert_header("etag", etag)
+                .set_body_json(body),
+            4_000,
+        ))
+        .mount(server)
+        .await;
+    }
+
+    async fn mount_tagged_idle(server: &MockServer, repository: &OwnerRepo) {
+        let runs = runs_path(repository);
+        mount_tagged(
+            server,
+            &runs,
+            Some(QUEUED_RUN_STATUS),
+            r#"W/"queued""#,
+            no_runs(),
+        )
+        .await;
+        mount_tagged(
+            server,
+            &runs,
+            Some(IN_PROGRESS_RUN_STATUS),
+            r#"W/"in-progress""#,
+            no_runs(),
+        )
+        .await;
+    }
+
+    fn conditional_requests(received: &[wiremock::Request]) -> usize {
+        received
+            .iter()
+            .filter(|request| request.headers.contains_key("if-none-match"))
+            .count()
+    }
+
+    /// The owner's requirement in one test: an idle repository polled again
+    /// sends its tags back, GitHub answers `304`, and the reading is the same.
+    #[tokio::test]
+    async fn an_unchanged_repository_is_polled_with_its_etags_and_answered_304() {
+        let server = MockServer::start().await;
+        mount_tagged_idle(&server, &repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let scope = ActivityScope::repository(repo());
+
+        let first = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a first reading");
+        let second = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a second reading");
+
+        assert_eq!(first.per_repository(), second.per_repository());
+        let received = server.received_requests().await.expect("recorded requests");
+        assert_eq!(received.len(), 4, "two listings, twice");
+        assert_eq!(
+            conditional_requests(&received),
+            2,
+            "the second poll sends both tags back"
+        );
+        let traffic = gateway.client().traffic().summary(clock.now());
+        assert_eq!((traffic.full, traffic.not_modified), (2, 2));
+        let stats = gateway.stats();
+        assert_eq!((stats.reads, stats.unchanged_reads), (2, 1));
+        assert!(second.is_quiet());
+    }
+
+    /// A conditional request must never hide a change: a new run on the very
+    /// next poll is counted on that poll.
+    #[tokio::test]
+    async fn a_run_that_arrives_between_polls_is_counted_on_the_next_one() {
+        let server = MockServer::start().await;
+        let runs = runs_path(&repo());
+        // Asked with the first tag, the queue has moved on: a full answer with
+        // a new tag.
+        Mock::given(method("GET"))
+            .and(path(runs.clone()))
+            .and(query_param("status", QUEUED_RUN_STATUS))
+            .and(wiremock::matchers::header("if-none-match", r#"W/"empty""#))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", r#"W/"one-run""#)
+                    .set_body_json(runs_body(&[100])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(runs.clone()))
+            .and(query_param("status", QUEUED_RUN_STATUS))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", r#"W/"empty""#)
+                    .set_body_json(no_runs()),
+            )
+            .mount(&server)
+            .await;
+        mount_tagged(
+            &server,
+            &runs,
+            Some(IN_PROGRESS_RUN_STATUS),
+            r#"W/"in-progress""#,
+            no_runs(),
+        )
+        .await;
+        mount_jobs(&server, &repo(), 100, jobs_body(&["rm-home-win-x64"], 2, 0)).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let scope = ActivityScope::repository(repo());
+
+        let before = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("an idle reading");
+        let after = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a reading after the run arrived");
+
+        assert_eq!(before.total(), 0);
+        assert_eq!(after.total(), 2, "the change is seen on the very next poll");
+        assert!(
+            !after.is_quiet(),
+            "a run under way whose listing changed is activity"
+        );
+    }
+
+    /// A run stuck in the queue for a label nobody serves is still in the
+    /// listing hours later. While its listings answer `304` it costs nothing,
+    /// and it must not hold the target at the slower active interval.
+    #[tokio::test]
+    async fn a_queued_run_whose_listings_are_unchanged_is_quiet() {
+        let server = MockServer::start().await;
+        let runs = runs_path(&repo());
+        mount_tagged(
+            &server,
+            &runs,
+            Some(QUEUED_RUN_STATUS),
+            r#"W/"stuck""#,
+            runs_body(&[100]),
+        )
+        .await;
+        mount_tagged(
+            &server,
+            &runs,
+            Some(IN_PROGRESS_RUN_STATUS),
+            r#"W/"in-progress""#,
+            no_runs(),
+        )
+        .await;
+        mount_tagged(
+            &server,
+            &jobs_path(&repo(), 100),
+            None,
+            r#"W/"jobs""#,
+            jobs_body(&["ubuntu-latest"], 1, 0),
+        )
+        .await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let scope = ActivityScope::repository(repo());
+
+        let first = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a first reading");
+        let second = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("a second reading");
+
+        assert!(
+            !first.is_quiet(),
+            "the first sight of a run is a change, and the target must look at it"
+        );
+        assert!(second.is_quiet(), "nothing changed; three 304s");
+        assert_eq!(second.total(), 1, "the job is still counted from the cache");
+        let received = server.received_requests().await.expect("recorded requests");
+        assert_eq!(conditional_requests(&received), 3);
+    }
+
+    /// The quota GitHub reports during the poll travels with the reading, so
+    /// `e1` can slow down on it.
+    #[tokio::test]
+    async fn the_accounts_quota_travels_with_the_reading() {
+        let server = MockServer::start().await;
+        mount_tagged_idle(&server, &repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+
+        let reading = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a reading");
+
+        let quota = reading
+            .rate_limit()
+            .expect("every response carries the quota");
+        assert_eq!(
+            (quota.limit, quota.remaining, quota.used),
+            (5000, 4000, Some(1000))
+        );
+    }
+
+    /// Two targets covering one repository make one read between them.
+    #[tokio::test]
+    async fn a_repository_is_read_once_for_every_target_that_covers_it() {
+        let server = MockServer::start().await;
+        mount_tagged_idle(&server, &repo()).await;
+        mount_tagged_idle(&server, &other_repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock).with_shared_readings(Duration::from_secs(10));
+
+        // A repository target and an organization target that contains it.
+        gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("the repository target's reading");
+        let organization = gateway
+            .queued_demand(&org_scope([repo(), other_repo()]), &CancelToken::new())
+            .await
+            .expect("the organization target's reading");
+
+        assert_eq!(organization.per_repository().len(), 2);
+        assert_eq!(
+            gateway.requests_issued(),
+            4,
+            "dashboard once (2 listings) and api once (2): the organization target is \
+             handed the repository target's reading of dashboard"
+        );
+        assert_eq!(gateway.stats().shared_reads, 1);
+
+        // Past the window the repository is read again.
+        clock.advance_secs(10);
+        gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect("a later reading");
+        assert_eq!(gateway.requests_issued(), 6);
+    }
+
+    /// Two loops asking at the same moment make one read between them.
+    #[tokio::test]
+    async fn concurrent_targets_wait_for_one_read_instead_of_making_two() {
+        let server = MockServer::start().await;
+        mount_tagged_idle(&server, &repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway =
+            Arc::new(gateway_at(&server, &clock).with_shared_readings(Duration::from_secs(10)));
+
+        let scope = ActivityScope::repository(repo());
+        let cancel = CancelToken::new();
+        let (left, right) = tokio::join!(
+            gateway.queued_demand(&scope, &cancel),
+            gateway.queued_demand(&scope, &cancel),
+        );
+        left.expect("one reading");
+        right.expect("the other reading");
+        assert_eq!(gateway.requests_issued(), 2, "one read: two listings");
+    }
+
+    fn secondary_limit(retry_after: Option<&str>) -> ResponseTemplate {
+        let template = ResponseTemplate::new(429).set_body_json(json!({
+            "message": "You have exceeded a secondary rate limit"
+        }));
+        match retry_after {
+            Some(seconds) => template.insert_header("retry-after", seconds),
+            None => template,
+        }
+    }
+
+    /// GitHub: "If the `retry-after` response header is present, you should
+    /// not retry your request until after that many seconds has elapsed." Not
+    /// this poll, and not any other target's poll on this host either.
+    #[tokio::test]
+    async fn a_secondary_limit_stops_every_demand_request_until_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(secondary_limit(Some("42")))
+            .mount(&server)
+            .await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+
+        let first = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await
+            .expect_err("a rate limit");
+        assert_eq!(
+            first.rate_limited().and_then(|limit| limit.retry_after),
+            Some(Duration::from_secs(42))
+        );
+
+        // Another target, half-way through the window: no request at all.
+        clock.advance_secs(20);
+        let held = gateway
+            .queued_demand(
+                &ActivityScope::repository(other_repo()),
+                &CancelToken::new(),
+            )
+            .await
+            .expect_err("still inside the quiet period");
+        assert_eq!(
+            held.rate_limited().and_then(|limit| limit.retry_after),
+            Some(Duration::from_secs(22)),
+            "the wait left, so the loop's schedule sleeps exactly that"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("recorded").len(),
+            1,
+            "a request inside the quiet period is the one GitHub said not to send"
+        );
+        assert_eq!(gateway.stats().suppressed, 1);
+        assert!(gateway.stats().held);
+
+        // At the end of the window, the next poll asks again.
+        clock.advance_secs(22);
+        let _ = gateway
+            .queued_demand(&ActivityScope::repository(repo()), &CancelToken::new())
+            .await;
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 2);
+    }
+
+    /// GitHub: "Otherwise, wait for at least one minute before retrying. If
+    /// your request continues to fail due to a secondary rate limit, wait for
+    /// an exponentially increasing amount of time between retries."
+    #[tokio::test]
+    async fn a_recurring_secondary_limit_doubles_the_quiet_period() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(secondary_limit(None))
+            .mount(&server)
+            .await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let scope = ActivityScope::repository(repo());
+
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            let error = gateway
+                .queued_demand(&scope, &CancelToken::new())
+                .await
+                .expect_err("a rate limit");
+            let wait = error
+                .rate_limited()
+                .and_then(|limit| limit.retry_after)
+                .expect("a wait");
+            waits.push(wait.as_secs());
+            clock.advance_secs(i64::try_from(wait.as_secs()).expect("fits"));
+        }
+        assert_eq!(waits, [60, 120, 240, 480]);
+    }
+
+    /// A success in between resets the doubling.
+    #[tokio::test]
+    async fn a_success_resets_the_doubling() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(secondary_limit(None))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_idle(&server, &repo()).await;
+        let clock = Arc::new(TestClock::default());
+        let gateway = gateway_at(&server, &clock);
+        let scope = ActivityScope::repository(repo());
+
+        let _ = gateway.queued_demand(&scope, &CancelToken::new()).await;
+        clock.advance_secs(60);
+        gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect("GitHub answered");
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(secondary_limit(None))
+            .mount(&server)
+            .await;
+        let again = gateway
+            .queued_demand(&scope, &CancelToken::new())
+            .await
+            .expect_err("a fresh rate limit");
+        assert_eq!(
+            again.rate_limited().and_then(|limit| limit.retry_after),
+            Some(Duration::from_secs(60)),
+            "a limit after a success is a first limit again"
+        );
+    }
+
     // -- cancellation -------------------------------------------------------
 
     /// A token flipped between requests stops the poll before the next one.
@@ -2448,11 +3237,13 @@ mod tests {
     #[test]
     fn nothing_in_this_crate_reserves_or_claims_a_job() {
         const SOURCES: &[(&str, &str)] = &[
+            ("conditional.rs", include_str!("conditional.rs")),
             ("demand.rs", include_str!("demand.rs")),
             ("device_flow.rs", include_str!("device_flow.rs")),
             ("jit.rs", include_str!("jit.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("rest.rs", include_str!("rest.rs")),
+            ("traffic.rs", include_str!("traffic.rs")),
         ];
         // `SOURCES` is a snapshot, and a snapshot makes "anywhere in the crate"
         // false the moment a file is added. The walk below turns the claim back
