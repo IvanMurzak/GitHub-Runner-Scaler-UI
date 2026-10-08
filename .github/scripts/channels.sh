@@ -75,7 +75,9 @@ Usage: bash .github/scripts/channels.sh <subcommand> [args]
 
   cargo-publish <version>
       Publish the workspace crates in dependency order using crates.io Trusted
-      Publishing. Checks the HTTP API first to skip already published crates.
+      Publishing. Checks the HTTP API first to skip already published crates,
+      and waits for each crate in both the API and the sparse index before
+      publishing the next.
 USAGE
 }
 
@@ -585,56 +587,119 @@ cmd_cargo_publish() {
         runner-manager
     )
 
+    # Responses are kept out of the checkout.
+    local scratch
+    scratch="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "rm -rf '$scratch'" EXIT
+
+    # The tests replace the network and Cargo with a script of their own;
+    # nothing else sets this.
+    tool() {
+        if [[ -n "${CHANNELS_FAKE_TOOLS:-}" ]]; then
+            bash "$CHANNELS_FAKE_TOOLS" "$@"
+        else
+            "$@"
+        fi
+    }
+
     registry_status() {
         local package="$1"
-        curl --silent --show-error --output crates-io-response.json \
+        tool curl --silent --show-error --output "$scratch/crates-io-response.json" \
             --write-out '%{http_code}' \
             --user-agent "IvanMurzak/GitHub-Runner-Scaler-UI release workflow" \
             "https://crates.io/api/v1/crates/${package}/${version}"
     }
 
-    local package status visible attempt
+    # Where Cargo resolves dependencies: the sparse index, which can trail
+    # the HTTP API. 0.4.35's release saw runner-manager-agent in the API while
+    # `cargo publish -p runner-manager` still "failed to select a version for
+    # runner-manager-agent ^0.4.35" from the index.
+    index_path() {
+        local name="$1"
+        case "${#name}" in
+        1 | 2) printf '%s/%s' "${#name}" "$name" ;;
+        3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+        *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+        esac
+    }
+
+    in_index() {
+        local package="$1"
+        # Captured, then searched: `grep -q` on a pipe exits at the first match,
+        # and under pipefail curl's broken pipe would then fail the check.
+        tool curl --silent --fail --output "$scratch/index-entry.txt" \
+            --user-agent "IvanMurzak/GitHub-Runner-Scaler-UI release workflow" \
+            "https://index.crates.io/$(index_path "$package")" || return 1
+        grep -q "\"vers\":\"${version}\"" "$scratch/index-entry.txt"
+    }
+
+    # Waits until both the API and the index carry package@version, with a
+    # backoff from 5 to 60 seconds and at most ten minutes in all.
+    await_visible() {
+        local package="$1" waited=0 delay=5 status
+        while :; do
+            status="$(registry_status "$package")"
+            if [ "$status" != 200 ] && [ "$status" != 404 ]; then
+                printf 'REJECTED: crates.io returned HTTP %s after publishing %s@%s.\n' "$status" "$package" "$version" >&2
+                cat "$scratch/crates-io-response.json" >&2
+                exit 1
+            fi
+            if [ "$status" = 200 ] && in_index "$package"; then
+                return 0
+            fi
+            if [ "$waited" -ge 600 ]; then
+                printf 'REJECTED: %s@%s was accepted but was not in the crates.io API and index within %s seconds.\n' "$package" "$version" "$waited" >&2
+                printf 'Re-run only the failed channels job; published versions are skipped.\n' >&2
+                exit 1
+            fi
+            printf 'waiting %ss for crates.io to expose %s@%s (API HTTP %s)\n' "$delay" "$package" "$version" "$status"
+            tool sleep "$delay"
+            waited=$((waited + delay))
+            delay=$((delay * 2 > 60 ? 60 : delay * 2))
+        done
+    }
+
+    local package status attempt
     for package in "${packages[@]}"; do
         status="$(registry_status "$package")"
         case "$status" in
         200)
             printf 'already published: %s@%s\n' "$package" "$version"
+            # Its dependents resolve it from the index, which may still trail.
+            await_visible "$package"
             continue
             ;;
         404)
             ;;
         *)
             printf 'REJECTED: crates.io returned HTTP %s while checking %s@%s.\n' "$status" "$package" "$version" >&2
-            cat crates-io-response.json >&2
+            cat "$scratch/crates-io-response.json" >&2
             exit 1
             ;;
         esac
 
         printf -- '--- publishing %s@%s\n' "$package" "$version"
-        cargo publish --locked -p "$package"
-
-        # Cargo polls the index, but the HTTP API can trail it. Waiting here
-        # makes the dependency edge explicit and bounds eventual consistency.
-        visible=0
-        for attempt in $(seq 1 24); do
-            status="$(registry_status "$package")"
-            if [ "$status" = 200 ]; then
-                visible=1
+        # A dependency just published can still be missing from the index the
+        # moment Cargo resolves, whatever was waited for: that one error is
+        # retried, after a pause, a few times. Anything else ends the job.
+        for attempt in 1 2 3 4 5; do
+            if tool cargo publish --locked -p "$package" >"$scratch/cargo-publish.log" 2>&1; then
+                cat "$scratch/cargo-publish.log"
                 break
             fi
-            if [ "$status" != 404 ]; then
-                printf 'REJECTED: crates.io returned HTTP %s after publishing %s@%s.\n' "$status" "$package" "$version" >&2
-                cat crates-io-response.json >&2
-                exit 1
+            cat "$scratch/cargo-publish.log" >&2
+            if [ "$attempt" -lt 5 ] && grep -q 'failed to select a version for' "$scratch/cargo-publish.log"; then
+                printf 'a dependency of %s@%s is not in the index yet; trying again (%s/5)\n' "$package" "$version" "$attempt"
+                tool sleep 30
+                continue
             fi
-            printf 'waiting for crates.io to expose %s@%s (%s/24)\n' "$package" "$version" "$attempt"
-            sleep 5
-        done
-        if [ "$visible" -ne 1 ]; then
-            printf 'REJECTED: %s@%s was accepted but did not become visible within 120 seconds.\n' "$package" "$version" >&2
-            printf 'Re-run only the failed channels job; published versions are skipped.\n' >&2
             exit 1
-        fi
+        done
+
+        # Cargo polls the index, but times out quietly; the next dependent
+        # resolves from that index, so its record is awaited here.
+        await_visible "$package"
     done
 
     printf 'Cargo channel is at %s\n' "$version"

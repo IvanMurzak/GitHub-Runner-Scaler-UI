@@ -1529,8 +1529,9 @@ fn cargo_channel_uses_trusted_publishing_in_dependency_order() {
 
     for required in [
         "https://crates.io/api/v1/crates/",
+        "https://index.crates.io/",
         "already published:",
-        "sleep 5",
+        "failed to select a version for",
     ] {
         assert!(
             script.contains(required),
@@ -1826,4 +1827,176 @@ fn the_readme_and_the_workflow_name_the_same_homebrew_tap() {
          `{documented}`. Every reader who copies the README's line would get \
          `No available formula`."
     );
+}
+
+// ----------------------------------------------------------------------------
+// cargo-publish against a crates.io whose sparse index trails its API.
+// ----------------------------------------------------------------------------
+
+/// Stands in for `curl`, `cargo` and `sleep`, as channels.sh runs them when
+/// `CHANNELS_FAKE_TOOLS` names it.
+///
+/// A crate becomes visible in the API the moment it is uploaded, and in the
+/// index only after `FAKE_LAG` further index reads or pauses: the 0.4.35
+/// release, where `cargo publish -p runner-manager` "failed to select a version
+/// for runner-manager-agent" the API already listed. The fake Cargo refuses
+/// `runner-manager` while `runner-manager-agent` is not in its index yet.
+const FAKE_CRATES_IO: &str = r#"set -u
+state="$FAKE_STATE"
+tool="$1"
+shift
+lagging() { [ -f "$state/lag-$1" ] && [ "$(cat "$state/lag-$1")" -gt 0 ]; }
+tick() {
+    for file in "$state"/lag-*; do
+        [ -f "$file" ] || continue
+        value="$(cat "$file")"
+        [ "$value" -gt 0 ] && echo $((value - 1)) >"$file"
+    done
+    return 0
+}
+case "$tool" in
+sleep)
+    echo "$1" >>"$state/sleeps"
+    tick
+    ;;
+cargo)
+    package="${@: -1}"
+    echo "$package" >>"$state/cargo-calls"
+    if [ "$package" = runner-manager ] && lagging runner-manager-agent; then
+        echo 'error: failed to select a version for the requirement `runner-manager-agent = "^9.9.9"`' >&2
+        exit 101
+    fi
+    if [ -f "$state/fail-once-$package" ]; then
+        rm "$state/fail-once-$package"
+        echo 'error: failed to select a version for the requirement `x = "^9.9.9"`' >&2
+        exit 101
+    fi
+    touch "$state/published-$package"
+    echo "${FAKE_LAG:-0}" >"$state/lag-$package"
+    echo "Uploaded $package"
+    ;;
+curl)
+    out=/dev/null
+    url=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --output) out="$2"; shift 2 ;;
+        --write-out | --user-agent) shift 2 ;;
+        --*) shift ;;
+        *) url="$1"; shift ;;
+        esac
+    done
+    case "$url" in
+    https://crates.io/api/v1/crates/*)
+        package="${url#https://crates.io/api/v1/crates/}"
+        package="${package%%/*}"
+        if [ -f "$state/published-$package" ]; then
+            echo '{}' >"$out"
+            printf 200
+        else
+            echo '{"errors":[]}' >"$out"
+            printf 404
+        fi
+        ;;
+    https://index.crates.io/*)
+        package="${url##*/}"
+        [ -f "$state/published-$package" ] || exit 22
+        if lagging "$package"; then
+            tick
+            echo '{"name":"older","vers":"0.0.1"}' >"$out"
+        else
+            echo "{\"name\":\"$package\",\"vers\":\"9.9.9\"}" >"$out"
+        fi
+        ;;
+    *) exit 6 ;;
+    esac
+    ;;
+esac
+"#;
+
+const PUBLISH_ORDER: [&str; 5] = [
+    "runner-manager-domain",
+    "runner-manager-github",
+    "runner-manager-platform",
+    "runner-manager-agent",
+    "runner-manager",
+];
+
+/// Runs `channels.sh cargo-publish 9.9.9` against [`FAKE_CRATES_IO`]. Returns
+/// whether it succeeded, what it printed, and the packages Cargo was asked to
+/// publish, in order.
+fn publish_against_fake_crates_io(state: &TempDir, lag: u32) -> (bool, String, Vec<String>) {
+    let tools = state.path().join("fake-tools.sh");
+    std::fs::write(&tools, FAKE_CRATES_IO).unwrap();
+    let lag = lag.to_string();
+    let (ok, output) = run_bash(
+        &channels_script(),
+        &["cargo-publish", "9.9.9"],
+        &[
+            ("CHANNELS_FAKE_TOOLS", posix(&tools).as_str()),
+            ("FAKE_STATE", posix(state.path()).as_str()),
+            ("FAKE_LAG", lag.as_str()),
+            ("CARGO_REGISTRY_TOKEN", "not-a-real-token"),
+        ],
+    );
+    let calls = std::fs::read_to_string(state.path().join("cargo-calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (ok, output, calls)
+}
+
+/// Each crate is awaited in the index Cargo resolves from, not only in the
+/// API, so the dependent's publish never meets a dependency the API lists and
+/// the index does not.
+#[test]
+fn cargo_publish_waits_for_each_crate_in_the_index_before_its_dependents() {
+    let state = TempDir::new().unwrap();
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 3);
+    assert!(ok, "{output}");
+    assert_eq!(
+        calls, PUBLISH_ORDER,
+        "one publish per crate, none refused:\n{output}"
+    );
+    assert!(
+        output.contains("waiting 5s for crates.io to expose"),
+        "{output}"
+    );
+    assert!(output.contains("Cargo channel is at 9.9.9"), "{output}");
+}
+
+/// The dependent's publish is retried on the one error an index that trails
+/// produces, and on nothing else.
+#[test]
+fn cargo_publish_retries_a_dependency_the_index_does_not_have_yet() {
+    let state = TempDir::new().unwrap();
+    std::fs::write(state.path().join("fail-once-runner-manager"), "").unwrap();
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 0);
+    assert!(ok, "{output}");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| *call == "runner-manager")
+            .count(),
+        2,
+        "{output}"
+    );
+    assert!(
+        output.contains("not in the index yet; trying again"),
+        "{output}"
+    );
+}
+
+/// A re-run publishes nothing that is already out.
+#[test]
+fn cargo_publish_skips_what_is_already_published() {
+    let state = TempDir::new().unwrap();
+    for package in PUBLISH_ORDER {
+        std::fs::write(state.path().join(format!("published-{package}")), "").unwrap();
+    }
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 0);
+    assert!(ok, "{output}");
+    assert!(calls.is_empty(), "{calls:?}");
+    assert_eq!(output.matches("already published:").count(), 5, "{output}");
 }
