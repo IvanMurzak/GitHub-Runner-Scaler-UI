@@ -69,6 +69,12 @@ Every path above is a terminal command, deliberately: Gatekeeper on macOS and Sm
 on Windows act on the quarantine flag a *browser* sets, and `curl`, `irm`, `tar`, `brew`,
 `npm` and `cargo` do not set one, so no install here raises a security prompt.
 
+The published macOS binaries (install script, Homebrew, npm) are signed with the project's
+Developer ID certificate under one identifier, and are not notarized. macOS ties the
+permissions it gives the service, such as reading a runner root on an external volume, to
+that signature, so they carry over from one release to the next. A binary built with `cargo
+install` is signed ad hoc by the linker instead, and macOS asks again after every rebuild.
+
 ### Which one to pick
 
 The **install script** is the one to use for a boot-start service. It installs to a fixed

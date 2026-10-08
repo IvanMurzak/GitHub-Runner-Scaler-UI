@@ -7,6 +7,34 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.37
+
+### Changes
+
+- The macOS binaries are signed with the project's Developer ID Application certificate, under
+  one identifier for every release and both architectures (`io.github.IvanMurzak.runner-manager`),
+  with the hardened runtime and a secure timestamp. They are not notarized: every documented
+  install path is a terminal command, which Gatekeeper does not check. macOS ties the service's
+  login-keychain item, and its permission to read a runner root on a removable volume, to the
+  binary's signature. An ad-hoc signature names the hash of one exact build, so every update asked
+  again on the Mac's desktop whether runner-manager "would like to access files on a removable
+  volume", and the service started no runner until somebody clicked Allow. A Developer ID
+  signature is matched by its identifier and Team ID instead, and the next release has both.
+- **The first update to a signed build asks one last time.** To macOS, 0.4.37 is a new program,
+  because 0.4.36 and earlier are ad-hoc signed. Expect the removable-volume question once more on
+  a Mac whose runner root is on an external volume, and click Allow on its desktop. The service
+  still hands its keychain credential to the new build while it upgrades; where that does not
+  run, `runner-manager auth login` once more by the new build ends it. From 0.4.37 on, updates
+  keep both grants.
+- Releases: the signing material lives in the repository's `release` environment (secrets
+  `MAC_CSC_LINK` and `MAC_CSC_KEY_PASSWORD`, variable `MAC_SIGN_IDENTITY`). The workflow signs
+  through a keychain of its own that is deleted when signing ends, and checks, before anything is
+  packaged, that the signature's designated requirement names the identifier and the Team ID
+  rather than a code hash. With no material configured the binaries are ad-hoc signed and the run
+  says so in a warning. With part of it configured, or none while the variable
+  `RUNNER_MANAGER_REQUIRE_DEVELOPER_ID` is `true`, the release refuses before it tags anything.
+  A release can then be dispatched only from a branch the environment admits (`main`).
+
 ## 0.4.36
 
 ### Fixes
