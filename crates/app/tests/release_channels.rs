@@ -1868,7 +1868,11 @@ cargo)
     fi
     if [ -f "$state/fail-once-$package" ]; then
         rm "$state/fail-once-$package"
-        echo 'error: failed to select a version for the requirement `x = "^9.9.9"`' >&2
+        echo 'error: failed to select a version for the requirement `runner-manager-agent = "^9.9.9"`' >&2
+        exit 101
+    fi
+    if [ -f "$state/fail-with-$package" ]; then
+        cat "$state/fail-with-$package" >&2
         exit 101
     fi
     touch "$state/published-$package"
@@ -1904,6 +1908,8 @@ curl)
         if lagging "$package"; then
             tick
             echo '{"name":"older","vers":"0.0.1"}' >"$out"
+        elif [ -f "$state/index-only-$package" ]; then
+            cat "$state/index-only-$package" >"$out"
         else
             echo "{\"name\":\"$package\",\"vers\":\"9.9.9\"}" >"$out"
         fi
@@ -1926,6 +1932,17 @@ const PUBLISH_ORDER: [&str; 5] = [
 /// whether it succeeded, what it printed, and the packages Cargo was asked to
 /// publish, in order.
 fn publish_against_fake_crates_io(state: &TempDir, lag: u32) -> (bool, String, Vec<String>) {
+    publish_against_fake_crates_io_waiting(state, lag, "900")
+}
+
+/// [`publish_against_fake_crates_io`], with the seconds the step may spend
+/// waiting for crates.io. The fake `sleep` returns at once, so a wait that
+/// never ends is bounded only by this.
+fn publish_against_fake_crates_io_waiting(
+    state: &TempDir,
+    lag: u32,
+    wait: &str,
+) -> (bool, String, Vec<String>) {
     let tools = state.path().join("fake-tools.sh");
     std::fs::write(&tools, FAKE_CRATES_IO).unwrap();
     let lag = lag.to_string();
@@ -1937,6 +1954,7 @@ fn publish_against_fake_crates_io(state: &TempDir, lag: u32) -> (bool, String, V
             ("FAKE_STATE", posix(state.path()).as_str()),
             ("FAKE_LAG", lag.as_str()),
             ("CARGO_REGISTRY_TOKEN", "not-a-real-token"),
+            ("CHANNELS_PUBLISH_WAIT", wait),
         ],
     );
     let calls = std::fs::read_to_string(state.path().join("cargo-calls"))
@@ -1953,7 +1971,7 @@ fn publish_against_fake_crates_io(state: &TempDir, lag: u32) -> (bool, String, V
 #[test]
 fn cargo_publish_waits_for_each_crate_in_the_index_before_its_dependents() {
     let state = TempDir::new().unwrap();
-    let (ok, output, calls) = publish_against_fake_crates_io(&state, 3);
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 1);
     assert!(ok, "{output}");
     assert_eq!(
         calls, PUBLISH_ORDER,
@@ -1999,4 +2017,55 @@ fn cargo_publish_skips_what_is_already_published() {
     assert!(ok, "{output}");
     assert!(calls.is_empty(), "{calls:?}");
     assert_eq!(output.matches("already published:").count(), 5, "{output}");
+}
+
+/// The re-run after 0.4.35's failure: the dependency is out, and still
+/// missing from the index, and its dependent waits for it rather than
+/// failing again.
+#[test]
+fn cargo_publish_awaits_an_already_published_dependency_in_the_index() {
+    let state = TempDir::new().unwrap();
+    for package in &PUBLISH_ORDER[..4] {
+        std::fs::write(state.path().join(format!("published-{package}")), "").unwrap();
+    }
+    std::fs::write(state.path().join("lag-runner-manager-agent"), "2").unwrap();
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 0);
+    assert!(ok, "{output}");
+    assert_eq!(calls, ["runner-manager"], "{output}");
+    assert!(
+        output.contains("waiting 5s for crates.io to expose runner-manager-agent@9.9.9"),
+        "{output}"
+    );
+}
+
+/// Any other publish failure ends the job at once.
+#[test]
+fn cargo_publish_does_not_retry_other_failures() {
+    let state = TempDir::new().unwrap();
+    std::fs::write(
+        state.path().join("fail-with-runner-manager-domain"),
+        "error: failed to select a version for the requirement `serde = \"^9\"`\n",
+    )
+    .unwrap();
+    let (ok, output, calls) = publish_against_fake_crates_io(&state, 0);
+    assert!(!ok, "{output}");
+    assert_eq!(calls, ["runner-manager-domain"], "{output}");
+}
+
+/// The index must hold this exact version: 9.9.90 is not 9.9.9.
+#[test]
+fn cargo_publish_reads_the_exact_version_from_the_index() {
+    let state = TempDir::new().unwrap();
+    std::fs::write(state.path().join("published-runner-manager-domain"), "").unwrap();
+    std::fs::write(
+        state.path().join("index-only-runner-manager-domain"),
+        "{\"name\":\"runner-manager-domain\",\"vers\":\"9.9.90\"}\n",
+    )
+    .unwrap();
+    let (ok, output, _) = publish_against_fake_crates_io_waiting(&state, 0, "20");
+    assert!(!ok, "{output}");
+    assert!(
+        output.contains("was not in both the crates.io API and index in time"),
+        "{output}"
+    );
 }

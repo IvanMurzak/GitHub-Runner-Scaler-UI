@@ -304,10 +304,14 @@ impl Channel {
         wait: Wait,
         sent: impl FnOnce(),
     ) -> Result<T, AskError> {
+        // Unique within this process as well as across processes: two threads
+        // can read the same instant where the clock is coarse (macOS).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = format!(
-            "{}-{}",
+            "{}-{}-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
-            std::process::id()
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let request = self.request_file(state_dir, &id);
         crate::host_fitness::write_atomically(&request, id.as_bytes())
