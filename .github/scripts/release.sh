@@ -87,7 +87,7 @@ Usage: bash .github/scripts/release.sh <subcommand> [args]
       Steps 1-2 and 5. Print `developer-id` or `adhoc`, from the PRESENCE of
       MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD and MAC_SIGN_IDENTITY. Exit non-zero
       when they are only partly set, or when none is set and
-      MACOS_SIGNING_REQUIRED is `true`. Never prints a value.
+      RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is `true`. Never prints a value.
 
   sign-macos <binary>
       Step 5. Sign <binary> with the Developer ID identity through a keychain
@@ -814,9 +814,9 @@ readonly DEVELOPER_ID_PATTERN='^Developer ID Application: .+ \(([A-Z0-9]{10})\)$
 #   MAC_CSC_LINK               base64 of the .p12 (secret)
 #   MAC_CSC_KEY_PASSWORD       the .p12's password (secret)
 #   MAC_SIGN_IDENTITY          `Developer ID Application: <name> (<TEAM ID>)`
-#   MACOS_SIGNING_REQUIRED     `true` refuses the ad-hoc fallback
+#   RUNNER_MANAGER_REQUIRE_DEVELOPER_ID  `true` refuses the ad-hoc fallback
 macos_signing_mode() {
-    local required="${MACOS_SIGNING_REQUIRED-}"
+    local required="${RUNNER_MANAGER_REQUIRE_DEVELOPER_ID-}"
     case "$required" in
     "" | false | true) ;;
     *) die "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID must be 'true', 'false' or unset, not '${required}'" ;;
@@ -866,7 +866,6 @@ macos_signing_mode() {
 # The temporary keychain's state, global so the EXIT trap can undo it.
 SIGNING_WORK=""
 SIGNING_KEYCHAIN=""
-SIGNING_SEARCH_LIST_CHANGED=0
 SIGNING_SEARCH_LIST=()
 
 # Undoes everything `sign_with_developer_id` did to the machine, in reverse,
@@ -875,7 +874,8 @@ SIGNING_SEARCH_LIST=()
 signing_cleanup() {
     local status=$?
     set +e
-    if ((SIGNING_SEARCH_LIST_CHANGED != 0)); then
+    # Non-empty only once the list was read, and it is set the line after.
+    if ((${#SIGNING_SEARCH_LIST[@]} != 0)); then
         security list-keychains -d user -s "${SIGNING_SEARCH_LIST[@]}" ||
             printf 'WARNING: could not restore the keychain search list\n' >&2
     fi
@@ -937,20 +937,16 @@ sign_with_developer_id() {
     # setting a one-entry list would be persistent damage to the machine.
     local listing line
     listing="$(security list-keychains -d user)"
+    local quoted='^[[:space:]]*"(.+)"[[:space:]]*$'
     while IFS= read -r line; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        line="${line#\"}"
-        line="${line%\"}"
-        if [[ -n "$line" && "$line" != "$keychain" ]]; then
-            SIGNING_SEARCH_LIST+=("$line")
+        if [[ "$line" =~ $quoted ]] && [[ "${BASH_REMATCH[1]}" != "$keychain" ]]; then
+            SIGNING_SEARCH_LIST+=("${BASH_REMATCH[1]}")
         fi
     done <<<"$listing"
     if ((${#SIGNING_SEARCH_LIST[@]} == 0)); then
         reject "could not read the user keychain search list; refusing to modify it."
         exit 1
     fi
-    SIGNING_SEARCH_LIST_CHANGED=1
     security list-keychains -d user -s "$keychain" "${SIGNING_SEARCH_LIST[@]}"
 
     # BY HASH, FROM THIS KEYCHAIN, AND EXACTLY ONE.
@@ -1090,33 +1086,21 @@ cmd_verify_macos_signature() {
 
     # Every mismatch is reported, not just the first, so one failed release
     # names everything that is wrong with the signature.
-    local failed=0 first_authority=""
-    local line
-    while IFS= read -r line; do
-        if [[ -z "$first_authority" && "$line" == Authority=* ]]; then
-            first_authority="${line#Authority=}"
-        fi
-    done <<<"$display"
-    if [[ "$first_authority" != "$identity" ]]; then
-        reject "${binary} is signed by '${first_authority:-nothing}', not by '${identity}'."
+    local failed=0
+    mismatch() {
+        reject "$1"
         failed=1
-    fi
-    if [[ $'\n'"$display"$'\n' != *$'\n'"Identifier=${MACOS_SIGNING_IDENTIFIER}"$'\n'* ]]; then
-        reject "${binary} does not carry the identifier ${MACOS_SIGNING_IDENTIFIER}."
-        failed=1
-    fi
-    if [[ $'\n'"$display"$'\n' != *$'\n'"TeamIdentifier=${team}"$'\n'* ]]; then
-        reject "${binary} does not carry the Team ID ${team}."
-        failed=1
-    fi
-    if [[ "$display" != *"(runtime)"* ]]; then
-        reject "${binary} was not signed with the hardened runtime (--options runtime)."
-        failed=1
-    fi
-    if [[ $'\n'"$display" != *$'\n'Timestamp=* ]]; then
-        reject "${binary} carries no secure timestamp (--timestamp)."
-        failed=1
-    fi
+    }
+    has_line() { [[ $'\n'"$display"$'\n' == *$'\n'"$1"$'\n'* ]]; }
+
+    has_line "Authority=${identity}" || mismatch "${binary} is not signed by '${identity}'."
+    has_line "Identifier=${MACOS_SIGNING_IDENTIFIER}" ||
+        mismatch "${binary} does not carry the identifier ${MACOS_SIGNING_IDENTIFIER}."
+    has_line "TeamIdentifier=${team}" || mismatch "${binary} does not carry the Team ID ${team}."
+    [[ "$display" == *"(runtime)"* ]] ||
+        mismatch "${binary} was not signed with the hardened runtime (--options runtime)."
+    [[ $'\n'"$display" == *$'\n'Timestamp=* ]] ||
+        mismatch "${binary} carries no secure timestamp (--timestamp)."
 
     # THE PROPERTY THIS SIGNATURE IS FOR: a requirement the NEXT build meets.
     local requirement
@@ -1125,37 +1109,25 @@ cmd_verify_macos_signature() {
     status=$?
     set -e
     printf '%s\n' "$requirement"
-    if ((status != 0)); then
-        reject "codesign could not read the designated requirement of ${binary}."
-        failed=1
-    fi
-    if [[ "$requirement" == *cdhash* ]]; then
-        reject "the designated requirement pins a code hash, so the next build will not satisfy it."
-        failed=1
-    fi
-    if [[ "$requirement" != *"designated => identifier \"${MACOS_SIGNING_IDENTIFIER}\" "* ]]; then
-        reject "the designated requirement does not name the identifier ${MACOS_SIGNING_IDENTIFIER}."
-        failed=1
-    fi
-    if [[ "$requirement" != *"anchor apple generic"* ]]; then
-        reject "the designated requirement is not anchored to Apple's certificate authority."
-        failed=1
-    fi
-    if [[ "$requirement" != *"certificate leaf[subject.OU] = ${team}"* &&
-        "$requirement" != *"certificate leaf[subject.OU] = \"${team}\""* ]]; then
-        reject "the designated requirement does not pin the Team ID ${team}."
-        failed=1
-    fi
+    ((status == 0)) || mismatch "codesign could not read the designated requirement of ${binary}."
+    [[ "$requirement" != *cdhash* ]] ||
+        mismatch "the designated requirement pins a code hash, so the next build will not satisfy it."
+    [[ "$requirement" == *"designated => identifier \"${MACOS_SIGNING_IDENTIFIER}\" "* ]] ||
+        mismatch "the designated requirement does not name the identifier ${MACOS_SIGNING_IDENTIFIER}."
+    [[ "$requirement" == *"anchor apple generic"* ]] ||
+        mismatch "the designated requirement is not anchored to Apple's certificate authority."
+    # codesign quotes a Team ID that starts with a digit.
+    [[ "$requirement" == *"certificate leaf[subject.OU] = ${team}"* ||
+        "$requirement" == *"certificate leaf[subject.OU] = \"${team}\""* ]] ||
+        mismatch "the designated requirement does not pin the Team ID ${team}."
 
     # And asked of `codesign` itself, which evaluates the certificate chain up
     # to Apple's root: the string checks above read what the requirement SAYS,
     # this checks that the signature MEETS it.
-    if ! codesign --verify --strict \
+    codesign --verify --strict \
         -R="anchor apple generic and identifier \"${MACOS_SIGNING_IDENTIFIER}\" and certificate leaf[subject.OU] = \"${team}\"" \
-        "$binary"; then
-        reject "${binary} does not satisfy a Developer ID requirement for Team ID ${team}."
-        failed=1
-    fi
+        "$binary" ||
+        mismatch "${binary} does not satisfy a Developer ID requirement for Team ID ${team}."
 
     if ((failed != 0)); then
         exit 1

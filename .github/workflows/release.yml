@@ -403,7 +403,7 @@ jobs:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
-          MACOS_SIGNING_REQUIRED: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
+          RUNNER_MANAGER_REQUIRE_DEVELOPER_ID: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
         run: bash .github/scripts/release.sh macos-signing-mode
 
   # --------------------------------------------------------------------------
@@ -536,7 +536,11 @@ jobs:
     needs: [validate, tag]
     runs-on: ${{ matrix.os }}
     # The macOS signing material lives in this environment and nowhere else.
-    # See "THE SIGNING MATERIAL" in this file's header.
+    # See "THE SIGNING MATERIAL" in this file's header. Every leg names it --
+    # an environment cannot be chosen per matrix entry without an expression
+    # nothing here can test -- but only the macOS steps read it. Give the
+    # environment a branch rule, not required reviewers, which would ask for
+    # one approval per leg.
     environment: release
     permissions:
       contents: read
@@ -620,29 +624,14 @@ jobs:
       # ----------------------------------------------------------------------
       # SIGNED WITH THE PROJECT'S DEVELOPER ID, BEFORE ANYTHING IS PACKAGED.
       # ----------------------------------------------------------------------
-      # macOS ties a service's login-keychain item and its removable-volume
-      # privacy grant to the binary's designated requirement. The free ad-hoc
-      # signature this step used to apply makes that requirement the hash of
-      # one exact build, so every update asked again on the Mac's desktop and
-      # the daemon started no runner until somebody clicked Allow. A Developer
-      # ID signature with one constant identifier makes it "this identifier,
-      # from this Team ID", which every later release satisfies.
-      # `release.sh sign-macos` explains the keychain it uses and why it never
-      # calls `set-key-partition-list`.
+      # Why a Developer ID, and how the keychain is handled: `release.sh`, above
+      # `sign-macos`. The header of this file lists the signing material.
       #
       # It runs HERE, on the binary straight out of `cargo build`, because every
       # channel ships these bytes: the archive below, `SHA256SUMS`, the npm
       # packages unpacked from the archive, the Homebrew formula and the install
       # scripts. Nothing after this step rewrites the Mach-O -- staging is `cp`,
       # packaging is `tar` -- so the signature reaches all of them intact.
-      #
-      # Without signing material in the `release` environment this falls back
-      # to the ad-hoc signature (every macOS binary still carries one, which an
-      # arm64 binary needs to execute at all) and says so as a workflow
-      # warning. Material that is only partly configured, or absent while
-      # RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is true, refuses the release; so
-      # does any failure while signing. `preflight` asks the same question
-      # before the tag is pushed.
       - name: Step 5 - sign the macOS binary
         if: runner.os == 'macOS'
         env:
@@ -650,7 +639,7 @@ jobs:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
-          MACOS_SIGNING_REQUIRED: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
+          RUNNER_MANAGER_REQUIRE_DEVELOPER_ID: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
         run: |
           bash .github/scripts/release.sh sign-macos \
             "target/${TARGET}/release/runner-manager"

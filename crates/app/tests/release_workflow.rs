@@ -188,7 +188,7 @@ const SIGNING_VARIABLES: [&str; 5] = [
     "MAC_CSC_LINK",
     "MAC_CSC_KEY_PASSWORD",
     "MAC_SIGN_IDENTITY",
-    "MACOS_SIGNING_REQUIRED",
+    "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID",
     "GITHUB_STEP_SUMMARY",
 ];
 
@@ -798,7 +798,9 @@ fn stub_codesign(directory: &Path, display_body: &str, display_exit: i32, verify
 /// Writes `<directory>/<program>`, a bash script with `body` after the shebang.
 fn write_stub(directory: &Path, program: &str, body: &str) {
     let path = directory.join(program);
-    std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}"))
+    // `/bin/bash` rather than `/usr/bin/env bash`: one process per stub call
+    // instead of two, which is most of the cost on Windows.
+    std::fs::write(&path, format!("#!/bin/bash\n{body}"))
         .unwrap_or_else(|err| panic!("the {program} stub must be writable: {err}"));
 
     #[cfg(unix)]
@@ -943,39 +945,41 @@ const SIGNING_IDENTIFIER: &str = "io.github.IvanMurzak.runner-manager";
 const TEST_P12: &str = "p12-bytes-SENTINEL-3f9c";
 const TEST_PASSWORD: &str = "password-SENTINEL-77ad";
 
-fn base64(text: &str) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = text.as_bytes();
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
+/// `TEST_P12`, base64-encoded the way `MAC_CSC_LINK` carries the .p12.
+const TEST_P12_BASE64: &str = "cDEyLWJ5dGVzLVNFTlRJTkVMLTNmOWM=";
+
+fn developer_id_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("MAC_CSC_LINK", TEST_P12_BASE64),
+        ("MAC_CSC_KEY_PASSWORD", TEST_PASSWORD),
+        ("MAC_SIGN_IDENTITY", TEST_IDENTITY),
+    ]
+}
+
+/// Asserts that no secret value reached either stream.
+fn assert_no_secret(out: &str, err: &str) {
+    for secret in [TEST_P12_BASE64, TEST_PASSWORD, TEST_P12] {
+        assert!(
+            !out.contains(secret) && !err.contains(secret),
+            "a secret value reached the output"
+        );
     }
-    out
+}
+
+/// `macos-signing-mode` under `env`; every run is also checked for a leak.
+fn signing_mode(env: &[(&str, &str)]) -> (bool, String, String) {
+    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, env);
+    assert_no_secret(&out, &err);
+    (ok, out, err)
 }
 
 #[test]
 fn the_signing_mode_is_decided_by_what_is_configured() {
-    let link = base64(TEST_P12);
-    let full: Vec<(&str, &str)> = vec![
-        ("MAC_CSC_LINK", link.as_str()),
-        ("MAC_CSC_KEY_PASSWORD", TEST_PASSWORD),
-        ("MAC_SIGN_IDENTITY", TEST_IDENTITY),
-    ];
+    let full = developer_id_env();
+    const REQUIRE: &str = "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID";
 
     // -- all three present: Developer ID ------------------------------------
-    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, &full);
+    let (ok, out, err) = signing_mode(&full);
     assert!(
         ok,
         "complete signing material must be accepted:\n{out}{err}"
@@ -987,7 +991,7 @@ fn the_signing_mode_is_decided_by_what_is_configured() {
     );
 
     // -- none present: the ad-hoc fallback, LOUDLY ---------------------------
-    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, &[]);
+    let (ok, out, err) = signing_mode(&[]);
     assert!(ok, "no signing material falls back to ad-hoc:\n{out}{err}");
     assert_eq!(out.trim(), "adhoc");
     assert!(
@@ -997,43 +1001,30 @@ fn the_signing_mode_is_decided_by_what_is_configured() {
     );
 
     // -- none present, but required: refused ---------------------------------
-    let (ok, out, err) = release_script_with_env(
-        &["macos-signing-mode"],
-        None,
-        &[("MACOS_SIGNING_REQUIRED", "true")],
-    );
+    let (ok, out, err) = signing_mode(&[(REQUIRE, "true")]);
     assert!(
         !ok,
-        "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID=true with no material must refuse \
-         the release rather than ship ad-hoc:\n{out}{err}"
+        "{REQUIRE}=true with no material must refuse the release rather than \
+         ship ad-hoc:\n{out}{err}"
     );
 
     // -- required and present: Developer ID ---------------------------------
-    let mut required = full.clone();
-    required.push(("MACOS_SIGNING_REQUIRED", "true"));
-    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, &required);
+    let (ok, out, err) = signing_mode(&[full.as_slice(), &[(REQUIRE, "true")]].concat());
     assert!(ok && out.trim() == "developer-id", "{out}{err}");
 
     // -- a typo in the switch is not "false" ---------------------------------
-    let (ok, out, err) = release_script_with_env(
-        &["macos-signing-mode"],
-        None,
-        &[("MACOS_SIGNING_REQUIRED", "yes")],
-    );
+    let (ok, out, err) = signing_mode(&[(REQUIRE, "yes")]);
     assert!(
         !ok,
-        "an unrecognised RUNNER_MANAGER_REQUIRE_DEVELOPER_ID must refuse; read \
-         as false it would quietly allow the fallback it was set to forbid:\n{out}{err}"
+        "an unrecognised {REQUIRE} must refuse; read as false it would quietly \
+         allow the fallback it was set to forbid:\n{out}{err}"
     );
 
     // -- any ONE missing: refused, and it names what is missing --------------
-    for missing in ["MAC_CSC_LINK", "MAC_CSC_KEY_PASSWORD", "MAC_SIGN_IDENTITY"] {
-        let partial: Vec<(&str, &str)> = full
-            .iter()
-            .copied()
-            .filter(|(name, _)| *name != missing)
-            .collect();
-        let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, &partial);
+    for (index, (missing, _)) in full.iter().enumerate() {
+        let mut partial = full.clone();
+        partial.remove(index);
+        let (ok, out, err) = signing_mode(&partial);
         assert!(
             !ok,
             "signing material without {missing} must refuse: a release that was \
@@ -1046,29 +1037,19 @@ fn the_signing_mode_is_decided_by_what_is_configured() {
     }
 
     // -- an identity that is not a Developer ID Application one --------------
-    let mut wrong = full.clone();
-    wrong.retain(|(name, _)| *name != "MAC_SIGN_IDENTITY");
-    wrong.push((
-        "MAC_SIGN_IDENTITY",
-        "Apple Development: Runner Manager Test (ABCDE12345)",
-    ));
-    let (ok, out, err) = release_script_with_env(&["macos-signing-mode"], None, &wrong);
+    let (ok, out, err) = signing_mode(&[
+        full[0],
+        full[1],
+        (
+            "MAC_SIGN_IDENTITY",
+            "Apple Development: Runner Manager Test (ABCDE12345)",
+        ),
+    ]);
     assert!(
         !ok,
         "only a Developer ID Application identity produces the requirement that \
          survives an update:\n{out}{err}"
     );
-
-    // -- and never a secret in the output, on any path above -----------------
-    for (path, env) in [("complete", full.as_slice()), ("partial", &full[..2])] {
-        let (_, out, err) = release_script_with_env(&["macos-signing-mode"], None, env);
-        for secret in [link.as_str(), TEST_PASSWORD] {
-            assert!(
-                !out.contains(secret) && !err.contains(secret),
-                "the {path} path printed a secret value"
-            );
-        }
-    }
 }
 
 /// `security` and `codesign` stubs that append every invocation to a log.
@@ -1103,7 +1084,7 @@ impl SigningStubs {
             &directory,
             "security",
             &format!(
-                "printf 'security' >>'{log}'; printf ' %s' \"$@\" >>'{log}'; printf '\\n' >>'{log}'\n\
+                "printf '%s\\n' \"security $*\" >>'{log}'\n\
                  case \"$1\" in\n\
                  create-keychain) : >\"${{!#}}\" ;;\n\
                  delete-keychain) rm -f \"$2\" ;;\n\
@@ -1125,7 +1106,7 @@ impl SigningStubs {
             &directory,
             "codesign",
             &format!(
-                "printf 'codesign' >>'{log}'; printf ' %s' \"$@\" >>'{log}'; printf '\\n' >>'{log}'\n\
+                "printf '%s\\n' \"codesign $*\" >>'{log}'\n\
                  exit \"${{STUB_CODESIGN_EXIT:-0}}\"\n",
                 log = posix(&log),
             ),
@@ -1179,19 +1160,10 @@ impl SigningStubs {
     }
 }
 
-fn developer_id_env(link: &str) -> Vec<(&str, &str)> {
-    vec![
-        ("MAC_CSC_LINK", link),
-        ("MAC_CSC_KEY_PASSWORD", TEST_PASSWORD),
-        ("MAC_SIGN_IDENTITY", TEST_IDENTITY),
-    ]
-}
-
 #[test]
 fn developer_id_signing_uses_a_keychain_of_its_own_and_leaves_nothing_behind() {
-    let link = base64(TEST_P12);
     let stubs = SigningStubs::new(TEST_IDENTITY);
-    let (ok, out, err) = stubs.sign(&developer_id_env(&link));
+    let (ok, out, err) = stubs.sign(&developer_id_env());
     let calls = stubs.calls();
     let transcript = format!("{out}{err}\ncalls:\n{}", calls.join("\n"));
     assert!(
@@ -1275,21 +1247,14 @@ fn developer_id_signing_uses_a_keychain_of_its_own_and_leaves_nothing_behind() {
         "nothing may be left in RUNNER_TEMP -- the decoded .p12 least of all: {:?}",
         stubs.leftovers()
     );
-    for secret in [link.as_str(), TEST_PASSWORD, TEST_P12] {
-        assert!(
-            !out.contains(secret) && !err.contains(secret),
-            "a secret value reached the output"
-        );
-    }
+    assert_no_secret(&out, &err);
 }
 
 #[test]
 fn a_failed_developer_id_signing_fails_the_release_and_still_cleans_up() {
-    let link = base64(TEST_P12);
-
     // -- codesign itself fails ------------------------------------------------
     let stubs = SigningStubs::new(TEST_IDENTITY);
-    let mut env = developer_id_env(&link);
+    let mut env = developer_id_env();
     env.push(("STUB_CODESIGN_EXIT", "1"));
     let (ok, out, err) = stubs.sign(&env);
     let transcript = format!("{out}{err}\ncalls:\n{}", stubs.calls().join("\n"));
@@ -1309,7 +1274,7 @@ fn a_failed_developer_id_signing_fails_the_release_and_still_cleans_up() {
 
     // -- the .p12 holds some other identity -----------------------------------
     let stubs = SigningStubs::new("Developer ID Application: Somebody Else (ZZZZZ99999)");
-    let (ok, out, err) = stubs.sign(&developer_id_env(&link));
+    let (ok, out, err) = stubs.sign(&developer_id_env());
     let calls = stubs.calls();
     assert!(
         !ok,
@@ -1345,7 +1310,7 @@ fn without_signing_material_the_binary_is_ad_hoc_signed_with_a_warning() {
 
     // -- and forbidden when the operator said so ------------------------------
     let stubs = SigningStubs::new(TEST_IDENTITY);
-    let (ok, out, err) = stubs.sign(&[("MACOS_SIGNING_REQUIRED", "true")]);
+    let (ok, out, err) = stubs.sign(&[("RUNNER_MANAGER_REQUIRE_DEVELOPER_ID", "true")]);
     assert!(
         !ok,
         "required signing with no material must refuse:\n{out}{err}"
@@ -1398,12 +1363,14 @@ impl VerifyStub {
             "codesign",
             &format!(
                 "data='{data}'\n\
+                 # Builtins only: a `cat` per answer is a process start per answer.\n\
+                 slurp() {{ IFS= read -r -d '' text <\"$data/$1\"; printf '%s' \"$text\"; }}\n\
                  case \"$1 $2\" in\n\
-                 '--display --verbose=2') cat \"$data/display\" >&2; exit 0 ;;\n\
-                 '--display -r-') printf 'Executable=%s\\n' \"$3\" >&2; cat \"$data/requirement\"; exit 0 ;;\n\
+                 '--display --verbose=2') slurp display >&2; exit 0 ;;\n\
+                 '--display -r-') printf 'Executable=%s\\n' \"$3\" >&2; slurp requirement; exit 0 ;;\n\
                  '--verify --strict')\n\
                    case \"$3\" in\n\
-                   -R=*) printf '%s' \"${{3#-R=}}\" >\"$data/tested\"; exit \"$(cat \"$data/r_exit\")\" ;;\n\
+                   -R=*) printf '%s' \"${{3#-R=}}\" >\"$data/tested\"; exit \"$(slurp r_exit)\" ;;\n\
                    esac\n\
                    exit 0 ;;\n\
                  esac\n\
@@ -1501,7 +1468,7 @@ fn the_developer_id_check_requires_a_requirement_the_next_build_satisfies() {
             ),
             GOOD_REQUIREMENT.to_string(),
             0,
-            "is signed by 'Developer ID Application: Somebody Else",
+            "is not signed by 'Developer ID Application: Runner Manager Test",
         ),
         (
             "another identifier",
