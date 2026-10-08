@@ -1965,14 +1965,29 @@ impl EventSink for TracingEvents {
                 unresolvable,
                 complete,
             } => {
-                tracing::info!(
-                    event = name,
-                    policy_id = %policy,
-                    demand,
-                    not_matched,
-                    unresolvable,
-                    count = u64::from(complete),
-                );
+                // An empty reading is the idle steady state, and the idle
+                // interval repeats it every few seconds per target: at `info`
+                // it would be most of the log. Anything worth reading is still
+                // `info`.
+                if demand == 0 && not_matched == 0 && unresolvable == 0 && complete {
+                    tracing::debug!(
+                        event = name,
+                        policy_id = %policy,
+                        demand,
+                        not_matched,
+                        unresolvable,
+                        count = u64::from(complete),
+                    );
+                } else {
+                    tracing::info!(
+                        event = name,
+                        policy_id = %policy,
+                        demand,
+                        not_matched,
+                        unresolvable,
+                        count = u64::from(complete),
+                    );
+                }
                 // There is deliberately no `warn!` here for the "demand is zero
                 // but jobs were not matched" shape, though it is the one this
                 // change introduced: before demand was filtered, a repository
@@ -2006,6 +2021,26 @@ impl EventSink for TracingEvents {
                 reason = reason.as_str(),
                 count,
                 "{reason}"
+            ),
+            LifecycleEvent::Allocated {
+                policy,
+                demand,
+                desired,
+                active_owned,
+                headroom,
+                to_start,
+                limiting,
+            } if demand == 0 && to_start == 0 && active_owned == 0 => tracing::debug!(
+                // Nothing wanted, nothing held, nothing started: the idle
+                // steady state, see `DemandObserved` above.
+                event = name,
+                policy_id = %policy,
+                demand,
+                desired,
+                capacity = active_owned,
+                headroom,
+                count = to_start,
+                reason = %limiting,
             ),
             LifecycleEvent::Allocated {
                 policy,
@@ -2077,7 +2112,11 @@ impl EventSink for TracingEvents {
                 attempt_state = "busy",
             ),
             LifecycleEvent::PollScheduled { retry_in_ms, pace } => {
-                tracing::info!(event = name, retry_in_ms, state = pace.as_str());
+                if pace == PollPace::Idle {
+                    tracing::debug!(event = name, retry_in_ms, state = pace.as_str());
+                } else {
+                    tracing::info!(event = name, retry_in_ms, state = pace.as_str());
+                }
             }
         }
     }
