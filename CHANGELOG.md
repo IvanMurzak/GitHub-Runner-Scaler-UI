@@ -7,6 +7,99 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.36
+
+### Fixes
+
+- `auth login` on a Mac with no service installed, run as an ordinary account, signs in for a
+  login-mode service. It used to assume `boot`, reached for the System keychain only root may
+  write, and failed after the device code with `SecKeychainItemCreateFromContent returned -61`.
+  The assumed mode is printed with the flag that picks the other one, and recorded, so `repo
+  add`, `auth status` and the service look in the same store. A `-61` from the System keychain
+  now says that only root may write it and names `sudo runner-manager auth login --start-at
+  boot` and `runner-manager auth login --start-at login`.
+- A short job is recorded `completed_job`. A job of a few seconds starts and ends between two
+  polls, so GitHub was never seen reporting the runner busy, and its clean exit was recorded
+  `failed / process_exited_unexpectedly`, with a replacement runner started for it (3 of 5
+  attempts on a new Mac). The runner's own diagnostics now decide: a job worker's log in its
+  `_diag` directory means it ran a job. The same evidence settles two related errors. A runner
+  GitHub showed assigned that never started the job, and exited 0, is recorded
+  `exited_idle_without_work` rather than `completed_job`, and a live one goes back to `idle`, so
+  the idle timeout holds it again. A runner that finished its job before GitHub took it off the
+  list is recorded `completed_job` rather than `orphaned`.
+- `service status` no longer tells a Mac that signs its runner account in automatically that it
+  will not resume after an unattended reboot. It reads automatic login and FileVault: it says
+  nothing for a host that comes back by itself, and names the System Settings steps for one that
+  does not. The dashboard's "starts only after this user signs in" warning follows it.
+- On a login-mode Mac reached over SSH, `repo add`, `org add` and `auth status` work. The SSH
+  session cannot unlock the login keychain, so they failed with its error while the service, in
+  the desktop session, used the credential every poll. They now ask the running service what the
+  credential reaches; the answer crosses through the state directory and never holds the
+  credential. `status` says the credential is in use by the service when the service reached
+  GitHub in the last 15 minutes, instead of calling it unreadable.
+- A runner root on an external volume that macOS has not yet let the service read is reported
+  as such. After an update, macOS asks again whether runner-manager "would like to access files
+  on a removable volume", because it ties the answer to the exact build, and until somebody
+  clicks Allow on the Mac's desktop the service's listing of the root waits and it starts no
+  runner. `host.runner_root_responsive` now says that a privacy question is probably waiting and
+  which button answers it, and, when the answer was no, where to turn it on (System Settings >
+  Privacy & Security > Files & Folders). A refusal is a failure; it used to be "unknown", which
+  let runners start on a root they could not use.
+- `service status` is not healthy while the service starts no runner because a required host
+  check fails; it used to say `verdict healthy`. It names what the service found and the fix,
+  and so does `status`, under `host unfit because`.
+- A daemon that stops making progress reads as such. One blocked in a file system call sat at 0%
+  CPU for half an hour after an update, writing nothing, while launchd reported it running and
+  `service status` said `verdict healthy`. The daemon now writes a heartbeat from its loop every
+  minute; when a running daemon has not beaten for five minutes, `service status` is not healthy
+  and `status` says `daemon stalled`, with the last GitHub contact and what to do. Its host-unfit
+  record no longer expires from `status` while it is stalled, and host checks that do not finish
+  within two minutes count as a failure (`host.checks`) instead of holding the daemon back
+  silently. Reading a runner's diagnostics is bounded as well.
+- `wsl install` (and anything else that raises a UAC prompt) asks for administrator rights from
+  a session on the Windows desktop even with no terminal, as when a script or an agent runs it.
+  A UAC prompt is a desktop dialog; it used to be refused with "this session has no terminal".
+  Sessions with no desktop (services, scheduled tasks that run whether or not anybody is signed
+  in, SSH logins) are still refused, and a change that lowers security still needs its flag or
+  an answer on a terminal.
+- `host doctor` reports a required check the running service finds failing as failing, with the
+  service's finding, even when its own look passes. Over SSH it used to list the runner root
+  itself, from a session macOS was not asking about, and call it passing.
+- The release's crates.io publish no longer fails when the crates.io index trails its API. In
+  0.4.35, `runner-manager` "failed to select a version for runner-manager-agent ^0.4.35" right
+  after that crate was uploaded, and only a re-run published it. Each crate is now awaited in
+  both the API and the sparse index Cargo resolves from, with a backoff inside one fifteen-minute
+  budget, and a dependent whose workspace dependency the index does not show yet is retried.
+  Versions already published are still skipped.
+- The Spotlight check's remedy names `/Users/Shared/rman.noindex`. It used to suggest
+  `…/Application Support/…/runtime.noindex`, a path with a space that `host set-runtime-root`
+  also refused.
+
+### Features
+
+- `host doctor` checks a Mac's power settings, and `host prepare` fixes them with one
+  administrator prompt (`pmset -a …`), recording the values it replaced so `host prepare
+  --revert` puts them back: `macos.sleep` (`sleep 0`), `macos.disk_sleep` (`disksleep 0`) and
+  `macos.autorestart` (`autorestart 1`) are recommended, `macos.wake_on_lan` (`womp 1`) is
+  informational.
+- `macos.unattended_login` reports whether the service comes back after an unattended restart:
+  automatic login as the service's account for a login-mode service, and FileVault off for
+  either mode. It prints the System Settings steps and never changes automatic login or
+  FileVault itself.
+- `macos.runner_root_location` reports a runner root with a space in its path, or inside the
+  home folder of the account the service runs as, where every job's `TMPDIR` is too (a test
+  that builds a stand-in home folder from `TMPDIR` then nests it inside the real one). The
+  default root is unchanged; the remedy is `host set-runtime-root --path
+  /Users/Shared/rman.noindex`.
+
+### Notes
+
+- Job steps see SIGPIPE ignored, so `yes | head` exits 1 rather than 141. That comes from the
+  GitHub Actions runner, not from runner-manager: .NET ignores SIGPIPE in `Runner.Listener` and
+  `Runner.Worker` and its process start keeps an ignored disposition for every step, on classic
+  runners too (actions/runner#2684). runner-manager starts the listener with the default
+  disposition, and a test now pins that.
+
 ## 0.4.35
 
 ### Fixes

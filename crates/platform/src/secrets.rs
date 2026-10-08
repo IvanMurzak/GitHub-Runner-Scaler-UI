@@ -1960,6 +1960,22 @@ mod sys {
 
 // ---------------------------------------------------------------------------
 
+/// The System keychain's refusal of an ordinary account, explained.
+///
+/// `auth login` without `--start-at` on a Mac with no service used to reach
+/// for this store and print only `SecKeychainItemCreateFromContent returned
+/// -61`, after the operator had already approved the device code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn system_keychain_write_refused(source: &str) -> String {
+    format!(
+        "{source}. The machine-scoped store is the System keychain, and only root may write \
+         it. It holds the credential for a service that starts at boot; sign in for that one \
+         with `sudo runner-manager auth login --start-at boot`. For a service that runs as you \
+         (`runner-manager service install --start-at login`), sign in to your own login \
+         keychain instead: `runner-manager auth login --start-at login`"
+    )
+}
+
 #[cfg(target_os = "macos")]
 mod sys {
     //! A generic-password item in a keychain, and which keychain is the whole
@@ -2132,11 +2148,38 @@ mod sys {
         }
     }
 
+    /// `errSecWrPerm`: the keychain refused to be written.
+    const ERR_SEC_WR_PERM: i32 = -61;
+
+    /// A Security.framework status, carried inside the `io::Error` so that a
+    /// caller acts on the code rather than on the words.
+    #[derive(Debug)]
+    struct Status {
+        message: String,
+        code: i32,
+    }
+
+    impl std::fmt::Display for Status {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Status {}
+
+    /// The status an error from this module carries, if it carries one.
+    fn status_of(error: &io::Error) -> Option<i32> {
+        error
+            .get_ref()?
+            .downcast_ref::<Status>()
+            .map(|status| status.code)
+    }
+
     fn sec_error(error: &security_framework::base::Error) -> io::Error {
-        io::Error::other(format!(
-            "Security.framework returned {} ({error})",
-            error.code()
-        ))
+        io::Error::other(Status {
+            message: format!("Security.framework returned {} ({error})", error.code()),
+            code: error.code(),
+        })
     }
 
     fn is_absence(error: &security_framework::base::Error) -> bool {
@@ -2361,6 +2404,20 @@ mod sys {
     }
 
     pub(super) fn store(site: &Site, _scope: SecretScope, plaintext: &[u8]) -> io::Result<()> {
+        write(site, plaintext).map_err(|error| {
+            if site.kind == Kind::System && !is_root() && status_of(&error) == Some(ERR_SEC_WR_PERM)
+            {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    super::system_keychain_write_refused(&error.to_string()),
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn write(site: &Site, plaintext: &[u8]) -> io::Result<()> {
         let _no_ui = without_user_interaction();
         let keychain = open(site, true)?.ok_or_else(|| {
             io::Error::new(
@@ -2666,7 +2723,10 @@ mod sys {
         if status == 0 {
             Ok(())
         } else {
-            Err(io::Error::other(format!("{call} returned {status}")))
+            Err(io::Error::other(Status {
+                message: format!("{call} returned {status}"),
+                code: status,
+            }))
         }
     }
 
@@ -3251,6 +3311,22 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn a_system_keychain_write_refusal_says_which_sign_in_to_run() {
+        let explained =
+            system_keychain_write_refused("SecKeychainItemCreateFromContent returned -61");
+        assert!(explained.starts_with("SecKeychainItemCreateFromContent returned -61. "));
+        assert!(explained.contains("only root may write it"), "{explained}");
+        assert!(
+            explained.contains("`runner-manager auth login --start-at login`"),
+            "{explained}"
+        );
+        assert!(
+            explained.contains("`sudo runner-manager auth login --start-at boot`"),
+            "{explained}"
+        );
+    }
 
     /// Shaped like a real `ghu_` user access token and unmistakably not one.
     ///

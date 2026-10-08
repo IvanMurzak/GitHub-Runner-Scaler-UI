@@ -48,6 +48,7 @@
 //! ("no other local user can read this") through a platform-specific check
 //! behind one cross-platform name.
 
+pub mod daemon_heartbeat;
 pub mod dependency_cache;
 pub mod host_fitness;
 pub mod launch_health;
@@ -61,4 +62,6 @@ pub mod runner_root;
 pub mod runner_root_access;
 pub mod secrets;
 pub mod service;
+pub mod service_request;
+pub mod unattended_login;
 pub mod wsl;

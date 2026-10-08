@@ -689,6 +689,9 @@ struct LocalServiceReadiness {
     log_file: String,
     problems: Vec<(String, String)>,
     legacy_windows_action: bool,
+    /// Why the service does not come back by itself after an unattended
+    /// restart, and what changes that. `None` when it does.
+    unattended_gap: Option<runner_manager_platform::service::UnattendedGap>,
 }
 
 /// The WSL distribution this process runs inside, if any.
@@ -781,7 +784,7 @@ fn with_host_doctor(
             outcome: screens::ActivityOutcome::Failed,
             summary: format!(
                 "The service starts no runner: required host check(s) fail ({}).",
-                unfit.checks.join(", ")
+                unfit.detail
             ),
             remediation: "Press f to run host prepare, or run `runner-manager host prepare`; the \
                           service re-checks within five minutes."
@@ -852,6 +855,7 @@ fn inspect_local_service(context: &crate::cli::Context) -> Result<LocalServiceRe
             .map(|problem| (problem.subject.to_owned(), problem.detail.clone()))
             .collect(),
         legacy_windows_action,
+        unattended_gap: service.unattended_gap().cloned(),
     })
 }
 
@@ -949,14 +953,12 @@ fn readiness_from_facts(
                     remediation,
                 );
             }
-            if service.start_mode == Some(StartMode::Login) {
+            if let Some(gap) = service.unattended_gap {
                 issue(
                     "local:login-only",
                     OperationalReadiness::Degraded,
-                    "Local service starts only after this user signs in; it will not cover an unattended reboot."
-                        .into(),
-                    "For machine-on operation, move the service and credential to `--start-at boot` from an elevated terminal."
-                        .into(),
+                    gap.reason,
+                    gap.remedy,
                 );
             }
             if service.legacy_windows_action {
@@ -5854,6 +5856,7 @@ fn ready_service() -> LocalServiceReadiness {
         log_file: "service.log".into(),
         problems: vec![],
         legacy_windows_action: false,
+        unattended_gap: None,
     }
 }
 
@@ -5872,6 +5875,7 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
             log_file: "service.log".into(),
             problems: vec![],
             legacy_windows_action: false,
+            unattended_gap: None,
         }),
         false,
         &[],
@@ -5883,6 +5887,10 @@ fn operational_readiness_reports_ready_degraded_blocked_and_unknown() {
     let mut stopped = ready_service();
     stopped.running = false;
     stopped.start_mode = Some(StartMode::Login);
+    stopped.unattended_gap = Some(runner_manager_platform::service::UnattendedGap {
+        reason: "This host does not resume work after an unattended reboot.".into(),
+        remedy: "Turn on automatic login.".into(),
+    });
     stopped.legacy_windows_action = true;
     stopped
         .problems
@@ -6000,6 +6008,7 @@ fn a_missing_service_registration_is_one_actionable_problem() {
                 "the service record exists but SCM has no registration".into(),
             )],
             legacy_windows_action: false,
+            unattended_gap: None,
         }),
         true,
         &[],
@@ -6086,6 +6095,7 @@ fn doctor_summary(
         daemon_host_unfit: unfit.then(|| crate::cli::doctor::HostUnfitSummary {
             since: chrono::Utc::now(),
             checks: vec!["windows.symlink_privilege".into()],
+            detail: "windows.symlink_privilege: symbolic links are refused".into(),
         }),
     }
 }

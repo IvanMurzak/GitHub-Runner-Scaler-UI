@@ -154,6 +154,10 @@ pub struct Product {
     /// refused, or its WSL launch fence is stuck -- as `since`, `reason` and
     /// `remedy`; `null` while launches can proceed.
     pub service_launches_blocked: Option<LaunchesBlocked>,
+    /// Why the local daemon, which its service manager reports running, has
+    /// stopped making progress; `null` while it beats. See
+    /// [`runner_manager_platform::daemon_heartbeat`].
+    pub service_stalled: Option<String>,
 }
 
 fn binary_version(path: &std::path::Path) -> Option<String> {
@@ -241,6 +245,14 @@ pub struct Credential {
     pub unreadable: Option<String>,
     pub store_scope: String,
     pub store_location: String,
+    /// While `unreadable` is set: how long ago the installed service, which
+    /// reads the store in its own session, last reached GitHub, in seconds.
+    /// `null` when it has not since its binary was put in place.
+    ///
+    /// A login-mode Mac reached over SSH is the case: the SSH session cannot
+    /// unlock the login keychain, and `status` used to report that as the
+    /// credential's problem while the service was using it every poll.
+    pub service_reached_github_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -466,6 +478,15 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         Ok(value) => (value.is_some(), None),
         Err(source) => (false, Some(source.to_string())),
     };
+    // Not while GitHub is rejecting the service's credential: a contact from
+    // before the rejection vouches for nothing.
+    let service_reached_github_secs_ago = (unreadable.is_some()
+        && github_credential_rejected_since(context.paths())
+            .ok()
+            .flatten()
+            .is_none())
+    .then(|| super::doctor::installed_service_contact_age(context))
+    .flatten();
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
@@ -498,6 +519,15 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
                 .flatten(),
             service_definition_outdated_since_version: outdated_service_definition(context),
             service_launches_blocked: launches_blocked(context.paths(), context.clock().now()),
+            service_stalled: runner_manager_platform::daemon_heartbeat::liveness(
+                context.paths(),
+                context.clock().now(),
+            )
+            .stall(
+                runner_manager_platform::service::last_github_contact(context.paths())
+                    .ok()
+                    .flatten(),
+            ),
         },
         github_contacted: false,
         credential: Credential {
@@ -505,6 +535,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             unreadable,
             store_scope: secrets.scope().to_string(),
             store_location: secrets.location(),
+            service_reached_github_secs_ago,
         },
         host: HostSnapshot {
             configured: host.is_some(),
@@ -636,24 +667,47 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
         "  ephemeral paths           {} active, {} awaiting cleanup",
         document.host.active_ephemeral_attempts, document.host.cleanup_blocked_ephemeral_attempts
     )?;
+    // The service reads the store in its own session. When it reached GitHub
+    // recently, a store this session cannot read is this session's limit (an
+    // SSH session and a login keychain), not the credential's problem.
+    // Only filled while the store is unreadable here; recent enough, it means
+    // the credential is in use by the service, and this session's limit (an
+    // SSH session and a login keychain) is not the credential's problem.
+    let service_minutes = document
+        .credential
+        .service_reached_github_secs_ago
+        .filter(|age| *age <= super::doctor::RECENT_CONTACT_SECS)
+        .map(|age| age / 60);
+    let state = match (
+        service_minutes,
+        &document.credential.unreadable,
+        document.credential.present,
+    ) {
+        (Some(minutes), ..) => {
+            format!("in use by the service, which reached GitHub {minutes} minute(s) ago,")
+        }
+        // Never "absent". An unreadable store has not answered the question,
+        // and the two words an operator acts on differently must not be the
+        // same word.
+        (None, Some(_), _) => "not readable by this account".to_owned(),
+        (None, None, true) => "present".to_owned(),
+        (None, None, false) => "absent".to_owned(),
+    };
     writeln!(
         out,
-        "  credential                {} in the {}-scoped store",
-        match (&document.credential.unreadable, document.credential.present) {
-            // Never "absent". An unreadable store has not answered the
-            // question, and the two words an operator acts on differently must
-            // not be the same word.
-            (Some(_), _) => "not readable by this account",
-            (None, true) => "present",
-            (None, false) => "absent",
-        },
-        document.credential.store_scope
+        "  {:<26}{state} in the {}-scoped store",
+        "credential", document.credential.store_scope
     )?;
     // The store's own words, on their own line, for the same reason the runner
     // root's problem gets one: the reason names a remedy and a two-column table
     // cell would truncate it.
     if let Some(reason) = &document.credential.unreadable {
-        writeln!(out, "  credential problem        {reason}")?;
+        let label = if service_minutes.is_some() {
+            "not readable here"
+        } else {
+            "credential problem"
+        };
+        writeln!(out, "  {label:<26}{reason}")?;
     }
     writeln!(
         out,
@@ -671,10 +725,14 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
             unfit.since,
             unfit.checks.join(", ")
         )?;
+        writeln!(out, "  host unfit because        {}", unfit.detail)?;
     }
     if let Some(blocked) = &document.product.service_launches_blocked {
         writeln!(out, "  daemon starts no runner   {blocked}")?;
         writeln!(out, "  launches remedy           {}", blocked.remedy)?;
+    }
+    if let Some(stall) = &document.product.service_stalled {
+        writeln!(out, "  daemon stalled            {stall}")?;
     }
     writeln!(
         out,
@@ -758,6 +816,7 @@ mod tests {
                 service_credential_rejected_since: None,
                 service_definition_outdated_since_version: None,
                 service_launches_blocked: None,
+                service_stalled: None,
             },
             github_contacted: false,
             credential: Credential {
@@ -765,6 +824,7 @@ mod tests {
                 unreadable: None,
                 store_scope: "machine".to_string(),
                 store_location: "C:/ProgramData/runner-manager/secrets".to_string(),
+                service_reached_github_secs_ago: None,
             },
             host: HostSnapshot {
                 configured: true,
@@ -836,6 +896,9 @@ mod tests {
                 daemon_host_unfit: Some(super::super::doctor::HostUnfitSummary {
                     since: chrono::DateTime::from_timestamp(1_787_270_000, 0).unwrap(),
                     checks: vec!["windows.symlink_privilege".to_string()],
+                    detail: "windows.symlink_privilege: symbolic links are refused. Fix: turn \
+                             on Developer Mode"
+                        .to_string(),
                 }),
             },
             caches: super::super::cache::CacheSnapshot {
@@ -912,7 +975,7 @@ mod tests {
         );
         assert_eq!(
             keys(&emitted, "/doctor/daemon_host_unfit"),
-            ["checks", "since"]
+            ["checks", "detail", "since"]
         );
         assert_eq!(
             keys(&emitted, "/caches"),
@@ -936,12 +999,19 @@ mod tests {
                 "service_credential_rejected_since",
                 "service_definition_outdated_since_version",
                 "service_launches_blocked",
+                "service_stalled",
                 "version"
             ]
         );
         assert_eq!(
             keys(&emitted, "/credential"),
-            ["present", "store_location", "store_scope", "unreadable"]
+            [
+                "present",
+                "service_reached_github_secs_ago",
+                "store_location",
+                "store_scope",
+                "unreadable"
+            ]
         );
         assert_eq!(
             keys(&emitted, "/host"),
@@ -1163,6 +1233,67 @@ mod tests {
         assert!(text.contains("Policies (1)"), "{text}");
     }
 
+    /// An SSH session on a login-mode Mac cannot unlock the login keychain,
+    /// while the service, in the desktop session, uses the credential every
+    /// poll. `status` defers to the service's recent contact.
+    #[test]
+    fn a_store_only_the_service_can_read_defers_to_its_recent_contact() {
+        let mut document = document();
+        document.credential.present = false;
+        document.credential.unreadable =
+            Some("the login keychain is locked for this session".to_string());
+        document.credential.service_reached_github_secs_ago = Some(130);
+
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains(
+                "credential                in use by the service, which reached GitHub 2 \
+                 minute(s) ago"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("credential problem"), "{text}");
+        assert!(!text.contains("not readable by this account"), "{text}");
+        assert!(
+            text.contains("not readable here         the login keychain is locked"),
+            "the session's own limit is still said: {text}"
+        );
+
+        // A contact too old to vouch for the credential changes nothing.
+        document.credential.service_reached_github_secs_ago =
+            Some(super::super::doctor::RECENT_CONTACT_SECS + 1);
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(text.contains("not readable by this account"), "{text}");
+        assert!(text.contains("credential problem"), "{text}");
+    }
+
+    /// A stalled daemon is said, with what to do.
+    #[test]
+    fn a_stalled_daemon_is_reported() {
+        let mut document = document();
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        assert!(
+            !String::from_utf8(buffer)
+                .unwrap()
+                .contains("daemon stalled")
+        );
+
+        document.product.service_stalled =
+            Some("the service (process 7) has made no progress since then".into());
+        let mut buffer = Vec::new();
+        write_text(&mut buffer, &document).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(
+            text.contains("  daemon stalled            the service (process 7) has made"),
+            "{text}"
+        );
+    }
+
     /// Blocked launches name their reason and their remedy, in the text and in
     /// the JSON document a `wsl status` on Windows reads back.
     #[test]
@@ -1213,6 +1344,12 @@ mod tests {
             text.contains("  daemon starts no runner   since ")
                 && text.contains("host unfit (windows.symlink_privilege)"),
             "{text}"
+        );
+        assert!(
+            text.contains(
+                "  host unfit because        windows.symlink_privilege: symbolic links are refused. Fix: turn on Developer Mode"
+            ),
+            "what the daemon found, and what fixes it: {text}"
         );
 
         let mut healthy = document();

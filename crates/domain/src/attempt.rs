@@ -224,6 +224,9 @@ impl AttemptState {
         (AttemptState::Starting, AttemptState::Busy),
         // `idle -> busy`.
         (AttemptState::Idle, AttemptState::Busy),
+        // `busy -> idle`: GitHub showed the runner assigned, and the runner
+        // never started the job. See [`RunnerAttempt::assignment_not_taken`].
+        (AttemptState::Busy, AttemptState::Idle),
         // `allocated | jit_received | starting -> failed | orphaned`.
         (AttemptState::Allocated, AttemptState::Failed),
         (AttemptState::Allocated, AttemptState::Orphaned),
@@ -1236,6 +1239,30 @@ impl RunnerAttempt {
         Ok(())
     }
 
+    /// `busy -> idle`: GitHub showed this runner assigned, but the runner never
+    /// started the job.
+    ///
+    /// GitHub's inventory marks a runner busy when it hands it a job, before the
+    /// runner has acquired it. An assignment the runner does not take up is
+    /// re-queued to another runner, and this one goes back to waiting (or, as a
+    /// one-shot JIT runner, exits). Without this edge the journal went on saying
+    /// `busy`, so the attempt was later recorded `completed_job` for a job it
+    /// never ran, and a live runner in that position was never held to the idle
+    /// timeout. The caller takes the edge only with local proof that no job ran:
+    /// the runner's own diagnostics show its listener but no job worker.
+    ///
+    /// # Errors
+    /// [`AttemptError::IllegalTransition`] from any state but `busy`.
+    pub fn assignment_not_taken(&mut self, now: Timestamp) -> Result<(), AttemptError> {
+        if self.state != AttemptState::Busy {
+            return Err(AttemptError::IllegalTransition {
+                from: self.state,
+                to: AttemptState::Idle,
+            });
+        }
+        self.move_to(AttemptState::Idle, now)
+    }
+
     /// Record the terminal outcome, moving to the state it implies.
     ///
     /// # Errors
@@ -1945,6 +1972,7 @@ mod tests {
     /// ```text
     /// allocated -> jit_received -> starting -> idle | busy
     /// idle -> busy
+    /// busy -> idle
     /// allocated | jit_received | starting -> failed | orphaned
     /// idle | busy -> finished | failed | orphaned
     /// finished | failed | orphaned -> cleaned
@@ -1963,6 +1991,9 @@ mod tests {
         ];
         // Line 2, added by the 2026-08-21 amendment.
         edges.push((Idle, Busy));
+        // Added when an assignment GitHub reported was shown not to have been
+        // taken up: the runner's diagnostics hold no job worker.
+        edges.push((Busy, Idle));
         // Line 3, added by the same amendment.
         for from in [Allocated, Preparing, Prepared, JitReceived, Starting] {
             for to in [Failed, Orphaned] {
@@ -1993,7 +2024,7 @@ mod tests {
         let expected = diagram_edges();
         assert_eq!(
             expected.len(),
-            33,
+            34,
             "the transcription itself changed; check it against the diagram"
         );
 
@@ -2030,8 +2061,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_seen, 33);
-        assert_eq!(illegal_seen, 13 * 13 - 33);
+        assert_eq!(legal_seen, 34);
+        assert_eq!(illegal_seen, 13 * 13 - 34);
 
         // And the published constant matches the transcription.
         let mut published = AttemptState::LEGAL.to_vec();

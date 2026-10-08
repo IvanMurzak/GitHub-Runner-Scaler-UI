@@ -60,6 +60,8 @@ use runner_manager_github::{
 };
 use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
+use runner_manager_platform::service::InstallRecord;
+use runner_manager_platform::service_request::{self, AskError};
 use secrecy::zeroize::Zeroize as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -343,9 +345,8 @@ pub fn dispatch(
 /// Names the store this sign-in will write to, before it writes anything.
 ///
 /// Printed unconditionally. The case worth catching is the one where the
-/// operator did *not* choose — the default is `boot`, and on macOS that is the
-/// System keychain, which needs privilege and is not where a `--start-at login`
-/// service will ever look.
+/// operator did *not* choose: the line then names the mode that was assumed and
+/// the flag that picks the other one.
 fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io::Result<()> {
     let scope = match mode {
         StartMode::Boot => "machine-scoped",
@@ -362,10 +363,48 @@ fn write_store_choice(out: &mut dyn Write, mode: StartMode, chosen: bool) -> io:
     if chosen {
         writeln!(out, "Credential store: {scope} (start mode {mode}).")
     } else {
+        let other = match mode {
+            StartMode::Boot => StartMode::Login,
+            StartMode::Login => StartMode::Boot,
+        };
         writeln!(
             out,
-            "Credential store: {scope} (start mode {mode}, assumed; `--start-at login` to change)."
+            "Credential store: {scope} (start mode {mode}, assumed; `--start-at {other}` to change)."
         )
+    }
+}
+
+/// Whether a service is installed from this account's directories, asked
+/// only where the answer decides anything: on a Mac whose two stores are the
+/// two keychains. With `--data-dir` both stores live under the data directory,
+/// where either mode's can be written. `None` everywhere else.
+fn service_installed_on_a_keychain_mac(context: &Context) -> Option<bool> {
+    if !cfg!(target_os = "macos") || context.data_root.is_some() {
+        return None;
+    }
+    InstallRecord::read(context.paths())
+        .ok()
+        .map(|record| record.is_some())
+}
+
+/// The start mode a sign-in uses when the operator did not name one.
+///
+/// The recorded mode, except on a Mac with no service installed, signing in as
+/// an ordinary account. The recorded mode there is a default nobody chose
+/// (`boot`), and `boot`'s store is the System keychain, which only root may
+/// write: the sign-in got as far as the device code and then failed with
+/// `SecKeychainItemCreateFromContent returned -61`. With no service yet, the
+/// service this credential is for is the one this account would install, and
+/// without `sudo` that is a `login` service.
+fn assumed_start_mode(
+    recorded: StartMode,
+    service_installed: Option<bool>,
+    root: bool,
+) -> StartMode {
+    if service_installed == Some(false) && !root {
+        StartMode::Login
+    } else {
+        recorded
     }
 }
 
@@ -562,14 +601,26 @@ pub fn login(
     // warning that they were signing in to the wrong half. Hence the flag, and
     // hence the line printed below whether or not it was passed.
     let recorded = context.recorded_start_mode(&store)?;
-    let start_mode = requested_mode.unwrap_or(recorded);
+    // Only a host with no record has a mode nobody chose; one recorded
+    // earlier, `boot` included, keeps it.
+    let host_recorded = super::host::local_host(&store)?.is_some();
+    let start_mode = requested_mode.unwrap_or_else(|| {
+        assumed_start_mode(
+            recorded,
+            service_installed_on_a_keychain_mac(context).filter(|_| !host_recorded),
+            runner_manager_platform::host_fitness::is_elevated(),
+        )
+    });
     let secrets = context.secret_store(start_mode)?;
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
-    // An explicit choice is recorded, so that `repo add`, `auth status` and the
+    // The mode used is recorded, so that `repo add`, `auth status` and the
     // daemon all agree with the sign-in that just happened rather than with a
-    // default nobody chose.
-    if let Some(mode) = requested_mode {
-        record_start_mode(context, &store, recorded, mode)?;
+    // default nobody chose. A chosen mode is recorded now; an assumed one only
+    // once a credential is in its store, so an abandoned sign-in changes
+    // nothing. Left unrecorded, every later command would look for the
+    // credential in the System keychain.
+    if requested_mode.is_some() {
+        record_start_mode(context, &store, recorded, start_mode)?;
     }
 
     // ------------------------------------------------------------------------
@@ -625,6 +676,7 @@ pub fn login(
     if let Some(secret) = resumable
         && let CredentialState::Authenticated(discovery) = credential_state_of(context, secret)?
     {
+        record_start_mode(context, &store, recorded, start_mode)?;
         writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
         write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
         return Ok(());
@@ -650,6 +702,7 @@ pub fn login(
         // bare token when it does not. See `UserAccessToken::to_stored_document`.
         .store(&token.to_stored_document())
         .map_err(|source| secret_store_failure(&source))?;
+    record_start_mode(context, &store, recorded, start_mode)?;
 
     // ---- what the credential reaches, and the third action if any --------
     let client = AuthenticatedClient::new(context.endpoints().clone(), token, context.clock())
@@ -1319,7 +1372,7 @@ fn store_received_credential(
 /// reason. `f1`'s Definition of Done names four; folding an offline host into
 /// [`CredentialState::Revoked`] would tell an operator with a dropped
 /// connection to sign in again, which is the wrong remedy stated confidently.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CredentialState {
     /// No value in the store. The ordinary state before `auth login`.
     NotAuthenticated,
@@ -1391,13 +1444,93 @@ pub fn credential_state(
     context: &Context,
     secrets: &dyn SecretStore,
 ) -> Result<CredentialState, CliError> {
-    let Some(secret) = secrets
-        .load()
-        .map_err(|source| secret_store_failure(&source))?
-    else {
-        return Ok(CredentialState::NotAuthenticated);
+    credential_state_or_ask(context, secrets, || ask_service(context))
+}
+
+fn credential_state_or_ask(
+    context: &Context,
+    secrets: &dyn SecretStore,
+    ask: impl FnOnce() -> Option<Result<CredentialState, AskError>>,
+) -> Result<CredentialState, CliError> {
+    match secrets.load() {
+        Ok(Some(secret)) => credential_state_of(context, secret),
+        Ok(None) => Ok(CredentialState::NotAuthenticated),
+        Err(source) => through_service(&source, ask),
+    }
+}
+
+/// Asks the service installed from this account's directories what the
+/// credential reaches, for a command that could not read the store itself.
+/// `None` when no service is installed from them, so nothing is waited for.
+///
+/// # Why
+///
+/// On a login-mode Mac reached over SSH the credential is in a login keychain
+/// the SSH session cannot unlock, so `repo add`, `org add` and `auth status`
+/// failed there while the service, in the desktop session, read the same item
+/// every poll. The service answers through
+/// [`service_request::GITHUB_DISCOVERY`]: what GitHub said about the
+/// installations, never the credential.
+fn ask_service(context: &Context) -> Option<Result<CredentialState, AskError>> {
+    InstallRecord::read(context.paths()).ok().flatten()?;
+    Some(ask_service_at(
+        context.paths().state_dir(),
+        service_request::Wait::GITHUB,
+    ))
+}
+
+fn ask_service_at(
+    state_dir: &std::path::Path,
+    wait: service_request::Wait,
+) -> Result<CredentialState, AskError> {
+    service_request::GITHUB_DISCOVERY.ask(state_dir, wait)
+}
+
+/// The store could not be read: the service's answer when there is one,
+/// otherwise the store's own failure, with what the service said beside it.
+fn through_service(
+    source: &SecretStoreError,
+    ask: impl FnOnce() -> Option<Result<CredentialState, AskError>>,
+) -> Result<CredentialState, CliError> {
+    let failure = secret_store_failure(source);
+    let why = match ask() {
+        Some(Ok(state)) => return Ok(state),
+        None => return Err(failure),
+        Some(Err(why)) => why,
     };
-    credential_state_of(context, secret)
+    // A service that could not read the credential either has the store's
+    // problem, and the store's remedy; one that never answered needs looking
+    // at itself.
+    let remedy = match &why {
+        AskError::Refused(_) => failure.remedy().unwrap_or(NO_OPERATOR_REMEDY).to_owned(),
+        _ => "runner-manager service status".to_owned(),
+    };
+    Err(CliError::with_remedy(
+        Failure::SecretStore,
+        format!(
+            "{}; the service was asked instead, and {why}",
+            failure.message()
+        ),
+        remedy,
+    ))
+}
+
+/// The service's half of [`ask_service`]: what the credential stored for
+/// `mode` reaches, read in the service's own session.
+pub async fn credential_state_for_service(
+    context: &Context,
+    mode: StartMode,
+) -> Result<CredentialState, String> {
+    let secrets = context
+        .secret_store(mode)
+        .map_err(|error| error.to_string())?;
+    match secrets.load() {
+        Ok(Some(secret)) => discover(context, secret)
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(None) => Ok(CredentialState::NotAuthenticated),
+        Err(source) => Err(format!("it cannot read its credential either: {source}")),
+    }
 }
 
 /// What GitHub makes of a credential already in hand.
@@ -1415,6 +1548,10 @@ pub fn credential_state_of(
     context: &Context,
     secret: SecretString,
 ) -> Result<CredentialState, CliError> {
+    super::runtime()?.block_on(discover(context, secret))
+}
+
+async fn discover(context: &Context, secret: SecretString) -> Result<CredentialState, CliError> {
     let app = context.app_registration()?;
     let client = AuthenticatedClient::new(
         context.endpoints().clone(),
@@ -1423,8 +1560,7 @@ pub fn credential_state_of(
     )
     .map_err(|source| github_failure(&source))?;
 
-    let runtime = super::runtime()?;
-    match runtime.block_on(client.discover_installations(&app)) {
+    match client.discover_installations(&app).await {
         Ok(discovery) => Ok(CredentialState::Authenticated(Box::new(discovery))),
         Err(GithubError::AuthenticationFailed) => Ok(CredentialState::Revoked),
         Err(GithubError::AuthenticationLockout { retry_after }) => Ok(CredentialState::LockedOut {
@@ -1940,6 +2076,133 @@ mod tests {
 
     /// The prefix every counted action line starts with.
     const ACTION_PREFIX: &str = "Action ";
+
+    /// A Mac with no service, signing in as an ordinary account, used to go to
+    /// the System keychain and fail with `-61` after the device code.
+    #[test]
+    fn a_mac_with_no_service_signs_an_ordinary_account_in_for_a_login_service() {
+        assert_eq!(
+            assumed_start_mode(StartMode::Boot, Some(false), false),
+            StartMode::Login
+        );
+        // Everywhere else the recorded mode stands: as root, with a service,
+        // and where nothing was asked (not a Mac, or `--data-dir`).
+        for (installed, root) in [(Some(false), true), (Some(true), false), (None, false)] {
+            assert_eq!(
+                assumed_start_mode(StartMode::Boot, installed, root),
+                StartMode::Boot,
+                "{installed:?} {root}"
+            );
+        }
+        assert_eq!(
+            assumed_start_mode(StartMode::Login, Some(false), true),
+            StartMode::Login
+        );
+    }
+
+    fn locked_login_keychain() -> SecretStoreError {
+        SecretStoreError::Load {
+            scope: runner_manager_platform::secrets::SecretScope::User,
+            location: "login keychain".into(),
+            source: std::io::Error::other("the login keychain is locked for this session"),
+        }
+    }
+
+    /// An SSH session on a login-mode Mac cannot unlock the login keychain;
+    /// the running service can, and answers for it.
+    #[test]
+    fn a_store_this_session_cannot_read_is_answered_by_the_service() {
+        let answered = through_service(&locked_login_keychain(), || {
+            Some(Ok(CredentialState::Revoked))
+        })
+        .expect("the service's answer");
+        assert!(matches!(answered, CredentialState::Revoked));
+
+        // No service installed from this account's directories: the store's
+        // own failure, as before.
+        let alone = through_service(&locked_login_keychain(), || None).unwrap_err();
+        assert!(
+            alone.message().contains("locked for this session"),
+            "{alone:?}"
+        );
+
+        // A service that could not answer either: both reasons.
+        let neither = through_service(&locked_login_keychain(), || {
+            Some(Err(AskError::NotTaken(8)))
+        })
+        .unwrap_err();
+        assert!(
+            neither.message().contains("locked for this session"),
+            "{neither:?}"
+        );
+        assert!(
+            neither
+                .message()
+                .contains("the service was asked instead, and no running service"),
+            "{neither:?}"
+        );
+        assert_eq!(neither.remedy(), Some("runner-manager service status"));
+
+        // A service that cannot read it either has the store's problem, and
+        // keeps the store's remedy.
+        let refused = through_service(&locked_login_keychain(), || {
+            Some(Err(AskError::Refused(
+                "it cannot read its credential either".into(),
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(refused.remedy(), alone.remedy(), "{refused:?}");
+    }
+
+    /// What crosses the request channel survives the trip: the installations,
+    /// never the credential.
+    #[test]
+    fn a_credential_state_round_trips_through_the_service_channel() {
+        let state = CredentialState::LockedOut {
+            retry_after_secs: 60,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: CredentialState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            CredentialState::LockedOut {
+                retry_after_secs: 60
+            }
+        ));
+        let not_installed = CredentialState::Authenticated(Box::new(
+            runner_manager_github::InstallationDiscovery::NotInstalled {
+                install_url: reqwest::Url::parse("https://github.com/apps/x/installations/new")
+                    .unwrap(),
+            },
+        ));
+        let json = serde_json::to_string(&not_installed).unwrap();
+        let CredentialState::Authenticated(discovery) =
+            serde_json::from_str::<CredentialState>(&json).unwrap()
+        else {
+            panic!("{json}");
+        };
+        assert_eq!(
+            discovery.install_url().map(reqwest::Url::as_str),
+            Some("https://github.com/apps/x/installations/new")
+        );
+    }
+
+    #[test]
+    fn an_assumed_start_mode_names_the_flag_that_picks_the_other_one() {
+        for (mode, flag) in [
+            (StartMode::Login, "`--start-at boot` to change"),
+            (StartMode::Boot, "`--start-at login` to change"),
+        ] {
+            let mut out = Vec::new();
+            write_store_choice(&mut out, mode, false).unwrap();
+            let line = String::from_utf8(out).unwrap();
+            assert!(
+                line.contains(&format!("start mode {mode}, assumed")),
+                "{line}"
+            );
+            assert!(line.contains(flag), "{line}");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // THE ACTION ORACLE LIVES IN THE TEST MODULE, AND SO DOES ITS TWIN IN
@@ -2937,6 +3200,59 @@ mod tests {
                 },
             })
         }
+    }
+
+    /// The whole command half against the real channel: the store refuses,
+    /// a stand-in service takes the request and answers, and the command gets
+    /// the service's answer rather than the store's error.
+    #[test]
+    fn an_unreadable_store_is_answered_by_the_running_service_through_the_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let context = Context::rooted_against(
+            root.path(),
+            runner_manager_github::Endpoints::for_test_server("http://127.0.0.1:9").unwrap(),
+        )
+        .unwrap();
+        let state_dir = context.paths().state_dir().to_path_buf();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let service_dir = state_dir.clone();
+        let service = std::thread::spawn(move || {
+            loop {
+                if let Some(request) = service_request::GITHUB_DISCOVERY.take(&service_dir).pop() {
+                    service_request::GITHUB_DISCOVERY
+                        .answer(
+                            &service_dir,
+                            &request,
+                            Ok(CredentialState::LockedOut {
+                                retry_after_secs: 42,
+                            }),
+                        )
+                        .unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let store = UnreadableStore::holding("{}");
+        let wait = service_request::Wait {
+            taken: Duration::from_secs(5),
+            finished: Duration::from_secs(5),
+            poll: Duration::from_millis(20),
+        };
+        let state =
+            credential_state_or_ask(&context, &store, || Some(ask_service_at(&state_dir, wait)))
+                .expect("the service's answer");
+        service.join().unwrap();
+        assert!(
+            matches!(
+                state,
+                CredentialState::LockedOut {
+                    retry_after_secs: 42
+                }
+            ),
+            "{state:?}"
+        );
+        assert_eq!(store.loads(), 1);
     }
 
     // -- the device-flow fixture -------------------------------------------

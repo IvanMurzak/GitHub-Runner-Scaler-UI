@@ -1944,6 +1944,35 @@ mod sys {
 pub(crate) mod tests {
     use super::*;
 
+    /// Every Rust program, this test binary and the daemon alike, starts with
+    /// SIGPIPE ignored, and an ignored disposition survives `exec`. A runner
+    /// started with it would hand it to every job step, where `yes | head`
+    /// exits 1 instead of 141 and `tr … </dev/urandom | head` never ends. The
+    /// child must start with the default disposition, so a shell that sends
+    /// itself SIGPIPE dies of it.
+    ///
+    /// Job steps on a runner this product starts do still see SIGPIPE ignored,
+    /// on every host and under a classic runner too: .NET ignores it in
+    /// `Runner.Listener` and `Runner.Worker`, and its process start keeps an
+    /// ignored disposition for the shells it runs (actions/runner#2684). That is
+    /// below this spawn, and this test pins only what this spawn hands over.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_starts_with_the_default_sigpipe_disposition() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut child = SpawnSpec::new("/bin/sh")
+            .args(["-c", "kill -s PIPE $$; exit 3"])
+            .output(OutputMode::Discard)
+            .spawn()
+            .expect("/bin/sh starts");
+        let status = child.wait().expect("the shell is reaped");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGPIPE),
+            "the child inherited an ignored SIGPIPE: {status:?}"
+        );
+    }
+
     /// A child can be gone before its parent reads its identity, and launching
     /// it must still succeed. macOS is where this bites: `proc_pidinfo` answers
     /// `ESRCH` for a child that has only just exited, so `IncludeExited` -- which

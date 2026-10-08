@@ -64,7 +64,10 @@ use runner_manager_domain::policy::ScalePolicy;
 use runner_manager_domain::store::Store as _;
 use runner_manager_platform::host_fitness::{self, ElevationOutcome};
 use runner_manager_platform::runner_env::{self, Inherited, RunnerEnv, RunnerPlatform};
-use runner_manager_platform::service::{InstallRecord, LAUNCHD_PROCESS_TYPE, plist_string_value};
+use runner_manager_platform::service::{
+    InstallRecord, LAUNCHD_PROCESS_TYPE, ServiceAccount, plist_string_value, service_account_name,
+};
+use runner_manager_platform::unattended_login::{self, Resume, UnattendedLogin};
 use serde::{Deserialize, Serialize};
 
 use super::workspace::{self, HostRoot};
@@ -88,12 +91,7 @@ pub const REQUIRED_TOOLS_FILE: &str = "required-tools.json";
 /// credential, so that copy does not run the doctor in turn.
 pub const SKIP_DOCTOR_VARIABLE: &str = "RUNNER_MANAGER_SKIP_HOST_DOCTOR";
 
-/// How often the daemon re-evaluates the required checks.
-pub const DAEMON_RECHECK: Duration = Duration::from_secs(5 * 60);
-
-/// How long the daemon's host-unfit record counts as a refusal in force: three
-/// rechecks, so one slow evaluation does not hide it.
-const HOST_UNFIT_RECORD_FRESH: Duration = Duration::from_secs(3 * DAEMON_RECHECK.as_secs());
+pub use host_fitness::DAEMON_RECHECK;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The memory one concurrent job is assumed to need when a capacity is
@@ -101,7 +99,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const MEMORY_PER_RUNNER_GIB: u64 = 3;
 
 /// A GitHub contact this recent proves the service could read its credential.
-const RECENT_CONTACT_SECS: u64 = 15 * 60;
+pub(crate) const RECENT_CONTACT_SECS: u64 = 15 * 60;
 
 const ALLOW_AV_EXCLUSION: &str = "--allow-av-exclusion";
 const ALLOW_DEVELOPER_MODE: &str = "--allow-developer-mode";
@@ -265,6 +263,16 @@ pub struct HostSetup {
     /// launch fence. See [`runner_manager_platform::launch_health`].
     #[serde(default)]
     pub launches_blocked: Option<runner_manager_platform::launch_health::LaunchesBlocked>,
+    /// The account the service runs as, or would run as, on macOS.
+    #[serde(default)]
+    pub service_account: Option<String>,
+    /// That account's home folder, on macOS.
+    #[serde(default)]
+    pub service_home: Option<PathBuf>,
+    /// The required checks the running daemon finds failing, from its own
+    /// session, when it refuses to start runners. See [`evaluate`].
+    #[serde(default, skip_serializing)]
+    pub daemon_unfit: Option<host_fitness::HostUnfitRecord>,
 }
 
 impl HostSetup {
@@ -381,6 +389,15 @@ pub trait HostFacts {
         binary: &Path,
         data_root: Option<&Path>,
     ) -> Result<CredentialProbe, String>;
+    /// macOS's power settings in use now (`pmset -g`), by name. `Ok(None)` on
+    /// a platform without them.
+    fn power_settings(&self) -> Result<Option<BTreeMap<String, u32>>, String> {
+        Ok(None)
+    }
+    /// Automatic login and FileVault. `None` on a platform without them.
+    fn unattended_login(&self) -> Option<UnattendedLogin> {
+        None
+    }
 }
 
 /// The writes fixes and reverts make.
@@ -396,6 +413,12 @@ pub trait HostActions {
     fn add_defender_exclusions(&self, paths: &[String]) -> Result<(), String>;
     fn remove_defender_exclusions(&self, paths: &[String]) -> Result<(), String>;
     fn set_spotlight(&self, volume: &Path, enabled: bool) -> Result<(), String>;
+    /// `pmset -a NAME VALUE`, for one of [`POWER_SETTINGS`].
+    fn set_power_setting(&self, name: &str, _value: u32) -> Result<(), String> {
+        Err(format!(
+            "cannot set {name}: power settings exist only on macOS"
+        ))
+    }
 }
 
 /// One change a fix made, with what it replaced.
@@ -424,7 +447,21 @@ pub enum Change {
     SpotlightIndexingOff {
         volume: PathBuf,
     },
+    PowerSetting {
+        name: String,
+        previous: Option<u32>,
+        applied: u32,
+    },
 }
+
+/// The power settings a fix may write, with the largest value a revert may
+/// restore. A closed set, as with [`RegValue`]: the journal is a plain file.
+const POWER_SETTINGS: [(&str, u32); 4] = [
+    ("sleep", u16::MAX as u32),
+    ("disksleep", u16::MAX as u32),
+    ("autorestart", 1),
+    ("womp", 1),
+];
 
 /// The only execution policies a revert may restore.
 const EXECUTION_POLICIES: [&str; 6] = [
@@ -448,6 +485,7 @@ impl Change {
             Self::GitSystemConfig { name, .. } => format!("git:{name}"),
             Self::DefenderExclusions { added } => format!("defender:{}", added.join(";")),
             Self::SpotlightIndexingOff { volume } => format!("spotlight:{}", volume.display()),
+            Self::PowerSetting { name, .. } => format!("pmset:{name}"),
         }
     }
 
@@ -486,6 +524,14 @@ impl Change {
             Self::SpotlightIndexingOff { volume } => {
                 format!("Spotlight indexing off for {}", volume.display())
             }
+            Self::PowerSetting {
+                name,
+                previous,
+                applied,
+            } => format!(
+                "pmset -a {name} {applied} (was {})",
+                previous.map_or_else(|| "not set".to_owned(), |v| v.to_string())
+            ),
         }
     }
 
@@ -517,6 +563,24 @@ impl Change {
             }
             Self::DefenderExclusions { added } => actions.remove_defender_exclusions(added),
             Self::SpotlightIndexingOff { volume } => actions.set_spotlight(volume, true),
+            Self::PowerSetting {
+                name,
+                previous: Some(previous),
+                ..
+            } if POWER_SETTINGS
+                .iter()
+                .any(|(known, most)| known == name && previous <= most) =>
+            {
+                actions.set_power_setting(name, *previous)
+            }
+            Self::PowerSetting {
+                name,
+                previous: None,
+                ..
+            } => Err(format!(
+                "pmset reported no `{name}` before `host prepare` set it, so there is nothing to \
+                 put back"
+            )),
             _ => Err(format!(
                 "the journal records a change `host prepare` never makes ({}); it was not reverted",
                 self.key()
@@ -704,6 +768,77 @@ pub const CHECKS: &[CheckSpec] = &[
         }),
     },
     CheckSpec {
+        id: "macos.sleep",
+        title: "The Mac does not go to sleep",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Recommended,
+        probe: probe_sleep,
+        fix: Some(FixSpec {
+            needs_admin: true,
+            consent_flag: None,
+            action: "pmset -a sleep 0 (the Mac stops sleeping when nobody uses it; the display \
+                     still turns off)",
+            apply: apply_sleep,
+        }),
+    },
+    CheckSpec {
+        id: "macos.disk_sleep",
+        title: "Disks do not sleep",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Recommended,
+        probe: probe_disk_sleep,
+        fix: Some(FixSpec {
+            needs_admin: true,
+            consent_flag: None,
+            action: "pmset -a disksleep 0",
+            apply: apply_disk_sleep,
+        }),
+    },
+    CheckSpec {
+        id: "macos.autorestart",
+        title: "The Mac starts again after a power failure",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Recommended,
+        probe: probe_autorestart,
+        fix: Some(FixSpec {
+            needs_admin: true,
+            consent_flag: None,
+            action: "pmset -a autorestart 1",
+            apply: apply_autorestart,
+        }),
+    },
+    CheckSpec {
+        id: "macos.wake_on_lan",
+        title: "The Mac wakes for network access",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Info,
+        probe: probe_wake_on_lan,
+        fix: Some(FixSpec {
+            needs_admin: true,
+            consent_flag: None,
+            action: "pmset -a womp 1",
+            apply: apply_wake_on_lan,
+        }),
+    },
+    CheckSpec {
+        id: "macos.unattended_login",
+        title: "The service comes back after an unattended restart",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Recommended,
+        probe: probe_unattended_login,
+        // Automatic login and FileVault are security settings: reported with
+        // the steps, never changed by `host prepare`.
+        fix: None,
+    },
+    CheckSpec {
+        id: "macos.runner_root_location",
+        title: "Runner roots have no spaces and are outside the service account's home",
+        platform: CheckPlatform::Macos,
+        severity: Severity::Recommended,
+        probe: probe_runner_root_location,
+        fix: None,
+    },
+    CheckSpec {
         id: "macos.keychain_credential",
         title: "Service binary can read its GitHub credential",
         platform: CheckPlatform::Macos,
@@ -737,6 +872,17 @@ pub const CHECKS: &[CheckSpec] = &[
     },
     // Recommended, not Required: a Required failure makes the daemon refuse
     // every launch, and this check reports exactly that refusal.
+    // The daemon's own: its host checks did not finish, so one is blocked. A
+    // command's look always finishes, so it passes here; `daemon_view` fails
+    // it when the service recorded it.
+    CheckSpec {
+        id: BLOCKED_CHECKS_ID,
+        title: "The service's host checks finish",
+        platform: CheckPlatform::Any,
+        severity: Severity::Required,
+        probe: |_, _| pass("the host checks finish"),
+        fix: None,
+    },
     CheckSpec {
         id: "host.launches",
         title: "The service can start runners",
@@ -746,6 +892,10 @@ pub const CHECKS: &[CheckSpec] = &[
         fix: None,
     },
 ];
+
+/// The id the daemon's host-unfit record carries when its host checks did not
+/// finish.
+pub const BLOCKED_CHECKS_ID: &str = "host.checks";
 
 fn check(id: &str) -> Option<&'static CheckSpec> {
     CHECKS.iter().find(|check| check.id == id)
@@ -1243,11 +1393,10 @@ fn probe_spotlight(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
         return outcome;
     };
     let remedy = format!(
-        "{} is on the startup volume: move it into a folder whose name ends in `.noindex` \
-         (runner-manager host set-runtime-root --path {}.noindex), or add it to System \
-         Settings > Spotlight > Search Privacy",
+        "{} is on the startup volume: move it into a folder whose name ends in `.noindex`, has \
+         no spaces and is outside your home folder (runner-manager host set-runtime-root --path \
+         {MACOS_RUNNER_ROOT}), or add it to System Settings > Spotlight > Search Privacy",
         startup_root.display(),
-        startup_root.display()
     );
     let outcome = outcome.remedy(remedy);
     if indexed.iter().all(|(_, volume)| is_startup_volume(volume)) {
@@ -1278,6 +1427,230 @@ fn apply_spotlight(
         changes.push(Change::SpotlightIndexingOff { volume });
     }
     Ok(changes)
+}
+
+// -- macos.sleep, macos.disk_sleep, macos.autorestart, macos.wake_on_lan --------
+
+/// A runner root a Mac can always use: no spaces, outside every home folder,
+/// and named `.noindex` so Spotlight leaves it alone. Jobs that broke under
+/// `~/Library/Application Support` pass there, measured on the runner Macs.
+const MACOS_RUNNER_ROOT: &str = "/Users/Shared/rman.noindex";
+
+/// Reads `pmset -g`: every setting it lists, by name. A name can contain
+/// spaces (`Sleep On Power Button 1`) and a value can carry a note (`sleep 0
+/// (sleep prevented by powerd)`), so the value is the first number on the line
+/// and the name is everything before it.
+fn power_settings_in(output: &str) -> BTreeMap<String, u32> {
+    let mut settings = BTreeMap::new();
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with(char::is_whitespace))
+    {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let Some(at) = words.iter().position(|word| word.parse::<u32>().is_ok())
+            && at > 0
+            && let Ok(value) = words[at].parse()
+        {
+            settings.insert(words[..at].join(" "), value);
+        }
+    }
+    settings
+}
+
+/// One power setting against the value a runner host wants.
+fn power_probe(
+    settings: Result<Option<BTreeMap<String, u32>>, String>,
+    name: &str,
+    wanted: u32,
+    good: &str,
+    bad: impl Fn(u32) -> String,
+) -> Outcome {
+    match settings {
+        Err(error) => unknown(format!("`pmset -g` could not be read: {error}")),
+        Ok(None) => not_applicable("this platform has no power settings to check"),
+        Ok(Some(settings)) => match settings.get(name) {
+            None => not_applicable(format!("this Mac has no `{name}` power setting")),
+            Some(&value) if value == wanted => pass(good),
+            Some(&value) => fail(bad(value)),
+        },
+    }
+}
+
+fn apply_power(
+    facts: &dyn HostFacts,
+    actions: &dyn HostActions,
+    name: &str,
+    wanted: u32,
+) -> Result<Vec<Change>, String> {
+    let previous = facts
+        .power_settings()?
+        .and_then(|settings| settings.get(name).copied());
+    actions.set_power_setting(name, wanted)?;
+    Ok(vec![Change::PowerSetting {
+        name: name.to_owned(),
+        previous,
+        applied: wanted,
+    }])
+}
+
+fn probe_sleep(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    let settings = facts.power_settings();
+    if let Ok(Some(settings)) = &settings
+        && settings.get("SleepDisabled") == Some(&1)
+    {
+        return pass("sleep is disabled for the whole system");
+    }
+    power_probe(
+        settings,
+        "sleep",
+        0,
+        "the Mac does not sleep on its own",
+        |minutes| {
+            format!(
+                "the Mac sleeps after {minutes} minute(s) nobody uses it, and a sleeping Mac freezes \
+             the job it is running; GitHub fails a job whose runner stops answering"
+            )
+        },
+    )
+}
+
+fn apply_sleep(
+    _: &HostSetup,
+    facts: &dyn HostFacts,
+    actions: &dyn HostActions,
+) -> Result<Vec<Change>, String> {
+    apply_power(facts, actions, "sleep", 0)
+}
+
+fn probe_disk_sleep(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    power_probe(
+        facts.power_settings(),
+        "disksleep",
+        0,
+        "disks do not sleep",
+        |minutes| {
+            format!(
+                "disks sleep after {minutes} minute(s) idle, so the first read after a quiet spell \
+             waits for a disk to wake"
+            )
+        },
+    )
+}
+
+fn apply_disk_sleep(
+    _: &HostSetup,
+    facts: &dyn HostFacts,
+    actions: &dyn HostActions,
+) -> Result<Vec<Change>, String> {
+    apply_power(facts, actions, "disksleep", 0)
+}
+
+fn probe_autorestart(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    power_probe(
+        facts.power_settings(),
+        "autorestart",
+        1,
+        "the Mac starts again by itself after a power failure",
+        |_| {
+            "after a power failure the Mac stays off until somebody presses its power button"
+                .to_owned()
+        },
+    )
+}
+
+fn apply_autorestart(
+    _: &HostSetup,
+    facts: &dyn HostFacts,
+    actions: &dyn HostActions,
+) -> Result<Vec<Change>, String> {
+    apply_power(facts, actions, "autorestart", 1)
+}
+
+fn probe_wake_on_lan(_: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    power_probe(
+        facts.power_settings(),
+        "womp",
+        1,
+        "the Mac wakes when the network asks it to",
+        |_| "Wake for network access is off, so the Mac cannot be woken remotely".to_owned(),
+    )
+}
+
+fn apply_wake_on_lan(
+    _: &HostSetup,
+    facts: &dyn HostFacts,
+    actions: &dyn HostActions,
+) -> Result<Vec<Change>, String> {
+    apply_power(facts, actions, "womp", 1)
+}
+
+// -- macos.unattended_login ---------------------------------------------------
+
+fn probe_unattended_login(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
+    let Some(service) = &setup.service else {
+        return not_applicable("no service is installed");
+    };
+    let Some(found) = facts.unattended_login() else {
+        return not_applicable("automatic login and FileVault could not be probed here");
+    };
+    let account = setup
+        .service_account
+        .as_deref()
+        .unwrap_or("the service account");
+    let verdict = unattended_login::resume(&found, service.start_mode, account);
+    let (Some(detail), Some(remedy)) = (verdict.detail(account), verdict.remedy()) else {
+        return match verdict {
+            Resume::Resumes => pass(match service.start_mode {
+                StartMode::Login => format!(
+                    "automatic login signs {account} in and FileVault is off, so the service \
+                     starts again after a restart"
+                ),
+                StartMode::Boot => "FileVault is off, so the service starts at boot".to_owned(),
+            }),
+            _ => unknown(verdict.detail(account).unwrap_or_default()),
+        };
+    };
+    fail(detail).remedy(remedy)
+}
+
+// -- macos.runner_root_location -----------------------------------------------
+
+fn probe_runner_root_location(setup: &HostSetup, _: &dyn HostFacts) -> Outcome {
+    if setup.runner_roots.is_empty() {
+        return not_applicable("no runner root could be resolved");
+    }
+    let home = setup
+        .service_home
+        .as_deref()
+        .filter(|home| *home != Path::new("/"));
+    let mut found = Vec::new();
+    for root in &setup.runner_roots {
+        if root.to_string_lossy().chars().any(char::is_whitespace) {
+            found.push(format!(
+                "{} has a space in its path, which breaks job scripts that do not quote paths",
+                root.display()
+            ));
+        }
+        if let Some(home) = home
+            && root.starts_with(home)
+        {
+            found.push(format!(
+                "{} is inside {}, the home folder of the account the service runs as, and so is \
+                 every job's TMPDIR; a test that builds a stand-in home folder under TMPDIR then \
+                 nests it inside the real one",
+                root.display(),
+                home.display()
+            ));
+        }
+    }
+    if found.is_empty() {
+        pass("no runner root has a space in its path or is inside the service account's home")
+    } else {
+        fail(found.join("; ")).remedy(format!(
+            "move the runner root to a folder with no spaces outside every home folder: \
+             runner-manager host set-runtime-root --path {MACOS_RUNNER_ROOT}"
+        ))
+    }
 }
 
 // -- macos.keychain_credential ------------------------------------------------
@@ -1364,15 +1737,46 @@ fn probe_runner_root_responsive(setup: &HostSetup, facts: &dyn HostFacts) -> Out
         return not_applicable("no runner root could be resolved");
     }
     let mut hung = Vec::new();
+    let mut asking = Vec::new();
+    let mut refused = Vec::new();
     let mut errors = Vec::new();
     for root in &setup.runner_roots {
+        let privacy_protected = setup.os == HostOs::Macos && is_privacy_protected_volume(root);
         match facts.directory_responds(root) {
             host_fitness::Responsiveness::Responds => {}
-            host_fitness::Responsiveness::Hung => hung.push(root.display().to_string()),
-            host_fitness::Responsiveness::Failed(error) => {
+            host_fitness::Responsiveness::ListingBlocked if privacy_protected => {
+                asking.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::NotPermitted(_) if privacy_protected => {
+                refused.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::Hung | host_fitness::Responsiveness::ListingBlocked => {
+                hung.push(root.display().to_string());
+            }
+            host_fitness::Responsiveness::NotPermitted(error)
+            | host_fitness::Responsiveness::Failed(error) => {
                 errors.push(format!("{}: {error}", root.display()));
             }
         }
+    }
+    if !asking.is_empty() {
+        return fail(format!(
+            "macOS has not let the service list {}: listing it waits, which is what a pending \
+             privacy question looks like (\"would like to access files on a removable volume\", \
+             or on a network volume). Nothing starts there until somebody answers it",
+            asking.join(", ")
+        ))
+        .remedy(format!(
+            "{PRIVACY_PROMPT_REMEDY}; if no dialog is showing, check the volume"
+        ));
+    }
+    if !refused.is_empty() {
+        return fail(format!(
+            "macOS refuses to let the service list {} (Operation not permitted): its access to \
+             files on that volume was turned down",
+            refused.join(", ")
+        ))
+        .remedy(PRIVACY_REFUSED_REMEDY);
     }
     if !hung.is_empty() {
         return fail(format!(
@@ -1391,6 +1795,22 @@ fn probe_runner_root_responsive(setup: &HostSetup, facts: &dyn HostFacts) -> Out
     }
     pass("every runner root answers")
 }
+
+/// Folders macOS guards behind a privacy question: every other volume, under
+/// `/Volumes`. The startup volume's own folders are not asked about.
+fn is_privacy_protected_volume(root: &Path) -> bool {
+    root.starts_with("/Volumes")
+}
+
+/// What to click when the question is on the desktop.
+const PRIVACY_PROMPT_REMEDY: &str = "at this Mac's desktop, click Allow on the dialog asking \
+     whether runner-manager may access files on a removable (or network) volume. macOS asks \
+     again after every runner-manager update, because it ties the answer to the exact build";
+
+/// What to turn on when the question was answered no.
+const PRIVACY_REFUSED_REMEDY: &str = "System Settings > Privacy & Security > Files & Folders > \
+     runner-manager: turn on Removable Volumes (or Network Volumes); the service checks again \
+     within five minutes";
 
 // -- host.capacity ------------------------------------------------------------
 
@@ -1554,7 +1974,7 @@ pub fn evaluate(setup: &HostSetup, facts: &dyn HostFacts) -> Report {
         .iter()
         .filter(|check| check.platform.includes(setup.os))
         .map(|check| {
-            let outcome = (check.probe)(setup, facts);
+            let outcome = daemon_view(setup, check.id, (check.probe)(setup, facts));
             Finding {
                 id: check.id,
                 title: check.title,
@@ -1582,6 +2002,40 @@ pub fn evaluate(setup: &HostSetup, facts: &dyn HostFacts) -> Report {
         perspective: setup.perspective,
         elevated: facts.elevated(),
         findings,
+    }
+}
+
+/// A required check the running daemon finds failing fails here too, whatever
+/// this command's own probe says.
+///
+/// The two can disagree, and the daemon is the one that matters: it is the
+/// account and the session runners inherit. Over SSH on a Mac, the daemon in
+/// the desktop session was waiting on a privacy question about the runner
+/// root's volume and starting no runner, while `host doctor` in the SSH
+/// session listed the same root and reported it passing.
+fn daemon_view(setup: &HostSetup, id: &str, outcome: Outcome) -> Outcome {
+    if setup.perspective != Perspective::Operator || outcome.status == Status::Fail {
+        return outcome;
+    }
+    let Some(unfit) = &setup.daemon_unfit else {
+        return outcome;
+    };
+    if !unfit.checks.iter().any(|failing| failing == id) {
+        return outcome;
+    }
+    let found = unfit.findings.iter().find(|finding| finding.id == id);
+    let failed = fail(format!(
+        "the service finds this failing from its own session, and starts no runner until it \
+         passes{}; this command's own look found: {}",
+        found.map_or_else(String::new, |finding| format!(": {}", finding.detail)),
+        outcome.detail
+    ));
+    match found
+        .and_then(|finding| finding.remedy.clone())
+        .or(outcome.remedy)
+    {
+        Some(remedy) => failed.remedy(remedy),
+        None => failed,
     }
 }
 
@@ -1774,6 +2228,25 @@ fn current_daemon_contact_age(
     u64::try_from((now - contact).num_seconds()).ok()
 }
 
+/// How long ago the installed service last reached GitHub, counted only when
+/// the binary installed now made that contact. See
+/// [`current_daemon_contact_age`].
+pub(crate) fn installed_service_contact_age(context: &Context) -> Option<u64> {
+    let binary = InstallRecord::read(context.paths()).ok().flatten()?.binary;
+    service_contact_age(context, Some(&binary))
+}
+
+/// [`current_daemon_contact_age`] for the service binary at `binary`.
+fn service_contact_age(context: &Context, binary: Option<&Path>) -> Option<u64> {
+    current_daemon_contact_age(
+        runner_manager_platform::service::last_github_contact(context.paths())
+            .ok()
+            .flatten(),
+        binary.and_then(replaced_at),
+        context.clock().now(),
+    )
+}
+
 /// When `binary` was put in place: its status-change time, which a copy or a
 /// rename sets and nothing can set back (a copy may keep the source's
 /// modification time). The modification time where there is no such field.
@@ -1843,6 +2316,7 @@ fn setup_from_parts(
         runner_roots.push(cache_root);
     }
     let mode = service.as_ref().map(|service| service.start_mode);
+    let (service_account, service_home) = service_account_and_home(perspective, mode);
     let (required_tools, required_tools_error) = match required_tools(context) {
         Ok(tools) => (tools, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
@@ -1857,14 +2331,9 @@ fn setup_from_parts(
         runner_path: runner_path(context, perspective, mode),
         probe_dir: context.paths().state_dir().to_path_buf(),
         data_root: context.data_root.clone(),
-        service_contact_age_secs: current_daemon_contact_age(
-            runner_manager_platform::service::last_github_contact(context.paths())
-                .ok()
-                .flatten(),
-            service
-                .as_ref()
-                .and_then(|service| replaced_at(&service.binary)),
-            context.clock().now(),
+        service_contact_age_secs: service_contact_age(
+            context,
+            service.as_ref().map(|service| service.binary.as_path()),
         ),
         service_credential_unreadable:
             runner_manager_platform::service::credential_unreadable_since(context.paths())
@@ -1881,8 +2350,36 @@ fn setup_from_parts(
             context.paths(),
             context.clock().now(),
         ),
+        service_account,
+        service_home,
+        daemon_unfit: (perspective == Perspective::Operator)
+            .then(|| host_fitness::host_unfit_in_force(context.paths(), context.clock().now()))
+            .flatten(),
         service,
     }
+}
+
+/// The account the service runs as on macOS, and its home folder: root's for
+/// a boot service seen by an operator, and otherwise this process's own (a
+/// login service runs as the account that installed it, and the daemon is the
+/// service). `(None, None)` elsewhere, where nothing reads them.
+fn service_account_and_home(
+    perspective: Perspective,
+    mode: Option<StartMode>,
+) -> (Option<String>, Option<PathBuf>) {
+    if HostOs::current() != HostOs::Macos {
+        return (None, None);
+    }
+    if perspective == Perspective::Operator && mode == Some(StartMode::Boot) {
+        return (
+            Some(ServiceAccount::Root.as_str().to_owned()),
+            Some(PathBuf::from("/var/root")),
+        );
+    }
+    (
+        Some(service_account_name(&ServiceAccount::InvokingUser)),
+        runner_manager_platform::service::host_home(),
+    )
 }
 
 /// Builds the setup by reading this host's configuration.
@@ -2026,6 +2523,23 @@ impl HostFacts for SystemFacts {
 
     fn cpu_count(&self) -> usize {
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+    }
+
+    fn power_settings(&self) -> Result<Option<BTreeMap<String, u32>>, String> {
+        if !cfg!(target_os = "macos") {
+            return Ok(None);
+        }
+        let output = run_capture(Path::new("/usr/bin/pmset"), &["-g"])?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(Some(power_settings_in(&String::from_utf8_lossy(
+            &output.stdout,
+        ))))
+    }
+
+    fn unattended_login(&self) -> Option<UnattendedLogin> {
+        unattended_login::probe()
     }
 
     fn spotlight_indexing(&self, volume: &Path) -> Result<Option<bool>, String> {
@@ -2207,6 +2721,23 @@ impl HostActions for SystemActions {
         let output = run_capture(
             Path::new("/usr/bin/mdutil"),
             &["-i", flag, &volume.to_string_lossy()],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    }
+
+    fn set_power_setting(&self, name: &str, value: u32) -> Result<(), String> {
+        if !POWER_SETTINGS.iter().any(|(known, _)| *known == name) {
+            return Err(format!(
+                "{name} is not a power setting `host prepare` changes"
+            ));
+        }
+        let output = run_capture(
+            Path::new("/usr/bin/pmset"),
+            &["-a", name, &value.to_string()],
         )?;
         if output.status.success() {
             Ok(())
@@ -2768,11 +3299,15 @@ pub struct PrepareOutcome {
 /// [`Failure::InvalidArgument`] for an unknown id, or a non-interactive run
 /// without `--yes`; [`Failure::LocalState`] when the journal cannot be written.
 pub fn prepare(
-    run: PrepareRun<'_>,
+    mut run: PrepareRun<'_>,
     only: &[String],
     out: &mut dyn Write,
 ) -> Result<PrepareOutcome, CliError> {
     known_ids(only)?;
+    // What the service found is reported, not prepared: a fix is planned from
+    // this host's own probes, and judged by them afterwards. The service
+    // re-checks within five minutes and drops its record then.
+    run.setup.daemon_unfit = None;
     let failed = write_failed("this host preparation");
     let before = evaluate(&run.setup, run.facts);
     let plan = plan(&before, only, &run.consent, run.prompt);
@@ -3078,6 +3613,8 @@ pub struct FindingSummary {
 pub struct HostUnfitSummary {
     pub since: Timestamp,
     pub checks: Vec<String>,
+    /// What each check found and what fixes it, as the daemon recorded it.
+    pub detail: String,
 }
 
 /// The `doctor` block of `status --json`.
@@ -3123,22 +3660,16 @@ impl DoctorSummary {
                 })
                 .map(|finding| finding.id.to_owned())
                 .collect(),
-            daemon_host_unfit: host_fitness::host_unfit(context.paths())
-                .ok()
-                .flatten()
-                // A running daemon re-stamps the record every recheck, so one
-                // it has not touched for several is left behind by a daemon
-                // that stopped (or was uninstalled) while refusing, not a
-                // refusal in force.
-                .filter(|record| {
-                    (context.clock().now() - record.checked_at)
-                        .to_std()
-                        .is_ok_and(|age| age <= HOST_UNFIT_RECORD_FRESH)
-                })
-                .map(|record| HostUnfitSummary {
-                    since: record.since,
-                    checks: record.checks,
-                }),
+            // A record a daemon stopped re-stamping is not a refusal in force.
+            daemon_host_unfit: host_fitness::host_unfit_in_force(
+                context.paths(),
+                context.clock().now(),
+            )
+            .map(|record| HostUnfitSummary {
+                since: record.since,
+                detail: record.describe(),
+                checks: record.checks,
+            }),
         }
     }
 
@@ -3381,6 +3912,10 @@ fn tui_summary(outcome: &PrepareOutcome) -> String {
     format!("Host prepare: {}.", parts.join("; "))
 }
 
+/// What [`daemon_preflight`] answers while an earlier evaluation is still
+/// running.
+pub const PREFLIGHT_STILL_RUNNING: &str = "the previous host checks are still running";
+
 /// What the daemon's preflight found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonVerdict {
@@ -3399,10 +3934,26 @@ pub struct DaemonVerdict {
 /// A description of why the checks could not run at all; the caller then
 /// holds nothing back.
 pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Set while an evaluation runs. One that outlived its caller's deadline
+    /// still holds a thread, so a recheck does not start a second beside it.
+    static EVALUATING: AtomicBool = AtomicBool::new(false);
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            EVALUATING.store(false, Ordering::Release);
+        }
+    }
     let setup = setup(context, Perspective::Daemon, None).map_err(|error| error.to_string())?;
-    let report = tokio::task::spawn_blocking(move || evaluate(&setup, &SystemFacts))
-        .await
-        .map_err(|error| error.to_string())?;
+    if EVALUATING.swap(true, Ordering::AcqRel) {
+        return Err(PREFLIGHT_STILL_RUNNING.to_owned());
+    }
+    let report = tokio::task::spawn_blocking(move || {
+        let _done = Done;
+        evaluate(&setup, &SystemFacts)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let verdict = DaemonVerdict {
         required: report.required_failing(),
         recommended: report
@@ -3413,7 +3964,15 @@ pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String
     let recorded = if verdict.required.is_empty() {
         host_fitness::clear_host_unfit(context.paths())
     } else {
-        host_fitness::record_host_unfit(context.paths(), &verdict.required, context.clock().now())
+        let findings: Vec<host_fitness::UnfitFinding> = report
+            .with(Severity::Required, Status::Fail)
+            .map(|finding| host_fitness::UnfitFinding {
+                id: finding.id.to_owned(),
+                detail: finding.detail.clone(),
+                remedy: finding.remedy.clone(),
+            })
+            .collect();
+        host_fitness::record_host_unfit(context.paths(), &findings, context.clock().now())
     };
     // The refusal itself does not depend on the record; only what `status`
     // can show does.
@@ -3454,9 +4013,13 @@ mod tests {
         mounts: HashMap<PathBuf, PathBuf>,
         /// Directories that do not answer.
         hung: Vec<PathBuf>,
+        /// Directories that answer something other than "responds" or "hung".
+        answers: HashMap<PathBuf, host_fitness::Responsiveness>,
         process_type: Option<String>,
         throttled: usize,
         credential: Option<CredentialProbe>,
+        power: Option<BTreeMap<String, u32>>,
+        unattended: Option<UnattendedLogin>,
     }
 
     impl HostFacts for Facts {
@@ -3502,6 +4065,9 @@ mod tests {
             Ok(Some(self.indexed.iter().any(|v| v == volume)))
         }
         fn directory_responds(&self, directory: &Path) -> host_fitness::Responsiveness {
+            if let Some(answer) = self.answers.get(directory) {
+                return answer.clone();
+            }
             if self.hung.iter().any(|hung| hung == directory) {
                 host_fitness::Responsiveness::Hung
             } else {
@@ -3523,6 +4089,12 @@ mod tests {
             _: Option<&Path>,
         ) -> Result<CredentialProbe, String> {
             self.credential.clone().ok_or_else(|| "no answer".into())
+        }
+        fn power_settings(&self) -> Result<Option<BTreeMap<String, u32>>, String> {
+            Ok(self.power.clone())
+        }
+        fn unattended_login(&self) -> Option<UnattendedLogin> {
+            self.unattended.clone()
         }
     }
 
@@ -3580,6 +4152,10 @@ mod tests {
                 .push(format!("spotlight {} {enabled}", volume.display()));
             Ok(())
         }
+        fn set_power_setting(&self, name: &str, value: u32) -> Result<(), String> {
+            self.log.borrow_mut().push(format!("pmset {name} {value}"));
+            Ok(())
+        }
     }
 
     fn windows_setup() -> HostSetup {
@@ -3604,6 +4180,9 @@ mod tests {
             service_credential_unreadable: false,
             own_keychain_readable: None,
             launches_blocked: None,
+            service_account: None,
+            service_home: None,
+            daemon_unfit: None,
         }
     }
 
@@ -3620,6 +4199,8 @@ mod tests {
             runner_roots: vec![PathBuf::from("/Volumes/NVME/rman")],
             runner_path: Some("/usr/bin".into()),
             probe_dir: PathBuf::from("/tmp/state"),
+            service_account: Some("me".into()),
+            service_home: Some(PathBuf::from("/Users/me")),
             ..windows_setup()
         }
     }
@@ -3634,6 +4215,336 @@ mod tests {
 
     fn status_of(setup: &HostSetup, facts: &Facts, id: &str) -> Status {
         finding(&evaluate(setup, facts), id).status
+    }
+
+    /// `pmset -g` on the runner Mac that was set up with the defaults.
+    const SLEEPY_MAC_PMSET: &str = "System-wide power settings:\n\
+                                    Currently in use:\n \
+                                    standby              0\n \
+                                    Sleep On Power Button 1\n \
+                                    autorestart          0\n \
+                                    powernap             1\n \
+                                    disksleep            10\n \
+                                    sleep                1 (sleep prevented by powerd)\n \
+                                    womp                 1\n";
+
+    #[test]
+    fn power_settings_are_read_the_way_pmset_prints_them() {
+        let settings = power_settings_in(SLEEPY_MAC_PMSET);
+        assert_eq!(settings.get("sleep"), Some(&1));
+        assert_eq!(settings.get("disksleep"), Some(&10));
+        assert_eq!(settings.get("autorestart"), Some(&0));
+        assert_eq!(settings.get("womp"), Some(&1));
+        assert_eq!(settings.get("Sleep On Power Button"), Some(&1));
+        assert!(!settings.contains_key("Currently in use:"));
+    }
+
+    #[test]
+    fn a_mac_that_sleeps_or_stays_off_after_a_power_failure_is_fixed_with_pmset() {
+        let setup = macos_setup();
+        let mut facts = Facts {
+            power: Some(power_settings_in(SLEEPY_MAC_PMSET)),
+            ..Facts::default()
+        };
+        let report = evaluate(&setup, &facts);
+        for id in ["macos.sleep", "macos.disk_sleep", "macos.autorestart"] {
+            let found = finding(&report, id);
+            assert_eq!(found.status, Status::Fail, "{id}");
+            assert_eq!(found.severity, Severity::Recommended, "{id}");
+            let fix = found.fix.as_ref().expect("fixable");
+            assert!(fix.needs_admin, "{id}");
+            assert!(fix.consent_flag.is_none(), "{id}");
+        }
+        assert_eq!(finding(&report, "macos.wake_on_lan").status, Status::Pass);
+
+        let actions = Actions::default();
+        for (id, expected) in [
+            ("macos.sleep", ("sleep", Some(1), 0)),
+            ("macos.disk_sleep", ("disksleep", Some(10), 0)),
+            ("macos.autorestart", ("autorestart", Some(0), 1)),
+        ] {
+            let (name, previous, applied) = expected;
+            assert_eq!(
+                apply_one(id, &setup, &facts, &actions).outcome,
+                FixOutcome::Applied {
+                    changes: vec![Change::PowerSetting {
+                        name: name.into(),
+                        previous,
+                        applied,
+                    }]
+                },
+                "{id}"
+            );
+        }
+        assert_eq!(
+            *actions.log.borrow(),
+            ["pmset sleep 0", "pmset disksleep 0", "pmset autorestart 1"]
+        );
+
+        // A revert puts back exactly what was there, and nothing outside the
+        // closed set a journal could name.
+        let reverting = Actions::default();
+        Change::PowerSetting {
+            name: "disksleep".into(),
+            previous: Some(10),
+            applied: 0,
+        }
+        .revert(&reverting)
+        .unwrap();
+        assert_eq!(*reverting.log.borrow(), ["pmset disksleep 10"]);
+        for tampered in [
+            Change::PowerSetting {
+                name: "hibernatemode".into(),
+                previous: Some(0),
+                applied: 3,
+            },
+            Change::PowerSetting {
+                name: "autorestart".into(),
+                previous: Some(7),
+                applied: 1,
+            },
+        ] {
+            assert!(tampered.revert(&reverting).is_err(), "{tampered:?}");
+        }
+
+        facts.power = Some(power_settings_in(
+            "Currently in use:\n sleep 0\n disksleep 0\n autorestart 1\n womp 0\n",
+        ));
+        for id in ["macos.sleep", "macos.disk_sleep", "macos.autorestart"] {
+            assert_eq!(status_of(&setup, &facts, id), Status::Pass, "{id}");
+        }
+        let womp = finding(&evaluate(&setup, &facts), "macos.wake_on_lan").clone();
+        assert_eq!((womp.status, womp.severity), (Status::Fail, Severity::Info));
+        assert!(!womp.needs_attention(), "wake-on-LAN is optional");
+        facts.power = None;
+        assert_eq!(
+            status_of(&setup, &facts, "macos.sleep"),
+            Status::NotApplicable
+        );
+    }
+
+    #[test]
+    fn unattended_login_is_reported_with_its_steps_and_never_fixed() {
+        use runner_manager_platform::unattended_login::AutoLogin;
+        let id = "macos.unattended_login";
+        let mut setup = macos_setup();
+        let mut facts = Facts {
+            unattended: Some(UnattendedLogin {
+                auto_login: AutoLogin::As("me".into()),
+                filevault_on: Some(false),
+            }),
+            ..Facts::default()
+        };
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+
+        facts.unattended = Some(UnattendedLogin {
+            auto_login: AutoLogin::Off,
+            filevault_on: Some(false),
+        });
+        let report = evaluate(&setup, &facts);
+        let off = finding(&report, id);
+        assert_eq!(off.status, Status::Fail);
+        assert!(
+            off.fix.is_none(),
+            "automatic login is never changed for you"
+        );
+        assert!(
+            off.detail.contains("waits for me to sign in"),
+            "{}",
+            off.detail
+        );
+        assert!(
+            off.remedy
+                .as_deref()
+                .unwrap()
+                .contains("System Settings > Users & Groups"),
+            "{off:?}"
+        );
+
+        facts.unattended = Some(UnattendedLogin {
+            auto_login: AutoLogin::As("me".into()),
+            filevault_on: Some(true),
+        });
+        let report = evaluate(&setup, &facts);
+        let locked = finding(&report, id);
+        assert_eq!(locked.status, Status::Fail);
+        assert!(locked.fix.is_none(), "FileVault is never changed for you");
+        assert!(
+            locked
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("Privacy & Security > FileVault"),
+            "{locked:?}"
+        );
+
+        setup.service = None;
+        assert_eq!(status_of(&setup, &facts, id), Status::NotApplicable);
+    }
+
+    /// The old Mac after an update: the daemon's listing of a runner root on
+    /// an external volume waits on "would like to access files on a removable
+    /// volume", and the report has to say which button that is.
+    #[test]
+    fn a_runner_root_behind_a_privacy_question_names_what_to_click() {
+        let id = "host.runner_root_responsive";
+        let root = PathBuf::from("/Volumes/NVME/runners");
+        let mut setup = macos_setup();
+        setup.runner_roots = vec![root.clone()];
+        let mut facts = Facts::default();
+        facts
+            .answers
+            .insert(root.clone(), host_fitness::Responsiveness::ListingBlocked);
+        let report = evaluate(&setup, &facts);
+        let asking = finding(&report, id);
+        assert_eq!(asking.status, Status::Fail);
+        assert_eq!(asking.severity, Severity::Required);
+        assert!(
+            asking.detail.contains("removable volume"),
+            "{}",
+            asking.detail
+        );
+        assert!(
+            asking.remedy.as_deref().unwrap().contains("click Allow"),
+            "{asking:?}"
+        );
+
+        facts.answers.insert(
+            root.clone(),
+            host_fitness::Responsiveness::NotPermitted("Operation not permitted".into()),
+        );
+        let report = evaluate(&setup, &facts);
+        let refused = finding(&report, id);
+        assert_eq!(refused.status, Status::Fail, "a refusal is not an unknown");
+        assert!(
+            refused
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("Files & Folders > runner-manager"),
+            "{refused:?}"
+        );
+
+        // Off `/Volumes` the startup volume asks nothing: a blocked listing is
+        // a stalled disk there, as before.
+        let local = PathBuf::from("/Users/Shared/rman.noindex");
+        setup.runner_roots = vec![local.clone()];
+        facts
+            .answers
+            .insert(local, host_fitness::Responsiveness::ListingBlocked);
+        let report = evaluate(&setup, &facts);
+        let stalled = finding(&report, id);
+        assert_eq!(stalled.status, Status::Fail);
+        assert!(!stalled.detail.contains("removable"), "{}", stalled.detail);
+    }
+
+    /// `host doctor` over SSH listed a root the daemon, in the desktop
+    /// session, could not, and called it passing. The daemon's own finding
+    /// wins.
+    #[test]
+    fn a_check_the_daemon_finds_failing_fails_here_too() {
+        let id = "host.runner_root_responsive";
+        let mut setup = macos_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+
+        let record = host_fitness::HostUnfitRecord {
+            schema_version: 1,
+            since: chrono::Utc::now(),
+            checked_at: chrono::Utc::now(),
+            checks: vec![id.into()],
+            findings: vec![host_fitness::UnfitFinding {
+                id: id.into(),
+                detail: "macOS has not let the service list /Volumes/NVME/rman".into(),
+                remedy: Some("click Allow".into()),
+            }],
+        };
+        setup.daemon_unfit = Some(record);
+        let report = evaluate(&setup, &facts);
+        let found = finding(&report, id);
+        assert_eq!(found.status, Status::Fail);
+        assert!(
+            found.detail.contains("from its own session"),
+            "{}",
+            found.detail
+        );
+        assert!(
+            found.detail.contains("/Volumes/NVME/rman"),
+            "{}",
+            found.detail
+        );
+        assert_eq!(found.remedy.as_deref(), Some("click Allow"));
+        assert!(!report.required_failing().is_empty());
+        assert_eq!(
+            finding(&report, "macos.spotlight").status,
+            status_of(
+                &HostSetup {
+                    daemon_unfit: None,
+                    ..setup.clone()
+                },
+                &facts,
+                "macos.spotlight"
+            ),
+            "only the checks the daemon names change"
+        );
+
+        // The daemon's own preflight is not overridden by its own record.
+        setup.perspective = Perspective::Daemon;
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+    }
+
+    #[test]
+    fn a_runner_root_with_a_space_or_inside_the_service_home_is_reported() {
+        let id = "macos.runner_root_location";
+        let mut setup = macos_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+
+        // The default root on a login-mode Mac: both problems at once.
+        setup.runner_roots = vec![PathBuf::from(
+            "/Users/me/Library/Application Support/io.github.IvanMurzak.runner-manager/runtime",
+        )];
+        let report = evaluate(&setup, &facts);
+        let found = finding(&report, id);
+        assert_eq!(found.status, Status::Fail);
+        assert!(found.detail.contains("has a space"), "{}", found.detail);
+        assert!(
+            found.detail.contains("inside /Users/me"),
+            "{}",
+            found.detail
+        );
+        let remedy = found.remedy.as_deref().unwrap();
+        assert!(remedy.contains(MACOS_RUNNER_ROOT), "{remedy}");
+        assert!(!MACOS_RUNNER_ROOT.contains(' '));
+
+        setup.runner_roots = vec![PathBuf::from("/Users/me/rman.noindex")];
+        let found = finding(&evaluate(&setup, &facts), id).clone();
+        assert_eq!(found.status, Status::Fail);
+        assert!(!found.detail.contains("has a space"), "{}", found.detail);
+
+        setup.runner_roots = vec![PathBuf::from(MACOS_RUNNER_ROOT)];
+        assert_eq!(status_of(&setup, &facts, id), Status::Pass);
+    }
+
+    #[test]
+    fn the_spotlight_remedy_names_a_root_with_no_spaces() {
+        let mut setup = macos_setup();
+        let root = PathBuf::from(
+            "/Users/me/Library/Application Support/io.github.IvanMurzak.runner-manager/runtime",
+        );
+        setup.runner_roots = vec![root.clone()];
+        let mut facts = Facts::default();
+        facts
+            .mounts
+            .insert(root, PathBuf::from("/System/Volumes/Data"));
+        facts.indexed = vec![PathBuf::from("/System/Volumes/Data")];
+        let report = evaluate(&setup, &facts);
+        let remedy = finding(&report, "macos.spotlight").remedy.clone().unwrap();
+        assert!(
+            remedy.contains(&format!("--path {MACOS_RUNNER_ROOT})")),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("runtime.noindex"), "{remedy}");
     }
 
     #[test]
@@ -4656,6 +5567,90 @@ mod tests {
     /// The whole prepare path against fakes: nothing is applied without a yes
     /// and with nobody to ask, and with one the batch goes to one elevated
     /// run and every change lands in the journal with what it replaced.
+    fn unfit_record(id: &str) -> host_fitness::HostUnfitRecord {
+        host_fitness::HostUnfitRecord {
+            schema_version: 1,
+            since: chrono::Utc::now(),
+            checked_at: chrono::Utc::now(),
+            checks: vec![id.into()],
+            findings: vec![host_fitness::UnfitFinding {
+                id: id.into(),
+                detail: "it fails for the service".into(),
+                remedy: None,
+            }],
+        }
+    }
+
+    /// What the service found is reported, never prepared: a run plans from
+    /// this host's own probes and judges them afterwards, and the elevated
+    /// copy is not handed the record.
+    #[test]
+    fn prepare_neither_plans_nor_judges_by_the_services_record() {
+        let root = tempfile::tempdir().unwrap();
+        let context = rooted_context(root.path());
+        let mut setup = windows_setup();
+        setup.daemon_unfit = Some(unfit_record("windows.long_paths"));
+        let facts = Facts {
+            dwords: [(RegValue::LongPathsEnabled, Ok(Some(1)))].into(),
+            exclusions: Some(Vec::new()),
+            ..Facts::default()
+        };
+        assert_eq!(
+            status_of(&setup, &facts, "windows.long_paths"),
+            Status::Fail,
+            "host doctor reports the service's finding"
+        );
+        let actions = Actions::default();
+        let elevator = FakeElevator {
+            facts: &facts,
+            actions: &actions,
+            refuse: false,
+            requests: RefCell::default(),
+        };
+        let outcome = prepare(
+            PrepareRun {
+                context: &context,
+                setup: setup.clone(),
+                facts: &facts,
+                actions: &actions,
+                elevator: &elevator,
+                prompt: &mut NoPrompt,
+                consent: Consent {
+                    assume_yes: true,
+                    ..Consent::default()
+                },
+            },
+            &["windows.long_paths".to_owned()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(outcome.results.is_empty(), "{outcome:?}");
+        assert_eq!(
+            finding(&outcome.after, "windows.long_paths").status,
+            Status::Pass
+        );
+        let encoded = serde_json::to_string(&setup).unwrap();
+        assert!(!encoded.contains("daemon_unfit"), "{encoded}");
+    }
+
+    /// The service's own "my checks never finished" is a check `host doctor`
+    /// shows, not a refusal only `status` knows about.
+    #[test]
+    fn host_checks_the_service_could_not_finish_fail_in_host_doctor() {
+        let mut setup = macos_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, BLOCKED_CHECKS_ID), Status::Pass);
+        setup.daemon_unfit = Some(unfit_record(BLOCKED_CHECKS_ID));
+        let report = evaluate(&setup, &facts);
+        assert_eq!(finding(&report, BLOCKED_CHECKS_ID).status, Status::Fail);
+        assert!(
+            report
+                .required_failing()
+                .iter()
+                .any(|id| id == BLOCKED_CHECKS_ID)
+        );
+    }
+
     #[test]
     fn prepare_needs_a_yes_then_elevates_once_and_journals_what_it_changed() {
         let root = tempfile::tempdir().unwrap();

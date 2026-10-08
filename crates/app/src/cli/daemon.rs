@@ -119,6 +119,9 @@ async fn run_generation(
     windows_service_host: bool,
 ) -> Result<DaemonOutcome, CliError> {
     let instance = acquire_instance(context)?;
+    // From here on this generation's loop beats, so a blocked one reads as
+    // stalled in `status` and `service status` rather than as healthy.
+    let _heartbeat = Heartbeat::start(context.paths().clone());
     reset_launch_state(context);
     let store = Arc::new(context.store()?);
     let host = super::host::local_host_or_create(context, store.as_ref())?;
@@ -163,6 +166,9 @@ async fn run_generation(
             }
             () = maintain_idle_credential(context, host.service_start_mode) => {
                 unreachable!("credential maintenance runs until the daemon is stopped")
+            },
+            () = answer_github_requests(context, host.service_start_mode) => {
+                unreachable!("GitHub requests are answered until the daemon is stopped")
             },
             // No runner grows the caches on an idle host, so nothing prunes on
             // a schedule; an operator's `host cache prune` is still honoured.
@@ -465,6 +471,9 @@ async fn run_generation(
         ) => {
             unreachable!("dependency cache pruning runs until the daemon is stopped")
         }
+        () = answer_github_requests(context, mode) => {
+            unreachable!("GitHub requests are answered until the daemon is stopped")
+        }
         () = maintain_wsl_recovery(watchdog_paths, wsl_inventory, windows_service_host) => {
             unreachable!("WSL recovery watchdog runs until the daemon is stopped")
         }
@@ -643,6 +652,47 @@ async fn maintain_dependency_caches(
     }
 }
 
+/// Answers what the stored credential reaches, for a command that cannot read
+/// it: `repo add`, `org add` or `auth status` in an SSH session on a login-mode
+/// Mac, whose login keychain that session cannot unlock. This process reads it
+/// in the session it runs in. See
+/// [`GITHUB_DISCOVERY`](runner_manager_platform::service_request::GITHUB_DISCOVERY).
+async fn answer_github_requests(context: &Context, mode: StartMode) {
+    use runner_manager_platform::service_request::{GITHUB_DISCOVERY, POLL};
+    let state_dir = context.paths().state_dir().to_path_buf();
+    // One discovery answers every request that arrives within this long, so
+    // whatever can write the state directory cannot spend the credential's
+    // GitHub budget faster than this.
+    const REUSE: Duration = Duration::from_secs(30);
+    let mut last: Option<(
+        std::time::Instant,
+        Result<super::auth::CredentialState, String>,
+    )> = None;
+    loop {
+        let requests = GITHUB_DISCOVERY.take(&state_dir);
+        if !requests.is_empty() {
+            let outcome = match &last {
+                Some((at, outcome)) if at.elapsed() < REUSE => outcome.clone(),
+                _ => {
+                    let outcome = super::auth::credential_state_for_service(context, mode).await;
+                    last = Some((std::time::Instant::now(), outcome.clone()));
+                    outcome
+                }
+            };
+            for request in requests {
+                if let Err(error) = GITHUB_DISCOVERY.answer(&state_dir, &request, outcome.clone()) {
+                    tracing::warn!(
+                        %error,
+                        reason = "github_request_unanswered",
+                        "could not answer a command waiting for what the credential reaches"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Publish only local, non-secret evidence. Windows owns the destructive
 /// decision; the guest owns the authoritative attempt journal and the audit
 /// for persistent runner services Windows cannot safely infer.
@@ -727,7 +777,14 @@ const CREDENTIAL_RENEWAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// first evaluation of a generation also names the missing recommended
 /// preparation, once.
 async fn observe_host_fitness(context: &Context, unfit: &AtomicBool, first: bool) {
-    match super::doctor::daemon_preflight(context).await {
+    let verdict = bounded_preflight(
+        super::doctor::daemon_preflight(context),
+        PREFLIGHT_DEADLINE,
+        runner_manager_platform::host_fitness::probes_in_flight,
+        context,
+    )
+    .await;
+    match verdict {
         Ok(verdict) => {
             let now_unfit = !verdict.required.is_empty();
             let was_unfit = unfit.swap(now_unfit, Ordering::AcqRel);
@@ -761,6 +818,124 @@ async fn observe_host_fitness(context: &Context, unfit: &AtomicBool, first: bool
                 "host checks could not run, so no runner is held back: {error}"
             );
         }
+    }
+}
+
+/// How long the host checks may take before the daemon treats them as blocked.
+/// Each runner-root probe gives up after five seconds on its own; this bounds
+/// everything else a check might wait on.
+const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(120);
+
+use super::doctor::BLOCKED_CHECKS_ID;
+
+/// Runs `preflight` for at most `deadline`, and says what checks that never
+/// finish mean.
+///
+/// While a directory probe is still blocked (`stuck` names the paths), a
+/// runner placed on this host would block there too -- a hung volume, or a
+/// runner root behind a macOS question nobody has answered -- so the host
+/// counts as unfit until it answers. A check that is merely slow elsewhere
+/// holds no runner back, as a check that could not run never does.
+async fn bounded_preflight(
+    preflight: impl Future<Output = Result<super::doctor::DaemonVerdict, String>>,
+    deadline: Duration,
+    stuck: impl FnOnce() -> Vec<std::path::PathBuf>,
+    context: &Context,
+) -> Result<super::doctor::DaemonVerdict, String> {
+    match tokio::time::timeout(deadline, preflight).await {
+        Ok(Err(error)) if error == super::doctor::PREFLIGHT_STILL_RUNNING => {}
+        Ok(verdict) => return verdict,
+        Err(_) => {}
+    }
+    let stuck = stuck();
+    if stuck.is_empty() {
+        return Err(format!(
+            "the host checks did not finish within {} seconds",
+            deadline.as_secs()
+        ));
+    }
+    let stuck = stuck
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let finding = runner_manager_platform::host_fitness::UnfitFinding {
+        id: BLOCKED_CHECKS_ID.to_owned(),
+        detail: format!(
+            "the host checks did not finish within {} seconds: {stuck} does not answer",
+            deadline.as_secs()
+        ),
+        remedy: Some(
+            if cfg!(target_os = "macos") {
+                "look for a dialog on this Mac's desktop asking whether runner-manager may \
+                 access files on a volume, and click Allow; otherwise check the volume holding \
+                 the runner root"
+            } else {
+                "check the volume holding the runner root (a stalled external disk or network \
+                 mount); `runner-manager host doctor` names it"
+            }
+            .to_owned(),
+        ),
+    };
+    if let Err(error) = runner_manager_platform::host_fitness::record_host_unfit(
+        context.paths(),
+        std::slice::from_ref(&finding),
+        context.clock().now(),
+    ) {
+        tracing::warn!(
+            event = "host_unfit_unrecorded",
+            "the host-fitness record could not be written: {error}"
+        );
+    }
+    Ok(super::doctor::DaemonVerdict {
+        required: vec![finding.id],
+        recommended: Vec::new(),
+    })
+}
+
+/// This generation's heartbeat task. It runs on the daemon's one runtime
+/// thread, so it says the loop is not blocked, not that every task advances.
+/// Dropped when the generation returns,
+/// which stops it and removes the record, so a daemon that exits cleanly
+/// never reads as stalled. See [`runner_manager_platform::daemon_heartbeat`].
+struct Heartbeat {
+    task: tokio::task::JoinHandle<()>,
+    paths: runner_manager_platform::paths::AppPaths,
+}
+
+impl Heartbeat {
+    fn start(paths: runner_manager_platform::paths::AppPaths) -> Self {
+        let beating = paths.clone();
+        let task = tokio::spawn(async move {
+            use runner_manager_platform::daemon_heartbeat::{HEARTBEAT_INTERVAL, beat};
+            let mut failing = false;
+            loop {
+                match beat(&beating, chrono::Utc::now()) {
+                    // Said once: a record that stops being written reads as a
+                    // stalled daemon, and this is the line that says why.
+                    Err(error) if !failing => {
+                        failing = true;
+                        tracing::warn!(
+                            %error,
+                            reason = "heartbeat_unwritten",
+                            "the daemon heartbeat could not be written, so `status` will call \
+                             this daemon stalled"
+                        );
+                    }
+                    Err(_) => {}
+                    Ok(()) => failing = false,
+                }
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            }
+        });
+        Self { task, paths }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = runner_manager_platform::daemon_heartbeat::stop(&self.paths);
     }
 }
 
@@ -2246,6 +2421,96 @@ impl RepositoryDirectory for GithubDirectory {
 mod tests {
     use super::*;
     use secrecy::SecretString;
+
+    fn rooted(root: &std::path::Path) -> Context {
+        let endpoints =
+            runner_manager_github::Endpoints::for_test_server("http://127.0.0.1:9").unwrap();
+        Context::rooted_against(root, endpoints).unwrap()
+    }
+
+    /// Host checks blocked behind a volume that never answers must not hold
+    /// the daemon's loop, and leave the host unfit with what to do.
+    #[tokio::test(start_paused = true)]
+    async fn host_checks_that_never_finish_make_the_host_unfit() {
+        let root = tempfile::tempdir().unwrap();
+        let context = rooted(root.path());
+        context.paths().create_all().unwrap();
+        let stuck_root = std::path::PathBuf::from("/Volumes/NVME/runners");
+        // Bounded from outside too, so a regression fails here rather than
+        // hanging the run.
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(600),
+            bounded_preflight(
+                std::future::pending(),
+                Duration::from_secs(120),
+                || vec![stuck_root.clone()],
+                &context,
+            ),
+        )
+        .await
+        .expect("host checks that never finish are given up on")
+        .expect("a verdict");
+        assert_eq!(verdict.required, [BLOCKED_CHECKS_ID]);
+        let record = runner_manager_platform::host_fitness::host_unfit(context.paths())
+            .unwrap()
+            .expect("recorded for status");
+        assert!(
+            record
+                .describe()
+                .contains("/Volumes/NVME/runners does not answer"),
+            "{record:?}"
+        );
+
+        // A recheck while that evaluation still runs says the same.
+        let again = bounded_preflight(
+            async { Err(super::super::doctor::PREFLIGHT_STILL_RUNNING.to_owned()) },
+            Duration::from_secs(120),
+            || vec![stuck_root.clone()],
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.required, [BLOCKED_CHECKS_ID]);
+
+        // Slow, with no directory blocked: nothing is held back.
+        let slow = bounded_preflight(
+            std::future::pending(),
+            Duration::from_secs(120),
+            Vec::new,
+            &context,
+        )
+        .await;
+        assert!(slow.is_err(), "{slow:?}");
+
+        // A preflight that answers is passed through untouched.
+        let answered = bounded_preflight(
+            async { Ok(super::super::doctor::DaemonVerdict::default()) },
+            Duration::from_secs(120),
+            Vec::new,
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(answered.required.is_empty());
+    }
+
+    /// The heartbeat beats while the generation runs and is gone once it
+    /// returns.
+    #[tokio::test]
+    async fn the_heartbeat_beats_until_the_generation_ends() {
+        use runner_manager_platform::daemon_heartbeat::{Liveness, liveness};
+        let root = tempfile::tempdir().unwrap();
+        let paths = runner_manager_platform::paths::AppPaths::rooted_at(root.path());
+        paths.create_all().unwrap();
+        let heartbeat = Heartbeat::start(paths.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            liveness(&paths, chrono::Utc::now()),
+            Liveness::Beating { .. }
+        ));
+        drop(heartbeat);
+        assert_eq!(liveness(&paths, chrono::Utc::now()), Liveness::Unknown);
+    }
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

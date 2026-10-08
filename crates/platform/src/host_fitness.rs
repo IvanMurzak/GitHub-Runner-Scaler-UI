@@ -61,6 +61,29 @@ pub fn run_elevated(program: &Path, args: &[OsString], terminal: bool) -> Elevat
     sys::run_elevated(program, args, terminal)
 }
 
+/// Whether somebody can answer an administrator prompt from this process.
+///
+/// On Windows the prompt is UAC's, a dialog on the desktop of this process's
+/// session, so a terminal has nothing to do with it: what matters is whether
+/// the session has a desktop somebody sits at. Every session but session 0
+/// does; session 0 is where services, tasks that run whether or not anybody is
+/// signed in, and OpenSSH logins run, and a dialog there is seen by nobody. A
+/// command started on the desktop by a script or an agent, with no terminal at
+/// all, used to be refused the prompt it could have shown.
+///
+/// Elsewhere it is `terminal`: whether stdin and stderr are a terminal, where
+/// `sudo` asks for the password.
+#[must_use]
+pub fn can_answer_elevation_prompt(terminal: bool) -> bool {
+    prompt_answerable(sys::session_id(), terminal)
+}
+
+/// [`can_answer_elevation_prompt`] from what was found: the Windows session
+/// when there is one to ask about, otherwise the terminal.
+fn prompt_answerable(session: Option<u32>, terminal: bool) -> bool {
+    session.map_or(terminal, |session| session != 0)
+}
+
 /// Quotes one argument for a POSIX shell.
 #[must_use]
 pub fn quote_posix_argument(argument: &str) -> String {
@@ -121,13 +144,46 @@ pub enum Responsiveness {
     /// It did not answer within the deadline: a hung volume (a stalled USB or
     /// NVMe enclosure, a dead network mount).
     Hung,
+    /// Its metadata answered, and listing it did not within the deadline. On
+    /// macOS that is what a pending privacy question looks like: reading a
+    /// folder on a removable or network volume waits while "would like to
+    /// access files on a removable volume" is on the desktop, while `stat`
+    /// does not. A stalled disk usually stalls the `stat` too.
+    ListingBlocked,
+    /// The system refused to let this process list it (`EPERM`). On macOS
+    /// that is a privacy setting this process was refused, not file
+    /// permissions, which answer `EACCES`.
+    NotPermitted(String),
     /// It answered with an error.
     Failed(String),
 }
 
-/// Paths a [`directory_responds`] probe is still blocked on, so a volume that
-/// stays hung costs one stuck thread rather than one per probe.
-static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// A [`directory_responds`] probe still blocked: its path, and whether its
+/// metadata had answered (so the listing is what blocks).
+type InFlight = (PathBuf, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+/// Probes still blocked, so a volume that stays hung costs one stuck thread
+/// rather than one per probe, and a later probe of it reports what the stuck
+/// one is blocked on.
+static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<InFlight>> = std::sync::Mutex::new(Vec::new());
+
+/// The directories a [`directory_responds`] probe is still blocked on.
+#[must_use]
+pub fn probes_in_flight() -> Vec<PathBuf> {
+    PROBES_IN_FLIGHT
+        .lock()
+        .map(|in_flight| in_flight.iter().map(|(path, _)| path.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// How a probe that has not answered is reported.
+fn unanswered(listing: &std::sync::atomic::AtomicBool) -> Responsiveness {
+    if listing.load(std::sync::atomic::Ordering::Acquire) {
+        Responsiveness::ListingBlocked
+    } else {
+        Responsiveness::Hung
+    }
+}
 
 /// Whether `directory` (or, when it does not exist yet, its nearest existing
 /// ancestor) answers a `stat` and a one-entry listing within `deadline`.
@@ -139,17 +195,21 @@ static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(
 #[must_use]
 pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Responsiveness {
     let path = directory.to_path_buf();
+    // Set once the metadata has answered, so a probe still blocked can say
+    // whether it was the `stat` or the listing that never came back.
+    let listing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() else {
             return Responsiveness::Failed("the probe registry is poisoned".into());
         };
-        if in_flight.contains(&path) {
-            return Responsiveness::Hung;
+        if let Some((_, stuck)) = in_flight.iter().find(|(stuck, _)| *stuck == path) {
+            return unanswered(stuck);
         }
-        in_flight.push(path.clone());
+        in_flight.push((path.clone(), std::sync::Arc::clone(&listing)));
     }
     let (sender, receiver) = std::sync::mpsc::channel();
     let probed = path.clone();
+    let listing_started = std::sync::Arc::clone(&listing);
     let spawned = std::thread::Builder::new()
         .name("runner-root-probe".into())
         .spawn(move || {
@@ -157,30 +217,51 @@ pub fn directory_responds(directory: &Path, deadline: std::time::Duration) -> Re
                 .ancestors()
                 .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
                 .map(Path::to_path_buf);
+            listing_started.store(true, std::sync::atomic::Ordering::Release);
+            let refused = |error: std::io::Error| {
+                if is_not_permitted(&error) {
+                    Responsiveness::NotPermitted(error.to_string())
+                } else {
+                    Responsiveness::Failed(error.to_string())
+                }
+            };
             let answer = match existing {
                 None => Responsiveness::Failed(format!("{} does not exist", probed.display())),
                 Some(existing) => match std::fs::read_dir(&existing) {
                     Ok(mut entries) => match entries.next() {
-                        Some(Err(error)) => Responsiveness::Failed(error.to_string()),
+                        Some(Err(error)) => refused(error),
                         _ => Responsiveness::Responds,
                     },
-                    Err(error) => Responsiveness::Failed(error.to_string()),
+                    Err(error) => refused(error),
                 },
             };
             if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
-                in_flight.retain(|candidate| *candidate != probed);
+                in_flight.retain(|(candidate, _)| *candidate != probed);
             }
             let _ = sender.send(answer);
         });
     if let Err(error) = spawned {
         if let Ok(mut in_flight) = PROBES_IN_FLIGHT.lock() {
-            in_flight.retain(|candidate| *candidate != path);
+            in_flight.retain(|(candidate, _)| *candidate != path);
         }
         return Responsiveness::Failed(error.to_string());
     }
     receiver
         .recv_timeout(deadline)
-        .unwrap_or(Responsiveness::Hung)
+        .unwrap_or_else(|_| unanswered(&listing))
+}
+
+/// `EPERM`, which a privacy refusal answers, as opposed to `EACCES`.
+fn is_not_permitted(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// Whether this process can create a symbolic link inside `directory`.
@@ -342,6 +423,16 @@ pub fn write_registry_string(
 
 /// The file under `state/` the daemon keeps while it refuses to start runners.
 pub const HOST_UNFIT_FILE: &str = "host-unfit.json";
+
+/// How often the daemon re-evaluates the required checks, re-stamping the
+/// record while they fail.
+pub const DAEMON_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long the record counts as a refusal in force: three rechecks, so one
+/// slow evaluation does not hide it, and a record nobody re-stamps for longer
+/// was left behind by a daemon that stopped while refusing.
+pub const HOST_UNFIT_RECORD_FRESH: std::time::Duration =
+    std::time::Duration::from_secs(3 * DAEMON_RECHECK.as_secs());
 const HOST_UNFIT_SCHEMA_VERSION: u32 = 1;
 
 /// What the daemon recorded the last time a required host check failed.
@@ -354,6 +445,37 @@ pub struct HostUnfitRecord {
     pub checked_at: DateTime<Utc>,
     /// The ids of the required checks that failed.
     pub checks: Vec<String>,
+    /// What each of them found, from the daemon's own session, and what fixes
+    /// it. Empty in a record an older daemon wrote.
+    #[serde(default)]
+    pub findings: Vec<UnfitFinding>,
+}
+
+/// One failing required check, as the daemon saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfitFinding {
+    pub id: String,
+    pub detail: String,
+    #[serde(default)]
+    pub remedy: Option<String>,
+}
+
+impl HostUnfitRecord {
+    /// One sentence per failing check, with its remedy.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if self.findings.is_empty() {
+            return self.checks.join(", ");
+        }
+        self.findings
+            .iter()
+            .map(|finding| match &finding.remedy {
+                Some(remedy) => format!("{}: {}. Fix: {remedy}", finding.id, finding.detail),
+                None => format!("{}: {}", finding.id, finding.detail),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 fn host_unfit_path(paths: &AppPaths) -> PathBuf {
@@ -367,7 +489,7 @@ fn host_unfit_path(paths: &AppPaths) -> PathBuf {
 /// A description of the write failure.
 pub fn record_host_unfit(
     paths: &AppPaths,
-    checks: &[String],
+    findings: &[UnfitFinding],
     at: DateTime<Utc>,
 ) -> Result<(), String> {
     let since = host_unfit(paths)
@@ -378,7 +500,8 @@ pub fn record_host_unfit(
         schema_version: HOST_UNFIT_SCHEMA_VERSION,
         since,
         checked_at: at,
-        checks: checks.to_vec(),
+        checks: findings.iter().map(|finding| finding.id.clone()).collect(),
+        findings: findings.to_vec(),
     };
     let path = host_unfit_path(paths);
     let text = serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?;
@@ -397,6 +520,35 @@ pub fn clear_host_unfit(paths: &AppPaths) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
     }
+}
+
+/// The daemon's refusal, when one is in force at `now`: recorded, and either
+/// re-stamped within [`HOST_UNFIT_RECORD_FRESH`] or left by a daemon that is
+/// still running and has stalled.
+///
+/// A record nobody re-stamps is a stopped daemon's, not a refusal in force.
+/// But a daemon that stalls stops re-stamping too, and its cause usually
+/// persists: the refusal used to vanish from `status` after fifteen minutes on
+/// a daemon still blocked behind the very question that made the host unfit.
+#[must_use]
+pub fn host_unfit_in_force(paths: &AppPaths, now: DateTime<Utc>) -> Option<HostUnfitRecord> {
+    host_unfit(paths).ok().flatten().filter(|record| {
+        if !crate::wsl::fence::elapsed_at_least(record.checked_at, now, HOST_UNFIT_RECORD_FRESH) {
+            return true;
+        }
+        // Stamped by the daemon that stalled, near its last beat: an older
+        // record is another generation's, and says nothing about this one.
+        match crate::daemon_heartbeat::liveness(paths, now) {
+            crate::daemon_heartbeat::Liveness::Stalled { since, .. } => {
+                !crate::wsl::fence::elapsed_at_least(
+                    record.checked_at,
+                    since,
+                    HOST_UNFIT_RECORD_FRESH,
+                )
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The daemon's current refusal, if it has one.
@@ -429,7 +581,7 @@ mod sys {
         ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0, WIN32_ERROR,
     };
     use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenSessionId,
     };
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
@@ -466,6 +618,32 @@ mod sys {
         } else {
             RegistryError::Other(format!("registry error {}", code.0))
         }
+    }
+
+    /// The Terminal Services session this process runs in.
+    pub(super) fn session_id() -> Option<u32> {
+        let mut token = HANDLE::default();
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` needs no closing;
+        // `token` is a live out-parameter owned by this frame.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
+            return None;
+        }
+        let mut session = 0u32;
+        let mut returned = 0u32;
+        // SAFETY: `session` is a `u32` owned by this frame, which is what
+        // `TokenSessionId` returns, and its size is the length passed.
+        let queried = unsafe {
+            GetTokenInformation(
+                token,
+                TokenSessionId,
+                Some((&raw mut session).cast()),
+                4,
+                &raw mut returned,
+            )
+        };
+        // SAFETY: `token` was opened above and is closed exactly once.
+        let _ = unsafe { CloseHandle(token) };
+        queried.is_ok().then_some(session)
     }
 
     pub(super) fn is_elevated() -> bool {
@@ -792,6 +970,11 @@ mod sys {
     use std::path::Path;
     use std::process::Command;
 
+    /// No session to ask about: the terminal decides.
+    pub(super) const fn session_id() -> Option<u32> {
+        None
+    }
+
     use super::{ElevationOutcome, RegistryError};
 
     pub(super) fn is_elevated() -> bool {
@@ -1003,6 +1186,64 @@ mod tests {
         assert_eq!(find_on_path("npm.cmd", &path), Some(cmd));
     }
 
+    fn unfit_finding(id: &str) -> UnfitFinding {
+        UnfitFinding {
+            id: id.into(),
+            detail: "it fails".into(),
+            remedy: None,
+        }
+    }
+
+    /// A UAC prompt is a desktop dialog: a session with a desktop can answer it
+    /// with no terminal at all, and session 0 cannot even with one.
+    #[test]
+    fn who_can_answer_an_administrator_prompt() {
+        assert!(
+            prompt_answerable(Some(1), false),
+            "the desktop, no terminal"
+        );
+        assert!(prompt_answerable(Some(2), true));
+        assert!(!prompt_answerable(Some(0), true), "services and SSH");
+        assert!(prompt_answerable(None, true), "sudo on a terminal");
+        assert!(!prompt_answerable(None, false));
+    }
+
+    /// A stalled daemon cannot re-stamp its refusal, and the refusal stands.
+    #[test]
+    fn an_unfit_record_stays_in_force_while_its_daemon_is_stalled() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(root.path());
+        paths.create_all().unwrap();
+        let then = Utc::now();
+        record_host_unfit(
+            &paths,
+            &[unfit_finding("host.runner_root_responsive")],
+            then,
+        )
+        .unwrap();
+        let later = then + chrono::Duration::hours(1);
+        assert_eq!(
+            host_unfit_in_force(&paths, later),
+            None,
+            "nobody beats: stopped"
+        );
+
+        // The same process, still running, last heard from with the record.
+        crate::daemon_heartbeat::beat(&paths, then).unwrap();
+        assert!(host_unfit_in_force(&paths, later).is_some(), "stalled");
+        crate::daemon_heartbeat::beat(&paths, later).unwrap();
+        assert_eq!(
+            host_unfit_in_force(&paths, later),
+            None,
+            "a daemon still beating would have re-stamped a refusal in force"
+        );
+
+        // A record from long before the stalled daemon's last beat is another
+        // generation's, and does not come back.
+        let much_later = later + chrono::Duration::hours(1);
+        assert_eq!(host_unfit_in_force(&paths, much_later), None);
+    }
+
     #[test]
     fn the_unfit_record_keeps_its_first_moment_and_clears() {
         let root = tempfile::tempdir().unwrap();
@@ -1010,9 +1251,9 @@ mod tests {
         paths.create_all().unwrap();
         assert_eq!(host_unfit(&paths).unwrap(), None);
         let first = Utc::now() - chrono::Duration::minutes(10);
-        record_host_unfit(&paths, &["windows.symlink_privilege".into()], first).unwrap();
+        record_host_unfit(&paths, &[unfit_finding("windows.symlink_privilege")], first).unwrap();
         let later = Utc::now();
-        record_host_unfit(&paths, &["host.required_tools".into()], later).unwrap();
+        record_host_unfit(&paths, &[unfit_finding("host.required_tools")], later).unwrap();
         let record = host_unfit(&paths).unwrap().unwrap();
         assert_eq!(record.since, first);
         assert_eq!(record.checked_at, later);
@@ -1046,25 +1287,35 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|path| path.starts_with(directory.path())),
+                .any(|(path, _)| path.starts_with(directory.path())),
             "a finished probe deregisters"
         );
     }
 
-    /// While an earlier probe of a path is still blocked, a new one answers
-    /// `Hung` at once instead of parking another thread on the same volume.
+    /// While an earlier probe of a path is still blocked, a new one answers at
+    /// once instead of parking another thread on the same volume, and says
+    /// what the stuck one is blocked on: a daemon re-checking every five
+    /// minutes behind a pending privacy question keeps naming it.
     #[test]
-    fn a_path_still_being_probed_is_hung_without_a_second_thread() {
+    fn a_path_still_being_probed_answers_without_a_second_thread() {
         let directory = tempfile::tempdir().unwrap();
-        let stuck = directory.path().join("stuck-volume");
-        PROBES_IN_FLIGHT.lock().unwrap().push(stuck.clone());
-        let started = std::time::Instant::now();
-        let answer = directory_responds(&stuck, std::time::Duration::from_secs(30));
-        PROBES_IN_FLIGHT
-            .lock()
-            .unwrap()
-            .retain(|path| *path != stuck);
-        assert_eq!(answer, Responsiveness::Hung);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for (name, listing, expected) in [
+            ("stuck-volume", false, Responsiveness::Hung),
+            ("asking-volume", true, Responsiveness::ListingBlocked),
+        ] {
+            let stuck = directory.path().join(name);
+            PROBES_IN_FLIGHT.lock().unwrap().push((
+                stuck.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(listing)),
+            ));
+            let started = std::time::Instant::now();
+            let answer = directory_responds(&stuck, std::time::Duration::from_secs(30));
+            PROBES_IN_FLIGHT
+                .lock()
+                .unwrap()
+                .retain(|(path, _)| *path != stuck);
+            assert_eq!(answer, expected, "{name}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
     }
 }
