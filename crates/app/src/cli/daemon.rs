@@ -780,6 +780,7 @@ async fn observe_host_fitness(context: &Context, unfit: &AtomicBool, first: bool
     let verdict = bounded_preflight(
         super::doctor::daemon_preflight(context),
         PREFLIGHT_DEADLINE,
+        runner_manager_platform::host_fitness::probes_in_flight,
         context,
     )
     .await;
@@ -825,26 +826,43 @@ async fn observe_host_fitness(context: &Context, unfit: &AtomicBool, first: bool
 /// everything else a check might wait on.
 const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The id the host-unfit record carries for checks that never finished.
-const BLOCKED_CHECKS_ID: &str = "host.checks";
+use super::doctor::BLOCKED_CHECKS_ID;
 
-/// Runs `preflight` for at most `deadline`. Checks that have not finished by
-/// then are blocked on something -- a hung volume, or a runner root behind a
-/// macOS question nobody has answered -- and a runner placed on this host
-/// would block on it too, so the host counts as unfit until they finish.
+/// Runs `preflight` for at most `deadline`, and says what checks that never
+/// finish mean.
+///
+/// While a directory probe is still blocked (`stuck` names the paths), a
+/// runner placed on this host would block there too -- a hung volume, or a
+/// runner root behind a macOS question nobody has answered -- so the host
+/// counts as unfit until it answers. A check that is merely slow elsewhere
+/// holds no runner back, as a check that could not run never does.
 async fn bounded_preflight(
     preflight: impl Future<Output = Result<super::doctor::DaemonVerdict, String>>,
     deadline: Duration,
+    stuck: impl FnOnce() -> Vec<std::path::PathBuf>,
     context: &Context,
 ) -> Result<super::doctor::DaemonVerdict, String> {
-    if let Ok(verdict) = tokio::time::timeout(deadline, preflight).await {
-        return verdict;
+    match tokio::time::timeout(deadline, preflight).await {
+        Ok(Err(error)) if error == super::doctor::PREFLIGHT_STILL_RUNNING => {}
+        Ok(verdict) => return verdict,
+        Err(_) => {}
     }
+    let stuck = stuck();
+    if stuck.is_empty() {
+        return Err(format!(
+            "the host checks did not finish within {} seconds",
+            deadline.as_secs()
+        ));
+    }
+    let stuck = stuck
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let finding = runner_manager_platform::host_fitness::UnfitFinding {
         id: BLOCKED_CHECKS_ID.to_owned(),
         detail: format!(
-            "the host checks did not finish within {} seconds, so one is blocked, probably on a \
-             runner root",
+            "the host checks did not finish within {} seconds: {stuck} does not answer",
             deadline.as_secs()
         ),
         remedy: Some(
@@ -875,7 +893,9 @@ async fn bounded_preflight(
     })
 }
 
-/// This generation's heartbeat task. Dropped when the generation returns,
+/// This generation's heartbeat task. It runs on the daemon's one runtime
+/// thread, so it says the loop is not blocked, not that every task advances.
+/// Dropped when the generation returns,
 /// which stops it and removes the record, so a daemon that exits cleanly
 /// never reads as stalled. See [`runner_manager_platform::daemon_heartbeat`].
 struct Heartbeat {
@@ -888,9 +908,22 @@ impl Heartbeat {
         let beating = paths.clone();
         let task = tokio::spawn(async move {
             use runner_manager_platform::daemon_heartbeat::{HEARTBEAT_INTERVAL, beat};
+            let mut failing = false;
             loop {
-                if let Err(error) = beat(&beating, chrono::Utc::now()) {
-                    tracing::debug!(%error, "the daemon heartbeat could not be written");
+                match beat(&beating, chrono::Utc::now()) {
+                    // Said once: a record that stops being written reads as a
+                    // stalled daemon, and this is the line that says why.
+                    Err(error) if !failing => {
+                        failing = true;
+                        tracing::warn!(
+                            %error,
+                            reason = "heartbeat_unwritten",
+                            "the daemon heartbeat could not be written, so `status` will call \
+                             this daemon stalled"
+                        );
+                    }
+                    Err(_) => {}
+                    Ok(()) => failing = false,
                 }
                 tokio::time::sleep(HEARTBEAT_INTERVAL).await;
             }
@@ -2402,11 +2435,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let context = rooted(root.path());
         context.paths().create_all().unwrap();
+        let stuck_root = std::path::PathBuf::from("/Volumes/NVME/runners");
         // Bounded from outside too, so a regression fails here rather than
         // hanging the run.
         let verdict = tokio::time::timeout(
             Duration::from_secs(600),
-            bounded_preflight(std::future::pending(), Duration::from_secs(120), &context),
+            bounded_preflight(
+                std::future::pending(),
+                Duration::from_secs(120),
+                || vec![stuck_root.clone()],
+                &context,
+            ),
         )
         .await
         .expect("host checks that never finish are given up on")
@@ -2415,12 +2454,39 @@ mod tests {
         let record = runner_manager_platform::host_fitness::host_unfit(context.paths())
             .unwrap()
             .expect("recorded for status");
-        assert!(record.describe().contains("runner root"), "{record:?}");
+        assert!(
+            record
+                .describe()
+                .contains("/Volumes/NVME/runners does not answer"),
+            "{record:?}"
+        );
+
+        // A recheck while that evaluation still runs says the same.
+        let again = bounded_preflight(
+            async { Err(super::super::doctor::PREFLIGHT_STILL_RUNNING.to_owned()) },
+            Duration::from_secs(120),
+            || vec![stuck_root.clone()],
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.required, [BLOCKED_CHECKS_ID]);
+
+        // Slow, with no directory blocked: nothing is held back.
+        let slow = bounded_preflight(
+            std::future::pending(),
+            Duration::from_secs(120),
+            Vec::new,
+            &context,
+        )
+        .await;
+        assert!(slow.is_err(), "{slow:?}");
 
         // A preflight that answers is passed through untouched.
         let answered = bounded_preflight(
             async { Ok(super::super::doctor::DaemonVerdict::default()) },
             Duration::from_secs(120),
+            Vec::new,
             &context,
         )
         .await

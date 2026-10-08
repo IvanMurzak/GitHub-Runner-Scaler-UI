@@ -574,36 +574,48 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
         let only_launches = status.problems().iter().all(|problem| {
             problem.subject == runner_manager_platform::service::LAUNCHES_BLOCKED_SUBJECT
         });
-        let remedy =
-            if status
-                .problems()
-                .iter()
-                .any(|problem| problem.subject == "registration")
-            {
-                let mode = status.start_mode().unwrap_or(StartMode::Boot);
-                format!("runner-manager service install --start-at {mode}")
-            } else if only_launches && let Some(blocked) = status.launches_blocked() {
-                // Reinstalling the service is not what unblocks a launch fence.
-                blocked.remedy.clone()
-            } else if status.problems().iter().all(|problem| {
+        let remedy = if status
+            .problems()
+            .iter()
+            .any(|problem| problem.subject == "registration")
+        {
+            let mode = status.start_mode().unwrap_or(StartMode::Boot);
+            format!("runner-manager service install --start-at {mode}")
+        } else if only_launches && let Some(blocked) = status.launches_blocked() {
+            // Reinstalling the service is not what unblocks a launch fence.
+            blocked.remedy.clone()
+        } else if only_daemon_health(&status) {
+            // A stall's own line names the dialog to answer; the restart is
+            // for when nothing is waiting.
+            if status.problems().iter().any(|problem| {
                 problem.subject == runner_manager_platform::service::DAEMON_STALLED_SUBJECT
             }) {
                 "runner-manager service stop && runner-manager service start".into()
-            } else if status.problems().iter().all(|problem| {
-                problem.subject == runner_manager_platform::service::HOST_UNFIT_SUBJECT
-            }) {
-                // Nor a host check: the problem line names its fix, and `host
-                // doctor` shows the rest.
-                "runner-manager host doctor".into()
             } else {
-                "runner-manager service uninstall && runner-manager service install".into()
-            };
+                // Nor a host check: the problem line names its fix, and
+                // `host doctor` shows the rest.
+                "runner-manager host doctor".into()
+            }
+        } else {
+            "runner-manager service uninstall && runner-manager service install".into()
+        };
         Err(CliError::with_remedy(
             Failure::LocalState,
             "the service status above contains one or more errors",
             remedy,
         ))
     }
+}
+
+/// Whether every problem is the daemon's own health -- stalled, or refusing
+/// runners on an unfit host -- which the two usually are together: a daemon
+/// that stalls stops re-stamping its refusal, and the refusal stands.
+fn only_daemon_health(status: &runner_manager_platform::service::ServiceStatus) -> bool {
+    use runner_manager_platform::service::{DAEMON_STALLED_SUBJECT, HOST_UNFIT_SUBJECT};
+    status
+        .problems()
+        .iter()
+        .all(|problem| matches!(problem.subject, DAEMON_STALLED_SUBJECT | HOST_UNFIT_SUBJECT))
 }
 
 fn persist_mode(
@@ -879,5 +891,57 @@ mod tests {
         assert!(rendered.contains("ERROR"));
         assert!(rendered.contains("nothing is at the recorded path"));
         assert!(rendered.contains("NOT healthy"));
+    }
+
+    /// A daemon blocked behind the macOS question is stalled and unfit at
+    /// once. Its remedy is the restart, never a reinstall.
+    #[test]
+    fn a_stalled_unfit_service_is_told_to_restart_not_to_reinstall() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = Context::resolve(Some(temporary.path()), &mut Vec::new()).unwrap();
+        let binary = temporary.path().join("runner-manager.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        let operations = ServiceOperations::with_controls(
+            context.paths().clone(),
+            ServiceIdentity::fixture("stalled-and-unfit"),
+            Arc::new(RecordingControls::new()),
+        )
+        .with_runner_root(
+            LocalAbsolutePath::new(
+                temporary
+                    .path()
+                    .join("runner-root")
+                    .to_str()
+                    .expect("a unicode temporary path"),
+            )
+            .expect("a local absolute path"),
+        );
+        operations
+            .install(&InstallRequest::new(StartMode::Boot).for_binary(&binary))
+            .unwrap();
+        operations.start().unwrap();
+        let long_ago = chrono::Utc::now() - chrono::Duration::minutes(40);
+        runner_manager_platform::daemon_heartbeat::beat(context.paths(), long_ago).unwrap();
+        runner_manager_platform::host_fitness::record_host_unfit(
+            context.paths(),
+            &[runner_manager_platform::host_fitness::UnfitFinding {
+                id: "host.runner_root_responsive".into(),
+                detail: "macOS has not let the service list /Volumes/NVME/runners".into(),
+                remedy: Some("click Allow".into()),
+            }],
+            long_ago,
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let error = status_with(&operations, &mut out).expect_err("not healthy");
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("daemon progress"), "{rendered}");
+        assert!(rendered.contains("host fitness"), "{rendered}");
+        assert_eq!(
+            error.remedy(),
+            Some("runner-manager service stop && runner-manager service start"),
+            "{error:?}"
+        );
     }
 }

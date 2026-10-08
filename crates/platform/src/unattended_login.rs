@@ -147,13 +147,13 @@ pub fn resume(found: &UnattendedLogin, mode: StartMode, account: &str) -> Resume
 #[must_use]
 pub fn parse_filevault_status(output: &str) -> Option<bool> {
     let output = output.trim();
-    if output.starts_with("FileVault is Off") {
-        Some(false)
-    } else if output.starts_with("FileVault is On")
+    if output.starts_with("FileVault is On")
         || output.contains("Encryption in progress")
         || output.contains("Decryption in progress")
     {
         Some(true)
+    } else if output.starts_with("FileVault is Off") {
+        Some(false)
     } else {
         None
     }
@@ -290,6 +290,11 @@ mod tests {
         assert_eq!(
             parse_filevault_status("Encryption in progress: Percent completed = 12.0\n"),
             Some(true)
+        );
+        assert_eq!(
+            parse_filevault_status("FileVault is Off.\nDecryption in progress: 40.0\n"),
+            Some(true),
+            "the unlock screen stays until decryption ends"
         );
         assert_eq!(parse_filevault_status(""), None);
 

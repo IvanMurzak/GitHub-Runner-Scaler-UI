@@ -167,6 +167,15 @@ type InFlight = (PathBuf, std::sync::Arc<std::sync::atomic::AtomicBool>);
 /// one is blocked on.
 static PROBES_IN_FLIGHT: std::sync::Mutex<Vec<InFlight>> = std::sync::Mutex::new(Vec::new());
 
+/// The directories a [`directory_responds`] probe is still blocked on.
+#[must_use]
+pub fn probes_in_flight() -> Vec<PathBuf> {
+    PROBES_IN_FLIGHT
+        .lock()
+        .map(|in_flight| in_flight.iter().map(|(path, _)| path.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// How a probe that has not answered is reported.
 fn unanswered(listing: &std::sync::atomic::AtomicBool) -> Responsiveness {
     if listing.load(std::sync::atomic::Ordering::Acquire) {
@@ -524,11 +533,21 @@ pub fn clear_host_unfit(paths: &AppPaths) -> Result<(), String> {
 #[must_use]
 pub fn host_unfit_in_force(paths: &AppPaths, now: DateTime<Utc>) -> Option<HostUnfitRecord> {
     host_unfit(paths).ok().flatten().filter(|record| {
-        !crate::wsl::fence::elapsed_at_least(record.checked_at, now, HOST_UNFIT_RECORD_FRESH)
-            || matches!(
-                crate::daemon_heartbeat::liveness(paths, now),
-                crate::daemon_heartbeat::Liveness::Stalled { .. }
-            )
+        if !crate::wsl::fence::elapsed_at_least(record.checked_at, now, HOST_UNFIT_RECORD_FRESH) {
+            return true;
+        }
+        // Stamped by the daemon that stalled, near its last beat: an older
+        // record is another generation's, and says nothing about this one.
+        match crate::daemon_heartbeat::liveness(paths, now) {
+            crate::daemon_heartbeat::Liveness::Stalled { since, .. } => {
+                !crate::wsl::fence::elapsed_at_least(
+                    record.checked_at,
+                    since,
+                    HOST_UNFIT_RECORD_FRESH,
+                )
+            }
+            _ => false,
+        }
     })
 }
 
@@ -1218,6 +1237,11 @@ mod tests {
             None,
             "a daemon still beating would have re-stamped a refusal in force"
         );
+
+        // A record from long before the stalled daemon's last beat is another
+        // generation's, and does not come back.
+        let much_later = later + chrono::Duration::hours(1);
+        assert_eq!(host_unfit_in_force(&paths, much_later), None);
     }
 
     #[test]

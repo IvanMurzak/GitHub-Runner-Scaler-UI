@@ -4503,6 +4503,7 @@ impl ServiceOperations {
             unattended_gap(record.start_mode, &account, probed.as_ref())
         });
         let now = Utc::now();
+        let installed = record.is_some() || found.is_some();
         Ok(ServiceStatus::compose(
             self.identity.clone(),
             record,
@@ -4516,7 +4517,9 @@ impl ServiceOperations {
         .with_credential_unreadable(credential_unreadable_since)
         .with_launches_blocked(crate::launch_health::launches_blocked(&self.paths, now))
         .with_unattended_gap(unattended)
-        .with_host_unfit(crate::host_fitness::host_unfit_in_force(&self.paths, now))
+        .with_host_unfit(
+            crate::host_fitness::host_unfit_in_force(&self.paths, now).filter(|_| installed),
+        )
         .with_stall(crate::daemon_heartbeat::liveness(&self.paths, now).stall(last_github_contact)))
     }
 
@@ -4733,9 +4736,12 @@ pub struct UnattendedGap {
 #[must_use]
 pub fn service_account_name(account: &ServiceAccount) -> String {
     match account {
-        ServiceAccount::InvokingUser => {
-            crate::unattended_login::current_account().unwrap_or_else(|| "the operator".to_owned())
-        }
+        // Under `sudo` the invoking user is the one sudo names, not root.
+        ServiceAccount::InvokingUser => std::env::var("SUDO_USER")
+            .ok()
+            .filter(|user| !user.is_empty() && crate::host_fitness::is_elevated())
+            .or_else(crate::unattended_login::current_account)
+            .unwrap_or_else(|| "the operator".to_owned()),
         other => other.as_str().to_owned(),
     }
 }
@@ -4766,6 +4772,11 @@ pub fn unattended_gap(
         });
     };
     let resume = crate::unattended_login::resume(found, mode, account);
+    if matches!(resume, crate::unattended_login::Resume::Unknown(_)) {
+        // `host doctor` says what could not be read; a note here would claim
+        // a gap nobody has seen.
+        return None;
+    }
     Some(UnattendedGap {
         reason: resume.explain(account)?,
         remedy: resume.remedy().unwrap_or_else(|| {
@@ -10102,6 +10113,17 @@ logs = \"/d\"
         };
         let gap = unattended_gap(StartMode::Boot, "root", Some(&locked)).expect("a gap");
         assert!(gap.reason.contains("FileVault is on"), "{gap:?}");
+
+        // An unanswered probe is no gap: `host doctor` says what it could not
+        // read.
+        let unread = UnattendedLogin {
+            auto_login: AutoLogin::As("ivan".into()),
+            filevault_on: None,
+        };
+        assert_eq!(
+            unattended_gap(StartMode::Login, "ivan", Some(&unread)),
+            None
+        );
 
         // Where nothing can be probed, a login registration still says so.
         let gap = unattended_gap(StartMode::Login, "ivan", None).expect("a gap");

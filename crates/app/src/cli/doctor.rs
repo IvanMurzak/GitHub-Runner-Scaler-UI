@@ -271,7 +271,7 @@ pub struct HostSetup {
     pub service_home: Option<PathBuf>,
     /// The required checks the running daemon finds failing, from its own
     /// session, when it refuses to start runners. See [`evaluate`].
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub daemon_unfit: Option<host_fitness::HostUnfitRecord>,
 }
 
@@ -457,8 +457,8 @@ pub enum Change {
 /// The power settings a fix may write, with the largest value a revert may
 /// restore. A closed set, as with [`RegValue`]: the journal is a plain file.
 const POWER_SETTINGS: [(&str, u32); 4] = [
-    ("sleep", 24 * 60),
-    ("disksleep", 24 * 60),
+    ("sleep", u16::MAX as u32),
+    ("disksleep", u16::MAX as u32),
     ("autorestart", 1),
     ("womp", 1),
 ];
@@ -573,6 +573,14 @@ impl Change {
             {
                 actions.set_power_setting(name, *previous)
             }
+            Self::PowerSetting {
+                name,
+                previous: None,
+                ..
+            } => Err(format!(
+                "pmset reported no `{name}` before `host prepare` set it, so there is nothing to \
+                 put back"
+            )),
             _ => Err(format!(
                 "the journal records a change `host prepare` never makes ({}); it was not reverted",
                 self.key()
@@ -864,6 +872,17 @@ pub const CHECKS: &[CheckSpec] = &[
     },
     // Recommended, not Required: a Required failure makes the daemon refuse
     // every launch, and this check reports exactly that refusal.
+    // The daemon's own: its host checks did not finish, so one is blocked. A
+    // command's look always finishes, so it passes here; `daemon_view` fails
+    // it when the service recorded it.
+    CheckSpec {
+        id: BLOCKED_CHECKS_ID,
+        title: "The service's host checks finish",
+        platform: CheckPlatform::Any,
+        severity: Severity::Required,
+        probe: |_, _| pass("the host checks finish"),
+        fix: None,
+    },
     CheckSpec {
         id: "host.launches",
         title: "The service can start runners",
@@ -873,6 +892,10 @@ pub const CHECKS: &[CheckSpec] = &[
         fix: None,
     },
 ];
+
+/// The id the daemon's host-unfit record carries when its host checks did not
+/// finish.
+pub const BLOCKED_CHECKS_ID: &str = "host.checks";
 
 fn check(id: &str) -> Option<&'static CheckSpec> {
     CHECKS.iter().find(|check| check.id == id)
@@ -3276,11 +3299,15 @@ pub struct PrepareOutcome {
 /// [`Failure::InvalidArgument`] for an unknown id, or a non-interactive run
 /// without `--yes`; [`Failure::LocalState`] when the journal cannot be written.
 pub fn prepare(
-    run: PrepareRun<'_>,
+    mut run: PrepareRun<'_>,
     only: &[String],
     out: &mut dyn Write,
 ) -> Result<PrepareOutcome, CliError> {
     known_ids(only)?;
+    // What the service found is reported, not prepared: a fix is planned from
+    // this host's own probes, and judged by them afterwards. The service
+    // re-checks within five minutes and drops its record then.
+    run.setup.daemon_unfit = None;
     let failed = write_failed("this host preparation");
     let before = evaluate(&run.setup, run.facts);
     let plan = plan(&before, only, &run.consent, run.prompt);
@@ -3885,6 +3912,10 @@ fn tui_summary(outcome: &PrepareOutcome) -> String {
     format!("Host prepare: {}.", parts.join("; "))
 }
 
+/// What [`daemon_preflight`] answers while an earlier evaluation is still
+/// running.
+pub const PREFLIGHT_STILL_RUNNING: &str = "the previous host checks are still running";
+
 /// What the daemon's preflight found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonVerdict {
@@ -3903,10 +3934,26 @@ pub struct DaemonVerdict {
 /// A description of why the checks could not run at all; the caller then
 /// holds nothing back.
 pub async fn daemon_preflight(context: &Context) -> Result<DaemonVerdict, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Set while an evaluation runs. One that outlived its caller's deadline
+    /// still holds a thread, so a recheck does not start a second beside it.
+    static EVALUATING: AtomicBool = AtomicBool::new(false);
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            EVALUATING.store(false, Ordering::Release);
+        }
+    }
     let setup = setup(context, Perspective::Daemon, None).map_err(|error| error.to_string())?;
-    let report = tokio::task::spawn_blocking(move || evaluate(&setup, &SystemFacts))
-        .await
-        .map_err(|error| error.to_string())?;
+    if EVALUATING.swap(true, Ordering::AcqRel) {
+        return Err(PREFLIGHT_STILL_RUNNING.to_owned());
+    }
+    let report = tokio::task::spawn_blocking(move || {
+        let _done = Done;
+        evaluate(&setup, &SystemFacts)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let verdict = DaemonVerdict {
         required: report.required_failing(),
         recommended: report
@@ -5520,6 +5567,90 @@ mod tests {
     /// The whole prepare path against fakes: nothing is applied without a yes
     /// and with nobody to ask, and with one the batch goes to one elevated
     /// run and every change lands in the journal with what it replaced.
+    fn unfit_record(id: &str) -> host_fitness::HostUnfitRecord {
+        host_fitness::HostUnfitRecord {
+            schema_version: 1,
+            since: chrono::Utc::now(),
+            checked_at: chrono::Utc::now(),
+            checks: vec![id.into()],
+            findings: vec![host_fitness::UnfitFinding {
+                id: id.into(),
+                detail: "it fails for the service".into(),
+                remedy: None,
+            }],
+        }
+    }
+
+    /// What the service found is reported, never prepared: a run plans from
+    /// this host's own probes and judges them afterwards, and the elevated
+    /// copy is not handed the record.
+    #[test]
+    fn prepare_neither_plans_nor_judges_by_the_services_record() {
+        let root = tempfile::tempdir().unwrap();
+        let context = rooted_context(root.path());
+        let mut setup = windows_setup();
+        setup.daemon_unfit = Some(unfit_record("windows.long_paths"));
+        let facts = Facts {
+            dwords: [(RegValue::LongPathsEnabled, Ok(Some(1)))].into(),
+            exclusions: Some(Vec::new()),
+            ..Facts::default()
+        };
+        assert_eq!(
+            status_of(&setup, &facts, "windows.long_paths"),
+            Status::Fail,
+            "host doctor reports the service's finding"
+        );
+        let actions = Actions::default();
+        let elevator = FakeElevator {
+            facts: &facts,
+            actions: &actions,
+            refuse: false,
+            requests: RefCell::default(),
+        };
+        let outcome = prepare(
+            PrepareRun {
+                context: &context,
+                setup: setup.clone(),
+                facts: &facts,
+                actions: &actions,
+                elevator: &elevator,
+                prompt: &mut NoPrompt,
+                consent: Consent {
+                    assume_yes: true,
+                    ..Consent::default()
+                },
+            },
+            &["windows.long_paths".to_owned()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(outcome.results.is_empty(), "{outcome:?}");
+        assert_eq!(
+            finding(&outcome.after, "windows.long_paths").status,
+            Status::Pass
+        );
+        let encoded = serde_json::to_string(&setup).unwrap();
+        assert!(!encoded.contains("daemon_unfit"), "{encoded}");
+    }
+
+    /// The service's own "my checks never finished" is a check `host doctor`
+    /// shows, not a refusal only `status` knows about.
+    #[test]
+    fn host_checks_the_service_could_not_finish_fail_in_host_doctor() {
+        let mut setup = macos_setup();
+        let facts = Facts::default();
+        assert_eq!(status_of(&setup, &facts, BLOCKED_CHECKS_ID), Status::Pass);
+        setup.daemon_unfit = Some(unfit_record(BLOCKED_CHECKS_ID));
+        let report = evaluate(&setup, &facts);
+        assert_eq!(finding(&report, BLOCKED_CHECKS_ID).status, Status::Fail);
+        assert!(
+            report
+                .required_failing()
+                .iter()
+                .any(|id| id == BLOCKED_CHECKS_ID)
+        );
+    }
+
     #[test]
     fn prepare_needs_a_yes_then_elevates_once_and_journals_what_it_changed() {
         let root = tempfile::tempdir().unwrap();

@@ -29,9 +29,10 @@ pub const HEARTBEAT_FILE: &str = "daemon-heartbeat.toml";
 /// How often the daemon writes it.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How old it may get before a running daemon counts as stalled: five missed
-/// beats, so one slow pass does not trip it.
-pub const STALLED_AFTER: Duration = Duration::from_secs(5 * HEARTBEAT_INTERVAL.as_secs());
+/// How old it may get before a running daemon counts as stalled: fifteen
+/// missed beats. Long enough that legitimate work on the loop (removing a
+/// large workspace on a slow disk) or the Mac sleeping does not trip it.
+pub const STALLED_AFTER: Duration = Duration::from_secs(15 * HEARTBEAT_INTERVAL.as_secs());
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Heartbeat {
@@ -70,8 +71,9 @@ impl Liveness {
             "the service (process {pid}) has made no progress since {}: its loop has not \
              beaten for over {} minutes, and {contact}. A daemon blocked in a file system call \
              looks like this, for example on a runner root behind a macOS question nobody has \
-             answered (look for a dialog on the Mac's desktop). If nothing is waiting, restart \
-             it: `runner-manager service stop` then `runner-manager service start`",
+             answered (look for a dialog on the Mac's desktop). If nothing is waiting and the \
+             machine has not just woken from sleep, restart it: `runner-manager service stop` \
+             then `runner-manager service start`",
             since.to_rfc3339(),
             STALLED_AFTER.as_secs() / 60
         ))
@@ -148,11 +150,11 @@ mod tests {
     #[test]
     fn a_running_daemon_that_stopped_beating_is_stalled() {
         assert_eq!(
-            judge(at(0), 7, true, at(4)),
+            judge(at(0), 7, true, at(14)),
             Liveness::Beating { at: at(0) }
         );
         assert_eq!(
-            judge(at(0), 7, true, at(5)),
+            judge(at(0), 7, true, at(15)),
             Liveness::Stalled {
                 since: at(0),
                 pid: 7
@@ -174,7 +176,7 @@ mod tests {
             Liveness::Beating { .. }
         ));
         // The same running process, not heard from for long enough.
-        let stalled = liveness(&paths, Utc::now() + chrono::Duration::minutes(6));
+        let stalled = liveness(&paths, Utc::now() + chrono::Duration::minutes(16));
         assert!(matches!(stalled, Liveness::Stalled { pid, .. } if pid == std::process::id()));
         let said = stalled.stall(None).expect("a stall is a problem");
         assert!(said.contains("made no progress since"), "{said}");
