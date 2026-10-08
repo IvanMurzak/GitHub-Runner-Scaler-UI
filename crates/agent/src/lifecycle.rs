@@ -3183,35 +3183,57 @@ impl LifecycleLauncher {
         // witness: a job of a few seconds starts and ends between two passes,
         // and an assignment GitHub shows can be one the runner never took up.
         // The runner's own diagnostics decide, read before cleanup deletes
-        // them, and GitHub's sample only decides when they say nothing.
-        if !process_alive && self.ports.processes.completed_successfully(&attempt) {
-            let now = self.ports.clock.now();
-            let evidence = JobEvidence::of(attempt.runtime_path());
-            let outcome = match (attempt.state(), evidence) {
+        // them, and GitHub's sample only decides when they say nothing. Not
+        // while GitHub is unreachable: a registration still listed there could
+        // not be removed, and nothing visits a concluded attempt again.
+        if !process_alive
+            && github.status != GithubRunnerObservation::Unreachable
+            && matches!(
+                attempt.state(),
+                AttemptState::Starting | AttemptState::Idle | AttemptState::Busy
+            )
+            && self.ports.processes.completed_successfully(&attempt)
+        {
+            let state = attempt.state();
+            let outcome = match (state, JobEvidence::of(attempt.runtime_path())) {
+                // Without a runner id there is no edge to `busy`; the recovery
+                // path below concludes the attempt without one.
                 (AttemptState::Starting | AttemptState::Idle, JobEvidence::RanAJob) => {
-                    let runner_id = known_runner_id(&attempt, github.runner_id)
-                        .ok_or(LifecycleError::Transition)?;
-                    self.transition(&mut attempt, |a| a.assigned_job(runner_id, now))?;
-                    Some(AttemptOutcome::CompletedJob)
+                    known_runner_id(&attempt, github.runner_id)
+                        .map(|runner_id| (Some(runner_id), AttemptOutcome::CompletedJob))
                 }
-                (AttemptState::Busy, JobEvidence::RanAJob) => Some(AttemptOutcome::CompletedJob),
+                (AttemptState::Busy, JobEvidence::RanAJob) => {
+                    Some((None, AttemptOutcome::CompletedJob))
+                }
                 (AttemptState::Busy, JobEvidence::NoJob) => {
-                    self.transition(&mut attempt, |a| a.assignment_not_taken(now))?;
-                    Some(AttemptOutcome::ExitedIdleWithoutWork)
+                    Some((None, AttemptOutcome::ExitedIdleWithoutWork))
                 }
                 (AttemptState::Busy, JobEvidence::Unknown)
                     if github.status == GithubRunnerObservation::NotRegistered =>
                 {
-                    Some(AttemptOutcome::CompletedJob)
+                    Some((None, AttemptOutcome::CompletedJob))
                 }
                 _ => None,
             };
-            if let Some(outcome) = outcome {
+            if let Some((walk_to_busy, outcome)) = outcome {
                 // An ephemeral runner leaves GitHub's list a little after its
                 // process exits; one still listed is removed here rather than
-                // left for GitHub to time out.
+                // left for GitHub to time out. First, so the journal's last
+                // intermediate state and the conclusion are written back to back:
+                // an agent that dies between them recovers from the state it was
+                // in before this pass.
                 if matches!(github.status, GithubRunnerObservation::Registered { .. }) {
                     self.deregister_runner(policy, &attempt).await;
+                }
+                let now = self.ports.clock.now();
+                match (walk_to_busy, &outcome) {
+                    (Some(runner_id), _) => {
+                        self.transition(&mut attempt, |a| a.assigned_job(runner_id, now))?;
+                    }
+                    (None, AttemptOutcome::ExitedIdleWithoutWork) => {
+                        self.transition(&mut attempt, |a| a.assignment_not_taken(now))?;
+                    }
+                    (None, _) => {}
                 }
                 self.conclude(&mut attempt, outcome)?;
                 self.clean_or_quarantine(&mut attempt)?;
@@ -4711,6 +4733,9 @@ fn runner_name(attempt: AttemptId) -> String {
     format!("runner-manager-{attempt}")
 }
 
+/// How long reading a runner's diagnostics may take.
+const EVIDENCE_DEADLINE: Duration = Duration::from_secs(2);
+
 /// What a native runner's own diagnostics say about whether it ran a job.
 ///
 /// `Runner.Listener` writes `_diag/Runner_*.log` when it starts, and starts
@@ -4720,9 +4745,6 @@ fn runner_name(attempt: AttemptId) -> String {
 /// wrote, and nothing is concluded from it. `_diag` is scrubbed with the rest of
 /// the runtime after every attempt, persistent slots included, so a log found
 /// here belongs to this attempt.
-/// How long reading a runner's diagnostics may take.
-const EVIDENCE_DEADLINE: Duration = Duration::from_secs(2);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobEvidence {
     RanAJob,
@@ -4733,9 +4755,9 @@ enum JobEvidence {
 impl JobEvidence {
     fn of(runtime: &Path) -> Self {
         let diag = runtime.join("_diag");
-        // Bounded and off this thread: the daemon's loop runs on one thread,
-        // and a runtime on a volume that does not answer (a hung disk, a
-        // pending macOS question) must not stall it.
+        // Bounded: the daemon's loop runs on one thread, and a runtime on a
+        // volume that does not answer (a hung disk, a pending macOS question)
+        // must not stall it for longer than this.
         if runner_manager_platform::host_fitness::directory_responds(&diag, EVIDENCE_DEADLINE)
             != runner_manager_platform::host_fitness::Responsiveness::Responds
         {
@@ -7781,6 +7803,50 @@ mod tests {
             .observe(GithubRunnerObservation::Registered { busy: false });
         harness.launcher.supervise(&harness.policy).await.unwrap();
         assert_eq!(harness.only_attempt().state(), AttemptState::Busy);
+    }
+
+    /// While GitHub cannot be reached nothing is concluded, so a registration
+    /// still listed there is removed once it answers.
+    #[tokio::test]
+    async fn a_clean_exit_waits_for_github_to_answer() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness.processes.finish_successfully();
+        harness.github.observe(GithubRunnerObservation::Unreachable);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(harness.only_attempt().state(), AttemptState::Starting);
+
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness.launcher.supervise(&harness.policy).await.unwrap();
+        assert_eq!(
+            harness.only_attempt().outcome(),
+            Some(&AttemptOutcome::CompletedJob)
+        );
+    }
+
+    /// A runner id nobody can name is not a reason to stop supervising the
+    /// policy: the attempt is concluded the way it was before, without one.
+    #[tokio::test]
+    async fn a_short_job_with_no_runner_id_still_concludes() {
+        let harness = Harness::new(FakeGithubLifecycle::default(), Arc::new(PersistentDemand));
+        harness.ready().await;
+        let started = harness.launch().await;
+        fs::remove_file(started.runtime_path().join(RUNNER_ID_FILE)).unwrap();
+        write_runner_diagnostics(started.runtime_path(), true);
+        harness.processes.finish_successfully();
+        harness
+            .github
+            .observe(GithubRunnerObservation::NotRegistered);
+        harness
+            .launcher
+            .supervise(&harness.policy)
+            .await
+            .expect("supervision goes on");
+        assert!(harness.only_attempt().is_terminal());
     }
 
     /// Without the runner's diagnostics nothing changes: a clean exit seen only
