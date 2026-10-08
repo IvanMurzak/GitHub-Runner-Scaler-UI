@@ -48,6 +48,20 @@ the version being prepared rather than the version in `Cargo.toml`.
 - `service status` is not healthy while the service starts no runner because a required host
   check fails; it used to say `verdict healthy`. It names what the service found and the fix,
   and so does `status`, under `host unfit because`.
+- A daemon that stops making progress reads as such. One blocked in a file system call sat at 0%
+  CPU for half an hour after an update, writing nothing, while launchd reported it running and
+  `service status` said `verdict healthy`. The daemon now writes a heartbeat from its loop every
+  minute; when a running daemon has not beaten for five minutes, `service status` is not healthy
+  and `status` says `daemon stalled`, with the last GitHub contact and what to do. Its host-unfit
+  record no longer expires from `status` while it is stalled, and host checks that do not finish
+  within two minutes count as a failure (`host.checks`) instead of holding the daemon back
+  silently. Reading a runner's diagnostics is bounded as well.
+- `wsl install` (and anything else that raises a UAC prompt) asks for administrator rights from
+  a session on the Windows desktop even with no terminal, as when a script or an agent runs it.
+  A UAC prompt is a desktop dialog; it used to be refused with "this session has no terminal".
+  Sessions with no desktop (services, scheduled tasks that run whether or not anybody is signed
+  in, SSH logins) are still refused, and a change that lowers security still needs its flag or
+  an answer on a terminal.
 - `host doctor` reports a required check the running service finds failing as failing, with the
   service's finding, even when its own look passes. Over SSH it used to list the runner root
   itself, from a session macOS was not asking about, and call it passing.
