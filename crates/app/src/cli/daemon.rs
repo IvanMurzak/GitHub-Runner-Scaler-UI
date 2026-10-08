@@ -2383,9 +2383,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let context = rooted(root.path());
         context.paths().create_all().unwrap();
-        let verdict = bounded_preflight(std::future::pending(), Duration::from_secs(120), &context)
-            .await
-            .expect("a verdict");
+        // Bounded from outside too, so a regression fails here rather than
+        // hanging the run.
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(600),
+            bounded_preflight(std::future::pending(), Duration::from_secs(120), &context),
+        )
+        .await
+        .expect("host checks that never finish are given up on")
+        .expect("a verdict");
         assert_eq!(verdict.required, [BLOCKED_CHECKS_ID]);
         let record = runner_manager_platform::host_fitness::host_unfit(context.paths())
             .unwrap()
