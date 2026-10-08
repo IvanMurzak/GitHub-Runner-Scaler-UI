@@ -125,6 +125,10 @@ pub struct StatusDocument {
     pub credential: Credential,
     pub host: HostSnapshot,
     pub budget: BudgetSnapshot,
+    /// The idle and active poll intervals and what the daemon measured
+    /// polling to cost: `200`s and `304`s per hour, the account's remaining
+    /// hourly quota, and whether polling is being slowed down.
+    pub polling: super::polling::PollingSnapshot,
     pub policies: Vec<PolicySnapshot>,
     /// `host doctor`'s verdict, from this command's point of view, and the
     /// daemon's recorded refusal to start runners, if it has one. Read-only
@@ -490,6 +494,14 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);
+    // Tolerant on purpose: `status` must answer when something is broken, and
+    // an unreadable `polling.toml` is reported by `host show`, which refuses.
+    let intervals =
+        super::polling::configured(context, &store).unwrap_or(super::polling::Intervals {
+            active: interval,
+            idle: runner_manager_domain::model::IdlePollInterval::default(),
+        });
+    let polling = super::polling::snapshot(context, intervals, &targets);
 
     let runner_root = workspace::host_root(context.paths(), host.as_ref());
     let ephemeral = workspace::host_affected_attempts(&store)?;
@@ -570,6 +582,7 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
             max_repository_targets: max_repository_targets(interval),
             best_case_multiple_when_paging: FALLBACK_COST_MULTIPLE,
         },
+        polling,
         caches: super::cache::snapshot(context, host.as_ref()),
         policies: policies
             .iter()
@@ -780,9 +793,11 @@ fn write_text(out: &mut dyn Write, document: &StatusDocument) -> io::Result<()> 
     }
     writeln!(out)?;
 
+    super::polling::write_section(out, &document.polling)?;
+    writeln!(out)?;
     writeln!(
         out,
-        "Shared REST budget: {} requests/hour projected of {} this host may spend",
+        "Shared REST budget: {} requests/hour projected if no poll were answered 304, of {}          this host may spend",
         document.budget.projected_requests_per_hour, document.budget.allowance_requests_per_hour
     )?;
     writeln!(
@@ -855,6 +870,33 @@ mod tests {
                 exceeds_allowance: false,
                 max_repository_targets: 13,
                 best_case_multiple_when_paging: FALLBACK_COST_MULTIPLE,
+            },
+            polling: super::super::polling::PollingSnapshot {
+                idle_interval_secs: 10,
+                active_interval_secs: 60,
+                idle_requests_per_minute: 12,
+                secondary_limit_points_per_minute: 900,
+                measured: Some(super::super::polling::MeasuredPolling {
+                    written_at: chrono::DateTime::from_timestamp(1_787_270_400, 0)
+                        .expect("a valid instant"),
+                    stale: false,
+                    observed_minutes: 60,
+                    full_responses_per_hour: 40,
+                    not_modified_responses_per_hour: 680,
+                    failed_responses_per_hour: 0,
+                    not_modified_percent: Some(94),
+                    peak_requests_per_minute: 14,
+                    secondary_limit_percent: 1,
+                    pace: "idle".to_string(),
+                    targets_idle: 1,
+                    targets_total: 1,
+                    throttled: false,
+                    throttled_because: None,
+                    rate_limit_limit: Some(5000),
+                    rate_limit_remaining: Some(4200),
+                    rate_limit_used: Some(800),
+                    rate_limit_reset: None,
+                }),
             },
             policies: vec![PolicySnapshot {
                 id: "00000000-0000-0000-0000-000000000010".to_string(),
@@ -952,8 +994,42 @@ mod tests {
                 "github_contacted",
                 "host",
                 "policies",
+                "polling",
                 "product",
                 "schema_version",
+            ]
+        );
+        assert_eq!(
+            keys(&emitted, "/polling"),
+            [
+                "active_interval_secs",
+                "idle_interval_secs",
+                "idle_requests_per_minute",
+                "measured",
+                "secondary_limit_points_per_minute",
+            ]
+        );
+        assert_eq!(
+            keys(&emitted, "/polling/measured"),
+            [
+                "failed_responses_per_hour",
+                "full_responses_per_hour",
+                "not_modified_percent",
+                "not_modified_responses_per_hour",
+                "observed_minutes",
+                "pace",
+                "peak_requests_per_minute",
+                "rate_limit_limit",
+                "rate_limit_remaining",
+                "rate_limit_reset",
+                "rate_limit_used",
+                "secondary_limit_percent",
+                "stale",
+                "targets_idle",
+                "targets_total",
+                "throttled",
+                "throttled_because",
+                "written_at",
             ]
         );
         assert_eq!(

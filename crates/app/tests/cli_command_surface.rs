@@ -52,6 +52,9 @@ const SURFACE: [(&str, &[&str]); 10] = [
         "host",
         &[
             "set-capacity",
+            // Owner decision 2026-10-07: idle polling every 10 s on conditional
+            // requests, with a host-level setting for both intervals.
+            "set-poll-interval",
             "set-runtime-root",
             "reset-runtime-root",
             "show",

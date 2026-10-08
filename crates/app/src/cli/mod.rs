@@ -46,6 +46,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod host;
 pub mod policy;
+pub mod polling;
 pub mod profile;
 pub mod service;
 pub mod status;
@@ -825,6 +826,8 @@ pub struct AuthStatusArgs {
 pub enum HostCommand {
     /// Set the ceiling on concurrent runner attempts for this machine.
     SetCapacity(HostSetCapacityArgs),
+    /// Set how often GitHub is polled for work: when idle, and when busy.
+    SetPollInterval(HostSetPollIntervalArgs),
     /// Place disposable runner workspaces under a directory you choose.
     SetRuntimeRoot(HostSetRuntimeRootArgs),
     /// Return runner placement to this platform's default directory.
@@ -1091,6 +1094,27 @@ pub struct HostEnvUnsetArgs {
 pub enum HostIsolationCommand {
     /// Report provider readiness and installation remedies.
     Status(StatusArgs),
+}
+
+/// `host set-poll-interval --idle 10s --active 60s`.
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("interval")
+        .required(true)
+        .multiple(true)
+        .args(["idle", "active"])
+))]
+pub struct HostSetPollIntervalArgs {
+    /// How often a target with nothing happening is polled, e.g. `10s`. At
+    /// least 5s. These polls are conditional requests GitHub answers `304`,
+    /// which do not count against the hourly quota.
+    #[arg(long, value_name = "DURATION", value_parser = polling::parse_interval)]
+    pub idle: Option<u16>,
+    /// How often a target with runners up or runs changing is polled, e.g.
+    /// `60s`. At least 30s. These are full responses charged against the
+    /// hourly quota every host signed in as you shares.
+    #[arg(long, value_name = "DURATION", value_parser = polling::parse_interval)]
+    pub active: Option<u16>,
 }
 
 #[derive(Debug, Args)]

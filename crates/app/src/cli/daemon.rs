@@ -299,6 +299,28 @@ async fn run_generation(
     // the host's, and the namespace comes from each launch's policy.
     let dependency_caches =
         super::cache::daemon_caches(context, Arc::clone(&store) as Arc<dyn Store>, host.id);
+    // ------------------------------------------------------------------
+    // ONE DEMAND GATEWAY FOR EVERY TARGET.
+    // ------------------------------------------------------------------
+    // Shared, so a repository covered by two targets is read once per idle
+    // interval, every listing's `ETag` is kept in one place, and a rate limit
+    // one loop meets silences every loop. See `RestDemand`.
+    let intervals = super::polling::configured(context, store.as_ref()).unwrap_or_else(|error| {
+        tracing::warn!(%error, "the poll intervals could not be read; using the defaults");
+        super::polling::Intervals {
+            active: host.refresh_interval,
+            idle: runner_manager_domain::model::IdlePollInterval::default(),
+        }
+    });
+    let demand_gateway = Arc::new(RestDemand::new(Arc::clone(&client), Arc::clone(&clock)));
+    let polling = Arc::new(super::polling::PollingMonitor::new(
+        context.paths().clone(),
+        Arc::clone(&store) as Arc<dyn Store>,
+        host.id,
+        Arc::clone(&demand_gateway),
+        Arc::clone(&clock),
+        intervals,
+    ));
     let mut managed_targets = Vec::with_capacity(targets.len());
     for policies in targets {
         let package_target = policies[0].target.clone();
@@ -361,7 +383,7 @@ async fn run_generation(
         lifecycle_store.finish_recovery();
         let cancel = CancelToken::new();
         let demand = Arc::new(GatewayDemand::new(
-            RestDemand::new(Arc::clone(&client), Arc::clone(&clock)),
+            Arc::clone(&demand_gateway),
             cancel.clone(),
         ));
         managed_targets.push(ManagedTarget {
@@ -381,8 +403,10 @@ async fn run_generation(
                     jitter: Arc::new(RandomJitter),
                     events: Arc::clone(&events),
                 },
-            ),
+            )
+            .with_idle_interval(intervals.effective_idle()),
             cancel,
+            polling: Arc::clone(&polling),
         });
     }
 
@@ -393,6 +417,7 @@ async fn run_generation(
         paths: context.paths().clone(),
         clock: Arc::clone(&clock),
         write: Mutex::new(()),
+        recorded_at: Mutex::new(None),
     });
     // Captured before the targets are moved into their loops: this is the set a
     // restart is measured against.
@@ -1842,6 +1867,13 @@ trait TargetReconciler: Send + 'static {
     fn policies(&self) -> &[ScalePolicy];
     fn begin_drain(&mut self);
     fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>>;
+
+    /// Adopt poll intervals an operator changed while the daemon runs.
+    fn refresh_intervals(&mut self) {}
+
+    /// Report one pass's pace, for `status` and `host show`.
+    fn observe(&self, _report: &ReconcileReport) {}
+
     fn active_owned(&self, report: &ReconcileReport) -> Option<u16> {
         active_owned(report, self.policies())
     }
@@ -1890,6 +1922,7 @@ struct ManagedTarget {
     reconciler: Reconciler,
     cancel: CancelToken,
     store: Arc<dyn Store>,
+    polling: Arc<super::polling::PollingMonitor>,
 }
 
 impl TargetReconciler for ManagedTarget {
@@ -1904,6 +1937,18 @@ impl TargetReconciler for ManagedTarget {
 
     fn reconcile(&mut self) -> Pin<Box<dyn Future<Output = ReconcileReport> + Send + '_>> {
         Box::pin(self.reconciler.reconcile(&self.policies))
+    }
+
+    fn refresh_intervals(&mut self) {
+        let intervals = self.polling.intervals();
+        self.reconciler
+            .set_intervals(intervals.active, intervals.effective_idle());
+    }
+
+    fn observe(&self, report: &ReconcileReport) {
+        if let Some(policy) = self.policies.first() {
+            self.polling.observe(&policy.target, &report.next_poll);
+        }
     }
 
     fn refresh_policies(&mut self) {
@@ -1961,10 +2006,29 @@ struct FileContactRecorder {
     paths: runner_manager_platform::paths::AppPaths,
     clock: Arc<dyn Clock>,
     write: Mutex<()>,
+    /// When the record was last written. Every target loop records a contact
+    /// on every pass, and an idle loop passes every few seconds; the record
+    /// answers "is the service reaching GitHub now", which a timestamp a few
+    /// seconds old answers as well as a fresh one, so it is rewritten at most
+    /// every [`CONTACT_RECORD_EVERY`] instead of several times a second.
+    recorded_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// See [`FileContactRecorder::recorded_at`].
+const CONTACT_RECORD_EVERY: Duration = Duration::from_secs(30);
 
 impl ContactRecorder for FileContactRecorder {
     fn record(&self) -> Result<(), CliError> {
+        {
+            let mut recorded_at = self
+                .recorded_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if recorded_at.is_some_and(|at| at.elapsed() < CONTACT_RECORD_EVERY) {
+                return Ok(());
+            }
+            *recorded_at = Some(std::time::Instant::now());
+        }
         let _write = self.write.lock().map_err(|_| {
             CliError::new(
                 Failure::LocalState,
@@ -2067,7 +2131,11 @@ async fn run_target_loop<T: TargetReconciler>(
         // Before deciding anything, so a policy an operator changed a moment
         // ago governs this pass rather than the next one.
         target.refresh_policies();
+        target.refresh_intervals();
         let report = target.reconcile().await;
+        if draining.is_none() {
+            target.observe(&report);
+        }
         // `reached_github()` alone, and not `failure.is_none()`. Two changes in
         // one line, both deliberate.
         //

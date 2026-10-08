@@ -273,6 +273,23 @@ pub struct HostSetup {
     /// session, when it refuses to start runners. See [`evaluate`].
     #[serde(default, skip_serializing)]
     pub daemon_unfit: Option<host_fitness::HostUnfitRecord>,
+    /// The poll intervals, and the daemon's last measurement of what polling
+    /// costs. `None` when the intervals could not be read.
+    #[serde(default)]
+    pub polling: Option<PollingFacts>,
+}
+
+/// What `github.polling` reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollingFacts {
+    pub idle_secs: u16,
+    pub active_secs: u16,
+    /// `state/poll-traffic.toml`, when a daemon has written it.
+    pub traffic: Option<runner_manager_platform::polling::PollTraffic>,
+    /// Whether `traffic` is older than the daemon would let it get while it
+    /// runs: see [`super::polling::STALE_AFTER`].
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl HostSetup {
@@ -870,6 +887,14 @@ pub const CHECKS: &[CheckSpec] = &[
         probe: probe_required_tools,
         fix: None,
     },
+    CheckSpec {
+        id: "github.polling",
+        title: "GitHub polling runs at its configured pace",
+        platform: CheckPlatform::Any,
+        severity: Severity::Info,
+        probe: probe_polling,
+        fix: None,
+    },
     // Recommended, not Required: a Required failure makes the daemon refuse
     // every launch, and this check reports exactly that refusal.
     // The daemon's own: its host checks did not finish, so one is blocked. A
@@ -1254,6 +1279,60 @@ fn probe_pwsh(setup: &HostSetup, facts: &dyn HostFacts) -> Outcome {
         .remedy("add its directory with `runner-manager host env set PATH=...`")
     } else {
         fail("PowerShell 7 is not installed, so `shell: pwsh` steps fail").remedy(install)
+    }
+}
+
+// -- github.polling -----------------------------------------------------------
+
+/// The poll intervals, the share of polls GitHub answered `304`, and whether
+/// the daemon is slowing down. Information only: being throttled resolves by
+/// waiting, and the daemon already does.
+fn probe_polling(setup: &HostSetup, _facts: &dyn HostFacts) -> Outcome {
+    let Some(polling) = &setup.polling else {
+        return unknown("the poll intervals could not be read from config/polling.toml")
+            .remedy("runner-manager host set-poll-interval --idle 10s");
+    };
+    let intervals = format!(
+        "idle every {}s, active every {}s",
+        polling.idle_secs, polling.active_secs
+    );
+    let Some(traffic) = &polling.traffic else {
+        return pass(format!(
+            "{intervals}; no service has measured its polling yet"
+        ));
+    };
+    if polling.stale {
+        return unknown(format!(
+            "{intervals}; the last measurement is from {}, so the service is probably not              running",
+            traffic.written_at.to_rfc3339()
+        ));
+    }
+    let share = traffic.not_modified_percent().map_or_else(
+        || "no responses yet".to_string(),
+        |percent| {
+            format!(
+                "{percent}% of {} responses over {} minute(s) were 304 (free against the hourly                  quota)",
+                traffic.total(),
+                traffic.observed_minutes
+            )
+        },
+    );
+    let quota = match (traffic.rate_limit_remaining, traffic.rate_limit_limit) {
+        (Some(remaining), Some(limit)) => {
+            format!("; the account has {remaining} of {limit} requests left this hour")
+        }
+        _ => String::new(),
+    };
+    let detail = format!(
+        "{intervals}; {share}; busiest minute {} of {} secondary-limit points{quota}",
+        traffic.peak_requests_per_minute,
+        runner_manager_github::traffic::SECONDARY_POINTS_PER_MINUTE
+    );
+    match &traffic.throttled_because {
+        None => pass(format!("{detail}; not throttled")),
+        Some(reason) => fail(format!("{detail}. Throttled: {reason}")).remedy(
+            "nothing to do here; the service waits and recovers on its own. If the quota is              low, something else signed in as the same GitHub user may be spending it",
+        ),
     }
 }
 
@@ -2355,6 +2434,27 @@ fn setup_from_parts(
         daemon_unfit: (perspective == Perspective::Operator)
             .then(|| host_fitness::host_unfit_in_force(context.paths(), context.clock().now()))
             .flatten(),
+        polling: runner_manager_platform::polling::idle_interval(context.paths())
+            .ok()
+            .map(|idle| {
+                let traffic = runner_manager_platform::polling::last_traffic(context.paths())
+                    .ok()
+                    .flatten();
+                let now = context.clock().now();
+                PollingFacts {
+                    idle_secs: idle.as_secs(),
+                    active_secs: host.map_or(
+                        runner_manager_domain::model::RefreshInterval::DEFAULT_SECS,
+                        |host| host.refresh_interval.as_secs(),
+                    ),
+                    stale: traffic.as_ref().is_some_and(|traffic| {
+                        now.signed_duration_since(traffic.written_at)
+                            .to_std()
+                            .is_ok_and(|age| age > super::polling::STALE_AFTER)
+                    }),
+                    traffic,
+                }
+            }),
         service,
     }
 }
@@ -4183,6 +4283,7 @@ mod tests {
             service_account: None,
             service_home: None,
             daemon_unfit: None,
+            polling: None,
         }
     }
 
@@ -5758,5 +5859,79 @@ mod tests {
             ..summary
         };
         assert_eq!(clean.line(), "ok (9 checks)");
+    }
+
+    fn polling_setup(
+        traffic: Option<runner_manager_platform::polling::PollTraffic>,
+        stale: bool,
+    ) -> HostSetup {
+        HostSetup {
+            polling: Some(PollingFacts {
+                idle_secs: 10,
+                active_secs: 60,
+                traffic,
+                stale,
+            }),
+            ..windows_setup()
+        }
+    }
+
+    fn measured(throttled_because: Option<&str>) -> runner_manager_platform::polling::PollTraffic {
+        let mut traffic = runner_manager_platform::polling::PollTraffic::new(chrono::Utc::now());
+        traffic.observed_minutes = 60;
+        traffic.full = 40;
+        traffic.not_modified = 680;
+        traffic.peak_requests_per_minute = 14;
+        traffic.rate_limit_limit = Some(5_000);
+        traffic.rate_limit_remaining = Some(4_200);
+        traffic.throttled_because = throttled_because.map(str::to_string);
+        traffic
+    }
+
+    #[test]
+    fn the_polling_check_reports_the_intervals_the_304_share_and_throttling() {
+        let facts = Facts::default();
+        let healthy = evaluate(&polling_setup(Some(measured(None)), false), &facts);
+        let found = finding(&healthy, "github.polling");
+        assert_eq!(
+            (found.status, found.severity),
+            (Status::Pass, Severity::Info)
+        );
+        for part in [
+            "idle every 10s",
+            "active every 60s",
+            "94% of 720",
+            "4200 of 5000",
+            "not throttled",
+        ] {
+            assert!(found.detail.contains(part), "{part}: {}", found.detail);
+        }
+
+        let throttled = evaluate(
+            &polling_setup(Some(measured(Some("the quota is low"))), false),
+            &facts,
+        );
+        let found = finding(&throttled, "github.polling");
+        assert_eq!(found.status, Status::Fail);
+        assert!(
+            found.detail.contains("Throttled: the quota is low"),
+            "{}",
+            found.detail
+        );
+        assert!(
+            !found.needs_attention(),
+            "information only: a throttled host recovers by waiting"
+        );
+
+        let stale = evaluate(&polling_setup(Some(measured(None)), true), &facts);
+        assert_eq!(finding(&stale, "github.polling").status, Status::Unknown);
+
+        let never = evaluate(&polling_setup(None, false), &facts);
+        assert_eq!(finding(&never, "github.polling").status, Status::Pass);
+        let unreadable = evaluate(&windows_setup(), &facts);
+        assert_eq!(
+            finding(&unreadable, "github.polling").status,
+            Status::Unknown
+        );
     }
 }

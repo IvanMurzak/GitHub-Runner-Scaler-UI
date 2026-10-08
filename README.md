@@ -309,6 +309,7 @@ runner-manager auth logout                                     # Purge the local
 
 runner-manager host show                                       # Show capacity, secret store and REST budget
 runner-manager host set-capacity N                             # Limit concurrent runners on this machine
+runner-manager host set-poll-interval --idle 10s [--active 60s] # How often GitHub is polled, idle and busy
 runner-manager host set-runtime-root --path PATH               # Put disposable runner workspaces under PATH
 runner-manager host reset-runtime-root                         # Return runner placement to the platform default
 runner-manager host isolation status [--json]                  # Report execution provider readiness
@@ -647,6 +648,7 @@ administrator rights:
 | `host.runner_root_responsive` | all | required | none; a runner root that does not answer within 5 s (a hung external disk or network mount) | - |
 | `host.capacity` | all | recommended | none; suggests `host set-capacity N` from memory and cores | - |
 | `host.required_tools` | all | required | none; install the tool or extend PATH | - |
+| `github.polling` | all | info | none; reports the idle and active poll intervals, the share of polls GitHub answered `304`, and whether the service is slowing down for the account's rate limit | - |
 
 `runner-manager host prepare` applies the fixes. It lists them and asks before changing anything
 (`--yes` skips that question), runs what needs no privilege itself, and asks for administrator
@@ -662,6 +664,31 @@ summary, and the dashboard lists failing checks with `f` to fix them. While a **
 fails, the service starts no runner and logs `host_unfit`; it re-checks every five minutes, so a
 fix takes effect without a restart. A check it could not evaluate never holds runners back.
 Name the tools every job needs with `runner-manager host required-tools --set git,pwsh,node`.
+
+### Choose how often GitHub is polled
+
+The service asks GitHub for queued jobs on two intervals. A repository with nothing happening is
+polled every **10 seconds** (the idle interval): those polls are conditional requests, GitHub
+answers them `304 Not Modified` while nothing changed, and a `304` does not count against your
+hourly rate limit. A repository with a runner up or runs in progress is polled every **60
+seconds** (the active interval), because its answers change and each one is charged.
+
+```bash
+runner-manager host set-poll-interval --idle 10s --active 60s
+```
+
+The idle interval is at least 5 seconds and the active one at least 30. A running service picks a
+change up within 15 seconds. Every policy and profile on one repository shares one poll, and a
+repository covered by two targets (an organization and a repository inside it) is read once for
+both within the idle interval.
+
+GitHub's hourly limit belongs to your GitHub user, not to a machine: every host signed in as you,
+and your own `gh`, draw from the same 5,000 requests. When fewer than a fifth are left, every
+host slows its polling down (twice the active interval, four times under a twentieth) until the
+hour resets, and `status`, `host show` and `host doctor` say so. A secondary rate limit stops
+every poll on the host until the time GitHub names, doubling if it recurs. `host show` prints
+what polling actually cost: full and `304` responses per hour, the busiest minute against
+GitHub's 900-a-minute secondary limit, and what is left of the hourly limit.
 
 ### Choose where runners work
 

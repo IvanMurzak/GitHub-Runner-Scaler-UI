@@ -653,6 +653,24 @@ pub trait DemandGateway: fmt::Debug + Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
+/// One gateway shared by every target loop on a host. Sharing is what lets
+/// [`RestDemand`] read a repository once for every target that covers it, and
+/// silence every loop at once inside a rate-limit quiet period.
+#[async_trait::async_trait]
+impl<T: DemandGateway + ?Sized> DemandGateway for Arc<T> {
+    async fn queued_demand(
+        &self,
+        scope: &ActivityScope,
+        cancel: &CancelToken,
+    ) -> Result<QueuedDemand, InventoryError> {
+        (**self).queued_demand(scope, cancel).await
+    }
+
+    fn now(&self) -> Timestamp {
+        (**self).now()
+    }
+}
+
 /// [`DemandGateway`] over `api.github.com`.
 ///
 /// Holds no credential of its own: authentication is entirely

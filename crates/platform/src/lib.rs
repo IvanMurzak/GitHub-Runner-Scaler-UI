@@ -56,6 +56,7 @@ pub mod lock;
 pub mod logging;
 pub mod os;
 pub mod paths;
+pub mod polling;
 pub mod process;
 pub mod runner_env;
 pub mod runner_root;

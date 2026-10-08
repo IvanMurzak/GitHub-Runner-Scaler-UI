@@ -7,6 +7,34 @@ SBOM and the verification steps; this file carries what the version *does*.
 Versions are `X.Y.Z` and are set by the release workflow, so the top entry names
 the version being prepared rather than the version in `Cargo.toml`.
 
+## 0.4.38
+
+### Features
+
+- A repository with nothing happening is polled for queued jobs every 10 seconds instead of every
+  60, so a job that arrives on an idle host gets its runner up to 50 seconds sooner. The polls
+  are conditional requests: the service keeps each listing's `ETag`, sends it back with
+  `If-None-Match`, and GitHub answers `304 Not Modified` while nothing changed. GitHub does not
+  count a `304` against the hourly rate limit, so idle polling is free against it. A repository
+  with a runner up or runs in progress is still polled every 60 seconds.
+- `runner-manager host set-poll-interval --idle 10s --active 60s` sets both intervals. The idle
+  interval is at least 5 seconds and the active one at least 30 (the active one is the existing
+  refresh interval). A running service picks a change up within 15 seconds, without a restart.
+- A repository covered by two targets on one host, such as an organization and a repository
+  inside it, is read once for both, and every target shares one set of `ETag`s.
+- The hourly rate limit is your GitHub user's, shared by every host signed in as you. Every
+  response carries what is left of it, and the service now slows down on it: under a fifth left,
+  it polls at twice the active interval, under a twentieth at four times, never past the hour's
+  reset. A secondary rate limit (`429`, or a `403` saying so) now stops every poll on the host,
+  not only the one that met it, until the `retry-after` GitHub sent, or a minute without one,
+  doubling while it recurs.
+- `host show` and `status` print what polling actually cost, measured by the service: full
+  (`200`) and `304` responses per hour and the share that were `304`, the busiest minute against
+  GitHub's 900-a-minute secondary limit, what is left of the hourly limit, and whether polling is
+  throttled and why. The old projection is still printed, as the cost if no poll were answered
+  `304`. `status --json` carries the measurement under `polling`. A new `host doctor` check,
+  `github.polling`, reports the same and never blocks runners.
+
 ## 0.4.37
 
 ### Changes
