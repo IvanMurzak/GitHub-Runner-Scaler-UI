@@ -660,19 +660,33 @@ async fn maintain_dependency_caches(
 async fn answer_github_requests(context: &Context, mode: StartMode) {
     use runner_manager_platform::service_request::{GITHUB_DISCOVERY, POLL};
     let state_dir = context.paths().state_dir().to_path_buf();
-    let request_file = GITHUB_DISCOVERY.request_path(&state_dir);
+    // One discovery answers every request that arrives within this long, so
+    // whatever can write the state directory cannot spend the credential's
+    // GitHub budget faster than this.
+    const REUSE: Duration = Duration::from_secs(30);
+    let mut last: Option<(
+        std::time::Instant,
+        Result<super::auth::CredentialState, String>,
+    )> = None;
     loop {
-        // Almost every look finds nothing, and a look is one `stat`.
-        if request_file.exists()
-            && let Some(request) = GITHUB_DISCOVERY.take(&state_dir)
-        {
-            let outcome = super::auth::credential_state_for_service(context, mode).await;
-            if let Err(error) = GITHUB_DISCOVERY.answer(&state_dir, &request, outcome) {
-                tracing::warn!(
-                    %error,
-                    reason = "github_request_unanswered",
-                    "could not answer a command waiting for what the credential reaches"
-                );
+        let requests = GITHUB_DISCOVERY.take(&state_dir);
+        if !requests.is_empty() {
+            let outcome = match &last {
+                Some((at, outcome)) if at.elapsed() < REUSE => outcome.clone(),
+                _ => {
+                    let outcome = super::auth::credential_state_for_service(context, mode).await;
+                    last = Some((std::time::Instant::now(), outcome.clone()));
+                    outcome
+                }
+            };
+            for request in requests {
+                if let Err(error) = GITHUB_DISCOVERY.answer(&state_dir, &request, outcome.clone()) {
+                    tracing::warn!(
+                        %error,
+                        reason = "github_request_unanswered",
+                        "could not answer a command waiting for what the credential reaches"
+                    );
+                }
             }
         }
         tokio::time::sleep(POLL).await;

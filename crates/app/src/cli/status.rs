@@ -478,10 +478,15 @@ fn snapshot_with(context: &Context, with_doctor: bool) -> Result<StatusDocument,
         Ok(value) => (value.is_some(), None),
         Err(source) => (false, Some(source.to_string())),
     };
-    let service_reached_github_secs_ago = unreadable
-        .is_some()
-        .then(|| super::doctor::installed_service_contact_age(context))
-        .flatten();
+    // Not while GitHub is rejecting the service's credential: a contact from
+    // before the rejection vouches for nothing.
+    let service_reached_github_secs_ago = (unreadable.is_some()
+        && github_credential_rejected_since(context.paths())
+            .ok()
+            .flatten()
+            .is_none())
+    .then(|| super::doctor::installed_service_contact_age(context))
+    .flatten();
 
     let targets: Vec<_> = policies.iter().map(|p| p.target.clone()).collect();
     let budget = HostBudget::of(interval, &targets);

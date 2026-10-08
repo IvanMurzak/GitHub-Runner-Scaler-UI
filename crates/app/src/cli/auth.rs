@@ -61,7 +61,7 @@ use runner_manager_github::{
 use runner_manager_platform::lock::{HostLock, LockKind};
 use runner_manager_platform::secrets::{Removal, SecretStore, SecretStoreError};
 use runner_manager_platform::service::InstallRecord;
-use runner_manager_platform::service_request;
+use runner_manager_platform::service_request::{self, AskError};
 use secrecy::zeroize::Zeroize as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -601,10 +601,13 @@ pub fn login(
     // warning that they were signing in to the wrong half. Hence the flag, and
     // hence the line printed below whether or not it was passed.
     let recorded = context.recorded_start_mode(&store)?;
+    // Only a host with no record has a mode nobody chose; one recorded
+    // earlier, `boot` included, keeps it.
+    let host_recorded = super::host::local_host(&store)?.is_some();
     let start_mode = requested_mode.unwrap_or_else(|| {
         assumed_start_mode(
             recorded,
-            service_installed_on_a_keychain_mac(context),
+            service_installed_on_a_keychain_mac(context).filter(|_| !host_recorded),
             runner_manager_platform::host_fitness::is_elevated(),
         )
     });
@@ -612,9 +615,13 @@ pub fn login(
     write_store_choice(out, start_mode, requested_mode.is_some()).map_err(failed)?;
     // The mode used is recorded, so that `repo add`, `auth status` and the
     // daemon all agree with the sign-in that just happened rather than with a
-    // default nobody chose. That includes an assumed `login`: left unrecorded,
-    // every later command would look for the credential in the System keychain.
-    record_start_mode(context, &store, recorded, start_mode)?;
+    // default nobody chose. A chosen mode is recorded now; an assumed one only
+    // once a credential is in its store, so an abandoned sign-in changes
+    // nothing. Left unrecorded, every later command would look for the
+    // credential in the System keychain.
+    if requested_mode.is_some() {
+        record_start_mode(context, &store, recorded, start_mode)?;
+    }
 
     // ------------------------------------------------------------------------
     // A HOST THAT IS ALREADY SIGNED IN RESUMES; IT DOES NOT SIGN IN AGAIN.
@@ -669,6 +676,7 @@ pub fn login(
     if let Some(secret) = resumable
         && let CredentialState::Authenticated(discovery) = credential_state_of(context, secret)?
     {
+        record_start_mode(context, &store, recorded, start_mode)?;
         writeln!(out, "Already signed in, so no new code is needed.").map_err(failed)?;
         write_discovery(out, styling, &discovery, true, list).map_err(failed)?;
         return Ok(());
@@ -694,6 +702,7 @@ pub fn login(
         // bare token when it does not. See `UserAccessToken::to_stored_document`.
         .store(&token.to_stored_document())
         .map_err(|source| secret_store_failure(&source))?;
+    record_start_mode(context, &store, recorded, start_mode)?;
 
     // ---- what the credential reaches, and the third action if any --------
     let client = AuthenticatedClient::new(context.endpoints().clone(), token, context.clock())
@@ -1363,7 +1372,7 @@ fn store_received_credential(
 /// reason. `f1`'s Definition of Done names four; folding an offline host into
 /// [`CredentialState::Revoked`] would tell an operator with a dropped
 /// connection to sign in again, which is the wrong remedy stated confidently.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CredentialState {
     /// No value in the store. The ordinary state before `auth login`.
     NotAuthenticated,
@@ -1441,7 +1450,7 @@ pub fn credential_state(
 fn credential_state_or_ask(
     context: &Context,
     secrets: &dyn SecretStore,
-    ask: impl FnOnce() -> Option<Result<CredentialState, String>>,
+    ask: impl FnOnce() -> Option<Result<CredentialState, AskError>>,
 ) -> Result<CredentialState, CliError> {
     match secrets.load() {
         Ok(Some(secret)) => credential_state_of(context, secret),
@@ -1462,7 +1471,7 @@ fn credential_state_or_ask(
 /// every poll. The service answers through
 /// [`service_request::GITHUB_DISCOVERY`]: what GitHub said about the
 /// installations, never the credential.
-fn ask_service(context: &Context) -> Option<Result<CredentialState, String>> {
+fn ask_service(context: &Context) -> Option<Result<CredentialState, AskError>> {
     InstallRecord::read(context.paths()).ok().flatten()?;
     Some(ask_service_at(
         context.paths().state_dir(),
@@ -1473,33 +1482,37 @@ fn ask_service(context: &Context) -> Option<Result<CredentialState, String>> {
 fn ask_service_at(
     state_dir: &std::path::Path,
     wait: service_request::Wait,
-) -> Result<CredentialState, String> {
-    service_request::GITHUB_DISCOVERY
-        .ask(state_dir, wait)
-        .map_err(|error| error.to_string())
+) -> Result<CredentialState, AskError> {
+    service_request::GITHUB_DISCOVERY.ask(state_dir, wait)
 }
 
 /// The store could not be read: the service's answer when there is one,
 /// otherwise the store's own failure, with what the service said beside it.
 fn through_service(
     source: &SecretStoreError,
-    ask: impl FnOnce() -> Option<Result<CredentialState, String>>,
+    ask: impl FnOnce() -> Option<Result<CredentialState, AskError>>,
 ) -> Result<CredentialState, CliError> {
-    match ask() {
-        Some(Ok(state)) => Ok(state),
-        None => Err(secret_store_failure(source)),
-        Some(Err(why)) => {
-            let failure = secret_store_failure(source);
-            Err(CliError::with_remedy(
-                Failure::SecretStore,
-                format!(
-                    "{}; the service was asked instead, and {why}",
-                    failure.message()
-                ),
-                "runner-manager service status",
-            ))
-        }
-    }
+    let failure = secret_store_failure(source);
+    let why = match ask() {
+        Some(Ok(state)) => return Ok(state),
+        None => return Err(failure),
+        Some(Err(why)) => why,
+    };
+    // A service that could not read the credential either has the store's
+    // problem, and the store's remedy; one that never answered needs looking
+    // at itself.
+    let remedy = match &why {
+        AskError::Refused(_) => failure.remedy().unwrap_or(NO_OPERATOR_REMEDY).to_owned(),
+        _ => "runner-manager service status".to_owned(),
+    };
+    Err(CliError::with_remedy(
+        Failure::SecretStore,
+        format!(
+            "{}; the service was asked instead, and {why}",
+            failure.message()
+        ),
+        remedy,
+    ))
 }
 
 /// The service's half of [`ask_service`]: what the credential stored for
@@ -2115,9 +2128,7 @@ mod tests {
 
         // A service that could not answer either: both reasons.
         let neither = through_service(&locked_login_keychain(), || {
-            Some(Err(
-                "no running service took the request within 8 seconds".into()
-            ))
+            Some(Err(AskError::NotTaken(8)))
         })
         .unwrap_err();
         assert!(
@@ -2131,6 +2142,16 @@ mod tests {
             "{neither:?}"
         );
         assert_eq!(neither.remedy(), Some("runner-manager service status"));
+
+        // A service that cannot read it either has the store's problem, and
+        // keeps the store's remedy.
+        let refused = through_service(&locked_login_keychain(), || {
+            Some(Err(AskError::Refused(
+                "it cannot read its credential either".into(),
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(refused.remedy(), alone.remedy(), "{refused:?}");
     }
 
     /// What crosses the request channel survives the trip: the installations,
@@ -3197,7 +3218,7 @@ mod tests {
         let service_dir = state_dir.clone();
         let service = std::thread::spawn(move || {
             loop {
-                if let Some(request) = service_request::GITHUB_DISCOVERY.take(&service_dir) {
+                if let Some(request) = service_request::GITHUB_DISCOVERY.take(&service_dir).pop() {
                     service_request::GITHUB_DISCOVERY
                         .answer(
                             &service_dir,

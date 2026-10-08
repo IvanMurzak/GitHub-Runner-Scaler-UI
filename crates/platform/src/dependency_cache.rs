@@ -150,7 +150,10 @@ pub fn prune_request_path(state_dir: &Path) -> PathBuf {
 /// times it is looked for.
 #[must_use]
 pub fn take_prune_request(state_dir: &Path) -> Option<String> {
-    crate::service_request::CACHE_PRUNE.take(state_dir)
+    crate::service_request::CACHE_PRUNE
+        .take(state_dir)
+        .into_iter()
+        .next()
 }
 
 /// The service's answer to one prune request.
