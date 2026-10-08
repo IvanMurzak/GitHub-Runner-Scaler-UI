@@ -65,6 +65,12 @@ the version being prepared rather than the version in `Cargo.toml`.
 - `host doctor` reports a required check the running service finds failing as failing, with the
   service's finding, even when its own look passes. Over SSH it used to list the runner root
   itself, from a session macOS was not asking about, and call it passing.
+- The release's crates.io publish no longer fails when the crates.io index trails its API. In
+  0.4.35, `runner-manager` "failed to select a version for runner-manager-agent ^0.4.35" right
+  after that crate was uploaded, and only a re-run published it. Each crate is now awaited in
+  both the API and the sparse index Cargo resolves from, with a backoff inside one fifteen-minute
+  budget, and a dependent whose workspace dependency the index does not show yet is retried.
+  Versions already published are still skipped.
 - The Spotlight check's remedy names `/Users/Shared/rman.noindex`. It used to suggest
   `…/Application Support/…/runtime.noindex`, a path with a space that `host set-runtime-root`
   also refused.
