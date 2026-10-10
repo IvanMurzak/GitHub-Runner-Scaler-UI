@@ -836,6 +836,16 @@ fn the_macos_signature_check_refuses_an_unsigned_binary() {
          ID identity asked for it is what a release without signing material \
          ships; it must pass.\n{output}"
     );
+    // The workflow always passes the identity, as an EMPTY argument when none
+    // is configured; that must mean the same as no argument at all.
+    let (ok, output) = run_release_script_with_path(
+        &["verify-macos-signature", &binary, ""],
+        Some(&stub_directory),
+    );
+    assert!(
+        ok && output.contains("signature OK"),
+        "an empty identity argument must ask for no Developer ID:\n{output}"
+    );
 
     // -- the DoD case: a deliberately stripped binary -------------------------
     // Real `codesign -dv` on an unsigned Mach-O exits 1 AND says so in words,
@@ -991,14 +1001,28 @@ fn the_signing_mode_is_decided_by_what_is_configured() {
     );
 
     // -- none present: the ad-hoc fallback, LOUDLY ---------------------------
-    let (ok, out, err) = signing_mode(&[]);
-    assert!(ok, "no signing material falls back to ad-hoc:\n{out}{err}");
-    assert_eq!(out.trim(), "adhoc");
-    assert!(
-        err.contains("::warning"),
-        "the fallback must be a workflow WARNING, visible on the run page, not \
-         a line nobody reads:\n{err}"
-    );
+    // Both shapes of "none": unset, and set to the EMPTY string -- which is
+    // what the workflow actually hands over for a secret or variable that is
+    // not configured, because `${{ secrets.X }}` always defines the name.
+    let all_empty = [
+        ("MAC_CSC_LINK", ""),
+        ("MAC_CSC_KEY_PASSWORD", ""),
+        ("MAC_SIGN_IDENTITY", ""),
+        (REQUIRE, ""),
+    ];
+    for env in [&[][..], &all_empty[..]] {
+        let (ok, out, err) = signing_mode(env);
+        assert!(
+            ok,
+            "no signing material falls back to ad-hoc ({env:?}):\n{out}{err}"
+        );
+        assert_eq!(out.trim(), "adhoc");
+        assert!(
+            err.contains("::warning"),
+            "the fallback must be a workflow WARNING, visible on the run page, not \
+             a line nobody reads:\n{err}"
+        );
+    }
 
     // -- none present, but required: refused ---------------------------------
     let (ok, out, err) = signing_mode(&[(REQUIRE, "true")]);
@@ -1089,7 +1113,7 @@ impl SigningStubs {
                  create-keychain) : >\"${{!#}}\" ;;\n\
                  delete-keychain) rm -f \"$2\" ;;\n\
                  import) cp \"$2\" '{imported}' ;;\n\
-                 list-keychains) [ \"${{3-}}\" = -s ] || printf '    \"/Users/ci/Library/Keychains/login.keychain-db\"\\n' ;;\n\
+                 list-keychains) [ \"${{4-}}\" = -s ] || printf '    \"/Users/ci/Library/Keychains/login.keychain-db\"\\n' ;;\n\
                  find-identity)\n\
                    printf '\\nPolicy: Code Signing\\n  Matching identities\\n'\n\
                    printf '  1) {hash} \"{name}\"\\n     1 identities found\\n\\n'\n\
@@ -2374,15 +2398,19 @@ fn every_release_sh_decision_is_reached_from_a_step() {
     // `codesign` exists only on macOS, so the step must be conditional -- but
     // `runner.os` is then the single value deciding whether the gate runs, and
     // a condition naming the wrong thing disables it silently on the leg that
-    // needs it.
+    // needs it. `preflight` verifies a throwaway rehearsal binary too; what
+    // is asserted here is the check on the binary that SHIPS.
     let signature: Vec<&WorkflowStep> = steps
         .iter()
-        .filter(|step| step.run.contains("release.sh verify-macos-signature"))
+        .filter(|step| {
+            step.run.contains("release.sh verify-macos-signature")
+                && step.run.contains("target/${TARGET}/release/runner-manager")
+        })
         .collect();
     assert_eq!(
         signature.len(),
         1,
-        "expected exactly one step to verify the macOS signature, found {}: {:?}",
+        "expected exactly one step to verify the shipped macOS binary, found {}: {:?}",
         signature.len(),
         signature.iter().map(|step| &step.name).collect::<Vec<_>>()
     );
@@ -2487,11 +2515,25 @@ fn the_macos_binary_is_signed_before_it_is_packaged_and_only_signing_sees_the_se
             holders.push(step);
         }
         if decides {
-            for secret in ["MAC_CSC_LINK", "MAC_CSC_KEY_PASSWORD"] {
+            // The rehearsal in `preflight` is worth something only if it is
+            // handed exactly what `build` is handed: a variable missing from
+            // either would let one pass while the other refuses after the tag.
+            for (name, value) in [
+                ("MAC_CSC_LINK", "${{ secrets.MAC_CSC_LINK }}"),
+                (
+                    "MAC_CSC_KEY_PASSWORD",
+                    "${{ secrets.MAC_CSC_KEY_PASSWORD }}",
+                ),
+                ("MAC_SIGN_IDENTITY", "${{ vars.MAC_SIGN_IDENTITY }}"),
+                (
+                    "RUNNER_MANAGER_REQUIRE_DEVELOPER_ID",
+                    "${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}",
+                ),
+            ] {
                 assert_eq!(
-                    step.env.get(secret).map(String::as_str),
-                    Some(format!("${{{{ secrets.{secret} }}}}").as_str()),
-                    "step `{}` decides how to sign and must read {secret}",
+                    step.env.get(name).map(String::as_str),
+                    Some(value),
+                    "step `{}` decides how to sign and must read {name} as {value}",
                     step.name
                 );
             }
@@ -2529,6 +2571,18 @@ fn the_macos_binary_is_signed_before_it_is_packaged_and_only_signing_sees_the_se
         preflight.condition.contains("runner.os == 'macOS'"),
         "the preflight signing decision belongs on the macOS legs"
     );
+    for required in [
+        "release.sh macos-signing-mode",
+        "release.sh sign-macos",
+        "release.sh verify-macos-signature \"$probe\" \"$MAC_SIGN_IDENTITY\"",
+    ] {
+        assert!(
+            preflight.run.contains(required),
+            "the preflight rehearsal must run `{required}`, or a wrong password \
+             or certificate is first found after the tag is pushed:\n{}",
+            preflight.run
+        );
+    }
 
     // ------------------------------------------------------------------------
     // THE ENVIRONMENT: named by the two jobs that need it, and no other.

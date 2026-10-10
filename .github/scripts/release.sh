@@ -868,16 +868,34 @@ SIGNING_WORK=""
 SIGNING_KEYCHAIN=""
 SIGNING_SEARCH_LIST=()
 
+# Fills SIGNING_SEARCH_LIST with the user's keychain search list as it is now,
+# minus this run's keychain. Empty when the list cannot be read.
+read_search_list() {
+    SIGNING_SEARCH_LIST=()
+    local listing line quoted='^[[:space:]]*"(.+)"[[:space:]]*$'
+    listing="$(security list-keychains -d user)" || return 0
+    while IFS= read -r line; do
+        if [[ "$line" =~ $quoted ]] && [[ "${BASH_REMATCH[1]}" != "$SIGNING_KEYCHAIN" ]]; then
+            SIGNING_SEARCH_LIST+=("${BASH_REMATCH[1]}")
+        fi
+    done <<<"$listing"
+}
+
 # Undoes everything `sign_with_developer_id` did to the machine, in reverse,
 # whatever stopped it. Keeps the exit status: a cleanup that turned a failed
 # signing into exit 0 would be the silent-unsigned release this file refuses.
 signing_cleanup() {
     local status=$?
     set +e
-    # Non-empty only once the list was read, and it is set the line after.
+    # Non-empty only once this run put its keychain on the list. Re-read rather
+    # than restored from the snapshot: on a Mac shared by two signing jobs the
+    # other job's keychain is on the list now, and a snapshot would drop it.
     if ((${#SIGNING_SEARCH_LIST[@]} != 0)); then
-        security list-keychains -d user -s "${SIGNING_SEARCH_LIST[@]}" ||
-            printf 'WARNING: could not restore the keychain search list\n' >&2
+        read_search_list
+        if ((${#SIGNING_SEARCH_LIST[@]} != 0)); then
+            security list-keychains -d user -s "${SIGNING_SEARCH_LIST[@]}" ||
+                printf 'WARNING: could not restore the keychain search list\n' >&2
+        fi
     fi
     if [[ -n "$SIGNING_KEYCHAIN" ]]; then
         security delete-keychain "$SIGNING_KEYCHAIN" ||
@@ -906,7 +924,10 @@ sign_with_developer_id() {
 
     trap signing_cleanup EXIT
     umask 077
-    SIGNING_WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/runner-manager-signing.XXXXXX")"
+    # macOS's TMPDIR ends in `/`; a doubled one would make the keychain path
+    # differ from the one `security list-keychains` prints back.
+    local base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+    SIGNING_WORK="$(mktemp -d "${base%/}/runner-manager-signing.XXXXXX")"
 
     # A per-run password nobody needs to know. `od` rather than the usual
     # `tr | head`: `head` closing the pipe kills `tr` with SIGPIPE, which
@@ -923,6 +944,10 @@ sign_with_developer_id() {
     security set-keychain-settings -u -t 3600 "$keychain"
     security unlock-keychain -p "$password" "$keychain"
 
+    # `security import` takes the .p12 password only in argv or at a prompt,
+    # so it is visible to this user's processes while the import runs. On a
+    # GitHub-hosted runner those are this job's own steps, which already hold
+    # it; a self-hosted Mac shared with other jobs would expose it to them.
     local p12="${SIGNING_WORK}/identity.p12"
     printf '%s' "$MAC_CSC_LINK" | base64 --decode >"$p12"
     security import "$p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" -A -f pkcs12
@@ -935,14 +960,7 @@ sign_with_developer_id() {
     # it. `list-keychains -s` replaces the list, so the old one is read first
     # and restored by the trap; an unreadable list is a refusal, because
     # setting a one-entry list would be persistent damage to the machine.
-    local listing line
-    listing="$(security list-keychains -d user)"
-    local quoted='^[[:space:]]*"(.+)"[[:space:]]*$'
-    while IFS= read -r line; do
-        if [[ "$line" =~ $quoted ]] && [[ "${BASH_REMATCH[1]}" != "$keychain" ]]; then
-            SIGNING_SEARCH_LIST+=("${BASH_REMATCH[1]}")
-        fi
-    done <<<"$listing"
+    read_search_list
     if ((${#SIGNING_SEARCH_LIST[@]} == 0)); then
         reject "could not read the user keychain search list; refusing to modify it."
         exit 1

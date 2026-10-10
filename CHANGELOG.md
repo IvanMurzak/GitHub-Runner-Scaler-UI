@@ -32,7 +32,9 @@ the version being prepared rather than the version in `Cargo.toml`.
   packaged, that the signature's designated requirement names the identifier and the Team ID
   rather than a code hash. With no material configured the binaries are ad-hoc signed and the run
   says so in a warning. With part of it configured, or none while the variable
-  `RUNNER_MANAGER_REQUIRE_DEVELOPER_ID` is `true`, the release refuses before it tags anything.
+  `RUNNER_MANAGER_REQUIRE_DEVELOPER_ID` is `true`, the release refuses before it tags anything;
+  it also rehearses the signing on a throwaway binary first, so a wrong password or certificate
+  is found before the tag as well.
   A release can then be dispatched only from a branch the environment admits (`main`).
 
 ## 0.4.36

@@ -159,7 +159,9 @@
 #
 # With none of the material configured the binaries are ad-hoc signed and the
 # run says so in a warning. With PART of it configured, or none while
-# RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is true, the run refuses at `preflight`.
+# RUNNER_MANAGER_REQUIRE_DEVELOPER_ID is true, the run refuses at `preflight`,
+# which also rehearses the whole signing on a throwaway binary so that a wrong
+# password or certificate is found before the tag rather than after it.
 name: Release
 
 on:
@@ -395,16 +397,25 @@ jobs:
           bash .github/scripts/release.sh check-native-runner \
             "$TARGET" "$RUNNER_OS" "$RUNNER_ARCH"
 
-      # The decision `build` makes when it signs, made here first. Reads only
-      # whether the material is present, never its value.
-      - name: Decide how the macOS binary will be signed
+      # `build` signs after the tag is pushed, so everything that can make
+      # signing fail is rehearsed here first, on a throwaway copy of a system
+      # binary: material only partly configured, a wrong .p12 password, a .p12
+      # holding another identity or missing its intermediates, an expired
+      # certificate, an unreachable timestamp server. Same subcommands, same
+      # inputs, as `build`.
+      - name: Rehearse signing the macOS binary
         if: runner.os == 'macOS'
         env:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           MAC_SIGN_IDENTITY: ${{ vars.MAC_SIGN_IDENTITY }}
           RUNNER_MANAGER_REQUIRE_DEVELOPER_ID: ${{ vars.RUNNER_MANAGER_REQUIRE_DEVELOPER_ID }}
-        run: bash .github/scripts/release.sh macos-signing-mode
+        run: |
+          bash .github/scripts/release.sh macos-signing-mode
+          probe="${RUNNER_TEMP}/signing-rehearsal"
+          cp /usr/bin/true "$probe"
+          bash .github/scripts/release.sh sign-macos "$probe"
+          bash .github/scripts/release.sh verify-macos-signature "$probe" "$MAC_SIGN_IDENTITY"
 
   # --------------------------------------------------------------------------
   # Step 3. The same matrix as CI, by calling CI rather than copying it.
@@ -538,9 +549,7 @@ jobs:
     # The macOS signing material lives in this environment and nowhere else.
     # See "THE SIGNING MATERIAL" in this file's header. Every leg names it --
     # an environment cannot be chosen per matrix entry without an expression
-    # nothing here can test -- but only the macOS steps read it. Give the
-    # environment a branch rule, not required reviewers, which would ask for
-    # one approval per leg.
+    # nothing here can test -- but only the macOS steps read it.
     environment: release
     permissions:
       contents: read
@@ -971,16 +980,16 @@ jobs:
           A scan that ignores `scope` will report advisories against code these
           artifacts do not contain.
 
-          The macOS binaries are signed with the project's Developer ID
-          Application certificate under the identifier
+          The macOS binaries are code-signed, and the release workflow
+          verifies the signature before publishing. When the project's
+          Developer ID Application certificate is configured, which is the
+          intended state, they are signed with it under the identifier
           `io.github.IvanMurzak.runner-manager`, so the keychain and privacy
-          grants macOS gives the service carry over to the next release; the
-          release workflow verifies the signature before publishing. Run
-          `codesign -dv` on the binary to see it. A release built while no
-          signing certificate was configured carries an ad-hoc signature
-          instead, and its run says so. The binaries are not notarized, and
-          every documented install path is a terminal command, so no
-          supported install triggers Gatekeeper or SmartScreen.
+          grants macOS gives the service carry over to the next release;
+          otherwise they carry an ad-hoc signature and the run warns. Run
+          `codesign -dv` on the binary to see which. The binaries are not
+          notarized, and every documented install path is a terminal command,
+          so no supported install triggers Gatekeeper or SmartScreen.
           NOTES
 
           # `--verify-tag` refuses to invent a tag: the tag must be the one the

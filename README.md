@@ -73,7 +73,8 @@ The published macOS binaries (install script, Homebrew, npm) are signed with the
 Developer ID certificate under one identifier, and are not notarized. macOS ties the
 permissions it gives the service, such as reading a runner root on an external volume, to
 that signature, so they carry over from one release to the next. A binary built with `cargo
-install` is signed ad hoc by the linker instead, and macOS asks again after every rebuild.
+install` is not: the linker signs it ad hoc on Apple Silicon and not at all on Intel, and
+macOS asks again after every rebuild.
 
 ### Which one to pick
 
