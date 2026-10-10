@@ -4879,7 +4879,7 @@ impl ServiceOperations {
             Err(error) => Err(error.to_string()),
         };
         match readable {
-            Ok(status) => status.from_another_root(foreign),
+            Ok(status) => status.with_foreign(foreign),
             Err(reason) => {
                 foreign.unreadable = Some(reason);
                 ServiceStatus::foreign_unread(self.identity.clone(), registration, foreign)
@@ -5549,7 +5549,7 @@ impl ServiceStatus {
 
     /// Marks a status read from another installation's directories as that
     /// installation's. See [`ForeignService`].
-    fn from_another_root(mut self, foreign: ForeignService) -> Self {
+    fn with_foreign(mut self, foreign: ForeignService) -> Self {
         if let Some(note) = foreign.unused_local_note() {
             self.notes.push(note);
         }
@@ -5625,6 +5625,15 @@ impl ServiceStatus {
     #[must_use]
     pub const fn foreign(&self) -> Option<&ForeignService> {
         self.foreign.as_ref()
+    }
+
+    /// Whether this is another installation's service whose own records this
+    /// account could not read, so only the service manager's facts are here.
+    #[must_use]
+    pub fn is_unread(&self) -> bool {
+        self.foreign
+            .as_ref()
+            .is_some_and(|foreign| foreign.unreadable.is_some())
     }
 
     /// The one-word-or-so verdict `service status` ends with.
@@ -6009,11 +6018,7 @@ impl fmt::Display for ServiceStatus {
         }
         // Not known, rather than "never", for a service whose records were not
         // read: its contact file is in a directory this account cannot open.
-        if !self
-            .foreign
-            .as_ref()
-            .is_some_and(|foreign| foreign.unreadable.is_some())
-        {
+        if !self.is_unread() {
             writeln!(
                 f,
                 "  last GitHub contact       {}",

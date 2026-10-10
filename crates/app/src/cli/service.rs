@@ -564,10 +564,7 @@ fn status_with(operations: &ServiceOperations, out: &mut dyn Write) -> Result<()
     announce_fixture(operations, "reports", "this service status", out)?;
     let status = operations.status().map_err(service_failure)?;
     writeln!(out, "{status}").map_err(write_failed("this service status"))?;
-    let unread = status
-        .foreign()
-        .is_some_and(|foreign| foreign.unreadable.is_some());
-    if status.last_github_contact().is_none() && !unread {
+    if status.last_github_contact().is_none() && !status.is_unread() {
         writeln!(
             out,
             "  GitHub connectivity       offline (no successful contact recorded)"

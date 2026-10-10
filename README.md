@@ -327,6 +327,7 @@ runner-manager host cache reset-root                           # Keep the caches
 runner-manager host cache set-max-size N                       # Cap the caches' total size in GiB (0 removes the cap)
 runner-manager host cache set-tool TOOL --state on|off|default # Turn one cache on or off for every policy
 runner-manager host cache prune                                # Remove least recently used idle caches over the cap now
+runner-manager host forget-local                               # Move this account's unused configuration aside
 
 runner-manager repo add OWNER/REPO --host-label HOST           # Add a repository in monitor-only mode
 runner-manager repo add OWNER/REPO --host-label HOST \
