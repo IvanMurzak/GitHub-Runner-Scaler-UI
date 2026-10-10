@@ -6043,7 +6043,7 @@ fn another_installations_service_is_not_blocked_by_this_accounts_stale_record() 
             .activity
             .iter()
             .any(|row| row.id == "readiness:local:service-elsewhere"
-                && row.remediation.contains("elevated")),
+                && row.remediation.contains("signed in as yuriv")),
         "{:?}",
         unread.activity
     );
