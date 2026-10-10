@@ -255,7 +255,10 @@ impl HostBudget {
     /// # Errors
     /// Whatever `out` fails with.
     pub fn write(&self, out: &mut dyn Write) -> io::Result<()> {
-        writeln!(out, "Shared REST budget")?;
+        writeln!(
+            out,
+            "Shared REST budget, projected as if no poll were answered 304 (the worst case)"
+        )?;
         writeln!(out, "  refresh interval          {}", self.interval)?;
         writeln!(
             out,
@@ -286,11 +289,19 @@ impl HostBudget {
         if self.exceeds_allowance() {
             writeln!(
                 out,
-                "  OVER BUDGET: this host's configured targets already project more than it"
+                "  OVER BUDGET if every poll were a full response: this host's configured targets"
             )?;
             writeln!(
                 out,
-                "  may plan to spend. Lengthen the refresh interval or remove a target."
+                "  project more than it may plan to spend. Idle polls are conditional and answered"
+            )?;
+            writeln!(
+                out,
+                "  304, which GitHub does not charge, so check the measured figures under \"GitHub"
+            )?;
+            writeln!(
+                out,
+                "  polling\" before lengthening the active interval or removing a target."
             )?;
             writeln!(out)?;
         }
@@ -430,6 +441,7 @@ pub fn dispatch(
 ) -> Result<(), CliError> {
     match command {
         HostCommand::SetCapacity(args) => set_capacity(context, args, out),
+        HostCommand::SetPollInterval(args) => super::polling::set_poll_interval(context, args, out),
         HostCommand::SetRuntimeRoot(args) => runtime_root(context, Some(&args.path), styling, out),
         HostCommand::ResetRuntimeRoot => runtime_root(context, None, styling, out),
         HostCommand::Show => show(context, out),
@@ -1026,6 +1038,17 @@ pub fn show(context: &Context, out: &mut dyn Write) -> Result<(), CliError> {
         .into_iter()
         .map(|policy| policy.target)
         .collect();
+    // What polling measured first, then the projection: with conditional
+    // requests the projection is the cost *if nothing were answered 304*, and
+    // an operator deciding whether to lengthen an interval needs the measured
+    // number in front of them. See `super::polling`.
+    let configured = super::polling::configured(context, &store)?;
+    super::polling::write_section(
+        out,
+        &super::polling::snapshot(context, configured, &targets),
+    )
+    .map_err(failed)?;
+    writeln!(out).map_err(failed)?;
     HostBudget::of(interval, &targets)
         .write(out)
         .map_err(failed)?;

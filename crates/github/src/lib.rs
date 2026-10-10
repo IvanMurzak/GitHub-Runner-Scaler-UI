@@ -65,10 +65,12 @@
 //! `tests/no_secret_reaches_the_logs.rs` records the numbers and what they rule
 //! out.
 
+pub mod conditional;
 pub mod demand;
 pub mod device_flow;
 pub mod jit;
 pub mod rest;
+pub mod traffic;
 
 use std::{
     fmt,
@@ -840,6 +842,9 @@ pub struct ApiRequest {
     path: String,
     query: Vec<(String, String)>,
     body: Option<serde_json::Value>,
+    /// What to send as `If-None-Match` / `If-Modified-Since`, when this is a
+    /// conditional `GET`. See [`crate::conditional`].
+    validators: Option<Validators>,
 }
 
 impl ApiRequest {
@@ -860,6 +865,7 @@ impl ApiRequest {
             path: path.into(),
             query: Vec::new(),
             body: None,
+            validators: None,
         }
     }
 
@@ -876,6 +882,7 @@ impl ApiRequest {
             path: path.into(),
             query: Vec::new(),
             body: Some(value),
+            validators: None,
         })
     }
 
@@ -883,6 +890,41 @@ impl ApiRequest {
     pub fn query(mut self, key: impl Into<String>, value: impl fmt::Display) -> Self {
         self.query.push((key.into(), value.to_string()));
         self
+    }
+
+    /// Make this a conditional request: GitHub answers `304 Not Modified`,
+    /// with no body, while the resource still matches `validators`.
+    ///
+    /// Only meaningful on a `GET`. GitHub: "Conditional requests for unsafe
+    /// methods, such as `POST`, `PUT`, `PATCH`, and `DELETE` are not supported
+    /// unless otherwise noted in the documentation."
+    #[must_use]
+    pub fn conditional(mut self, validators: Validators) -> Self {
+        self.validators = (!validators.is_empty()).then_some(validators);
+        self
+    }
+
+    /// Whether this request carries validators, and so may be answered `304`.
+    #[must_use]
+    pub const fn is_conditional(&self) -> bool {
+        self.validators.is_some()
+    }
+
+    /// The resource this request reads: method, path, and query in the order
+    /// it was added. An `ETag` is scoped to exactly this — GitHub: "Use the
+    /// same parameters every time you poll the same data. A different page
+    /// size, page number, or filter produces a different response with a
+    /// different `etag`."
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        let mut key = format!("{} {}", self.method.as_str(), self.path);
+        for (index, (name, value)) in self.query.iter().enumerate() {
+            key.push(if index == 0 { '?' } else { '&' });
+            key.push_str(name);
+            key.push('=');
+            key.push_str(value);
+        }
+        key
     }
 
     #[must_use]
@@ -909,7 +951,44 @@ impl fmt::Debug for ApiRequest {
                 "body",
                 &self.body.as_ref().map_or("none", |_| "[REDACTED JSON]"),
             )
+            .field("conditional", &self.validators.is_some())
             .finish()
+    }
+}
+
+/// A response's cache validators: its `ETag` and `Last-Modified`.
+///
+/// Sent back verbatim, a weak `W/"…"` tag included, because that is what
+/// GitHub compares against. Measured on `api.github.com` before this was
+/// written: the workflow-run, job and runner listings each return a weak
+/// `ETag`, and an `If-None-Match` carrying it is answered `304` for as long as
+/// the listing is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    /// The validators a response carries, if any.
+    #[must_use]
+    pub fn of(response: &ApiResponse) -> Self {
+        let read = |name: &str| {
+            response
+                .header(name)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            etag: read("etag"),
+            last_modified: read("last-modified"),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
     }
 }
 
@@ -932,6 +1011,14 @@ impl ApiResponse {
     #[must_use]
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// `304 Not Modified`: the answer to a conditional request whose resource
+    /// has not changed. It has no body; [`crate::conditional`] substitutes the
+    /// cached one.
+    #[must_use]
+    pub fn is_not_modified(&self) -> bool {
+        self.status == StatusCode::NOT_MODIFIED
     }
 
     #[must_use]
@@ -1160,6 +1247,10 @@ pub struct AuthenticatedClient {
     /// `a_concurrent_success_cannot_downgrade_a_lockout_to_a_permissions_answer`.
     consecutive_unauthorized: AtomicU64,
     lockout: std::sync::Mutex<LockoutState>,
+    /// Every response this client received, counted. Observation only:
+    /// nothing in this client decides anything from it. See
+    /// [`crate::traffic`].
+    traffic: traffic::ApiTraffic,
 }
 
 impl fmt::Debug for AuthenticatedClient {
@@ -1319,12 +1410,20 @@ impl AuthenticatedClient {
                 until: None,
                 backoff: DEFAULT_LOCKOUT_BACKOFF,
             }),
+            traffic: traffic::ApiTraffic::new(),
         }
     }
 
     #[must_use]
     pub fn endpoints(&self) -> &Endpoints {
         &self.endpoints
+    }
+
+    /// What this client has received from GitHub, by class, and the newest
+    /// reading of the account's hourly quota.
+    #[must_use]
+    pub const fn traffic(&self) -> &traffic::ApiTraffic {
+        &self.traffic
     }
 
     /// How many credential re-validations this client has performed.
@@ -1928,7 +2027,10 @@ impl AuthenticatedClient {
         attempt: Attempt,
     ) -> Classified {
         let status = response.status;
-        if status.is_success() {
+        // A `304` is a success only as the answer to a conditional request:
+        // it means "what you hold is still current". Unasked for, it is not an
+        // answer this client can hand on, and it stays an error.
+        if status.is_success() || (status == StatusCode::NOT_MODIFIED && request.is_conditional()) {
             self.consecutive_unauthorized.store(0, Ordering::SeqCst);
             return Classified::Ok;
         }
@@ -2095,10 +2197,21 @@ impl AuthenticatedClient {
         if let Some(body) = &request.body {
             builder = builder.json(body);
         }
+        if let Some(validators) = &request.validators {
+            if let Some(etag) = &validators.etag {
+                builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(modified) = &validators.last_modified {
+                builder = builder.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+            }
+        }
 
         let response = builder.send().await.map_err(transport)?;
         let status = response.status();
         let headers = response.headers().clone();
+        // Counted on the headers, before the body: GitHub charged the request
+        // whether or not the body then arrives whole.
+        self.traffic.record(status, &headers, self.clock.now());
         let body = response.bytes().await.map_err(transport)?.to_vec();
 
         tracing::debug!(
@@ -4654,11 +4767,13 @@ mod tests {
     /// by walking the directory tree, so adding a file — at the top level or in
     /// a subdirectory — and not adding it here fails.
     const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("conditional.rs", include_str!("conditional.rs")),
         ("demand.rs", include_str!("demand.rs")),
         ("device_flow.rs", include_str!("device_flow.rs")),
         ("jit.rs", include_str!("jit.rs")),
         ("lib.rs", include_str!("lib.rs")),
         ("rest.rs", include_str!("rest.rs")),
+        ("traffic.rs", include_str!("traffic.rs")),
     ];
 
     /// The two source files `c2` owns, plus the manifest. The renewal half of

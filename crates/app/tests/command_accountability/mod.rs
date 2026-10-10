@@ -171,6 +171,7 @@ const PROFILE_COMMANDS: &str = "crates/app/tests/profile_commands.rs";
 const RUNNER_ENV_COMMANDS: &str = "crates/app/tests/runner_env_commands.rs";
 const HOST_DOCTOR_COMMANDS: &str = "crates/app/tests/host_doctor_commands.rs";
 const DEPENDENCY_CACHE_COMMANDS: &str = "crates/app/tests/dependency_cache_commands.rs";
+const POLL_INTERVAL_COMMANDS: &str = "crates/app/tests/poll_interval_commands.rs";
 
 pub const LOCAL_CHAIN_EVIDENCE: &[Evidence] = &[
     at(
@@ -311,6 +312,28 @@ pub const MANIFEST: &[Classification] = &[
     generated("auth logout"),
     // -- host ----------------------------------------------------------------
     generated("host set-capacity"),
+    Classification {
+        leaf: "host set-poll-interval",
+        coverage: Coverage::Dedicated,
+        evidence: &[
+            at(
+                POLL_INTERVAL_COMMANDS,
+                "host_set_poll_interval_round_trips_through_polling_toml_and_the_host_row",
+            ),
+            at(
+                POLL_INTERVAL_COMMANDS,
+                "host_set_poll_interval_refuses_what_the_daemon_would_refuse_and_writes_nothing",
+            ),
+        ],
+        exclusion: Some(Exclusion {
+            boundary: Boundary::HostConfiguration,
+            reason: "The intervals change only how often the daemon polls GitHub, which the \
+                     generated oracle does not model: no policy, attempt, root or credential. \
+                     Dedicated real-process tests drive both flags against polling.toml and the \
+                     host row under --data-dir, read them back through status and host show, \
+                     and pin every refusal and that it writes nothing.",
+        }),
+    },
     generated("host set-runtime-root"),
     generated("host reset-runtime-root"),
     generated("host show"),

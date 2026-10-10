@@ -8,9 +8,13 @@
 //!
 //! * [`PollSchedule`] — the budget-aware interval. Demand shares one 5,000
 //!   requests/hour ceiling with inventory and workflow counts, so this loop
-//!   polls on a bounded interval (default 60 s, hard floor 30 s per target) and
-//!   *increases* the delay under a rate-limit signal, never decreases it to
-//!   catch up.
+//!   polls an *active* target on a bounded interval (default 60 s, hard floor
+//!   30 s per target) and *increases* the delay under a rate-limit signal,
+//!   never decreases it to catch up. A target with nothing happening is polled
+//!   at the shorter *idle* interval (default 10 s), because its polls are
+//!   conditional requests answered `304`, which GitHub does not charge against
+//!   the hourly ceiling — and because work usually arrives after idle. When
+//!   the account's remaining quota runs low, the schedule stretches.
 //! * [`RepositoryCache`] — the per-organization repository list, refreshed on
 //!   an interval materially slower than the demand poll. Re-listing an
 //!   organization at demand-poll frequency is what exhausts the shared budget
@@ -116,13 +120,15 @@ use runner_manager_domain::attempt::{
 };
 use runner_manager_domain::capacity::{Allocation, HostAllocator, LimitingFactor};
 use runner_manager_domain::model::{
-    AttemptId, Clock, Host, Org, OwnerRepo, PolicyId, RefreshInterval, ScaleTarget, Timestamp,
+    AttemptId, Clock, Host, IdlePollInterval, Org, OwnerRepo, PolicyId, RefreshInterval,
+    ScaleTarget, Timestamp,
 };
 use runner_manager_domain::policy::{DemandTally, ScalePolicy};
 use runner_manager_github::demand::{DemandGateway, QueuedDemand, demand_requests_per_poll};
 use runner_manager_github::rest::{
     ActivityScope, CancelToken, InventoryError, RateLimitKind, RefreshState,
 };
+use runner_manager_github::traffic::{PrimaryPressure, RateLimitSnapshot};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -170,6 +176,24 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 5;
 /// opposite of backing off; it is spelled out because "add jitter" reads as
 /// symmetric and is not.
 const JITTER_RATIO: f64 = 0.5;
+
+/// How much of a rate-limit wait is jitter: added, never subtracted.
+///
+/// Every target loop on a host shares one rate-limit quiet period, so without
+/// it they all wake at the same instant the period ends, and a burst is the
+/// shape most likely to meet the secondary limit again. A tenth spreads them
+/// over a few seconds to a minute and a half without overshooting a
+/// 15-minute wait by much.
+const RATE_LIMIT_JITTER_RATIO: f64 = 0.1;
+
+/// The most demand requests a minute one target's idle polling may cost.
+///
+/// A third of GitHub's 900-a-minute secondary limit. A target of one or a few
+/// repositories never reaches it at the 5-second floor, but an organization of
+/// a hundred repositories costs about four hundred requests a pass, and at a
+/// 10-second idle interval that alone would exceed the whole account's
+/// secondary limit. Its idle interval stretches instead.
+pub const MAX_IDLE_REQUESTS_PER_MINUTE_PER_TARGET: u32 = 300;
 
 /// GitHub cancels a queued job after this long.
 ///
@@ -514,8 +538,16 @@ impl Jitter for NoJitter {
 /// hidden however visible the number is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollPace {
-    /// The configured interval. Nothing is throttling this loop.
+    /// The configured (active) interval. Nothing is throttling this loop.
     Nominal,
+    /// The idle interval: nothing is happening on this target, so its polls
+    /// are `304`s and cost nothing against the hourly quota. Not a slowdown.
+    Idle,
+    /// The account's remaining hourly quota is low, so this loop waits a
+    /// multiple of its active interval. GitHub's quota is per user, shared by
+    /// every host signed in as that user, so this can be another machine's
+    /// doing.
+    Stretched { pressure: PrimaryPressure },
     /// GitHub's rate limit is exhausted. Resolves by waiting.
     RateLimited { kind: RateLimitKind },
     /// GitHub's temporary authentication lockout. The credential is fine.
@@ -534,7 +566,7 @@ impl PollPace {
     /// Whether this pace is a slowdown the operator should be told about.
     #[must_use]
     pub const fn is_throttled(&self) -> bool {
-        !matches!(self, Self::Nominal)
+        !matches!(self, Self::Nominal | Self::Idle)
     }
 
     /// A fixed, credential-free name for the log sink and for `g2`.
@@ -542,6 +574,16 @@ impl PollPace {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Nominal => "nominal",
+            Self::Idle => "idle",
+            Self::Stretched {
+                pressure: PrimaryPressure::Normal,
+            } => "nominal",
+            Self::Stretched {
+                pressure: PrimaryPressure::Low,
+            } => "stretched_low_budget",
+            Self::Stretched {
+                pressure: PrimaryPressure::Critical,
+            } => "stretched_critical_budget",
             Self::RateLimited {
                 kind: RateLimitKind::Primary,
             } => "rate_limited_primary",
@@ -590,8 +632,25 @@ pub struct NextPoll {
 #[derive(Debug, Clone)]
 pub struct PollSchedule {
     interval: RefreshInterval,
+    /// The idle interval. Equal to the active one until [`Self::with_idle`]
+    /// says otherwise, so a caller that never heard of it keeps its schedule.
+    idle: Duration,
     consecutive_offline: u32,
     offline_since: Option<Timestamp>,
+}
+
+/// What a successful pass found, beyond "GitHub answered".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollConditions {
+    /// Nothing is happening: no live runner, no run whose listings changed.
+    /// See `QueuedDemand::is_quiet`.
+    pub quiet: bool,
+    /// The account's hourly quota as GitHub last reported it.
+    pub quota: Option<RateLimitSnapshot>,
+    /// What one poll of this target costs, in demand requests. Stretches the
+    /// idle interval of a target too large to poll that often; see
+    /// [`MAX_IDLE_REQUESTS_PER_MINUTE_PER_TARGET`].
+    pub requests_per_pass: u32,
 }
 
 impl PollSchedule {
@@ -599,14 +658,44 @@ impl PollSchedule {
     pub const fn new(interval: RefreshInterval) -> Self {
         Self {
             interval,
+            idle: Duration::from_secs(interval.as_secs() as u64),
             consecutive_offline: 0,
             offline_since: None,
         }
     }
 
+    /// Poll a quiet target every `idle` instead of every active interval.
+    ///
+    /// Never longer than the active interval: an idle interval above it would
+    /// make a quiet target *slower* to notice work than a busy one.
+    #[must_use]
+    pub fn with_idle(mut self, idle: Duration) -> Self {
+        self.set_intervals(self.interval, idle);
+        self
+    }
+
+    /// Change both intervals while running.
+    pub fn set_intervals(&mut self, interval: RefreshInterval, idle: Duration) {
+        self.interval = interval;
+        self.idle = idle.min(self.nominal()).max(Self::idle_floor());
+    }
+
     #[must_use]
     pub const fn interval(&self) -> RefreshInterval {
         self.interval
+    }
+
+    /// The interval a quiet target is polled at.
+    #[must_use]
+    pub const fn idle(&self) -> Duration {
+        self.idle
+    }
+
+    /// The shortest delay this schedule ever produces: the idle interval's
+    /// floor. See `IdlePollInterval` for why it is lower than [`Self::floor`].
+    #[must_use]
+    pub const fn idle_floor() -> Duration {
+        Duration::from_secs(IdlePollInterval::MIN_SECS as u64)
     }
 
     /// The nominal interval as a [`Duration`].
@@ -654,14 +743,55 @@ impl PollSchedule {
         now: Timestamp,
         jitter: &dyn Jitter,
     ) -> NextPoll {
+        self.next_poll_with(failure, PollConditions::default(), now, jitter)
+    }
+
+    /// [`Self::next_poll`], with what a successful pass found.
+    ///
+    /// # On success, three paces, in this order
+    ///
+    /// 1. **Stretched**, when the account's remaining quota is under
+    ///    `LOW_PRIMARY_REMAINING_PERCENT`: the active interval times
+    ///    [`PrimaryPressure::stretch_factor`] (2, or 4 under
+    ///    `CRITICAL_PRIMARY_REMAINING_PERCENT`), but never past the quota's
+    ///    reset — waiting longer than that buys nothing, because the bucket is
+    ///    full again. This wins over idle: a `304` is free, but the poll that
+    ///    finds new work is not, and every host on the account draws from the
+    ///    same bucket.
+    /// 2. **Idle**, when the pass was quiet.
+    /// 3. **Nominal**, the active interval, otherwise.
+    pub fn next_poll_with(
+        &mut self,
+        failure: Option<&RefreshState>,
+        conditions: PollConditions,
+        now: Timestamp,
+        jitter: &dyn Jitter,
+    ) -> NextPoll {
         let nominal = self.nominal();
 
         let next = match failure {
             None => {
                 self.recovered();
-                NextPoll {
-                    delay: nominal,
-                    pace: PollPace::Nominal,
+                let pressure = conditions
+                    .quota
+                    .map_or(PrimaryPressure::Normal, |quota| quota.pressure(now));
+                match (pressure, conditions.quota) {
+                    (PrimaryPressure::Low | PrimaryPressure::Critical, Some(quota)) => NextPoll {
+                        delay: nominal
+                            .saturating_mul(pressure.stretch_factor())
+                            .min(quota.reset_in(now).max(nominal)),
+                        pace: PollPace::Stretched { pressure },
+                    },
+                    // An idle interval no shorter than the active one is no
+                    // idle interval at all, and naming it would be noise.
+                    _ if conditions.quiet && self.idle < nominal => NextPoll {
+                        delay: self.idle.max(idle_floor_for(conditions.requests_per_pass)),
+                        pace: PollPace::Idle,
+                    },
+                    _ => NextPoll {
+                        delay: nominal,
+                        pace: PollPace::Nominal,
+                    },
                 }
             }
             Some(RefreshState::Offline) => {
@@ -677,9 +807,13 @@ impl PollSchedule {
             }
             Some(state @ RefreshState::RateLimited(limit)) => {
                 self.recovered();
+                // `max`, never `+`. See the type documentation. The jitter is
+                // added to the result, never to the floor GitHub named.
+                let wait = retry_floor(state, now).max(nominal);
                 NextPoll {
-                    // `max`, never `+`. See the type documentation.
-                    delay: retry_floor(state, now).max(nominal),
+                    delay: wait.saturating_add(
+                        wait.mul_f64(RATE_LIMIT_JITTER_RATIO * jitter.fraction().clamp(0.0, 1.0)),
+                    ),
                     pace: PollPace::RateLimited { kind: limit.kind },
                 }
             }
@@ -707,8 +841,12 @@ impl PollSchedule {
         };
 
         debug_assert!(
-            next.delay >= Self::floor(),
-            "the 30-second floor is a rate-budget constraint and no branch may go below it"
+            next.delay >= Self::floor() || next.pace == PollPace::Idle,
+            "the 30-second floor is a rate-budget constraint and no charged branch may go below it"
+        );
+        debug_assert!(
+            next.delay >= Self::idle_floor(),
+            "the idle floor is a secondary-limit constraint and no branch may go below it"
         );
         next
     }
@@ -734,6 +872,38 @@ impl PollSchedule {
         let spread = capped.mul_f64(JITTER_RATIO * jitter.fraction().clamp(0.0, 1.0));
         capped.saturating_add(spread).max(Self::floor())
     }
+}
+
+/// Whether a pass found nothing happening, so the next one may come at the
+/// idle interval.
+///
+/// All three are needed. Every target answered, and quietly
+/// (`QueuedDemand::is_quiet`); this pass started no runner; and no policy
+/// here holds a live one. A live runner means a job is running or about to,
+/// and its follow-on work (`needs:`, the next matrix wave) is exactly what an
+/// active target is polled for. A pass that polled nothing is not quiet: there
+/// is nothing to be quiet about, and the active interval is what it had
+/// before.
+fn is_quiet(readings: &BTreeMap<ScaleTarget, PollOutcome>, report: &ReconcileReport) -> bool {
+    !readings.is_empty()
+        && readings
+            .values()
+            .all(|outcome| outcome.reading().is_some_and(QueuedDemand::is_quiet))
+        && report.started == 0
+        // Demand this host matched and did not serve is not quiet either: a
+        // launch that keeps failing (a refused JIT registration) would
+        // otherwise be retried, and charged, every few seconds.
+        && report
+            .allocations
+            .iter()
+            .all(|allocation| allocation.active_owned == 0 && allocation.demand == 0)
+}
+
+/// The shortest idle delay a poll of `requests_per_pass` requests may have.
+fn idle_floor_for(requests_per_pass: u32) -> Duration {
+    Duration::from_secs(
+        u64::from(requests_per_pass) * 60 / u64::from(MAX_IDLE_REQUESTS_PER_MINUTE_PER_TARGET),
+    )
 }
 
 /// `c3`'s retry floor, with the one fallback this loop needs.
@@ -1831,14 +2001,29 @@ impl EventSink for TracingEvents {
                 unresolvable,
                 complete,
             } => {
-                tracing::info!(
-                    event = name,
-                    policy_id = %policy,
-                    demand,
-                    not_matched,
-                    unresolvable,
-                    count = u64::from(complete),
-                );
+                // An empty reading is the idle steady state, and the idle
+                // interval repeats it every few seconds per target: at `info`
+                // it would be most of the log. Anything worth reading is still
+                // `info`.
+                if demand == 0 && not_matched == 0 && unresolvable == 0 && complete {
+                    tracing::debug!(
+                        event = name,
+                        policy_id = %policy,
+                        demand,
+                        not_matched,
+                        unresolvable,
+                        count = u64::from(complete),
+                    );
+                } else {
+                    tracing::info!(
+                        event = name,
+                        policy_id = %policy,
+                        demand,
+                        not_matched,
+                        unresolvable,
+                        count = u64::from(complete),
+                    );
+                }
                 // There is deliberately no `warn!` here for the "demand is zero
                 // but jobs were not matched" shape, though it is the one this
                 // change introduced: before demand was filtered, a repository
@@ -1872,6 +2057,26 @@ impl EventSink for TracingEvents {
                 reason = reason.as_str(),
                 count,
                 "{reason}"
+            ),
+            LifecycleEvent::Allocated {
+                policy,
+                demand,
+                desired,
+                active_owned,
+                headroom,
+                to_start,
+                limiting,
+            } if demand == 0 && to_start == 0 && active_owned == 0 => tracing::debug!(
+                // Nothing wanted, nothing held, nothing started: the idle
+                // steady state, see `DemandObserved` above.
+                event = name,
+                policy_id = %policy,
+                demand,
+                desired,
+                capacity = active_owned,
+                headroom,
+                count = to_start,
+                reason = %limiting,
             ),
             LifecycleEvent::Allocated {
                 policy,
@@ -1943,7 +2148,11 @@ impl EventSink for TracingEvents {
                 attempt_state = "busy",
             ),
             LifecycleEvent::PollScheduled { retry_in_ms, pace } => {
-                tracing::info!(event = name, retry_in_ms, state = pace.as_str());
+                if pace == PollPace::Idle {
+                    tracing::debug!(event = name, retry_in_ms, state = pace.as_str());
+                } else {
+                    tracing::info!(event = name, retry_in_ms, state = pace.as_str());
+                }
             }
         }
     }
@@ -2316,6 +2525,12 @@ impl Reconciler {
         &self.schedule
     }
 
+    /// Adopt intervals an operator changed while the loop runs.
+    pub fn set_intervals(&mut self, active: RefreshInterval, idle: Duration) {
+        self.host.refresh_interval = active;
+        self.schedule.set_intervals(active, idle);
+    }
+
     /// The repository-list cache, so `f1` can report what it has spent.
     #[must_use]
     pub const fn repositories(&self) -> &RepositoryCache {
@@ -2497,9 +2712,19 @@ impl Reconciler {
             .max_by_key(|state| severity(state))
             .cloned();
         let now = self.clock.now();
-        report.next_poll = self
-            .schedule
-            .next_poll(failure.as_ref(), now, self.jitter.as_ref());
+        let conditions = PollConditions {
+            quiet: is_quiet(&readings, &report),
+            requests_per_pass: report.demand_requests,
+            quota: readings
+                .values()
+                .filter_map(PollOutcome::reading)
+                .filter_map(QueuedDemand::rate_limit)
+                .max_by_key(|quota| quota.observed_at)
+                .copied(),
+        };
+        report.next_poll =
+            self.schedule
+                .next_poll_with(failure.as_ref(), conditions, now, self.jitter.as_ref());
         report.failure = failure;
         // Flow 3.3's fourth obligation: the offline state carries the 24-hour
         // bound, and it can only say whether that bound has passed if it is
@@ -4939,6 +5164,371 @@ mod tests {
 
         // "We cannot tell" is not "not yet".
         assert!(!OfflineState::new(9, Duration::from_secs(60)).has_outlasted_the_queue());
+    }
+
+    // =======================================================================
+    // Idle polling and the shared quota
+    // =======================================================================
+
+    fn quota(remaining: u64, reset_in_secs: i64, now: Timestamp) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            limit: 5_000,
+            remaining,
+            used: Some(5_000 - remaining),
+            reset_unix_secs: u64::try_from(now.timestamp() + reset_in_secs).expect("positive"),
+            observed_at: now,
+        }
+    }
+
+    fn quiet() -> PollConditions {
+        PollConditions {
+            quiet: true,
+            quota: None,
+            requests_per_pass: 0,
+        }
+    }
+
+    #[test]
+    fn a_quiet_pass_polls_at_the_idle_interval_and_a_busy_one_at_the_active_interval() {
+        let now = fixtures::created_at();
+        let mut schedule =
+            PollSchedule::new(RefreshInterval::default()).with_idle(Duration::from_secs(10));
+
+        let idle = schedule.next_poll_with(None, quiet(), now, &NoJitter);
+        assert_eq!(idle.delay, Duration::from_secs(10));
+        assert_eq!(idle.pace, PollPace::Idle);
+        assert!(!idle.pace.is_throttled(), "idle is faster, not a slowdown");
+
+        let busy = schedule.next_poll_with(None, PollConditions::default(), now, &NoJitter);
+        assert_eq!(busy.delay, Duration::from_secs(60));
+        assert_eq!(busy.pace, PollPace::Nominal);
+    }
+
+    #[test]
+    fn a_schedule_never_told_an_idle_interval_keeps_its_active_one() {
+        let now = fixtures::created_at();
+        let mut schedule = PollSchedule::new(RefreshInterval::default());
+        assert_eq!(
+            schedule.next_poll_with(None, quiet(), now, &NoJitter).delay,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn an_idle_interval_is_clamped_between_its_floor_and_the_active_interval() {
+        let schedule = PollSchedule::new(RefreshInterval::from_secs(30).expect("the floor"))
+            .with_idle(Duration::from_secs(120));
+        assert_eq!(
+            schedule.idle(),
+            Duration::from_secs(30),
+            "an idle interval above the active one would make quiet targets slower to react"
+        );
+        let schedule =
+            PollSchedule::new(RefreshInterval::default()).with_idle(Duration::from_secs(1));
+        assert_eq!(schedule.idle(), PollSchedule::idle_floor());
+    }
+
+    /// The owner's fourth requirement: when the shared quota runs low, stretch
+    /// the interval automatically, and say so.
+    #[test]
+    fn a_low_quota_stretches_polling_and_wins_over_idle() {
+        let now = fixtures::created_at();
+        let mut schedule =
+            PollSchedule::new(RefreshInterval::default()).with_idle(Duration::from_secs(10));
+
+        let healthy = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: true,
+                quota: Some(quota(1_000, 3_000, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(healthy.pace, PollPace::Idle, "a fifth left is still normal");
+
+        let low = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: true,
+                quota: Some(quota(999, 3_000, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(low.delay, Duration::from_secs(120));
+        assert_eq!(
+            low.pace,
+            PollPace::Stretched {
+                pressure: PrimaryPressure::Low
+            }
+        );
+        assert!(low.pace.is_throttled());
+        assert_eq!(low.pace.as_str(), "stretched_low_budget");
+
+        let critical = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: false,
+                quota: Some(quota(100, 3_000, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(critical.delay, Duration::from_secs(240));
+        assert_eq!(critical.pace.as_str(), "stretched_critical_budget");
+    }
+
+    #[test]
+    fn a_stretch_never_outlasts_the_quotas_reset_nor_undercuts_the_active_interval() {
+        let now = fixtures::created_at();
+        let mut schedule = PollSchedule::new(RefreshInterval::default());
+
+        let soon = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: false,
+                quota: Some(quota(10, 90, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(
+            soon.delay,
+            Duration::from_secs(90),
+            "the bucket refills in 90 s; waiting 240 s buys nothing"
+        );
+
+        let imminent = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: false,
+                quota: Some(quota(10, 5, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(imminent.delay, Duration::from_secs(60));
+
+        let expired = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: true,
+                quota: Some(quota(10, -5, now)),
+                requests_per_pass: 0,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(
+            expired.pace,
+            PollPace::Nominal,
+            "a reading from a window that has reset says nothing; the schedule here had no \
+             idle interval, so it is the active one"
+        );
+    }
+
+    #[test]
+    fn an_idle_target_too_large_to_poll_that_often_stretches_its_idle_interval() {
+        let now = fixtures::created_at();
+        let mut schedule =
+            PollSchedule::new(RefreshInterval::default()).with_idle(Duration::from_secs(10));
+        let small = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: true,
+                quota: None,
+                requests_per_pass: 40,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(small.delay, Duration::from_secs(10), "ten repositories fit");
+        let organization = schedule.next_poll_with(
+            None,
+            PollConditions {
+                quiet: true,
+                quota: None,
+                requests_per_pass: 400,
+            },
+            now,
+            &NoJitter,
+        );
+        assert_eq!(
+            organization.delay,
+            Duration::from_secs(80),
+            "400 requests a pass at 300 a minute is one pass every 80 s"
+        );
+        assert_eq!(organization.pace, PollPace::Idle);
+    }
+
+    #[test]
+    fn a_rate_limit_wait_is_jittered_upward_only() {
+        let now = fixtures::created_at();
+        let mut schedule = PollSchedule::new(RefreshInterval::default());
+        let limited = RefreshState::RateLimited(RateLimited {
+            kind: RateLimitKind::Secondary,
+            retry_after: Some(Duration::from_secs(300)),
+            remaining: None,
+            reset_unix_secs: None,
+        });
+        assert_eq!(
+            schedule
+                .next_poll(Some(&limited), now, &FixedJitter(0.5))
+                .delay,
+            Duration::from_secs(315),
+            "every loop shares one quiet period; without jitter they all wake together"
+        );
+        assert_eq!(
+            schedule.next_poll(Some(&limited), now, &NoJitter).delay,
+            Duration::from_secs(300),
+            "never shorter than GitHub asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_this_host_did_not_serve_keeps_the_target_off_the_idle_pace() {
+        // Capacity zero would refuse the policy outright; a host already full
+        // is the ordinary way matched demand goes unserved for a pass.
+        let launcher =
+            Arc::new(FakeLauncher::new().seeded(vec![attempt_in(AttemptState::Busy, 9, 9)]));
+        let demand = Arc::new(FakeDemand::ready(2, &repo("acme/app")));
+        let mut harness = Harness::build(
+            host_with(1),
+            launcher,
+            demand,
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(report.started, 0, "the host is full");
+        assert_eq!(
+            report.next_poll.pace,
+            PollPace::Nominal,
+            "matched demand it could not serve is work waiting, not idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_with_nothing_to_do_is_polled_at_the_idle_interval() {
+        let mut harness = Harness::simple(4, 0, "acme/app");
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(report.next_poll.pace, PollPace::Idle);
+        assert_eq!(report.next_poll.delay, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_target_whose_runs_are_changing_is_polled_at_the_active_interval() {
+        let mut harness = Harness::simple(4, 0, "acme/app");
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        harness.demand.set(PollOutcome::Ready(
+            QueuedDemand::of(repo("acme/app"), Vec::new()).with_busy(repo("acme/app")),
+        ));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(report.next_poll.pace, PollPace::Nominal);
+        assert_eq!(report.next_poll.delay, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_a_live_runner_is_polled_at_the_active_interval() {
+        let launcher =
+            Arc::new(FakeLauncher::new().seeded(vec![attempt_in(AttemptState::Busy, 1, 1)]));
+        let demand = Arc::new(FakeDemand::ready(0, &repo("acme/app")));
+        let mut harness = Harness::build(
+            host_with(4),
+            launcher,
+            demand,
+            Arc::new(InProcessAllocationLock::new()),
+        );
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(
+            report.next_poll.pace,
+            PollPace::Nominal,
+            "a job is running: its follow-on work is what the active interval watches for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_starts_a_runner_is_not_idle() {
+        let mut harness = Harness::simple(4, 2, "acme/app");
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert!(report.started > 0);
+        assert_eq!(report.next_poll.pace, PollPace::Nominal);
+    }
+
+    #[tokio::test]
+    async fn the_quota_reported_with_a_reading_stretches_the_next_poll() {
+        let mut harness = Harness::simple(4, 0, "acme/app");
+        harness
+            .reconciler
+            .set_intervals(RefreshInterval::default(), Duration::from_secs(10));
+        let now = harness.clock.now();
+        harness.demand.set(PollOutcome::Ready(
+            QueuedDemand::of(repo("acme/app"), Vec::new())
+                .with_rate_limit(Some(quota(200, 1_800, now))),
+        ));
+        let policy = policy(1, "acme/app", 4);
+
+        let report = harness
+            .reconciler
+            .reconcile(std::slice::from_ref(&policy))
+            .await;
+
+        assert_eq!(
+            report.next_poll.pace,
+            PollPace::Stretched {
+                pressure: PrimaryPressure::Critical
+            }
+        );
+        assert_eq!(report.next_poll.delay, Duration::from_secs(240));
     }
 
     // =======================================================================

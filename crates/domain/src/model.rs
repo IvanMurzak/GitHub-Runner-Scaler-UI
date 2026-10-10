@@ -451,6 +451,81 @@ impl fmt::Display for RefreshInterval {
     }
 }
 
+/// How often a target with **nothing happening** is polled.
+///
+/// [`RefreshInterval`] is the *active* interval and keeps its 30-second floor,
+/// because an active target's listings change and every changed listing is a
+/// full, charged response. An idle target's listings do not change, and its
+/// polls are conditional requests that GitHub answers `304 Not Modified`,
+/// which "does not count against your primary rate limit"
+/// (<https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests-if-appropriate>).
+/// So the idle interval may be much shorter, and that is where it pays: work
+/// usually arrives after idle, and every second of idle interval is a second a
+/// queued job waits before a runner is started for it.
+///
+/// The floor is not the primary limit any more but the secondary one: every
+/// request, a `304` included, is assumed to cost one of the 900 points a
+/// minute GitHub allows per user. Five seconds keeps one host polling ten
+/// idle repositories (two listings each) at 240 requests a minute, under a
+/// third of that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct IdlePollInterval(u16);
+
+impl IdlePollInterval {
+    pub const MIN_SECS: u16 = 5;
+    pub const DEFAULT_SECS: u16 = 10;
+
+    /// # Errors
+    /// [`ValidationError::BelowFloor`] under [`Self::MIN_SECS`].
+    pub fn from_secs(secs: u16) -> Result<Self, ValidationError> {
+        if secs < Self::MIN_SECS {
+            return Err(ValidationError::BelowFloor {
+                what: "idle poll interval (seconds)",
+                min: Self::MIN_SECS,
+                actual: secs,
+            });
+        }
+        Ok(Self(secs))
+    }
+
+    #[must_use]
+    pub const fn as_secs(self) -> u16 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.0 as u64)
+    }
+}
+
+impl Default for IdlePollInterval {
+    fn default() -> Self {
+        Self(Self::DEFAULT_SECS)
+    }
+}
+
+impl TryFrom<u16> for IdlePollInterval {
+    type Error = ValidationError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::from_secs(value)
+    }
+}
+
+impl From<IdlePollInterval> for u16 {
+    fn from(value: IdlePollInterval) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for IdlePollInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s", self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------
@@ -1396,6 +1471,24 @@ mod tests {
     }
 
     // -- refresh interval ---------------------------------------------------
+
+    #[test]
+    fn the_idle_interval_defaults_to_ten_seconds_with_a_five_second_floor() {
+        assert_eq!(IdlePollInterval::default().as_secs(), 10);
+        assert_eq!(
+            IdlePollInterval::from_secs(5).unwrap().as_duration(),
+            std::time::Duration::from_secs(5)
+        );
+        assert!(matches!(
+            IdlePollInterval::from_secs(4),
+            Err(ValidationError::BelowFloor {
+                min: 5,
+                actual: 4,
+                ..
+            })
+        ));
+        assert!(serde_json::from_str::<IdlePollInterval>("4").is_err());
+    }
 
     #[test]
     fn the_refresh_interval_floor_is_unrepresentable_rather_than_validated() {
