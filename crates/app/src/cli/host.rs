@@ -455,6 +455,7 @@ pub fn dispatch(
             super::doctor::required_tools_command(context, args, out)
         }
         HostCommand::Cache(command) => super::cache::dispatch_host(context, command, out),
+        HostCommand::ForgetLocal => super::service::forget_local(context, out),
     }
 }
 
